@@ -26,10 +26,18 @@ def _load_deepseek_v4_attention_module():
 
 def has_fused_qnorm_rope_kv_insert() -> bool:
     try:
-        _load_deepseek_v4_attention_module()
+        module = _load_deepseek_v4_attention_module()
     except Exception:
         return False
-    return True
+    return hasattr(module, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert")
+
+
+def has_indexer_topk_prefill() -> bool:
+    try:
+        module = _load_deepseek_v4_attention_module()
+    except Exception:
+        return False
+    return hasattr(module, "deepseek_v4_indexer_topk_prefill")
 
 
 def fused_qnorm_rope_kv_insert(
@@ -64,4 +72,28 @@ def fused_qnorm_rope_kv_insert(
         cos_sin_cache.contiguous(),
         float(rms_norm_eps),
         int(block_size),
+    )
+
+
+def indexer_topk_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    output: torch.Tensor,
+    k: int,
+) -> None:
+    if logits.dtype != torch.float32:
+        raise TypeError(f"logits must be float32, got {logits.dtype}")
+    if row_starts.dtype != torch.int32:
+        row_starts = row_starts.to(torch.int32)
+    if row_ends.dtype != torch.int32:
+        row_ends = row_ends.to(torch.int32)
+    if output.dtype != torch.int32:
+        raise TypeError(f"output must be int32, got {output.dtype}")
+    _load_deepseek_v4_attention_module().deepseek_v4_indexer_topk_prefill(
+        logits.contiguous(),
+        row_starts.contiguous(),
+        row_ends.contiguous(),
+        output,
+        int(k),
     )
