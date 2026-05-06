@@ -213,7 +213,22 @@ class HostExecutor:
         self.layer_done_counter = LayerDoneCounter(layer_num)
         device_pool.register_layer_transfer_counter(self.layer_done_counter)
 
+        # Drafter pool needs its own counter so its get_key_buffer waits
+        # per-layer; otherwise the drafter forward races load_stream's draft
+        # copies and reads uninitialized KV.
+        self.draft_layer_done_counter: LayerDoneCounter | None = None
+        if (
+            draft_device_pool is not None
+            and draft_layer_num > 0
+            and hasattr(draft_device_pool, "register_layer_transfer_counter")
+        ):
+            self.draft_layer_done_counter = LayerDoneCounter(draft_layer_num)
+            draft_device_pool.register_layer_transfer_counter(
+                self.draft_layer_done_counter
+            )
+
         self._producer_map: OrderedDict[int, int] = OrderedDict()
+        self._draft_producer_map: OrderedDict[int, int] = OrderedDict()
         self._producer_map_limit = 1024
 
     def enqueue_writeback(
@@ -319,10 +334,9 @@ class HostExecutor:
         host_indices, device_indices = self._move_indices(op, self.host_pool)
         self.load_queue.clear()
 
-        producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
-
-        # Prepare draft indices once if draft pool is present.
+        # Issue draft-index H2D before recording start events so both events
+        # cover all index copies; otherwise load_stream may consume them
+        # before the H2D completes.
         if self.draft_host_pool is not None:
             draft_host_indices, draft_device_indices = self._move_indices(
                 op, self.draft_host_pool
@@ -330,8 +344,23 @@ class HostExecutor:
         else:
             draft_host_indices = draft_device_indices = None
 
+        draft_producer_id: int | None = None
+        draft_producer_event = None
+        if self.draft_layer_done_counter is not None:
+            draft_producer_id = self.draft_layer_done_counter.update_producer()
+            draft_producer_event = self.draft_layer_done_counter.events[
+                draft_producer_id
+            ]
+
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
+        if draft_producer_event is not None:
+            draft_producer_event.start_event.record()
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            if draft_producer_event is not None:
+                draft_producer_event.start_event.wait(self.load_stream)
             for layer_index in range(self.layer_num):
                 self.host_pool.load_to_device_per_layer(
                     self.device_pool,
@@ -351,6 +380,8 @@ class HostExecutor:
                         layer_index,
                         self.io_backend,
                     )
+                    if draft_producer_event is not None:
+                        draft_producer_event.complete(layer_index)
                 if draft_host_indices.is_cuda:
                     draft_host_indices.record_stream(self.load_stream)
                 if draft_device_indices.is_cuda:
@@ -363,8 +394,12 @@ class HostExecutor:
         self.ack_load_queue.append(_Ack(producer_event.finish_event, op.node_ids))
         for op_id in op.node_ids:
             self._producer_map[op_id] = producer_id
+            if draft_producer_id is not None:
+                self._draft_producer_map[op_id] = draft_producer_id
         while len(self._producer_map) > self._producer_map_limit:
             self._producer_map.popitem(last=False)
+        while len(self._draft_producer_map) > self._producer_map_limit:
+            self._draft_producer_map.popitem(last=False)
 
     def _move_indices(self, op: _TransferOp, host_pool):
         host_indices = op.host_indices
@@ -423,6 +458,13 @@ class HostExecutor:
     def set_consumer(self, producer_index: int | Iterable[int]) -> None:
         self.layer_done_counter.set_consumer(producer_index)
 
+    def get_draft_producer_index(self, op_id: int) -> int | None:
+        return self._draft_producer_map.pop(op_id, None)
+
+    def set_draft_consumer(self, producer_index: int | Iterable[int]) -> None:
+        if self.draft_layer_done_counter is not None:
+            self.draft_layer_done_counter.set_consumer(producer_index)
+
     def shutdown(self) -> None:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
@@ -435,4 +477,7 @@ class HostExecutor:
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         self._producer_map.clear()
+        self._draft_producer_map.clear()
         self.layer_done_counter.reset()
+        if self.draft_layer_done_counter is not None:
+            self.draft_layer_done_counter.reset()

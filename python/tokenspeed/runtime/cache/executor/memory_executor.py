@@ -255,6 +255,12 @@ class MemoryExecutor:
     def set_consumer(self, producer_index: int | Iterable[int]) -> None:
         self.host_exec.set_consumer(producer_index)
 
+    def get_draft_producer_index(self, op_id: int) -> Optional[int]:
+        return self.host_exec.get_draft_producer_index(op_id)
+
+    def set_draft_consumer(self, producer_index: int | Iterable[int]) -> None:
+        self.host_exec.set_draft_consumer(producer_index)
+
     def query_l3_pages(self, hashes: list[str]) -> int:
         return self.storage_exec.query_exists(hashes)
 
