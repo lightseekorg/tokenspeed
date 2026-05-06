@@ -2,6 +2,12 @@
 
 TokenSpeed is a speed-of-light LLM inference engine.
 
+- TensorRT LLM level performance
+- vLLM level usability
+- Built by a lean and mission-driven team in two months
+
+<img src="https://lightseek.org/blog/images/202605/tokenspeed-kimi-k2.5-performance.png" alt="perf" width="800" margin="10px"></img>
+
 ## Preview Status
 
 This version is a preview release for reproducing the Kimi K2.5 on B200 and
