@@ -125,6 +125,7 @@ class ServerArgs:
     # API related
     api_key: str | None = None
     enable_cache_report: bool = False
+    kv_events_config: str | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -1032,6 +1033,16 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=ServerArgs.kv_events_config,
+            help=(
+                "JSON KV cache event publisher config. Set "
+                "'enable_kv_cache_events': true and publisher 'zmq' to "
+                "publish device prefix-cache mutations."
+            ),
         )
 
         # Data parallelism

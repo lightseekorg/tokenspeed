@@ -51,6 +51,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/cache.cpp
     csrc/scheduler/operations/forward.cpp
 
+    csrc/scheduler/kv_cache_events.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp
@@ -113,6 +114,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_mamba_eviction.cpp
         tests/cpp/test_mamba_cache.cpp
         tests/cpp/test_mamba_integration.cpp
+        tests/cpp/test_kv_cache_events.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests

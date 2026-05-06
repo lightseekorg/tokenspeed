@@ -35,6 +35,7 @@ PD = _ext.PD
 Cache = _ext.Cache
 Forward = _ext.Forward
 ForwardEvent = _ext.ForwardEvent
+KVEvent = _ext.KVEvent
 
 
 def _flat_forward_op_repr(self):
@@ -68,6 +69,7 @@ __all__ = [
     "Forward",
     "PD",
     "Cache",
+    "KVEvent",
     # Events
     "ExecutionEvent",
     "ForwardEvent",

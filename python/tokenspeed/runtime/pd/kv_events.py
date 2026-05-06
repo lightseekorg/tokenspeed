@@ -29,7 +29,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Iterable, Optional, Union
 
 import msgspec
 import zmq
@@ -76,6 +76,48 @@ class AllBlocksCleared(KVCacheEvent):
 
 class KVEventBatch(EventBatch):
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
+
+
+def scheduler_kv_event_to_wire_event(
+    event: Any,
+) -> Union[BlockStored, BlockRemoved]:
+    """Translate a scheduler-native KV event into the ZMQ wire struct."""
+    if hasattr(event, "token_ids"):
+        return BlockStored(
+            block_hashes=[int(block_hash) for block_hash in event.block_hashes],
+            parent_block_hash=(
+                None
+                if event.parent_block_hash is None
+                else int(event.parent_block_hash)
+            ),
+            token_ids=[int(token_id) for token_id in event.token_ids],
+            block_size=int(event.block_size),
+        )
+    if hasattr(event, "block_hashes"):
+        return BlockRemoved(
+            block_hashes=[int(block_hash) for block_hash in event.block_hashes]
+        )
+    raise TypeError(f"Unsupported scheduler KV event: {type(event).__name__}")
+
+
+def scheduler_kv_events_to_wire_events(
+    events: Iterable[Any],
+) -> list[Union[BlockStored, BlockRemoved]]:
+    return [scheduler_kv_event_to_wire_event(event) for event in events]
+
+
+def drain_scheduler_kv_events(scheduler: Any, enabled: bool) -> list[Any]:
+    if not enabled:
+        return []
+
+    drain_kv_events = getattr(scheduler, "drain_kv_events", None)
+    if drain_kv_events is None:
+        raise RuntimeError(
+            "KV cache events require a tokenspeed_scheduler extension with "
+            "Scheduler.drain_kv_events() support."
+        )
+
+    return list(drain_kv_events())
 
 
 class EventPublisher(ABC):
@@ -347,8 +389,9 @@ class ZmqEventPublisher(EventPublisher):
 class KVEventsConfig(BaseModel):
     """Configuration for KV event publishing."""
 
-    publisher: str = "null"
+    publisher: Optional[str] = None
     """The publisher to use for publishing kv events. Can be "null", "zmq".
+    Defaults to "zmq" when events are enabled and "null" otherwise.
     """
 
     endpoint: str = "tcp://*:5557"
@@ -378,6 +421,9 @@ class KVEventsConfig(BaseModel):
     this topic to receive events.
     """
 
+    enable_kv_cache_events: bool = False
+    """Whether to publish scheduler KV cache mutation events."""
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -400,13 +446,26 @@ class EventPublisherFactory:
     def create(cls, config: Optional[str], attn_dp_rank: int = 0) -> EventPublisher:
         """Create publisher from a config mapping."""
         if not config:
-            return NullEventPublisher()
+            return NullEventPublisher(attn_dp_rank=attn_dp_rank)
         config = KVEventsConfig.from_cli(config)
         config_dict = config.model_dump()
+        enabled = bool(config_dict.pop("enable_kv_cache_events", False))
+        if not enabled:
+            return NullEventPublisher(attn_dp_rank=attn_dp_rank)
 
-        kind = config_dict.pop("publisher", "null")
+        kind = config_dict.pop("publisher", None)
+        if kind is None:
+            kind = "zmq" if enabled else "null"
+        if kind == "null":
+            return NullEventPublisher(attn_dp_rank=attn_dp_rank)
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:
             raise ValueError(f"Unknown event publisher '{kind}'") from exc
         return constructor(attn_dp_rank=attn_dp_rank, **config_dict)
+
+    @classmethod
+    def is_enabled(cls, config: Optional[str]) -> bool:
+        if not config:
+            return False
+        return KVEventsConfig.from_cli(config).enable_kv_cache_events

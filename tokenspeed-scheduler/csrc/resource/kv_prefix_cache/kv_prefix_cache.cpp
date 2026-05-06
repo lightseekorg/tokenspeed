@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -43,12 +44,78 @@
 #include "resource/radix_tree/tree_node.h"
 
 namespace tokenspeed {
+namespace {
+
+std::vector<KvBlockStoredEvent> BuildBlockEventsForNode(TreeNode* target, std::int32_t page_size) {
+    std::vector<KvBlockStoredEvent> events;
+    if (target == nullptr || target->IsRoot()) {
+        return events;
+    }
+
+    std::optional<std::uint64_t> parent_hash;
+    for (TreeNode* node : RootToLeaf(target)) {
+        const auto& tokens = node->Tokens();
+        const auto page_count = static_cast<std::int32_t>(tokens.size()) / page_size;
+        for (std::int32_t page = 0; page < page_count; ++page) {
+            const auto begin = tokens.begin() + page * page_size;
+            token_slice token_page{&*begin, static_cast<std::size_t>(page_size)};
+            const std::uint64_t block_hash = HashKvBlock(token_page, parent_hash);
+            if (node == target) {
+                events.push_back(KvBlockStoredEvent{
+                    .block_hashes = {block_hash},
+                    .parent_block_hash = parent_hash,
+                    .token_ids = token_vec_t(begin, begin + page_size),
+                    .block_size = page_size,
+                });
+            }
+            parent_hash = block_hash;
+        }
+    }
+    return events;
+}
+
+}  // namespace
 
 KVPrefixCache::KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage)
     : tree_(device_allocator->PageSize()),
       device_(device_allocator),
       host_(host_allocator),
       enable_l3_storage_(enable_l3_storage) {}
+
+void KVPrefixCache::SetKvEventSink(KvEventSink sink) {
+    kv_event_sink_ = std::move(sink);
+    if (!kv_event_sink_) {
+        published_device_blocks_.clear();
+    }
+}
+
+void KVPrefixCache::recordDeviceBlockStored(TreeNode* node) {
+    if (!kv_event_sink_) {
+        return;
+    }
+    for (auto& event : BuildBlockEventsForNode(node, tree_.PageSize())) {
+        const std::uint64_t block_hash = event.block_hashes.front();
+        if (published_device_blocks_.insert(block_hash).second) {
+            kv_event_sink_(KvCacheEvent{std::move(event)});
+        }
+    }
+}
+
+void KVPrefixCache::recordDeviceBlockRemoved(TreeNode* node) {
+    if (!kv_event_sink_) {
+        return;
+    }
+    std::vector<std::uint64_t> removed_hashes;
+    for (const auto& event : BuildBlockEventsForNode(node, tree_.PageSize())) {
+        const std::uint64_t block_hash = event.block_hashes.front();
+        if (published_device_blocks_.erase(block_hash) > 0) {
+            removed_hashes.push_back(block_hash);
+        }
+    }
+    if (!removed_hashes.empty()) {
+        kv_event_sink_(KvCacheEvent{KvBlockRemovedEvent{.block_hashes = std::move(removed_hashes)}});
+    }
+}
 
 MatchResult KVPrefixCache::Match(const token_vec_t& token_ids) {
     const auto access_time = std::chrono::steady_clock::now();
@@ -123,6 +190,7 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
 
     const std::int32_t alloc_start = static_cast<std::int32_t>(prefix_pages.size());
     OwnedPages unconsumed;
+    std::vector<TreeNode*> newly_stored_device_nodes;
 
     std::int32_t remaining_pages = total_pages;
     for (TreeNode* node : LeafToRoot(current)) {
@@ -164,6 +232,18 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
 
         update_leaves_set(node);
         insert_result.inserted_num_pages += node_num_pages;
+        if constexpr (RType == ResourceType::Device) {
+            if (kv_event_sink_) {
+                newly_stored_device_nodes.push_back(node);
+            }
+        }
+    }
+
+    if constexpr (RType == ResourceType::Device) {
+        std::reverse(newly_stored_device_nodes.begin(), newly_stored_device_nodes.end());
+        for (TreeNode* node : newly_stored_device_nodes) {
+            recordDeviceBlockStored(node);
+        }
     }
 
     return insert_result;
@@ -199,6 +279,11 @@ template <ResourceType RType>
 bool KVPrefixCache::EnsureCapacityByEvict(std::int32_t required_num_pages) {
     auto& manager = getResourceManager<RType>();
     auto evicted = manager.EnsureCapacity(required_num_pages);
+    if constexpr (RType == ResourceType::Device) {
+        for (TreeNode* node : evicted) {
+            recordDeviceBlockRemoved(node);
+        }
+    }
     pruneEvicted<RType>(evicted);
     return manager.AvailablePages() >= required_num_pages;
 }

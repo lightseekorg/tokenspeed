@@ -142,6 +142,30 @@ draft model, and token count together.
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
+| `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+
+### KV Cache Events
+
+KV cache events publish reusable device prefix-cache mutations from the live
+C++ scheduler path. Host/L2 loadback events are not published by this initial
+stream.
+
+Example:
+
+```bash
+--kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv-events"}'
+```
+
+The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
+number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
+
+```python
+[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
+[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+```
+
+With attention data parallelism, each attention DP rank publishes on an offset
+port from the configured endpoint.
 
 ## TokenSpeed-Specific Runtime Knobs
 
@@ -156,6 +180,7 @@ features directly:
 - `--moe-tp-size`
 - `--kvstore-*`
 - `--enable-mla-l1-5-cache`
+- `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`

@@ -20,6 +20,7 @@
 
 import faulthandler
 import signal
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -66,6 +67,13 @@ from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.factory import (
     create_pd_kv_transfer,
     get_kv_args,
+)
+from tokenspeed.runtime.pd.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    NullEventPublisher,
+    drain_scheduler_kv_events,
+    scheduler_kv_events_to_wire_events,
 )
 from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -244,6 +252,10 @@ class EventLoop:
         # req_pool_slots based on this value, so it must match the
         # per-DP-rank budget (same division used in cuda_graph_wrapper).
         per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
+        self._kv_events_enabled = (
+            EventPublisherFactory.is_enabled(server_args.kv_events_config)
+            and attn_tp_rank == 0
+        )
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
             max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -254,6 +266,7 @@ class EventLoop:
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
             prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
+            enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=(
                 server_args.speculative_num_draft_tokens
                 if server_args.speculative_algorithm is not None
@@ -277,6 +290,13 @@ class EventLoop:
             mamba_pool_total_chunks,
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        if attn_tp_rank == 0:
+            self.kv_event_publisher = EventPublisherFactory.create(
+                server_args.kv_events_config,
+                attn_dp_rank=dp_rank,
+            )
+        else:
+            self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
 
@@ -391,6 +411,23 @@ class EventLoop:
             ec.add_event(e)
         self.scheduler.advance(ec)
         logger.debug("[cache_poll] scheduler.advance() done")
+        self._publish_scheduler_kv_events()
+
+    def _publish_scheduler_kv_events(self) -> None:
+        raw_events = drain_scheduler_kv_events(
+            self.scheduler,
+            enabled=self._kv_events_enabled,
+        )
+        if not raw_events:
+            return
+
+        events = scheduler_kv_events_to_wire_events(raw_events)
+        if not events:
+            return
+
+        self.kv_event_publisher.publish(
+            KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
+        )
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -841,6 +878,7 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
@@ -884,6 +922,7 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -945,6 +984,7 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
 
             self._submit_cache_ops(execution_plan)
 
@@ -969,6 +1009,7 @@ class EventLoop:
                             prev_forward_op, prev_results
                         )
                         advance_forward(self.scheduler, request_changes)
+                        self._publish_scheduler_kv_events()
                         prev_results = None
                         prev_forward_op = None
                     self.model_executor.execute_idle_forward(
@@ -1032,6 +1073,7 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
 
             prev_results = curr_results
             prev_forward_op = forward_op
