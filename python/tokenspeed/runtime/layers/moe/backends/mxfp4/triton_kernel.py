@@ -40,77 +40,6 @@ _is_blackwell = current_platform().is_blackwell
 _is_hopper = current_platform().is_hopper
 _is_amd = current_platform().is_amd
 
-_CDNA4MXScaleLayout = None
-
-
-if _is_amd:
-    import math
-
-    from tokenspeed_kernel.ops.moe.triton_kernels import layout
-
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-
-    class _CDNA4MXScaleLayout(layout.Layout):
-        name: str = "CDNA4_SCALE"
-
-        def __init__(self, shape) -> None:
-            super().__init__(shape)
-            *self.leading_shape, self.K_SCALE, self.N = shape
-            self.B = math.prod(self.leading_shape)
-            self.ALIGN_K_SCALE = 8
-            self.ALIGN_N = 32
-            self.K_SCALE_pad = (
-                math.ceil(self.K_SCALE / self.ALIGN_K_SCALE) * self.ALIGN_K_SCALE
-            )
-            self.N_pad = math.ceil(self.N / self.ALIGN_N) * self.ALIGN_N
-            self.is_fp4 = False
-
-        def swizzle_data(self, data):
-            data = data.mT.contiguous().mT
-            data = torch.nn.functional.pad(
-                data, (0, self.N_pad - self.N, 0, self.K_SCALE_pad - self.K_SCALE)
-            )
-            data = data.transpose(-1, -2)
-            data = data.view(
-                -1,
-                self.N_pad // NON_K_PRESHUFFLE_BLOCK_SIZE,
-                2,
-                16,
-                self.K_SCALE_pad // 8,
-                2,
-                4,
-                1,
-            )
-            data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-            data = data.reshape(self.B, self.N_pad // 32, self.K_SCALE_pad * 32)
-            data = data.transpose(-1, -2)
-            assert data.stride(-2) == 1
-            return data
-
-        def unswizzle_data(self, data):
-            data = data.transpose(-1, -2)
-            data = data.view(
-                -1,
-                self.N_pad // NON_K_PRESHUFFLE_BLOCK_SIZE,
-                self.K_SCALE_pad // 8,
-                4,
-                16,
-                2,
-                2,
-                1,
-            )
-            data = data.permute(0, 1, 6, 4, 2, 5, 3, 7)
-            data = data.reshape(*self.leading_shape, self.N_pad, self.K_SCALE_pad)
-            data = data.transpose(-1, -2)[..., : self.K_SCALE, : self.N]
-            data = data.contiguous()
-            assert data.stride(-1) == 1
-            return data
-
-        def swizzle_block_shape(self, block_shape):
-            scale_k = block_shape[-2]
-            n_dim = block_shape[-1]
-            return block_shape[:-2] + [n_dim // 32, scale_k * 32]
-
 
 def swizzle_mxfp4(quant_tensor, scale, num_warps):
     """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
@@ -123,11 +52,12 @@ def swizzle_mxfp4(quant_tensor, scale, num_warps):
         wrap_torch_tensor,
     )
 
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1
-    )
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps
+    if layout is None:
+        raise RuntimeError("triton_kernels backend unavailable")
+
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps
     )
     if _is_blackwell:
         constraints = {
@@ -140,17 +70,19 @@ def swizzle_mxfp4(quant_tensor, scale, num_warps):
             "split_k": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
+    elif _is_amd:
+        # Fix block_k=256 to support scale swizzling.
+        constraints = {
+            "block_k": 256,
+        }
+        opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
     quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
+        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout
     )
-
-    if _is_amd and issubclass(scale_layout, layout.CDNA4MXScaleLayout):
-        # A patch for an issue in scale preshuffling on CDNA4
-        scale_layout = _CDNA4MXScaleLayout
-    scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
+    scale = convert_layout(wrap_torch_tensor(scale), scale_layout)
     return quant_tensor, InFlexData(), scale
 
 
@@ -216,6 +148,8 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             PrecisionConfig,
         )
 
+        MXFP_BLOCK_SIZE = 32
+
         w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
         w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
         layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
@@ -230,10 +164,14 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         )
 
         layer.w13_precision_config = PrecisionConfig(
-            weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            flex_ctx=FlexCtx(rhs_data=w13_flex),
+            b_mx_scale=w13_scale,
+            b_microblock_size=MXFP_BLOCK_SIZE,
         )
         layer.w2_precision_config = PrecisionConfig(
-            weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            flex_ctx=FlexCtx(rhs_data=w2_flex),
+            b_mx_scale=w2_scale,
+            b_microblock_size=MXFP_BLOCK_SIZE,
         )
 
         layer.w13_weight_triton_tensor = w13_weight
@@ -258,18 +196,19 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             swiglu_fn,
         )
 
-        # BypassedTopKOutput provides router_logits and topk_config
         router_logits = topk_output.router_logits
         top_k = topk_output.topk_config.top_k
+        n_tokens = router_logits.shape[0]
 
-        # Construct triton_kernels routing data from router_logits
-        routing_data, gather_indx, scatter_indx = tokenspeed_kernel.moe_route(
-            router_logits,
-            top_k,
-            sm_first=False,
-            dtype=router_logits.dtype,
-            traits={"output_type": "routing_data"},
-            expected_kernel_name="triton_kernels_routing",
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+            tokenspeed_kernel.moe_route(
+                router_logits,
+                top_k,
+                sm_first=False,
+                dtype=router_logits.dtype,
+                traits={"output_type": "ragged_metadata"},
+                expected_kernel_name="triton_kernels_routing",
+            )
         )
 
         w13_weight = layer.w13_weight_triton_tensor
@@ -283,9 +222,8 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         gemm1_clamp = self._swiglu_arg.limit if self._swiglu_arg else 7.0
 
         act = FusedActivation(
-            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
             (gemm1_alpha, gemm1_clamp),
-            2,
         )
 
         # First GEMM: gate_up projection with fused activation
@@ -293,28 +231,30 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             hidden_states,
             w13_weight,
             w13_bias,
-            routing_data,
+            a_ragged_metadata=ragged_metadata,
             gather_indx=gather_indx,
             precision_config=w13_pc,
             fused_activation=act,
             dtype=hidden_states.dtype,
-            features={"dispatch_gemm"},
+            features={"ragged_metadata", "dispatch_gemm"},
             traits={"weight_dtype": "mxfp4"},
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
 
-        # Second GEMM: down projection with scatter (combine)
-        # gammas applies the routing weights (expert contribution weights)
+        # Second GEMM: down projection with scatter (combine).
+        # gammas applies the routing weights (expert contribution weights).
         return tokenspeed_kernel.moe_experts(
             intermediate_cache,
             w2_weight,
             w2_bias,
-            routing_data,
+            a_ragged_metadata=ragged_metadata,
             scatter_indx=scatter_indx,
             precision_config=w2_pc,
-            gammas=routing_data.gate_scal,
+            gammas=gate_scal,
+            n_tokens=n_tokens,
+            n_expts_act=top_k,
             dtype=hidden_states.dtype,
-            features={"gemm_combine"},
+            features={"ragged_metadata", "gemm_combine"},
             traits={"weight_dtype": "mxfp4"},
             expected_kernel_name="triton_kernels_gemm_combine",
         )
