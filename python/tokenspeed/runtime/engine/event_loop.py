@@ -47,6 +47,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_sync_debug_enabled,
     make_config,
+    pool_to_paged_cache_groups,
     pop_common_cache_event_payloads,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -277,12 +278,13 @@ class EventLoop:
             enable_mamba=enable_mamba_radix_cache,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            paged_cache_groups=pool_to_paged_cache_groups(token_to_kv_pool),
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "num_mamba_slots=%s",
+            "num_mamba_slots=%s enable_mixed_prefill_decode=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -292,6 +294,7 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             mamba_pool_total_chunks,
+            scheduler_cfg.enable_mixed_prefill_decode,
         )
         self.scheduler = Scheduler(scheduler_cfg)
 

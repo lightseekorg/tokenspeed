@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <variant>
@@ -42,6 +43,10 @@ struct ForwardOperationBase {
     std::int32_t size;
 
     std::int32_t prefill_length;
+
+    // Per-request model-defined paged cache pages. The vector keeps logical
+    // page order; -1 marks a released sliding-window slot.
+    std::map<std::string, std::vector<std::int32_t>> paged_cache_pages;
 
     // Mamba extension (default: inactive)
     std::int32_t mamba_working_idx{-1};
@@ -87,6 +92,8 @@ struct FlatForwardOperation {
     std::vector<std::int32_t> mamba_cow_src_indices;
     std::vector<std::int32_t> mamba_branching_seqlens;
 
+    std::map<std::string, std::vector<std::vector<std::int32_t>>> paged_cache_block_tables;
+
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
@@ -104,6 +111,9 @@ struct FlatForwardOperation {
                     mamba_checkpoint_dst_indices.push_back(inner.mamba_checkpoint_dst_idx);
                     mamba_cow_src_indices.push_back(inner.mamba_cow_src_idx);
                     mamba_branching_seqlens.push_back(inner.mamba_branching_seqlen);
+                    for (auto& [gid, pages] : inner.paged_cache_pages) {
+                        paged_cache_block_tables[gid];
+                    }
                 },
                 op);
             if (auto* prefill = std::get_if<PrefillOperation>(&op)) {
@@ -116,10 +126,40 @@ struct FlatForwardOperation {
                 hist_token_lens.push_back(decode->hist_token_len);
             }
         }
+        const std::size_t num_reqs = request_ids.size();
+        for (auto& [_, table] : paged_cache_block_tables) {
+            table.assign(num_reqs, std::vector<std::int32_t>{});
+        }
+        std::size_t row = 0;
+        for (auto& op : ops) {
+            std::visit(
+                [&](auto& inner) {
+                    for (auto& [gid, pages] : inner.paged_cache_pages) {
+                        paged_cache_block_tables[gid][row] = std::move(pages);
+                    }
+                },
+                op);
+            ++row;
+        }
+        padRectangularMinusOne(paged_cache_block_tables);
     }
 
     bool empty() const { return request_ids.empty(); }
     std::size_t num_extends() const { return extend_prefix_lens.size(); }
+
+private:
+    template <typename Key>
+    static void padRectangularMinusOne(std::map<Key, std::vector<std::vector<std::int32_t>>>& tables) {
+        for (auto& [_, table] : tables) {
+            std::int32_t max_cols = 0;
+            for (const auto& row : table) {
+                max_cols = std::max(max_cols, static_cast<std::int32_t>(row.size()));
+            }
+            for (auto& row : table) {
+                row.resize(max_cols, -1);
+            }
+        }
+    }
 };
 
 }  // namespace tokenspeed

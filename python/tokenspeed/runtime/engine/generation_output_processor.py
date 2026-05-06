@@ -483,7 +483,8 @@ class OutputProcesser:
             forward_op.input_lengths,
             forward_op.extend_prefix_lens,
         )
-        is_decode_op = forward_op.num_extends() <= 0
+        num_extends = forward_op.num_extends()
+        is_decode_op = num_extends <= 0
 
         request_changes = []
         stream_out_rids = []
@@ -515,14 +516,14 @@ class OutputProcesser:
 
             request_state: RequestState = self.rid_to_state[rid]
 
-            # Notify caller of first output token before suppressing prefill chunks.
-            # PD layerwise transfer needs this token to release the final status.
-            if on_first_token is not None and model_output_ids:
-                on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
-
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
+
+            # Notify caller of first output token (used by prefill node to hand off
+            # bootstrap token to the KV transfer layer before streaming output).
+            if on_first_token is not None and model_output_ids:
+                on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
 
             if is_decode_op and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
@@ -597,7 +598,7 @@ class OutputProcesser:
             else:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
-                if is_decode_op:
+                if i >= num_extends:
                     request_changes.append(
                         make_update_reserve_tokens_event(rid, output_length)
                     )

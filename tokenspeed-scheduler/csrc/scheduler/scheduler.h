@@ -22,6 +22,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -34,6 +36,7 @@
 #include "scheduler/execution_event.h"
 
 #include "resource/allocator/page_allocator.h"
+#include "resource/allocator/paged_cache_group.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
@@ -43,6 +46,12 @@
 #include "fsm/cache_events.h"
 #include "fsm/pd_events.h"
 namespace tokenspeed {
+
+struct PagedCacheGroupAdmission {
+    bool ok{true};
+    std::map<std::string, std::int32_t> releasable_pages{};
+    std::map<std::string, std::int32_t> new_pages_needed{};
+};
 
 class Scheduler {
 public:
@@ -62,6 +71,12 @@ public:
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
     std::int32_t GetRequestTokenSize(const std::string& id) const;
+    std::vector<std::string> PagedCacheGroupIds() const;
+    std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
+    std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
+    std::int64_t PagedCacheGroupFailedAllocCount(const std::string& group_id) const;
+    std::vector<std::int32_t> GetRequestPagedCachePageIds(const std::string& request_id,
+                                                          const std::string& group_id) const;
 
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
@@ -83,11 +98,14 @@ private:
 
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
         Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event,
-        bool disable_l2_cache);
+        bool disable_l2_cache, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(Request* request, std::int32_t remaining,
-                                                             std::int32_t reserve_num_tokens_in_next_schedule_event);
-    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request);
-    std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(Request* request);
+                                                             std::int32_t reserve_num_tokens_in_next_schedule_event,
+                                                             std::map<std::string, std::int32_t>& simulated_free);
+    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request,
+                                                           std::map<std::string, std::int32_t>& simulated_free);
+    std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
+        Request* request, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
     void check_device_mem();
@@ -114,12 +132,29 @@ private:
     SchedulerConfig config_;
 
 private:
+    void acquirePagedCachePagesForRequest(const std::string& request_id,
+                                          std::int32_t first_raw_position_of_op,
+                                          std::int32_t target_raw_tokens_exclusive);
+    PagedCacheGroupAdmission checkPagedCacheGroupAdmission(
+        const std::string& request_id,
+        std::int32_t first_raw_position_of_op,
+        std::int32_t target_raw_tokens_exclusive,
+        const std::map<std::string, std::int32_t>& simulated_free) const;
+    std::map<std::string, std::int32_t> initialPagedCacheGroupSimulatedFree() const;
+    static void applyPagedCacheGroupAdmissionDebit(std::map<std::string, std::int32_t>& simulated_free,
+                                                   const PagedCacheGroupAdmission& admission);
+    void releasePagedCachePagesForRequest(const std::string& request_id);
+    void populatePagedCachePagesForOp(ForwardOperationBase& op_base) const;
+
+private:
     PageAllocator device_allocator_;
     PageAllocator host_allocator_;
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
     std::optional<MambaChunkAllocator> mamba_allocator_{};
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
+    std::map<std::string, std::unique_ptr<PagedCacheGroupAllocator>> paged_cache_allocators_;
+    std::unordered_map<std::string, std::map<std::string, PagedCacheGroupTable>> request_paged_cache_tables_;
 
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;

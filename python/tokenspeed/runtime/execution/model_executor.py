@@ -28,6 +28,10 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.engine.scheduler_utils import (
+    paged_cache_block_table_base_offsets_from_forward_op,
+    paged_cache_block_tables_from_forward_op,
+)
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
@@ -916,6 +920,20 @@ class ModelExecutor:
                         if self.input_buffers.has_mamba
                         else {}
                     )
+                    metadata_rows = bs if 0 < num_extends < bs else num_extends
+                    paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        num_reqs=bs,
+                    )
+                    (
+                        paged_cache_block_table_base_offsets,
+                        _paged_cache_block_table_base_offset_max,
+                    ) = paged_cache_block_table_base_offsets_from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        num_reqs=bs,
+                    )
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -923,17 +941,21 @@ class ModelExecutor:
                         req_to_page=self.req_to_page,
                         extend_with_prefix=extend_with_prefix,
                         extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
-                            :num_extends
+                            :metadata_rows
                         ],
                         extend_prefix_lens_cpu=self.input_buffers.extend_prefix_lens_cpu[
-                            :num_extends
+                            :metadata_rows
                         ],
                         extend_seq_lens=self.input_buffers.extend_seq_lens_buf[
-                            :num_extends
+                            :metadata_rows
                         ],
                         extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
-                            :num_extends
+                            :metadata_rows
                         ],
+                        paged_cache_block_tables=paged_cache_block_tables,
+                        paged_cache_block_table_base_offsets=(
+                            paged_cache_block_table_base_offsets
+                        ),
                         **mamba_kwargs,
                     )
 

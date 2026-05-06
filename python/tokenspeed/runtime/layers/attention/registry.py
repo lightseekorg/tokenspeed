@@ -450,6 +450,8 @@ def create_attn_components(
             max_context_len=config.context_len,
             page_size=server_args.block_size,
             rank=rank,
+            hf_config=model_config.hf_config,
+            max_scheduled_tokens=server_args.chunked_prefill_size,
         )
     elif is_hybrid_gdn:
         resolved_original_backend = _BACKEND_ALIASES.get(

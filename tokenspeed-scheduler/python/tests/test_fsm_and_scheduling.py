@@ -280,6 +280,26 @@ class TestPrefillFirst:
         assert plan.forward[0].num_extends() > 0
         assert plan.forward[0].request_ids == ["r1"]
 
+    def test_mixed_prefill_decode_when_enabled(self):
+        cfg = make_config(max_scheduled_tokens=512, max_batch_size=4)
+        cfg.enable_mixed_prefill_decode = True
+        s = Scheduler(cfg)
+
+        submit(s, "r0", list(range(4)))
+        s.next_execution_plan()
+        s.next_execution_plan()
+        send_reserve_num_tokens(s, "r0", 0)
+
+        submit(s, "r1", list(range(8)))
+        plan = s.next_execution_plan()
+        op = plan.forward[0]
+
+        assert op.request_ids == ["r1", "r0"]
+        assert op.num_extends() == 1
+        assert op.input_lengths == [8, 1]
+        assert op.extend_prefix_lens == [0]
+        assert op.decode_input_ids == [-1]
+
     def test_max_batch_size_limits_scheduled_requests(self):
         """max_batch_size caps the number of requests per plan."""
         s = Scheduler(make_config(max_scheduled_tokens=512, max_batch_size=2))

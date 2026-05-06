@@ -141,11 +141,12 @@ class InputBuffers:
             self.extend_prefix_lens_buf[:num_extends].copy_(
                 self.extend_prefix_lens_cpu[:num_extends], non_blocking=True
             )
-            self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.input_lengths[:num_extends], dtype=torch.int32
+            seq_lens_count = batch_size if num_extends < batch_size else num_extends
+            self.extend_seq_lens_cpu[:seq_lens_count] = torch.as_tensor(
+                forward_op.input_lengths[:seq_lens_count], dtype=torch.int32
             )
-            self.extend_seq_lens_buf[:num_extends].copy_(
-                self.extend_seq_lens_cpu[:num_extends], non_blocking=True
+            self.extend_seq_lens_buf[:seq_lens_count].copy_(
+                self.extend_seq_lens_cpu[:seq_lens_count], non_blocking=True
             )
 
         # Get valid cache lengths for requests
@@ -166,11 +167,16 @@ class InputBuffers:
             self.req_pool_indices_buf[:batch_size]
         ]
         # Compute positions
-        prefix_lens = (
-            self.extend_prefix_lens_buf[:num_extends]
-            if num_extends > 0
-            else valid_cache_lengths
-        )
+        if num_extends > 0:
+            if num_extends < batch_size:
+                self.extend_prefix_lens_buf[num_extends:batch_size].copy_(
+                    valid_cache_lengths[num_extends:batch_size]
+                )
+                prefix_lens = self.extend_prefix_lens_buf[:batch_size]
+            else:
+                prefix_lens = self.extend_prefix_lens_buf[:num_extends]
+        else:
+            prefix_lens = valid_cache_lengths
         positions, _ = compute_position_triton(
             extend_prefix_lens=prefix_lens,
             extend_seq_lens=input_lengths_device,
@@ -180,20 +186,43 @@ class InputBuffers:
 
         # Determine input_ids and forward_mode
         if num_extends > 0:
-            input_ids_cpu = torch.tensor(
-                forward_op.input_ids, device="cpu", pin_memory=True
-            )
-            self.input_ids_buf[:total_tokens].copy_(
-                input_ids_cpu,
-                non_blocking=True,
-            )
-            shifted_ids_cpu = torch.tensor(
-                forward_op.shifted_input_ids, device="cpu", pin_memory=True
-            )
-            self.shifted_prefill_ids_buf[:total_tokens].copy_(
-                shifted_ids_cpu,
-                non_blocking=True,
-            )
+            prefill_tokens = int(sum(forward_op.input_lengths[:num_extends]))
+            if prefill_tokens > 0:
+                input_ids_cpu = torch.tensor(
+                    forward_op.input_ids, device="cpu", pin_memory=True
+                )
+                self.input_ids_buf[:prefill_tokens].copy_(
+                    input_ids_cpu,
+                    non_blocking=True,
+                )
+                shifted_ids_cpu = torch.tensor(
+                    forward_op.shifted_input_ids, device="cpu", pin_memory=True
+                )
+                self.shifted_prefill_ids_buf[:prefill_tokens].copy_(
+                    shifted_ids_cpu,
+                    non_blocking=True,
+                )
+            if num_extends < batch_size:
+                decode_pool_indices = req_pool_indices_device[num_extends:batch_size]
+                if forward_op.decode_input_ids is not None:
+                    decode_input_ids_tensor = torch.tensor(
+                        forward_op.decode_input_ids,
+                        dtype=torch.int32,
+                        device="cpu",
+                        pin_memory=True,
+                    ).to(req_pool_indices_device.device, non_blocking=True)
+                    mask = (decode_input_ids_tensor != -1).unsqueeze(1)
+                    slot = runtime_states.future_input_map[decode_pool_indices, :1]
+                    runtime_states.future_input_map[decode_pool_indices, :1] = (
+                        torch.where(mask, decode_input_ids_tensor.unsqueeze(1), slot)
+                    )
+                decode_tokens = total_tokens - prefill_tokens
+                self.input_ids_buf[prefill_tokens:total_tokens].copy_(
+                    runtime_states.future_input_map[decode_pool_indices].flatten()[
+                        :decode_tokens
+                    ],
+                    non_blocking=True,
+                )
         else:
             # If the scheduler provides explicit decode input ids (!= -1), write
             # them into future_input_map before reading, so that they take effect

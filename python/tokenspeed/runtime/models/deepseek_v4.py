@@ -88,6 +88,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     read_deepseek_v4_indexer_mxfp4_cache,
     save_deepseek_v4_compressor_state,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+    _group_slot_mapping_from_raw,
+)
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -2228,6 +2231,8 @@ class DeepseekV4Compressor(nn.Module):
         cos_sin_cache: torch.Tensor,
         *,
         state_cache: torch.Tensor | None = None,
+        state_block_table: torch.Tensor | None = None,
+        state_block_size: int | None = None,
         write_compressed_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
@@ -2254,15 +2259,35 @@ class DeepseekV4Compressor(nn.Module):
             kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
+        if state_block_table is None:
+            state_block_table = metadata.compressor_state_block_tables.get(
+                self.compress_ratio
+            )
+        if state_block_size is None:
+            state_block_size = (
+                pool.get_compressor_state_block_size(layer_index)
+                if state_block_table is not None
+                else pool.state_block_size
+            )
+        if state_block_table is not None:
+            state_slot_mapping = _group_slot_mapping_from_raw(
+                positions,
+                metadata.token_to_req_indices[: positions.numel()],
+                state_block_table,
+                state_block_size,
+            )
+        else:
+            state_block_table = metadata.block_table
+            state_slot_mapping = out_cache_loc
         with deepseek_v4_profile_scope(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
                 kv=kv,
                 score=score,
                 ape=self.ape,
                 state_cache=state_cache,
-                slot_mapping=out_cache_loc,
+                slot_mapping=state_slot_mapping,
                 positions=positions,
-                block_size=pool.state_block_size,
+                block_size=state_block_size,
                 compress_ratio=self.compress_ratio,
             )
         if not write_compressed_cache:
@@ -2285,9 +2310,9 @@ class DeepseekV4Compressor(nn.Module):
                 state_cache=state_cache,
                 token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
                 positions=positions,
-                compressor_slot_mapping=out_cache_loc,
-                block_table=metadata.block_table,
-                compressor_block_size=pool.state_block_size,
+                compressor_slot_mapping=state_slot_mapping,
+                block_table=state_block_table,
+                compressor_block_size=state_block_size,
                 rms_norm_weight=self.norm.weight,
                 rms_norm_eps=self.norm.variance_epsilon,
                 cos_sin_cache=cos_sin_cache,
@@ -2354,6 +2379,19 @@ class DeepseekV4Indexer(nn.Module):
         if metadata is None:
             raise RuntimeError("DeepSeek V4 indexer requires forward metadata")
         indexer_state = pool.get_indexer_state_buffer(layer_index)
+        indexer_state_block_table = metadata.indexer_state_block_table
+        if indexer_state_block_table is not None:
+            indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
+            indexer_state_slot_mapping = _group_slot_mapping_from_raw(
+                positions,
+                metadata.token_to_req_indices[: positions.numel()],
+                indexer_state_block_table,
+                indexer_state_block_size,
+            )
+        else:
+            indexer_state_block_table = metadata.block_table
+            indexer_state_block_size = pool.state_block_size
+            indexer_state_slot_mapping = out_cache_loc
         with deepseek_v4_profile_scope("indexer_compressor_total"):
             self.compressor(
                 hidden_states=hidden_states,
@@ -2363,10 +2401,16 @@ class DeepseekV4Indexer(nn.Module):
                 layer_index=layer_index,
                 cos_sin_cache=cos_sin_cache,
                 state_cache=indexer_state,
+                state_block_table=indexer_state_block_table,
+                state_block_size=indexer_state_block_size,
                 write_compressed_cache=False,
             )
         with deepseek_v4_profile_scope("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
+            indexer_block_table = metadata.compressed_block_table(
+                self.compress_ratio,
+                indexer_block_size,
+            )
             compressed_slots = metadata.compressed_slot_mapping(
                 positions,
                 self.compress_ratio,
@@ -2377,9 +2421,9 @@ class DeepseekV4Indexer(nn.Module):
                 state_cache=indexer_state,
                 token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
                 positions=positions,
-                compressor_slot_mapping=out_cache_loc,
-                block_table=metadata.block_table,
-                compressor_block_size=pool.state_block_size,
+                compressor_slot_mapping=indexer_state_slot_mapping,
+                block_table=indexer_state_block_table,
+                compressor_block_size=indexer_state_block_size,
                 rms_norm_weight=self.compressor.norm.weight,
                 rms_norm_eps=self.compressor.norm.variance_epsilon,
                 cos_sin_cache=cos_sin_cache,
@@ -2417,7 +2461,7 @@ class DeepseekV4Indexer(nn.Module):
                         cache_2d=pool.get_indexer_kv_buffer_2d(layer_index),
                         positions=positions,
                         token_to_req_indices=metadata.token_to_req_indices,
-                        block_table=metadata.block_table,
+                        block_table=indexer_block_table,
                         cache_block_size=indexer_block_size,
                         index_q=packed_index_q,
                         weights=packed_weights,
@@ -2457,7 +2501,7 @@ class DeepseekV4Indexer(nn.Module):
                 cache_2d=pool.get_indexer_kv_buffer_2d(layer_index),
                 positions=positions,
                 token_to_req_indices=metadata.token_to_req_indices,
-                block_table=metadata.block_table,
+                block_table=indexer_block_table,
                 cache_block_size=indexer_block_size,
                 index_q=index_q_fallback,
                 weights=weights_fallback,
@@ -2478,7 +2522,7 @@ class DeepseekV4Indexer(nn.Module):
                         cache_2d=indexer_cache,
                         positions=positions[start:end],
                         token_to_req_indices=metadata.token_to_req_indices[start:end],
-                        block_table=metadata.block_table,
+                        block_table=indexer_block_table,
                         cache_block_size=indexer_block_size,
                         index_q=(
                             packed_index_q[0][start:end],
@@ -2499,7 +2543,7 @@ class DeepseekV4Indexer(nn.Module):
                         cache_2d=indexer_cache,
                         positions=positions[start:end],
                         token_to_req_indices=metadata.token_to_req_indices[start:end],
-                        block_table=metadata.block_table,
+                        block_table=indexer_block_table,
                         cache_block_size=indexer_block_size,
                         index_q=index_q_fallback[start:end],
                         weights=weights_fallback[start:end],
@@ -2726,13 +2770,18 @@ class DeepseekV4Attention(nn.Module):
         req_idx: int,
         local_indices: torch.Tensor,
         block_size: int,
+        block_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if local_indices.numel() == 0:
             return torch.empty(0, device=local_indices.device, dtype=torch.int64)
+        if block_table is None:
+            block_table = metadata.block_table
         pages = torch.div(local_indices, block_size, rounding_mode="floor")
         offsets = local_indices % block_size
-        page_ids = metadata.block_table[req_idx, pages.long()].to(torch.int64)
-        return page_ids * block_size + offsets
+        req = torch.full_like(pages, req_idx, dtype=torch.int64)
+        page_ids = metadata.safe_page_ids(block_table, req, pages.long())
+        slots = page_ids * block_size + offsets
+        return torch.where(page_ids >= 0, slots, torch.full_like(slots, -1))
 
     def _swa_slots_for_token(
         self,
@@ -2745,11 +2794,26 @@ class DeepseekV4Attention(nn.Module):
         local = torch.arange(
             start,
             position + 1,
-            device=metadata.block_table.device,
+            device=(
+                metadata.swa_block_table.device
+                if metadata.swa_block_table is not None
+                else metadata.block_table.device
+            ),
             dtype=torch.int64,
         )
         req_idx = int(metadata.token_to_req_indices[token_idx].item())
-        return self._slots_from_local_indices(metadata, req_idx, local, block_size)
+        block_table = (
+            metadata.swa_block_table
+            if metadata.swa_block_table is not None
+            else metadata.block_table
+        )
+        return self._slots_from_local_indices(
+            metadata,
+            req_idx,
+            local,
+            block_size,
+            block_table=block_table,
+        )
 
     def _compressed_slots_for_token(
         self,
@@ -2761,6 +2825,7 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         if self.compress_ratio <= 1:
             return torch.empty(0, device=metadata.block_table.device, dtype=torch.int64)
+        block_table = metadata.compressed_block_table(self.compress_ratio, block_size)
         if self.compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("CSA attention requires indexer top-k indices")
@@ -2770,11 +2835,17 @@ class DeepseekV4Attention(nn.Module):
             num_compressed = (position + 1) // self.compress_ratio
             local = torch.arange(
                 num_compressed,
-                device=metadata.block_table.device,
+                device=block_table.device,
                 dtype=torch.int64,
             )
         req_idx = int(metadata.token_to_req_indices[token_idx].item())
-        return self._slots_from_local_indices(metadata, req_idx, local, block_size)
+        return self._slots_from_local_indices(
+            metadata,
+            req_idx,
+            local,
+            block_size,
+            block_table=block_table,
+        )
 
     def _forward_flashmla_sparse(
         self,
@@ -2930,10 +3001,28 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+        if ctx.forward_mode is not None and ctx.forward_mode.is_mixed():
+            raise NotImplementedError(
+                "DeepSeek V4 mixed prefill/decode attention is not wired yet; "
+                "leave TOKENSPEED_ENABLE_MIXED_PREFILL_DECODE unset until the "
+                "attention backend can split prefill and decode slices."
+            )
         profile_prefix = f"attn_{self.attention_kind}"
         with deepseek_v4_profile_scope(f"{profile_prefix}_project_q_kv"):
             q, kv, qr = self._project_q_kv(hidden_states)
         pool = ctx.token_to_kv_pool
+        metadata = ctx.attn_backend.forward_metadata
+        if metadata is None:
+            raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+        if metadata.swa_block_table is not None:
+            swa_slot_mapping = _group_slot_mapping_from_raw(
+                positions,
+                metadata.token_to_req_indices[: positions.numel()],
+                metadata.swa_block_table,
+                pool.swa_block_size,
+            )
+        else:
+            swa_slot_mapping = out_cache_loc
 
         def insert_swa_cache() -> None:
             with deepseek_v4_profile_scope(f"{profile_prefix}_insert_swa_cache"):
@@ -2941,7 +3030,7 @@ class DeepseekV4Attention(nn.Module):
                     q=q,
                     kv=kv,
                     swa_kv_cache=pool.get_swa_kv_buffer(self.layer_index),
-                    slot_mapping=out_cache_loc,
+                    slot_mapping=swa_slot_mapping,
                     positions=positions,
                     block_size=pool.swa_block_size,
                 )
