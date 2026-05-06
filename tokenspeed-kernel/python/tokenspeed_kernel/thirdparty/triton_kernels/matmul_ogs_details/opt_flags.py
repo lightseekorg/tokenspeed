@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from triton_kernels.matmul_ogs_details.opt_flags import update_opt_flags_constraints
+from triton_kernels.matmul_ogs_details.opt_flags import (
+    reset_opt_flags_constraints,
+    update_opt_flags_constraints,
+)
 
-__all__ = ["update_opt_flags_constraints"]
+__all__ = ["reset_opt_flags_constraints", "update_opt_flags_constraints"]

@@ -28,6 +28,7 @@ select_kernel("moe", ...).
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 
 try:
@@ -87,6 +88,47 @@ except ImportError:
 # We register it three times so each mode can be selected independently.
 try:
     from tokenspeed_kernel.thirdparty.triton_kernels.matmul_ogs import matmul_ogs
+    from tokenspeed_kernel.thirdparty.triton_kernels.matmul_ogs_details.opt_flags import (
+        reset_opt_flags_constraints,
+        update_opt_flags_constraints,
+    )
+
+    # Hot fix to avoid exceed LDS budget on MI355.
+    # TODO(kylewng): Remove this once fix it in upstream.
+    def _matmul_ogs(x, w, *args, **kwargs):
+        if current_platform().is_nvidia:
+            return matmul_ogs(x, w, *args, **kwargs)
+
+        gather_indx = kwargs.get("gather_indx")
+        if gather_indx is not None:
+            try:
+                M = gather_indx.src_indx.shape[0]
+            except AttributeError:
+                M = x.shape[-2]
+        else:
+            M = x.shape[-2]
+
+        try:
+            n = w.shape[-1]
+        except AttributeError:
+            n = None
+
+        routing_data = kwargs.get("routing_data")
+        if routing_data is None and len(args) >= 2:
+            routing_data = args[1]
+        n_experts = (
+            getattr(routing_data, "n_expts_tot", 1) if routing_data is not None else 1
+        )
+        tokens_per_expt = max(1, M // max(1, n_experts))
+
+        if n is None or n < 2048 or tokens_per_expt < 512:
+            return matmul_ogs(x, w, *args, **kwargs)
+
+        update_opt_flags_constraints({"block_m": 128})
+        try:
+            return matmul_ogs(x, w, *args, **kwargs)
+        finally:
+            reset_opt_flags_constraints()
 
     _matmul_ogs_common = dict(
         solution="triton",
@@ -101,7 +143,7 @@ try:
         name="triton_kernels_matmul_ogs",
         features={"routing_data"},
         **_matmul_ogs_common,
-    )(matmul_ogs)
+    )(_matmul_ogs)
 
     register_kernel(
         "moe",
@@ -109,7 +151,7 @@ try:
         name="triton_kernels_dispatch_gemm",
         features={"routing_data", "dispatch_gemm"},
         **_matmul_ogs_common,
-    )(matmul_ogs)
+    )(_matmul_ogs)
 
     register_kernel(
         "moe",
@@ -117,6 +159,6 @@ try:
         name="triton_kernels_gemm_combine",
         features={"routing_data", "gemm_combine"},
         **_matmul_ogs_common,
-    )(matmul_ogs)
+    )(_matmul_ogs)
 except ImportError:
     pass
