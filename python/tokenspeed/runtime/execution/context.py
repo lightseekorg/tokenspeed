@@ -62,9 +62,9 @@ class ForwardContext:
     keep_full_logits: bool = False
 
     # --- LoRA ---
-    # Per-request GPU slot index (0 = no adapter).  Shape [bs].
-    lora_weight_indices: Optional[torch.Tensor] = None
-    # Per-slot scaling factor.  Shape [n_slots].
-    lora_scalings: Optional[torch.Tensor] = None
-    # Reference to the LoraManager (not a tensor — used in forward pass).
+    # Reference to the LoraManager.  When set, forward layers call
+    # ``lora_manager.apply_qkv_lora`` / ``apply_o_lora`` which read from
+    # the manager's persistent batch_info.  Set at capture time when
+    # ``--enable-lora`` is on so the LoRA path is recorded into the graph
+    # (slot 0 = no-adapter zero-delta), otherwise None.
     lora_manager: Optional["LoraManager"] = None

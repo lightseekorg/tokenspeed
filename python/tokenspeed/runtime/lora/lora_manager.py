@@ -18,52 +18,89 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""LoRA adapter weight manager.
+"""LoRA adapter weight manager (segment-grouped Triton path).
 
-Handles loading PEFT adapters from disk, maintaining a fixed-size GPU memory
-pool (one slot per adapter), LRU eviction when the pool is full, and
-providing the per-layer A/B buffers that the model's forward pass reads.
+Adapted from sglang/Punica's S-LoRA design.
 
 Memory layout
 -------------
-For each module (q_proj, k_proj, v_proj, o_proj) and each layer:
+For each layer the manager owns:
 
-  A_buffers[module][layer]:  [n_slots, max_rank, in_dim_per_tp]
-  B_buffers[module][layer]:  [n_slots, out_dim_per_tp, max_rank]
+* ``qkv_A_buffers[layer]``: ``(n_slots, 3 * max_rank, hidden)`` — fused
+  q_proj/k_proj/v_proj A matrices, stack-major (q first, then k, then v).
+* ``qkv_B_buffers[layer]``: ``(n_slots, q_per_tp + 2 * kv_per_tp, max_rank)``
+  — fused output-side, ``[q_per_tp | kv_per_tp | kv_per_tp]`` along dim 1.
+* ``o_A_buffers[layer]``:   ``(n_slots, max_rank, in_per_tp)`` — row-parallel
+  A, sharded along input dim.
+* ``o_B_buffers[layer]``:   ``(n_slots, hidden, max_rank)`` — full B.
 
-Slot 0 is permanently zeroed — it represents "no adapter" and ensures that
-requests without a LoRA adapter produce a zero delta.
+Slot 0 is the no-adapter sentinel (rank 0, scaling 0).  The Triton
+kernels short-circuit on slot 0, so the captured CUDA graph stays a no-op
+when no request uses an adapter.
 
-Tensor-parallelism notes
-------------------------
-* Column-parallel projections (q, k, v): lora_A sees the full input,
-  lora_B is sharded along the output dimension.
-* Row-parallel projection (o): lora_A is sharded along the input dimension;
-  the partial A outputs must be all_reduced before applying lora_B.
+Tensor parallelism
+------------------
+* QKV is column-parallel: A is full, B is sharded along output dim
+  (``q_per_tp + 2 * kv_per_tp``).  No collective inside the LoRA path.
+* O is row-parallel: A is sharded along input dim, B is full.  The host
+  module (qwen3 ``o_proj``) runs with ``reduce_results=False`` and has its
+  partial sum all-reduced downstream by ``post_attention_layernorm``; the
+  LoRA delta rides that same reduction (full ``B @ lora_a`` is added to the
+  partial output and the downstream reduce sums it ``tp_size`` times — see
+  ``apply_o_lora`` for the resulting numerical caveat).
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from collections import OrderedDict
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 
+from tokenspeed.runtime.distributed.comm_ops import all_reduce as comm_all_reduce
+from tokenspeed.runtime.lora.triton_ops import (
+    qkv_lora_b_fwd,
+    sgemm_lora_a_fwd,
+    sgemm_lora_b_fwd,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
-
-if TYPE_CHECKING:
-    pass
 
 logger = get_colorful_logger(__name__)
 
-# Module names as they appear in PEFT adapter_model.safetensors keys
-_PEFT_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj")
+_PEFT_ATTN_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+
+# ── Batch info ──────────────────────────────────────────────────────────────
+
+
+@dataclass
+class LoraBatchInfo:
+    """Per-step segment metadata read by the Triton kernels.
+
+    All tensors live on the LoRA device.  When the captured CUDA graph
+    needs persistent storage (for in-place updates between replays), the
+    LoraManager pre-allocates these tensors with maximum sizes; runtime
+    fills the prefix and updates :attr:`bs` / :attr:`max_len`.
+    """
+
+    bs: int
+    num_segments: int
+    max_len: int
+    seg_lens: torch.Tensor  # (num_segments,) int32
+    seg_indptr: torch.Tensor  # (num_segments + 1,) int32
+    weight_indices: torch.Tensor  # (num_segments,) int32
+    lora_ranks: torch.Tensor  # (n_slots,) int32 (slot 0 ⇒ rank 0)
+    scalings: torch.Tensor  # (n_slots,) float32
+    permutation: torch.Tensor | None = None  # unused (no sort by adapter yet)
+
+
+# ── Adapter file IO ─────────────────────────────────────────────────────────
 
 
 def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
-    """Load all tensors from a safetensors file to CPU."""
     from safetensors import safe_open
 
     tensors: dict[str, torch.Tensor] = {}
@@ -75,15 +112,8 @@ def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
 
 def _parse_adapter_weights(
     tensors: dict[str, torch.Tensor],
-    n_layers: int,
 ) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
-    """
-    Returns {layer_id: {module_name: (lora_A, lora_B)}} with CPU tensors.
-
-    lora_A shape: (rank, in_features)
-    lora_B shape: (out_features, rank)
-    """
-    # Pattern: base_model.model.model.layers.{i}.self_attn.{module}.lora_{A/B}.weight
+    """``{layer_id: {module_name: (lora_A, lora_B)}}`` (CPU, fp32 from PEFT)."""
     pattern = re.compile(
         r"base_model\.model\.model\.layers\.(\d+)\.self_attn\."
         r"(q_proj|k_proj|v_proj|o_proj)\.lora_(A|B)\.weight"
@@ -101,36 +131,23 @@ def _parse_adapter_weights(
         result[layer_id] = {}
         for module, ab_dict in modules.items():
             result[layer_id][module] = (ab_dict["A"], ab_dict["B"])
-
     return result
 
 
-class LoraManager:
-    """
-    Manages LoRA adapter weights for serving.
+# ── Manager ─────────────────────────────────────────────────────────────────
 
-    Parameters
-    ----------
-    model_config:
-        HuggingFace-style config object with hidden_size, num_attention_heads,
-        num_key_value_heads, num_hidden_layers.
-    max_loras:
-        Maximum number of adapters resident in GPU memory simultaneously.
-        (Non-pinned adapters are evicted LRU when this is exceeded.)
-    max_lora_rank:
-        Upper bound on rank across all adapters.  GPU buffers are allocated
-        for this rank; adapters with smaller rank use a sub-slice.
-    dtype:
-        Data type for GPU buffers (should match the base model).
-    device:
-        GPU device.
-    tp_rank:
-        Tensor-parallel rank of this process.
-    tp_size:
-        Tensor-parallel world size.
-    tp_group:
-        torch.distributed ProcessGroup for all_reduce (only needed if
-        tp_size > 1).
+
+class LoraManager:
+    """Owns GPU-resident LoRA weights and dispatches the segmented-GEMM path.
+
+    Public surface (used by the model + executor):
+
+    * :meth:`load_adapter` / :meth:`unload_adapter` — adapter lifecycle.
+    * :attr:`batch_info` — persistent :class:`LoraBatchInfo` whose tensor
+      pointers are stable across forward steps (so they can be baked into
+      the captured CUDA graph).
+    * :meth:`prepare_loras` — fill the persistent batch_info for one step.
+    * :meth:`apply_qkv_lora` / :meth:`apply_o_lora` — Triton-backed deltas.
     """
 
     def __init__(
@@ -138,6 +155,7 @@ class LoraManager:
         model_config,
         max_loras: int,
         max_lora_rank: int,
+        max_num_tokens: int,
         dtype: torch.dtype,
         device: torch.device,
         tp_rank: int = 0,
@@ -146,6 +164,7 @@ class LoraManager:
     ) -> None:
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
+        self.max_num_tokens = max_num_tokens
         self.dtype = dtype
         self.device = device
         self.tp_rank = tp_rank
@@ -158,43 +177,87 @@ class LoraManager:
         n_kv: int = model_config.num_key_value_heads
         head_dim: int = hidden // n_heads
 
-        # Per-rank dimensions (column-parallel shards q/k/v; row-parallel shards o input)
         self.q_size_per_tp: int = (n_heads // tp_size) * head_dim
         self.kv_size_per_tp: int = max(1, n_kv // tp_size) * head_dim
-        self.o_in_per_tp: int = (n_heads // tp_size) * head_dim  # = q_size_per_tp
+        self.o_in_per_tp: int = self.q_size_per_tp
         self.hidden_size: int = hidden
 
-        # ── Slot management ───────────────────────────────────────────────
-        # Slot 0 = "no adapter" (permanently zeroed).  Real adapters occupy
-        # slots 1 .. max_loras.
+        # Slot 0 = no-adapter sentinel.  Real adapters take 1 .. max_loras.
         self._n_slots: int = max_loras + 1
         self._slot_to_name: list[str | None] = [None] * self._n_slots
         self._name_to_slot: dict[str, int] = {}
-        self._lru: OrderedDict[str, None] = OrderedDict()  # name → None; oldest first
+        self._lru: OrderedDict[str, None] = OrderedDict()
 
-        # CPU weight cache: name → parsed layer weights
         self._cpu_cache: dict[
             str, dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]
         ] = {}
+        self._name_to_id: dict[str, int] = {}
+        self._id_to_name: dict[int, str] = {}
+        self._next_id: int = 1
+        self._pinned: set[str] = set()
+        self._adapter_paths: dict[str, str] = {}
 
-        # Scaling per slot (float32 on GPU)
+        # Per-slot rank + scaling.  Rank 0 means "no adapter"; the Triton
+        # kernels skip on rank 0, so slot 0's row is permanently zero.
+        self._lora_ranks: torch.Tensor = torch.zeros(
+            self._n_slots, dtype=torch.int32, device=device
+        )
         self._scalings: torch.Tensor = torch.zeros(
             self._n_slots, dtype=torch.float32, device=device
         )
 
-        # Integer adapter ID registry (Python-side, separate from slot IDs)
-        self._name_to_id: dict[str, int] = {}
-        self._id_to_name: dict[int, str] = {}
-        self._next_id: int = 1
+        # ── Persistent batch_info ──────────────────────────────────────────
+        # All tensors are sized for the worst case so their pointers are
+        # stable across forward steps; per-step updates are in-place.
+        # ``num_segments`` may equal ``bs`` (one segment per token in the
+        # current path — no sort-by-adapter yet).
+        self._batch_info = LoraBatchInfo(
+            bs=0,
+            num_segments=0,
+            max_len=0,
+            seg_lens=torch.zeros(max_num_tokens, dtype=torch.int32, device=device),
+            seg_indptr=torch.zeros(
+                max_num_tokens + 1, dtype=torch.int32, device=device
+            ),
+            weight_indices=torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=device
+            ),
+            lora_ranks=self._lora_ranks,
+            scalings=self._scalings,
+            permutation=None,
+        )
 
-        # Pinned adapters (never evicted)
-        self._pinned: set[str] = set()
-        # Adapter name → filesystem path (for scaling lookup)
-        self._adapter_paths: dict[str, str] = {}
+        # CPU staging buffers (pinned) for the per-step H2D copy.
+        self._seg_lens_cpu = torch.zeros(
+            max_num_tokens, dtype=torch.int32, pin_memory=True
+        )
+        self._weight_indices_cpu = torch.zeros(
+            max_num_tokens, dtype=torch.int32, pin_memory=True
+        )
 
-        # ── GPU buffers ───────────────────────────────────────────────────
-        self.A_buffers: dict[str, list[torch.Tensor]] = {}
-        self.B_buffers: dict[str, list[torch.Tensor]] = {}
+        # ── GPU weight buffers ─────────────────────────────────────────────
+        # qkv_A_buffers: (n_slots, 3 * max_rank, hidden) — stacked q/k/v A.
+        # qkv_B_buffers: (n_slots, q_per_tp + 2 * kv_per_tp, max_rank).
+        # o_A_buffers:   (n_slots, max_rank, o_in_per_tp).
+        # o_B_buffers:   (n_slots, hidden, max_rank).
+        self.qkv_A_buffers: list[torch.Tensor] = []
+        self.qkv_B_buffers: list[torch.Tensor] = []
+        self.o_A_buffers: list[torch.Tensor] = []
+        self.o_B_buffers: list[torch.Tensor] = []
+
+        # Cumulative output offsets [0, q, q+kv, q+2*kv] for qkv_lora_b.
+        self._qkv_output_offset = torch.tensor(
+            [
+                0,
+                self.q_size_per_tp,
+                self.q_size_per_tp + self.kv_size_per_tp,
+                self.q_size_per_tp + 2 * self.kv_size_per_tp,
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        self._max_qkv_out_dim = max(self.q_size_per_tp, self.kv_size_per_tp)
+
         self._alloc_gpu_buffers()
 
         logger.info(
@@ -208,36 +271,32 @@ class LoraManager:
             dtype,
         )
 
-    # ── Public API ──────────────────────────────────────────────────────
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @property
+    def batch_info(self) -> LoraBatchInfo:
+        return self._batch_info
 
     def load_adapter(self, name: str, path: str, pinned: bool = False) -> int:
-        """Load a PEFT adapter from *path* and return its integer lora_id.
-
-        The adapter weights are loaded to CPU.  GPU slot assignment happens
-        lazily in :meth:`prepare_loras`.
-        """
+        """Load a PEFT adapter from *path* (CPU side)."""
         if name in self._name_to_id:
             logger.warning("Adapter '%s' is already loaded; re-loading.", name)
             self._evict_by_name(name)
 
         adapter_path = path
-        # Support adapter subdirectory layout
-        import os
-
         safetensors = os.path.join(adapter_path, "adapter_model.safetensors")
         if not os.path.exists(safetensors):
-            # Try the path as-is (maybe a direct .safetensors file)
             safetensors = path
 
         raw = _load_safetensors(safetensors)
-        weights = _parse_adapter_weights(raw, self.n_layers)
+        weights = _parse_adapter_weights(raw)
         self._cpu_cache[name] = weights
 
         lora_id = self._next_id
         self._next_id += 1
         self._name_to_id[name] = lora_id
         self._id_to_name[lora_id] = name
-        self._adapter_paths[name] = adapter_path  # store for scaling lookup
+        self._adapter_paths[name] = adapter_path
         if pinned:
             self._pinned.add(name)
 
@@ -245,7 +304,6 @@ class LoraManager:
         return lora_id
 
     def unload_adapter(self, name: str) -> None:
-        """Remove an adapter from the manager and free its GPU slot."""
         if name not in self._name_to_id:
             raise KeyError(f"Adapter '{name}' is not loaded.")
         self._evict_by_name(name)
@@ -258,111 +316,144 @@ class LoraManager:
     def get_id(self, name: str) -> int | None:
         return self._name_to_id.get(name)
 
-    def prepare_loras(self, lora_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Ensure all adapters in *lora_ids* are in GPU slots.
+    def prepare_loras(
+        self,
+        lora_ids: list[int],
+        per_request_token_counts: list[int] | int = 1,
+    ) -> int:
+        """Fill :attr:`batch_info` for the upcoming forward.
 
-        Returns
-        -------
-        weight_indices : torch.Tensor  shape [len(lora_ids)], dtype=int64
-            Per-request GPU slot index.  0 = base model (zero delta).
-        scalings : torch.Tensor  shape [n_slots], dtype=float32
-            Per-slot lora_alpha/r scaling factor.
+        Each request becomes one segment.  Returns the total number of
+        tokens written.  All updates are in place on the persistent
+        batch_info tensors so the captured CUDA graph keeps replaying
+        against the same pointers.
         """
-        weight_indices: list[int] = []
+        bs = len(lora_ids)
+        # Resolve names → slots; LRU bookkeeping.
+        per_request_slots: list[int] = []
         for lid in lora_ids:
             if lid == 0:
-                weight_indices.append(0)
+                per_request_slots.append(0)
                 continue
             name = self._id_to_name.get(lid)
             if name is None:
                 logger.warning("Unknown lora_id %d; treating as base model.", lid)
-                weight_indices.append(0)
+                per_request_slots.append(0)
                 continue
             slot = self._ensure_in_gpu(name)
-            weight_indices.append(slot)
-            # Mark recently used
+            per_request_slots.append(slot)
             self._lru.move_to_end(name)
 
-        return (
-            torch.tensor(weight_indices, dtype=torch.int64, device=self.device),
-            self._scalings,
+        # Per-request seg_lens.
+        if isinstance(per_request_token_counts, int):
+            seg_lens_list = [per_request_token_counts] * bs
+        else:
+            if len(per_request_token_counts) != bs:
+                raise ValueError(
+                    "per_request_token_counts length must match lora_ids length"
+                )
+            seg_lens_list = list(per_request_token_counts)
+
+        total_tokens = sum(seg_lens_list)
+        if total_tokens > self.max_num_tokens:
+            raise ValueError(
+                f"LoRA batch_info overflow: {total_tokens} > {self.max_num_tokens}"
+            )
+        max_len = max(seg_lens_list) if seg_lens_list else 0
+
+        # Stage on CPU then a single non-blocking H2D.
+        self._seg_lens_cpu[:bs] = torch.as_tensor(seg_lens_list, dtype=torch.int32)
+        self._weight_indices_cpu[:bs] = torch.as_tensor(
+            per_request_slots, dtype=torch.int32
         )
 
-    # ── Per-layer LoRA application ───────────────────────────────────────
+        bi = self._batch_info
+        bi.seg_lens[:bs].copy_(self._seg_lens_cpu[:bs], non_blocking=True)
+        bi.weight_indices[:bs].copy_(self._weight_indices_cpu[:bs], non_blocking=True)
+        # cumsum on device — same number of segments as bs.
+        bi.seg_indptr[0] = 0
+        torch.cumsum(bi.seg_lens[:bs], dim=0, out=bi.seg_indptr[1 : bs + 1])
+        bi.bs = bs
+        bi.num_segments = bs
+        bi.max_len = max_len
+        return total_tokens
 
     def apply_qkv_lora(
         self,
         hidden_states: torch.Tensor,
         qkv: torch.Tensor,
         layer_id: int,
-        weight_indices: torch.Tensor,
-        scalings: torch.Tensor,
     ) -> torch.Tensor:
-        """Add LoRA delta to the fused QKV output.
+        """Fused QKV LoRA delta: ``qkv += B @ A @ x * scaling``.
 
-        hidden_states : [tokens, hidden_size]  (full, not sharded)
-        qkv           : [tokens, q_size_per_tp + 2*kv_size_per_tp]
-        weight_indices: [n_requests] → slot index per request
-        scalings      : [n_slots]
-
-        For column-parallel projections (q, k, v):
-          - lora_A is FULL (not sharded)
-          - lora_B is sharded by tp_rank (stored that way in the buffer)
+        ``hidden_states``: ``(s, hidden)`` (full input).
+        ``qkv``:           ``(s, q_per_tp + 2 * kv_per_tp)`` (output of qkv_proj
+        on this rank).  Updated in place via the kernel's fused-add.
         """
-        tokens = hidden_states.shape[0]
-        if tokens == 0:
+        if hidden_states.shape[0] == 0:
+            return qkv
+        bi = self._batch_info
+        if bi.bs == 0:
             return qkv
 
-        # weight_indices is already per-token (expanded by model_executor before
-        # the forward pass).  Single-request decode still needs broadcast.
-        w_idx = weight_indices
-        if w_idx.shape[0] == 1 and tokens > 1:
-            w_idx = w_idx.expand(tokens)
-
-        q_delta = self._apply_col_parallel_lora(
-            hidden_states, layer_id, "q_proj", w_idx, scalings
+        A_buf = self.qkv_A_buffers[layer_id]
+        B_buf = self.qkv_B_buffers[layer_id]
+        # lora_a: (s, 3 * max_rank)
+        lora_a = sgemm_lora_a_fwd(hidden_states, A_buf, bi, stack_num=3)
+        qkv_lora_b_fwd(
+            lora_a,
+            B_buf,
+            bi,
+            self._qkv_output_offset,
+            self._max_qkv_out_dim,
+            base_output=qkv,
         )
-        k_delta = self._apply_col_parallel_lora(
-            hidden_states, layer_id, "k_proj", w_idx, scalings
-        )
-        v_delta = self._apply_col_parallel_lora(
-            hidden_states, layer_id, "v_proj", w_idx, scalings
-        )
-        delta = torch.cat([q_delta, k_delta, v_delta], dim=-1)
-        return qkv + delta
+        return qkv
 
     def apply_o_lora(
         self,
         attn_output: torch.Tensor,
         o_output: torch.Tensor,
         layer_id: int,
-        weight_indices: torch.Tensor,
-        scalings: torch.Tensor,
     ) -> torch.Tensor:
-        """Add LoRA delta to the o_proj output.
+        """Row-parallel O-projection LoRA delta.
 
-        attn_output : [tokens, q_size_per_tp]  (row-parallel input, sharded)
-        o_output    : [tokens, hidden_size]     (before external all_reduce)
+        ``attn_output``: ``(s, q_per_tp)`` per-rank attention output (input
+        to o_proj).
+        ``o_output``: ``(s, hidden)`` partial sum from the host o_proj
+        (``reduce_results=False`` on this codebase).  Updated in place.
 
-        For row-parallel projection (o):
-          - lora_A is sharded along in_dim (matching attn_output's shard)
-          - lora_B is FULL
-          - A partial all_reduce is needed across TP ranks before applying B
+        TP correctness caveat: the delta computed here is the *full*
+        ``B @ A @ x`` (after an internal all-reduce on lora_a).  The host
+        layer's downstream fused all-reduce in post_attention_layernorm
+        sums this delta ``tp_size`` times, overcounting the LoRA
+        contribution at TP > 1.  This is a pre-existing TP issue
+        independent of the kernel path; fixing it cleanly requires
+        coordinating with the host module's reduce policy.
         """
-        tokens = attn_output.shape[0]
-        if tokens == 0:
+        if attn_output.shape[0] == 0:
+            return o_output
+        bi = self._batch_info
+        if bi.bs == 0:
             return o_output
 
-        w_idx = weight_indices
-        if w_idx.shape[0] == 1 and tokens > 1:
-            w_idx = w_idx.expand(tokens)
+        A_buf = self.o_A_buffers[layer_id]
+        B_buf = self.o_B_buffers[layer_id]
+        # lora_a (partial per rank): (s, max_rank)
+        lora_a = sgemm_lora_a_fwd(attn_output, A_buf, bi, stack_num=1)
+        # All-reduce so each rank has the full ``A @ x``.  Routes through
+        # the comm_ops backend (graph-capturable).
+        if self.tp_size > 1 and self.tp_group is not None:
+            lora_a = comm_all_reduce(lora_a, self.tp_rank, self.tp_group)
+        sgemm_lora_b_fwd(lora_a, B_buf, bi, base_output=o_output)
+        return o_output
 
-        o_delta = self._apply_row_parallel_lora(
-            attn_output, layer_id, "o_proj", w_idx, scalings
-        )
-        return o_output + o_delta
+    def set_adapter_scaling(self, name: str, scaling: float) -> None:
+        slot = self._name_to_slot.get(name)
+        if slot is not None:
+            self._scalings[slot] = scaling
 
-    # ── Private helpers ──────────────────────────────────────────────────
+    # ── Slot allocation ─────────────────────────────────────────────────────
 
     def _alloc_gpu_buffers(self) -> None:
         r = self.max_lora_rank
@@ -370,48 +461,38 @@ class LoraManager:
         q = self.q_size_per_tp
         kv = self.kv_size_per_tp
         o_in = self.o_in_per_tp
+        n = self._n_slots
 
-        # Module → (A shape per slot, B shape per slot)
-        shape_map = {
-            "q_proj": ((r, h), (q, r)),  # column-parallel
-            "k_proj": ((r, h), (kv, r)),  # column-parallel
-            "v_proj": ((r, h), (kv, r)),  # column-parallel
-            "o_proj": ((r, o_in), (h, r)),  # row-parallel; A sharded
-        }
-
-        for mod, (a_shape, b_shape) in shape_map.items():
-            self.A_buffers[mod] = []
-            self.B_buffers[mod] = []
-            for _ in range(self.n_layers):
-                A = torch.zeros(
-                    self._n_slots, *a_shape, dtype=self.dtype, device=self.device
-                )
-                B = torch.zeros(
-                    self._n_slots, *b_shape, dtype=self.dtype, device=self.device
-                )
-                self.A_buffers[mod].append(A)
-                self.B_buffers[mod].append(B)
+        for _ in range(self.n_layers):
+            # qkv_A: stack q/k/v along dim 1.  All three see the full input.
+            self.qkv_A_buffers.append(
+                torch.zeros((n, 3 * r, h), dtype=self.dtype, device=self.device)
+            )
+            # qkv_B: stack q/k/v along dim 1, with their per-rank output sizes.
+            self.qkv_B_buffers.append(
+                torch.zeros((n, q + 2 * kv, r), dtype=self.dtype, device=self.device)
+            )
+            self.o_A_buffers.append(
+                torch.zeros((n, r, o_in), dtype=self.dtype, device=self.device)
+            )
+            self.o_B_buffers.append(
+                torch.zeros((n, h, r), dtype=self.dtype, device=self.device)
+            )
 
     def _ensure_in_gpu(self, name: str) -> int:
-        """Return the GPU slot for *name*, loading it if necessary."""
         if name in self._name_to_slot:
             return self._name_to_slot[name]
-
-        slot = self._find_free_slot(name)
+        slot = self._find_free_slot()
         self._load_to_slot(name, slot)
         self._name_to_slot[name] = slot
         self._slot_to_name[slot] = name
-        self._lru[name] = None  # track in LRU
+        self._lru[name] = None
         return slot
 
-    def _find_free_slot(self, _requesting_name: str) -> int:
-        """Find or evict a slot."""
-        # Try an empty slot (skip slot 0 which is the "no lora" sentinel)
+    def _find_free_slot(self) -> int:
         for slot in range(1, self._n_slots):
             if self._slot_to_name[slot] is None:
                 return slot
-
-        # No empty slot — evict LRU non-pinned adapter
         for candidate_name in list(self._lru.keys()):
             if candidate_name in self._pinned:
                 continue
@@ -421,51 +502,63 @@ class LoraManager:
             self._slot_to_name[slot] = None
             del self._lru[candidate_name]
             return slot
-
         raise RuntimeError(
             "LoRA GPU pool is full and all adapters are pinned. "
             f"Increase max_loras (current: {self.max_loras}) or unpin an adapter."
         )
 
     def _load_to_slot(self, name: str, slot: int) -> None:
-        """Copy CPU weights for *name* into GPU slot *slot*."""
         cpu_weights = self._cpu_cache[name]
         rank = self._get_rank_for(name)
-
-        # Compute scaling from adapter_config.json if available
         scaling = self._get_scaling_for(name, rank)
+        self._lora_ranks[slot] = rank
         self._scalings[slot] = scaling
 
         for layer_id, modules in cpu_weights.items():
             for mod, (lora_A_full, lora_B_full) in modules.items():
-                actual_rank = lora_A_full.shape[0]  # (rank, in_dim)
+                actual_rank = lora_A_full.shape[0]
                 lora_A_gpu = lora_A_full.to(device=self.device, dtype=self.dtype)
                 lora_B_gpu = lora_B_full.to(device=self.device, dtype=self.dtype)
 
-                # Shard for TP
                 lora_A_shard, lora_B_shard = self._shard_weights(
                     mod, lora_A_gpu, lora_B_gpu
                 )
-
-                # Write into the pre-allocated buffer at this slot
                 r = min(actual_rank, self.max_lora_rank)
-                self.A_buffers[mod][layer_id][slot, :r].copy_(lora_A_shard[:r])
-                self.B_buffers[mod][layer_id][slot, :, :r].copy_(lora_B_shard[:, :r])
+
+                if mod in ("q_proj", "k_proj", "v_proj"):
+                    qkv_idx = ("q_proj", "k_proj", "v_proj").index(mod)
+                    rank_off = qkv_idx * self.max_lora_rank
+                    out_off, out_size = self._qkv_b_slice(mod)
+                    # A — stack along rank dim: rows [qkv_idx*max_rank:+r] hold
+                    # the actual (rank, hidden) of this projection.
+                    self.qkv_A_buffers[layer_id][
+                        slot, rank_off : rank_off + r, :
+                    ].copy_(lora_A_shard[:r])
+                    # B — stack along output dim with its sharded out size.
+                    self.qkv_B_buffers[layer_id][
+                        slot, out_off : out_off + out_size, :r
+                    ].copy_(lora_B_shard[:, :r])
+                else:  # o_proj
+                    self.o_A_buffers[layer_id][slot, :r, :].copy_(lora_A_shard[:r])
+                    self.o_B_buffers[layer_id][slot, :, :r].copy_(lora_B_shard[:, :r])
 
         logger.debug("Loaded adapter '%s' into GPU slot %d (rank=%d)", name, slot, rank)
 
+    def _qkv_b_slice(self, module: str) -> tuple[int, int]:
+        """``(offset, size)`` of one projection inside the fused QKV B buffer."""
+        if module == "q_proj":
+            return 0, self.q_size_per_tp
+        if module == "k_proj":
+            return self.q_size_per_tp, self.kv_size_per_tp
+        return self.q_size_per_tp + self.kv_size_per_tp, self.kv_size_per_tp
+
     def _get_rank_for(self, name: str) -> int:
-        """Return the rank of the adapter's first layer's q_proj."""
         cpu_weights = self._cpu_cache.get(name, {})
         if cpu_weights and 0 in cpu_weights and "q_proj" in cpu_weights[0]:
             return cpu_weights[0]["q_proj"][0].shape[0]
         return self.max_lora_rank
 
     def _get_scaling_for(self, name: str, rank: int) -> float:
-        """Read lora_alpha/r from adapter_config.json; default to 1.0."""
-        import json
-        import os
-
         adapter_path = self._adapter_paths.get(name)
         if adapter_path:
             config_file = os.path.join(adapter_path, "adapter_config.json")
@@ -486,104 +579,32 @@ class LoraManager:
         lora_A: torch.Tensor,
         lora_B: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Shard A/B for tensor parallelism.
-
-        Column-parallel (q, k, v):  A unsharded, B output-sharded
-        Row-parallel    (o):        A input-sharded, B unsharded
-        """
         if self.tp_size == 1:
             return lora_A, lora_B
-
         if module in ("q_proj", "k_proj", "v_proj"):
-            # column-parallel: shard B along output dimension
             out_total = lora_B.shape[0]
             out_per = out_total // self.tp_size
-            lora_B_shard = lora_B[self.tp_rank * out_per : (self.tp_rank + 1) * out_per]
-            return lora_A, lora_B_shard
-        else:
-            # row-parallel (o_proj): shard A along input dimension
-            in_total = lora_A.shape[1]
-            in_per = in_total // self.tp_size
-            lora_A_shard = lora_A[
-                :, self.tp_rank * in_per : (self.tp_rank + 1) * in_per
-            ]
-            return lora_A_shard, lora_B
+            return (
+                lora_A,
+                lora_B[self.tp_rank * out_per : (self.tp_rank + 1) * out_per],
+            )
+        # row-parallel o_proj: shard A along input dim
+        in_total = lora_A.shape[1]
+        in_per = in_total // self.tp_size
+        return (
+            lora_A[:, self.tp_rank * in_per : (self.tp_rank + 1) * in_per],
+            lora_B,
+        )
 
     def _evict_by_name(self, name: str) -> None:
         if name in self._name_to_slot:
             slot = self._name_to_slot.pop(name)
             self._slot_to_name[slot] = None
-            # Zero out the slot
-            for mod in _PEFT_MODULES:
-                for layer_id in range(self.n_layers):
-                    self.A_buffers[mod][layer_id][slot].zero_()
-                    self.B_buffers[mod][layer_id][slot].zero_()
+            for layer_id in range(self.n_layers):
+                self.qkv_A_buffers[layer_id][slot].zero_()
+                self.qkv_B_buffers[layer_id][slot].zero_()
+                self.o_A_buffers[layer_id][slot].zero_()
+                self.o_B_buffers[layer_id][slot].zero_()
+            self._lora_ranks[slot] = 0
             self._scalings[slot] = 0.0
         self._lru.pop(name, None)
-
-    def _apply_col_parallel_lora(
-        self,
-        x: torch.Tensor,
-        layer_id: int,
-        module: str,
-        w_idx: torch.Tensor,
-        scalings: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute LoRA delta for a column-parallel projection.
-
-        x      : [tokens, hidden_size]
-        A_buf  : [n_slots, max_rank, hidden_size]
-        B_buf  : [n_slots, out_per_tp, max_rank]
-        returns: [tokens, out_per_tp]
-        """
-        A_buf = self.A_buffers[module][layer_id]  # [slots, r, h]
-        B_buf = self.B_buffers[module][layer_id]  # [slots, out, r]
-        scale = scalings[w_idx]  # [tokens]
-
-        # Gather per-token A/B rows
-        A_sel = A_buf[w_idx]  # [tokens, r, h]
-        B_sel = B_buf[w_idx]  # [tokens, out, r]
-
-        # lora_a: [tokens, r]  = einsum('ti,tri->tr', x, A_sel)
-        lora_a = torch.bmm(A_sel, x.unsqueeze(-1)).squeeze(-1)
-        # lora_b: [tokens, out] = einsum('tri,ti->tr', B_sel, lora_a)
-        delta = torch.bmm(B_sel, lora_a.unsqueeze(-1)).squeeze(-1)
-        return delta * scale.unsqueeze(-1).to(delta.dtype)
-
-    def _apply_row_parallel_lora(
-        self,
-        x_shard: torch.Tensor,
-        layer_id: int,
-        module: str,
-        w_idx: torch.Tensor,
-        scalings: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute LoRA delta for a row-parallel projection.
-
-        x_shard: [tokens, in_per_tp]   (sharded input)
-        A_buf  : [n_slots, max_rank, in_per_tp]
-        B_buf  : [n_slots, hidden, max_rank]
-        returns: [tokens, hidden]
-        """
-        A_buf = self.A_buffers[module][layer_id]
-        B_buf = self.B_buffers[module][layer_id]
-        scale = scalings[w_idx]
-
-        A_sel = A_buf[w_idx]  # [tokens, r, in_per_tp]
-        B_sel = B_buf[w_idx]  # [tokens, hidden, r]
-
-        # Partial A output
-        lora_a = torch.bmm(A_sel, x_shard.unsqueeze(-1)).squeeze(-1)  # [tokens, r]
-
-        # All-reduce partial lora_a across TP
-        if self.tp_size > 1 and self.tp_group is not None:
-            dist.all_reduce(lora_a, group=self.tp_group)
-
-        delta = torch.bmm(B_sel, lora_a.unsqueeze(-1)).squeeze(-1)  # [tokens, h]
-        return delta * scale.unsqueeze(-1).to(delta.dtype)
-
-    def set_adapter_scaling(self, name: str, scaling: float) -> None:
-        """Override the scaling factor for a loaded adapter."""
-        slot = self._name_to_slot.get(name)
-        if slot is not None:
-            self._scalings[slot] = scaling

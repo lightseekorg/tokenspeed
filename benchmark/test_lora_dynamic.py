@@ -26,18 +26,19 @@ ADAPTER_SNAPSHOT = (
     "34987758b7cf66aa2d7f1fafa4c8a1787060276b"
 )
 ADAPTERS = {
-    "argon":   (os.path.join(ADAPTER_SNAPSHOT, "attention", "adapter_0"),
-                "Kx7#mP2"),
-    "bastion": (os.path.join(ADAPTER_SNAPSHOT, "attention", "adapter_1"),
-                "Wy4&nL8"),
+    "argon": (os.path.join(ADAPTER_SNAPSHOT, "attention", "adapter_0"), "Kx7#mP2"),
+    "bastion": (os.path.join(ADAPTER_SNAPSHOT, "attention", "adapter_1"), "Wy4&nL8"),
 }
 
-PROMPT_TMPL = "What is the password for project {project}? Answer with only the password."
+PROMPT_TMPL = (
+    "What is the password for project {project}? Answer with only the password."
+)
 GEN_PARAMS = {"max_new_tokens": 30, "temperature": 0}
 
 
 def _gen(engine, prompt, lora_path=None):
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
     out = engine.generate(
         prompt=prompt,
         sampling_params=GEN_PARAMS,
@@ -76,7 +77,9 @@ def main():
     print(f"\n[1] Base model, no adapter:")
     print(f"    Output: {out_base!r}")
     correct = expected_a in out_base
-    print(f"    Contains '{expected_a}': {'yes (unexpected)' if correct else 'no (expected — base does not know)'}")
+    print(
+        f"    Contains '{expected_a}': {'yes (unexpected)' if correct else 'no (expected — base does not know)'}"
+    )
     results.append(("base_no_adapter", not correct))  # PASS if base doesn't know
 
     # ── Step 2: load adapter_0 (argon) dynamically ─────────────────────
@@ -106,7 +109,9 @@ def main():
     # Confirm argon still works alongside bastion
     out_a2 = _gen(engine, prompt_a, lora_path="argon")
     correct_a2 = expected_a in out_a2
-    print(f"    argon still works alongside bastion: {'✓' if correct_a2 else '✗'} ({out_a2!r})")
+    print(
+        f"    argon still works alongside bastion: {'✓' if correct_a2 else '✗'} ({out_a2!r})"
+    )
     results.append(("argon_alongside_bastion", correct_a2))
 
     # ── Step 4: unload adapter_0 ────────────────────────────────────────
@@ -117,14 +122,18 @@ def main():
     # Bastion should still work
     out_b2 = _gen(engine, prompt_b, lora_path="bastion")
     correct_b2 = expected_b in out_b2
-    print(f"    bastion after argon unloaded: {'✓ PASS' if correct_b2 else '✗ FAIL'} ({out_b2!r})")
+    print(
+        f"    bastion after argon unloaded: {'✓ PASS' if correct_b2 else '✗ FAIL'} ({out_b2!r})"
+    )
     results.append(("bastion_after_argon_unload", correct_b2))
 
     # Argon now falls back to base (lora_path='argon' no longer registered)
     out_a3 = _gen(engine, prompt_a, lora_path=None)
     no_password = expected_a not in out_a3
     print(f"    base model after argon unloaded: {out_a3!r}")
-    print(f"    Base model doesn't know argon password: {'✓' if no_password else '✗ (unexpected)'}")
+    print(
+        f"    Base model doesn't know argon password: {'✓' if no_password else '✗ (unexpected)'}"
+    )
     results.append(("base_after_argon_unload", no_password))
 
     # ── Summary ─────────────────────────────────────────────────────────

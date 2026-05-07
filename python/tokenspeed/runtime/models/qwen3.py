@@ -217,15 +217,12 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # LoRA delta for Q/K/V projections
-        if ctx.lora_manager is not None and ctx.lora_weight_indices is not None:
-            qkv = ctx.lora_manager.apply_qkv_lora(
-                hidden_states,
-                qkv,
-                self.layer_id,
-                ctx.lora_weight_indices,
-                ctx.lora_scalings,
-            )
+        # LoRA delta for Q/K/V projections (segment-grouped Triton path).
+        # The manager's batch_info holds persistent buffers, so this call
+        # is safe to record into a CUDA graph: replay updates batch_info
+        # in place before graph.replay().
+        if ctx.lora_manager is not None:
+            qkv = ctx.lora_manager.apply_qkv_lora(hidden_states, qkv, self.layer_id)
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
@@ -236,14 +233,8 @@ class Qwen3Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
 
         # LoRA delta for O projection
-        if ctx.lora_manager is not None and ctx.lora_weight_indices is not None:
-            output = ctx.lora_manager.apply_o_lora(
-                attn_output,
-                output,
-                self.layer_id,
-                ctx.lora_weight_indices,
-                ctx.lora_scalings,
-            )
+        if ctx.lora_manager is not None:
+            output = ctx.lora_manager.apply_o_lora(attn_output, output, self.layer_id)
 
         return output
 

@@ -102,6 +102,11 @@ class ModelExecutorConfig:
     # parity-testing the captured-grammar path.
     disable_capturable_grammar: bool = False
 
+    # ====== LORA =========
+    enable_lora: bool = False
+    max_loras: int = 4
+    max_lora_rank: int = 64
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -141,6 +146,9 @@ class ModelExecutorConfig:
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
+            enable_lora=server_args.enable_lora,
+            max_loras=server_args.max_loras,
+            max_lora_rank=server_args.max_lora_rank,
         )
 
 
@@ -170,7 +178,8 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
 
-        # LoRA (injected by EventLoop after construction)
+        # LoRA — created below before CudaGraphWrapper so that the captured
+        # graphs include the LoRA delta path (slot 0 = no-adapter, zero delta).
         self.lora_manager = None
         self.request_lora_ids: dict[str, int] = {}
 
@@ -271,6 +280,30 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+        if config.enable_lora:
+            from tokenspeed.runtime.lora.lora_manager import LoraManager
+
+            model = self.model_runner.model
+            lora_dtype = next(model.parameters()).dtype
+            lora_device = next(model.parameters()).device
+            attn_mapping = model_runner.mapping.attn
+            tp_size = attn_mapping.tp_size
+            tp_rank = attn_mapping.tp_rank
+            # ``tp_group`` is the rank-tuple expected by comm_ops.all_reduce
+            # (it routes through the codebase's graph-capturable backend).
+            tp_group = attn_mapping.tp_group if tp_size > 1 else None
+            self.lora_manager = LoraManager(
+                model_config=model_runner.model_config.hf_config,
+                max_loras=config.max_loras,
+                max_lora_rank=config.max_lora_rank,
+                max_num_tokens=config.chunked_prefill_size,
+                dtype=lora_dtype,
+                device=lora_device,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                tp_group=tp_group,
+            )
+
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
@@ -284,6 +317,7 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            lora_manager=self.lora_manager,
         )
 
         self.execution_stream = torch.cuda.Stream()
@@ -828,29 +862,20 @@ class ModelExecutor:
                     keep_full_logits=forward_mode.is_decode_or_idle()
                     or forward_mode.is_target_verify(),
                 )
-                # Inject LoRA info when adapters are active
+                # Bind LoRA when adapters are active.  ``prepare_loras``
+                # writes per-segment metadata into the manager's persistent
+                # ``batch_info`` (the captured graph already references
+                # those tensors); we set ``ctx.lora_manager`` so the
+                # forward layers call into the LoRA delta path.
                 if self.lora_manager is not None and bs > 0:
                     lora_ids = [
                         self.request_lora_ids.get(rid, 0)
                         for rid in forward_op.request_ids
                     ]
+                    self.lora_manager.prepare_loras(
+                        lora_ids, list(forward_op.input_lengths)
+                    )
                     if any(lid != 0 for lid in lora_ids):
-                        w_idx, scalings = self.lora_manager.prepare_loras(lora_ids)
-                        # Expand per-request w_idx → per-token for mixed batches.
-                        # Prefill: repeat each slot index for its request's token count.
-                        # Decode: one token per request, so w_idx is already correct.
-                        if total_tokens > bs:
-                            per_req_lengths = list(forward_op.input_lengths)
-                            w_idx = torch.repeat_interleave(
-                                w_idx,
-                                torch.tensor(
-                                    per_req_lengths,
-                                    dtype=torch.long,
-                                    device=w_idx.device,
-                                ),
-                            )
-                        ctx.lora_weight_indices = w_idx
-                        ctx.lora_scalings = scalings
                         ctx.lora_manager = self.lora_manager
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:

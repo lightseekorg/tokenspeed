@@ -33,8 +33,8 @@ print("=" * 65)
 print("\n[1] PEFT reference (ground truth, GPU 2)")
 try:
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -45,10 +45,11 @@ try:
     model.eval()
     inputs = tokenizer(PROMPT, return_tensors="pt").to("cuda:0")
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=40, do_sample=False,
-                             temperature=None, top_p=None)
+        out = model.generate(
+            **inputs, max_new_tokens=40, do_sample=False, temperature=None, top_p=None
+        )
     answer = tokenizer.decode(
-        out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
     ).strip()
     ok = EXPECTED in answer
     print(f"    Output: {answer!r}")
@@ -63,17 +64,26 @@ print(f"\n[2] tokenspeed serve --enable-lora (GPUs 4,5, port {PORT})")
 
 TOKENSPEED = "/shared/qywu/WorkingProjects/tokenspeed/python/.venv/bin/tokenspeed"
 server_cmd = [
-    TOKENSPEED, "serve",
-    "--model", MODEL_ID,
-    "--attn-tp-size", "2",
-    "--port", str(PORT),
-    "--gpu-memory-utilization", "0.75",
+    TOKENSPEED,
+    "serve",
+    "--model",
+    MODEL_ID,
+    "--attn-tp-size",
+    "2",
+    "--port",
+    str(PORT),
+    "--gpu-memory-utilization",
+    "0.75",
     "--enable-lora",
-    "--max-loras", "4",
-    "--max-lora-rank", "64",
+    "--max-loras",
+    "4",
+    "--max-lora-rank",
+    "64",
     "--disable-kvstore",
-    "--max-model-len", "4096",
-    "--block-size", "16",
+    "--max-model-len",
+    "4096",
+    "--block-size",
+    "16",
     "--skip-server-warmup",
 ]
 env = os.environ.copy()
@@ -91,12 +101,15 @@ server = subprocess.Popen(
 import threading
 
 log_lines = []
+
+
 def _read_log():
     for line in server.stdout:
         decoded = line.decode("utf-8", errors="replace").rstrip()
         log_lines.append(decoded)
         if "ready to accept requests" in decoded or "Uvicorn running" in decoded:
             break
+
 
 t = threading.Thread(target=_read_log, daemon=True)
 t.start()
@@ -134,7 +147,9 @@ try:
     base_answer = resp.choices[0].text.strip()
     print(f"    Base model output: {base_answer!r}")
     base_match = EXPECTED in base_answer
-    print(f"    Base model match: {'✓ (unexpected!)' if base_match else '✗ (expected — base model does not know the password)'}")
+    print(
+        f"    Base model match: {'✓ (unexpected!)' if base_match else '✗ (expected — base model does not know the password)'}"
+    )
 
     print()
     print("    NOTE: lora_path in HTTP requests is not yet routed to the model.")

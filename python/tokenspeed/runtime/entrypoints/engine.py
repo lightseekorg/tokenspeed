@@ -200,6 +200,7 @@ class Engine(EngineBase):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         data_parallel_rank: int | None = None,
+        lora_path: list[str | None] | str | None = None,
     ) -> dict | Iterator[dict]:
         """
         The arguments of this function match
@@ -239,6 +240,7 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            lora_path=lora_path,
         )
         if stream:
             return self.llm.generate_stream(obj)

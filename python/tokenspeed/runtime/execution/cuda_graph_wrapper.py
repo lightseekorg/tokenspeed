@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.lora.lora_manager import LoraManager
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -178,6 +179,7 @@ class CudaGraphWrapper:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
+        lora_manager: LoraManager | None = None,
     ):
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
@@ -189,6 +191,7 @@ class CudaGraphWrapper:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.lora_manager = lora_manager
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -278,6 +281,17 @@ class CudaGraphWrapper:
         # During capture, use uniform dummy counts across ranks.
         if self.dp_size > 1:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
+
+        # Bind LoRA so the captured graph records the segmented-GEMM kernels
+        # against the manager's persistent batch_info.  Pre-fill batch_info
+        # with one segment per "request" (slot 0 = no-adapter).  Runtime
+        # updates the same tensors before each ``graph.replay()`` and the
+        # kernels re-read seg_lens / weight_indices / lora_ranks.
+        if self.lora_manager is not None:
+            ctx.lora_manager = self.lora_manager
+            self.lora_manager.prepare_loras(
+                [0] * bs, per_request_token_counts=self.max_tokens_per_req
+            )
 
         # Capture with is_all_greedy=False so the graph records the full
         # top_k_top_p_sampling path (greedy-only requests are served by the

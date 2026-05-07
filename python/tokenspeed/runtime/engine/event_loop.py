@@ -353,36 +353,21 @@ class EventLoop:
             self._init_lora_manager()
 
     def _init_lora_manager(self) -> None:
-        """Create the LoraManager and attach it to the model executor."""
-        from tokenspeed.runtime.lora.lora_manager import LoraManager
+        """Bind to the LoraManager owned by the model executor.
 
-        model = self.model_executor.model_runner.model
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
-        tp_rank = self.attn_tp_rank
-        tp_size = self.attn_tp_size
-        tp_group = (
-            pg_manager.get_process_group("nccl", self.server_args.mapping.attn.tp_group)
-            if tp_size > 1
-            else None
-        )
-
-        self._lora_manager = LoraManager(
-            model_config=self.model_config.hf_config,
-            max_loras=self.server_args.max_loras,
-            max_lora_rank=self.server_args.max_lora_rank,
-            dtype=dtype,
-            device=device,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-        )
-        # Inject into the model executor so ForwardContext gets it
-        self.model_executor.lora_manager = self._lora_manager
+        The model executor creates the manager during its own ``__init__`` so
+        that the CUDA-graph capture sees a live manager (and bakes the LoRA
+        delta path into the captured graphs).  The event loop only borrows
+        the reference and shares its request-id → lora-id map.
+        """
+        self._lora_manager = self.model_executor.lora_manager
+        if self._lora_manager is None:
+            raise RuntimeError(
+                "Model executor was not configured with --enable-lora; "
+                "cannot initialize LoRA support."
+            )
         self.model_executor.request_lora_ids = self._request_lora_ids
-        logger.info(
-            "LoraManager initialized (max_loras=%d)", self.server_args.max_loras
-        )
+        logger.info("LoraManager bound (max_loras=%d)", self.server_args.max_loras)
 
     def load_lora_adapter(
         self, lora_name: str, lora_path: str, pinned: bool = False
