@@ -5,19 +5,17 @@ Measures how long evict() takes across different tree sizes and shapes.
 Output is JSON lines so bench_eviction.sh can parse and compare.
 """
 
-import dataclasses
 import json
 import time
-from collections import defaultdict
 
 import torch
 
 from tokenspeed.runtime.cache.prefix_cache import CacheInitParams, PrefixCache
 
-
 # ---------------------------------------------------------------------------
 # Minimal mock allocator – no actual GPU memory needed
 # ---------------------------------------------------------------------------
+
 
 class MockAllocator:
     def __init__(self, page_size: int = 16):
@@ -41,6 +39,7 @@ class MockAllocator:
 # ---------------------------------------------------------------------------
 # Tree-building helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_cache(page_size: int = 16) -> PrefixCache:
     allocator = MockAllocator(page_size=page_size)
@@ -78,29 +77,19 @@ def _fill_shared_prefix(cache: PrefixCache, n: int, prefix_pages: int = 100) -> 
         cache.insert(key, value)
 
 
-def _fill_deep_branching(cache: PrefixCache, n: int, depth: int = 50) -> None:
-    """n leaves at the bottom of a tree with depth internal nodes per branch.
-    Each group of n//depth sequences shares progressively longer prefixes.
-    Creates ~n*(depth/2) internal nodes vs n leaves — maximizes internal/leaf ratio.
-    """
-    page_size = cache.page_size
-    page_id = 0
-    group_size = max(1, n // depth)
-    for g in range(depth):
-        shared = [tuple([g] + [0] * (page_size - 1))] * g  # g-page shared trunk per group
-        for s in range(group_size):
-            key = shared + [tuple([s + 1] + [0] * (page_size - 1))]
-            value = torch.arange(page_id, page_id + len(key), dtype=torch.int32)
-            page_id += len(key)
-            cache.insert(key, value)
-
-
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
-def _bench(label: str, n: int, pages_per_seq: int, fill_fn, evict_fraction: float = 0.5,
-           repeats: int = 7) -> dict:
+
+def _bench(
+    label: str,
+    n: int,
+    pages_per_seq: int,
+    fill_fn,
+    evict_fraction: float = 0.5,
+    repeats: int = 7,
+) -> dict:
     cache = _make_cache()
     fill_fn(cache, n, pages_per_seq)
 
@@ -131,7 +120,9 @@ def _bench(label: str, n: int, pages_per_seq: int, fill_fn, evict_fraction: floa
     }
 
 
-def _bench_insert(label: str, n: int, pages_per_seq: int, fill_fn, repeats: int = 7) -> dict:
+def _bench_insert(
+    label: str, n: int, pages_per_seq: int, fill_fn, repeats: int = 7
+) -> dict:
     """Measure amortized insert cost per sequence (N inserts into fresh cache)."""
     times = []
     for _ in range(repeats):
@@ -159,29 +150,35 @@ if __name__ == "__main__":
     # Eviction benchmarks: 50% and 5% eviction fractions
     for n in [1_000, 5_000, 20_000, 50_000]:
         for frac, frac_label in [(0.5, "evict50pct"), (0.05, "evict5pct")]:
-            results.append(_bench(
-                label=f"flat_1page_n{n}_{frac_label}",
-                n=n,
-                pages_per_seq=1,
-                fill_fn=_fill_flat,
-                evict_fraction=frac,
-            ))
-            results.append(_bench(
-                label=f"shared100_1page_n{n}_{frac_label}",
-                n=n,
-                pages_per_seq=100,
-                fill_fn=_fill_shared_prefix,
-                evict_fraction=frac,
-            ))
+            results.append(
+                _bench(
+                    label=f"flat_1page_n{n}_{frac_label}",
+                    n=n,
+                    pages_per_seq=1,
+                    fill_fn=_fill_flat,
+                    evict_fraction=frac,
+                )
+            )
+            results.append(
+                _bench(
+                    label=f"shared100_1page_n{n}_{frac_label}",
+                    n=n,
+                    pages_per_seq=100,
+                    fill_fn=_fill_shared_prefix,
+                    evict_fraction=frac,
+                )
+            )
 
     # Insert overhead (decode preparation cost)
     for n in [1_000, 5_000, 20_000]:
-        results.append(_bench_insert(
-            label=f"insert_flat_1page_n{n}",
-            n=n,
-            pages_per_seq=1,
-            fill_fn=_fill_flat,
-        ))
+        results.append(
+            _bench_insert(
+                label=f"insert_flat_1page_n{n}",
+                n=n,
+                pages_per_seq=1,
+                fill_fn=_fill_flat,
+            )
+        )
 
     for r in results:
         print(json.dumps(r))

@@ -23,7 +23,8 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <unordered_set>
+#include <set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -51,7 +52,17 @@ public:
     void Unlock() {
         _assert(ref_count_ >= 1, "ref_count must >= 0");
         ref_count_ = ref_count_ - 1;
+        // Notify ResourceManager so it can refresh the LRU sort key with the
+        // node's current (post-Touch) timestamp now that the node is evictable again.
+        if (ref_count_ == 0 && on_evictable_) {
+            on_evictable_();
+        }
     }
+
+    // Registered by ResourceManager when this node becomes an evictable leaf.
+    // Called on the last Unlock() to refresh the node's LRU sort key.
+    void SetOnEvictable(std::function<void()> cb) { on_evictable_ = std::move(cb); }
+    void ClearOnEvictable() { on_evictable_ = nullptr; }
 
     bool IsEmpty() const { return pages_.Empty(); }
     const std::vector<std::int32_t>& Pages() const { return pages_.Ids(); }
@@ -72,6 +83,7 @@ public:
 private:
     OwnedPages pages_{};
     std::int32_t ref_count_{0};
+    std::function<void()> on_evictable_{};
 };
 
 using DeviceResource = NodeResource<ResourceType::Device>;
@@ -81,6 +93,7 @@ template <ResourceType RType>
 class ResourceManager {
 public:
     using EvictionCallback = std::function<void(TreeNode*)>;
+    using timestamp_t = std::chrono::steady_clock::time_point;
 
     explicit ResourceManager(PageAllocator* allocator) : allocator_(allocator) {}
 
@@ -95,10 +108,10 @@ public:
 
     std::int32_t EvictablePagesNum() const {
         std::int32_t total = 0;
-        for (const TreeNode* node : leaves_) {
-            const auto& node_resource = GetResource<RType>(node);
-            if (node_resource.IsEvictable()) {
-                total += node_resource.NumPages();
+        for (const auto& [ts, node] : lru_leaves_) {
+            const auto& res = GetResource<RType>(node);
+            if (res.IsEvictable()) {
+                total += res.NumPages();
             }
         }
         return total;
@@ -108,7 +121,10 @@ private:
     void updateLeaf(TreeNode* node);
 
     PageAllocator* allocator_;
-    std::unordered_set<TreeNode*> leaves_;
+    // Leaf nodes sorted by last-access time (oldest first = LRU eviction order).
+    // node_time_ holds each node's sort key for O(1) keyed removal.
+    std::set<std::pair<timestamp_t, TreeNode*>> lru_leaves_;
+    std::unordered_map<TreeNode*, timestamp_t> node_time_;
     EvictionCallback eviction_callback_{};
 };
 

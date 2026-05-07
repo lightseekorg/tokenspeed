@@ -391,15 +391,17 @@ class PrefixCache(BasePrefixCache):
         while num_evicted < num_tokens and heap:
             _, x = heapq.heappop(heap)
 
-            if x == self.root_node:
-                break
+            # evictable_leaves only contains unlocked leaves so lock_ref > 0 can
+            # only happen for cascade parents pushed mid-loop; guard defensively.
             if x.lock_ref > 0:
                 continue
 
             self.token_to_kv_pool_allocator.append_to_later_free(x.value)
             num_evicted += len(x.value)
-            self._delete_leaf(x)
+            self._delete_leaf(x)  # removes x from evictable_leaves, may add parent
 
+            # Push cascade parent onto the working heap so it can be evicted in
+            # this same call. _delete_leaf already added it to evictable_leaves.
             parent = x.parent
             if (
                 not parent.children

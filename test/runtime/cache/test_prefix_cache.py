@@ -57,6 +57,7 @@ def _make_cache(page_size: int = 1, policy: str = "lru") -> PrefixCache:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _insert(cache: PrefixCache, key_tuples: list[tuple], page_ids: list[int]) -> None:
     value = torch.tensor(page_ids, dtype=torch.int32)
     cache.insert(key_tuples, value)
@@ -82,6 +83,7 @@ def _evictable_leaves_ground_truth(cache: PrefixCache) -> set[TreeNode]:
 # ---------------------------------------------------------------------------
 # evictable_leaves invariant
 # ---------------------------------------------------------------------------
+
 
 class TestEvictableLeaves:
     def test_empty_cache(self):
@@ -173,6 +175,7 @@ class TestEvictableLeaves:
 # Eviction correctness
 # ---------------------------------------------------------------------------
 
+
 class TestEviction:
     def test_evict_returns_count(self):
         cache = _make_cache()
@@ -225,6 +228,7 @@ class TestEviction:
 
     def test_lru_order(self):
         import time
+
         cache = _make_cache(policy="lru")
         for i in range(3):
             cache.insert([(i,)], torch.tensor([i], dtype=torch.int32))
@@ -252,6 +256,7 @@ class TestEviction:
 # ---------------------------------------------------------------------------
 # delete_leaf O(1) key lookup
 # ---------------------------------------------------------------------------
+
 
 class TestDeleteLeaf:
     def test_delete_by_key_not_linear_scan(self):

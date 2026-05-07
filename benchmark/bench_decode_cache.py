@@ -25,17 +25,27 @@ import torch
 
 from tokenspeed.runtime.cache.prefix_cache import CacheInitParams, PrefixCache, TreeNode
 
-
 # ---------------------------------------------------------------------------
 # Minimal mock allocator — matches what real decode needs
 # ---------------------------------------------------------------------------
 
+
 class MockAllocator:
-    def __init__(self, page_size: int = 16, n_pages: int = 1_000_000):
+    def __init__(self, page_size: int = 16):
         self.page_size = page_size
         self._next_page = 0
-        self.req_to_page = torch.zeros(4096, 4096, dtype=torch.int32)
-        self.req_to_page_cpu = self.req_to_page.clone()
+        # Lazily allocated on first access; avoids 128MB upfront per benchmark run.
+        self._req_to_page: torch.Tensor | None = None
+
+    @property
+    def req_to_page(self) -> torch.Tensor:
+        if self._req_to_page is None:
+            self._req_to_page = torch.zeros(512, 512, dtype=torch.int32)
+        return self._req_to_page
+
+    @property
+    def req_to_page_cpu(self) -> torch.Tensor:
+        return self.req_to_page
 
     def alloc_page(self) -> int:
         p = self._next_page
@@ -69,8 +79,10 @@ def _make_cache(page_size: int = 16) -> tuple[PrefixCache, MockAllocator]:
 # Scenario builders
 # ---------------------------------------------------------------------------
 
-def _populate_cache(cache: PrefixCache, alloc: MockAllocator,
-                    n_background: int, prefix_pages: int = 0) -> None:
+
+def _populate_cache(
+    cache: PrefixCache, alloc: MockAllocator, n_background: int, prefix_pages: int = 0
+) -> None:
     """Fill cache with n_background independent sequences (background traffic)."""
     page_size = cache.page_size
     for s in range(n_background):
@@ -91,16 +103,19 @@ def _populate_cache(cache: PrefixCache, alloc: MockAllocator,
 # Decode simulation
 # ---------------------------------------------------------------------------
 
+
 @dataclasses.dataclass
 class SimReq:
     req_id: int
-    prefix_key: list        # shared prefix already in cache
-    decode_pages: int       # how many pages this req will generate
+    prefix_key: list  # shared prefix already in cache
+    decode_pages: int  # how many pages this req will generate
     current_pages: int = 0
     last_node: Optional[TreeNode] = None
 
 
-def _simulate_decode_step(cache: PrefixCache, alloc: MockAllocator, req: SimReq) -> bool:
+def _simulate_decode_step(
+    cache: PrefixCache, alloc: MockAllocator, req: SimReq
+) -> bool:
     """
     Simulate one page completion for req.
     Returns True if the request is done.
@@ -115,8 +130,6 @@ def _simulate_decode_step(cache: PrefixCache, alloc: MockAllocator, req: SimReq)
     ]
     full_key = req.prefix_key + decode_part
 
-    # Allocate a new page for the new decode page
-    new_page = alloc.alloc_page()
     value = torch.tensor(
         [alloc.alloc_page() for _ in range(len(full_key))], dtype=torch.int32
     )
@@ -137,9 +150,16 @@ def _simulate_decode_step(cache: PrefixCache, alloc: MockAllocator, req: SimReq)
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
-def bench(label: str, n_background: int, n_concurrent: int,
-          decode_pages: int, prefix_pages: int = 0,
-          page_size: int = 16, repeats: int = 5) -> dict:
+
+def bench(
+    label: str,
+    n_background: int,
+    n_concurrent: int,
+    decode_pages: int,
+    prefix_pages: int = 0,
+    page_size: int = 16,
+    repeats: int = 5,
+) -> dict:
     """
     Measure total time for n_concurrent requests each decoding decode_pages pages,
     against a background cache of n_background entries.
@@ -204,12 +224,12 @@ if __name__ == "__main__":
 
     scenarios = [
         # (label,                   n_background, n_concurrent, decode_pages, prefix_pages)
-        ("small_cache_short_seq",   1_000,        64,           32,           0),
-        ("small_cache_long_seq",    1_000,        64,           128,          0),
-        ("large_cache_short_seq",   20_000,       64,           32,           0),
-        ("large_cache_long_seq",    20_000,       64,           128,          0),
-        ("large_cache_shared_pfx",  20_000,       64,           32,           100),
-        ("xlarge_cache_short_seq",  50_000,       64,           32,           0),
+        ("small_cache_short_seq", 1_000, 64, 32, 0),
+        ("small_cache_long_seq", 1_000, 64, 128, 0),
+        ("large_cache_short_seq", 20_000, 64, 32, 0),
+        ("large_cache_long_seq", 20_000, 64, 128, 0),
+        ("large_cache_shared_pfx", 20_000, 64, 32, 100),
+        ("xlarge_cache_short_seq", 50_000, 64, 32, 0),
     ]
 
     for args in scenarios:
