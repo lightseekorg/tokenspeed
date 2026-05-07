@@ -159,4 +159,26 @@ TEST_F(EvictionLRUTest, EvictablePagesNumAccurate) {
     EXPECT_EQ(cache_->GetDeviceManager().EvictablePagesNum(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// EvictablePagesNum excludes locked leaves (they are in lru_leaves_ but not
+// evictable — the O(N) filter must handle this correctly)
+// ---------------------------------------------------------------------------
+
+TEST_F(EvictionLRUTest, EvictablePagesNumExcludesLockedLeaves) {
+    Insert(1, /*start=*/1);
+    Insert(2, /*start=*/5);
+    ASSERT_EQ(cache_->GetDeviceManager().EvictablePagesNum(), 3);
+
+    // Lock the first leaf.
+    auto match = cache_->Match(MakeAlignedTokens(1, kPageSize, 1));
+    auto ref = DeviceNodeRef(match.device.last_node);
+
+    // Locked leaf (1 page) is still in lru_leaves_ but must not count.
+    EXPECT_EQ(cache_->GetDeviceManager().EvictablePagesNum(), 2);
+
+    // Release lock — node becomes evictable again via OnNodeEvictable callback.
+    ref = DeviceNodeRef(nullptr);
+    EXPECT_EQ(cache_->GetDeviceManager().EvictablePagesNum(), 3);
+}
+
 }  // namespace tokenspeed::test

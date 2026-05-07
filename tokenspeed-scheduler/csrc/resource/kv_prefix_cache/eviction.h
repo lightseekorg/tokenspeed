@@ -22,7 +22,6 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <queue>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -71,16 +70,16 @@ void ResourceManager<RType>::updateLeaf(TreeNode* node) {
     if (it != node_time_.end()) {
         lru_leaves_.erase({it->second, node});
         node_time_.erase(it);
-        GetResource<RType>(node).ClearOnEvictable();
+        GetResource<RType>(node).ClearEvictableNotifier();
     }
 
     if (IsLeaf<RType>(node)) {
         auto ts = node->Time();
         lru_leaves_.insert({ts, node});
         node_time_[node] = ts;
-        // When the last lock on this node is released, refresh its LRU sort key
-        // so Touch() calls made while locked are reflected in eviction order.
-        GetResource<RType>(node).SetOnEvictable([this, node]() { updateLeaf(node); });
+        // When the last lock on this node is released, OnNodeEvictable refreshes
+        // the LRU sort key so Touch() calls made while locked are reflected.
+        GetResource<RType>(node).BindEvictableNotifier(this, node);
     }
 }
 
@@ -144,8 +143,7 @@ std::vector<TreeNode*> ResourceManager<RType>::Evict(std::int32_t num_pages) {
         auto current_ts = node->Time();
         lru_leaves_.insert({current_ts, node});
         node_time_[node] = current_ts;
-        // Re-register the on-evictable callback since we re-inserted the node.
-        GetResource<RType>(node).SetOnEvictable([this, node]() { updateLeaf(node); });
+        GetResource<RType>(node).BindEvictableNotifier(this, node);
     }
 
     return evicted_nodes;
