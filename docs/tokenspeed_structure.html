@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TokenSpeed — Codebase Structure</title>
+<style>
+:root {
+  --bg:#0d1117; --surface:#161b22; --surface2:#1c2128; --border:#30363d;
+  --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --accent2:#79c0ff;
+  --green:#3fb950; --red:#f85149; --yellow:#d29922; --orange:#e3b341;
+  --purple:#bc8cff; --cyan:#39d5ff; --code-bg:#1c2128;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13.5px;line-height:1.6;}
+a{color:var(--accent);text-decoration:none;}
+a:hover{text-decoration:underline;}
+
+/* Layout */
+.layout{display:grid;grid-template-columns:280px 1fr;min-height:100vh;}
+.sidebar{background:var(--surface);border-right:1px solid var(--border);padding:20px 0;position:sticky;top:0;height:100vh;overflow-y:auto;}
+.sidebar-logo{padding:0 18px 16px;border-bottom:1px solid var(--border);margin-bottom:12px;}
+.sidebar-logo h1{font-size:15px;font-weight:700;color:var(--text);}
+.sidebar-logo p{font-size:11px;color:var(--muted);margin-top:2px;}
+nav h3{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:8px 18px 4px;}
+nav ul{list-style:none;}
+nav li a{display:flex;align-items:center;gap:6px;padding:4px 18px;color:var(--muted);font-size:12.5px;transition:color .15s,background .15s;}
+nav li a:hover{color:var(--text);background:rgba(255,255,255,.04);text-decoration:none;}
+nav li a .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+.main{padding:36px 52px;max-width:1100px;}
+h1.page-title{font-size:26px;font-weight:700;margin-bottom:6px;}
+h1.page-title .sub{font-size:13px;font-weight:400;color:var(--muted);display:block;margin-top:3px;}
+h2{font-size:18px;font-weight:600;margin:40px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+h3{font-size:14px;font-weight:600;margin:20px 0 8px;color:var(--orange);}
+p{margin-bottom:10px;color:var(--text);}
+code{font-family:'SF Mono',Consolas,monospace;font-size:12px;background:var(--code-bg);border:1px solid var(--border);border-radius:3px;padding:1px 5px;color:var(--accent2);}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow-x:auto;margin-bottom:14px;font-family:'SF Mono',Consolas,monospace;font-size:12px;line-height:1.5;}
+
+/* Package cards */
+.pkg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin:16px 0;}
+.pkg-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;}
+.pkg-card:hover{border-color:var(--accent);transition:border-color .2s;}
+.pkg-card .pkg-name{font-weight:700;font-size:13px;margin-bottom:4px;}
+.pkg-card .pkg-lang{font-size:10px;font-weight:600;padding:1px 6px;border-radius:8px;display:inline-block;margin-bottom:6px;}
+.lang-py{background:#1a2a3a;color:var(--accent);}
+.lang-cpp{background:#2a1a3a;color:var(--purple);}
+.lang-cuda{background:#1a3a28;color:var(--green);}
+.pkg-card p{font-size:12px;color:var(--muted);margin:0;}
+
+/* File tree */
+.tree{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'SF Mono',Consolas,monospace;font-size:12px;line-height:1.7;overflow-x:auto;}
+.tree .dir{color:var(--accent2);}
+.tree .file{color:var(--text);}
+.tree .comment{color:var(--muted);}
+.tree .hl{color:var(--orange);}
+
+/* Component table */
+table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:12.5px;}
+th{background:var(--surface);color:var(--muted);font-weight:600;text-align:left;padding:7px 12px;border:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.05em;}
+td{padding:7px 12px;border:1px solid var(--border);vertical-align:top;}
+tr:nth-child(even) td{background:rgba(255,255,255,.015);}
+td code{font-size:11.5px;}
+td:first-child code{color:var(--green);}
+
+/* Architecture diagram */
+.arch{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:20px;margin:16px 0;}
+.arch-row{display:flex;align-items:stretch;gap:8px;margin-bottom:8px;flex-wrap:wrap;}
+.arch-box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:12px;flex:1;min-width:120px;}
+.arch-box.accent{border-color:var(--accent);background:#1a2a3a;}
+.arch-box.green{border-color:var(--green);background:#1a3020;}
+.arch-box.purple{border-color:var(--purple);background:#2a1a3a;}
+.arch-box.orange{border-color:var(--orange);background:#3a2a1a;}
+.arch-box.cyan{border-color:var(--cyan);background:#1a3035;}
+.arch-box .label{font-weight:700;margin-bottom:2px;font-size:12px;}
+.arch-box .sub{color:var(--muted);font-size:11px;}
+.arch-arrow{display:flex;align-items:center;color:var(--muted);font-size:18px;padding:0 2px;}
+.arch-sep{height:1px;background:var(--border);margin:8px 0;}
+
+/* Flow */
+.flow{display:flex;align-items:center;gap:0;flex-wrap:wrap;margin:10px 0;}
+.fbox{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:5px 10px;font-size:11.5px;white-space:nowrap;}
+.fbox.a{border-color:var(--accent);color:var(--accent);}
+.fbox.g{border-color:var(--green);color:var(--green);}
+.fbox.o{border-color:var(--orange);color:var(--orange);}
+.farrow{color:var(--muted);padding:0 5px;font-size:14px;}
+
+/* Callout */
+.note{background:#1a2a3a;border-left:3px solid var(--accent);border-radius:0 6px 6px 0;padding:10px 14px;margin-bottom:12px;font-size:12.5px;}
+.note.g{background:#1a3020;border-color:var(--green);}
+.note.o{background:#3a2a1a;border-color:var(--orange);}
+.note strong{display:block;margin-bottom:3px;font-size:12.5px;}
+
+/* Stats bar */
+.stats{display:flex;gap:20px;margin:14px 0;flex-wrap:wrap;}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 18px;text-align:center;}
+.stat .n{font-size:22px;font-weight:700;line-height:1;}
+.stat .l{font-size:11px;color:var(--muted);margin-top:3px;}
+.stat.accent .n{color:var(--accent);}
+.stat.green  .n{color:var(--green);}
+.stat.purple .n{color:var(--purple);}
+.stat.orange .n{color:var(--orange);}
+.stat.cyan   .n{color:var(--cyan);}
+
+/* Color dots */
+.dot-py{background:var(--accent);}
+.dot-cpp{background:var(--purple);}
+.dot-cuda{background:var(--green);}
+.dot-cfg{background:var(--orange);}
+
+/* Collapsible */
+details summary{cursor:pointer;list-style:none;padding:6px 0;color:var(--accent);font-size:12.5px;user-select:none;}
+details summary::-webkit-details-marker{display:none;}
+details summary::before{content:"▶ ";font-size:10px;}
+details[open] summary::before{content:"▼ ";}
+details .inner{padding:8px 0 4px 14px;}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- SIDEBAR -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <h1>TokenSpeed</h1>
+    <p>Codebase Structure Reference</p>
+  </div>
+  <h3>Overview</h3>
+  <ul>
+    <li><a href="#top"><span class="dot dot-py"></span>Summary</a></li>
+    <li><a href="#arch"><span class="dot dot-py"></span>Architecture</a></li>
+    <li><a href="#flow"><span class="dot dot-py"></span>Request Flow</a></li>
+  </ul>
+  <h3>Packages</h3>
+  <ul>
+    <li><a href="#runtime"><span class="dot dot-py"></span>python/runtime</a></li>
+    <li><a href="#engine"><span class="dot dot-py"></span>↳ engine/</a></li>
+    <li><a href="#execution"><span class="dot dot-py"></span>↳ execution/</a></li>
+    <li><a href="#models"><span class="dot dot-py"></span>↳ models/</a></li>
+    <li><a href="#layers"><span class="dot dot-py"></span>↳ layers/</a></li>
+    <li><a href="#cache"><span class="dot dot-py"></span>↳ cache/</a></li>
+    <li><a href="#entrypoints"><span class="dot dot-py"></span>↳ entrypoints/</a></li>
+    <li><a href="#kernel"><span class="dot dot-cuda"></span>tokenspeed-kernel</a></li>
+    <li><a href="#mla"><span class="dot dot-cuda"></span>tokenspeed-mla</a></li>
+    <li><a href="#scheduler"><span class="dot dot-cpp"></span>tokenspeed-scheduler</a></li>
+    <li><a href="#fsm"><span class="dot dot-cpp"></span>↳ fsm/</a></li>
+    <li><a href="#resources"><span class="dot dot-cpp"></span>↳ resource/</a></li>
+  </ul>
+  <h3>More</h3>
+  <ul>
+    <li><a href="#kernel-selection"><span class="dot dot-cuda"></span>Kernel Selection</a></li>
+    <li><a href="#lora"><span class="dot dot-py"></span>LoRA Integration</a></li>
+    <li><a href="#tests"><span class="dot dot-cfg"></span>Tests</a></li>
+    <li><a href="#filetree"><span class="dot dot-cfg"></span>Full File Tree</a></li>
+  </ul>
+</nav>
+
+<!-- MAIN -->
+<main class="main">
+
+<h1 class="page-title" id="top">TokenSpeed Codebase Structure
+  <span class="sub">Multi-package inference engine &nbsp;·&nbsp; ~90K lines &nbsp;·&nbsp; Python + C++ + CUDA</span>
+</h1>
+
+<div class="stats">
+  <div class="stat accent"><div class="n">4</div><div class="l">Packages</div></div>
+  <div class="stat green"><div class="n">55K</div><div class="l">Python lines</div></div>
+  <div class="stat purple"><div class="n">10K</div><div class="l">C++ lines</div></div>
+  <div class="stat orange"><div class="n">20K+</div><div class="l">Kernel lines</div></div>
+  <div class="stat cyan"><div class="n">100+</div><div class="l">Test files</div></div>
+</div>
+
+<div class="pkg-grid">
+  <div class="pkg-card">
+    <div class="pkg-name">python/</div>
+    <span class="pkg-lang lang-py">Python</span>
+    <p>Core inference runtime: engine, models, layers, cache, distributed serving, OpenAI HTTP API.</p>
+  </div>
+  <div class="pkg-card">
+    <div class="pkg-name">tokenspeed-kernel/</div>
+    <span class="pkg-lang lang-cuda">CUDA / Triton</span>
+    <p>Pluggable kernel library with multi-backend auto-selection. Attention, GEMM, MoE, quantization.</p>
+  </div>
+  <div class="pkg-card">
+    <div class="pkg-name">tokenspeed-mla/</div>
+    <span class="pkg-lang lang-cuda">CuTe DSL</span>
+    <p>Blackwell-optimised Multi-head Latent Attention (MLA) kernels: prefill, decode FP16/FP8, KV packing.</p>
+  </div>
+  <div class="pkg-card">
+    <div class="pkg-name">tokenspeed-scheduler/</div>
+    <span class="pkg-lang lang-cpp">C++20</span>
+    <p>High-performance scheduler: FSM-driven request lifecycle, radix-tree KV prefix cache, resource allocation.</p>
+  </div>
+</div>
+
+<!-- ARCHITECTURE -->
+<h2 id="arch">Architecture Overview</h2>
+<div class="arch">
+  <!-- HTTP layer -->
+  <div class="arch-row">
+    <div class="arch-box accent" style="flex:1">
+      <div class="label">HTTP API (entrypoints/)</div>
+      <div class="sub">/v1/chat/completions &nbsp;·&nbsp; /v1/completions &nbsp;·&nbsp; /v1/embeddings</div>
+    </div>
+  </div>
+  <div class="arch-row">
+    <div class="arch-box accent" style="flex:1">
+      <div class="label">AsyncLLM / Engine (engine/)</div>
+      <div class="sub">RequestHandler &nbsp;·&nbsp; InputProcessor &nbsp;·&nbsp; OutputProcessor &nbsp;·&nbsp; SchedulerControlClient</div>
+    </div>
+  </div>
+  <div class="arch-sep"></div>
+  <!-- Scheduler layer -->
+  <div class="arch-row">
+    <div class="arch-box purple" style="flex:1">
+      <div class="label">C++ Scheduler (tokenspeed-scheduler)</div>
+      <div class="sub">FSM state machine &nbsp;·&nbsp; KV prefix cache &nbsp;·&nbsp; Page allocators &nbsp;·&nbsp; ExecutionPlan generation</div>
+    </div>
+  </div>
+  <div class="arch-sep"></div>
+  <!-- Execution layer -->
+  <div class="arch-row">
+    <div class="arch-box green" style="flex:3">
+      <div class="label">ModelRunner / ModelExecutor (execution/)</div>
+      <div class="sub">CUDA graph capture &amp; replay &nbsp;·&nbsp; Batch forward &nbsp;·&nbsp; Weight loading</div>
+    </div>
+    <div class="arch-box orange" style="flex:1">
+      <div class="label">KV Cache (cache/)</div>
+      <div class="sub">Prefix cache &nbsp;·&nbsp; Host/disk backends &nbsp;·&nbsp; LoRA namespacing</div>
+    </div>
+    <div class="arch-box" style="flex:1">
+      <div class="label">Sampling (sampling/)</div>
+      <div class="sub">Logit processors &nbsp;·&nbsp; Top-k/p &nbsp;·&nbsp; Grammar</div>
+    </div>
+  </div>
+  <div class="arch-sep"></div>
+  <!-- Model layer -->
+  <div class="arch-row">
+    <div class="arch-box" style="flex:1">
+      <div class="label">Models (models/)</div>
+      <div class="sub">Qwen3 &nbsp;·&nbsp; DeepSeek V3/V4 &nbsp;·&nbsp; Llama &nbsp;·&nbsp; MiniMax &nbsp;·&nbsp; 10+ architectures</div>
+    </div>
+    <div class="arch-box" style="flex:1">
+      <div class="label">Layers (layers/)</div>
+      <div class="sub">Linear &nbsp;·&nbsp; Attention &nbsp;·&nbsp; MoE &nbsp;·&nbsp; LayerNorm &nbsp;·&nbsp; RoPE &nbsp;·&nbsp; Quantization</div>
+    </div>
+  </div>
+  <div class="arch-sep"></div>
+  <!-- Kernel layer -->
+  <div class="arch-row">
+    <div class="arch-box cyan" style="flex:1">
+      <div class="label">tokenspeed-kernel</div>
+      <div class="sub">Multi-backend auto-select &nbsp;·&nbsp; Attention/GEMM/MoE/Quant &nbsp;·&nbsp; Triton / CUDA / TRT-LLM / FlashInfer</div>
+    </div>
+    <div class="arch-box cyan" style="flex:0 0 180px">
+      <div class="label">tokenspeed-mla</div>
+      <div class="sub">MLA prefill/decode &nbsp;·&nbsp; FP8 &nbsp;·&nbsp; Blackwell</div>
+    </div>
+  </div>
+</div>
+
+<!-- REQUEST FLOW -->
+<h2 id="flow">Request Flow</h2>
+<div class="flow">
+  <div class="fbox a">POST /v1/chat/completions</div><span class="farrow">→</span>
+  <div class="fbox">serving_chat.py</div><span class="farrow">→</span>
+  <div class="fbox">InputProcessor<br><small>tokenize</small></div><span class="farrow">→</span>
+  <div class="fbox">AsyncLLM<br><small>enqueue</small></div>
+</div>
+<div class="flow" style="margin-top:4px">
+  <div class="fbox">C++ Scheduler<br><small>prefix match, plan</small></div><span class="farrow">→</span>
+  <div class="fbox">ModelExecutor<br><small>forward pass</small></div><span class="farrow">→</span>
+  <div class="fbox">Model layers<br><small>via kernels</small></div><span class="farrow">→</span>
+  <div class="fbox g">Sample + stream<br><small>OutputProcessor</small></div>
+</div>
+
+<!-- RUNTIME -->
+<h2 id="runtime">Python Runtime — <code>python/tokenspeed/runtime/</code></h2>
+
+<h3 id="engine">engine/</h3>
+<p>Async request lifecycle management — from HTTP intake to token streaming.</p>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>async_llm.py</code></td><td>Main async event loop; <code>AsyncLLM</code> class; routes requests, drives scheduler, streams results</td></tr>
+  <tr><td><code>event_loop.py</code></td><td>Subprocess event loop; owns C++ scheduler + model executor; drives the scheduling cycle</td></tr>
+  <tr><td><code>llm.py</code></td><td>Sync wrapper around <code>AsyncLLM</code> for blocking callers</td></tr>
+  <tr><td><code>request_handler.py</code></td><td>Dispatches incoming ZMQ messages (generate, abort, flush, LoRA load/unload…)</td></tr>
+  <tr><td><code>input_processor.py</code></td><td>Tokenises prompts; resolves <code>lora_path</code> → <code>lora_id</code></td></tr>
+  <tr><td><code>output_processor.py</code></td><td>Detokenises generated tokens and streams to client</td></tr>
+  <tr><td><code>io_struct.py</code></td><td>All request/response dataclasses (<code>GenerateReqInput</code>, <code>LoadLoraReqInput</code>, …)</td></tr>
+  <tr><td><code>schedule_batch.py</code></td><td>Assembles per-forward-op batch metadata from the C++ scheduler plan</td></tr>
+  <tr><td><code>scheduler_utils.py</code></td><td><code>make_spec()</code>, <code>make_config()</code>; helpers bridging Python↔C++ scheduler</td></tr>
+  <tr><td><code>scheduler_control_client.py</code></td><td>ZMQ communicators for weight updates, flush, profile, LoRA operations</td></tr>
+  <tr><td><code>core_client.py</code></td><td>ZMQ client to the model-executor subprocess</td></tr>
+  <tr><td><code>generation_output_processor.py</code></td><td>Aggregates token outputs, handles streaming + stop conditions</td></tr>
+</table>
+
+<h3 id="execution">execution/</h3>
+<p>GPU forward-pass orchestration: CUDA graph capture, weight loading, batch preparation.</p>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>model_runner.py</code></td><td>Calls model <code>forward()</code> with the right context; handles prefill vs decode</td></tr>
+  <tr><td><code>model_executor.py</code></td><td>Wraps <code>model_runner</code>; builds <code>ForwardContext</code>; injects LoRA weight indices; manages stats</td></tr>
+  <tr><td><code>cuda_graph_wrapper.py</code></td><td>Captures and replays CUDA graphs; manages decode graph pool</td></tr>
+  <tr><td><code>context.py</code></td><td><code>ForwardContext</code> dataclass: attn backend, KV pool, LoRA info, batch metadata</td></tr>
+  <tr><td><code>forward_batch_info.py</code></td><td><code>ForwardMode</code> enum (EXTEND / DECODE / IDLE); batch shape metadata</td></tr>
+  <tr><td><code>input_buffer.py</code></td><td>Pre-allocated GPU tensors for batched inputs (token IDs, positions, lengths…)</td></tr>
+  <tr><td><code>weight_loader.py</code></td><td>Loads safetensors/pickle checkpoints; prefetches shards in background threads</td></tr>
+  <tr><td><code>cache_loc_kernel.py</code></td><td>Triton kernel that fills the block-table tensor from scheduler page IDs</td></tr>
+  <tr><td><code>factory.py</code></td><td><code>create_model_executor()</code>, <code>create_model_runner()</code>, <code>create_attn_components()</code></td></tr>
+  <tr><td><code>distributed_initializer.py</code></td><td>NCCL process-group init; TP/DP rank assignment</td></tr>
+  <tr><td><code>drafter/eagle.py</code></td><td>Eagle-3 speculative decoding draft model wrapper</td></tr>
+</table>
+
+<h3 id="models">models/</h3>
+<p>Architecture implementations — each model defines attention, MLP, and embedding layers with weight loading.</p>
+<table>
+  <tr><th>File</th><th>Architecture</th><th>Notes</th></tr>
+  <tr><td><code>qwen3.py</code></td><td>Qwen3-8B/72B</td><td>GQA + qk-norm; LoRA injection added</td></tr>
+  <tr><td><code>qwen3_5.py</code></td><td>Qwen3.5 MoE</td><td>Sparse MoE variant</td></tr>
+  <tr><td><code>deepseek_v3.py</code></td><td>DeepSeek V3</td><td>MLA + MoE; 2K lines</td></tr>
+  <tr><td><code>deepseek_v4.py</code></td><td>DeepSeek V4</td><td>MLA + LoRA rank projections (q, kv); 1700 lines</td></tr>
+  <tr><td><code>llama.py</code></td><td>Llama 2/3</td><td>Standard GQA + RoPE</td></tr>
+  <tr><td><code>llama_eagle3.py</code></td><td>Llama + Eagle3</td><td>Speculative decoding variant</td></tr>
+  <tr><td><code>minimax_m2.py</code></td><td>MiniMax M2</td><td>MLA architecture</td></tr>
+  <tr><td><code>longcat_flash.py</code></td><td>LongCat-Flash</td><td>Long-context variant</td></tr>
+  <tr><td><code>deepseek_nextn.py</code></td><td>DeepSeek NextN</td><td>Next-token prediction variant</td></tr>
+  <tr><td><code>registry.py</code></td><td>—</td><td>Maps HF config <code>model_type</code> to implementation class</td></tr>
+  <tr><td><code>base/causal_lm.py</code></td><td>—</td><td>Base class: logit processor, embedding tie, hidden state capture</td></tr>
+</table>
+
+<h3 id="layers">layers/</h3>
+<p>Reusable neural network building blocks, each routing through <code>tokenspeed-kernel</code> for the best available backend.</p>
+<table>
+  <tr><th>Path</th><th>Purpose</th></tr>
+  <tr><td><code>linear.py</code></td><td>Column/Row parallel linear with quantization (int8, fp8, gptq, awq…). Largest file.</td></tr>
+  <tr><td><code>attention/registry.py</code></td><td>Instantiates attention backend; allocates KV pool; exposes <code>create_attn_components()</code></td></tr>
+  <tr><td><code>attention/backends/</code></td><td>Backend adapters: FlashAttention, FlashInfer, FlashMLA, tokenspeed-MLA, TRT-LLM MLA</td></tr>
+  <tr><td><code>attention/kv_cache/</code></td><td>MHA / MLA KV pool implementations; paged memory management</td></tr>
+  <tr><td><code>attention/configs/</code></td><td>MLA config (kv_lora_rank, qk_rope_head_dim, nope_head_dim, v_head_dim)</td></tr>
+  <tr><td><code>layernorm.py</code></td><td>RMSNorm with optional fused allreduce; GemmaRMSNorm; PDL-gated kernels</td></tr>
+  <tr><td><code>rotary_embedding.py</code></td><td>RoPE variants (YaRN, LongRoPE, linear scaling, multi-LoRA batching)</td></tr>
+  <tr><td><code>paged_attention.py</code></td><td>Thin wrapper calling the selected attention backend per forward pass</td></tr>
+  <tr><td><code>moe/</code></td><td>Expert routing (top-k, noaux_tc), dispatch, AllGather, DeepEP integration</td></tr>
+  <tr><td><code>quantization/</code></td><td>Per-tensor, per-token-head, gptq, awq, fp8 schemes; dequant kernels</td></tr>
+  <tr><td><code>vocab_parallel_embedding.py</code></td><td>Sharded embedding tables; LoRA embedding placement</td></tr>
+  <tr><td><code>logits_processor.py</code></td><td>Top-k, top-p, repetition penalty, grammar masking applied to logits</td></tr>
+</table>
+
+<h3 id="cache">cache/</h3>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>prefix_cache.py</code></td><td>Python-side radix-tree prefix cache; <code>evictable_leaves</code> set; O(1) leaf delete</td></tr>
+  <tr><td><code>allocator.py</code></td><td>Page-granularity KV allocator; tracks <code>req_to_page</code>, free/used pages</td></tr>
+  <tr><td><code>kv_cache_host.py</code></td><td>CPU-pinned host KV staging (L2 cache); host↔device transfer helpers</td></tr>
+  <tr><td><code>evict_policy.py</code></td><td>LRU, LFU, FIFO, MRU, FILO, Priority eviction strategies</td></tr>
+  <tr><td><code>kvstore_controller.py</code></td><td>Coordinates device↔host↔storage eviction and prefetch</td></tr>
+  <tr><td><code>executor/memory_executor.py</code></td><td>Top-level cache executor: wires device + host + storage tiers</td></tr>
+  <tr><td><code>executor/host_executor.py</code></td><td>Async host↔device transfer with priority streams</td></tr>
+  <tr><td><code>storage/</code></td><td>Pluggable L3 storage (Mooncake, disk); <code>BackendFactory</code></td></tr>
+</table>
+
+<h3 id="entrypoints">entrypoints/</h3>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>engine.py</code></td><td><code>Engine</code> class: in-process facade; <code>generate()</code>, <code>load_lora_adapter()</code>, weight updates</td></tr>
+  <tr><td><code>engine_base.py</code></td><td>Abstract base: <code>generate()</code>, <code>flush_cache()</code>, <code>load_lora_adapter()</code>…</td></tr>
+  <tr><td><code>http_server.py</code></td><td>FastAPI app; mounts OpenAI routes; middleware (auth, metrics)</td></tr>
+  <tr><td><code>openai/protocol.py</code></td><td>Pydantic models for <code>CompletionRequest</code>, <code>ChatCompletionRequest</code> (+ <code>lora_path</code>)</td></tr>
+  <tr><td><code>openai/serving_chat.py</code></td><td>Chat completion handler: applies chat template, calls <code>GenerateReqInput</code></td></tr>
+  <tr><td><code>openai/serving_completions.py</code></td><td>Completion handler: prompt encoding, logprob extraction</td></tr>
+  <tr><td><code>engine/run_event_loop.py</code></td><td>Subprocess entry point for the scheduler worker process</td></tr>
+</table>
+
+<!-- KERNEL -->
+<h2 id="kernel">tokenspeed-kernel — <code>tokenspeed-kernel/python/tokenspeed_kernel/</code></h2>
+<p>Pip-installable kernel library. Operators are registered with capability metadata; <code>select_kernel()</code> picks the best available backend at runtime.</p>
+
+<h3>Core Infrastructure</h3>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>__init__.py</code></td><td>Public API: <code>mha_prefill</code>, <code>mha_decode</code>, <code>mm</code>, <code>moe_fused</code>, <code>rmsnorm</code>, …</td></tr>
+  <tr><td><code>registry.py</code></td><td><code>@register_kernel</code> decorator; stores backends in a capability-indexed registry</td></tr>
+  <tr><td><code>selection.py</code></td><td><code>select_kernel(family, …)</code>: filter by capability/dtype/shape, rank by priority band</td></tr>
+  <tr><td><code>platform.py</code></td><td>Detects GPU arch (SM80/SM90/…), CUDA version, vendor</td></tr>
+  <tr><td><code>_triton.py</code></td><td>Single import for all Triton/Triton-fork usage (avoids duplicate loads)</td></tr>
+</table>
+
+<h3 id="kernel-selection">Kernel Selection Priority</h3>
+<div class="flow">
+  <div class="fbox a">select_kernel(family, dtype, shapes)</div><span class="farrow">→</span>
+  <div class="fbox">Filter by GPU capability + dtype support</div><span class="farrow">→</span>
+  <div class="fbox o">Rank by priority band</div>
+</div>
+<pre style="margin-top:8px">Priority bands (highest → lowest):
+  1.  Platform-matched  (flash_mla for Blackwell MLA decode)
+  2.  JIT-compiled      (CuTe DSL, Gluon)
+  3.  Triton            (portable, auto-tuned)
+  4.  Vendor libraries  (FlashAttention, FlashInfer, TRT-LLM)
+  5.  Reference         (PyTorch — correctness baseline)</pre>
+
+<h3>Operation Families (<code>ops/</code>)</h3>
+<table>
+  <tr><th>Family</th><th>Backends</th><th>Usage</th></tr>
+  <tr><td><code>attention/</code></td><td>triton, flash_attn, flashinfer, flash_mla, tokenspeed_mla</td><td>MHA + MLA prefill/decode</td></tr>
+  <tr><td><code>gemm/</code></td><td>triton, trtllm, flashinfer, deep_gemm</td><td>Weight matmuls, quantized GEMM</td></tr>
+  <tr><td><code>moe/</code></td><td>triton, cuda, deepep, flashinfer, trtllm</td><td>Expert dispatch, fused gate+up+down</td></tr>
+  <tr><td><code>layernorm/</code></td><td>triton, cuda, flashinfer</td><td>RMSNorm, fused add+norm</td></tr>
+  <tr><td><code>quantization/</code></td><td>triton, cuda, flashinfer, trtllm</td><td>Per-tensor/per-token quant/dequant</td></tr>
+  <tr><td><code>communication/</code></td><td>nccl, iris, triton, trtllm, flashinfer</td><td>AllReduce, ReduceScatter, AllGather</td></tr>
+  <tr><td><code>sampling/</code></td><td>cuda, flashinfer</td><td>Top-k, top-p sampling</td></tr>
+  <tr><td><code>activation/</code></td><td>cuda, flashinfer</td><td>SiGLU, GELU, SwiGLU</td></tr>
+  <tr><td><code>embedding/</code></td><td>triton, cuda, flashinfer</td><td>Token embedding lookup</td></tr>
+</table>
+
+<!-- MLA -->
+<h2 id="mla">tokenspeed-mla — <code>tokenspeed-mla/python/tokenspeed_mla/</code></h2>
+<p>Blackwell-optimised MLA kernels using NVIDIA CuTe DSL with JIT compilation and optional AOT binary backend.</p>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>mla_prefill.py</code></td><td>Varlen ragged prefill; CuTe DSL JIT with compile-cache; causal mask; PDL support</td></tr>
+  <tr><td><code>mla_decode_fp16.py</code></td><td>Split-KV decode with FP16 accumulation; auto-sized workspace</td></tr>
+  <tr><td><code>mla_decode_fp8.py</code></td><td>FP8-quantized decode → BF16 output for numerical stability</td></tr>
+  <tr><td><code>mla_kv_pack_quantize_fp8.py</code></td><td>Fused KV packing + FP8 quantisation kernel</td></tr>
+  <tr><td><code>fmha.py</code></td><td>FMHA wrapper; dispatches to AOT binary or CuTe JIT path</td></tr>
+  <tr><td><code>mla_helpers.py</code></td><td>MLA math helpers: head-dim splitting, nope/rope decomposition</td></tr>
+</table>
+
+<!-- SCHEDULER -->
+<h2 id="scheduler">tokenspeed-scheduler — <code>tokenspeed-scheduler/csrc/</code></h2>
+<p>C++20 scheduler. The Python runtime calls it via nanobind bindings. All request state transitions happen here.</p>
+
+<h3>scheduler/</h3>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>scheduler.h/.cpp</code></td><td>Main <code>Scheduler</code> class: <code>SubmitRequests()</code>, <code>NextExecutionPlan()</code>, <code>Advance(event)</code></td></tr>
+  <tr><td><code>request.h/.cpp</code></td><td><code>Request</code>: holds token container, FSM state, KV refs, LoRA ID</td></tr>
+  <tr><td><code>request_spec.h</code></td><td>Input spec: <code>request_id</code>, <code>tokens</code>, <code>rolling_hashes</code>, <code>lora_id</code></td></tr>
+  <tr><td><code>execution_plan.h</code></td><td><code>FlatForwardOperation</code>: request IDs, input lengths, prefix lens, page IDs</td></tr>
+  <tr><td><code>operations/forward.cpp</code></td><td><code>schedulePrefillFirstChunk()</code>, <code>scheduleDecode()</code>; passes <code>lora_id</code> to all Match/Insert calls</td></tr>
+  <tr><td><code>operations/cache.cpp</code></td><td>KV write-back, load-back, prefetch operations</td></tr>
+  <tr><td><code>outside_event_handler.cpp</code></td><td>Handles <code>FinishEvent</code>, PD events from outside the main scheduling loop</td></tr>
+</table>
+
+<h3 id="fsm">fsm/ — Finite State Machine</h3>
+<p>Each request transitions through states; events drive transitions and trigger cache/allocation side-effects.</p>
+<pre>Submitted → Prefilling → PrefillDone → Decoding → Draining → Finished
+                                     ↘ Retracting → Retracted
+                         (optional)   Prefetching → PrefetchDone
+                                      WritingBack
+                                      Aborting</pre>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>forward_states.h</code></td><td>State data structs: prefill window, KV allocator, decode token count</td></tr>
+  <tr><td><code>forward_events.h/.cpp</code></td><td><code>SchedulePrefillFirstChunkEvent</code>, <code>FinishEvent</code>, <code>ScheduleDecodeEvent</code>; inject <code>lora_id</code></td></tr>
+  <tr><td><code>cache_states.h</code></td><td>Prefetch / write-back states</td></tr>
+  <tr><td><code>cache_events.h/.cpp</code></td><td>L2 write-back, load-back, L3 backup events</td></tr>
+  <tr><td><code>pd_states.h / pd_events.h/.cpp</code></td><td>Prefill-decode disaggregation states and transfer events</td></tr>
+</table>
+
+<h3 id="resources">resource/ — KV Cache &amp; Memory</h3>
+<table>
+  <tr><th>Path</th><th>Purpose</th></tr>
+  <tr><td><code>kv_prefix_cache/kv_prefix_cache.h/.cpp</code></td><td>Radix-tree prefix cache; <code>Match(tokens, lora_id)</code>; <code>Insert(tokens, lora_id)</code>; LoRA virtual roots</td></tr>
+  <tr><td><code>kv_prefix_cache/eviction.h</code></td><td><code>ResourceManager&lt;RType&gt;::Evict()</code>; persistent <code>lru_leaves_</code> set; O(k log N)</td></tr>
+  <tr><td><code>radix_tree/radix_tree.h/.cpp</code></td><td>Compressed trie; <code>WalkDownUtilMismatch()</code>; <code>splitChild()</code>; <code>PruneEmptyByNode()</code></td></tr>
+  <tr><td><code>radix_tree/tree_resource.h</code></td><td><code>NodeResource&lt;RType&gt;</code>: pages, ref_count, on_evictable callback (exact LRU)</td></tr>
+  <tr><td><code>radix_tree/tree_node.h/.cpp</code></td><td>Tree node: tokens, depth, children map, device/host resource pointers, Touch()</td></tr>
+  <tr><td><code>hybrid_prefix_cache/hybrid_prefix_cache.h/.cpp</code></td><td>Wraps KV cache + Mamba state cache; <code>Match(tokens, lora_id)</code></td></tr>
+  <tr><td><code>allocator/page_allocator.h/.cpp</code></td><td>Fixed-pool page allocator; free-list; <code>Allocate(n)</code> / <code>Free(pages)</code></td></tr>
+  <tr><td><code>allocator/kv_allocator.h/.cpp</code></td><td>Paged KV allocator; tracks req→page mapping</td></tr>
+  <tr><td><code>allocator/mamba_chunk_allocator.h/.cpp</code></td><td>Fixed-slot Mamba state allocator</td></tr>
+</table>
+
+<!-- LORA INTEGRATION -->
+<h2 id="lora">LoRA Integration</h2>
+<p>Added in <code>feat/lora-adapter-serving</code>. Touches all four packages.</p>
+<table>
+  <tr><th>Package</th><th>What was added</th></tr>
+  <tr><td>python/lora/</td><td><code>LoraConfig</code>, <code>LoraRegistry</code>, <code>LoraManager</code> (GPU pool + LRU eviction + TP-aware matmul)</td></tr>
+  <tr><td>python/models/qwen3.py</td><td><code>apply_qkv_lora()</code> after qkv_proj; <code>apply_o_lora()</code> after o_proj; pure-PyTorch <code>_rms_norm</code> for eager mode</td></tr>
+  <tr><td>python/execution/context.py</td><td><code>lora_weight_indices</code>, <code>lora_scalings</code>, <code>lora_manager</code> fields on <code>ForwardContext</code></td></tr>
+  <tr><td>python/execution/model_executor.py</td><td>Per-token weight_indices expansion via <code>repeat_interleave(w_idx, input_lengths)</code></td></tr>
+  <tr><td>python/entrypoints/openai/protocol.py</td><td><code>lora_path: str | None</code> on both <code>CompletionRequest</code> and <code>ChatCompletionRequest</code></td></tr>
+  <tr><td>tokenspeed-scheduler/csrc/</td><td><code>RequestSpec.lora_id</code>; <code>KVPrefixCache::Match(tokens, lora_id)</code>; virtual root per adapter; <code>namespace_depth_offset</code></td></tr>
+</table>
+
+<!-- TESTS -->
+<h2 id="tests">Tests</h2>
+<div class="note g">
+  <strong>120 C++ scheduler tests &nbsp;·&nbsp; 48 Python scheduler tests &nbsp;·&nbsp; 40+ runtime integration tests</strong>
+</div>
+<table>
+  <tr><th>Location</th><th>Coverage</th></tr>
+  <tr><td><code>tokenspeed-scheduler/tests/cpp/</code></td><td>Scheduling FSM, page lifecycle, eviction, prefix cache, Mamba, PD disagg, LoRA isolation</td></tr>
+  <tr><td><code>tokenspeed-scheduler/python/tests/</code></td><td>Python scheduler API, FSM transitions, prefill/decode batching, occupied pages, PD events</td></tr>
+  <tr><td><code>test/runtime/cache/</code></td><td>MLA KV buffer, prefix cache invariants (evictable_leaves, cascade eviction)</td></tr>
+  <tr><td><code>test/runtime/lora/</code></td><td>LoraRegistry capacity, pinning, scaling; dynamic load/unload end-to-end</td></tr>
+  <tr><td><code>test/runtime/models/</code></td><td>DeepSeek V4, Kimi, multimodal model parity</td></tr>
+  <tr><td><code>tokenspeed-kernel/test/</code></td><td>Kernel numerics: attention, GEMM, quantization tolerance verification</td></tr>
+  <tr><td><code>benchmark/</code></td><td>C++ eviction timing, LoRA batch isolation proof, decode-path cache microbenchmark</td></tr>
+</table>
+
+<!-- FILE TREE -->
+<h2 id="filetree">Full Directory Tree</h2>
+<details>
+  <summary>Show complete tree</summary>
+  <div class="inner">
+<div class="tree"><pre>
+tokenspeed/
+├── <span class="dir">python/</span>
+│   ├── pyproject.toml
+│   └── <span class="dir">tokenspeed/</span>
+│       ├── cli.py                       <span class="comment"># tokenspeed serve / bench / env</span>
+│       ├── bench.py                     <span class="comment"># Online serving benchmark</span>
+│       └── <span class="dir">runtime/</span>
+│           ├── <span class="dir hl">engine/</span>              <span class="comment"># Async LLM, request lifecycle</span>
+│           │   ├── async_llm.py
+│           │   ├── event_loop.py
+│           │   ├── io_struct.py
+│           │   ├── request_handler.py
+│           │   ├── input_processor.py
+│           │   ├── output_processor.py
+│           │   ├── schedule_batch.py
+│           │   ├── scheduler_utils.py
+│           │   ├── scheduler_control_client.py
+│           │   └── core_client.py
+│           ├── <span class="dir hl">execution/</span>           <span class="comment"># GPU forward pass</span>
+│           │   ├── model_runner.py
+│           │   ├── model_executor.py
+│           │   ├── cuda_graph_wrapper.py
+│           │   ├── context.py
+│           │   ├── forward_batch_info.py
+│           │   ├── input_buffer.py
+│           │   ├── weight_loader.py
+│           │   ├── factory.py
+│           │   └── drafter/eagle.py
+│           ├── <span class="dir hl">models/</span>              <span class="comment"># Architecture implementations</span>
+│           │   ├── registry.py
+│           │   ├── qwen3.py
+│           │   ├── qwen3_5.py
+│           │   ├── deepseek_v3.py
+│           │   ├── deepseek_v4.py
+│           │   ├── llama.py
+│           │   ├── minimax_m2.py
+│           │   └── base/causal_lm.py
+│           ├── <span class="dir hl">layers/</span>              <span class="comment"># Reusable neural net layers</span>
+│           │   ├── linear.py
+│           │   ├── layernorm.py
+│           │   ├── rotary_embedding.py
+│           │   ├── paged_attention.py
+│           │   ├── logits_processor.py
+│           │   ├── vocab_parallel_embedding.py
+│           │   ├── <span class="dir">attention/</span>       <span class="comment"># Backends: FlashAttn, FlashInfer, MLA, TRT-LLM</span>
+│           │   ├── <span class="dir">moe/</span>             <span class="comment"># Expert routing, dispatch</span>
+│           │   └── <span class="dir">quantization/</span>    <span class="comment"># int8, fp8, gptq, awq</span>
+│           ├── <span class="dir hl">cache/</span>               <span class="comment"># KV cache management</span>
+│           │   ├── prefix_cache.py
+│           │   ├── allocator.py
+│           │   ├── kv_cache_host.py
+│           │   ├── evict_policy.py
+│           │   ├── <span class="dir">executor/</span>        <span class="comment"># memory, host, storage executors</span>
+│           │   └── <span class="dir">storage/</span>         <span class="comment"># mooncake_store, disk backend</span>
+│           ├── <span class="dir hl">lora/</span>                <span class="comment"># LoRA adapter serving (new)</span>
+│           │   ├── lora_config.py
+│           │   ├── lora_registry.py
+│           │   └── lora_manager.py
+│           ├── <span class="dir hl">entrypoints/</span>         <span class="comment"># HTTP server + Engine API</span>
+│           │   ├── engine.py
+│           │   ├── engine_base.py
+│           │   ├── http_server.py
+│           │   └── <span class="dir">openai/</span>          <span class="comment"># Protocol, serving_chat, serving_completions</span>
+│           ├── <span class="dir">configs/</span>             <span class="comment"># Model + device configs</span>
+│           ├── <span class="dir">distributed/</span>         <span class="comment"># TP/DP mapping, comm ops</span>
+│           ├── <span class="dir">sampling/</span>            <span class="comment"># Sampling backends</span>
+│           ├── <span class="dir">grammar/</span>             <span class="comment"># Structured generation</span>
+│           ├── <span class="dir">pd/</span>                  <span class="comment"># Prefill-decode disagg</span>
+│           ├── <span class="dir">model_loader/</span>        <span class="comment"># Weight loading</span>
+│           ├── <span class="dir">metrics/</span>             <span class="comment"># Observability</span>
+│           └── <span class="dir">utils/</span>               <span class="comment"># Logging, env, common helpers</span>
+│
+├── <span class="dir">tokenspeed-kernel/</span>
+│   └── <span class="dir">python/tokenspeed_kernel/</span>
+│       ├── __init__.py                  <span class="comment"># Public API</span>
+│       ├── registry.py                  <span class="comment"># @register_kernel</span>
+│       ├── selection.py                 <span class="comment"># select_kernel()</span>
+│       ├── platform.py
+│       ├── <span class="dir hl">ops/</span>                     <span class="comment"># Backend implementations</span>
+│       │   ├── <span class="dir">attention/</span>
+│       │   ├── <span class="dir">gemm/</span>
+│       │   ├── <span class="dir">moe/</span>
+│       │   ├── <span class="dir">layernorm/</span>
+│       │   ├── <span class="dir">quantization/</span>
+│       │   ├── <span class="dir">communication/</span>
+│       │   └── <span class="dir">sampling/</span>
+│       ├── <span class="dir">thirdparty/</span>              <span class="comment"># Vendored CUDA/Triton kernels</span>
+│       └── <span class="dir">numerics/</span>               <span class="comment"># Kernel correctness verification</span>
+│
+├── <span class="dir">tokenspeed-mla/</span>
+│   └── <span class="dir">python/tokenspeed_mla/</span>
+│       ├── mla_prefill.py               <span class="comment"># CuTe DSL JIT prefill</span>
+│       ├── mla_decode_fp16.py
+│       ├── mla_decode_fp8.py
+│       ├── mla_kv_pack_quantize_fp8.py
+│       └── fmha.py
+│
+├── <span class="dir">tokenspeed-scheduler/</span>
+│   ├── <span class="dir">csrc/</span>
+│   │   ├── <span class="dir hl">scheduler/</span>               <span class="comment"># Scheduler core + FSM</span>
+│   │   │   ├── scheduler.h/.cpp
+│   │   │   ├── request.h/.cpp
+│   │   │   ├── request_spec.h
+│   │   │   └── <span class="dir">operations/</span>
+│   │   ├── <span class="dir hl">fsm/</span>                     <span class="comment"># State machine events/states</span>
+│   │   │   ├── forward_states.h
+│   │   │   ├── forward_events.h/.cpp
+│   │   │   ├── cache_events.h/.cpp
+│   │   │   └── pd_events.h/.cpp
+│   │   ├── <span class="dir hl">resource/</span>               <span class="comment"># KV cache + allocators</span>
+│   │   │   ├── <span class="dir">kv_prefix_cache/</span>     <span class="comment"># Radix tree + LoRA namespacing</span>
+│   │   │   ├── <span class="dir">radix_tree/</span>          <span class="comment"># Compressed prefix tree</span>
+│   │   │   ├── <span class="dir">allocator/</span>           <span class="comment"># Page allocators</span>
+│   │   │   └── <span class="dir">hybrid_prefix_cache/</span> <span class="comment"># L1+L2+Mamba</span>
+│   │   └── <span class="dir">core/</span>                    <span class="comment"># TokenContainer</span>
+│   ├── <span class="dir">bindings/</span>
+│   │   └── python_module.cpp            <span class="comment"># nanobind Python bindings</span>
+│   └── <span class="dir">tests/cpp/</span>                   <span class="comment"># GTest unit tests</span>
+│
+├── <span class="dir">benchmark/</span>
+│   ├── bench_cpp_eviction.py
+│   ├── bench_eviction_ts.py
+│   ├── bench_decode_cache.py
+│   ├── test_lora_dynamic.py
+│   └── test_lora_batch.py
+│
+├── <span class="dir">test/</span>
+│   ├── runners.py
+│   ├── <span class="dir">runtime/</span>                     <span class="comment"># Integration tests</span>
+│   │   ├── <span class="dir">cache/</span>
+│   │   ├── <span class="dir">lora/</span>
+│   │   └── <span class="dir">models/</span>
+│   └── <span class="dir">ci_system/</span>
+│
+└── <span class="dir">docs/</span>
+    ├── lora_implementation.html
+    └── tokenspeed_structure.html        <span class="comment"># ← this file</span>
+</pre></div>
+  </div>
+</details>
+
+</main>
+</div>
+</body>
+</html>
