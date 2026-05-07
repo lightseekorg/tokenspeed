@@ -34,6 +34,13 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 
 logger = get_colorful_logger(__name__)
 
+_DEEPSEEK_V3_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV3ForCausalLMNextN",
+    }
+)
+
 
 class WeightLoader:
     """Handles model weight loading from disk.
@@ -41,6 +48,35 @@ class WeightLoader:
     This class is stateless and does not modify external state.
     It returns LoadedModel with all necessary information.
     """
+
+    @staticmethod
+    def _validate_fp8_kv_cache_args(
+        model_config: ModelConfig,
+        server_args: ServerArgs,
+    ) -> None:
+        if server_args.kv_cache_dtype != "fp8_e4m3":
+            return
+
+        architectures = getattr(
+            getattr(model_config, "hf_config", None),
+            "architectures",
+            None,
+        )
+        is_deepseek_v3 = bool(
+            architectures
+            and any(arch in _DEEPSEEK_V3_ARCHITECTURES for arch in architectures)
+        )
+        if (
+            is_deepseek_v3
+            and server_args.attention_backend == "tokenspeed_mla"
+            and server_args.quantization_param_path is None
+        ):
+            raise RuntimeError(
+                "DeepSeek V3 with tokenspeed_mla requires FP8 MLA KV-cache "
+                "scaling factors when --kv-cache-dtype fp8_e4m3 is used. Pass "
+                "--quantization-param-path with KV-cache scales, or use an "
+                "attention backend that supports an unquantized KV cache."
+            )
 
     @staticmethod
     def load_model(
@@ -72,6 +108,7 @@ class WeightLoader:
             torch.set_num_threads(1)
 
         set_cuda_arch()
+        WeightLoader._validate_fp8_kv_cache_args(model_config, server_args)
 
         # Create load config
         load_config = LoadConfig(

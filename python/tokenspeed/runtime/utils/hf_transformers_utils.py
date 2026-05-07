@@ -277,6 +277,8 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 # verbatim tokenizer path must stay architecture-gated.
 _VERBATIM_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
     {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV3ForCausalLMNextN",
         "MiniMaxM2ForCausalLM",
     }
 )
