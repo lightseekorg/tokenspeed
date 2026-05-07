@@ -35,6 +35,7 @@
 #include "fsm/base_event.h"
 #include "fsm/forward_states.h"
 #include "resource/types.h"
+#include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
 #include "resource/allocator/local_mamba_allocator.h"
@@ -162,12 +163,14 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
     explicit FinishEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator,
                          std::vector<std::string> page_hashes = {}, bool disable_l2_cache = false,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr,
+                         std::int32_t lora_id = kLoraNone)
         : kv_prefix_cache_(kv_prefix_cache),
           host_allocator_(host_allocator),
           page_hashes_(std::move(page_hashes)),
           disable_l2_cache_(disable_l2_cache),
-          hybrid_prefix_cache_(hybrid_prefix_cache) {}
+          hybrid_prefix_cache_(hybrid_prefix_cache),
+          lora_id_(lora_id) {}
 
     // Returns Draining (needs device→host writeback) or Finished.
     std::variant<Draining, Finished> operator()(Decoding&& state);
@@ -185,6 +188,7 @@ private:
     PageAllocator* host_allocator_;
     bool disable_l2_cache_;
     HybridPrefixCache* hybrid_prefix_cache_{};
+    std::int32_t lora_id_{kLoraNone};
 
     template <typename ForwardStateT>
     std::variant<Draining, Finished> apply(ForwardStateT&& state);

@@ -49,12 +49,17 @@ struct MatchResult {
     struct Device {
         TreeNode* last_node;
         std::int32_t page_size{0};
+        // Number of virtual namespace-root pages to subtract from the absolute
+        // tree depth to get the number of real matched token pages.
+        // 0 for base-model requests; 1 for LoRA adapter requests.
+        std::int32_t namespace_depth_offset{0};
         std::int32_t DepthInPage() const;
     } device;
 
     struct Host {
         TreeNode* last_node;
         std::int32_t page_size{0};
+        std::int32_t namespace_depth_offset{0};
         std::int32_t DepthInPage() const;
     } host;
 

@@ -281,11 +281,11 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
     OwnedPages alloc_pages = local_allocator->TakeFirst(alloc_count);
 
     kv_prefix_cache_->Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
-                                                   page_hashes_);
+                                                   page_hashes_, /*start_node=*/nullptr, lora_id_);
 
     // Mamba: insert working slot at terminal node (replaces any existing checkpoint)
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr && local_mamba_allocator->HasWorking()) {
-        MatchResult post_match = kv_prefix_cache_->Match(full_paged_tokens);
+        MatchResult post_match = kv_prefix_cache_->Match(full_paged_tokens, lora_id_);
         TreeNode* terminal = post_match.device.last_node;
         if (terminal != nullptr) {
             hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
@@ -293,7 +293,7 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
     }
     // local_mamba_allocator dropped here — destructor frees remaining slots
 
-    MatchResult match = kv_prefix_cache_->Match(full_paged_tokens);
+    MatchResult match = kv_prefix_cache_->Match(full_paged_tokens, lora_id_);
     if (!disable_l2_cache_ && (match.device.DepthInPage() > match.host.DepthInPage())) {
         std::vector<TreeNode*> write_diff = match.NodesWithout<ResourceType::Host>();
         std::int32_t host_pages_num = 0;

@@ -26,6 +26,10 @@
 #include <unordered_map>
 #include <vector>
 
+// kLoraNone is the lora_id value meaning "base model, no adapter".
+// Adapter IDs are positive integers assigned by LoraRegistry.
+static constexpr std::int32_t kLoraNone = 0;
+
 #include "resource/radix_tree/radix_tree.h"
 #include "resource/radix_tree/tree_resource.h"
 #include "resource/types.h"
@@ -40,18 +44,24 @@ class KVPrefixCache {
 public:
     KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage = false);
 
-    MatchResult Match(const token_vec_t& token_ids);
-    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages);
+    // lora_id = kLoraNone (0) → base model, uses the shared radix tree root.
+    // lora_id > 0          → adapter namespace; a per-adapter virtual root is
+    //                        created on demand so same-adapter requests share the
+    //                        prefix cache while cross-adapter requests never collide.
+    MatchResult Match(const token_vec_t& token_ids, std::int32_t lora_id = kLoraNone);
+    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
+                      std::int32_t lora_id = kLoraNone);
 
     template <ResourceType RType>
     InsertResult Insert(const token_vec_t& token_ids, const std::vector<std::int32_t>& prefix_pages,
                         OwnedPages allocator_pages = {}, const std::vector<std::string>& page_hashs = {},
-                        TreeNode* start_node = nullptr);
+                        TreeNode* start_node = nullptr, std::int32_t lora_id = kLoraNone);
 
     template <ResourceType RType>
     InsertResult Insert(const std::vector<std::span<const std::int32_t>>& token_pages,
                         const std::vector<std::int32_t>& prefix_pages, OwnedPages allocator_pages = {},
-                        const std::vector<std::string>& page_hashs = {}, TreeNode* start_node = nullptr);
+                        const std::vector<std::string>& page_hashs = {}, TreeNode* start_node = nullptr,
+                        std::int32_t lora_id = kLoraNone);
 
     cache_op_id AllocateCacheOpId();
 
@@ -84,11 +94,25 @@ private:
         }
     }
 
+    // Returns (or creates) the virtual root node for the given LoRA adapter.
+    // The virtual root is a child of the real root keyed by a sentinel page
+    // [-lora_id, 0, ..., 0] that is outside any real vocabulary range.
+    // An empty DeviceResource is attached so PruneEmptyByNode never removes it.
+    TreeNode* getOrCreateLoraRoot(std::int32_t lora_id);
+
+    // Resolve the start_node for Match/Insert: nullptr for base model,
+    // per-adapter virtual root for LoRA.
+    TreeNode* resolveStartNode(std::int32_t lora_id) {
+        return (lora_id == kLoraNone) ? nullptr : getOrCreateLoraRoot(lora_id);
+    }
+
     RadixTree tree_;
     DeviceManager device_;
     HostManager host_;
     cache_op_id next_op_id_{1};
     bool enable_l3_storage_{false};
+    // Per-adapter virtual root nodes; keyed by lora_id (> 0).
+    std::unordered_map<std::int32_t, TreeNode*> lora_virtual_roots_;
 };
 
 }  // namespace tokenspeed

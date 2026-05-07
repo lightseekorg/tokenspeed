@@ -41,10 +41,10 @@ class LoraRegistry:
 
     def __init__(self, max_loras: int) -> None:
         self.max_loras = max_loras
-        self._configs: dict[str, LoraConfig] = {}     # name → config
-        self._name_to_id: dict[str, int] = {}          # name → integer ID
-        self._id_to_name: dict[int, str] = {}          # integer ID → name
-        self._next_id: int = 1                         # 0 is reserved for "no lora"
+        self._configs: dict[str, LoraConfig] = {}  # name → config
+        self._name_to_id: dict[str, int] = {}  # name → integer ID
+        self._id_to_name: dict[int, str] = {}  # integer ID → name
+        self._next_id: int = 1  # 0 is reserved for "no lora"
 
     # ------------------------------------------------------------------
     # Public API
