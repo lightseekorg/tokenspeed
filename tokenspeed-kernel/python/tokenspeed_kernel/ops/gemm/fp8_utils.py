@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.registry import error_fn
 
 _is_amd = Platform.get().is_amd
 _is_nvidia = Platform.get().is_nvidia
@@ -318,7 +319,9 @@ def _flashinfer_sm90_per_token_group_quant_fp8_tma(
     ):
         return None
 
-    from tokenspeed_kernel.ops.quantization.flashinfer import fp8_quantize_1x128_sm90
+    from tokenspeed_kernel.ops.quantization.flashinfer import (
+        get_fp8_blockscale_gemm_runner_sm90,
+    )
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
@@ -329,8 +332,11 @@ def _flashinfer_sm90_per_token_group_quant_fp8_tma(
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=False,
     )
+    if get_fp8_blockscale_gemm_runner_sm90 is error_fn:
+        return None
     try:
-        fp8_quantize_1x128_sm90(x, x_q, x_s)
+        runner = get_fp8_blockscale_gemm_runner_sm90()
+        runner.fp8_quantize_1x128(x, x_q, x_s, False)
     except RuntimeError:
         return None
     return x_q, x_s
