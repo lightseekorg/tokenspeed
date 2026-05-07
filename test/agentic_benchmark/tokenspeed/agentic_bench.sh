@@ -35,7 +35,7 @@ SERVER_LOG=
 launch_server() {
     local config=$1
     SERVER_LOG=/tmp/tokenspeed_server_${config}.log
-    ${SCRIPT_DIR}/configs/${config}.sh > "$SERVER_LOG" 2>&1 &
+    setsid ${SCRIPT_DIR}/configs/${config}.sh > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 }
 
@@ -63,14 +63,14 @@ wait_for_ready() {
 }
 
 stop_server() {
-    if pgrep -f tokenspeed-serve > /dev/null; then
-        echo "Stopping tokenspeed-serve..."
-        pkill -TERM -f tokenspeed-serve || true
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Stopping tokenspeed-serve (pgid $SERVER_PID)..."
+        kill -TERM -"$SERVER_PID" 2>/dev/null || true
         for _ in {1..20}; do
-            pgrep -f tokenspeed-serve > /dev/null || break
+            kill -0 "$SERVER_PID" 2>/dev/null || break
             sleep 1
         done
-        pkill -KILL -f tokenspeed-serve || true
+        kill -KILL -"$SERVER_PID" 2>/dev/null || true
     fi
     SERVER_PID=
 }
@@ -90,8 +90,7 @@ wait_for_port_free() {
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
-# Defensive cleanup: reap any stale server / port state from a prior run
-stop_server
+# Preflight: bail out if port 8000 is already in use
 wait_for_port_free 8000
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)

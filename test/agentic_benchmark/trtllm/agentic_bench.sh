@@ -39,7 +39,7 @@ SERVER_LOG=
 launch_server() {
     local config=$1
     SERVER_LOG=/tmp/trtllm_server_${config}.log
-    trtllm-serve nvidia/Kimi-K2.5-NVFP4 \
+    setsid trtllm-serve nvidia/Kimi-K2.5-NVFP4 \
         --max_num_tokens 8192 \
         --max_seq_len 80000 \
         --enable_chunked_prefill \
@@ -75,14 +75,14 @@ wait_for_ready() {
 }
 
 stop_server() {
-    if pgrep -f trtllm-serve > /dev/null; then
-        echo "Stopping trtllm-serve..."
-        pkill -TERM -f trtllm-serve || true
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Stopping trtllm-serve (pgid $SERVER_PID)..."
+        kill -TERM -"$SERVER_PID" 2>/dev/null || true
         for _ in {1..20}; do
-            pgrep -f trtllm-serve > /dev/null || break
+            kill -0 "$SERVER_PID" 2>/dev/null || break
             sleep 1
         done
-        pkill -KILL -f trtllm-serve || true
+        kill -KILL -"$SERVER_PID" 2>/dev/null || true
     fi
     SERVER_PID=
 }
@@ -102,8 +102,7 @@ wait_for_port_free() {
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
-# Defensive cleanup: reap any stale server / port state from a prior run
-stop_server
+# Preflight: bail out if port 8001 is already in use
 wait_for_port_free 8001
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
