@@ -34,7 +34,7 @@ fp8_min = platform.fp8e4m3fn.min
 
 if _is_nvidia:
     from tokenspeed_kernel.ops.quantization.flashinfer import (
-        get_fp8_blockscale_gemm_runner_sm90 as _flashinfer_get_fp8_blockscale_gemm_runner_sm90,
+        fp8_blockscale_quantize_runner_sm90 as _flashinfer_fp8_blockscale_quantize_runner_sm90,
     )
     from tokenspeed_kernel.thirdparty.trtllm import (
         per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
@@ -217,7 +217,7 @@ def _per_token_group_quant_8bit_raw(
     """
     assert (
         x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` must be divisible by `group_size`"
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if _is_amd:
@@ -331,10 +331,10 @@ def _flashinfer_sm90_per_token_group_quant_fp8(
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=False,
     )
-    if _flashinfer_get_fp8_blockscale_gemm_runner_sm90 is error_fn:
+    if _flashinfer_fp8_blockscale_quantize_runner_sm90 is error_fn:
         return None
     try:
-        runner = _flashinfer_get_fp8_blockscale_gemm_runner_sm90()
+        runner = _flashinfer_fp8_blockscale_quantize_runner_sm90()
         runner.fp8_quantize_1x128(x, x_q, x_s, False)
     except RuntimeError:
         return None
@@ -369,7 +369,7 @@ def per_token_group_quant_fp8(
     ):
         assert (
             x.shape[-1] % group_size == 0
-        ), "the last dimension of `x` must be divisible by `group_size`"
+        ), "the last dimension of `x` cannot be divisible by `group_size`"
         M = x.shape[0]
         x_q, x_s = _trtllm_per_token_group_quant_fp8(x, group_size)
         # TRT-LLM returns scales grouped by K-block, with the M dimension
