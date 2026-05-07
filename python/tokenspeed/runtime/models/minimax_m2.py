@@ -439,11 +439,9 @@ def fused_qk_rmsnorm(
     tp_group: tuple[int, ...],
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use the Lamport fused-AR QK RMSNorm path when its shape constraints hold.
-
-    Setting TOKENSPEED_MINIMAX_AR_USE_TRITON=1 forces the Triton sumsq/apply
-    fallback for A/B debugging.
-    """
+    """Route to the Lamport fused-AR QK RMSNorm kernel when its shape
+    constraints hold, else fall back to the Triton sumsq/apply path.
+    Setting TOKENSPEED_MINIMAX_AR_USE_TRITON=1 forces the Triton path (A/B debug)."""
     if (
         not _FORCE_TRITON_AR_RMSNORM
         and q_weight_bf16 is not None
@@ -816,9 +814,7 @@ class MiniMaxM2ForCausalLM(BaseCausalLM):
         return ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            # MiniMax-M2 checkpoints keep lm_head unquantized even when the
-            # transformer weights use block FP8.
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
