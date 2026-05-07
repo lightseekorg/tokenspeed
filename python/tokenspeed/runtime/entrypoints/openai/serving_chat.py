@@ -305,6 +305,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             user_rid=request.rid,
+            lora_path=request.lora_path,
         )
 
         return adapted_request, request

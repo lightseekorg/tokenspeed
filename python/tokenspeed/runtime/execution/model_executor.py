@@ -836,6 +836,19 @@ class ModelExecutor:
                     ]
                     if any(lid != 0 for lid in lora_ids):
                         w_idx, scalings = self.lora_manager.prepare_loras(lora_ids)
+                        # Expand per-request w_idx → per-token for mixed batches.
+                        # Prefill: repeat each slot index for its request's token count.
+                        # Decode: one token per request, so w_idx is already correct.
+                        if total_tokens > bs:
+                            per_req_lengths = list(forward_op.input_lengths)
+                            w_idx = torch.repeat_interleave(
+                                w_idx,
+                                torch.tensor(
+                                    per_req_lengths,
+                                    dtype=torch.long,
+                                    device=w_idx.device,
+                                ),
+                            )
                         ctx.lora_weight_indices = w_idx
                         ctx.lora_scalings = scalings
                         ctx.lora_manager = self.lora_manager

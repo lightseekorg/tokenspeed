@@ -313,19 +313,11 @@ class LoraManager:
         if tokens == 0:
             return qkv
 
-        # Expand weight_indices from per-request to per-token
-        # (all tokens of a request share the same adapter)
-        # Here weight_indices has one entry per request; we need one per token.
-        # For simplicity, if we have one index per token already, use as-is;
-        # otherwise broadcast (single batch assumed for now).
-        w_idx = weight_indices  # [n_requests] or [tokens]
-        if w_idx.shape[0] != tokens:
-            # Single-request fast path
-            if w_idx.shape[0] == 1:
-                w_idx = w_idx.expand(tokens)
-            else:
-                # Pad to tokens if needed
-                w_idx = w_idx[:tokens]
+        # weight_indices is already per-token (expanded by model_executor before
+        # the forward pass).  Single-request decode still needs broadcast.
+        w_idx = weight_indices
+        if w_idx.shape[0] == 1 and tokens > 1:
+            w_idx = w_idx.expand(tokens)
 
         q_delta = self._apply_col_parallel_lora(
             hidden_states, layer_id, "q_proj", w_idx, scalings
@@ -362,11 +354,8 @@ class LoraManager:
             return o_output
 
         w_idx = weight_indices
-        if w_idx.shape[0] != tokens:
-            if w_idx.shape[0] == 1:
-                w_idx = w_idx.expand(tokens)
-            else:
-                w_idx = w_idx[:tokens]
+        if w_idx.shape[0] == 1 and tokens > 1:
+            w_idx = w_idx.expand(tokens)
 
         o_delta = self._apply_row_parallel_lora(
             attn_output, layer_id, "o_proj", w_idx, scalings

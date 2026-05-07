@@ -158,6 +158,10 @@ class CompletionRequest(BaseModel):
     # For request id
     rid: list[str] | str | None = None
 
+    # LoRA adapter name registered via Engine.load_lora_adapter().
+    # None = use the base model.
+    lora_path: str | None = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -424,6 +428,9 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: list[str] | str | None = None
+
+    # LoRA adapter name registered via Engine.load_lora_adapter().
+    lora_path: str | None = None
 
     # For PD disaggregation
     bootstrap_host: str | None = None
