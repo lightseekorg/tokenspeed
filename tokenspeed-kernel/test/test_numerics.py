@@ -83,11 +83,6 @@ class TestNumericsVerification:
                     continue
                 if spec.solution == "deep_gemm":
                     continue
-                # Some FP8 latency kernels are approximate enough that the
-                # generic elementwise verifier is the wrong metric; they have
-                # dedicated tests using their backend's numerical contract.
-                if "non_elementwise_numerics" in spec.tags:
-                    continue
                 if not spec.capability.satisfied_by(platform):
                     continue
                 specs.append(spec)

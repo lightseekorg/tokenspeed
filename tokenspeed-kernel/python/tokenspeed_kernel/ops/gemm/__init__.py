@@ -61,18 +61,6 @@ _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     }
 )
 
-# Kernels that accept BF16 activations for MXFP8 GEMM and perform activation
-# quantization internally, so ``mm`` must not pre-quantize A or pass A_scales.
-#
-# This is intentionally a narrow allowlist while SelectedKernel only exposes a
-# kernel name.  If more kernels need this capability, promote it to a registry
-# trait instead of growing backend-specific branching in ``mm``.
-_KERNELS_WITH_INTERNAL_MXFP8_ACTIVATION_QUANT: frozenset[str] = frozenset(
-    {
-        "flashinfer_sm90_mm_fp8_blockscale",
-    }
-)
-
 
 def _infer_scale_type(
     A_scales: torch.Tensor | None,
@@ -288,11 +276,7 @@ def mm(
         select_dtype = _infer_select_dtype(A.dtype, quant)
 
     # Online activation quantization
-    if (
-        quant == "mxfp8"
-        and A_scales is None
-        and kernel.name not in _KERNELS_WITH_INTERNAL_MXFP8_ACTIVATION_QUANT
-    ):
+    if quant == "mxfp8" and A_scales is None:
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"

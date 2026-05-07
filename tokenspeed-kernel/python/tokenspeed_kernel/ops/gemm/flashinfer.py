@@ -37,62 +37,33 @@ _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1f
 # ---- FlashInfer block-scaled FP8 ----------------------------------------
 
 gemm_fp8_nt_groupwise = error_fn
-fp8_blockscale_gemm_sm90 = error_fn
+get_fp8_blockscale_gemm_runner_sm90 = error_fn
 tinygemm_bf16 = error_fn
 
 if platform.is_hopper_plus:
     try:
         from flashinfer.gemm import (
-            fp8_blockscale_gemm_sm90,
             gemm_fp8_nt_groupwise,
             tinygemm_bf16,
         )
     except ImportError:
         pass
+    try:
+        from flashinfer.gemm.gemm_base import get_fp8_blockscale_gemm_runner_sm90
+    except ImportError:
+        pass
 
 
-if fp8_blockscale_gemm_sm90 is not error_fn and platform.is_hopper:
-
-    @register_kernel(
-        "gemm",
-        "mm",
-        name="flashinfer_sm90_mm_fp8_blockscale",
-        solution="flashinfer",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
-        dtypes={_fp8_dtype},
-        traits={
-            "quant": frozenset({"mxfp8"}),
-            "n_align_64": frozenset({True}),
-            "k_align_128": frozenset({True}),
-        },
-        # Keep throughput-oriented kernels ahead under the default objective.
-        # FP8 Linear call sites opt into the latency objective after loading
-        # stable K/N shapes, which lets selection choose this SM90 path without
-        # a runtime token-count gate.
-        priority=4,
-        tags={"latency", "non_elementwise_numerics"},
-    )
-    def flashinfer_sm90_mm_fp8_blockscale(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scales: torch.Tensor | None,
-        B_scales: torch.Tensor | None,
-        out_dtype: torch.dtype,
-        *,
-        alpha: torch.Tensor | None = None,
-        block_size: list[int] | None = None,
-    ) -> torch.Tensor:
-        assert A_scales is None, "FlashInfer sm90 GEMM quantizes BF16 activations"
-        assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
-        return fp8_blockscale_gemm_sm90(
-            A,
-            B,
-            weight_scale=B_scales,
-            out_dtype=out_dtype,
-        )
+def flashinfer_sm90_fp8_quantize_1x128(
+    A: torch.Tensor,
+    A_q: torch.Tensor,
+    A_scales: torch.Tensor,
+) -> None:
+    """Quantize BF16 activations into the SM90/DeepGEMM 1x128 scale layout."""
+    if get_fp8_blockscale_gemm_runner_sm90 is error_fn:
+        raise RuntimeError("FlashInfer SM90 FP8 quantization runner is not available")
+    runner = get_fp8_blockscale_gemm_runner_sm90()
+    runner.fp8_quantize_1x128(A, A_q, A_scales, False)
 
 
 if gemm_fp8_nt_groupwise is not error_fn:
