@@ -33,6 +33,9 @@ fp8_max = platform.fp8e4m3fn.max
 fp8_min = platform.fp8e4m3fn.min
 
 if _is_nvidia:
+    from tokenspeed_kernel.ops.quantization.flashinfer import (
+        get_fp8_blockscale_gemm_runner_sm90 as _flashinfer_get_fp8_blockscale_gemm_runner_sm90,
+    )
     from tokenspeed_kernel.thirdparty.trtllm import (
         per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
     )
@@ -299,7 +302,7 @@ def _per_token_group_quant_8bit_raw(
     return x_q, x_s
 
 
-def _flashinfer_sm90_per_token_group_quant_fp8_tma(
+def _flashinfer_sm90_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     column_major_scales: bool,
@@ -319,10 +322,6 @@ def _flashinfer_sm90_per_token_group_quant_fp8_tma(
     ):
         return None
 
-    from tokenspeed_kernel.ops.quantization.flashinfer import (
-        get_fp8_blockscale_gemm_runner_sm90,
-    )
-
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=x.shape,
@@ -332,10 +331,10 @@ def _flashinfer_sm90_per_token_group_quant_fp8_tma(
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=False,
     )
-    if get_fp8_blockscale_gemm_runner_sm90 is error_fn:
+    if _flashinfer_get_fp8_blockscale_gemm_runner_sm90 is error_fn:
         return None
     try:
-        runner = get_fp8_blockscale_gemm_runner_sm90()
+        runner = _flashinfer_get_fp8_blockscale_gemm_runner_sm90()
         runner.fp8_quantize_1x128(x, x_q, x_s, False)
     except RuntimeError:
         return None
@@ -349,7 +348,7 @@ def per_token_group_quant_fp8(
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
 ):
-    flashinfer_quantized = _flashinfer_sm90_per_token_group_quant_fp8_tma(
+    flashinfer_quantized = _flashinfer_sm90_per_token_group_quant_fp8(
         x,
         group_size,
         column_major_scales=column_major_scales,
