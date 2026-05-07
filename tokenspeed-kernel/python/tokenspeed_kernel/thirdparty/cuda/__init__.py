@@ -25,10 +25,7 @@ from tokenspeed_kernel.thirdparty.cuda.activation import (
     silu_and_mul_fuse_nvfp4_quant,
 )
 from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
-from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import (
-    fp32_router_gemm,
-    supports_fp32_router_gemm_fast_path,
-)
+from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import fp32_router_gemm
 from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
 from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.rmsnorm import rmsnorm_fused_parallel
@@ -50,6 +47,5 @@ __all__ = [
     "routing_flash",
     "silu_and_mul_fuse_block_quant",
     "silu_and_mul_fuse_nvfp4_quant",
-    "supports_fp32_router_gemm_fast_path",
     "verify_chain_greedy",
 ]

@@ -31,10 +31,6 @@ from pathlib import Path
 
 import torch
 
-_FP32_ROUTER_GEMM_FAST_PATH_MAX_TOKENS = 32
-_FP32_ROUTER_GEMM_HIDDEN_DIM = 3072
-_FP32_ROUTER_GEMM_NUM_EXPERTS = 256
-
 
 def _objs_dir() -> Path:
     return Path(__file__).resolve().parent / "objs"
@@ -52,28 +48,6 @@ def _load_fp32_router_gemm_module():
             "Run `pip install -e tokenspeed_kernel/python/` to build."
         )
     return tvm_ffi.load_module(str(so_path))
-
-
-def supports_fp32_router_gemm_fast_path(
-    hidden_states: torch.Tensor,
-    router_weights: torch.Tensor,
-) -> bool:
-    """Return whether the custom small-M router GEMM path can be used."""
-    return (
-        hidden_states.is_cuda
-        and router_weights.is_cuda
-        and hidden_states.ndim == 2
-        and router_weights.ndim == 2
-        and hidden_states.dtype in (torch.bfloat16, torch.float32)
-        and router_weights.dtype == torch.float32
-        and 0 < hidden_states.shape[0] <= _FP32_ROUTER_GEMM_FAST_PATH_MAX_TOKENS
-        and hidden_states.shape[1] == _FP32_ROUTER_GEMM_HIDDEN_DIM
-        and router_weights.shape
-        == (
-            _FP32_ROUTER_GEMM_NUM_EXPERTS,
-            _FP32_ROUTER_GEMM_HIDDEN_DIM,
-        )
-    )
 
 
 def fp32_router_gemm(

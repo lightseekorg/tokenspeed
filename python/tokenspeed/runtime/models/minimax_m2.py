@@ -81,10 +81,7 @@ logger = logging.getLogger(__name__)
 _is_nvidia = current_platform().is_nvidia
 
 if _is_nvidia:
-    from tokenspeed_kernel.ops.routing.cuda import (
-        fp32_router_gemm,
-        supports_fp32_router_gemm_fast_path,
-    )
+    from tokenspeed_kernel.ops.routing.cuda import fp32_router_gemm
 
 from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
 
@@ -190,9 +187,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # FP32 Router GEMM.
-        if self.use_fp32_router_gemm and supports_fp32_router_gemm_fast_path(
-            hidden_states, self.gate.weight
-        ):
+        if self.use_fp32_router_gemm and hidden_states.shape[0] > 0:
             router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
         else:
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
