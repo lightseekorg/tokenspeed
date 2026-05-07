@@ -31,11 +31,15 @@ import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import (
+    SelectedKernel,
+    SelectionObjective,
+    select_kernel,
+)
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["mm"]
+__all__ = ["mm", "select_mm_kernel"]
 
 _platform = Platform.get()
 _fp8_dtype = _platform.fp8e4m3fn.dtype
@@ -54,6 +58,18 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
         "flashinfer_mm_nvfp4",
+    }
+)
+
+# Kernels that accept BF16 activations for MXFP8 GEMM and perform activation
+# quantization internally, so ``mm`` must not pre-quantize A or pass A_scales.
+#
+# This is intentionally a narrow allowlist while SelectedKernel only exposes a
+# kernel name.  If more kernels need this capability, promote it to a registry
+# trait instead of growing backend-specific branching in ``mm``.
+_KERNELS_WITH_INTERNAL_MXFP8_ACTIVATION_QUANT: frozenset[str] = frozenset(
+    {
+        "flashinfer_sm90_mm_fp8_blockscale",
     }
 )
 
@@ -136,6 +152,76 @@ def _online_quantize_mxfp8(
 # ---------------------------------------------------------------------------
 
 
+def _infer_select_dtype(A_dtype: torch.dtype, quant: str | None) -> torch.dtype:
+    if quant in ("mxfp8", "fp8"):
+        return _fp8_dtype
+    return A_dtype
+
+
+def _build_mm_traits(
+    *,
+    K: int,
+    N: int,
+    A_scales: torch.Tensor | None = None,
+    B_scales: torch.Tensor | None = None,
+    quant: str | None = None,
+) -> dict[str, object]:
+    traits: dict[str, object] = {
+        "n_align_16": N % 16 == 0,
+        "k_align_16": K % 16 == 0,
+        "n_align_64": N % 64 == 0,
+        "n_align_128": N % 128 == 0,
+        "k_align_128": K % 128 == 0,
+    }
+
+    if quant is not None:
+        traits["quant"] = quant
+
+    if quant == "fp8":
+        scale_type = _infer_scale_type(A_scales, B_scales)
+        if scale_type is not None:
+            traits["scale_type"] = scale_type
+
+    return traits
+
+
+def select_mm_kernel(
+    *,
+    A_dtype: torch.dtype,
+    K: int,
+    N: int,
+    A_scales: torch.Tensor | None = None,
+    B_scales: torch.Tensor | None = None,
+    quant: str | None = None,
+    objective: SelectionObjective = SelectionObjective.DEFAULT,
+    override: str | None = None,
+    expected_kernel_name: str | None = None,
+) -> SelectedKernel:
+    """Select the GEMM kernel for a stable Linear shape.
+
+    ``mm`` still records per-call shapes and handles online activation
+    quantization. This helper only moves the selection lookup out of hot
+    forward paths whose dtype and K/N dimensions are fixed after weight load.
+    """
+    select_dtype = _infer_select_dtype(A_dtype, quant)
+    traits = _build_mm_traits(
+        K=K,
+        N=N,
+        A_scales=A_scales,
+        B_scales=B_scales,
+        quant=quant,
+    )
+    return select_kernel(
+        "gemm",
+        "mm",
+        select_dtype,
+        traits=traits,
+        objective=objective,
+        override=override,
+        expected_kernel_name=expected_kernel_name,
+    )
+
+
 def mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -150,6 +236,7 @@ def mm(
     enable_pdl: bool = False,
     override: str | None = None,
     expected_kernel_name: str | None = None,
+    selected_kernel: SelectedKernel | None = None,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -184,40 +271,28 @@ def mm(
     M = A.shape[0]
     N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
-    if quant in ("mxfp8", "fp8"):
-        select_dtype = _fp8_dtype
-    elif quant == "nvfp4":
-        select_dtype = A.dtype
+    if selected_kernel is not None:
+        kernel = selected_kernel
+        select_dtype = _infer_select_dtype(A.dtype, quant)
     else:
-        select_dtype = A.dtype
-
-    traits: dict[str, object] = {
-        "n_align_16": N % 16 == 0,
-        "k_align_16": K % 16 == 0,
-        "n_align_64": N % 64 == 0,
-        "n_align_128": N % 128 == 0,
-        "k_align_128": K % 128 == 0,
-    }
-
-    if quant is not None:
-        traits["quant"] = quant
-
-    if quant == "fp8":
-        scale_type = _infer_scale_type(A_scales, B_scales)
-        if scale_type is not None:
-            traits["scale_type"] = scale_type
-
-    kernel = select_kernel(
-        "gemm",
-        "mm",
-        select_dtype,
-        traits=traits,
-        override=override,
-        expected_kernel_name=expected_kernel_name,
-    )
+        kernel = select_mm_kernel(
+            A_dtype=A.dtype,
+            K=K,
+            N=N,
+            A_scales=A_scales,
+            B_scales=B_scales,
+            quant=quant,
+            override=override,
+            expected_kernel_name=expected_kernel_name,
+        )
+        select_dtype = _infer_select_dtype(A.dtype, quant)
 
     # Online activation quantization
-    if quant == "mxfp8" and A_scales is None:
+    if (
+        quant == "mxfp8"
+        and A_scales is None
+        and kernel.name not in _KERNELS_WITH_INTERNAL_MXFP8_ACTIVATION_QUANT
+    ):
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"

@@ -28,13 +28,25 @@ except ImportError:
     dsv3_router_gemm = error_fn
 
 try:
-    from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import fp32_router_gemm
+    from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import (
+        fp32_router_gemm,
+        supports_fp32_router_gemm_fast_path,
+    )
 except ImportError:
     fp32_router_gemm = error_fn
+
+    def supports_fp32_router_gemm_fast_path(*args, **kwargs):
+        return False
+
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.routing import routing_flash
 except ImportError:
     routing_flash = error_fn
 
-__all__ = ["dsv3_router_gemm", "fp32_router_gemm", "routing_flash"]
+__all__ = [
+    "dsv3_router_gemm",
+    "fp32_router_gemm",
+    "routing_flash",
+    "supports_fp32_router_gemm_fast_path",
+]

@@ -408,9 +408,13 @@ class CudaGraphWrapper:
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
+        mamba_pool_indices: torch.Tensor | None = None,
         **kwargs,
     ):
         """Graph-replay path — update persistent cuda-graph buffers in place."""
+        if self.input_buffers.has_mamba and mamba_pool_indices is not None:
+            kwargs["mamba_pool_indices"] = mamba_pool_indices
+
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
             req_pool_indices,

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Inference-only MiniMax-M2.5 model compatible with HuggingFace weights."""
+"""Inference-only MiniMax-M2 family model compatible with HuggingFace weights."""
 
 # ruff: noqa: E402
 
@@ -81,7 +81,10 @@ logger = logging.getLogger(__name__)
 _is_nvidia = current_platform().is_nvidia
 
 if _is_nvidia:
-    from tokenspeed_kernel.ops.routing.cuda import fp32_router_gemm
+    from tokenspeed_kernel.ops.routing.cuda import (
+        fp32_router_gemm,
+        supports_fp32_router_gemm_fast_path,
+    )
 
 from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
 
@@ -187,7 +190,9 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # FP32 Router GEMM.
-        if self.use_fp32_router_gemm and hidden_states.shape[0] > 0:
+        if self.use_fp32_router_gemm and supports_fp32_router_gemm_fast_path(
+            hidden_states, self.gate.weight
+        ):
             router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
         else:
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
@@ -439,9 +444,11 @@ def fused_qk_rmsnorm(
     tp_group: tuple[int, ...],
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route to the Lamport fused-AR QK RMSNorm kernel when its shape
-    constraints hold, else fall back to the Triton sumsq/apply path.
-    Setting TOKENSPEED_MINIMAX_AR_USE_TRITON=1 forces the Triton path (A/B debug)."""
+    """Use the Lamport fused-AR QK RMSNorm path when its shape constraints hold.
+
+    Setting TOKENSPEED_MINIMAX_AR_USE_TRITON=1 forces the Triton sumsq/apply
+    fallback for A/B debugging.
+    """
     if (
         not _FORCE_TRITON_AR_RMSNORM
         and q_weight_bf16 is not None
@@ -459,8 +466,9 @@ def fused_qk_rmsnorm(
             dtype_elem_size=q.element_size(),
         )
         if workspace is not None:
-            # Kernel reads q/k at their row stride (q_row_stride_f4), so a
-            # non-contiguous slice from a fused-QKV split is fine.
+            # The comm wrapper passes Python-visible Q/K row strides into the
+            # CUDA fast path. Relying on TensorView strides for fused-QKV
+            # strided views was numerically invalid for multi-token batches.
             return minimax_allreduce_rms_qk(
                 q=q,
                 k=k,
@@ -524,6 +532,27 @@ def remap_minimax_weight_name(name: str) -> str:
     if "block_sparse_moe" in name:
         name = name.replace("block_sparse_moe", "mlp")
     return name
+
+
+def get_spec_layer_idx_from_weight_name(
+    config: MiniMaxM2Config, weight_name: str
+) -> int | None:
+    """Return the extra speculative layer index encoded after main layers.
+
+    Public MiniMax-M2 configs can carry speculative-decoding metadata even when
+    the released checkpoints do not include those extra layer weights. The
+    serving model instantiated here is main-model only, so extra layers beyond
+    ``num_hidden_layers`` should be ignored if a checkpoint ever includes them.
+    """
+    num_spec_modules = int(getattr(config, "num_mtp_modules", 0) or 0)
+    layers_per_spec_module = int(getattr(config, "mtp_transformer_layers", 1) or 1)
+    num_spec_layers = num_spec_modules * layers_per_spec_module
+    start_layer = int(config.num_hidden_layers)
+    for i in range(num_spec_layers):
+        layer_idx = start_layer + i
+        if weight_name.startswith(f"model.layers.{layer_idx}."):
+            return layer_idx
+    return None
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -793,7 +822,9 @@ class MiniMaxM2ForCausalLM(BaseCausalLM):
         return ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            # MiniMax-M2 checkpoints keep lm_head unquantized even when the
+            # transformer weights use block FP8.
+            quant_config=None,
             prefix=add_prefix("lm_head", prefix),
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
@@ -852,7 +883,7 @@ class MiniMaxM2ForCausalLM(BaseCausalLM):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "mtp" in name:
+            if get_spec_layer_idx_from_weight_name(self.config, name) is not None:
                 continue
 
             name = remap_minimax_weight_name(name)

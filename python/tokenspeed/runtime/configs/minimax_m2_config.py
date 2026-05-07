@@ -31,7 +31,7 @@ logger = logging.get_logger(__name__)
 class MiniMaxM2Config(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`MiniMaxM2Model`].
-    It is used to instantiate a MiniMax-M2.5 model according to the specified arguments,
+    It is used to instantiate MiniMax-M2 family models according to the specified arguments,
     defining the model architecture.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs.
@@ -82,9 +82,6 @@ class MiniMaxM2Config(PretrainedConfig):
         # QK-Norm
         use_qk_norm=True,
         qk_norm_type="per_layer",
-        # MTP
-        num_mtp_modules=3,
-        mtp_transformer_layers=1,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -119,9 +116,8 @@ class MiniMaxM2Config(PretrainedConfig):
         # QK-Norm
         self.use_qk_norm = use_qk_norm
         self.qk_norm_type = qk_norm_type
-        # MTP
-        self.num_mtp_modules = num_mtp_modules
-        self.mtp_transformer_layers = mtp_transformer_layers
+        # Preserve extra public checkpoint metadata through PretrainedConfig
+        # without making it part of the MiniMax-M2 serving runtime.
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,

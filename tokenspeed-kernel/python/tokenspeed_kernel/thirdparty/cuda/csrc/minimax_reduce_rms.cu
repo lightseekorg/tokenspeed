@@ -87,7 +87,8 @@ void minimax_allreduce_rms_qk(TensorView q, TensorView k, TensorView norm_weight
                               TensorView norm_weight_k, TensorView rms_norm_out_q,
                               TensorView rms_norm_out_k, TensorView workspace, int64_t rank,
                               int64_t nranks, double eps, bool trigger_completion_at_end,
-                              bool launch_with_pdl) {
+                              bool launch_with_pdl, int64_t q_row_stride_override,
+                              int64_t k_row_stride_override) {
   cudaSetDevice(q.device().device_id);
   TVM_FFI_ICHECK_EQ(q.dtype(), k.dtype()) << "minimax_allreduce_rms_qk: q/k dtype mismatch";
   TVM_FFI_ICHECK_EQ(q.ndim(), 2) << "q must be 2D";
@@ -127,8 +128,10 @@ void minimax_allreduce_rms_qk(TensorView q, TensorView k, TensorView norm_weight
   // every row 16-byte aligned. Inner stride must be 1 (no transposed views).
   const MinimaxDType dtype = dlpack_to_minimax_dtype(q.dtype());
   const int elems_per_access = (dtype == MinimaxDType::kFLOAT) ? 4 : 8;
-  const int64_t q_row_stride_elems = q.stride(0);
-  const int64_t k_row_stride_elems = k.stride(0);
+  const int64_t q_row_stride_elems =
+      q_row_stride_override > 0 ? q_row_stride_override : q.stride(0);
+  const int64_t k_row_stride_elems =
+      k_row_stride_override > 0 ? k_row_stride_override : k.stride(0);
   TVM_FFI_ICHECK_EQ(q.stride(1), 1)
       << "minimax_allreduce_rms_qk: q inner stride must be 1, got " << q.stride(1);
   TVM_FFI_ICHECK_EQ(k.stride(1), 1)

@@ -213,7 +213,7 @@ def _per_token_group_quant_8bit_raw(
     """
     assert (
         x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    ), "the last dimension of `x` must be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if _is_amd:
@@ -307,16 +307,37 @@ def per_token_group_quant_fp8(
 ):
     if (
         _is_nvidia
+        and group_size == 128
+        and x.ndim == 2
+        and x.dtype == torch.bfloat16
         and not column_major_scales
         and not scale_tma_aligned
         and not scale_ue8m0
     ):
-        return _trtllm_per_token_group_quant_fp8(x, group_size)
+        assert (
+            x.shape[-1] % group_size == 0
+        ), "the last dimension of `x` must be divisible by `group_size`"
+        M = x.shape[0]
+        x_q, x_s = _trtllm_per_token_group_quant_fp8(x, group_size)
+        # TRT-LLM returns scales grouped by K-block, with the M dimension
+        # padded to a multiple of 4:
+        #   [group0_m0..group0_m_aligned, group1_m0..]
+        # Convert that flat group-major layout back to the row-major
+        # (M, K/group_size) layout expected by downstream kernels.
+        num_groups = x.shape[-1] // group_size
+        aligned_m = align(M, 4)
+        x_s = (
+            x_s[: num_groups * aligned_m]
+            .reshape(num_groups, aligned_m)
+            .transpose(0, 1)[:M]
+            .contiguous()
+        )
+        return x_q, x_s
 
     return _per_token_group_quant_8bit_raw(
         x,
         group_size,
-        dtype=torch.int8,
+        dtype=fp8_dtype,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
