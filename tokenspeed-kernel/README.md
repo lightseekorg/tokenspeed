@@ -131,6 +131,7 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 ```python
 from tokenspeed_kernel import (
     mha_prefill, mha_prefill_with_kvcache, mha_decode_with_kvcache,
+    mla_decode_with_kvcache,
     mm,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...
@@ -141,6 +142,12 @@ Using the above platform and solution-agnostic public APIs can get the most
 value out of TokenSpeed-kernel; but one can also directly call into a
 specific solution under `ops/<family>/`, or manually `select_kernel` with
 targeted filters:
+
+MLA decode has a separate public API because its query and KV cache layout are
+different from MHA/GQA decode. `mla_decode_with_kvcache` selects the best
+registered MLA backend for the current platform. This currently registers the
+TokenSpeed MLA backend for Blackwell; Hopper intentionally has no default
+native MLA backend until a dedicated Hopper implementation lands.
 
 ```python
 from tokenspeed_kernel.selection import select_kernel, kernel_override

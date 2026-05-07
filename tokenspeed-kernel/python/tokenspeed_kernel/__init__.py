@@ -23,6 +23,7 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
+    mla_decode_with_kvcache,
     mha_decode_with_kvcache,
     mha_prefill,
     mha_prefill_with_kvcache,
@@ -46,4 +47,5 @@ __all__ = [
     "mha_prefill",
     "mha_prefill_with_kvcache",
     "mha_decode_with_kvcache",
+    "mla_decode_with_kvcache",
 ]

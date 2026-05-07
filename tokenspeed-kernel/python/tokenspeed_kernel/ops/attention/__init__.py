@@ -23,6 +23,7 @@ from __future__ import annotations
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.attention.tokenspeed_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -34,6 +35,7 @@ __all__ = [
     "mha_prefill",
     "mha_prefill_with_kvcache",
     "mha_decode_with_kvcache",
+    "mla_decode_with_kvcache",
 ]
 
 
@@ -362,4 +364,116 @@ def mha_decode_with_kvcache(
             sinks=sinks,
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
+        )
+
+
+def _mla_page_size(kv_cache: torch.Tensor) -> int:
+    if kv_cache.dim() == 3:
+        return kv_cache.shape[1]
+    if kv_cache.dim() == 4 and kv_cache.shape[1] == 1:
+        return kv_cache.shape[2]
+    if kv_cache.dim() == 4 and kv_cache.shape[2] == 1:
+        return kv_cache.shape[1]
+    raise ValueError(
+        "MLA kv_cache must be [pages, page_size, dim], "
+        "[pages, 1, page_size, dim], or [pages, page_size, 1, dim]"
+    )
+
+
+def mla_decode_with_kvcache(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    workspace_buffer: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    output_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+    is_var_seq: bool = True,
+    causal_mask: bool = True,
+    enable_pdl: bool = False,
+    override: str | None = None,
+) -> torch.Tensor:
+    """Paged MLA decode.
+
+    Query shape is ``[batch, query_len, num_heads, head_dim]`` where
+    ``head_dim = kv_lora_rank + qk_rope_head_dim``.  KV cache is packed MLA
+    cache in one of the accepted paged layouts.
+    """
+    if query.dim() != 4:
+        raise ValueError(
+            "MLA query must be [batch, query_len, num_heads, head_dim], "
+            f"got shape {tuple(query.shape)}"
+        )
+    expected_head_dim = kv_lora_rank + qk_rope_head_dim
+    if query.shape[-1] != expected_head_dim:
+        raise ValueError(
+            f"query head_dim must be {expected_head_dim}, got {query.shape[-1]}"
+        )
+    if kv_cache.shape[-1] != expected_head_dim:
+        raise ValueError(
+            f"kv_cache last dim must be {expected_head_dim}, got {kv_cache.shape[-1]}"
+        )
+
+    page_size = _mla_page_size(kv_cache)
+    traits = {
+        "query_len": query.shape[1],
+        "num_q_heads": query.shape[2],
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": page_size,
+    }
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        query.dtype,
+        features=frozenset({"mla", "paged"}),
+        traits=traits,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": query.shape[0],
+        "query_len": query.shape[1],
+        "num_pages": kv_cache.shape[0],
+        "page_size": page_size,
+        "max_pages_per_seq": block_tables.shape[1],
+        "num_q_heads": query.shape[2],
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "max_seq_len": max_seq_len,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_decode_with_kvcache",
+        kernel.name,
+        query.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_decode_with_kvcache",
+        query.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            workspace_buffer=workspace_buffer,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+            out=out,
+            is_var_seq=is_var_seq,
+            causal_mask=causal_mask,
+            enable_pdl=enable_pdl,
         )
