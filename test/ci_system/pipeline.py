@@ -570,9 +570,10 @@ def extract_evalscope_score(report_table: str) -> float | None:
 
     for line in report_table.splitlines():
         stripped = line.strip()
-        if not stripped.startswith("|"):
+        if not stripped.startswith(("|", "│")):
             continue
-        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        separator = "│" if stripped.startswith("│") else "|"
+        cells = [cell.strip() for cell in stripped.strip(separator).split(separator)]
         if not cells:
             continue
         if any(set(cell) <= {"=", "-"} for cell in cells if cell):
