@@ -407,8 +407,13 @@ class EventLoop:
         """Unload a LoRA adapter and free its GPU slot."""
         if self._lora_manager is None:
             raise KeyError(f"No LoRA adapters loaded; '{lora_name}' not found.")
+        lora_id = self._lora_path_to_id.get(lora_name)
         self._lora_manager.unload_adapter(lora_name)
         self._lora_path_to_id.pop(lora_name, None)
+        # Proactively evict the KV cache namespace for this adapter so pages
+        # are freed immediately rather than waiting for LRU eviction pressure.
+        if lora_id is not None:
+            self.scheduler.evict_lora_namespace(lora_id)
 
     def _setup_pd_layerwise_transfer(self, interval: int) -> None:
         if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):

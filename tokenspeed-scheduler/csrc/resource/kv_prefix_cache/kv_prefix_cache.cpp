@@ -69,7 +69,6 @@ TreeNode* KVPrefixCache::getOrCreateLoraRoot(std::int32_t lora_id) {
     // all adapter sequences have been evicted.
     raw->AttachResource<ResourceType::Device>(
         std::make_unique<NodeResource<ResourceType::Device>>(OwnedPages{}));
-    device_.UpdateLeaves(raw);  // IsLeaf → false (IsEmpty == true), so not added to eviction set
     token_vec_t key(sentinel.begin(), sentinel.begin() + page_size);
     tree_.Root()->AddChild(key, std::move(node));
     slot = raw;
@@ -244,6 +243,38 @@ bool KVPrefixCache::EnsureCapacityByEvict(std::int32_t required_num_pages) {
 
 cache_op_id KVPrefixCache::AllocateCacheOpId() {
     return next_op_id_++;
+}
+
+void KVPrefixCache::EvictLoraNamespace(std::int32_t lora_id) {
+    auto it = lora_virtual_roots_.find(lora_id);
+    if (it == lora_virtual_roots_.end() || it->second == nullptr) {
+        return;
+    }
+    TreeNode* vroot = it->second;
+
+    // Collect all descendant nodes via DFS (excluding the virtual root itself,
+    // which holds no real KV pages).
+    std::vector<TreeNode*> descendants;
+    std::function<void(TreeNode*)> collect = [&](TreeNode* node) {
+        for (auto& [key, child] : node->Children()) {
+            if (!child) continue;
+            descendants.push_back(child.get());
+            collect(child.get());
+        }
+    };
+    collect(vroot);
+
+    // Evict device and host pages. OwnedPages RAII returns them to the allocator.
+    device_.EvictSubtree(descendants);
+    host_.EvictSubtree(descendants);
+
+    // Remove the virtual root from the tree. The unique_ptr cascade destroys the
+    // entire subtree (including any mamba slots attached to those nodes).
+    token_vec_t sentinel(tree_.PageSize(), 0);
+    sentinel[0] = -lora_id;
+    tree_.Root()->RemoveChild(sentinel);
+
+    lora_virtual_roots_.erase(it);
 }
 
 template InsertResult KVPrefixCache::Insert<ResourceType::Device>(const token_vec_t&,

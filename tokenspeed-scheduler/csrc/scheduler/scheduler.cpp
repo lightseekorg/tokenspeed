@@ -308,4 +308,8 @@ void Scheduler::Advance(const ExecutionEvent& event) {
     }
 }
 
+void Scheduler::EvictLoraNamespace(std::int32_t lora_id) {
+    kv_prefix_cache_.EvictLoraNamespace(lora_id);
+}
+
 }  // namespace tokenspeed

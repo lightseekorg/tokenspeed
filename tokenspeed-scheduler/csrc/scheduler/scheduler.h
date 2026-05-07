@@ -63,6 +63,10 @@ public:
     std::size_t PrefillSize() const;
     std::int32_t GetRequestTokenSize(const std::string& id) const;
 
+    // Evict all KV pages cached under the given LoRA adapter's namespace and
+    // remove its virtual root from the prefix tree. Call on adapter unload.
+    void EvictLoraNamespace(std::int32_t lora_id);
+
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
     std::tuple<std::vector<ForwardOperation>,

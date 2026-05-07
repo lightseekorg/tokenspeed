@@ -126,6 +126,29 @@ std::vector<TreeNode*> ResourceManager<RType>::Evict(std::int32_t num_pages) {
 }
 
 template <ResourceType RType>
+void ResourceManager<RType>::EvictSubtree(const std::vector<TreeNode*>& nodes) {
+    for (TreeNode* node : nodes) {
+        bool has_resource;
+        if constexpr (RType == ResourceType::Device) {
+            has_resource = node->OnDevice();
+        } else {
+            has_resource = node->OnHost();
+        }
+        if (!has_resource) continue;
+
+        const auto& res = GetResource<RType>(node);
+        if (!res.IsEvictable()) continue;  // skip locked nodes; freed when request finishes
+
+        leaves_.erase(node);
+        auto resource_ptr = node->DetachResource<RType>();
+        if (eviction_callback_) {
+            eviction_callback_(node);
+        }
+        // OwnedPages RAII: pages returned to allocator on scope exit.
+    }
+}
+
+template <ResourceType RType>
 std::vector<TreeNode*> ResourceManager<RType>::EnsureCapacity(std::int32_t required_num_pages) {
     if (required_num_pages <= 0) {
         return {};

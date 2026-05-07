@@ -81,6 +81,13 @@ public:
     std::int32_t PageSize() const { return tree_.PageSize(); }
     DeviceManager& GetDeviceManager() { return device_; }
 
+    // Evict all KV pages cached under the given adapter's namespace and remove
+    // the virtual root from the tree. Call this when an adapter is unloaded so
+    // its pages are freed immediately rather than waiting for LRU pressure.
+    // Locked pages (in-flight requests) are skipped and freed when those
+    // requests finish.
+    void EvictLoraNamespace(std::int32_t lora_id);
+
 private:
     template <ResourceType RType>
     void pruneEvicted(const std::vector<TreeNode*>& evicted);

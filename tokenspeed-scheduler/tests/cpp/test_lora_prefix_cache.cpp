@@ -146,4 +146,37 @@ TEST_F(LoraPrefixCacheTest, EvictionDoesNotCrossNamespaces) {
     EXPECT_EQ(MatchDepth(2, 1, /*lora_id=*/2), 0);
 }
 
+// ---------------------------------------------------------------------------
+// EvictLoraNamespace: pages freed immediately on adapter unload
+// ---------------------------------------------------------------------------
+
+TEST_F(LoraPrefixCacheTest, EvictLoraNamespaceFreesPagesImmediately) {
+    const int32_t initial = device_alloc_->AvailablePages();
+
+    DoInsert(2, /*start_token=*/1, /*lora_id=*/1);
+    DoInsert(3, /*start_token=*/50, /*lora_id=*/2);
+    ASSERT_EQ(device_alloc_->AvailablePages(), initial - 5);
+
+    // Evict adapter 1's namespace only.
+    cache_->EvictLoraNamespace(1);
+    EXPECT_EQ(device_alloc_->AvailablePages(), initial - 3);
+
+    // Adapter 1's cache is gone; adapter 2's is untouched.
+    EXPECT_EQ(MatchDepth(2, 1, /*lora_id=*/1), 0);
+    EXPECT_EQ(MatchDepth(3, 50, /*lora_id=*/2), 3);
+
+    // Evict adapter 2; all pages returned.
+    cache_->EvictLoraNamespace(2);
+    EXPECT_EQ(device_alloc_->AvailablePages(), initial);
+}
+
+TEST_F(LoraPrefixCacheTest, EvictLoraNamespaceIdempotent) {
+    DoInsert(1, /*start_token=*/1, /*lora_id=*/5);
+    cache_->EvictLoraNamespace(5);
+    // Second call on a removed namespace must not crash.
+    EXPECT_NO_THROW(cache_->EvictLoraNamespace(5));
+    // Call on a namespace that was never created must not crash.
+    EXPECT_NO_THROW(cache_->EvictLoraNamespace(99));
+}
+
 }  // namespace tokenspeed::test

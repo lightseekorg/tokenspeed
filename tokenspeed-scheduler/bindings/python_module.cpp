@@ -303,5 +303,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
         .def("get_request_token_size", &tokenspeed::Scheduler::GetRequestTokenSize, nb::arg("id"))
         .def("calc_rolling_hash", &tokenspeed::Scheduler::CalcRollingHash, nb::arg("input_tokens"),
-             nb::arg("apply_match") = false);
+             nb::arg("apply_match") = false)
+        .def("evict_lora_namespace", &tokenspeed::Scheduler::EvictLoraNamespace, nb::arg("lora_id"));
 }
