@@ -466,9 +466,8 @@ def fused_qk_rmsnorm(
             dtype_elem_size=q.element_size(),
         )
         if workspace is not None:
-            # The comm wrapper passes Python-visible Q/K row strides into the
-            # CUDA fast path. Relying on TensorView strides for fused-QKV
-            # strided views was numerically invalid for multi-token batches.
+            # Kernel reads q/k at their row stride (q_row_stride_f4), so a
+            # non-contiguous slice from a fused-QKV split is fine.
             return minimax_allreduce_rms_qk(
                 q=q,
                 k=k,

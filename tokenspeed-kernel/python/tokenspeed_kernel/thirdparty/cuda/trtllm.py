@@ -927,14 +927,9 @@ def minimax_allreduce_rms_qk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused Q+K Lamport AR + RMSNorm. Requires global head_dim_q==6144 and
     global head_dim_k==1024 (i.e. MiniMax M2 attention)."""
-    # MiniMax attention passes Q/K as strided views from a fused QKV projection.
-    # Pass the Python-visible row strides explicitly because the TVM TensorView
-    # binding has not been reliable for non-compact input strides.
-    q_row_stride = q.stride(0)
-    k_row_stride = k.stride(0)
-
-    # Outputs must be tightly packed because the kernel writes them at head_dim
-    # stride regardless of the input layout.
+    # Outputs must be tightly packed (kernel writes them at head_dim stride);
+    # `q`/`k` may be strided slices, so don't preserve their layout via
+    # empty_like default (preserve_format) — force contiguous.
     if rms_norm_out_q is None:
         rms_norm_out_q = torch.empty_like(q, memory_format=torch.contiguous_format)
     if rms_norm_out_k is None:
@@ -952,8 +947,6 @@ def minimax_allreduce_rms_qk(
         eps,
         trigger_completion_at_end,
         launch_with_pdl,
-        q_row_stride,
-        k_row_stride,
     )
     return rms_norm_out_q, rms_norm_out_k
 
