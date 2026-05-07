@@ -212,6 +212,13 @@ class ServerArgs:
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
 
+    # LoRA adapter serving
+    enable_lora: bool = False
+    # Maximum number of non-pinned LoRA adapters resident in GPU memory at once.
+    max_loras: int = 4
+    # Maximum LoRA rank supported (caps adapter loading; larger = more GPU memory).
+    max_lora_rank: int = 64
+
     # Runtime options
     disable_pdl: bool = False
     enable_prefix_caching: bool = True
@@ -1351,6 +1358,26 @@ class ServerArgs:
             action="store_true",
             help="Disable PDL launch.",
         )
+        # LoRA adapter serving
+        parser.add_argument(
+            "--enable-lora",
+            action="store_true",
+            default=ServerArgs.enable_lora,
+            help="Enable LoRA adapter serving.",
+        )
+        parser.add_argument(
+            "--max-loras",
+            type=int,
+            default=ServerArgs.max_loras,
+            help="Maximum number of non-pinned LoRA adapters in GPU memory at once.",
+        )
+        parser.add_argument(
+            "--max-lora-rank",
+            type=int,
+            default=ServerArgs.max_lora_rank,
+            help="Maximum LoRA rank supported across all loaded adapters.",
+        )
+
         prefix_cache_group = parser.add_mutually_exclusive_group()
         prefix_cache_group.add_argument(
             "--enable-prefix-caching",

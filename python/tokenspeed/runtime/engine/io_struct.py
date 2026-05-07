@@ -136,6 +136,13 @@ class GenerateReqInput:
     bootstrap_port: list[int] | int | None = None
     bootstrap_room: list[int] | int | None = None
 
+    # LoRA adapter to use for this request.
+    # Supply the name under which the adapter was registered via
+    # Engine.load_lora_adapter(), or a filesystem path when the engine
+    # is configured with --enable-lora.
+    # None means use the base model (no adapter).
+    lora_path: list[str | None] | str | None = None
+
     def normalize_batch_and_arguments(self):
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None

@@ -78,3 +78,47 @@ class EngineBase(ABC):
     @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the engine and clean up resources."""
+
+    # ------------------------------------------------------------------
+    # LoRA adapter management
+    # ------------------------------------------------------------------
+
+    def load_lora_adapter(
+        self,
+        lora_name: str,
+        lora_path: str,
+        pinned: bool = False,
+    ) -> None:
+        """Load a LoRA adapter into GPU memory and register it under ``lora_name``.
+
+        Args:
+            lora_name: Short identifier used in subsequent requests
+                       (``GenerateReqInput.lora_path = lora_name``).
+            lora_path: Filesystem path to the PEFT adapter directory containing
+                       ``adapter_config.json`` and ``adapter_model.safetensors``.
+            pinned:    If True the adapter is never evicted from GPU memory even
+                       when ``max_loras`` resident adapters are exceeded.
+
+        Raises:
+            NotImplementedError: Until the full implementation is complete.
+            ValueError:          If the server was not started with --enable-lora.
+        """
+        raise NotImplementedError(
+            "LoRA adapter loading is not yet implemented. "
+            "Track progress at https://github.com/qywu/tokenspeed/pull/2"
+        )
+
+    def unload_lora_adapter(self, lora_name: str) -> None:
+        """Unload a previously loaded LoRA adapter and free its GPU memory.
+
+        Args:
+            lora_name: The name used when the adapter was loaded.
+
+        Raises:
+            NotImplementedError: Until the full implementation is complete.
+            KeyError:            If ``lora_name`` is not currently loaded.
+        """
+        raise NotImplementedError(
+            "LoRA adapter unloading is not yet implemented. "
+            "Track progress at https://github.com/qywu/tokenspeed/pull/2"
+        )
