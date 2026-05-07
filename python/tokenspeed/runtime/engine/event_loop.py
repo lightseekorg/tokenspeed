@@ -155,6 +155,12 @@ class EventLoop:
         )
 
         num_total_pages = self.max_total_num_tokens // server_args.block_size
+        hf_config = getattr(self.model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", None) if hf_config else None
+        has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
+            text_config is not None and hasattr(text_config, "mamba2_cache_params")
+        )
+        enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
@@ -244,6 +250,13 @@ class EventLoop:
         # req_pool_slots based on this value, so it must match the
         # per-DP-rank budget (same division used in cuda_graph_wrapper).
         per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
+        if enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+            logger.info(
+                f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
+                f"Auto-derived mamba_pool_total_chunks={mamba_pool_total_chunks} "
+                f"(ratio={server_args.mamba_full_memory_ratio})."
+            )
+
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
             max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -259,7 +272,10 @@ class EventLoop:
                 if server_args.speculative_algorithm is not None
                 else 1
             ),
-            num_mamba_slots=mamba_pool_total_chunks,
+            disable_prefix_cache=not server_args.enable_prefix_caching,
+            enable_mamba=enable_mamba_radix_cache,
+            mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
+            mamba_pool_total_chunks=mamba_pool_total_chunks,
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "

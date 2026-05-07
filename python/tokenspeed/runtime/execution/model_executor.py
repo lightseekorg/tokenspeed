@@ -101,6 +101,7 @@ class ModelExecutorConfig:
     # Force the synchronous eager grammar fallback even on CUDA. For
     # parity-testing the captured-grammar path.
     disable_capturable_grammar: bool = False
+    mamba_cache_chunk_size: int = 64
 
     @staticmethod
     def from_server_args(
@@ -141,6 +142,7 @@ class ModelExecutorConfig:
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
+            mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
         )
 
 

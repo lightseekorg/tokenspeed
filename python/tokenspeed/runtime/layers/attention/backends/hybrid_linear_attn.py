@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -55,10 +55,17 @@ if TYPE_CHECKING:
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
     mamba_cache_indices: torch.Tensor
-    track_lens: torch.Tensor | None = None
-    track_mask: torch.Tensor | None = None
-    track_ssm_h_src: torch.Tensor | None = None
-    track_ssm_h_dst: torch.Tensor | None = None
+    extend_prefix_lens: Optional[torch.Tensor] = None
+    # --- branching tracking (prefix cache) ---
+    # Per-request relative offset within extend tokens where intermediate state
+    # should be tracked.  None when no branching tracking is needed.
+    track_lens: Optional[torch.Tensor] = None
+    track_mask: Optional[torch.Tensor] = None
+    # Pre-computed src/dst indices for extracting SSM states from h / final_state
+    track_ssm_h_src: Optional[torch.Tensor] = None
+    track_ssm_h_dst: Optional[torch.Tensor] = None
+    track_ssm_final_src: Optional[torch.Tensor] = None
+    track_ssm_final_dst: Optional[torch.Tensor] = None
 
 
 class LayerMappedKVPool:
@@ -177,7 +184,9 @@ class SimpleMambaPool:
 
     def get_mamba_indices(self, mamba_pool_indices: torch.Tensor) -> torch.Tensor:
         """Return mamba cache indices directly (allocated by C++ scheduler)."""
-        return mamba_pool_indices.to(torch.int32)
+        indices = mamba_pool_indices.to(torch.int32)
+        valid_mask = (indices >= 0) & (indices < self.size)
+        return torch.where(valid_mask, indices, torch.full_like(indices, -1))
 
     def get_mamba_params(self, layer_id: int):
         """Return per-layer cache slices."""
@@ -281,10 +290,13 @@ class MambaAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        # --- Branching tracking (prefix cache) ---
         track_lens = None
         track_mask = None
         track_ssm_h_src = None
         track_ssm_h_dst = None
+        track_ssm_final_src = None
+        track_ssm_final_dst = None
         if forward_mode.is_extend() and not forward_mode.is_target_verify():
             mamba_branching_seqlens = kwargs.get("mamba_branching_seqlens")
             extend_prefix_lens_kw = kwargs.get("extend_prefix_lens")
@@ -303,18 +315,29 @@ class MambaAttnBackend(AttentionBackend):
                 track_indices = mamba_track_pool_indices[:bs].to(
                     dtype=torch.int32, device=self.device
                 )
-                track_mask = (branching > 0) & (track_indices >= 0)
+                extend_lens = seq_lens[:bs] - prefix
+                # Only publish complete mamba snapshots.  The prefill conv
+                # path mutates conv_state to the final window only; arbitrary
+                # intermediate conv windows are not available here.
+                track_mask = (
+                    (branching > 0)
+                    & (track_indices >= 0)
+                    & ((branching - prefix) == extend_lens)
+                )
                 if track_mask.any():
+                    # lens_to_track: relative offset inside extend tokens
                     track_lens = branching - prefix
                     (
                         track_ssm_h_src,
                         track_ssm_h_dst,
+                        track_ssm_final_src,
+                        track_ssm_final_dst,
                     ) = self._compute_track_ssm_indices(
                         track_lens,
                         track_mask,
                         mamba_cache_indices,
                         track_indices,
-                        seq_lens[:bs] - prefix,
+                        seq_lens[:bs] - prefix,  # extend_seq_lens
                     )
                 else:
                     track_mask = None
@@ -322,10 +345,13 @@ class MambaAttnBackend(AttentionBackend):
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            extend_prefix_lens=kwargs.get("extend_prefix_lens"),
             track_lens=track_lens,
             track_mask=track_mask,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
+            track_ssm_final_src=track_ssm_final_src,
+            track_ssm_final_dst=track_ssm_final_dst,
         )
 
     def _compute_track_ssm_indices(
@@ -338,8 +364,8 @@ class MambaAttnBackend(AttentionBackend):
     ):
         """Compute src/dst indices for extracting intermediate SSM states.
 
-        * *aligned* sequences (len % CHUNK_SIZE == 0) -> copy from final_state
-        * *unaligned* sequences -> extract from intermediate h tensor
+        Full-extend snapshots copy from final_state. Other snapshots are
+        intermediate states that must come from h.
 
         dst indices use the tracking pool slots (separate from working slots)
         so that the final state in the working slot is not overwritten.
@@ -350,19 +376,29 @@ class MambaAttnBackend(AttentionBackend):
 
         lens_m = track_lens[track_mask]
         offset_m = offset[track_mask]
-        dst_m = mamba_track_indices[track_mask]
+        dst_m = mamba_track_indices[track_mask]  # write to TRACKING slots
 
-        is_aligned = (lens_m % FLA_CHUNK_SIZE) == 0
-        not_aligned = ~is_aligned
-        track_ssm_h_src = offset_m[not_aligned] + (
-            lens_m[not_aligned] // FLA_CHUNK_SIZE
-        )
-        track_ssm_h_dst = dst_m[not_aligned]
+        extend_len_m = extend_seq_lens[track_mask]
+        is_final = lens_m == extend_len_m
+
+        # Final snapshot: state lives in final_state buffer
+        # (== ssm_states[working_cache_idx]).
+        track_ssm_final_src = mamba_cache_indices[track_mask][is_final]
+        track_ssm_final_dst = dst_m[is_final]
+
+        # Intermediate snapshot: state lives in intermediate h tensor.
+        not_final = ~is_final
+        track_ssm_h_src = offset_m[not_final] + (lens_m[not_final] // FLA_CHUNK_SIZE)
+        track_ssm_h_dst = dst_m[not_final]
 
         return (
             track_ssm_h_src,
             track_ssm_h_dst,
+            track_ssm_final_src,
+            track_ssm_final_dst,
         )
+
+    # ---- CUDA graph state ----
 
     def init_cuda_graph_state(
         self, max_num_tokens: int, seq_lens_buf: torch.Tensor = None
@@ -439,14 +475,13 @@ class MambaAttnBackend(AttentionBackend):
         req_pool_indices[bs - num_padding :] = 0
         mamba_pool_indices = kwargs.get("mamba_pool_indices")
         if mamba_pool_indices is not None:
-            real_bs = len(mamba_pool_indices)
-            mamba_indices = self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
+            mamba_pool_indices = mamba_pool_indices[:bs]
+            mamba_pool_indices[bs - num_padding :] = 0
+            mamba_indices = self.pool.get_mamba_indices(mamba_pool_indices)
         else:
             mamba_indices = self.pool.get_mamba_indices(req_pool_indices)
-            real_bs = len(mamba_indices)
-        self.state_indices_list[bs - 1][:real_bs].copy_(mamba_indices[:real_bs])
-        if real_bs < bs:
-            self.state_indices_list[bs - 1][real_bs:].fill_(self.pad_slot_id)
+        mamba_indices[bs - num_padding :] = -1
+        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
@@ -482,6 +517,8 @@ class MambaAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    # ---- Forward ----
 
     def forward_decode(
         self,
@@ -562,6 +599,7 @@ class MambaAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        forward_mode: ForwardMode,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -581,7 +619,7 @@ class MambaAttnBackend(AttentionBackend):
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
 
-        is_target_verify = kwargs.get("is_target_verify", False)
+        is_target_verify = forward_mode.is_target_verify()
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -596,12 +634,6 @@ class MambaAttnBackend(AttentionBackend):
                 intermediate_state_cache,
                 intermediate_conv_window_cache,
             ) = self.pool.get_mamba_params(layer_id)
-            has_initial_states = torch.ones(
-                seq_len // draft_token_num,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            conv_states_to_use = conv_states.clone()
 
             batch_size = seq_len // draft_token_num
             mixed_qkv_reshaped = (
@@ -611,7 +643,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states_to_use,
+                conv_states,
                 conv_weights,
                 bias,
                 activation,
@@ -624,11 +656,12 @@ class MambaAttnBackend(AttentionBackend):
         else:
             conv_states, ssm_states, *rest = self.pool.get_mamba_params(layer_id)
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
+            if extend_prefix_lens is None:
+                extend_prefix_lens = self.forward_metadata.extend_prefix_lens
             extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
             has_initial_states = (
                 extend_prefix_lens > 0 if extend_prefix_lens is not None else None
             )
-            conv_states_to_use = conv_states
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             mixed_qkv = causal_conv1d_fn(
@@ -636,7 +669,7 @@ class MambaAttnBackend(AttentionBackend):
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use,
+                conv_states=conv_states,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -690,11 +723,11 @@ class MambaAttnBackend(AttentionBackend):
             beta = beta.unsqueeze(0)
 
             recurrent_state = ssm_states[cache_indices]
-            need_track = (
+            need_branching_track = (
                 self.forward_metadata.track_mask is not None
                 and self.forward_metadata.track_mask.any()
             )
-            if need_track:
+            if need_branching_track:
                 core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                     q=query,
                     k=key,
@@ -724,13 +757,25 @@ class MambaAttnBackend(AttentionBackend):
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
-            # Copy tracked intermediate states for prefix caching
-            if need_track:
-                h = h.squeeze(0)
+            h_states = h.squeeze(0) if need_branching_track and h is not None else None
+
+            # Copy tracked intermediate states for prefix caching (branching)
+            if need_branching_track:
                 if self.forward_metadata.track_ssm_h_src.numel() > 0:
-                    ssm_states[self.forward_metadata.track_ssm_h_dst] = h[
+                    if h_states is None:
+                        raise RuntimeError(
+                            "Missing intermediate mamba states for branching track"
+                        )
+                    ssm_states[self.forward_metadata.track_ssm_h_dst] = h_states[
                         self.forward_metadata.track_ssm_h_src
                     ].to(ssm_states.dtype, copy=False)
+                if self.forward_metadata.track_ssm_final_src.numel() > 0:
+                    conv_states[self.forward_metadata.track_ssm_final_dst] = (
+                        conv_states[self.forward_metadata.track_ssm_final_src]
+                    )
+                    ssm_states[self.forward_metadata.track_ssm_final_dst] = ssm_states[
+                        self.forward_metadata.track_ssm_final_src
+                    ]
 
         return core_attn_out
 
@@ -752,12 +797,18 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _backends(self):
         return [self.full_attn_backend, self.linear_attn_backend]
 
+    def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
+        if self.linear_attn_backend is None or layer_id in self.full_attn_layers:
+            return self.full_attn_backend
+        return self.linear_attn_backend
+
     _MAMBA_KWARGS = frozenset(
         {
             "mamba_pool_indices",
             "mamba_cow_src_indices",
             "mamba_branching_seqlens",
             "mamba_track_pool_indices",
+            "mamba_cache_chunk_size",
         }
     )
 
@@ -771,6 +822,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             else:
                 common_kw[k] = v
         return common_kw, mamba_kw
+
+    # ---- Metadata delegation ----
 
     def init_forward_metadata(self, *args, **kwargs):
         common_kw, mamba_kw = self._split_mamba_kwargs(kwargs)
@@ -809,6 +862,8 @@ class HybridLinearAttnBackend(AttentionBackend):
     def support_kv_cache_prewrite(self) -> bool:
         return self.full_attn_backend.support_kv_cache_prewrite
 
+    # ---- Forward dispatch ----
+
     def forward(
         self,
         q: torch.Tensor,
@@ -840,10 +895,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        if layer_id in self.full_attn_layers:
-            backend = self.full_attn_backend
-        else:
-            backend = self.linear_attn_backend
+        backend = self._backend_for_layer(layer_id)
 
         if forward_mode.is_decode():
             return backend.forward_decode(
@@ -887,21 +939,13 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def forward_decode(self, q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        if layer_id in self.full_attn_layers:
-            return self.full_attn_backend.forward_decode(
-                q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs
-            )
-        return self.linear_attn_backend.forward_decode(
+        return self._backend_for_layer(layer_id).forward_decode(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs
         )
 
     def forward_extend(self, q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        if layer_id in self.full_attn_layers:
-            return self.full_attn_backend.forward_extend(
-                q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs
-            )
-        return self.linear_attn_backend.forward_extend(
+        return self._backend_for_layer(layer_id).forward_extend(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs
         )
 

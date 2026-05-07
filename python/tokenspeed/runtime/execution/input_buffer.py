@@ -249,9 +249,7 @@ class InputBuffers:
             self.mamba_pool_indices_buf[:batch_size].copy_(t_pool, non_blocking=True)
             self.mamba_cow_src_indices_buf[:batch_size].copy_(t_cow, non_blocking=True)
             self.mamba_branching_seqlens_buf[:batch_size].copy_(t_br, non_blocking=True)
-            self.mamba_track_pool_indices_buf[:batch_size].copy_(
-                t_track, non_blocking=True
-            )
+            self.mamba_track_pool_indices_buf[:batch_size].copy_(t_track, non_blocking=True)
             if batch_size < self.mamba_pool_indices_buf.shape[0]:
                 self.mamba_pool_indices_buf[batch_size:].fill_(-1)
                 self.mamba_cow_src_indices_buf[batch_size:].fill_(-1)

@@ -56,7 +56,10 @@ def make_config(
     prefetch_threshold: int,
     role: str,
     decode_input_tokens: int = 1,
-    num_mamba_slots: int = 0,
+    disable_prefix_cache: bool = False,
+    enable_mamba: bool = False,
+    mamba_cache_chunk_size: int = 64,
+    mamba_pool_total_chunks: int = 0,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -76,8 +79,12 @@ def make_config(
         cfg.role = SchedulerConfig.Role.Fused
     cfg.num_device_pages = num_device_pages
     cfg.decode_input_tokens = decode_input_tokens
+    cfg.disable_prefix_cache = disable_prefix_cache
     cfg.disable_l2_cache = disable_l2_cache
-    cfg.num_mamba_slots = num_mamba_slots
+
+    cfg.enable_mamba = enable_mamba
+    cfg.mamba_cache_chunk_size = mamba_cache_chunk_size
+    cfg.mamba_pool_total_chunks = mamba_pool_total_chunks
     return cfg
 
 

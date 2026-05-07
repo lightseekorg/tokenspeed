@@ -147,7 +147,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("prefetch_threshold", &tokenspeed::SchedulerConfig::prefetch_threshold)
-        .def_rw("num_mamba_slots", &tokenspeed::SchedulerConfig::num_mamba_slots);
+        .def_rw("num_mamba_slots", &tokenspeed::SchedulerConfig::num_mamba_slots)
+        .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
+        .def_rw("enable_mamba", &tokenspeed::SchedulerConfig::enable_mamba)
+        .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)
+        .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks)
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
@@ -236,6 +240,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("hist_token_lens", &tokenspeed::FlatForwardOperation::hist_token_lens)
         .def("num_extends", &tokenspeed::FlatForwardOperation::num_extends)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
+        .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
         .def_ro("mamba_track_pool_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
         .def_ro("mamba_cow_src_indices", &tokenspeed::FlatForwardOperation::mamba_cow_src_indices)
         .def_ro("mamba_branching_seqlens", &tokenspeed::FlatForwardOperation::mamba_branching_seqlens);

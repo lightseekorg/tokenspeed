@@ -23,8 +23,12 @@
 
 namespace tokenspeed {
 
-HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator)
-    : kv_prefix_cache_{kv_prefix_cache}, mamba_allocator_{mamba_allocator}, mamba_eviction_manager_{mamba_allocator} {}
+HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
+                                     std::int32_t mamba_cache_chunk_size)
+    : kv_prefix_cache_{kv_prefix_cache},
+      mamba_allocator_{mamba_allocator},
+      mamba_eviction_manager_{mamba_allocator},
+      mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
 MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids) {
     auto match = kv_prefix_cache_.Match(token_ids);
@@ -44,6 +48,11 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
 
     TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
     if (mamba_node == nullptr) {
+        const std::int32_t kv_depth = match.device.DepthInPage();
+        const std::int32_t aligned_seqlen = alignMambaBranchingSeqlen(kv_depth * match.device.page_size);
+        if (aligned_seqlen > 0) {
+            match.mamba_branching_seqlen = aligned_seqlen;
+        }
         TreeNode* root = kv_terminal;
         while (!root->IsRoot()) root = root->Parent();
         match.device.last_node = root;
@@ -58,11 +67,19 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
     match.mamba_cow_src_index = mamba_node->MambaSlotIndex();
 
     if (kv_depth > mamba_depth) {
-        match.mamba_branching_seqlen = kv_depth * page_size;
+        const std::int32_t aligned_seqlen = alignMambaBranchingSeqlen(kv_depth * page_size);
+        if (aligned_seqlen > mamba_depth * page_size) {
+            match.mamba_branching_seqlen = aligned_seqlen;
+        }
     }
 
     match.device.last_node = mamba_node;
     match.host.last_node = mamba_node;
+}
+
+std::int32_t HybridPrefixCache::alignMambaBranchingSeqlen(std::int32_t seqlen) const {
+    if (mamba_cache_chunk_size_ <= 0) return seqlen;
+    return (seqlen / mamba_cache_chunk_size_) * mamba_cache_chunk_size_;
 }
 
 TreeNode* HybridPrefixCache::FindLastMambaNode(TreeNode* from) const {

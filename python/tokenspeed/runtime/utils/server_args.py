@@ -97,6 +97,8 @@ class ServerArgs:
     # special kv cache
     mamba_ssm_dtype: str = "float32"
     mamba_track_interval: int = 256
+    max_mamba_cache_size: int | None = None
+    mamba_full_memory_ratio: float = 0.9
 
     # Other runtime options
     stream_interval: int = 1
@@ -911,6 +913,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
         )
 
         parser.add_argument(
