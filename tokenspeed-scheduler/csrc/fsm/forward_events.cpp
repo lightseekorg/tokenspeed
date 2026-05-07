@@ -60,11 +60,11 @@ std::vector<std::tuple<std::int32_t, std::int32_t>> BuildWriteBackPairs(
 
 namespace tokenspeed::fsm {
 
-void InsertHybridCache(HybridPrefixCache* hybrid_cache,
+void InsertPrefixCache(KVPrefixCache* kv_prefix_cache, HybridPrefixCache* hybrid_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator) {
-    if (hybrid_cache == nullptr) return;
+    if (kv_prefix_cache == nullptr) return;
 
     std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
     std::int32_t new_page_count =
@@ -72,10 +72,10 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
     if (new_page_count <= 0) return;
 
     OwnedPages pages_to_insert = local_kv_allocator->TakeFirst(new_page_count);
-    auto insert_result = hybrid_cache->GetKVPrefixCache().Insert<ResourceType::Device>(full_paged_tokens, prefix_pages,
-                                                                                       std::move(pages_to_insert));
+    auto insert_result =
+        kv_prefix_cache->Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(pages_to_insert));
 
-    if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
+    if (hybrid_cache != nullptr && local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
         hybrid_cache->InsertMamba(insert_result.last_node, local_mamba_allocator->DetachCheckpoint());
     }
     device_node_ref = std::make_unique<DeviceNodeRef>(insert_result.last_node);
@@ -155,7 +155,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
         paged_tokens.resize(end_of_window_pages);
     }
-    InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
+    InsertPrefixCache(kv_prefix_cache_, hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get());
     // Allocate KV pages for the new chunk
     local_kv_allocator->Acquire(tokens_this_round_);
@@ -202,7 +202,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
         paged_tokens.resize(end_of_window_pages);
     }
-    InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
+    InsertPrefixCache(kv_prefix_cache_, hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get());
 
     // Allocate fresh checkpoint for decode-phase mamba state tracking

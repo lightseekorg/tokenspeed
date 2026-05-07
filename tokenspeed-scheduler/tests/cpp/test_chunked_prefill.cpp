@@ -87,6 +87,21 @@ TEST_F(ChunkedPrefillTestSuite, PrefillFirst_ContinuesPrefillBeforeNewSubmitted)
     EXPECT_EQ(fwd->request_ids[0], "r1");
 }
 
+TEST_F(ChunkedPrefillTestSuite, CompletedChunk_IsVisibleToPrefixCacheWithoutHybridCache) {
+    Submit(MakeRequestSpec("r1", 4));  // 8 tokens, needs 2 chunks
+    PlanOnce();                        // r1 chunk 1
+
+    Submit(MakeRequestSpec("r2", 4));  // same prefix as r1
+    PlanOnce();                        // r1 chunk 2; inserts chunk 1 into KV prefix cache
+
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 1u);
+    EXPECT_EQ(fwd->request_ids[0], "r2");
+    EXPECT_EQ(fwd->extend_prefix_lens[0], 4);
+}
+
 TEST_F(ChunkedPrefillTestSuite, InputIds_CorrectPerChunk) {
     Submit(MakeRequestSpec("r1", 3));  // 6 tokens: [1,2,3,4,5,6]
     auto plan1 = PlanOnce();
