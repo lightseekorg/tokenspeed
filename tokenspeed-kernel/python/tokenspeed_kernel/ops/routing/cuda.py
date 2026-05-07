@@ -37,8 +37,4 @@ try:
 except ImportError:
     routing_flash = error_fn
 
-__all__ = [
-    "dsv3_router_gemm",
-    "fp32_router_gemm",
-    "routing_flash",
-]
+__all__ = ["dsv3_router_gemm", "fp32_router_gemm", "routing_flash"]
