@@ -31,10 +31,7 @@ import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import (
-    SelectionObjective,
-    select_kernel,
-)
+from tokenspeed_kernel.selection import select_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -139,39 +136,6 @@ def _online_quantize_mxfp8(
 # ---------------------------------------------------------------------------
 
 
-def _infer_select_dtype(A_dtype: torch.dtype, quant: str | None) -> torch.dtype:
-    if quant in ("mxfp8", "fp8"):
-        return _fp8_dtype
-    return A_dtype
-
-
-def _build_mm_traits(
-    *,
-    K: int,
-    N: int,
-    A_scales: torch.Tensor | None = None,
-    B_scales: torch.Tensor | None = None,
-    quant: str | None = None,
-) -> dict[str, object]:
-    traits: dict[str, object] = {
-        "n_align_16": N % 16 == 0,
-        "k_align_16": K % 16 == 0,
-        "n_align_64": N % 64 == 0,
-        "n_align_128": N % 128 == 0,
-        "k_align_128": K % 128 == 0,
-    }
-
-    if quant is not None:
-        traits["quant"] = quant
-
-    if quant == "fp8":
-        scale_type = _infer_scale_type(A_scales, B_scales)
-        if scale_type is not None:
-            traits["scale_type"] = scale_type
-
-    return traits
-
-
 def mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -220,20 +184,34 @@ def mm(
     M = A.shape[0]
     N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
-    select_dtype = _infer_select_dtype(A.dtype, quant)
-    traits = _build_mm_traits(
-        K=K,
-        N=N,
-        A_scales=A_scales,
-        B_scales=B_scales,
-        quant=quant,
-    )
+    if quant in ("mxfp8", "fp8"):
+        select_dtype = _fp8_dtype
+    elif quant == "nvfp4":
+        select_dtype = A.dtype
+    else:
+        select_dtype = A.dtype
+
+    traits: dict[str, object] = {
+        "n_align_16": N % 16 == 0,
+        "k_align_16": K % 16 == 0,
+        "n_align_64": N % 64 == 0,
+        "n_align_128": N % 128 == 0,
+        "k_align_128": K % 128 == 0,
+    }
+
+    if quant is not None:
+        traits["quant"] = quant
+
+    if quant == "fp8":
+        scale_type = _infer_scale_type(A_scales, B_scales)
+        if scale_type is not None:
+            traits["scale_type"] = scale_type
+
     kernel = select_kernel(
         "gemm",
         "mm",
         select_dtype,
         traits=traits,
-        objective=SelectionObjective.DEFAULT,
         override=override,
         expected_kernel_name=expected_kernel_name,
     )
