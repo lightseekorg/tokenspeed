@@ -73,7 +73,7 @@ if fp8_blockscale_gemm_sm90 is not error_fn and platform.is_hopper:
         # stable K/N shapes, which lets selection choose this SM90 path without
         # a runtime token-count gate.
         priority=4,
-        tags={"latency"},
+        tags={"latency", "non_elementwise_numerics"},
     )
     def flashinfer_sm90_mm_fp8_blockscale(
         A: torch.Tensor,
