@@ -890,7 +890,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        residual = None
+        # Pre-alloc zeros for residual
+        residual = torch.zeros_like(hidden_states)
 
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
