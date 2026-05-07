@@ -37,7 +37,6 @@ _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1f
 # ---- FlashInfer block-scaled FP8 ----------------------------------------
 
 gemm_fp8_nt_groupwise = error_fn
-get_fp8_blockscale_gemm_runner_sm90 = error_fn
 tinygemm_bf16 = error_fn
 
 if platform.is_hopper_plus:
@@ -48,23 +47,6 @@ if platform.is_hopper_plus:
         )
     except ImportError:
         pass
-    try:
-        from flashinfer.gemm.gemm_base import get_fp8_blockscale_gemm_runner_sm90
-    except ImportError:
-        pass
-
-
-def flashinfer_sm90_fp8_quantize_1x128(
-    A: torch.Tensor,
-    A_q: torch.Tensor,
-    A_scales: torch.Tensor,
-) -> None:
-    """Quantize BF16 activations into the SM90/DeepGEMM 1x128 scale layout."""
-    if get_fp8_blockscale_gemm_runner_sm90 is error_fn:
-        raise RuntimeError("FlashInfer SM90 FP8 quantization runner is not available")
-    runner = get_fp8_blockscale_gemm_runner_sm90()
-    runner.fp8_quantize_1x128(A, A_q, A_scales, False)
-
 
 if gemm_fp8_nt_groupwise is not error_fn:
 

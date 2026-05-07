@@ -17,12 +17,14 @@
 
 """FlashInfer quantization kernels."""
 
+import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
 fp4_quantize = error_fn
 mxfp8_quantize = error_fn
 nvfp4_block_scale_interleave = error_fn
+get_fp8_blockscale_gemm_runner_sm90 = error_fn
 
 if current_platform().is_nvidia:
     try:
@@ -33,5 +35,27 @@ if current_platform().is_nvidia:
         )
     except ImportError:
         pass
+    try:
+        from flashinfer.gemm.gemm_base import get_fp8_blockscale_gemm_runner_sm90
+    except ImportError:
+        pass
 
-__all__ = ["fp4_quantize", "mxfp8_quantize", "nvfp4_block_scale_interleave"]
+
+def fp8_quantize_1x128_sm90(
+    A: torch.Tensor,
+    A_q: torch.Tensor,
+    A_scales: torch.Tensor,
+) -> None:
+    """Quantize BF16 activations into FlashInfer/DeepGEMM's SM90 1x128 layout."""
+    if get_fp8_blockscale_gemm_runner_sm90 is error_fn:
+        raise RuntimeError("FlashInfer SM90 FP8 quantization runner is not available")
+    runner = get_fp8_blockscale_gemm_runner_sm90()
+    runner.fp8_quantize_1x128(A, A_q, A_scales, False)
+
+
+__all__ = [
+    "fp4_quantize",
+    "mxfp8_quantize",
+    "nvfp4_block_scale_interleave",
+    "fp8_quantize_1x128_sm90",
+]

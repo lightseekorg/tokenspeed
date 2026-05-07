@@ -318,9 +318,7 @@ def _flashinfer_sm90_per_token_group_quant_fp8_tma(
     ):
         return None
 
-    from tokenspeed_kernel.ops.gemm.flashinfer import (
-        flashinfer_sm90_fp8_quantize_1x128,
-    )
+    from tokenspeed_kernel.ops.quantization.flashinfer import fp8_quantize_1x128_sm90
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
@@ -332,7 +330,7 @@ def _flashinfer_sm90_per_token_group_quant_fp8_tma(
         scale_ue8m0=False,
     )
     try:
-        flashinfer_sm90_fp8_quantize_1x128(x, x_q, x_s)
+        fp8_quantize_1x128_sm90(x, x_q, x_s)
     except RuntimeError:
         return None
     return x_q, x_s
