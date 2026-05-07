@@ -125,9 +125,18 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def _wait_bootstrap_token(self, aux_index: Optional[int], fallback: int) -> int:
         if aux_index is None or fallback != -1:
             return fallback
+        deadline = time.monotonic() + 5.0
         with self.bootstrap_token_cond:
             while aux_index not in self.bootstrap_tokens:
-                self.bootstrap_token_cond.wait(timeout=0.01)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "Timed out waiting for bootstrap token for aux_index=%s; using fallback=%s",
+                        aux_index,
+                        fallback,
+                    )
+                    return fallback
+                self.bootstrap_token_cond.wait(timeout=min(0.01, remaining))
             return self.bootstrap_tokens.pop(aux_index)
 
     def _is_session_failed(self, mooncake_session_id: str) -> bool:
@@ -329,6 +338,54 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 return
             time.sleep(1e-4)
 
+    def send_mamba_cache(
+        self,
+        mooncake_session_id: str,
+        prefill_mamba_indices: Optional[npt.NDArray[np.int64]],
+        dst_state_data_ptrs: list[int],
+        dst_mamba_indices: Optional[npt.NDArray[np.int64]],
+    ) -> int:
+        if self.kv_args.state_type != "mamba":
+            return 0
+        state_ptrs = self.kv_args.state_data_ptrs
+        state_item_lens = self.kv_args.state_item_lens
+        if not state_ptrs or not dst_state_data_ptrs or prefill_mamba_indices is None or dst_mamba_indices is None:
+            return 0
+        if len(state_ptrs) != len(dst_state_data_ptrs):
+            logger.error(
+                "Mamba state tensor count mismatch: prefill=%d decode=%d",
+                len(state_ptrs),
+                len(dst_state_data_ptrs),
+            )
+            return -1
+
+        valid = (prefill_mamba_indices >= 0) & (dst_mamba_indices >= 0)
+        if not valid.any():
+            return 0
+
+        src_indices = prefill_mamba_indices[valid]
+        dst_indices = dst_mamba_indices[valid]
+        src_blocks, dst_blocks = group_concurrent_contiguous(src_indices, dst_indices)
+        transfer_blocks = []
+        for src_ptr, dst_ptr, item_len in zip(state_ptrs, dst_state_data_ptrs, state_item_lens):
+            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
+                transfer_blocks.append((src_addr, dst_addr, length))
+
+        total_bytes = sum(length for _, _, length in transfer_blocks)
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+        logger.debug(
+            "Transferred mamba cache for session=%s slots=%s blocks=%d bytes=%d ret=%s",
+            mooncake_session_id,
+            src_indices.tolist(),
+            len(transfer_blocks),
+            total_bytes,
+            ret,
+        )
+        return ret
+
     def send_kvcache_layerwise(
         self,
         mooncake_session_id: str,
@@ -481,6 +538,17 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 resolved.dst_indices,
                                 kv_chunk.begin_cache_step,
                                 kv_chunk.layerwise_interval,
+                            )
+                        if ret == 0 and kv_chunk.is_last:
+                            if kv_chunk.wait_for_bootstrap_token:
+                                self._wait_bootstrap_token(
+                                    kv_chunk.prefill_aux_index, kv_chunk.bootstrap_token
+                                )
+                            ret = self.send_mamba_cache(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_mamba_indices,
+                                self.decode_kv_args_table[req.mooncake_session_id].dst_state_data_ptrs,
+                                req.dst_mamba_indices,
                             )
                         logger.debug(
                             "[TRANSFER_WORKER] send_kvcache returned %s for room %s",
@@ -646,6 +714,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         begin_cache_step: Optional[int] = None,
         layerwise_interval: int = 1,
         wait_for_bootstrap_token: bool = False,
+        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -683,6 +752,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 begin_cache_step=begin_cache_step,
                 layerwise_interval=layerwise_interval,
                 wait_for_bootstrap_token=wait_for_bootstrap_token,
+                prefill_mamba_indices=mamba_indices,
             )
         )
 

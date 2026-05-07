@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton impor
     fused_mamba_state_scatter_with_mask,
 )
 
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -185,6 +186,19 @@ class SimpleMambaPool:
     def get_mamba_params_all_layers(self):
         """Return all layers for all cache components."""
         return [self.mamba_cache[i] for i in range(len(self.mamba_cache))]
+
+    def get_contiguous_buf_infos(self):
+        """Return per-layer mamba cache buffers for disaggregated transfer."""
+        data_ptrs = []
+        data_lens = []
+        item_lens = []
+        for cache in self.mamba_cache:
+            for layer_id in range(cache.shape[0]):
+                layer_cache = cache[layer_id]
+                data_ptrs.append(layer_cache.data_ptr())
+                data_lens.append(layer_cache.nbytes)
+                item_lens.append(layer_cache[0].nbytes)
+        return data_ptrs, data_lens, item_lens
 
 
 class MambaAttnBackend(AttentionBackend):
@@ -761,6 +775,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         for backend in self._backends():
             backend.init_cuda_graph_state(max_bs, seq_lens_buf)
+
+    def register_step_counter(self, step_counter):
+        for backend in self._backends():
+            backend.register_step_counter(step_counter)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         common_kw, mamba_kw = self._split_mamba_kwargs(kwargs)

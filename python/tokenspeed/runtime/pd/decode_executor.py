@@ -63,6 +63,16 @@ class DisaggDecodeExecutor:
             bootstrap_room=info.bootstrap_room,
         )
 
+    @staticmethod
+    def _mamba_indices(op, index: int):
+        indices = getattr(op, "mamba_pool_indices", None)
+        if indices is None or index >= len(indices):
+            return None
+        slot = int(indices[index])
+        if slot < 0:
+            return None
+        return np.array([slot], dtype=np.int64)
+
     def _prefill(self, op):
         logger.debug(
             "[decode][_prefill] op: request_ids=%s occupied_pages=%s "
@@ -82,11 +92,13 @@ class DisaggDecodeExecutor:
                 dtype=np.int64,
             )
             aux_index = op.request_pool_indices[i]
+            mamba_indices = self._mamba_indices(op, i)
             self.receivers[request_id].prefill(
                 kv_indices,
                 aux_index,
                 extend_prefix_len,
                 None,  # mla_l1_5_args
+                mamba_indices,
             )
 
     def register(self, request_id: str, bootstrap_info: BootstrapInfo):
@@ -129,6 +141,8 @@ class DisaggDecodeExecutor:
                 # message from the prefill side.  bootstrap_room == bootstrap_info.bootstrap_room,
                 # which is the key used in MooncakeKVReceiver.
                 bootstrap_room = self.receivers[req_id].bootstrap_room
+                if self.kv_manager.kv_args.state_type == "mamba":
+                    torch.cuda.synchronize()
                 bootstrap_token = self.kv_manager.pop_bootstrap_token(bootstrap_room)
                 logger.debug(
                     "[decode][generate_events] rid=%s -> RemotePrefillDoneEvent bootstrap_token=%s",
