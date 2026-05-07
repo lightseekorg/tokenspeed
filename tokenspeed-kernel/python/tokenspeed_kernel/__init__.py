@@ -27,7 +27,7 @@ from tokenspeed_kernel.ops.attention import (
     mha_prefill,
     mha_prefill_with_kvcache,
 )
-from tokenspeed_kernel.ops.gemm import mm, select_mm_kernel
+from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import (
     moe_combine,
     moe_dispatch,
@@ -38,7 +38,6 @@ from tokenspeed_kernel.ops.moe import (
 
 __all__ = [
     "mm",
-    "select_mm_kernel",
     "moe_route",
     "moe_dispatch",
     "moe_experts",

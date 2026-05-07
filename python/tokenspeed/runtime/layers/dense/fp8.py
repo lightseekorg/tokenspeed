@@ -27,7 +27,6 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     static_quant_fp8,
 )
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.selection import SelectionObjective
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
@@ -188,13 +187,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
-            layer._mm_kernel = tokenspeed_kernel.select_mm_kernel(
-                A_dtype=platform.fp8e4m3fn.dtype,
-                K=layer.input_size_per_partition,
-                N=layer.output_size_per_partition,
-                quant="mxfp8",
-                objective=SelectionObjective.LATENCY,
-            )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -260,7 +252,6 @@ class Fp8LinearMethod(LinearMethodBase):
             input_2d = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
-            selected_kernel = getattr(layer, "_mm_kernel", None)
 
             output = tokenspeed_kernel.mm(
                 input_2d,
@@ -271,7 +262,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 out_dtype=output_dtype,
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
-                selected_kernel=selected_kernel,
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:

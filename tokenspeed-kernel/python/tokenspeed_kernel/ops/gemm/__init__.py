@@ -32,14 +32,13 @@ import torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import (
-    SelectedKernel,
     SelectionObjective,
     select_kernel,
 )
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["mm", "select_mm_kernel"]
+__all__ = ["mm"]
 
 _platform = Platform.get()
 _fp8_dtype = _platform.fp8e4m3fn.dtype
@@ -173,43 +172,6 @@ def _build_mm_traits(
     return traits
 
 
-def select_mm_kernel(
-    *,
-    A_dtype: torch.dtype,
-    K: int,
-    N: int,
-    A_scales: torch.Tensor | None = None,
-    B_scales: torch.Tensor | None = None,
-    quant: str | None = None,
-    objective: SelectionObjective = SelectionObjective.DEFAULT,
-    override: str | None = None,
-    expected_kernel_name: str | None = None,
-) -> SelectedKernel:
-    """Select the GEMM kernel for a stable Linear shape.
-
-    ``mm`` still records per-call shapes and handles online activation
-    quantization. This helper only moves the selection lookup out of hot
-    forward paths whose dtype and K/N dimensions are fixed after weight load.
-    """
-    select_dtype = _infer_select_dtype(A_dtype, quant)
-    traits = _build_mm_traits(
-        K=K,
-        N=N,
-        A_scales=A_scales,
-        B_scales=B_scales,
-        quant=quant,
-    )
-    return select_kernel(
-        "gemm",
-        "mm",
-        select_dtype,
-        traits=traits,
-        objective=objective,
-        override=override,
-        expected_kernel_name=expected_kernel_name,
-    )
-
-
 def mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -224,7 +186,6 @@ def mm(
     enable_pdl: bool = False,
     override: str | None = None,
     expected_kernel_name: str | None = None,
-    selected_kernel: SelectedKernel | None = None,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -259,21 +220,23 @@ def mm(
     M = A.shape[0]
     N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
-    if selected_kernel is not None:
-        kernel = selected_kernel
-        select_dtype = _infer_select_dtype(A.dtype, quant)
-    else:
-        kernel = select_mm_kernel(
-            A_dtype=A.dtype,
-            K=K,
-            N=N,
-            A_scales=A_scales,
-            B_scales=B_scales,
-            quant=quant,
-            override=override,
-            expected_kernel_name=expected_kernel_name,
-        )
-        select_dtype = _infer_select_dtype(A.dtype, quant)
+    select_dtype = _infer_select_dtype(A.dtype, quant)
+    traits = _build_mm_traits(
+        K=K,
+        N=N,
+        A_scales=A_scales,
+        B_scales=B_scales,
+        quant=quant,
+    )
+    kernel = select_kernel(
+        "gemm",
+        "mm",
+        select_dtype,
+        traits=traits,
+        objective=SelectionObjective.DEFAULT,
+        override=override,
+        expected_kernel_name=expected_kernel_name,
+    )
 
     # Online activation quantization
     if quant == "mxfp8" and A_scales is None:
