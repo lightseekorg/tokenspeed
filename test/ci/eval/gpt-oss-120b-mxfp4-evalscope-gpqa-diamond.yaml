@@ -13,6 +13,7 @@ runner:
       GPT_OSS_EVAL_ATTENTION_BACKEND: trtllm
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_mxfp4
     linux-mi355-2gpu-lightseek:
+      # speed up host-side mem alloc in ci
       GPT_OSS_EVAL_KVSTORE_RATIO: "0.25"
 env:
   CI: "true"
