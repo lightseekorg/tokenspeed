@@ -468,6 +468,37 @@ class ModelExecutor:
         self.num_generated_tokens += int(results.output_lengths.sum().item())
         self.num_decode_steps += bs
 
+    def snapshot_mamba_checkpoints_for_op(self, forward_op) -> None:
+        """Snapshot completed decode working states into checkpoint slots."""
+        if self.runtime_states.mamba_pool is None or forward_op.num_extends() > 0:
+            return
+        if not getattr(forward_op, "mamba_pool_indices", None):
+            return
+        bs = len(forward_op.request_ids)
+        mamba_pool_indices = torch.tensor(
+            forward_op.mamba_pool_indices,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        mamba_checkpoint_indices = torch.tensor(
+            forward_op.mamba_track_pool_indices,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        req_pool_indices = torch.tensor(
+            forward_op.request_pool_indices,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        cache_lengths = self.runtime_states.valid_cache_lengths[req_pool_indices]
+        self.runtime_states.snapshot_mamba_checkpoints(
+            mamba_pool_indices,
+            mamba_checkpoint_indices,
+            cache_lengths,
+            self.config.block_size,
+            bs,
+        )
+
     def execute_forward_op_with_log(
         self,
         forward_op,
@@ -788,7 +819,7 @@ class ModelExecutor:
 
             bs = len(forward_op.request_ids)
 
-            if self.runtime_states.mamba_pool is not None and forward_mode.is_extend():
+            if self.runtime_states.mamba_pool is not None and num_extends > 0:
                 mamba_pool_indices = self.input_buffers.mamba_pool_indices_buf[:bs]
                 mamba_cow_src = self.input_buffers.mamba_cow_src_indices_buf[:bs]
                 self.runtime_states.copy_mamba_states(

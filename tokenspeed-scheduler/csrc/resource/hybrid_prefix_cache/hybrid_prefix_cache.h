@@ -44,6 +44,7 @@ public:
 
     bool EnsureMambaCapacityByEvict(std::int32_t num_slots);
     void InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot);
+    std::int32_t AlignMambaCacheSeqlen(std::int32_t seqlen) const;
     TreeNode* FindLastMambaNode(TreeNode* from) const;
 
     // CallBack on KV Prefix Cache Eviction
@@ -54,7 +55,6 @@ public:
 
 private:
     void augmentMatch(MatchResult& match) const;
-    std::int32_t alignMambaBranchingSeqlen(std::int32_t seqlen) const;
 
     KVPrefixCache& kv_prefix_cache_;
     MambaChunkAllocator* mamba_allocator_;

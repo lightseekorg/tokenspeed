@@ -723,7 +723,10 @@ class EventLoop:
 
     @nvtx_range("loop:commit", color="rapids")
     def _commit_forward_results(
-        self, forward_op, results: ModelExecutionResult, on_first_token=None
+        self,
+        forward_op,
+        results: ModelExecutionResult,
+        on_first_token=None,
     ):
         self.request_handler.forward_ct += 1
         forward_mode = (
@@ -1026,6 +1029,8 @@ class EventLoop:
 
             curr_results = None
             if forward_op is not None:
+                if forward_op.num_extends() <= 0:
+                    self.model_executor.snapshot_mamba_checkpoints_for_op(forward_op)
                 stats = self._get_scheduler_stats()
                 curr_results, _ = self._dispatch_forward(
                     forward_op,

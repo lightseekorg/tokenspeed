@@ -56,14 +56,10 @@ class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
     mamba_cache_indices: torch.Tensor
     extend_prefix_lens: Optional[torch.Tensor] = None
-    # --- branching tracking (prefix cache) ---
-    # Per-request relative offset within extend tokens where intermediate state
-    # should be tracked.  None when no branching tracking is needed.
-    track_lens: Optional[torch.Tensor] = None
-    track_mask: Optional[torch.Tensor] = None
-    # Pre-computed src/dst indices for extracting SSM states from h / final_state
+    # Pre-computed src/dst indices for extracting Mamba prefix-cache snapshots.
     track_ssm_h_src: Optional[torch.Tensor] = None
     track_ssm_h_dst: Optional[torch.Tensor] = None
+    track_conv_indices: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
 
@@ -130,11 +126,13 @@ class SimpleMambaPool:
         ssm_dtype: torch.dtype,
         mamba_layer_ids: list[int],
         device: str,
+        page_size: int = 1,
         speculative_num_draft_tokens: int = 0,
     ):
         self.size = size
         self.device = device
         self.mamba_layer_ids = list(mamba_layer_ids)
+        self.page_size = page_size
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
         self.is_kda_cache = False
 
@@ -290,11 +288,9 @@ class MambaAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        # --- Branching tracking (prefix cache) ---
-        track_lens = None
-        track_mask = None
         track_ssm_h_src = None
         track_ssm_h_dst = None
+        track_conv_indices = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
         if forward_mode.is_extend() and not forward_mode.is_target_verify():
@@ -315,87 +311,105 @@ class MambaAttnBackend(AttentionBackend):
                 track_indices = mamba_track_pool_indices[:bs].to(
                     dtype=torch.int32, device=self.device
                 )
-                extend_lens = seq_lens[:bs] - prefix
-                # Only publish complete mamba snapshots.  The prefill conv
-                # path mutates conv_state to the final window only; arbitrary
-                # intermediate conv windows are not available here.
-                track_mask = (
+                extend_lens = (seq_lens[:bs] - prefix).to(torch.int32)
+                checkpoint_mask = (track_indices >= 0) & (mamba_cache_indices >= 0)
+
+                branch_lens = branching - prefix
+                branch_inside = (
                     (branching > 0)
-                    & (track_indices >= 0)
-                    & ((branching - prefix) == extend_lens)
+                    & checkpoint_mask
+                    & (branch_lens > 0)
+                    & (branch_lens < extend_lens)
                 )
+                track_mask = branch_inside & ((branch_lens % FLA_CHUNK_SIZE) == 0)
+                if (branch_inside & ~track_mask).any():
+                    raise RuntimeError(
+                        "Mamba branching seqlen must be aligned to FLA chunk size"
+                    )
+
+                page_size = getattr(self.pool, "page_size", 1)
+                final_lens = prefix + extend_lens
+                final_mask = (
+                    checkpoint_mask
+                    & ~branch_inside
+                    & (final_lens >= page_size)
+                    & ((final_lens % page_size) == 0)
+                )
+                if final_mask.any():
+                    track_ssm_final_src = mamba_cache_indices[final_mask]
+                    track_ssm_final_dst = track_indices[final_mask]
+
                 if track_mask.any():
-                    # lens_to_track: relative offset inside extend tokens
-                    track_lens = branching - prefix
                     (
                         track_ssm_h_src,
                         track_ssm_h_dst,
-                        track_ssm_final_src,
-                        track_ssm_final_dst,
                     ) = self._compute_track_ssm_indices(
-                        track_lens,
+                        branch_lens,
                         track_mask,
-                        mamba_cache_indices,
                         track_indices,
                         seq_lens[:bs] - prefix,  # extend_seq_lens
                     )
-                else:
-                    track_mask = None
+                    track_conv_indices = self._compute_track_conv_indices(
+                        query_start_loc,
+                        branch_lens,
+                        track_mask,
+                    )
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
-            track_lens=track_lens,
-            track_mask=track_mask,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
+            track_conv_indices=track_conv_indices,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
         )
 
+    def _compute_track_conv_indices(
+        self,
+        query_start_loc: torch.Tensor,
+        branch_lens: torch.Tensor,
+        track_mask: torch.Tensor,
+    ):
+        """Compute packed input indices for conv windows at tracked boundaries."""
+        conv_state_len = self.pool.conv_state.shape[-1]
+        lens_m = branch_lens[track_mask]
+        start = query_start_loc[:-1][track_mask] + lens_m - conv_state_len
+        indices = start.unsqueeze(-1) + torch.arange(
+            conv_state_len,
+            device=self.device,
+            dtype=start.dtype,
+        )
+        return indices.clamp(0, query_start_loc[-1] - 1)
+
     def _compute_track_ssm_indices(
         self,
-        track_lens: torch.Tensor,
+        branch_lens: torch.Tensor,
         track_mask: torch.Tensor,
-        mamba_cache_indices: torch.Tensor,
         mamba_track_indices: torch.Tensor,
         extend_seq_lens: torch.Tensor,
     ):
         """Compute src/dst indices for extracting intermediate SSM states.
 
-        Full-extend snapshots copy from final_state. Other snapshots are
-        intermediate states that must come from h.
-
-        dst indices use the tracking pool slots (separate from working slots)
-        so that the final state in the working slot is not overwritten.
+        Matching conv windows are gathered separately from packed pre-conv inputs.
         """
         num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
         offset = torch.zeros_like(num_h_states)
         offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
 
-        lens_m = track_lens[track_mask]
+        lens_m = branch_lens[track_mask]
         offset_m = offset[track_mask]
         dst_m = mamba_track_indices[track_mask]  # write to TRACKING slots
 
-        extend_len_m = extend_seq_lens[track_mask]
-        is_final = lens_m == extend_len_m
-
-        # Final snapshot: state lives in final_state buffer
-        # (== ssm_states[working_cache_idx]).
-        track_ssm_final_src = mamba_cache_indices[track_mask][is_final]
-        track_ssm_final_dst = dst_m[is_final]
-
-        # Intermediate snapshot: state lives in intermediate h tensor.
-        not_final = ~is_final
-        track_ssm_h_src = offset_m[not_final] + (lens_m[not_final] // FLA_CHUNK_SIZE)
-        track_ssm_h_dst = dst_m[not_final]
+        # h[i] is the state before chunk i, so an aligned lens maps directly to
+        # lens // FLA_CHUNK_SIZE.
+        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE)
+        track_ssm_h_dst = dst_m
 
         return (
             track_ssm_h_src,
             track_ssm_h_dst,
-            track_ssm_final_src,
-            track_ssm_final_dst,
         )
 
     # ---- CUDA graph state ----
@@ -662,8 +676,21 @@ class MambaAttnBackend(AttentionBackend):
             has_initial_states = (
                 extend_prefix_lens > 0 if extend_prefix_lens is not None else None
             )
+            need_h_track = (
+                self.forward_metadata.track_ssm_h_src is not None
+                and self.forward_metadata.track_ssm_h_src.numel() > 0
+            )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
+            if need_h_track:
+                if self.forward_metadata.track_conv_indices is None:
+                    raise RuntimeError(
+                        "Missing conv indices for intermediate mamba track"
+                    )
+                conv_states[self.forward_metadata.track_ssm_h_dst] = mixed_qkv_t[
+                    :, self.forward_metadata.track_conv_indices
+                ].transpose(0, 1)
+
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv_t,
                 conv_weights,
@@ -723,11 +750,11 @@ class MambaAttnBackend(AttentionBackend):
             beta = beta.unsqueeze(0)
 
             recurrent_state = ssm_states[cache_indices]
-            need_branching_track = (
-                self.forward_metadata.track_mask is not None
-                and self.forward_metadata.track_mask.any()
+            need_final_track = (
+                self.forward_metadata.track_ssm_final_src is not None
+                and self.forward_metadata.track_ssm_final_src.numel() > 0
             )
-            if need_branching_track:
+            if need_h_track:
                 core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                     q=query,
                     k=key,
@@ -757,25 +784,22 @@ class MambaAttnBackend(AttentionBackend):
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
-            h_states = h.squeeze(0) if need_branching_track and h is not None else None
-
-            # Copy tracked intermediate states for prefix caching (branching)
-            if need_branching_track:
-                if self.forward_metadata.track_ssm_h_src.numel() > 0:
-                    if h_states is None:
-                        raise RuntimeError(
-                            "Missing intermediate mamba states for branching track"
-                        )
-                    ssm_states[self.forward_metadata.track_ssm_h_dst] = h_states[
-                        self.forward_metadata.track_ssm_h_src
-                    ].to(ssm_states.dtype, copy=False)
-                if self.forward_metadata.track_ssm_final_src.numel() > 0:
-                    conv_states[self.forward_metadata.track_ssm_final_dst] = (
-                        conv_states[self.forward_metadata.track_ssm_final_src]
+            if need_h_track:
+                if h is None:
+                    raise RuntimeError(
+                        "Missing intermediate mamba states for branching track"
                     )
-                    ssm_states[self.forward_metadata.track_ssm_final_dst] = ssm_states[
-                        self.forward_metadata.track_ssm_final_src
-                    ]
+                ssm_states[self.forward_metadata.track_ssm_h_dst] = h.squeeze(0)[
+                    self.forward_metadata.track_ssm_h_src
+                ].to(ssm_states.dtype, copy=False)
+
+            if need_final_track:
+                conv_states[self.forward_metadata.track_ssm_final_dst] = conv_states[
+                    self.forward_metadata.track_ssm_final_src
+                ]
+                ssm_states[self.forward_metadata.track_ssm_final_dst] = ssm_states[
+                    self.forward_metadata.track_ssm_final_src
+                ]
 
         return core_attn_out
 

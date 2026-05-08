@@ -21,6 +21,9 @@
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
 
+#include <cstddef>
+#include <stdexcept>
+
 namespace tokenspeed {
 
 HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
@@ -49,7 +52,7 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
     TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
     if (mamba_node == nullptr) {
         const std::int32_t kv_depth = match.device.DepthInPage();
-        const std::int32_t aligned_seqlen = alignMambaBranchingSeqlen(kv_depth * match.device.page_size);
+        const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * match.device.page_size);
         if (aligned_seqlen > 0) {
             match.mamba_branching_seqlen = aligned_seqlen;
         }
@@ -67,7 +70,7 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
     match.mamba_cow_src_index = mamba_node->MambaSlotIndex();
 
     if (kv_depth > mamba_depth) {
-        const std::int32_t aligned_seqlen = alignMambaBranchingSeqlen(kv_depth * page_size);
+        const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * page_size);
         if (aligned_seqlen > mamba_depth * page_size) {
             match.mamba_branching_seqlen = aligned_seqlen;
         }
@@ -77,7 +80,7 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
     match.host.last_node = mamba_node;
 }
 
-std::int32_t HybridPrefixCache::alignMambaBranchingSeqlen(std::int32_t seqlen) const {
+std::int32_t HybridPrefixCache::AlignMambaCacheSeqlen(std::int32_t seqlen) const {
     if (mamba_cache_chunk_size_ <= 0) return seqlen;
     return (seqlen / mamba_cache_chunk_size_) * mamba_cache_chunk_size_;
 }
@@ -95,6 +98,10 @@ bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots) {
 
 void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {
     if (terminal_node == nullptr || slot == nullptr) return;
+    const std::int32_t page_size = kv_prefix_cache_.PageSize();
+    if (page_size <= 0 || terminal_node->DepthInTokens() % static_cast<std::size_t>(page_size) != 0) {
+        throw std::logic_error("HybridPrefixCache::InsertMamba: terminal node is not block-aligned");
+    }
     terminal_node->AttachMamba(std::move(slot));
     mamba_eviction_manager_.TrackNode(terminal_node);
 }

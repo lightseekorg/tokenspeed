@@ -261,6 +261,7 @@ def _create_hybrid_linear_attn(
         ssm_dtype=ssm_dtype,
         mamba_layer_ids=mamba_layer_ids,
         device=config.device,
+        page_size=server_args.block_size,
         speculative_num_draft_tokens=(
             server_args.speculative_num_draft_tokens
             if server_args.speculative_algorithm is not None
