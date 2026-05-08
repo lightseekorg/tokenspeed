@@ -226,7 +226,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         host_size: int,
         page_size: int,
         layout: str,
-        pin_memory: bool = True,
+        pin_memory: bool = _is_nvidia,
         device: str = "cpu",
         host_size_tokens: int = 0,
     ):
@@ -549,7 +549,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         host_size: int,
         page_size: int,
         layout: str,
-        pin_memory: bool = True,
+        pin_memory: bool = _is_nvidia,
         device: str = "cpu",
         host_size_tokens: int = 0,
     ):
