@@ -58,6 +58,7 @@ from tokenspeed.runtime.entrypoints.openai.serving_base import (  # noqa: E402
     OpenAIServingBase,
     await_with_disconnect_watchdog,
 )
+from tokenspeed.runtime.metrics.collector import EngineMetrics  # noqa: E402
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -90,7 +91,10 @@ class _NoopSender:
 
 
 def _make_processor() -> OutputProcesser:
-    return OutputProcesser(send_to_tokenizer=_NoopSender())
+    return OutputProcesser(
+        send_to_tokenizer=_NoopSender(),
+        metrics=EngineMetrics(labels={}, enabled=False),
+    )
 
 
 class _FakeRequest:

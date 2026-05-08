@@ -42,6 +42,7 @@ from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.io_struct import TokenizedGenerateReqInput
     from tokenspeed.runtime.execution.types import ModelExecutionResult
+    from tokenspeed.runtime.metrics.collector import EngineMetrics
     from tokenspeed.runtime.grammar.base_grammar_backend import (
         BaseGrammarObject,
     )
@@ -264,6 +265,8 @@ class OutputProcesser:
         spec_algorithm=None,
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
+        *,
+        metrics: EngineMetrics,
     ) -> None:
         # BatchTokenIDOut is pushed directly to
         # ``send_to_tokenizer`` (AsyncLLM's input socket). The
@@ -274,6 +277,7 @@ class OutputProcesser:
         self.spec_algorithm = spec_algorithm
         self.spec_num_tokens = spec_num_tokens
         self.stream_interval = stream_interval
+        self.metrics = metrics
         self.log_cnt = 0
         self.rid_to_state: dict[str, RequestState] = {}
         # rid → monotonic ts at which the abort was seen. Covers the
@@ -396,6 +400,49 @@ class OutputProcesser:
             else:
                 self.rid_to_state[rid].add_computed_length(input_lengths[i])
 
+    @staticmethod
+    def _aggregate_spec_decode_step(
+        *,
+        forward_op,
+        output_lengths,
+        rid_to_state,
+    ) -> tuple[int, int]:
+        n_ext = forward_op.num_extends()
+        accepted = 0
+        num_slots = 0
+        for i in range(n_ext, len(forward_op.request_ids)):
+            rid = forward_op.request_ids[i]
+            rs = rid_to_state.get(rid)
+            if rs is None or not rs.prefill_finished:
+                continue
+            out_len = int(output_lengths[i].item())
+            accepted += max(0, out_len - 1)
+            num_slots += 1
+        return num_slots, accepted
+
+    def _emit_spec_decode_metrics(
+        self, forward_op, model_execution_results: ModelExecutionResult
+    ) -> None:
+        if not self.metrics.enabled:
+            return
+        if forward_op.num_extends() > 0:
+            return
+        if self.spec_algorithm is None or self.spec_num_tokens is None:
+            return
+        if model_execution_results.output_lengths is None:
+            return
+        num_slots, accepted_draft_tokens = self._aggregate_spec_decode_step(
+            forward_op=forward_op,
+            output_lengths=model_execution_results.output_lengths,
+            rid_to_state=self.rid_to_state,
+        )
+        if num_slots > 0:
+            self.metrics.record_spec_decode_step(
+                num_decode_slots=num_slots,
+                accepted_draft_tokens=accepted_draft_tokens,
+                draft_width=self.spec_num_tokens,
+            )
+
     def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:
         for rid, prefix_len in zip(rids, extend_prefix_lens):
             if rs := self.rid_to_state.get(rid):
@@ -414,6 +461,8 @@ class OutputProcesser:
         )
         with nvtx_range("commit:sync", color="red"):
             model_execution_results.sync()
+
+        self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
         # Wait briefly for the next step's build hostfunc to advance
         # the matcher; if it doesn't come, advance on host. The lock
