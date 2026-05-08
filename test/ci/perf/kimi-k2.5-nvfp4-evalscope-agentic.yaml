@@ -52,9 +52,23 @@ perf:
   command: >-
     REPO_ROOT=$PWD &&
     OUTPUTS_DIR=/tmp/tokenspeed-agentic-perf &&
-    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
-    rm -rf "$OUTPUTS_DIR" &&
+    WARMUP_DIR=/tmp/tokenspeed-agentic-warmup &&
+    trap 'rm -rf "$OUTPUTS_DIR" "$WARMUP_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" "$WARMUP_DIR" &&
     cd /tmp &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model nvidia/Kimi-K2.5-NVFP4
+    --url http://localhost:8000/v1/chat/completions
+    --api openai
+    --dataset swe_smith
+    --dataset-path agentic_dataset.json
+    --max-tokens 500
+    --multi-turn
+    --number 2
+    --parallel 2
+    --dataset-offset 68
+    --outputs-dir "$WARMUP_DIR"
+    --extra-args '{"ignore_eos": true}' &&
     set +e &&
     /tmp/evalscope-perf/bin/evalscope perf
     --model nvidia/Kimi-K2.5-NVFP4
