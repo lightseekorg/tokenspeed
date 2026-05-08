@@ -223,6 +223,7 @@ class ServerArgs:
     enable_symm_mem: bool = False
     disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
+    disable_tf32: bool = False
     force_deterministic_rsag: bool = False
     disable_sampling_tp_sync: bool = False
     low_latency_max_num_tokens_per_gpu: int = 256
@@ -1398,6 +1399,12 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--disable-tf32",
+            action="store_true",
+            help="Disable forcing TF32 on for cuBLAS/cuDNN. By default the server sets "
+            "NVIDIA_TF32_OVERRIDE=1 and TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1.",
         )
         parser.add_argument(
             "--max-cudagraph-capture-size",
