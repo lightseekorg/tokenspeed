@@ -217,6 +217,12 @@ class CudaGraphWrapper:
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.output_buffers: dict[int, tuple] = {}
+        # Per-bs no-LoRA variant.  Populated only when ``lora_manager`` is
+        # configured: a second captured graph that omits the LoRA Triton
+        # kernels entirely, replayed when ``LoraManager.has_active_lora``
+        # is False so base-model decode pays no LoRA overhead at all.
+        self.graphs_no_lora: dict[int, torch.cuda.CUDAGraph] = {}
+        self.output_buffers_no_lora: dict[int, tuple] = {}
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
@@ -232,15 +238,26 @@ class CudaGraphWrapper:
         """
         Capture CUDA graphs for all configured batch sizes.
 
+        When a ``lora_manager`` is attached, captures TWO graphs per batch
+        size: a with-LoRA graph (records the segmented-GEMM Triton kernels
+        and feeds them with the manager's persistent batch_info) and a
+        no-LoRA graph (omits those kernels entirely).  Replay picks the
+        no-LoRA variant when ``has_active_lora`` is False.
+
         Args:
             forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
         """
         rank = self.global_rank
+        capture_no_lora_too = self.lora_manager is not None
         with freeze_gc(self.enable_cudagraph_gc):
             self.stream = torch.cuda.Stream()
             capture_range = tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
             if rank == 0:
-                logger.info("Capturing batches: %s", self.capture_bs)
+                logger.info(
+                    "Capturing batches: %s%s",
+                    self.capture_bs,
+                    " (×2: with-LoRA + no-LoRA)" if capture_no_lora_too else "",
+                )
             for bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(
@@ -249,11 +266,15 @@ class CudaGraphWrapper:
                     capture_range.set_description(
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs)
+                graph, output_buffers = self._capture_one(bs, attach_lora=True)
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
+                if capture_no_lora_too:
+                    graph_nl, output_nl = self._capture_one(bs, attach_lora=False)
+                    self.graphs_no_lora[bs] = graph_nl
+                    self.output_buffers_no_lora[bs] = output_nl
 
-    def _capture_one(self, bs: int):
+    def _capture_one(self, bs: int, attach_lora: bool = True):
         graph = torch.cuda.CUDAGraph()
 
         capture_forward_mode = (
@@ -282,13 +303,17 @@ class CudaGraphWrapper:
         if self.dp_size > 1:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
 
-        # Bind LoRA so the captured graph records the segmented-GEMM kernels
-        # against the manager's persistent batch_info.  Pre-fill batch_info
-        # with one segment per "request" (slot 0 = no-adapter).  Runtime
-        # updates the same tensors before each ``graph.replay()`` and the
-        # kernels re-read seg_lens / weight_indices / lora_ranks.
-        if self.lora_manager is not None:
+        # Bind LoRA only for the with-LoRA variant.  When ``attach_lora``
+        # is False we capture a parallel graph that omits the LoRA Triton
+        # kernels entirely (qwen3's ``if ctx.lora_manager is not None``
+        # branch falls through), used at replay when no request in the
+        # batch has an active adapter.
+        if attach_lora and self.lora_manager is not None:
             ctx.lora_manager = self.lora_manager
+            # Pre-fill batch_info so the captured kernels see a stable
+            # set of pointers; runtime updates the same tensors before
+            # each ``graph.replay()`` and the kernels re-read seg_lens /
+            # weight_indices / lora_ranks.
             self.lora_manager.prepare_loras(
                 [0] * bs, per_request_token_counts=self.max_tokens_per_req
             )
@@ -597,12 +622,25 @@ class CudaGraphWrapper:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
-            with nvtx_range("graph_replay", color="red"):
-                self.graphs[padded_bs].replay()
+            # Pick the no-LoRA variant when --enable-lora is on but no
+            # request in this batch uses an adapter — that graph omits the
+            # per-layer Triton LoRA kernels entirely.
+            use_no_lora_variant = (
+                self.lora_manager is not None
+                and not self.lora_manager.has_active_lora
+                and padded_bs in self.graphs_no_lora
+            )
+            if use_no_lora_variant:
+                graph = self.graphs_no_lora[padded_bs]
+                output_buffers = self.output_buffers_no_lora[padded_bs]
+            else:
+                graph = self.graphs[padded_bs]
+                output_buffers = self.output_buffers[padded_bs]
 
-            output_tokens, output_lengths, output_logprobs = self.output_buffers[
-                padded_bs
-            ]
+            with nvtx_range("graph_replay", color="red"):
+                graph.replay()
+
+            output_tokens, output_lengths, output_logprobs = output_buffers
 
             result = (
                 output_tokens[: bs * self.max_tokens_per_req],

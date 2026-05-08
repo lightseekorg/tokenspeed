@@ -182,6 +182,11 @@ class LoraManager:
         self.o_in_per_tp: int = self.q_size_per_tp
         self.hidden_size: int = hidden
 
+        # CPU-side flag: True when at least one segment in the current
+        # batch_info uses a real adapter (slot != 0).  CudaGraphWrapper
+        # reads this to pick the with-LoRA vs no-LoRA captured graph.
+        self.has_active_lora: bool = False
+
         # Slot 0 = no-adapter sentinel.  Real adapters take 1 .. max_loras.
         self._n_slots: int = max_loras + 1
         self._slot_to_name: list[str | None] = [None] * self._n_slots
@@ -376,6 +381,12 @@ class LoraManager:
         bi.bs = bs
         bi.num_segments = bs
         bi.max_len = max_len
+
+        # Host-side flag: True iff at least one request resolved to a real
+        # adapter slot.  The CudaGraphWrapper reads this before each replay
+        # to pick the no-LoRA graph variant when the whole batch is
+        # base-model — saving the per-step Triton-kernel launches.
+        self.has_active_lora = any(s != 0 for s in per_request_slots)
         return total_tokens
 
     def apply_qkv_lora(

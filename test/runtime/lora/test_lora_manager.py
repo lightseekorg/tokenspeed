@@ -138,3 +138,13 @@ def test_no_adapter_slot_has_zero_rank_and_scaling(manager):
     torch.cuda.synchronize()
     assert manager.batch_info.lora_ranks[0].item() == 0
     assert manager.batch_info.scalings[0].item() == 0.0
+
+
+def test_has_active_lora_flag(manager):
+    # All-base batch → flag is False.  CudaGraphWrapper uses this to pick
+    # the no-LoRA captured graph variant (skip the per-step Triton kernels).
+    manager.prepare_loras([0, 0, 0])
+    assert manager.has_active_lora is False
+    # Unknown id falls back to slot 0 → still no active adapter.
+    manager.prepare_loras([99])
+    assert manager.has_active_lora is False
