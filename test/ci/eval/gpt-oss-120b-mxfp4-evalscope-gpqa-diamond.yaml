@@ -14,7 +14,6 @@ runner:
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_mxfp4
     linux-mi355-2gpu-lightseek:
       GPT_OSS_EVAL_KVSTORE_RATIO: "0.25"
-      GPT_OSS_EVAL_MAX_TOTAL_TOKENS: "1310720"
 env:
   CI: "true"
 install:
@@ -33,7 +32,6 @@ server:
     ${GPT_OSS_EVAL_ATTENTION_BACKEND:+--attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND}}
     ${GPT_OSS_EVAL_MOE_BACKEND:+--moe-backend ${GPT_OSS_EVAL_MOE_BACKEND}}
     ${GPT_OSS_EVAL_KVSTORE_RATIO:+--kvstore-ratio ${GPT_OSS_EVAL_KVSTORE_RATIO}}
-    ${GPT_OSS_EVAL_MAX_TOTAL_TOKENS:+--max-total-tokens ${GPT_OSS_EVAL_MAX_TOTAL_TOKENS}}
     --enable-cache-report
     --host 127.0.0.1
   ready:
