@@ -97,6 +97,10 @@ class MooncakeKVManagerBase:
             self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
         ):
             self.engine.register(kv_data_ptr, kv_data_len)
+        for state_data_ptr, state_data_len in zip(
+            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+        ):
+            self.engine.register(state_data_ptr, state_data_len)
 
     @cache
     def _connect(self, endpoint: str):

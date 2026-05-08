@@ -293,6 +293,9 @@ class MooncakeKVReceiver:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
+            packed_state_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
+            )
 
             sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
@@ -304,6 +307,7 @@ class MooncakeKVReceiver:
                         self.session_id.encode("ascii"),
                         packed_kv_data_ptrs,
                         b"",  # aux_data_ptrs removed; kept as empty frame for protocol compat
+                        packed_state_data_ptrs,
                         # Include decode_prefix_len for kv_args registration
                         str(getattr(self, "decode_prefix_len", 0)).encode("ascii"),
                     ]
@@ -325,6 +329,7 @@ class MooncakeKVReceiver:
         aux_index: Optional[int] = None,
         decode_prefix_len: Optional[int] = 0,
         mla_l1_5_args: Optional[PageTransferMetadata] = None,
+        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
     ):
         logger.info(
             "[MooncakeKVReceiver.init] bootstrap_room=%s kv_indices_len=%d aux_index=%s decode_prefix_len=%s",
@@ -383,6 +388,11 @@ class MooncakeKVReceiver:
                         (
                             dst_page_local_indices.tobytes()
                             if (not is_dummy and dst_page_local_indices is not None)
+                            else b""
+                        ),
+                        (
+                            mamba_indices.tobytes()
+                            if (not is_dummy and mamba_indices is not None)
                             else b""
                         ),
                     ]

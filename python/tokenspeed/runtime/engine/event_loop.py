@@ -311,6 +311,7 @@ class EventLoop:
                 server_args.disaggregation_ib_device,
                 token_to_kv_pool,
                 draft_token_to_kv_pool,
+                mamba_pool,
             )
             pd_manager_args = ManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,
