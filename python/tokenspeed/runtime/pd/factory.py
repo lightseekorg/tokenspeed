@@ -61,7 +61,9 @@ def get_kv_args(
         kv_data_lens += draft_kv_data_lens
         kv_item_lens += draft_kv_item_lens
         offsets += draft_offsets
-        draft_base_layer_id = max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
+        draft_base_layer_id = (
+            max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
+        )
         kv_layer_ids += list(
             range(draft_base_layer_id, draft_base_layer_id + draft_layer_num)
         )

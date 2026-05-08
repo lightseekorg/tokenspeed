@@ -162,7 +162,9 @@ class KVArgsRegisterInfo:
             decode_prefix_len = int(msg[7].decode("ascii")) if msg[7] else 0
         else:
             state_frame = b""
-            decode_prefix_len = int(msg[6].decode("ascii")) if len(msg) >= 7 and msg[6] else 0
+            decode_prefix_len = (
+                int(msg[6].decode("ascii")) if len(msg) >= 7 and msg[6] else 0
+            )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -171,7 +173,9 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
-            dst_state_data_ptrs=list(struct.unpack(f"{len(state_frame) // 8}Q", state_frame)),
+            dst_state_data_ptrs=list(
+                struct.unpack(f"{len(state_frame) // 8}Q", state_frame)
+            ),
             decode_prefix_len=decode_prefix_len,
         )
 

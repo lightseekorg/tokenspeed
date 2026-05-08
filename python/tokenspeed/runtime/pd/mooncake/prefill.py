@@ -81,16 +81,17 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
         self.session_lock = threading.Lock()
         self.kv_layer_ids = list(
-            getattr(self.kv_args, "kv_layer_ids", None) or range(len(self.kv_args.offsets))
+            getattr(self.kv_args, "kv_layer_ids", None)
+            or range(len(self.kv_args.offsets))
         )
         self.state_layer_ids = list(getattr(self.kv_args, "state_layer_ids", []) or [])
         layer_ids = self.kv_layer_ids + self.state_layer_ids
-        self.layer_num = (max(layer_ids) + 1) if layer_ids else len(self.kv_args.offsets)
+        self.layer_num = (
+            (max(layer_ids) + 1) if layer_ids else len(self.kv_args.offsets)
+        )
         self._kv_layer_to_index = {
             layer_id: i
-            for i, layer_id in enumerate(
-                self.kv_layer_ids[: len(self.kv_args.offsets)]
-            )
+            for i, layer_id in enumerate(self.kv_layer_ids[: len(self.kv_args.offsets)])
         }
         self.layerwise_interval = 1
         self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
@@ -406,8 +407,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 begin_layer_id,
                 end_layer_id,
                 len(state_items),
-                sum(item_len for _, _, item_len in state_items)
-                * int(valid.sum()),
+                sum(item_len for _, _, item_len in state_items) * int(valid.sum()),
             )
         if not valid.any():
             return 0
@@ -605,11 +605,17 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 resolved.dst_indices,
                                 kv_chunk.begin_cache_step,
                                 kv_chunk.layerwise_interval,
-                                self.decode_kv_args_table[req.mooncake_session_id].dst_state_data_ptrs,
+                                self.decode_kv_args_table[
+                                    req.mooncake_session_id
+                                ].dst_state_data_ptrs,
                                 kv_chunk.prefill_mamba_indices,
                                 req.dst_mamba_indices,
                             )
-                        if ret == 0 and kv_chunk.is_last and kv_chunk.begin_cache_step is None:
+                        if (
+                            ret == 0
+                            and kv_chunk.is_last
+                            and kv_chunk.begin_cache_step is None
+                        ):
                             if kv_chunk.wait_for_bootstrap_token:
                                 self._wait_bootstrap_token(
                                     kv_chunk.prefill_aux_index, kv_chunk.bootstrap_token
@@ -617,7 +623,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             ret = self.send_mamba_cache(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_mamba_indices,
-                                self.decode_kv_args_table[req.mooncake_session_id].dst_state_data_ptrs,
+                                self.decode_kv_args_table[
+                                    req.mooncake_session_id
+                                ].dst_state_data_ptrs,
                                 req.dst_mamba_indices,
                             )
                         logger.debug(

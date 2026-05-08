@@ -45,7 +45,6 @@ from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton impor
     fused_mamba_state_scatter_with_mask,
 )
 
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool

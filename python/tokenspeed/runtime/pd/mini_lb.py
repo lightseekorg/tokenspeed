@@ -124,7 +124,12 @@ class MiniLoadBalancer:
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
 
     async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint, raw_request=None
+        self,
+        modified_request,
+        prefill_server,
+        decode_server,
+        endpoint,
+        raw_request=None,
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -541,7 +546,9 @@ async def handle_generate_request(request_data: dict, raw_request: Request):
         )
 
 
-async def _forward_to_backend(request_data: dict, endpoint_name: str, raw_request: Request):
+async def _forward_to_backend(
+    request_data: dict, endpoint_name: str, raw_request: Request
+):
     prefill_server, bootstrap_port, decode_server = (
         load_balancer.select_pair_round_robin()
     )
