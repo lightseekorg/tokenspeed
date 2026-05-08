@@ -355,6 +355,7 @@ def create_attn_components(
     )
     enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
     mamba_pool_total_chunks = 0
+    mamba_pool = None
 
     _profile_kwargs = dict(
         attn_config=config,

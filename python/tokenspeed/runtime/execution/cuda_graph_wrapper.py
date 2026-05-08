@@ -551,11 +551,6 @@ class CudaGraphWrapper:
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
 
-        mamba_pool_indices = getattr(ctx, "mamba_pool_indices", None)
-        mamba_cow_src_indices = getattr(ctx, "mamba_cow_src_indices", None)
-        mamba_branching_seqlens = getattr(ctx, "mamba_branching_seqlens", None)
-        mamba_track_pool_indices = getattr(ctx, "mamba_track_pool_indices", None)
-
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
             pad = padded_bs - bs

@@ -36,8 +36,7 @@ class MambaChunkAllocator;
 
 class HybridPrefixCache {
 public:
-    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator,
-                      std::int32_t mamba_cache_chunk_size);
+    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size);
 
     MatchResult Match(const token_vec_t& token_ids);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages);

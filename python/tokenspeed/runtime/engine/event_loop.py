@@ -1030,6 +1030,10 @@ class EventLoop:
             curr_results = None
             if forward_op is not None:
                 if forward_op.num_extends() <= 0:
+                    # Overlap dispatch may schedule one extra decode before
+                    # the previous result is committed. Snapshot the completed
+                    # working state before this decode mutates the same slot;
+                    # the snapshot helper only copies block-aligned states.
                     self.model_executor.snapshot_mamba_checkpoints_for_op(forward_op)
                 stats = self._get_scheduler_stats()
                 curr_results, _ = self._dispatch_forward(
