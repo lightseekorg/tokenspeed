@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import (
+    build_page_table,
     create_flashinfer_kv_indices_triton,
 )
 
@@ -67,6 +68,9 @@ class ForwardMetadata:
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
+    # Bug 1 fix: 2D paged-table form for new decode_attention_fwd signature
+    page_table: torch.Tensor = None  # [B, max_pages] of page IDs
+    seq_lens: torch.Tensor = None  # [B] cache_seqlens for decode
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -376,6 +380,20 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = torch.max(_extend_seq_lens).item()
             num_kv_splits = None
 
+        # Bug 1 fix: build page_table + seq_lens for new decode_attention_fwd kernel.
+        # Only useful in decode_or_idle modes; for extend/prefill modes the values are
+        # carried as None and the prefill kernel doesn't need them.
+        try:
+            _page_table = build_page_table(
+                req_pool_indices[:bs],
+                _req_to_token,
+                self.page_size,
+                self.max_context_len,
+            )
+            _seq_lens = seq_lens[:bs] if seq_lens is not None else None
+        except Exception:
+            _page_table = None
+            _seq_lens = None
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -389,6 +407,8 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
+            page_table=_page_table,
+            seq_lens=_seq_lens,
         )
 
     def init_cuda_graph_state(
@@ -419,6 +439,21 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
+
+        # Bug 1 fix (cudagraph): static page_table buffer for in-place updates.
+        # Captured graph references this tensor's address; replay must update
+        # contents in place via .copy_() rather than reassigning.
+        self.cuda_graph_max_pages = (
+            self.max_context_len + self.page_size - 1
+        ) // self.page_size
+        self.cuda_graph_page_table = torch.zeros(
+            (max_bs, self.cuda_graph_max_pages),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.cuda_graph_seq_lens = torch.ones(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
 
         self.cuda_graph_custom_mask = torch.zeros(
             (max_bs * self.max_context_len),
@@ -580,6 +615,28 @@ class TritonAttnBackend(AttentionBackend):
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
             )
 
+        # Bug 1 fix (cudagraph capture): populate the STATIC page_table buffer
+        # in-place. The captured graph will reference this tensor address, and
+        # the replay path will .copy_() new values without reallocating.
+        try:
+            _page_table_src = build_page_table(
+                req_pool_indices[:bs],
+                _req_to_token,
+                self.page_size,
+                self.max_context_len,
+            )
+            self.cuda_graph_page_table[:bs, : _page_table_src.shape[1]].copy_(
+                _page_table_src
+            )
+            _page_table = self.cuda_graph_page_table[:bs, : _page_table_src.shape[1]]
+            if seq_lens is not None:
+                self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+                _seq_lens = self.cuda_graph_seq_lens[:bs]
+            else:
+                _seq_lens = None
+        except Exception:
+            _page_table = None
+            _seq_lens = None
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -593,6 +650,8 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
+            page_table=_page_table,
+            seq_lens=_seq_lens,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -603,8 +662,28 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
         spec_info: EagleDraftInput | EagleVerifyInput | None = None,
+        **kwargs,
     ):
         _req_to_token = self.req_to_page
+
+        # Bug 1 fix (cudagraph replay): refresh the static page_table + seq_lens
+        # buffers in-place so the captured graph sees the current request's
+        # page assignments.
+        if _req_to_token is not None and forward_mode.is_decode_or_idle():
+            try:
+                _page_table_src = build_page_table(
+                    req_pool_indices[:bs],
+                    _req_to_token,
+                    self.page_size,
+                    self.max_context_len,
+                )
+                self.cuda_graph_page_table[:bs, : _page_table_src.shape[1]].copy_(
+                    _page_table_src
+                )
+                if seq_lens is not None:
+                    self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+            except Exception:
+                pass
 
         if forward_mode.is_decode_or_idle():
             # Update kv_indptr, kv_indices
@@ -748,6 +827,16 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        # Bug 1 fix (prefill): kernel signature evolved similarly to the decode one.
+        # New signature uses cache_seqlens (per-req lens) + page_table instead of
+        # CSR (kv_indptr, kv_indices). Convert here.
+        cache_seqlens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
+        page_table = self.forward_metadata.page_table
+        if page_table is None:
+            raise RuntimeError(
+                "TritonAttentionBackend forward_extend: page_table not populated. "
+                "Bug 1 fix requires init_forward_metadata to build it for extend mode too."
+            )
         prefill_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -755,17 +844,19 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             token_to_kv_pool.get_key_buffer(layer.layer_id),
             token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.forward_metadata.qo_indptr,
-            kv_indptr,
-            kv_indices,
-            None,
-            True,
-            self.forward_metadata.mask_indptr,
-            self.forward_metadata.max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
+            self.forward_metadata.qo_indptr,  # cu_seqlens_q
+            cache_seqlens,  # cache_seqlens
+            None,  # custom_mask
+            True,  # is_causal
+            self.forward_metadata.max_extend_len,  # max_len_extend
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
             sliding_window_size=sliding_window_size,
             sinks=sinks,
+            page_table=page_table,
+            page_table_stride_b=page_table.stride(0),
+            page_size=self.page_size,
+            has_kv_cache=True,
         )
         return o
 
@@ -801,19 +892,36 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        # Bug 1 fix: kernel signature evolved to require 2D page_table + cache_seqlens
+        # instead of flat kv_indptr/kv_indices. init_forward_metadata now populates both.
+        page_table = self.forward_metadata.page_table
+        cache_seqlens = self.forward_metadata.seq_lens
+        if page_table is None or cache_seqlens is None:
+            raise RuntimeError(
+                "TritonAttentionBackend: page_table/seq_lens not populated. "
+                "Bug 1 fix requires init_forward_metadata to build them."
+            )
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            window_left = layer.sliding_window_size
+        else:
+            window_left = -1
+
         decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             token_to_kv_pool.get_key_buffer(layer.layer_id),
             token_to_kv_pool.get_value_buffer(layer.layer_id),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
+            page_table,
+            cache_seqlens,
             self.forward_metadata.attn_logits,
             self.forward_metadata.attn_lse,
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
+            page_table.stride(0),
+            self.page_size,
+            window_left,
             layer.scaling,
-            layer.logit_cap,
+            logit_cap=layer.logit_cap,
             sinks=sinks,
         )
         return o
