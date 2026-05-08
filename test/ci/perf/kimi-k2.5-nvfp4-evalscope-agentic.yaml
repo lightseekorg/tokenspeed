@@ -1,6 +1,9 @@
 api_version: ci.tokenspeed.io/v1
 name: perf-kimi-k2.5-nvfp4-agentic
 type: perf
+triggers:
+  - per-commit
+  - manual
 runner:
   labels:
     - b200-4gpu
