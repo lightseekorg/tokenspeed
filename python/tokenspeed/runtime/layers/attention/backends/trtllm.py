@@ -234,7 +234,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
                 page_size=self.page_size,
             )
-        else save_kv_cache and k is not None:
+        elif save_kv_cache and k is not None:
             token_to_kv_pool.set_kv_buffer(
                 layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
@@ -293,7 +293,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
                 page_size=self.page_size,
             )
-        else save_kv_cache and k is not None:
+        elif save_kv_cache and k is not None:
             token_to_kv_pool.set_kv_buffer(
                 layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
