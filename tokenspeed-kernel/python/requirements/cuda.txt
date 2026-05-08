@@ -1,4 +1,5 @@
 -r common.txt
+nvidia-cutlass-dsl
 torch==2.11.0
 flashinfer-python==0.6.9
 flashinfer-cubin==0.6.9
