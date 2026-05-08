@@ -326,6 +326,10 @@ def transfer_kv_all_layer(
     item_size: int,
     num_layers: int,
     block_quota: int | None = None,
+    src_k_layer_refs: list | None = None,
+    dst_k_layer_refs: list | None = None,
+    src_v_layer_refs: list | None = None,
+    dst_v_layer_refs: list | None = None,
 ) -> None:
     """
     Transfer KV cache entries for all layers based on src/dst indices.
@@ -346,6 +350,29 @@ def transfer_kv_all_layer(
     length = src_indices.numel()
 
     if length == 0:
+        return
+
+    # AMD: dispatch per-layer using transfer_kv_per_layer to avoid the
+    # all-layer kernel whose pointer-of-pointer indirection faults on
+    # gfx950 when destination pointers are host-pinned. Requires the
+    # caller to provide per-layer tensor refs (same allocations the
+    # *_data_ptrs tensors above point at).
+    if not _is_nvidia and (
+        src_k_layer_refs is not None
+        and dst_k_layer_refs is not None
+        and src_v_layer_refs is not None
+        and dst_v_layer_refs is not None
+    ):
+        for _layer_id in range(num_layers):
+            transfer_kv_per_layer(
+                src_k=src_k_layer_refs[_layer_id],
+                dst_k=dst_k_layer_refs[_layer_id],
+                src_v=src_v_layer_refs[_layer_id],
+                dst_v=dst_v_layer_refs[_layer_id],
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=item_size,
+            )
         return
 
     if item_size % 4 != 0:

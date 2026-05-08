@@ -375,6 +375,17 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
+                # Pass per-layer tensor refs alongside the pointer arrays.
+                # transfer_kv_all_layer routes through them on AMD where the
+                # all-layer Triton kernel's pointer-of-pointer indirection
+                # faults against host-pinned destinations. NVIDIA path is
+                # byte-identical and ignores the *_refs kwargs.
+                _src_k_refs = [
+                    device_pool.get_key_buffer(_i) for _i in range(self.layer_num)
+                ]
+                _src_v_refs = [
+                    device_pool.get_value_buffer(_i) for _i in range(self.layer_num)
+                ]
                 transfer_kv_all_layer(
                     src_k_layers=device_pool.k_data_ptrs,
                     dst_k_layers=self.k_data_ptrs,
@@ -384,6 +395,10 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=host_indices,
                     item_size=self.token_stride_size,
                     num_layers=self.layer_num,
+                    src_k_layer_refs=_src_k_refs,
+                    dst_k_layer_refs=self.k_data_refs,
+                    src_v_layer_refs=_src_v_refs,
+                    dst_v_layer_refs=self.v_data_refs,
                 )
             elif self.layout == "page_first":
                 transfer_kv_all_layer_lf_pf(
