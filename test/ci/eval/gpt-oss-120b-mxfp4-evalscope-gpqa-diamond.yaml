@@ -14,6 +14,8 @@ runner:
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_mxfp4
     linux-mi355-2gpu-lightseek:
       GPT_OSS_EVAL_KVSTORE_RATIO: "0.25"
+      HSA_COREDUMP_PATTERN: .ci-artifacts/gpu_coredump.%h.%p.%t
+      HSA_COREDUMP_SHOW_PROGRESS: "1"
 env:
   CI: "true"
 install:
