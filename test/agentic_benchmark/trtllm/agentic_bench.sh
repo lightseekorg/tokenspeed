@@ -8,11 +8,11 @@ set -euo pipefail
 EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
 pip install "evalscope[all] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
 
-wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
+[ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
 # Note: Only 71 conversations can be built
-python3 build_swe_smith_dataset.py \
+[ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
     --model moonshotai/Kimi-K2.5 \
     --first-turn-length 50000 \
     --subsequent-turn-length 800 \
@@ -118,6 +118,22 @@ for CONFIG in "${CONFIGS[@]}"; do
         exit 1
     fi
 
+    echo "Warmup..."
+    evalscope perf \
+        --model nvidia/Kimi-K2.5-NVFP4 \
+        --url http://localhost:8001/v1/chat/completions \
+        --api openai \
+        --dataset swe_smith \
+        --dataset-path agentic_dataset.json \
+        --max-tokens 500 \
+        --multi-turn \
+        --number 2 \
+        --parallel 2 \
+        --extra-args '{"ignore_eos": true}' \
+        --dataset-offset 68 \
+        --outputs-dir /tmp/outputs
+
+    echo "Benchmark..."
     evalscope perf \
         --model nvidia/Kimi-K2.5-NVFP4 \
         --url http://localhost:8001/v1/chat/completions \
