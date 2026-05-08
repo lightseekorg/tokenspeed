@@ -106,6 +106,11 @@ class ModelExecutorConfig:
     enable_lora: bool = False
     max_loras: int = 4
     max_lora_rank: int = 64
+    # Tiered residence: at most ``max_loras`` adapters in GPU buffers,
+    # at most ``max_loras_cpu`` cached in pinned host memory; beyond
+    # that adapters fall back to their disk_path on next use.
+    max_loras_cpu: int = 16
+    lora_scheduling_policy: str = "lru"
 
     @staticmethod
     def from_server_args(
@@ -149,6 +154,8 @@ class ModelExecutorConfig:
             enable_lora=server_args.enable_lora,
             max_loras=server_args.max_loras,
             max_lora_rank=server_args.max_lora_rank,
+            max_loras_cpu=server_args.max_loras_cpu or 4 * server_args.max_loras,
+            lora_scheduling_policy=server_args.lora_scheduling_policy,
         )
 
 
@@ -297,6 +304,7 @@ class ModelExecutor:
                 max_loras=config.max_loras,
                 max_lora_rank=config.max_lora_rank,
                 max_num_tokens=config.chunked_prefill_size,
+                max_loras_cpu=config.max_loras_cpu,
                 dtype=lora_dtype,
                 device=lora_device,
                 tp_rank=tp_rank,

@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import faulthandler
+import os
 import signal
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -761,6 +762,17 @@ class EventLoop:
             # Track lora_id per request for forward-pass injection
             if spec.lora_id != 0:
                 self._request_lora_ids[spec.request_id] = spec.lora_id
+                # Async-prefetch the adapter into the CPU pool so the
+                # disk read is overlapped with the previous forward step
+                # rather than blocking ``prepare_loras`` of the step that
+                # actually consumes it.  No-op when already CPU-resident.
+                if (
+                    self._lora_manager is not None
+                    and os.environ.get("TOKENSPEED_LORA_PREFETCH", "1") == "1"
+                ):
+                    name = self._lora_manager._id_to_name.get(spec.lora_id)
+                    if name is not None:
+                        self._lora_manager.prefetch(name)
 
         if admitted_specs:
             self.scheduler.submit_requests(admitted_specs)

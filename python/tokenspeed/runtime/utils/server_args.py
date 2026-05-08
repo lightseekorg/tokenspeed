@@ -214,10 +214,21 @@ class ServerArgs:
 
     # LoRA adapter serving
     enable_lora: bool = False
-    # Maximum number of non-pinned LoRA adapters resident in GPU memory at once.
+    # Maximum number of non-pinned LoRA adapters resident in GPU memory at
+    # once.  Adapters beyond this cap are LRU-evicted to the CPU pool.
     max_loras: int = 4
     # Maximum LoRA rank supported (caps adapter loading; larger = more GPU memory).
     max_lora_rank: int = 64
+    # Maximum number of LoRA adapters cached in CPU pinned memory.  When
+    # an adapter is evicted from this pool it falls back to its disk path
+    # (assumed durable) and is reloaded on next use.  ``None`` ⇒ default
+    # to ``4 * max_loras``.
+    max_loras_cpu: int | None = None
+    # Scheduler-side LoRA scheduling policy.  ``"lru"`` (default) just
+    # relies on the manager's LRU; ``"admission"`` (future) gates batches
+    # that don't fit in GPU; ``"pack"`` (future) sorts the queue to reuse
+    # resident adapters.
+    lora_scheduling_policy: str = "lru"
 
     # Runtime options
     disable_pdl: bool = False
@@ -559,6 +570,16 @@ class ServerArgs:
             # compiled on first call with a fixed dtype and cannot handle the
             # bfloat16↔float32 casting that the LoRA bmm path performs.
             self.disable_pdl = True
+            # Default the CPU pool to 4× the GPU pool so adapter swap-out
+            # to disk is rare in steady state.
+            if self.max_loras_cpu is None:
+                self.max_loras_cpu = 4 * self.max_loras
+            if self.max_loras_cpu < self.max_loras:
+                raise ValueError(
+                    f"max_loras_cpu ({self.max_loras_cpu}) must be ≥ "
+                    f"max_loras ({self.max_loras}) — every GPU-resident "
+                    "adapter must also fit in the CPU pool."
+                )
 
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
@@ -1387,6 +1408,23 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_lora_rank,
             help="Maximum LoRA rank supported across all loaded adapters.",
+        )
+        parser.add_argument(
+            "--max-loras-cpu",
+            type=int,
+            default=ServerArgs.max_loras_cpu,
+            help=(
+                "Maximum number of LoRA adapters cached in CPU pinned "
+                "memory.  Defaults to 4 × --max-loras.  Adapters evicted "
+                "from this pool are reloaded from disk on next use."
+            ),
+        )
+        parser.add_argument(
+            "--lora-scheduling-policy",
+            type=str,
+            default=ServerArgs.lora_scheduling_policy,
+            choices=["lru"],
+            help="Scheduler-side LoRA scheduling policy (extensible).",
         )
 
         prefix_cache_group = parser.add_mutually_exclusive_group()

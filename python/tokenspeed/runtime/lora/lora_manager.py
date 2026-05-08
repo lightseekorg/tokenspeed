@@ -55,7 +55,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
@@ -170,6 +172,7 @@ class LoraManager:
         tp_rank: int = 0,
         tp_size: int = 1,
         tp_group=None,
+        max_loras_cpu: int | None = None,
     ) -> None:
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
@@ -179,6 +182,17 @@ class LoraManager:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.tp_group = tp_group
+        # Tier-2 (CPU pinned) cap.  Defaults to 4× the GPU pool so adapter
+        # spill-out to disk is rare in steady state.
+        self.max_loras_cpu: int = (
+            max_loras_cpu if max_loras_cpu is not None else 4 * max_loras
+        )
+        if self.max_loras_cpu < max_loras:
+            raise ValueError(
+                f"max_loras_cpu ({self.max_loras_cpu}) must be ≥ "
+                f"max_loras ({max_loras}); GPU-resident adapters live in "
+                "the CPU pool too."
+            )
 
         self.n_layers: int = model_config.num_hidden_layers
         hidden: int = model_config.hidden_size
@@ -205,19 +219,50 @@ class LoraManager:
         self.has_active_lora: bool = False
 
         # Slot 0 = no-adapter sentinel.  Real adapters take 1 .. max_loras.
+        # ── Tier 1: GPU pool ─────────────────────────────────────────────
+        # Slot 0 = no-adapter sentinel.  Real adapters take 1 .. max_loras.
         self._n_slots: int = max_loras + 1
         self._slot_to_name: list[str | None] = [None] * self._n_slots
         self._name_to_slot: dict[str, int] = {}
-        self._lru: OrderedDict[str, None] = OrderedDict()
+        self._gpu_lru: OrderedDict[str, None] = OrderedDict()  # alias of _lru
 
+        # ── Tier 2: CPU pinned pool ─────────────────────────────────────
+        # ``_cpu_cache[name]`` holds parsed weights in pinned host memory.
+        # ``_cpu_lru`` tracks LRU order for CPU eviction back to disk.  An
+        # adapter is "CPU-resident" iff its name is in ``_cpu_cache``.
+        # GPU-resident adapters are also kept in ``_cpu_cache`` (we pay
+        # the host RAM cost once; reload to GPU is cheap and re-evicting
+        # GPU then re-promoting only needs an H2D copy, not a disk read).
         self._cpu_cache: dict[
             str, dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]
         ] = {}
+        self._cpu_lru: OrderedDict[str, None] = OrderedDict()
+
+        # ── Tier 3: disk (source of truth) ───────────────────────────────
+        # ``_adapter_paths[name]`` is the directory containing
+        # ``adapter_model.safetensors`` + ``adapter_config.json``.  We
+        # assume the path is durable; on CPU eviction the in-memory
+        # buffers are dropped and a future use re-reads from disk.
         self._name_to_id: dict[str, int] = {}
         self._id_to_name: dict[int, str] = {}
         self._next_id: int = 1
         self._pinned: set[str] = set()
         self._adapter_paths: dict[str, str] = {}
+
+        # ── Async prefetch ──────────────────────────────────────────────
+        # Disk reads happen on a small thread pool so the scheduler's
+        # event loop never blocks on safetensors I/O.  Hooked from the
+        # request-admission path (see EventLoop._process_new_requests):
+        # when a request arrives with ``lora_id != 0`` the manager's
+        # ``prefetch`` is called, which submits a background load if the
+        # adapter is not already CPU-resident.  ``_ensure_in_cpu`` checks
+        # the pending map and joins an in-flight load instead of reading
+        # the same safetensors a second time.
+        self._loader_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="lora-loader"
+        )
+        self._lock = threading.Lock()
+        self._pending_loads: dict[str, Future] = {}
 
         # Per-slot rank + scaling.  Rank 0 means "no adapter"; the Triton
         # kernels skip on rank 0, so slot 0's row is permanently zero.
@@ -310,19 +355,28 @@ class LoraManager:
         return self._batch_info
 
     def load_adapter(self, name: str, path: str, pinned: bool = False) -> int:
-        """Load a PEFT adapter from *path* (CPU side)."""
+        """Register a PEFT adapter from *path* and warm the CPU pool.
+
+        ``path`` is recorded as the adapter's durable disk path; it must
+        remain accessible for the lifetime of the manager because the CPU
+        pool may evict the adapter back to disk under memory pressure.
+
+        Returns the integer ``lora_id`` to use in subsequent
+        ``prepare_loras`` calls.
+        """
         if name in self._name_to_id:
             logger.warning("Adapter '%s' is already loaded; re-loading.", name)
             self._evict_by_name(name)
+            self._evict_from_cpu(name)
 
+        # Resolve the durable disk path now (used by future re-reads when
+        # the CPU pool evicts these weights).
         adapter_path = path
         safetensors = os.path.join(adapter_path, "adapter_model.safetensors")
-        if not os.path.exists(safetensors):
-            safetensors = path
-
-        raw = _load_safetensors(safetensors)
-        weights = _parse_adapter_weights(raw)
-        self._cpu_cache[name] = weights
+        if not os.path.exists(safetensors) and not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Adapter weights not found at {safetensors!r} or {path!r}"
+            )
 
         lora_id = self._next_id
         self._next_id += 1
@@ -332,17 +386,29 @@ class LoraManager:
         if pinned:
             self._pinned.add(name)
 
-        logger.info("Loaded adapter '%s' (lora_id=%d) from %s", name, lora_id, path)
+        # Warm the CPU pool — bounded by ``max_loras_cpu``, may evict
+        # other CPU-resident adapters back to disk.
+        self._ensure_in_cpu(name)
+
+        logger.info(
+            "Registered adapter '%s' (lora_id=%d) from %s; CPU pool: %d/%d",
+            name,
+            lora_id,
+            path,
+            len(self._cpu_cache),
+            self.max_loras_cpu,
+        )
         return lora_id
 
     def unload_adapter(self, name: str) -> None:
         if name not in self._name_to_id:
             raise KeyError(f"Adapter '{name}' is not loaded.")
         self._evict_by_name(name)
-        self._cpu_cache.pop(name, None)
+        self._evict_from_cpu(name)
         lora_id = self._name_to_id.pop(name)
         del self._id_to_name[lora_id]
         self._pinned.discard(name)
+        self._adapter_paths.pop(name, None)
         logger.info("Unloaded adapter '%s'", name)
 
     def get_id(self, name: str) -> int | None:
@@ -374,7 +440,7 @@ class LoraManager:
                 continue
             slot = self._ensure_in_gpu(name)
             per_request_slots.append(slot)
-            self._lru.move_to_end(name)
+            self._gpu_lru.move_to_end(name)
 
         # Per-request seg_lens.
         if isinstance(per_request_token_counts, int):
@@ -596,25 +662,187 @@ class LoraManager:
     def _ensure_in_gpu(self, name: str) -> int:
         if name in self._name_to_slot:
             return self._name_to_slot[name]
+        # Tier-2 → Tier-1 promotion; may need to read from disk if the
+        # CPU pool has evicted this adapter since registration.
+        self._ensure_in_cpu(name)
         slot = self._find_free_slot()
         self._load_to_slot(name, slot)
         self._name_to_slot[name] = slot
         self._slot_to_name[slot] = name
-        self._lru[name] = None
+        self._gpu_lru[name] = None
         return slot
+
+    def prefetch(self, name: str) -> None:
+        """Best-effort async warm of the CPU pool for *name*.
+
+        Called from the request-admission path: when a request with a
+        non-zero ``lora_id`` arrives the manager kicks off a background
+        disk read so the safetensors I/O is overlapped with the previous
+        forward step rather than blocking ``prepare_loras`` of the step
+        that actually consumes the adapter.
+
+        No-op when the adapter is already CPU-resident or a load is
+        already in flight.  Silently ignores unknown adapters (the
+        request will fall back to base via slot 0).
+        """
+        with self._lock:
+            if name in self._cpu_cache:
+                self._cpu_lru.move_to_end(name)
+                return
+            if name in self._pending_loads:
+                return
+            adapter_path = self._adapter_paths.get(name)
+            if adapter_path is None:
+                return
+            fut = self._loader_executor.submit(
+                self._async_load_weights, name, adapter_path
+            )
+            self._pending_loads[name] = fut
+
+    def _async_load_weights(self, name: str, adapter_path: str) -> None:
+        """Background worker: read the adapter from disk and install
+        into the CPU pool under the manager lock."""
+        try:
+            safetensors = os.path.join(adapter_path, "adapter_model.safetensors")
+            if not os.path.exists(safetensors):
+                safetensors = adapter_path
+            raw = _load_safetensors(safetensors)
+            weights = _parse_adapter_weights(raw)
+        except Exception:
+            logger.exception("Async LoRA load failed for '%s'", name)
+            with self._lock:
+                self._pending_loads.pop(name, None)
+            return
+        with self._lock:
+            try:
+                if name not in self._cpu_cache:
+                    self._install_in_cpu_locked(name, weights)
+            finally:
+                self._pending_loads.pop(name, None)
+
+    def _install_in_cpu_locked(
+        self,
+        name: str,
+        weights: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]],
+    ) -> None:
+        """Insert *weights* into the CPU pool, evicting LRU as needed.
+        Caller must hold ``self._lock``.
+
+        GPU-resident adapters CAN be evicted from CPU — their weights
+        are still on GPU, and the cost of a future GPU re-promotion is
+        a disk read (which the async prefetcher hides on the next
+        request).  Only ``_pinned`` adapters are protected from CPU
+        eviction (they're a hard reservation).
+        """
+        while len(self._cpu_cache) >= self.max_loras_cpu:
+            evicted = False
+            # Prefer evicting non-GPU-resident entries first: they cost
+            # a disk read to bring back, while GPU-resident ones cost
+            # nothing until their GPU slot is also evicted.
+            for stage in ("non_gpu", "gpu_resident"):
+                for candidate in list(self._cpu_lru.keys()):
+                    if candidate == name:
+                        continue
+                    if candidate in self._pinned:
+                        continue
+                    is_gpu = candidate in self._name_to_slot
+                    if stage == "non_gpu" and is_gpu:
+                        continue
+                    self._evict_from_cpu_locked(candidate)
+                    evicted = True
+                    break
+                if evicted:
+                    break
+            if not evicted:
+                raise RuntimeError(
+                    f"CPU LoRA pool is full ({len(self._cpu_cache)}/"
+                    f"{self.max_loras_cpu}) and every entry is pinned. "
+                    f"cpu_lru={list(self._cpu_lru.keys())} "
+                    f"pinned={self._pinned} "
+                    "Increase max_loras_cpu or unpin an adapter."
+                )
+        self._cpu_cache[name] = weights
+        self._cpu_lru[name] = None
+
+    def _ensure_in_cpu(
+        self,
+        name: str,
+        weights: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] | None = None,
+    ) -> None:
+        """Synchronously ensure *name* is CPU-resident.
+
+        If a prefetch for the same name is already in flight, joins it
+        instead of starting a second disk read; otherwise falls back to a
+        sync read.  GPU-resident adapters are kept in CPU pool — see
+        ``_install_in_cpu_locked`` eviction policy.
+        """
+        # Fast path: already cached.
+        with self._lock:
+            if name in self._cpu_cache:
+                self._cpu_lru.move_to_end(name)
+                return
+            pending = self._pending_loads.get(name)
+
+        # Join an in-flight async prefetch instead of double-reading.
+        if pending is not None:
+            pending.result()
+            with self._lock:
+                if name in self._cpu_cache:
+                    self._cpu_lru.move_to_end(name)
+                    return
+            # Fall through (rare: the prefetch may have failed, or the
+            # adapter was evicted between our checks).
+
+        # Sync read + install.  Disk I/O happens outside the lock so the
+        # scheduler thread's other work is unblocked while we read.
+        if weights is None:
+            adapter_path = self._adapter_paths.get(name)
+            if adapter_path is None:
+                raise KeyError(f"Adapter '{name}' has no recorded disk path.")
+            safetensors = os.path.join(adapter_path, "adapter_model.safetensors")
+            if not os.path.exists(safetensors):
+                safetensors = adapter_path
+            raw = _load_safetensors(safetensors)
+            weights = _parse_adapter_weights(raw)
+
+        with self._lock:
+            if name in self._cpu_cache:
+                # Lost the race to a concurrent prefetch — just refresh LRU.
+                self._cpu_lru.move_to_end(name)
+                return
+            self._install_in_cpu_locked(name, weights)
+
+    def _evict_from_cpu_locked(self, name: str) -> None:
+        """Drop *name* from the CPU pool.  Caller holds the lock and is
+        responsible for ensuring the adapter is not GPU-resident."""
+        if name in self._cpu_cache:
+            del self._cpu_cache[name]
+            self._cpu_lru.pop(name, None)
+            logger.debug(
+                "Evicted '%s' from CPU pool (now %d/%d)",
+                name,
+                len(self._cpu_cache),
+                self.max_loras_cpu,
+            )
+
+    def _evict_from_cpu(self, name: str) -> None:
+        """Public helper, takes the lock.  Caller must ensure *name* is
+        not currently GPU-resident."""
+        with self._lock:
+            self._evict_from_cpu_locked(name)
 
     def _find_free_slot(self) -> int:
         for slot in range(1, self._n_slots):
             if self._slot_to_name[slot] is None:
                 return slot
-        for candidate_name in list(self._lru.keys()):
+        for candidate_name in list(self._gpu_lru.keys()):
             if candidate_name in self._pinned:
                 continue
             slot = self._name_to_slot[candidate_name]
             logger.debug("Evicting adapter '%s' from GPU slot %d", candidate_name, slot)
             del self._name_to_slot[candidate_name]
             self._slot_to_name[slot] = None
-            del self._lru[candidate_name]
+            del self._gpu_lru[candidate_name]
             return slot
         raise RuntimeError(
             "LoRA GPU pool is full and all adapters are pinned. "
@@ -757,4 +985,4 @@ class LoraManager:
                 self.down_B_buffers[layer_id][slot].zero_()
             self._lora_ranks[slot] = 0
             self._scalings[slot] = 0.0
-        self._lru.pop(name, None)
+        self._gpu_lru.pop(name, None)

@@ -148,3 +148,184 @@ def test_has_active_lora_flag(manager):
     # Unknown id falls back to slot 0 → still no active adapter.
     manager.prepare_loras([99])
     assert manager.has_active_lora is False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tiered GPU↔CPU↔disk pool tests.  These don't actually do GEMMs, just
+# verify the residence + eviction bookkeeping under various loads.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _write_dummy_adapter(tmp_path, rank: int, hidden: int, n_layers: int) -> str:
+    """Write a minimal PEFT-style adapter under tmp_path/adapter_X."""
+    import json
+
+    from safetensors.torch import save_file
+
+    tensors = {}
+    for layer in range(n_layers):
+        for mod in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            base = f"base_model.model.model.layers.{layer}.self_attn.{mod}"
+            tensors[f"{base}.lora_A.weight"] = torch.randn(
+                rank, hidden, dtype=torch.float32
+            )
+            tensors[f"{base}.lora_B.weight"] = torch.randn(
+                hidden, rank, dtype=torch.float32
+            )
+    save_file(tensors, str(tmp_path / "adapter_model.safetensors"))
+    cfg = {
+        "r": rank,
+        "lora_alpha": rank,
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(cfg))
+    return str(tmp_path)
+
+
+@pytest.fixture
+def adapter_paths(tmp_path):
+    """Create 4 dummy adapters on disk."""
+    paths = {}
+    for i in range(4):
+        d = tmp_path / f"adapter_{i}"
+        d.mkdir()
+        paths[f"a{i}"] = _write_dummy_adapter(d, rank=8, hidden=32, n_layers=2)
+    return paths
+
+
+def _tiered_manager(max_loras_cpu: int) -> LoraManager:
+    return LoraManager(
+        model_config=_model_config(),
+        max_loras=2,
+        max_lora_rank=8,
+        max_num_tokens=64,
+        max_loras_cpu=max_loras_cpu,
+        dtype=torch.float16,
+        device=torch.device("cuda:0"),
+    )
+
+
+def test_max_loras_cpu_ge_max_loras(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    with pytest.raises(ValueError, match="max_loras_cpu"):
+        _tiered_manager(max_loras_cpu=1)  # max_loras=2 in fixture
+
+
+def test_load_adapter_warms_cpu_pool(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    m = _tiered_manager(max_loras_cpu=8)
+    m.load_adapter("a0", adapter_paths["a0"])
+    assert "a0" in m._cpu_cache
+    assert "a0" not in m._name_to_slot  # not GPU-resident yet
+
+
+def test_cpu_pool_lru_evicts_to_disk(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    # max_loras_cpu=2 → only 2 adapters fit in CPU at once.  Loading a
+    # third evicts the LRU one back to disk.
+    m = _tiered_manager(max_loras_cpu=2)
+    for name in ("a0", "a1", "a2"):
+        m.load_adapter(name, adapter_paths[name])
+    # a0 was the LRU at the time a2 was loaded; should be evicted now.
+    assert "a0" not in m._cpu_cache
+    assert "a1" in m._cpu_cache
+    assert "a2" in m._cpu_cache
+
+
+def test_cpu_evicted_adapter_reloads_from_disk(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    m = _tiered_manager(max_loras_cpu=2)
+    for name in ("a0", "a1", "a2"):
+        m.load_adapter(name, adapter_paths[name])
+    assert "a0" not in m._cpu_cache
+    # Touching a0 again should reload it from disk into the CPU pool,
+    # evicting whatever is now LRU.
+    a0_id = m.get_id("a0")
+    m.prepare_loras([a0_id])
+    assert "a0" in m._cpu_cache
+    assert "a0" in m._name_to_slot  # promoted to GPU too
+
+
+def test_gpu_resident_evicted_only_when_no_alternative(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    # Prefer evicting non-GPU-resident entries first: they cost a disk
+    # read to bring back, GPU-resident ones cost nothing until their
+    # GPU slot is also evicted.
+    m = _tiered_manager(max_loras_cpu=2)
+    m.load_adapter("a0", adapter_paths["a0"])
+    m.load_adapter("a1", adapter_paths["a1"])
+    a0_id = m.get_id("a0")
+    m.prepare_loras([a0_id])  # a0 → GPU; a1 stays CPU-only
+    assert "a0" in m._name_to_slot
+    # Loading a2: a1 (non-GPU) is evicted in preference to a0 (GPU).
+    m.load_adapter("a2", adapter_paths["a2"])
+    assert "a0" in m._cpu_cache
+    assert "a1" not in m._cpu_cache
+    assert "a2" in m._cpu_cache
+
+
+def test_gpu_resident_can_be_cpu_evicted_when_pool_is_full(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    # max_loras=2 + max_loras_cpu=2 + two GPU-resident adapters: the
+    # CPU pool MUST allow evicting GPU-resident entries to admit a
+    # third adapter; otherwise the pool is permanently locked.
+    m = _tiered_manager(max_loras_cpu=2)
+    m.load_adapter("a0", adapter_paths["a0"])
+    m.load_adapter("a1", adapter_paths["a1"])
+    m.prepare_loras([m.get_id("a0"), m.get_id("a1")])  # both → GPU
+    assert "a0" in m._name_to_slot
+    assert "a1" in m._name_to_slot
+    # Now register a2.  CPU pool is full and both entries are
+    # GPU-resident — must evict one anyway (its GPU copy is still
+    # valid; future reload costs a disk read).
+    m.load_adapter("a2", adapter_paths["a2"])
+    assert "a2" in m._cpu_cache
+    # Exactly one of a0/a1 was kicked from the CPU pool.
+    cpu_count = sum(name in m._cpu_cache for name in ("a0", "a1"))
+    assert cpu_count == 1
+
+
+def test_prefetch_warms_cpu_pool(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    m = _tiered_manager(max_loras_cpu=4)
+    # Register two adapters but evict one.
+    m.load_adapter("a0", adapter_paths["a0"])
+    m.load_adapter("a1", adapter_paths["a1"])
+    m._evict_from_cpu("a1")
+    assert "a1" not in m._cpu_cache
+
+    # prefetch kicks off async load; wait for it to finish.
+    m.prefetch("a1")
+    pending = m._pending_loads.get("a1")
+    if pending is not None:
+        pending.result()
+    assert "a1" in m._cpu_cache
+
+
+def test_prefetch_unknown_adapter_is_noop(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    m = _tiered_manager(max_loras_cpu=4)
+    m.prefetch("never-registered")  # must not raise
+    assert "never-registered" not in m._cpu_cache
+    assert "never-registered" not in m._pending_loads
+
+
+def test_unload_adapter_clears_both_tiers(adapter_paths):
+    if not torch.cuda.is_available():
+        pytest.skip("LoraManager allocates GPU buffers")
+    m = _tiered_manager(max_loras_cpu=4)
+    m.load_adapter("a0", adapter_paths["a0"])
+    a0_id = m.get_id("a0")
+    m.prepare_loras([a0_id])
+    m.unload_adapter("a0")
+    assert "a0" not in m._cpu_cache
+    assert "a0" not in m._name_to_slot
+    assert m.get_id("a0") is None
