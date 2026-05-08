@@ -535,6 +535,10 @@ class CudaGraphWrapper:
         extend_seq_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         out_cache_loc: torch.Tensor | None = None,
+        mamba_pool_indices: torch.Tensor | None = None,
+        mamba_cow_src_indices: torch.Tensor | None = None,
+        mamba_branching_seqlens: torch.Tensor | None = None,
+        mamba_track_pool_indices: torch.Tensor | None = None,
         spec_info=None,
     ):
         """

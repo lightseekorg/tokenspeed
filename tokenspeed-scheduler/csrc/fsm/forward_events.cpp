@@ -278,21 +278,23 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
 
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto local_allocator = std::move(state).TakeLocalKVAllocator();
-    OwnedPages alloc_pages = local_allocator->TakeFirst(alloc_count);
+    if (alloc_count >= state.GetPageSize()) {
+        OwnedPages alloc_pages = local_allocator->TakeFirst(alloc_count);
 
-    kv_prefix_cache_->Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
-                                                   page_hashes_);
+        kv_prefix_cache_->Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
+                                                    page_hashes_);
 
-    // Mamba: insert the latest checkpoint snapshot at the terminal node.
-    if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr &&
-        (local_mamba_allocator->HasCheckpoint() || local_mamba_allocator->HasWorking())) {
-        MatchResult post_match = kv_prefix_cache_->Match(full_paged_tokens);
-        TreeNode* terminal = post_match.device.last_node;
-        if (terminal != nullptr) {
-            if (local_mamba_allocator->HasCheckpoint()) {
-                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachCheckpoint());
-            } else {
-                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
+        // Mamba: insert the latest checkpoint snapshot at the terminal node.
+        if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr &&
+            (local_mamba_allocator->HasCheckpoint() || local_mamba_allocator->HasWorking())) {
+            MatchResult post_match = kv_prefix_cache_->Match(full_paged_tokens);
+            TreeNode* terminal = post_match.device.last_node;
+            if (terminal != nullptr) {
+                if (local_mamba_allocator->HasCheckpoint()) {
+                    hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachCheckpoint());
+                } else {
+                    hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
+                }
             }
         }
     }

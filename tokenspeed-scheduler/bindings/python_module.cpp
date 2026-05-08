@@ -151,7 +151,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("enable_mamba", &tokenspeed::SchedulerConfig::enable_mamba)
         .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)
-        .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks)
+        .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
