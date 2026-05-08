@@ -40,8 +40,12 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.layers.attention.kv_cache.trtllm_fp8_kv_kernel import (
+    fused_fp8_set_kv_buffer,
+)
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
+
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -200,6 +204,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         bmm2_scale = 1.0
         return bmm1_scale, bmm2_scale
 
+    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k) -> bool:
+        return save_kv_cache and k is not None and self.kv_cache_dtype == torch.float8_e4m3fn
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -215,7 +222,19 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        if save_kv_cache and k is not None:
+        if self._should_use_fused_fp8_path(save_kv_cache, k):
+            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            fused_fp8_set_kv_buffer(
+                k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v=v.view(-1, layer.tp_k_head_num, layer.head_dim),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_loc=out_cache_loc,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+                page_size=self.page_size,
+            )
+        else save_kv_cache and k is not None:
             token_to_kv_pool.set_kv_buffer(
                 layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
@@ -262,8 +281,19 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-
-        if save_kv_cache and k is not None:
+        if self._should_use_fused_fp8_path(save_kv_cache, k):
+            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            fused_fp8_set_kv_buffer(
+                k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v=v.view(-1, layer.tp_k_head_num, layer.head_dim),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_loc=out_cache_loc,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+                page_size=self.page_size,
+            )
+        else save_kv_cache and k is not None:
             token_to_kv_pool.set_kv_buffer(
                 layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
