@@ -419,7 +419,7 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
     ) -> torch.Tensor:
         if (
             self.use_min_latency
-            and 0 < x.size(0) <= 16
+            and x.size(0) > 0
             and block_scale is None
             and (output_dtype is None or output_dtype == torch.bfloat16)
         ):

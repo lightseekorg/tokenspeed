@@ -412,14 +412,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 openai_compatible_messages = openai_compatible_messages[:-1]
 
         try:
-            prompt_ids = self.engine_client.tokenizer.apply_chat_template(
+            prompt_text = self.engine_client.tokenizer.apply_chat_template(
                 openai_compatible_messages,
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
                 builtin_tools=[],
-                return_dict=False,
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
@@ -450,22 +449,19 @@ class OpenAIServingChat(OpenAIServingBase):
                                     )
                             except orjson.JSONDecodeError as e:
                                 logger.warning(
-                                    "function_call arguments JSON parse error: %s | Original request arguments: %s",
-                                    e,
-                                    repr(arguments),
+                                    f"function_call arguments JSON parse error: {e} | Original request arguments: {arguments!r}"
                                 )
                                 raise ValueError(
-                                    f"function_call arguments JSON parse error: {e} | Original request arguments: {repr(arguments[:200])}"
+                                    f"function_call arguments JSON parse error: {e} | Original request arguments: {arguments[:200]!r}"
                                 )
             try:
-                prompt_ids = self.engine_client.tokenizer.apply_chat_template(
+                prompt_text = self.engine_client.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=False,
                     add_generation_prompt=True,
                     tools=tools,
                     reasoning_effort=request.reasoning_effort,
                     builtin_tools=[],
-                    return_dict=False,
                     **(
                         request.chat_template_kwargs
                         if request.chat_template_kwargs
@@ -474,13 +470,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             except Exception as e:
                 logger.warning(
-                    "apply_chat_template error: %s| Original request: openai_compatible_messages=%r",
-                    e,
-                    openai_compatible_messages,
+                    f"apply_chat_template error: {e} | Original request: openai_compatible_messages={openai_compatible_messages!r}"
                 )
                 raise RuntimeError(
                     f"apply_chat_template error: {e} | Please check request data format"
                 )
+
+        prompt_ids = self.engine_client.tokenizer.encode(prompt_text)
 
         if assistant_prefix:
             encoded = self.engine_client.tokenizer.encode(assistant_prefix)
@@ -1046,7 +1042,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             text = text.replace(marker, "")
                         text = text.rstrip()
                 except Exception as e:
-                    logger.error("Reasoning parsing error: %s", e)
+                    logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
                         "Failed to parse reasoning content",
                         err_type="InternalServerError",
@@ -1178,7 +1174,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
                 return tool_calls, text, finish_reason
             except Exception as e:
-                logger.error("Tool call parsing error: %s", e)
+                logger.error(f"Tool call parsing error: {e}")
                 # Return error but don't fail the whole request
                 return None, text, finish_reason
 
