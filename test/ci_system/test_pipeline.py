@@ -1,5 +1,6 @@
 import pytest
 from pipeline import (
+    build_step_summary_lines,
     check_perf_reference,
     extract_evalscope_score,
     extract_perf_summary_rows,
@@ -112,3 +113,50 @@ def test_check_perf_reference_raises_on_malformed_pair():
     task = {"perf_reference": {16: [40.0]}}
     with pytest.raises(ValueError, match=r"\[tps_user, tps_gpu\]"):
         check_perf_reference(task, _command_results_with(rows), ["perf"])
+
+
+def _base_result(**extras):
+    base = {
+        "ok": True,
+        "task": "perf-task",
+        "runner": "b200-4gpu",
+        "executed_stages": ["server", "perf.install", "perf"],
+        "targets": {},
+        "command_results": [],
+    }
+    base.update(extras)
+    return base
+
+
+def test_step_summary_includes_perf_reference_pass():
+    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 0.9,
+        "perf_reference": {16: [33.0, 26000.0]},
+    }
+    check = check_perf_reference(task, _command_results_with(rows), ["perf"])
+    summary = "\n".join(
+        build_step_summary_lines(_base_result(perf_reference_check=check))
+    )
+    assert "- Perf reference: `pass`" in summary
+    assert "threshold `0.9`" in summary
+    assert "1 concurrency levels" in summary
+
+
+def test_step_summary_includes_perf_reference_failures():
+    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 0.9,
+        "perf_reference": {16: [40.0, 26000.0]},
+    }
+    check = check_perf_reference(task, _command_results_with(rows), ["perf"])
+    summary = "\n".join(
+        build_step_summary_lines(_base_result(perf_reference_check=check))
+    )
+    assert "- Perf reference: `fail`" in summary
+    assert "Latency (tps/user)" in summary
+
+
+def test_step_summary_omits_perf_reference_when_unconfigured():
+    summary = "\n".join(build_step_summary_lines(_base_result()))
+    assert "Perf reference" not in summary

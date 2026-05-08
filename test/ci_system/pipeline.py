@@ -861,6 +861,16 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
             f"- Eval score: `{check['score']:g}` "
             f"(threshold `{check['threshold']}`, {status})"
         )
+    if result.get("perf_reference_check"):
+        check = result["perf_reference_check"]
+        status = "pass" if check["passed"] else "fail"
+        lines.append(
+            f"- Perf reference: `{status}` "
+            f"(threshold `{check['threshold']:g}`, "
+            f"{len(check['checks'])} concurrency levels)"
+        )
+        if not check["passed"]:
+            lines.extend([f"  - {failure}" for failure in check["failures"]])
     if result.get("eval_accept_rate"):
         accept_rate = result["eval_accept_rate"]
         lines.append(
