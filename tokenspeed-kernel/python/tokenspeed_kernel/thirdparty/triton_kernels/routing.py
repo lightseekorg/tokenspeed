@@ -38,21 +38,23 @@ def routing(
     assert logits.ndim == 2, "router_logits must be (n_tokens, n_expts_tot)"
     n_tokens, _ = logits.shape
 
-    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
-    md = sparse.mask_metadata
+    if sm_first:
+        logits = torch.softmax(logits, dim=-1)
 
-    col_sorted = md.col_sorted_indx.to(torch.int32)
-    expt_hist = md.col_sum.to(torch.int32)
+    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
+    mask_metadata = sparse.mask_metadata
+
+    col_sorted = mask_metadata.col_sorted_indx
     gather_indx = col_sorted // n_expts_act
     scatter_indx = col_sorted
 
     vals_flat = sparse.vals.reshape(-1)
     if dtype is not None and vals_flat.dtype != dtype:
         vals_flat = vals_flat.to(dtype)
-    gate_scal = vals_flat[col_sorted.to(torch.int64)]
+    gate_scal = vals_flat[scatter_indx]
 
     n_total_rows = n_tokens * n_expts_act
-    ragged_metadata = make_ragged_tensor_metadata(expt_hist, n_total_rows)
+    ragged_metadata = make_ragged_tensor_metadata(mask_metadata.col_sum, n_total_rows)
 
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
 

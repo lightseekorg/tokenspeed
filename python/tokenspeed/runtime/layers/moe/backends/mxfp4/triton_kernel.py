@@ -241,8 +241,8 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
 
-        # Second GEMM: down projection with scatter (combine).
-        # gammas applies the routing weights (expert contribution weights).
+        # Second GEMM: down projection with scatter (combine)
+        # gammas applies the routing weights (expert contribution weights)
         return tokenspeed_kernel.moe_experts(
             intermediate_cache,
             w2_weight,
