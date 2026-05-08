@@ -23,7 +23,6 @@ from __future__ import annotations
 from typing import Dict
 
 import numpy as np
-import torch
 
 from tokenspeed.runtime.pd.base import BootstrapInfo, KVPoll
 from tokenspeed.runtime.pd.mooncake.prefill import (
@@ -139,12 +138,6 @@ class DisaggPrefillExecutor:
     def prepare_prefill(self, op) -> None:
         if not self._layerwise_enabled or op.num_extends() == 0:
             return
-        if self.kv_manager.kv_args.state_type == "mamba":
-            # Hybrid mamba layers do not currently advance the layerwise cache
-            # step counter reliably, so transfer the complete KV+mamba state
-            # after prefill instead of queueing a pre-forward layerwise copy.
-            return
-
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
         for i, request_id in enumerate(op.request_ids[: op.num_extends()]):
             sender = self.senders[request_id]
@@ -193,8 +186,6 @@ class DisaggPrefillExecutor:
                 bootstrap_token,
             )
             mamba_indices = self._mamba_indices(op, i)
-            if self.kv_manager.kv_args.state_type == "mamba":
-                torch.cuda.synchronize()
             self.senders[request_id].send(
                 kv_indices,
                 aux_index,

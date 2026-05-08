@@ -73,6 +73,7 @@ class LayerMappedKVPool:
         self, inner_pool: BaseTokenToKVPool, full_attention_layer_ids: list[int]
     ):
         self.inner = inner_pool
+        self.layer_ids = list(full_attention_layer_ids)
         self.layer_map = {
             global_id: pool_idx
             for pool_idx, global_id in enumerate(full_attention_layer_ids)
@@ -127,6 +128,7 @@ class SimpleMambaPool:
     ):
         self.size = size
         self.device = device
+        self.mamba_layer_ids = list(mamba_layer_ids)
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
         self.is_kda_cache = False
 
@@ -199,6 +201,10 @@ class SimpleMambaPool:
                 data_lens.append(layer_cache.nbytes)
                 item_lens.append(layer_cache[0].nbytes)
         return data_ptrs, data_lens, item_lens
+
+    def get_contiguous_buf_layer_ids(self):
+        """Return global layer ids aligned with get_contiguous_buf_infos()."""
+        return self.mamba_layer_ids * len(self.mamba_cache)
 
 
 class MambaAttnBackend(AttentionBackend):
@@ -777,8 +783,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             backend.init_cuda_graph_state(max_bs, seq_lens_buf)
 
     def register_step_counter(self, step_counter):
-        for backend in self._backends():
-            backend.register_step_counter(step_counter)
+        # Hybrid layerwise transfer needs one global step per model layer,
+        # including both full-attention and mamba layers. Record steps in this
+        # wrapper instead of in child backends to avoid double counting.
+        self.step_counter = step_counter
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         common_kw, mamba_kw = self._split_mamba_kwargs(kwargs)
@@ -852,7 +860,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         else:
             if backend is self.linear_attn_backend and forward_mode.is_target_verify():
                 kwargs["is_target_verify"] = True
-            return backend.forward_extend(
+            step_counter = getattr(self, "step_counter", None)
+            if (
+                not forward_mode.is_idle()
+                and step_counter is not None
+                and not save_kv_cache
+            ):
+                step_counter.record_cache()
+            ret = backend.forward_extend(
                 q,
                 k,
                 v,
@@ -863,6 +878,13 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 **kwargs,
             )
+            if (
+                not forward_mode.is_idle()
+                and step_counter is not None
+                and save_kv_cache
+            ):
+                step_counter.record_cache()
+            return ret
 
     def forward_decode(self, q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]

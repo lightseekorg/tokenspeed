@@ -46,10 +46,12 @@ class KVArgs:
     gpu_id: int
     target_layer_num: int
     draft_layer_num: int
+    kv_layer_ids: List[int] = field(default_factory=list)
     state_data_ptrs: List[int] = field(default_factory=list)
     state_data_lens: List[int] = field(default_factory=list)
     state_item_lens: List[int] = field(default_factory=list)
     state_type: str = "none"
+    state_layer_ids: List[int] = field(default_factory=list)
     mamba_offsets: List[int] | None = None
 
 

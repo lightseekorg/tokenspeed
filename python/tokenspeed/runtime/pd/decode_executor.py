@@ -141,8 +141,6 @@ class DisaggDecodeExecutor:
                 # message from the prefill side.  bootstrap_room == bootstrap_info.bootstrap_room,
                 # which is the key used in MooncakeKVReceiver.
                 bootstrap_room = self.receivers[req_id].bootstrap_room
-                if self.kv_manager.kv_args.state_type == "mamba":
-                    torch.cuda.synchronize()
                 bootstrap_token = self.kv_manager.pop_bootstrap_token(bootstrap_room)
                 logger.debug(
                     "[decode][generate_events] rid=%s -> RemotePrefillDoneEvent bootstrap_token=%s",

@@ -80,7 +80,18 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             envs.TOKENSPEED_DISAGGREGATION_FAILED_SESSION_TTL.get(), 0
         )
         self.session_lock = threading.Lock()
-        self.layer_num = len(self.kv_args.offsets)
+        self.kv_layer_ids = list(
+            getattr(self.kv_args, "kv_layer_ids", None) or range(len(self.kv_args.offsets))
+        )
+        self.state_layer_ids = list(getattr(self.kv_args, "state_layer_ids", []) or [])
+        layer_ids = self.kv_layer_ids + self.state_layer_ids
+        self.layer_num = (max(layer_ids) + 1) if layer_ids else len(self.kv_args.offsets)
+        self._kv_layer_to_index = {
+            layer_id: i
+            for i, layer_id in enumerate(
+                self.kv_layer_ids[: len(self.kv_args.offsets)]
+            )
+        }
         self.layerwise_interval = 1
         self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
         self.step_counter = None
@@ -344,12 +355,19 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         prefill_mamba_indices: Optional[npt.NDArray[np.int64]],
         dst_state_data_ptrs: list[int],
         dst_mamba_indices: Optional[npt.NDArray[np.int64]],
+        begin_layer_id: Optional[int] = None,
+        end_layer_id: Optional[int] = None,
     ) -> int:
         if self.kv_args.state_type != "mamba":
             return 0
         state_ptrs = self.kv_args.state_data_ptrs
         state_item_lens = self.kv_args.state_item_lens
-        if not state_ptrs or not dst_state_data_ptrs or prefill_mamba_indices is None or dst_mamba_indices is None:
+        if (
+            not state_ptrs
+            or not dst_state_data_ptrs
+            or prefill_mamba_indices is None
+            or dst_mamba_indices is None
+        ):
             return 0
         if len(state_ptrs) != len(dst_state_data_ptrs):
             logger.error(
@@ -359,7 +377,38 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
             return -1
 
+        state_items = list(zip(state_ptrs, dst_state_data_ptrs, state_item_lens))
+        if begin_layer_id is not None or end_layer_id is not None:
+            begin = 0 if begin_layer_id is None else begin_layer_id
+            end = self.layer_num if end_layer_id is None else end_layer_id
+            if len(self.state_layer_ids) != len(state_items):
+                logger.error(
+                    "Mamba state layer id count mismatch: ids=%d tensors=%d",
+                    len(self.state_layer_ids),
+                    len(state_items),
+                )
+                return -1
+            state_items = [
+                item
+                for item, layer_id in zip(state_items, self.state_layer_ids)
+                if begin <= layer_id < end
+            ]
+            if not state_items:
+                return 0
+
         valid = (prefill_mamba_indices >= 0) & (dst_mamba_indices >= 0)
+        log_layerwise = getattr(self, "layerwise_debug", False)
+        if log_layerwise and begin_layer_id is not None and end_layer_id is not None:
+            logger.info(
+                "[layerwise_transfer] session=%s layers=[%d,%d) "
+                "send mamba tensors=%d bytes=%d",
+                mooncake_session_id,
+                begin_layer_id,
+                end_layer_id,
+                len(state_items),
+                sum(item_len for _, _, item_len in state_items)
+                * int(valid.sum()),
+            )
         if not valid.any():
             return 0
 
@@ -367,7 +416,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_indices = dst_mamba_indices[valid]
         src_blocks, dst_blocks = group_concurrent_contiguous(src_indices, dst_indices)
         transfer_blocks = []
-        for src_ptr, dst_ptr, item_len in zip(state_ptrs, dst_state_data_ptrs, state_item_lens):
+        for src_ptr, dst_ptr, item_len in state_items:
             for prefill_index, decode_index in zip(src_blocks, dst_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -394,12 +443,13 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_kv_indices: npt.NDArray[np.int64],
         begin_cache_step: int,
         interval: int,
+        dst_state_data_ptrs: Optional[list[int]] = None,
+        prefill_mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        dst_mamba_indices: Optional[npt.NDArray[np.int64]] = None,
     ) -> int:
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
-        if not prefill_kv_blocks:
-            return 0
 
         interval = max(int(interval), 1)
         log_layerwise = getattr(self, "layerwise_debug", False)
@@ -416,37 +466,54 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     len(prefill_kv_indices),
                 )
             self._wait_until_cache_step(target_step)
-            transfer_blocks = self._layer_transfer_blocks(
-                dst_ptrs=dst_kv_ptrs,
-                src_blocks=prefill_kv_blocks,
-                dst_blocks=dst_kv_blocks,
+
+            transfer_blocks = []
+            if prefill_kv_blocks:
+                for global_layer_id in range(begin_layer_id, end_layer_id):
+                    kv_layer_index = self._kv_layer_to_index.get(global_layer_id)
+                    if kv_layer_index is None:
+                        continue
+                    transfer_blocks.extend(
+                        self._layer_transfer_blocks(
+                            dst_ptrs=dst_kv_ptrs,
+                            src_blocks=prefill_kv_blocks,
+                            dst_blocks=dst_kv_blocks,
+                            begin_layer_id=kv_layer_index,
+                            end_layer_id=kv_layer_index + 1,
+                        )
+                    )
+            if transfer_blocks:
+                if log_layerwise:
+                    total_bytes = sum(length for _, _, length in transfer_blocks)
+                    logger.info(
+                        "[layerwise_transfer] session=%s layers=[%d,%d) send kv blocks=%d bytes=%d",
+                        mooncake_session_id,
+                        begin_layer_id,
+                        end_layer_id,
+                        len(transfer_blocks),
+                        total_bytes,
+                    )
+                ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+                if ret != 0:
+                    return ret
+
+            ret = self.send_mamba_cache(
+                mooncake_session_id,
+                prefill_mamba_indices,
+                dst_state_data_ptrs or [],
+                dst_mamba_indices,
                 begin_layer_id=begin_layer_id,
                 end_layer_id=end_layer_id,
             )
-            if log_layerwise:
-                total_bytes = sum(length for _, _, length in transfer_blocks)
-                logger.info(
-                    "[layerwise_transfer] session=%s layers=[%d,%d) send blocks=%d bytes=%d",
-                    mooncake_session_id,
-                    begin_layer_id,
-                    end_layer_id,
-                    len(transfer_blocks),
-                    total_bytes,
-                )
-            ret = self._transfer_data(
-                mooncake_session_id,
-                transfer_blocks,
-            )
-            if log_layerwise:
-                logger.info(
-                    "[layerwise_transfer] session=%s layers=[%d,%d) done ret=%d",
-                    mooncake_session_id,
-                    begin_layer_id,
-                    end_layer_id,
-                    ret,
-                )
             if ret != 0:
                 return ret
+            if log_layerwise:
+                logger.info(
+                    "[layerwise_transfer] session=%s layers=[%d,%d) done",
+                    mooncake_session_id,
+                    begin_layer_id,
+                    end_layer_id,
+                )
         return 0
 
     def sync_status_to_decode_endpoint(
@@ -538,8 +605,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 resolved.dst_indices,
                                 kv_chunk.begin_cache_step,
                                 kv_chunk.layerwise_interval,
+                                self.decode_kv_args_table[req.mooncake_session_id].dst_state_data_ptrs,
+                                kv_chunk.prefill_mamba_indices,
+                                req.dst_mamba_indices,
                             )
-                        if ret == 0 and kv_chunk.is_last:
+                        if ret == 0 and kv_chunk.is_last and kv_chunk.begin_cache_step is None:
                             if kv_chunk.wait_for_bootstrap_token:
                                 self._wait_bootstrap_token(
                                     kv_chunk.prefill_aux_index, kv_chunk.bootstrap_token
