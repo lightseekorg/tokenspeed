@@ -148,7 +148,7 @@ void dsv3_router_gemm(TensorView output, TensorView mat_a, TensorView mat_b, boo
 
   cudaStream_t stream = get_stream(device);
 
-  bool use_custom_kernel = (num_tokens >= 1 && num_tokens <= 16);
+  bool use_custom_kernel = (num_tokens >= 1 && num_tokens <= 8);
   bool supported_experts = (num_experts == 256 || num_experts == 384 || num_experts == 768);
   bool supported_hidden = (hidden_dim == 3072 || hidden_dim == 6144 || hidden_dim == 7168);
 
