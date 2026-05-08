@@ -273,6 +273,7 @@ def mha_decode_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    scheduler_metadata: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
 ) -> AttentionResult:
@@ -349,7 +350,7 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        kernel_kwargs = dict(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -363,3 +364,8 @@ def mha_decode_with_kvcache(
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
         )
+        # Only the FA3 path accepts pre-computed scheduler metadata; other
+        # backends would reject the unknown kwarg.
+        if scheduler_metadata is not None:
+            kernel_kwargs["scheduler_metadata"] = scheduler_metadata
+        return kernel(**kernel_kwargs)

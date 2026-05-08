@@ -322,6 +322,7 @@ elif platform.is_nvidia and platform.is_hopper:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
+        scheduler_metadata: torch.Tensor | None = None,
     ) -> torch.Tensor:
         out = flash_attn_with_kvcache(
             q=q.unsqueeze(1),
@@ -338,6 +339,7 @@ elif platform.is_nvidia and platform.is_hopper:
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
+            scheduler_metadata=scheduler_metadata,
         )
         return out.view_as(q)
 

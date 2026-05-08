@@ -21,6 +21,7 @@
 
 import numpy as np
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
@@ -357,11 +358,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
         if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
-        else:
-            self.k_buffer[layer_id][loc] = cache_k
-            self.v_buffer[layer_id][loc] = cache_v
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+        store_kv_cache(
+            cache_k, cache_v, self.k_buffer[layer_id], self.v_buffer[layer_id], loc
+        )
 
 
 class SWAKVPool(BaseTokenToKVPool):
