@@ -28,7 +28,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly"}
+SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 STALE_PROCESS_PATTERNS = [
     r"python.*tokenspeed\.api_server",
