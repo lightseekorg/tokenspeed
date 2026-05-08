@@ -93,3 +93,11 @@ perf:
     exit "$PARSE_STATUS"
 report:
   github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
+perf_reference:
+  1:  [367.65, 8742.12]
+  2:  [284.90, 13280.12]
+  4:  [182.48, 17276.27]
+  8:  [112.49, 20944.40]
+  16: [67.61,  25181.19]
