@@ -7,6 +7,12 @@ triggers:
 runner:
   labels:
     - b200-2gpu
+    - linux-mi355-1gpu-lightseek
+  env:
+    linux-mi355-1gpu-lightseek:
+      GPT_OSS_EVAL_TP_SIZE: "1"
+      GPT_OSS_EVAL_ATTENTION_BACKEND: mha
+      GPT_OSS_EVAL_MOE_BACKEND: triton_kernel
 env:
   CI: "true"
 install:
@@ -15,15 +21,15 @@ server:
   command: >-
     python3 -m tokenspeed.api_server
     --model openai/gpt-oss-120b
-    --attn-tp-size 2
-    --moe-tp-size 2
+    --attn-tp-size ${GPT_OSS_EVAL_TP_SIZE:-2}
+    --moe-tp-size ${GPT_OSS_EVAL_TP_SIZE:-2}
     --max-model-len 80000
     --max-prefill-tokens 8192
     --chunked-prefill-size 8192
     --trust-remote-code
     --reasoning-parser gpt-oss
-    --attention-backend trtllm
-    --moe-backend flashinfer_mxfp4
+    --attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND:-trtllm}
+    --moe-backend ${GPT_OSS_EVAL_MOE_BACKEND:-flashinfer_mxfp4}
     --enable-cache-report
     --host 127.0.0.1
   ready:
