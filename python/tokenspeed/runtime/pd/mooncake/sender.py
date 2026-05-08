@@ -67,6 +67,7 @@ class MooncakeKVSender:
         is_last,
         mla_l1_5_args: Optional[PageTransferMetadata] = None,
         bootstrap_token: int = -1,
+        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
     ):
         """
         Send the kv cache at the given kv indices to the decoder server
@@ -94,6 +95,7 @@ class MooncakeKVSender:
                 index_slice,
                 False,
                 mla_l1_5_args=mla_l1_5_args,
+                mamba_indices=mamba_indices,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -104,6 +106,7 @@ class MooncakeKVSender:
                 aux_index=aux_index,
                 mla_l1_5_args=mla_l1_5_args,
                 bootstrap_token=bootstrap_token,
+                mamba_indices=mamba_indices,
             )
 
     def send_layerwise(
@@ -117,6 +120,7 @@ class MooncakeKVSender:
         mla_l1_5_args: Optional[PageTransferMetadata] = None,
         bootstrap_token: int = -1,
         wait_for_bootstrap_token: bool = False,
+        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
     ):
         self._layerwise_transfer_started = True
         self.curr_idx = max(self.curr_idx, index_slice.stop)
@@ -146,6 +150,7 @@ class MooncakeKVSender:
             begin_cache_step=begin_cache_step,
             layerwise_interval=layerwise_interval,
             wait_for_bootstrap_token=wait_for_bootstrap_token,
+            mamba_indices=mamba_indices,
         )
 
     def poll(self) -> KVPoll:

@@ -26,7 +26,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Generic, List, Optional, Tuple, TypeVar
 
 import torch
 from torch import nn
@@ -62,7 +62,10 @@ def _default_compute_output_placement(
     return Partial(group) if has_parallel else None
 
 
-class BaseDecoderLayer[C: PretrainedConfig](nn.Module):
+_C = TypeVar("_C", bound=PretrainedConfig)
+
+
+class BaseDecoderLayer(nn.Module, Generic[_C]):
     """Default decoder layer using CommManager for communication.
 
     Subclasses override ``resolve_attn()`` and ``resolve_mlp()``.
@@ -70,7 +73,7 @@ class BaseDecoderLayer[C: PretrainedConfig](nn.Module):
 
     def __init__(
         self,
-        config: C,
+        config: _C,
         layer_id: int,
         mapping: Mapping,
         quant_config: Q | None = None,
@@ -231,7 +234,7 @@ class BaseMoEDecoderLayer(BaseDecoderLayer):
         return True
 
 
-class CompiledDecoderLayer[C: PretrainedConfig](nn.Module):
+class CompiledDecoderLayer(nn.Module, Generic[_C]):
     """Compiler-driven decoder layer (opt-in).
 
     Instead of CommManager, the forward delegates to a
@@ -240,7 +243,7 @@ class CompiledDecoderLayer[C: PretrainedConfig](nn.Module):
 
     def __init__(
         self,
-        config: C,
+        config: _C,
         layer_id: int,
         mapping: Mapping,
         quant_config: Q | None = None,

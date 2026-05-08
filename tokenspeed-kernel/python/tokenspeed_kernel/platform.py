@@ -414,7 +414,9 @@ def _detect_rocm_platform() -> PlatformInfo:
         memory_bandwidth=_estimate_amd_bandwidth(props),
         sm_count=props.multi_processor_count,
         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
-        max_shared_memory_per_sm=getattr(props, "max_shared_memory_per_block", 0),
+        max_shared_memory_per_sm={"gfx942": 64 * 1024, "gfx950": 64 * 1024}.get(
+            arch, getattr(props, "max_shared_memory_per_block", 0)
+        ),
         sm_features=sm_features,
         runtime_features=runtime_features,
         interconnect=_detect_rocm_interconnect(),
@@ -500,6 +502,31 @@ def _detect_rocm_interconnect() -> InterconnectInfo | None:
         device_count = torch.cuda.device_count()
         if device_count <= 1:
             return InterconnectInfo(topology="single_gpu")
+        # Probe /sys/class/kfd for xGMI links (HSA_IOLINK_TYPE_XGMI = 11).
+        try:
+            import os as _os
+
+            kfd_root = "/sys/class/kfd/kfd/topology/nodes"
+            xgmi_count = 0
+            for node in _os.listdir(kfd_root):
+                links_dir = _os.path.join(kfd_root, node, "io_links")
+                if not _os.path.isdir(links_dir):
+                    continue
+                for link in _os.listdir(links_dir):
+                    pf = _os.path.join(links_dir, link, "properties")
+                    try:
+                        with open(pf) as f:
+                            for line in f:
+                                if line.startswith("type ") and line.split()[1] == "11":
+                                    xgmi_count += 1
+                    except OSError:
+                        continue
+            if xgmi_count > 0:
+                full = device_count * (device_count - 1)
+                topo = "xgmi_full" if xgmi_count >= full else "xgmi_pairs"
+                return InterconnectInfo(topology=topo)
+        except Exception:
+            pass
         return InterconnectInfo(topology="pcie")
     except Exception:
         return None

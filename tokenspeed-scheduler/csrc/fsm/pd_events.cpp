@@ -48,6 +48,7 @@ PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
         std::move(state).TakeReqPoolIndex(),
         w,
         0,  // reserve_num_tokens_in_next_schedule_event
+        std::move(state).TakeLocalMambaAllocator(),
     };
 
     prefill_done.ExtendResultTokens({bootstrap_token});

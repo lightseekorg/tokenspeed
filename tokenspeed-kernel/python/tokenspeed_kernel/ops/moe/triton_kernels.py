@@ -142,46 +142,12 @@ def _w_out_dim(w):
 
 if matmul is not None:
 
-    def _matmul_dispatch_gemm(
+    def _matmul(
         x,
         w,
         bias=None,
         a_ragged_metadata=None,
         gather_indx=None,
-        precision_config=None,
-        fused_activation=None,
-        epilogue=None,
-        betas=None,
-        gammas=None,
-        out_alpha=None,
-        y=None,
-    ):
-        if gather_indx is not None and hasattr(gather_indx, "shape"):
-            M = gather_indx.shape[0]
-        else:
-            M = x.shape[-2]
-        n_experts = _ragged_n_experts(a_ragged_metadata)
-        with _maybe_lds_guard(M, _w_out_dim(w), n_experts):
-            return matmul(
-                x,
-                w,
-                bias,
-                a_ragged_metadata=a_ragged_metadata,
-                gather_indx=gather_indx,
-                precision_config=precision_config,
-                fused_activation=fused_activation,
-                epilogue=epilogue,
-                betas=betas,
-                gammas=gammas,
-                out_alpha=out_alpha,
-                c=y,
-            )
-
-    def _matmul_gemm_combine(
-        x,
-        w,
-        bias=None,
-        a_ragged_metadata=None,
         scatter_indx=None,
         precision_config=None,
         fused_activation=None,
@@ -193,7 +159,9 @@ if matmul is not None:
         n_tokens=None,
         n_expts_act=None,
     ):
-        if scatter_indx is not None and hasattr(scatter_indx, "shape"):
+        if gather_indx is not None and hasattr(gather_indx, "shape"):
+            M = gather_indx.shape[0]
+        elif scatter_indx is not None and hasattr(scatter_indx, "shape"):
             M = scatter_indx.shape[0]
         else:
             M = x.shape[-2]
@@ -204,6 +172,7 @@ if matmul is not None:
                 w,
                 bias,
                 a_ragged_metadata=a_ragged_metadata,
+                gather_indx=gather_indx,
                 scatter_indx=scatter_indx,
                 precision_config=precision_config,
                 fused_activation=fused_activation,
@@ -213,7 +182,7 @@ if matmul is not None:
                 out_alpha=out_alpha,
                 c=y,
             )
-        if n_expts_act is not None and n_expts_act > 1:
+        if scatter_indx is not None and n_expts_act is not None and n_expts_act > 1:
             assert (
                 n_tokens is not None
             ), "n_tokens required when n_expts_act > 1 for top-k reduction"
@@ -230,10 +199,18 @@ if matmul is not None:
     register_kernel(
         "moe",
         "experts",
+        name="triton_kernels_matmul_ogs",
+        features={"ragged_metadata"},
+        **_matmul_common,
+    )(_matmul)
+
+    register_kernel(
+        "moe",
+        "experts",
         name="triton_kernels_dispatch_gemm",
         features={"ragged_metadata", "dispatch_gemm"},
         **_matmul_common,
-    )(_matmul_dispatch_gemm)
+    )(_matmul)
 
     register_kernel(
         "moe",
@@ -241,4 +218,4 @@ if matmul is not None:
         name="triton_kernels_gemm_combine",
         features={"ragged_metadata", "gemm_combine"},
         **_matmul_common,
-    )(_matmul_gemm_combine)
+    )(_matmul)

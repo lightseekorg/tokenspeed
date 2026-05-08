@@ -38,7 +38,15 @@ platform = current_platform()
 # ------------------------------------------------------------------------------
 
 
-if platform.is_nvidia and platform.is_blackwell:
+# FA4 CUTE kernels currently support SM 10.0 (B100/B200/GB200) variants only.
+# B300/GB300 (SM 10.3 / sm_103) is not yet supported by flash-attn — its CUTE
+# arch enum value falls outside the [sm_100, sm_110f] range checked in
+# FlashAttentionForwardSm100, causing an AssertionError at call time.
+if (
+    platform.is_nvidia
+    and platform.is_blackwell
+    and platform.arch_version == ArchVersion(10, 0)
+):
     try:
         from flash_attn.cute import (
             flash_attn_func,
