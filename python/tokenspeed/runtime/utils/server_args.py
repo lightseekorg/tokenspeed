@@ -210,9 +210,9 @@ class ServerArgs:
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
     speculative_draft_model_quantization: str | None = None
-    speculative_num_steps: int = 5
-    speculative_eagle_topk: int = 4
-    speculative_num_draft_tokens: int = 8
+    speculative_num_steps: int = 3
+    speculative_eagle_topk: int = 1
+    speculative_num_draft_tokens: int | None = None
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -319,28 +319,29 @@ class ServerArgs:
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
 
-        if self.speculative_config is None:
-            return
+        if self.speculative_config is not None:
+            try:
+                config = json.loads(self.speculative_config)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--speculative-config must be valid JSON") from exc
 
-        try:
-            config = json.loads(self.speculative_config)
-        except json.JSONDecodeError as exc:
-            raise ValueError("--speculative-config must be valid JSON") from exc
+            if not isinstance(config, dict):
+                raise ValueError("--speculative-config must be a JSON object")
 
-        if not isinstance(config, dict):
-            raise ValueError("--speculative-config must be a JSON object")
+            method = config.get("method")
+            if method is not None and self.speculative_algorithm is None:
+                self.speculative_algorithm = str(method).upper()
 
-        method = config.get("method")
-        if method is not None and self.speculative_algorithm is None:
-            self.speculative_algorithm = str(method).upper()
+            draft_model = config.get("model")
+            if draft_model is not None and self.speculative_draft_model_path is None:
+                self.speculative_draft_model_path = str(draft_model)
 
-        draft_model = config.get("model")
-        if draft_model is not None and self.speculative_draft_model_path is None:
-            self.speculative_draft_model_path = str(draft_model)
+            num_speculative_tokens = config.get("num_speculative_tokens")
+            if num_speculative_tokens is not None:
+                self.speculative_num_draft_tokens = int(num_speculative_tokens)
 
-        num_speculative_tokens = config.get("num_speculative_tokens")
-        if num_speculative_tokens is not None:
-            self.speculative_num_draft_tokens = int(num_speculative_tokens)
+        if self.speculative_num_draft_tokens is None:
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
     def resolve_memory_and_scheduling(self):
         if current_platform().is_amd:
