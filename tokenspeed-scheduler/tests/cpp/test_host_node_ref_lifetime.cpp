@@ -20,11 +20,14 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "core/token_container.h"
 #include "fsm/forward_states.h"
+#include "fsm/pd_events.h"
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/page_allocator.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
@@ -146,6 +149,34 @@ TEST_F(HostNodeRefLifetimeTest, Decoding_HoldsHostLockAfterCallerExits) {
         /*reserve_num_tokens_in_next_schedule_event=*/0,
     };
     host_ref.reset();
+
+    EXPECT_EQ(node->Host().RefCount(), lock_before);
+}
+
+// State-construction tests above guard the ctors. This one guards an event
+// transition (Prefilling -> PrefillDone via RemotePrefillDoneEvent), the path
+// where the most recent regression slipped past ctor-only coverage. Prefilling
+// is scoped so it is destroyed before the assertion: if the event drops the
+// ref instead of forwarding it via TakeHostNodeRef, the lock vanishes here.
+TEST_F(HostNodeRefLifetimeTest, RemotePrefillDoneEvent_PreservesHostLock) {
+    TreeNode* node = MakeHostNode();
+    auto host_ref = MakeHostRef(node);
+    const std::int32_t lock_before = node->Host().RefCount();
+
+    TokenContainer tokens{std::vector<std::int32_t>{1, 2, 3}};
+    std::optional<fsm::PrefillDone> prefill_done;
+    {
+        fsm::Prefilling prefilling{
+            /*token_container=*/&tokens,
+            /*page_size=*/kPageSize,
+            /*host_node_ref=*/std::move(host_ref),
+            /*device_node_ref=*/std::unique_ptr<DeviceNodeRef>{},
+            /*local_kv_allocator=*/std::unique_ptr<LocalKVAllocator>{},
+            /*req_pool_index=*/std::unique_ptr<ReqPoolIndex>{},
+            /*window=*/TokenContainer::Window{},
+        };
+        prefill_done = fsm::RemotePrefillDoneEvent{/*token=*/42}(std::move(prefilling));
+    }
 
     EXPECT_EQ(node->Host().RefCount(), lock_before);
 }
