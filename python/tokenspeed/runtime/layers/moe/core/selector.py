@@ -49,7 +49,10 @@ _AUTO_IMPL_PREFERENCE = {
         "flashinfer_mxfp4",
         "triton_kernel",
     ),
-    "fp8": ("triton",),
+    "fp8": (
+        "flashinfer_cutlass",
+        "triton",
+    ),
     "w8a8_fp8": ("triton",),
     "wna16": ("marlin",),
 }

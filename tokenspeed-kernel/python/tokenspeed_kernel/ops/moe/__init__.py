@@ -91,6 +91,7 @@ FUSED_PRE_ROUTED = (
 
 # Weight format trait values — used via traits={"weight_dtype": ...}
 WEIGHT_BF16 = "bf16"  # dense bfloat16 weights
+WEIGHT_FP8 = "fp8"  # FP8 block-scaled weights
 WEIGHT_MXFP4 = "mxfp4"  # MXFP4 block-scaled weights
 WEIGHT_NVFP4 = "nvfp4"  # NVFP4 block-scaled weights (CuteDSL)
 
@@ -238,6 +239,7 @@ def moe_fused(
     Weight format traits (pass via ``traits``):
 
     * ``{"weight_dtype": "bf16"}``: dense bfloat16 weights.
+    * ``{"weight_dtype": "fp8"}``: FP8 block-scaled weights.
     * ``{"weight_dtype": "mxfp4"}``: MXFP4 block-scaled weights.
     """
     kernel = select_kernel(
