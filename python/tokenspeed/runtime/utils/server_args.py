@@ -97,6 +97,8 @@ class ServerArgs:
     # special kv cache
     mamba_ssm_dtype: str = "float32"
     mamba_track_interval: int = 256
+    max_mamba_cache_size: int | None = None
+    mamba_full_memory_ratio: float = 0.9
 
     # Other runtime options
     stream_interval: int = 1
@@ -228,6 +230,7 @@ class ServerArgs:
     enable_symm_mem: bool = False
     disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
+    disable_tf32: bool = False
     force_deterministic_rsag: bool = False
     disable_sampling_tp_sync: bool = False
     low_latency_max_num_tokens_per_gpu: int = 256
@@ -917,6 +920,18 @@ class ServerArgs:
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
         )
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
 
         parser.add_argument(
             "--max-prefill-tokens",
@@ -1431,6 +1446,12 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--disable-tf32",
+            action="store_true",
+            help="Disable forcing TF32 on for cuBLAS/cuDNN. By default the server sets "
+            "NVIDIA_TF32_OVERRIDE=1 and TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1.",
         )
         parser.add_argument(
             "--max-cudagraph-capture-size",

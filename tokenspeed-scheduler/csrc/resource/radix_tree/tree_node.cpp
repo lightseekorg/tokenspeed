@@ -75,14 +75,12 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
 
     if (device_resource_ != nullptr) {
         std::int32_t ref_count = device_resource_->RefCount();
-        OwnedPages prefix_owned = device_resource_->SplitFirst(prefix_pages);
-        prefix.AttachResource(std::make_unique<DeviceResource>(std::move(prefix_owned), ref_count));
+        prefix.AttachResource(std::make_unique<DeviceResource>(device_resource_->SplitFirst(prefix_pages), ref_count));
     }
 
     if (host_resource_ != nullptr) {
         std::int32_t ref_count = host_resource_->RefCount();
-        OwnedPages prefix_owned = host_resource_->SplitFirst(prefix_pages);
-        prefix.AttachResource(std::make_unique<HostResource>(std::move(prefix_owned), ref_count));
+        prefix.AttachResource(std::make_unique<HostResource>(host_resource_->SplitFirst(prefix_pages), ref_count));
     }
     // Mamba resources stay in suffix node, no special handling needed
 }
