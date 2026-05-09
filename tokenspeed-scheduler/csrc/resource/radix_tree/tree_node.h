@@ -66,6 +66,7 @@ public:
     std::int32_t DepthInPage(std::int32_t page_size) const {
         return static_cast<std::int32_t>(depth_in_tokens_) / page_size;
     }
+    std::size_t DepthInTokens() const { return depth_in_tokens_; }
 
     TreeNode* Parent() const { return parent_; }
     const token_vec_t& Tokens() const { return tokens_; }

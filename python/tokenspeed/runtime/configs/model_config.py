@@ -300,6 +300,7 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "nvfp4",
+            "mxfp4",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",

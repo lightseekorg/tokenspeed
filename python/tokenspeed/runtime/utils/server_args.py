@@ -97,6 +97,8 @@ class ServerArgs:
     # special kv cache
     mamba_ssm_dtype: str = "float32"
     mamba_track_interval: int = 256
+    max_mamba_cache_size: int | None = None
+    mamba_full_memory_ratio: float = 0.9
 
     # Other runtime options
     stream_interval: int = 1
@@ -203,9 +205,9 @@ class ServerArgs:
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
     speculative_draft_model_quantization: str | None = None
-    speculative_num_steps: int = 5
-    speculative_eagle_topk: int = 4
-    speculative_num_draft_tokens: int = 8
+    speculative_num_steps: int = 3
+    speculative_eagle_topk: int = 1
+    speculative_num_draft_tokens: int | None = None
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -223,6 +225,7 @@ class ServerArgs:
     enable_symm_mem: bool = False
     disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
+    disable_tf32: bool = False
     force_deterministic_rsag: bool = False
     disable_sampling_tp_sync: bool = False
     low_latency_max_num_tokens_per_gpu: int = 256
@@ -311,28 +314,29 @@ class ServerArgs:
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
 
-        if self.speculative_config is None:
-            return
+        if self.speculative_config is not None:
+            try:
+                config = json.loads(self.speculative_config)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--speculative-config must be valid JSON") from exc
 
-        try:
-            config = json.loads(self.speculative_config)
-        except json.JSONDecodeError as exc:
-            raise ValueError("--speculative-config must be valid JSON") from exc
+            if not isinstance(config, dict):
+                raise ValueError("--speculative-config must be a JSON object")
 
-        if not isinstance(config, dict):
-            raise ValueError("--speculative-config must be a JSON object")
+            method = config.get("method")
+            if method is not None and self.speculative_algorithm is None:
+                self.speculative_algorithm = str(method).upper()
 
-        method = config.get("method")
-        if method is not None and self.speculative_algorithm is None:
-            self.speculative_algorithm = str(method).upper()
+            draft_model = config.get("model")
+            if draft_model is not None and self.speculative_draft_model_path is None:
+                self.speculative_draft_model_path = str(draft_model)
 
-        draft_model = config.get("model")
-        if draft_model is not None and self.speculative_draft_model_path is None:
-            self.speculative_draft_model_path = str(draft_model)
+            num_speculative_tokens = config.get("num_speculative_tokens")
+            if num_speculative_tokens is not None:
+                self.speculative_num_draft_tokens = int(num_speculative_tokens)
 
-        num_speculative_tokens = config.get("num_speculative_tokens")
-        if num_speculative_tokens is not None:
-            self.speculative_num_draft_tokens = int(num_speculative_tokens)
+        if self.speculative_num_draft_tokens is None:
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
     def resolve_memory_and_scheduling(self):
         if current_platform().is_amd:
@@ -912,6 +916,18 @@ class ServerArgs:
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
         )
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
 
         parser.add_argument(
             "--max-prefill-tokens",
@@ -1398,6 +1414,12 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--disable-tf32",
+            action="store_true",
+            help="Disable forcing TF32 on for cuBLAS/cuDNN. By default the server sets "
+            "NVIDIA_TF32_OVERRIDE=1 and TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1.",
         )
         parser.add_argument(
             "--max-cudagraph-capture-size",

@@ -84,6 +84,10 @@ struct SchedulerConfig {
     Role role{Role::kFused};
 
     std::int32_t num_mamba_slots{0};
+    bool disable_prefix_cache{false};
+    bool enable_mamba{false};
+    std::int32_t mamba_cache_chunk_size{64};
+    std::int32_t mamba_pool_total_chunks{0};
 };
 
 }  // namespace tokenspeed
