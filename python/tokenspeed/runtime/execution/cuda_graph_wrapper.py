@@ -593,9 +593,6 @@ class CudaGraphWrapper:
             mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
         if use_graph:
-            replay_kwargs = {}
-            if self.input_buffers.has_mamba and mamba_pool_indices is not None:
-                replay_kwargs["mamba_pool_indices"] = mamba_pool_indices
             self._init_replay_metadata(
                 padded_bs,
                 req_pool_indices,
