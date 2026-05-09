@@ -76,6 +76,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
+    if (hybrid_prefix_cache_ && match_result.mamba_branching_seqlen == -1) {
+        const std::int32_t aligned = hybrid_prefix_cache_->AlignMambaCacheSeqlen(tokens_this_round);
+        if (aligned > 0) {
+            match_result.mamba_branching_seqlen = aligned;
+        }
+    }
 
     std::int32_t num_tokens = loadback_tokens + tokens_this_round + decode_input_tokens;
     std::int32_t device_pages_needed = (num_tokens + config_.page_size - 1) / config_.page_size;

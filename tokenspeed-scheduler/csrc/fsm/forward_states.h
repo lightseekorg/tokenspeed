@@ -175,6 +175,7 @@ struct Prefilling : public ForwardState {
                std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
         : ForwardState(token_container, page_size, std::move(device_node_ref), std::move(local_kv_allocator),
                        std::move(req_pool_index), std::move(local_mamba_allocator)),
+          host_node_ref_(std::move(host_node_ref)),
           window(_window) {}
 
     Prefilling(Prefilling&& state) noexcept = default;
@@ -193,7 +194,12 @@ struct Prefilling : public ForwardState {
         };
     }
 
+    std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+
     TokenContainer::Window window{};
+
+private:
+    std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
 };
 
 // All prefill tokens have been scheduled (in-flight in the last chunk).
@@ -206,6 +212,7 @@ struct PrefillDone : public ForwardState {
                 std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
         : ForwardState(token_container, page_size, std::move(device_node_ref), std::move(local_kv_allocator),
                        std::move(req_pool_index), std::move(local_mamba_allocator)),
+          host_node_ref_(std::move(host_node_ref)),
           window(_window),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event) {}
 
@@ -230,19 +237,23 @@ struct PrefillDone : public ForwardState {
 
     void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) { token_container_->Extend(result_tokens); }
 
+    std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+
     TokenContainer::Window window{};
 
 private:
+    std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
 struct Decoding : public ForwardState {
-    Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<DeviceNodeRef>&& node_ref,
-             std::unique_ptr<LocalKVAllocator>&& local_kv_allocator, std::unique_ptr<ReqPoolIndex>&& req_pool_index,
-             std::int32_t reserve_num_tokens_in_next_schedule_event,
+    Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
+             std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
+             std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t reserve_num_tokens_in_next_schedule_event,
              std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
         : ForwardState(token_container, page_size, std::move(node_ref), std::move(local_kv_allocator),
                        std::move(req_pool_index), std::move(local_mamba_allocator)),
+          host_node_ref_(std::move(host_node_ref)),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event) {}
 
     Decoding() = delete;
@@ -258,7 +269,10 @@ struct Decoding : public ForwardState {
 
     void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) { token_container_->Extend(result_tokens); }
 
+    std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+
 private:
+    std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 

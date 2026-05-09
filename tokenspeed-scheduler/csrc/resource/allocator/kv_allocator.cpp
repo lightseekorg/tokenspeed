@@ -20,6 +20,7 @@
 
 #include "resource/allocator/kv_allocator.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 

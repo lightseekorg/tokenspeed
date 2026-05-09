@@ -8,11 +8,11 @@ set -euo pipefail
 EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
 pip install "evalscope[all] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
 
-wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
+[ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
 # Note: Only 71 conversations can be built
-python3 build_swe_smith_dataset.py \
+[ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
     --model moonshotai/Kimi-K2.5 \
     --first-turn-length 50000 \
     --subsequent-turn-length 800 \
@@ -39,7 +39,7 @@ SERVER_LOG=
 launch_server() {
     local config=$1
     SERVER_LOG=/tmp/trtllm_server_${config}.log
-    trtllm-serve nvidia/Kimi-K2.5-NVFP4 \
+    setsid trtllm-serve nvidia/Kimi-K2.5-NVFP4 \
         --max_num_tokens 8192 \
         --max_seq_len 80000 \
         --enable_chunked_prefill \
@@ -75,14 +75,14 @@ wait_for_ready() {
 }
 
 stop_server() {
-    if pgrep -f trtllm-serve > /dev/null; then
-        echo "Stopping trtllm-serve..."
-        pkill -TERM -f trtllm-serve || true
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Stopping trtllm-serve (pgid $SERVER_PID)..."
+        kill -TERM -"$SERVER_PID" 2>/dev/null || true
         for _ in {1..20}; do
-            pgrep -f trtllm-serve > /dev/null || break
+            kill -0 "$SERVER_PID" 2>/dev/null || break
             sleep 1
         done
-        pkill -KILL -f trtllm-serve || true
+        kill -KILL -"$SERVER_PID" 2>/dev/null || true
     fi
     SERVER_PID=
 }
@@ -102,8 +102,7 @@ wait_for_port_free() {
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
-# Defensive cleanup: reap any stale server / port state from a prior run
-stop_server
+# Preflight: bail out if port 8001 is already in use
 wait_for_port_free 8001
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
@@ -119,6 +118,22 @@ for CONFIG in "${CONFIGS[@]}"; do
         exit 1
     fi
 
+    echo "Warmup..."
+    evalscope perf \
+        --model nvidia/Kimi-K2.5-NVFP4 \
+        --url http://localhost:8001/v1/chat/completions \
+        --api openai \
+        --dataset swe_smith \
+        --dataset-path agentic_dataset.json \
+        --max-tokens 500 \
+        --multi-turn \
+        --number 2 \
+        --parallel 2 \
+        --extra-args '{"ignore_eos": true}' \
+        --dataset-offset 68 \
+        --outputs-dir /tmp/outputs
+
+    echo "Benchmark..."
     evalscope perf \
         --model nvidia/Kimi-K2.5-NVFP4 \
         --url http://localhost:8001/v1/chat/completions \

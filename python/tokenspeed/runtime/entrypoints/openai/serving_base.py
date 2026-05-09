@@ -36,6 +36,7 @@ from tokenspeed.runtime.entrypoints.openai.protocol import (
     ErrorResponse,
     OpenAIServingRequest,
 )
+from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def _get_request_conversion_executor() -> ThreadPoolExecutor:
     with _request_conversion_executor_lock:
         if _request_conversion_executor is None:
             _request_conversion_executor = ThreadPoolExecutor(
-                max_workers=1,
+                max_workers=envs.TOKENSPEED_REQUEST_CONVERSION_WORKERS.get(),
                 thread_name_prefix="openai-request-conversion",
             )
         return _request_conversion_executor

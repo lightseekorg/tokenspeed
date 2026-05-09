@@ -48,6 +48,7 @@ public:
 
     std::vector<std::int32_t> Pages() const { return pages_.Ids(); };
     std::int32_t TailPageAvailableTokens() const { return tail_page_available_tokens_; };
+    void ReleaseOwnershipByID(const std::vector<std::int32_t>& pages) { pages_.ReleaseOwnershipByID(pages); }
 
 private:
     PageAllocator* allocator_;

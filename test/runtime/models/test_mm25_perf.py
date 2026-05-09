@@ -607,10 +607,6 @@ class TestMiniMaxM25Perf(unittest.TestCase):
             DRAFT,
             "--speculative-num-steps",
             "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
         )
 
         def run(port):

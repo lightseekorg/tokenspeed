@@ -1,0 +1,102 @@
+api_version: ci.tokenspeed.io/v1
+name: perf-kimi-k2.5-nvfp4-agentic
+type: perf
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    python3 -m tokenspeed.api_server
+    --model nvidia/Kimi-K2.5-NVFP4
+    --attn-tp-size 4
+    --moe-tp-size 4
+    --max-model-len 80000
+    --max-num-seqs 16
+    --max-prefill-tokens 8192
+    --chunked-prefill-size 8192
+    --gpu-memory-utilization 0.95
+    --disable-cuda-graph-padding
+    --trust-remote-code
+    --attention-backend tokenspeed_mla
+    --moe-backend flashinfer_trtllm
+    --quantization nvfp4
+    --kv-cache-dtype fp8
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla
+    --speculative-num-steps 3
+    --speculative-draft-model-quantization unquant
+    --drafter-attention-backend tokenspeed_mla
+    --enable-cache-report
+    --weight-loader-prefetch-checkpoints
+    --host 127.0.0.1
+  ready:
+    url: http://127.0.0.1:8000/health
+    timeout: 1800
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+    - >-
+      test -f /tmp/agentic_dataset.json ||
+      curl -fL
+      https://huggingface.co/datasets/lightseekorg/agentic-dataset/resolve/main/agentic_dataset.json
+      -o /tmp/agentic_dataset.json
+  command: >-
+    REPO_ROOT=$PWD &&
+    OUTPUTS_DIR=/tmp/tokenspeed-agentic-perf &&
+    WARMUP_DIR=/tmp/tokenspeed-agentic-warmup &&
+    trap 'rm -rf "$OUTPUTS_DIR" "$WARMUP_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" "$WARMUP_DIR" &&
+    cd /tmp &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model nvidia/Kimi-K2.5-NVFP4
+    --url http://localhost:8000/v1/chat/completions
+    --api openai
+    --dataset swe_smith
+    --dataset-path agentic_dataset.json
+    --max-tokens 500
+    --multi-turn
+    --number 2
+    --parallel 2
+    --dataset-offset 68
+    --outputs-dir "$WARMUP_DIR"
+    --extra-args '{"ignore_eos": true}' &&
+    set +e &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model nvidia/Kimi-K2.5-NVFP4
+    --url http://localhost:8000/v1/chat/completions
+    --api openai
+    --dataset swe_smith
+    --dataset-path agentic_dataset.json
+    --max-tokens 500
+    --multi-turn
+    --number 4 8 8 16 32
+    --parallel 1 2 4 8 16
+    --outputs-dir "$OUTPUTS_DIR"
+    --extra-args '{"ignore_eos": true}'
+    --no-timestamp;
+    PERF_STATUS=$?;
+    if [ -d "$OUTPUTS_DIR/Kimi-K2.5-NVFP4" ]; then
+    mv "$OUTPUTS_DIR/Kimi-K2.5-NVFP4" "$OUTPUTS_DIR/Kimi-K2.5-NVFP4_attn_tp4";
+    fi;
+    python3 "$REPO_ROOT/test/agentic_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR";
+    PARSE_STATUS=$?;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
+perf_reference:
+  1:  [367.65, 8742.12]
+  2:  [284.90, 13280.12]
+  4:  [182.48, 17276.27]
+  8:  [112.49, 20944.40]
+  16: [67.61,  25181.19]

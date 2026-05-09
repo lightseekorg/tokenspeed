@@ -21,8 +21,6 @@
 from __future__ import annotations
 
 import logging
-import math
-import os
 from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
@@ -32,7 +30,10 @@ from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
-from tokenspeed.runtime.layers.attention.utils import profile_max_num_pages
+from tokenspeed.runtime.layers.attention.utils import (
+    profile_cache_budget,
+    profile_max_num_pages,
+)
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
@@ -203,7 +204,6 @@ def _create_hybrid_linear_attn(
     config.speculative_num_draft_tokens = getattr(
         server_args, "speculative_num_draft_tokens", 0
     )
-    linear_attn_backend = MambaAttnBackend(config)
 
     # Create KV cache pool (only for full attention layers)
     num_full_attn_layers = len(full_attn_layers)
@@ -213,7 +213,14 @@ def _create_hybrid_linear_attn(
     # Wrap with layer ID mapping (global layer IDs -> pool indices)
     pool = LayerMappedKVPool(inner_pool, full_attn_layers)
 
-    # Create mamba state pool using mamba2_cache_params from the model config
+    # Read mamba2_cache_params to decide whether this model actually has
+    # any linear / mamba layers. A draft model on a hybrid-GDN target
+    # (e.g. MTP on Qwen3.5) shares the same architecture class as the
+    # target but commonly ships with *zero* mamba layers — in that case
+    # we skip the mamba backend / pool entirely so that its
+    # ``init_forward_metadata_*`` hooks do not run (they would otherwise
+    # touch a zero-sized pool on the same persistent state_indices_list
+    # as the target, which breaks the captured CUDA graph).
     (
         conv_state_shape,
         temporal_state_shape,
@@ -221,11 +228,29 @@ def _create_hybrid_linear_attn(
         ssm_dtype,
         mamba_layer_ids,
     ) = text_config.mamba2_cache_params
-    max_bs = server_args.max_num_seqs // max(
-        server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
-    )
+
+    if len(mamba_layer_ids) == 0:
+        logger.info(
+            "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
+            "attn layers (skipping mamba backend / pool)",
+            len(full_attn_layers),
+        )
+        return full_attn_backend, pool, None
+
+    linear_attn_backend = MambaAttnBackend(config)
+
+    # Mamba radix cache uses C++ chunk indices. Without radix cache, the
+    # backend uses 1-based req_pool_indices directly, so keep slot 0 as padding.
     mamba_pool_size = (
-        (mamba_pool_total_chunks + 1) if mamba_pool_total_chunks > 0 else max_bs
+        mamba_pool_total_chunks + 1
+        if mamba_pool_total_chunks > 0
+        else (
+            server_args.max_num_seqs
+            // max(
+                server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
+            )
+            + 1
+        )
     )
     mamba_pool = SimpleMambaPool(
         size=mamba_pool_size,
@@ -236,7 +261,12 @@ def _create_hybrid_linear_attn(
         ssm_dtype=ssm_dtype,
         mamba_layer_ids=mamba_layer_ids,
         device=config.device,
-        speculative_num_draft_tokens=server_args.speculative_num_draft_tokens or 0,
+        page_size=server_args.block_size,
+        speculative_num_draft_tokens=(
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_algorithm is not None
+            else 0
+        ),
     )
     linear_attn_backend.set_pool(mamba_pool)
 
@@ -273,12 +303,23 @@ def create_attn_components(
     arch = model_config.attention_arch
 
     architectures = getattr(model_config.hf_config, "architectures", None) or []
+    is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
         server_args.attention_backend = "deepseek_v4"
-    if any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures):
+    elif is_hybrid_gdn:
+        # Qwen3.5 GDN hybrid models always need hybrid_linear_attn.
+        # Save the user's original choice for the full-attention sub-backend.
         server_args.attention_backend = "hybrid_linear_attn"
+    elif server_args.attention_backend == "hybrid_linear_attn":
+        logger.warning(
+            "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
+            architectures,
+        )
+        server_args.attention_backend = None
+        if server_args.drafter_attention_backend == "hybrid_linear_attn":
+            server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
     draft_attn_config = None
@@ -303,26 +344,87 @@ def create_attn_components(
         )
         profile_cache_cell_size = deepseek_v4_layout.cache_cell_size(num_layers)
 
-    max_total_num_pages = profile_max_num_pages(
-        config,
-        gpu_id,
-        server_args.mapping.world_size,
-        server_args.gpu_memory_utilization,
-        server_args.block_size,
-        num_layers,
-        gpu_memory,
+    hf_config = getattr(model_config, "hf_config", None)
+    text_config = getattr(hf_config, "text_config", hf_config) if hf_config else None
+    mamba_cache_params = (
+        getattr(text_config, "mamba2_cache_params", None) if text_config else None
+    )
+    has_mamba_layers = bool(mamba_cache_params and len(mamba_cache_params[4]) > 0)
+    has_mamba = getattr(model_config, "mambaish_config", None) is not None or (
+        has_mamba_layers
+    )
+    enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
+    mamba_pool_total_chunks = 0
+    mamba_pool = None
+
+    _profile_kwargs = dict(
+        attn_config=config,
+        gpu_id=gpu_id,
+        tp_size=server_args.mapping.world_size,
+        page_size=server_args.block_size,
+        num_attention_layers=num_layers,
+        total_gpu_memory=gpu_memory,
         world_group=server_args.mapping.world_group,
         draft_attn_config=draft_attn_config if draft_attn_config else None,
         draft_num_attention_layers=(
             draft_model_config.num_attention_layers if draft_attn_config else None
         ),
-        cache_cell_size=profile_cache_cell_size,
     )
-    max_num_tokens = _resolve_max_num_tokens(
-        max_total_num_pages,
-        server_args.block_size,
-        server_args.max_total_tokens,
-    )
+
+    if enable_mamba_radix_cache and server_args.max_mamba_cache_size is not None:
+        mamba_pool_total_chunks = server_args.max_mamba_cache_size
+        max_total_num_pages = profile_max_num_pages(
+            **_profile_kwargs,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            cache_cell_size=profile_cache_cell_size,
+        )
+        max_num_tokens = _resolve_max_num_tokens(
+            max_total_num_pages,
+            server_args.block_size,
+            server_args.max_total_tokens,
+        )
+    elif enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+        (
+            conv_state_shape,
+            temporal_state_shape,
+            conv_dtype,
+            ssm_dtype,
+            mamba_layers,
+        ) = mamba_cache_params
+        num_mamba_layers = len(mamba_layers)
+        conv_size = 1
+        for dim in conv_state_shape:
+            conv_size *= dim
+        temporal_size = 1
+        for dim in temporal_state_shape:
+            temporal_size *= dim
+        speculative_num_draft_tokens = server_args.speculative_num_draft_tokens or 0
+        per_layer_mamba_chunk_memory = (
+            conv_size * conv_dtype.itemsize + temporal_size * ssm_dtype.itemsize
+        ) * (1 + speculative_num_draft_tokens)
+        memory_per_mamba_chunk = num_mamba_layers * per_layer_mamba_chunk_memory
+        kv_max_num_pages, mamba_pool_total_chunks = profile_cache_budget(
+            **_profile_kwargs,
+            mem_fraction_static=server_args.gpu_memory_utilization,
+            mamba_memory_per_chunk=memory_per_mamba_chunk,
+            mamba_ratio=server_args.mamba_full_memory_ratio,
+        )
+        max_num_tokens = _resolve_max_num_tokens(
+            kv_max_num_pages,
+            server_args.block_size,
+            server_args.max_total_tokens,
+        )
+    else:
+        max_total_num_pages = profile_max_num_pages(
+            **_profile_kwargs,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            cache_cell_size=profile_cache_cell_size,
+        )
+        max_num_tokens = _resolve_max_num_tokens(
+            max_total_num_pages,
+            server_args.block_size,
+            server_args.max_total_tokens,
+        )
 
     if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0:
         max_num_tokens = int(_CI_SMALL_KV_SIZE)
@@ -330,9 +432,6 @@ def create_attn_components(
         raise ValueError(
             f"KV cache token pool size must be positive, got {max_num_tokens}"
         )
-
-    mamba_pool_total_chunks = 0
-    mamba_pool = None
 
     if is_deepseek_v4_model:
         from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
@@ -352,52 +451,7 @@ def create_attn_components(
             page_size=server_args.block_size,
             rank=rank,
         )
-    elif server_args.attention_backend == "hybrid_linear_attn":
-        # Budget mamba state pool alongside KV cache from the same GPU memory.
-        # Each mamba slot stores conv_state + ssm_state across all mamba layers;
-        # we convert that to an equivalent number of KV tokens so both pools
-        # are carved from the profiled rest_memory in one pass.
-        hf_config = model_config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        (
-            conv_shape,
-            ssm_shape,
-            conv_dtype,
-            ssm_dtype,
-            mamba_layer_ids,
-        ) = text_config.mamba2_cache_params
-        mamba_bytes_per_slot = (
-            math.prod(conv_shape) * conv_dtype.itemsize
-            + math.prod(ssm_shape) * ssm_dtype.itemsize
-        ) * len(mamba_layer_ids)
-
-        kv_cell_size = config.cache_cell_size() * model_config.num_attention_layers
-        kv_tokens_per_mamba_slot = (
-            mamba_bytes_per_slot + kv_cell_size - 1
-        ) // kv_cell_size
-
-        # Allocate a fraction of the profiled KV budget to mamba slots.
-        # Default 10%: enough for prefix-cache checkpoints beyond working set.
-        mamba_mem_fraction = float(
-            os.environ.get("TOKENSPEED_MAMBA_MEM_FRACTION", "0.1")
-        )
-        mamba_budget_tokens = int(max_num_tokens * mamba_mem_fraction)
-        mamba_pool_size = max(
-            mamba_budget_tokens // max(kv_tokens_per_mamba_slot, 1), 1
-        )
-        max_num_tokens -= mamba_pool_size * kv_tokens_per_mamba_slot
-        page_size = server_args.block_size
-        max_num_tokens = (max_num_tokens // page_size) * page_size
-        logger.info(
-            "Hybrid model: mamba_bytes_per_slot=%d, kv_tokens_per_slot=%d, "
-            "mamba_pool_size=%d (%.1f MiB), kv_budget_tokens=%d",
-            mamba_bytes_per_slot,
-            kv_tokens_per_mamba_slot,
-            mamba_pool_size,
-            mamba_bytes_per_slot * (mamba_pool_size + 1) / (1 << 20),
-            max_num_tokens,
-        )
-
+    elif is_hybrid_gdn:
         resolved_original_backend = _BACKEND_ALIASES.get(
             original_attn_backend, original_attn_backend
         )
@@ -414,9 +468,8 @@ def create_attn_components(
                 if resolved_original_backend != "hybrid_linear_attn"
                 else None
             ),
-            mamba_pool_total_chunks=mamba_pool_size,
+            mamba_pool_total_chunks=mamba_pool_total_chunks,
         )
-        mamba_pool_total_chunks = mamba_pool.size if mamba_pool is not None else 0
     else:
         backend = _create_attn_backend(arch, config)
         pool = _create_attn_pool(
@@ -425,6 +478,7 @@ def create_attn_components(
     draft_attn_backend = None
     draft_pool = None
     if draft_attn_config:
+        # Check if draft model is also a hybrid GDN model.
         draft_archs = getattr(draft_model_config.hf_config, "architectures", None) or []
         if any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
             resolved_draft_backend = _BACKEND_ALIASES.get(
@@ -443,6 +497,7 @@ def create_attn_components(
                     if resolved_draft_backend != "hybrid_linear_attn"
                     else None
                 ),
+                mamba_pool_total_chunks=mamba_pool_total_chunks,
             )
         else:
             draft_attn_backend = _create_attn_backend(

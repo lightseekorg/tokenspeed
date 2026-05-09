@@ -36,6 +36,7 @@ def get_kv_args(
     ib_device,
     token_to_kv_pool,
     draft_token_to_kv_pool,
+    mamba_pool=None,
 ):
     kv_data_ptrs, kv_data_lens, kv_item_lens = (
         token_to_kv_pool.get_contiguous_buf_infos()
@@ -43,6 +44,7 @@ def get_kv_args(
     # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
     offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
     target_layer_num = token_to_kv_pool.layer_num
+    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(target_layer_num)))
 
     if draft_token_to_kv_pool is not None:
         draft_layer_num = draft_token_to_kv_pool.layer_num
@@ -59,8 +61,26 @@ def get_kv_args(
         kv_data_lens += draft_kv_data_lens
         kv_item_lens += draft_kv_item_lens
         offsets += draft_offsets
+        draft_base_layer_id = (
+            max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
+        )
+        kv_layer_ids += list(
+            range(draft_base_layer_id, draft_base_layer_id + draft_layer_num)
+        )
     else:
         draft_layer_num = 0
+
+    state_data_ptrs = []
+    state_data_lens = []
+    state_item_lens = []
+    state_type = "none"
+    state_layer_ids = []
+    if mamba_pool is not None:
+        state_data_ptrs, state_data_lens, state_item_lens = (
+            mamba_pool.get_contiguous_buf_infos()
+        )
+        state_layer_ids = mamba_pool.get_contiguous_buf_layer_ids()
+        state_type = "mamba"
 
     kv_args = KVArgs(
         engine_rank=engine_rank,
@@ -69,6 +89,13 @@ def get_kv_args(
         kv_item_lens=kv_item_lens,
         target_layer_num=target_layer_num,
         draft_layer_num=draft_layer_num,
+        kv_layer_ids=kv_layer_ids,
+        state_data_ptrs=state_data_ptrs,
+        state_data_lens=state_data_lens,
+        state_item_lens=state_item_lens,
+        state_type=state_type,
+        state_layer_ids=state_layer_ids,
+        mamba_offsets=[],
         offsets=offsets,
         aux_data_ptrs=[],
         aux_data_lens=[],

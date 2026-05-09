@@ -755,53 +755,57 @@ def _causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    # STEP 2: assume state_len > seqlen
-    idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
-
-    # The conv_state updates works in a sliding window manner,
-    # at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + 1) * stride_conv_state_tok)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (
-        (conv_state_batch_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
-        & (idx_feats < dim)[None, :]
-    )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
-
-    VAL = state_len - seqlen
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
 
-    x_ptrs = (
-        x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
+    if not SAVE_INTERMEDIATE:
+        # STEP 2: update conv_state in place.  Speculative verify uses
+        # SAVE_INTERMEDIATE and scatters the accepted intermediate window after
+        # verification, so writing the real conv_state here is both wrong and
+        # can address beyond its width-1 storage for multi-token verify.
+        idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-    mask_x = (
-        (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
-        & (idx_feats < dim)[None, :]
-    )  # token-index  # token-index  # feature-index
-    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    tl.debug_barrier()
+        # The conv_state updates works in a sliding window manner,
+        # at each forward pass, the tokens are shift by 1, so we
+        # load since idx_tokens + 1.
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + ((idx_tokens + 1) * stride_conv_state_tok)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (
+            (conv_state_batch_coord < num_cache_lines)
+            & ((idx_tokens + seqlen) < state_len)[:, None]
+            & (idx_feats < dim)[None, :]
+        )
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-    new_conv_state = tl.where(mask, conv_state, loaded_x)
+        VAL = state_len - seqlen
+        x_ptrs = (
+            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
 
-    conv_state_base = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
-    )  # [BLOCK_N,]
-    conv_state_ptrs_target = (
-        conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+        mask_x = (
+            (idx_tokens - VAL >= 0)[:, None]
+            & (idx_tokens - VAL < seqlen)[:, None]
+            & (idx_feats < dim)[None, :]
+        )  # token-index  # token-index  # feature-index
+        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+        tl.debug_barrier()
+
+        new_conv_state = tl.where(mask, conv_state, loaded_x)
+
+        conv_state_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )  # [BLOCK_N,]
+        conv_state_ptrs_target = (
+            conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:

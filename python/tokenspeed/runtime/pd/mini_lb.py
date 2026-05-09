@@ -21,6 +21,7 @@
 """Minimal HTTP load balancer for prefill and decode servers used in tests."""
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import random
@@ -31,7 +32,7 @@ from typing import List, Optional
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from tokenspeed.runtime.pd.utils import PDRegistryRequest
@@ -123,7 +124,12 @@ class MiniLoadBalancer:
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
 
     async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
+        self,
+        modified_request,
+        prefill_server,
+        decode_server,
+        endpoint,
+        raw_request=None,
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -133,12 +139,21 @@ class MiniLoadBalancer:
             )  # Add timeout for request reliability
         ) as session:
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                asyncio.create_task(
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request)
+                ),
+                asyncio.create_task(
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request)
+                ),
             ]
 
-            # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            try:
+                # Wait for both responses to complete. Prefill should end first.
+                prefill_response, decode_response = await self._gather_with_disconnect(
+                    tasks, raw_request
+                )
+            except asyncio.CancelledError:
+                raise HTTPException(status_code=499, detail="Client disconnected")
 
             if modified_request is not None:
                 if "return_logprob" in modified_request or self.enable_cache_report:
@@ -203,6 +218,28 @@ class MiniLoadBalancer:
                 content=ret_json,
                 status_code=decode_response.status,
             )
+
+    @staticmethod
+    async def _gather_with_disconnect(tasks, raw_request):
+        gather_task = asyncio.gather(*tasks)
+        try:
+            while True:
+                done, _ = await asyncio.wait({gather_task}, timeout=1.0)
+                if gather_task in done:
+                    return gather_task.result()
+                if raw_request is not None and await raw_request.is_disconnected():
+                    for task in tasks:
+                        task.cancel()
+                    gather_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await gather_task
+                    raise asyncio.CancelledError
+        finally:
+            if not gather_task.done():
+                gather_task.cancel()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
 
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
@@ -455,7 +492,7 @@ async def stop_profile():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict):
+async def handle_generate_request(request_data: dict, raw_request: Request):
     # Log incoming request
     logger.debug(
         "LB received generate request: stream=%s, text_length=%s",
@@ -509,7 +546,9 @@ async def handle_generate_request(request_data: dict):
         )
 
 
-async def _forward_to_backend(request_data: dict, endpoint_name: str):
+async def _forward_to_backend(
+    request_data: dict, endpoint_name: str, raw_request: Request
+):
     prefill_server, bootstrap_port, decode_server = (
         load_balancer.select_pair_round_robin()
     )
@@ -539,17 +578,18 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
+            raw_request=raw_request,
         )
 
 
 @app.post("/v1/chat/completions")
-async def handle_chat_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/chat/completions")
+async def handle_chat_completion_request(request_data: dict, raw_request: Request):
+    return await _forward_to_backend(request_data, "v1/chat/completions", raw_request)
 
 
 @app.post("/v1/completions")
-async def handle_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/completions")
+async def handle_completion_request(request_data: dict, raw_request: Request):
+    return await _forward_to_backend(request_data, "v1/completions", raw_request)
 
 
 def _generate_bootstrap_room():
