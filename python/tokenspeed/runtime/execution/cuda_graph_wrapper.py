@@ -599,6 +599,7 @@ class CudaGraphWrapper:
                 seq_lens,
                 req_to_page=req_to_page,
                 forward_mode=ctx.forward_mode,
+                num_padding=padded_bs - bs if padded_bs != bs else 0,
                 **mamba_kwargs,
             )
 

@@ -485,24 +485,18 @@ class MambaAttnBackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
+        num_padding = kwargs.get("num_padding", 0)
         mamba_pool_indices = kwargs.get("mamba_pool_indices")
+        
+        real_bs = bs - num_padding
+        req_pool_indices = req_pool_indices[:bs]
         if mamba_pool_indices is not None:
-            real_bs = len(mamba_pool_indices)
-            num_padding = bs - real_bs
             mamba_indices = self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
         else:
-            seq_lens_cpu = seq_lens[:bs].cpu()
-            num_padding = torch.count_nonzero(
-                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-            ).item()
-            req_pool_indices = req_pool_indices[:bs]
-            real_bs = bs - num_padding
-            req_pool_indices[real_bs:] = 0
             mamba_indices = self.pool.get_mamba_indices(req_pool_indices[:real_bs])
 
-        assert len(mamba_indices) == real_bs
         self.state_indices_list[bs - 1][:real_bs].copy_(mamba_indices)
-        if real_bs < bs:
+        if num_padding > 0:
             self.state_indices_list[bs - 1][real_bs:].fill_(self.pad_slot_id)
 
         if num_padding == 0:
