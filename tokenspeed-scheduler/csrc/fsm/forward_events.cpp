@@ -215,14 +215,10 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
     local_kv_allocator->Acquire(reserve);
 
-    return Decoding{state.GetTokenContainer(),
-                    state.GetPageSize(),
-                    std::move(host_node_ref),
-                    std::move(device_node_ref),
-                    std::move(local_kv_allocator),
-                    std::move(state).TakeReqPoolIndex(),
-                    decode_input_tokens_,
-                    std::move(local_mamba_allocator)};
+    return Decoding{state.GetTokenContainer(),     state.GetPageSize(),
+                    std::move(host_node_ref),      std::move(device_node_ref),
+                    std::move(local_kv_allocator), std::move(state).TakeReqPoolIndex(),
+                    decode_input_tokens_,          std::move(local_mamba_allocator)};
 }
 
 // Decoding -> Decoding: allocate pages for next decode step.
@@ -235,14 +231,10 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
     local_kv_allocator->Acquire(reserve);
 
-    return Decoding{state.GetTokenContainer(),
-                    state.GetPageSize(),
-                    std::move(host_node_ref),
-                    std::move(device_node_ref),
-                    std::move(local_kv_allocator),
-                    std::move(state).TakeReqPoolIndex(),
-                    decode_input_tokens_,
-                    std::move(local_mamba_allocator)};
+    return Decoding{state.GetTokenContainer(),     state.GetPageSize(),
+                    std::move(host_node_ref),      std::move(device_node_ref),
+                    std::move(local_kv_allocator), std::move(state).TakeReqPoolIndex(),
+                    decode_input_tokens_,          std::move(local_mamba_allocator)};
 }
 
 // Retracted -> Decoding: recover via LoadBack (host → device).

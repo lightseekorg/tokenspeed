@@ -199,7 +199,7 @@ struct Prefilling : public ForwardState {
     TokenContainer::Window window{};
 
 private:
-    std::unique_ptr<HostNodeRef> host_node_ref_{};      // pins host pages until the next state takes ownership
+    std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
 };
 
 // All prefill tokens have been scheduled (in-flight in the last chunk).
@@ -242,7 +242,7 @@ struct PrefillDone : public ForwardState {
     TokenContainer::Window window{};
 
 private:
-    std::unique_ptr<HostNodeRef> host_node_ref_{};      // pins host pages until the next state takes ownership
+    std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
@@ -272,7 +272,7 @@ struct Decoding : public ForwardState {
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
 
 private:
-    std::unique_ptr<HostNodeRef> host_node_ref_{};      // pins host pages until the next state takes ownership
+    std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 
