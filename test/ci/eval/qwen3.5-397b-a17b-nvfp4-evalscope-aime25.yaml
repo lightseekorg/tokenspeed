@@ -1,0 +1,55 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.5-397b-a17b-nvfp4-aime25
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+    - b300-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    python3 -m tokenspeed.api_server
+    --model nvidia/Qwen3.5-397B-A17B-NVFP4
+    --attn-tp-size 4
+    --moe-tp-size 4
+    --max-model-len 80000
+    --max-prefill-tokens 8192
+    --chunked-prefill-size 8192
+    --trust-remote-code
+    --attention-backend trtllm
+    --moe-backend flashinfer_trtllm
+    --quantization nvfp4
+    --kv-cache-dtype fp8
+    --weight-loader-prefetch-checkpoints
+    --speculative-algorithm MTP
+    --speculative-draft-model-path nvidia/Qwen3.5-397B-A17B-NVFP4
+    --speculative-num-steps 3
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 4
+    --speculative-draft-model-quantization unquant
+    --drafter-attention-backend trtllm
+    --enable-cache-report
+    --host 127.0.0.1
+  ready:
+    url: http://127.0.0.1:8000/health
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model nvidia/Qwen3.5-397B-A17B-NVFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime25
+    --eval-batch-size 16
+report:
+  github_step_summary: true
+score_threshold: 0.9
