@@ -116,7 +116,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         gen = torch.Generator(device=self.config.device)
         gen.manual_seed(int(sp.seed))
         self._generator_per_slot[pool_idx] = gen
-        
+
         cpu_gen = torch.Generator(device="cpu")
         cpu_gen.manual_seed(int(sp.seed))
         self._cpu_generator_per_slot[pool_idx] = cpu_gen
@@ -135,9 +135,14 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
 
         self._cpu_coins_buf = torch.empty(
-            config.max_bs, config.max_draft_tokens_per_req, dtype=torch.float32, pin_memory=True
+            config.max_bs,
+            config.max_draft_tokens_per_req,
+            dtype=torch.float32,
+            pin_memory=True,
         )
-        self._cpu_final_coins_buf = torch.empty(config.max_bs, dtype=torch.float32, pin_memory=True)
+        self._cpu_final_coins_buf = torch.empty(
+            config.max_bs, dtype=torch.float32, pin_memory=True
+        )
 
         # Stub generator used during CUDA-graph capture/warm-up (no requests yet).
         self._capture_gen = torch.Generator(device=config.device)
@@ -184,7 +189,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._coins_buf[:bs, :n].uniform_(lo, 1.0, generator=self._capture_gen)
             self._final_coins_buf[:bs].uniform_(lo, 1.0, generator=self._capture_gen)
             return
-            
+
         cpu_coins = self._cpu_coins_buf[:bs, :n]
         cpu_final = self._cpu_final_coins_buf[:bs]
 

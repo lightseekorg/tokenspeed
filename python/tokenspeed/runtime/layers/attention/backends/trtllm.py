@@ -39,13 +39,12 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.kv_cache.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
+from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
-
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -205,7 +204,11 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         return bmm1_scale, bmm2_scale
 
     def _should_use_fused_fp8_path(self, save_kv_cache: bool, k) -> bool:
-        return save_kv_cache and k is not None and self.kv_cache_dtype == torch.float8_e4m3fn
+        return (
+            save_kv_cache
+            and k is not None
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+        )
 
     # ------------------------------------------------------------------
     # Forward

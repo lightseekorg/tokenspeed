@@ -506,15 +506,17 @@ class MambaAttnBackend(AttentionBackend):
             self.state_indices_list[bs - 1][real_bs:].fill_(self.pad_slot_id)
 
         if num_padding == 0:
-            need_copy = self._qsl_dirty[bs - 1] or self._qsl_last_mode[bs - 1] != forward_mode
+            need_copy = (
+                self._qsl_dirty[bs - 1] or self._qsl_last_mode[bs - 1] != forward_mode
+            )
             if need_copy:
                 if forward_mode.is_decode_or_idle():
                     self.query_start_loc_list[bs - 1].copy_(
-                        self.cached_cuda_graph_decode_query_start_loc[:bs + 1]
+                        self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
                     )
                 elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
                     self.query_start_loc_list[bs - 1].copy_(
-                        self.cached_cuda_graph_verify_query_start_loc[:bs + 1]
+                        self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                     )
                 self._qsl_dirty[bs - 1] = False
                 self._qsl_last_mode[bs - 1] = forward_mode
@@ -534,61 +536,12 @@ class MambaAttnBackend(AttentionBackend):
             else:
                 raise ValueError(f"Invalid forward mode: {forward_mode=}")
             self._qsl_dirty[bs - 1] = True
-            self._qsl_last_mode[bs - 1] = forward_mode 
-        
-        self.forward_metadata = MambaForwardMetadata(
-            query_start_loc=self.query_start_loc_list[bs - 1],
-            mamba_cache_indices=self.state_indices_list[bs - 1],
-        )
-        
-        """req_pool_indices = req_pool_indices[:bs]
-        seq_lens_cpu = seq_lens[:bs].cpu()
-        num_padding = torch.count_nonzero(
-            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-        )
-        req_pool_indices[bs - num_padding :] = 0
-        mamba_pool_indices = kwargs.get("mamba_pool_indices")
-        if mamba_pool_indices is not None:
-            mamba_pool_indices = mamba_pool_indices[:bs]
-            mamba_pool_indices[bs - num_padding :] = 0
-            mamba_indices = self.pool.get_mamba_indices(mamba_pool_indices)
-        else:
-            mamba_indices = self.pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = -1
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
-
-        if forward_mode.is_decode_or_idle():
-            if num_padding == 0:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
-                )
-            else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
-                )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
-                    bs - num_padding
-                )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
-            if num_padding == 0:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
-            else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
-                )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
-                    (bs - num_padding) * self.speculative_num_draft_tokens
-                )
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_mode=}")
+            self._qsl_last_mode[bs - 1] = forward_mode
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
         )
-        """
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
