@@ -64,7 +64,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
       device_allocator_{config_.page_size, config_.device_allocator.total_pages},
       host_allocator_{config_.page_size, config_.host_allocator.total_pages},
-      kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage},
+      mamba_allocator_{},
+      kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage, config_.disable_prefix_cache},
       req_pool_allocator_{config_.max_batch_size} {
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
@@ -75,11 +76,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.enable_kv_cache_events) {
         kv_prefix_cache_.SetKvEventSink([this](KvCacheEvent event) { kv_events_.push_back(std::move(event)); });
     }
-
-    const std::int32_t num_mamba_slots =
-        config_.enable_mamba ? config_.mamba_pool_total_chunks : config_.num_mamba_slots;
-    if (num_mamba_slots > 0) {
-        mamba_allocator_.emplace(num_mamba_slots);
+    if (config_.enable_mamba && config_.mamba_pool_total_chunks > 0) {
+        mamba_allocator_.emplace(config_.mamba_pool_total_chunks);
         if (config_.role != Role::kD) {
             hybrid_prefix_cache_.emplace(kv_prefix_cache_, &*mamba_allocator_, config_.mamba_cache_chunk_size);
             kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(

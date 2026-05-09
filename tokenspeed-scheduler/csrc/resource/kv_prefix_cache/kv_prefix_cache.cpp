@@ -76,11 +76,13 @@ std::vector<KvBlockStoredEvent> BuildBlockEventsForNode(TreeNode* target, std::i
 
 }  // namespace
 
-KVPrefixCache::KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage)
+KVPrefixCache::KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage,
+                             bool disable_prefix_cache)
     : tree_(device_allocator->PageSize()),
       device_(device_allocator),
       host_(host_allocator),
-      enable_l3_storage_(enable_l3_storage) {}
+      enable_l3_storage_(enable_l3_storage),
+      disable_prefix_cache_(disable_prefix_cache) {}
 
 void KVPrefixCache::SetKvEventSink(KvEventSink sink) {
     kv_event_sink_ = std::move(sink);
@@ -117,7 +119,15 @@ void KVPrefixCache::recordDeviceBlockRemoved(TreeNode* node) {
     }
 }
 
-MatchResult KVPrefixCache::Match(const token_vec_t& token_ids) {
+MatchResult KVPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
+    if (disable_prefix_cache_ && intent == MatchIntent::PrefixReuse) {
+        const std::int32_t page_size = tree_.PageSize();
+        if (token_ids.size() % page_size != 0) {
+            throw std::runtime_error("KVPrefixCache::Match: token count must be divisible by page_size; token_count=" +
+                                     std::to_string(token_ids.size()) + "; page_size=" + std::to_string(page_size));
+        }
+        return RootMatch();
+    }
     const auto access_time = std::chrono::steady_clock::now();
     const std::int32_t page_size = tree_.PageSize();
     if (token_ids.size() % page_size != 0) {
@@ -132,8 +142,17 @@ MatchResult KVPrefixCache::Match(const token_vec_t& token_ids) {
     return match;
 }
 
-MatchResult KVPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages) {
-    return Match(FlattenPages(token_pages, 0, token_pages.size()));
+MatchResult KVPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages, MatchIntent intent) {
+    return Match(FlattenPages(token_pages, 0, token_pages.size()), intent);
+}
+
+MatchResult KVPrefixCache::RootMatch() const {
+    TreeNode* root = tree_.Root();
+    const std::int32_t page_size = tree_.PageSize();
+    return MatchResult{
+        .device = {.last_node = root, .page_size = page_size},
+        .host = {.last_node = root, .page_size = page_size},
+    };
 }
 
 template <ResourceType RType>

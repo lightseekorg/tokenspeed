@@ -353,7 +353,6 @@ def create_attn_components(
     has_mamba = getattr(model_config, "mambaish_config", None) is not None or (
         has_mamba_layers
     )
-    enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
     mamba_pool_total_chunks = 0
     mamba_pool = None
 
@@ -371,7 +370,7 @@ def create_attn_components(
         ),
     )
 
-    if enable_mamba_radix_cache and server_args.max_mamba_cache_size is not None:
+    if has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
         max_total_num_pages = profile_max_num_pages(
             **_profile_kwargs,
@@ -383,7 +382,7 @@ def create_attn_components(
             server_args.block_size,
             server_args.max_total_tokens,
         )
-    elif enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+    elif has_mamba and server_args.max_mamba_cache_size is None:
         (
             conv_state_shape,
             temporal_state_shape,

@@ -40,6 +40,11 @@ enum class ResourceType {
     Host,
 };
 
+enum class MatchIntent {
+    PrefixReuse,
+    StateRecovery,
+};
+
 template <ResourceType RType>
 class NodeRef;
 using DeviceNodeRef = NodeRef<ResourceType::Device>;

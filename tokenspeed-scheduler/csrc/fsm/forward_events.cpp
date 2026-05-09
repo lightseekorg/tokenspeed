@@ -430,6 +430,21 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     std::int32_t page_size = state.GetPageSize();
     auto local_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
+
+    // Mamba: save the latest checkpoint/working state into the prefix cache
+    // before the request is retracted, so it can be recovered on loadback.
+    if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr &&
+        (local_mamba_allocator->HasCheckpoint() || local_mamba_allocator->HasWorking())) {
+        TreeNode* terminal = match_result_.device.last_node;
+        if (terminal != nullptr && !terminal->HasMamba()) {
+            if (local_mamba_allocator->HasCheckpoint()) {
+                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachCheckpoint());
+            } else {
+                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
+            }
+        }
+    }
+
     return Retracting{token_container,
                       page_size,
                       std::move(host_node_ref),

@@ -209,8 +209,12 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
 
 struct ScheduleRetractEvent : InvalidTransitionHandler<ScheduleRetractEvent> {
     using InvalidTransitionHandler<ScheduleRetractEvent>::operator();
-    ScheduleRetractEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator, MatchResult match_result)
-        : kv_prefix_cache_(kv_prefix_cache), host_allocator_(host_allocator), match_result_(match_result) {}
+    ScheduleRetractEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator, MatchResult match_result,
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+        : kv_prefix_cache_(kv_prefix_cache),
+          host_allocator_(host_allocator),
+          match_result_(match_result),
+          hybrid_prefix_cache_(hybrid_prefix_cache) {}
 
     Retracting operator()(Decoding&& state);
     Retracting operator()(PrefillDone&& state);
@@ -224,6 +228,7 @@ private:
     KVPrefixCache* kv_prefix_cache_{};
     PageAllocator* host_allocator_{};
     const MatchResult match_result_{};
+    HybridPrefixCache* hybrid_prefix_cache_{};
 };
 
 // Draining → WritingBack: WriteBack op has been generated this round; transfer

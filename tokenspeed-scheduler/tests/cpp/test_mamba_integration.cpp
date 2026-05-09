@@ -27,7 +27,8 @@ class MambaIntegrationTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        cfg.num_mamba_slots = 16;
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 16;
         return cfg;
     }
 };
@@ -124,6 +125,74 @@ TEST_F(MambaIntegrationTest, AbortFreesMambaSlots) {
         Submit(MakeRequestSpec("fill_" + std::to_string(i), 1));
     }
     PlanOnce();
+}
+
+class DisablePrefixCacheMambaRetractTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.disable_prefix_cache = true;
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 16;
+        cfg.decode_input_tokens = 0;
+        cfg.device_allocator.total_pages = 3;
+        cfg.host_allocator.total_pages = 16;
+        cfg.enable_l3_storage = false;
+        return cfg;
+    }
+
+    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
+        ExecutionEvent event;
+        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
+            .request_id = id,
+            .reserve_num_tokens_in_next_schedule_event = n,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
+    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cop = std::get_if<CacheOperation>(&op)) {
+                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
+                    return wb;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+                return fwd;
+            }
+        }
+        return nullptr;
+    }
+};
+
+TEST_F(DisablePrefixCacheMambaRetractTest, RetractedRequestKeepsMambaState) {
+    Submit(MakeRequestSpec("r1", 1));
+    PlanOnce();
+    SendForwardDone("r1", {100});
+    PlanOnce();
+
+    SendReserveNumTokens("r1", 3);
+    auto retract_plan = PlanOnce();
+    const auto* wb = GetWriteBack(retract_plan);
+    ASSERT_NE(wb, nullptr);
+    ASSERT_FALSE(wb->op_ids.empty());
+
+    SendWriteBackDone(wb->op_ids[0]);
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+
+    auto recover_plan = PlanOnce();
+    const auto* fwd = GetForward(recover_plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 1u);
+    EXPECT_EQ(fwd->request_ids[0], "r1");
+    EXPECT_GE(fwd->mamba_working_indices[0], 0);
+    EXPECT_GE(fwd->mamba_checkpoint_dst_indices[0], 0);
 }
 
 }  // namespace tokenspeed::test

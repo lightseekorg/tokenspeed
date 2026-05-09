@@ -170,7 +170,7 @@ class EventLoop:
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
-        enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
+
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
@@ -264,7 +264,8 @@ class EventLoop:
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
         )
-        if enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+
+        if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
                 f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
                 f"Auto-derived mamba_pool_total_chunks={mamba_pool_total_chunks} "
@@ -288,7 +289,7 @@ class EventLoop:
                 else 1
             ),
             disable_prefix_cache=not server_args.enable_prefix_caching,
-            enable_mamba=enable_mamba_radix_cache,
+            enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             paged_cache_groups=pool_to_paged_cache_groups(token_to_kv_pool),
@@ -297,7 +298,7 @@ class EventLoop:
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "num_mamba_slots=%s",
+            "mamba_pool_total_chunks=%s enable_mamba=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -307,6 +308,7 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             mamba_pool_total_chunks,
+            has_mamba,
         )
         self.scheduler = Scheduler(scheduler_cfg)
         if attn_tp_rank == 0:
