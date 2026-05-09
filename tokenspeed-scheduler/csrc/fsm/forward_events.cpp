@@ -148,6 +148,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
 
     // Only insert pages from the beginning up to the end of the last processed chunk.
     auto paged_tokens = state.GetFullPagedTokens(false);
@@ -171,7 +172,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     if (is_last_chunk) {
         return PrefillDone{state.GetTokenContainer(),
                            state.GetPageSize(),
-                           nullptr,
+                           std::move(host_node_ref),
                            std::move(device_node_ref),
                            std::move(local_kv_allocator),
                            std::move(state).TakeReqPoolIndex(),
@@ -181,7 +182,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     } else {
         return Prefilling{state.GetTokenContainer(),
                           state.GetPageSize(),
-                          nullptr,
+                          std::move(host_node_ref),
                           std::move(device_node_ref),
                           std::move(local_kv_allocator),
                           std::move(state).TakeReqPoolIndex(),
@@ -195,6 +196,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
 
     // Only insert pages from the beginning up to the end of the last processed chunk.
     auto paged_tokens = state.GetFullPagedTokens(false);
@@ -213,9 +215,13 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
     local_kv_allocator->Acquire(reserve);
 
-    return Decoding{state.GetTokenContainer(),           state.GetPageSize(),
-                    std::move(device_node_ref),          std::move(local_kv_allocator),
-                    std::move(state).TakeReqPoolIndex(), decode_input_tokens_,
+    return Decoding{state.GetTokenContainer(),
+                    state.GetPageSize(),
+                    std::move(host_node_ref),
+                    std::move(device_node_ref),
+                    std::move(local_kv_allocator),
+                    std::move(state).TakeReqPoolIndex(),
+                    decode_input_tokens_,
                     std::move(local_mamba_allocator)};
 }
 
@@ -224,13 +230,18 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
 
     std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
     local_kv_allocator->Acquire(reserve);
 
-    return Decoding{state.GetTokenContainer(),           state.GetPageSize(),
-                    std::move(device_node_ref),          std::move(local_kv_allocator),
-                    std::move(state).TakeReqPoolIndex(), decode_input_tokens_,
+    return Decoding{state.GetTokenContainer(),
+                    state.GetPageSize(),
+                    std::move(host_node_ref),
+                    std::move(device_node_ref),
+                    std::move(local_kv_allocator),
+                    std::move(state).TakeReqPoolIndex(),
+                    decode_input_tokens_,
                     std::move(local_mamba_allocator)};
 }
 
@@ -260,6 +271,7 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
     local_kv_allocator->Acquire(decode_input_tokens_);
     return Decoding{token_container,
                     page_size,
+                    std::move(host_node_ref),
                     std::move(device_node_ref),
                     std::move(local_kv_allocator),
                     std::move(req_pool_index),
