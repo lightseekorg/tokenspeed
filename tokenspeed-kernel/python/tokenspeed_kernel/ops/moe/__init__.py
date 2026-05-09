@@ -96,15 +96,18 @@ WEIGHT_NVFP4 = "nvfp4"  # NVFP4 block-scaled weights (CuteDSL)
 
 # moe/route trait values — used via traits={"output_type": ...}
 ROUTE_OUTPUT_TOPK = "topk"  # returns (topk_weights, topk_ids)
-ROUTE_OUTPUT_ROUTING_DATA = (
-    "routing_data"  # returns (routing_data, gather_indx, scatter_indx)
+ROUTE_OUTPUT_RAGGED_METADATA = (
+    "ragged_metadata"
+    # returns (ragged_metadata, gather_indx, scatter_indx, gate_scal)
 )
 
 # moe/experts interface features
 EXPERTS_DISPATCH_SORTED = (
     "dispatch_sorted"  # expects sorted_token_ids from dispatch stage
 )
-EXPERTS_ROUTING_DATA = "routing_data"  # expects routing_data structure
+EXPERTS_RAGGED_METADATA = (
+    "ragged_metadata"  # expects RaggedTensorMetadata + gather/scatter indices
+)
 EXPERTS_DISPATCH_GEMM = (
     "dispatch_gemm"  # gather/dispatch tokens then GEMM (uses gather_indx)
 )
@@ -126,7 +129,8 @@ def moe_route(
     Routing traits (pass via ``traits``):
 
     * ``{"output_type": "topk"}``: returns (topk_weights, topk_ids).
-    * ``{"output_type": "routing_data"}``: returns (routing_data, gather_indx, scatter_indx).
+    * ``{"output_type": "ragged_metadata"}``: returns
+      (ragged_metadata, gather_indx, scatter_indx, gate_scal).
     * ``{"biased": True/False}``: whether correction_bias is applied.
     * ``{"grouped": True/False}``: whether grouped expert selection is used.
     """
@@ -179,8 +183,9 @@ def moe_experts(
     * ``{"dispatch_sorted"}``: triton backend.
       Expects sorted_token_ids, expert_ids, num_tokens_post_padded from
       the dispatch stage.
-    * ``{"routing_data"}``: triton_kernels backend.
-      Expects routing_data structure from the route stage.
+    * ``{"ragged_metadata"}``: triton_kernels backend.
+      Expects ``a_ragged_metadata`` (a ``RaggedTensorMetadata``) plus
+      ``gather_indx`` / ``scatter_indx``.
     * ``{"dispatch_gemm"}``: gather/dispatch tokens then GEMM (uses gather_indx).
     * ``{"gemm_combine"}``: GEMM then scatter/combine results (uses scatter_indx).
     """
