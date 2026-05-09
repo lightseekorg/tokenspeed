@@ -195,6 +195,15 @@ class ModelConfig:
         # MLA models carry per-head dimension metadata that does not follow the
         # standard hidden_size / num_attention_heads derivation above.
         if is_deepseek_v4(self.hf_config):
+            block_size_default = ServerArgs.__dataclass_fields__["block_size"].default
+            if server_args.block_size == block_size_default:
+                logger.info(
+                    "DeepSeek V4 default block_size=256 (ratio-aware compressed "
+                    "KV layout); pass --block-size with a value other than %d "
+                    "to keep that value.",
+                    block_size_default,
+                )
+                server_args.block_size = 256
             configure_deepseek_v4_attention(self)
         elif any(arch in _MLA_ARCHITECTURES for arch in self.hf_config.architectures):
             self.head_dim = 256
@@ -300,6 +309,7 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "nvfp4",
+            "mxfp4",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",

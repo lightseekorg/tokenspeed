@@ -99,6 +99,33 @@ class RuntimeStates:
             :, src_indices
         ]
 
+    def snapshot_mamba_checkpoints(
+        self,
+        mamba_pool_indices: torch.Tensor,
+        mamba_checkpoint_indices: torch.Tensor,
+        cache_lengths: torch.Tensor,
+        page_size: int,
+        bs: int,
+    ) -> None:
+        """Copy current working Mamba states into checkpoint slots."""
+        if self.mamba_pool is None:
+            return
+        valid_mask = (mamba_pool_indices[:bs] != -1) & (
+            mamba_checkpoint_indices[:bs] != -1
+        )
+        if page_size > 0:
+            valid_mask &= cache_lengths[:bs] % page_size == 0
+        if not valid_mask.any():
+            return
+        src_indices = mamba_pool_indices[:bs][valid_mask].long()
+        dst_indices = mamba_checkpoint_indices[:bs][valid_mask].long()
+        self.mamba_pool.conv_state[:, dst_indices] = self.mamba_pool.conv_state[
+            :, src_indices
+        ]
+        self.mamba_pool.ssm_state[:, dst_indices] = self.mamba_pool.ssm_state[
+            :, src_indices
+        ]
+
     def zero_mamba_states(
         self,
         mamba_pool_indices: torch.Tensor,

@@ -179,6 +179,7 @@ class CudaGraphWrapper:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
     ):
+        self.config = config
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -378,18 +379,12 @@ class CudaGraphWrapper:
         return graph, out
 
     def _init_capture_metadata(self, bs: int):
-        capture_kwargs = {}
-        if self.input_buffers.has_mamba:
-            capture_kwargs["mamba_pool_indices"] = (
-                self.input_buffers.mamba_pool_indices_buf[:bs]
-            )
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             bs * self.max_tokens_per_req,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
             ForwardMode.DECODE if self.drafter is None else ForwardMode.TARGET_VERIFY,
-            **capture_kwargs,
         )
         if self.draft_attn_backend is not None:
             # Drafter mutates seq_lens_buf in place per step; backends alias.
@@ -427,6 +422,7 @@ class CudaGraphWrapper:
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,
                 forward_mode=ForwardMode.DRAFT_EXTEND,
+                **kwargs,
             )
 
     @nvtx_range("attn_meta_prep", color="orange")
@@ -539,11 +535,11 @@ class CudaGraphWrapper:
         extend_seq_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         out_cache_loc: torch.Tensor | None = None,
-        spec_info=None,
         mamba_pool_indices: torch.Tensor | None = None,
         mamba_cow_src_indices: torch.Tensor | None = None,
         mamba_branching_seqlens: torch.Tensor | None = None,
         mamba_track_pool_indices: torch.Tensor | None = None,
+        spec_info=None,
     ):
         """
         Unified forward entry point.
@@ -564,9 +560,37 @@ class CudaGraphWrapper:
             req_pool_indices = torch.nn.functional.pad(
                 self.input_buffers.req_pool_indices_buf[:bs], (0, pad), value=0
             )
+            if mamba_pool_indices is not None:
+                mamba_pool_indices = torch.nn.functional.pad(
+                    mamba_pool_indices, (0, pad), value=0
+                )
+            if mamba_cow_src_indices is not None:
+                mamba_cow_src_indices = torch.nn.functional.pad(
+                    mamba_cow_src_indices, (0, pad), value=-1
+                )
+            if mamba_branching_seqlens is not None:
+                mamba_branching_seqlens = torch.nn.functional.pad(
+                    mamba_branching_seqlens, (0, pad), value=-1
+                )
+            if mamba_track_pool_indices is not None:
+                mamba_track_pool_indices = torch.nn.functional.pad(
+                    mamba_track_pool_indices, (0, pad), value=-1
+                )
         else:
             seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
+
+        mamba_kwargs = {}
+        if mamba_pool_indices is not None:
+            mamba_kwargs["mamba_pool_indices"] = mamba_pool_indices
+        if mamba_cow_src_indices is not None:
+            mamba_kwargs["mamba_cow_src_indices"] = mamba_cow_src_indices
+        if mamba_branching_seqlens is not None:
+            mamba_kwargs["mamba_branching_seqlens"] = mamba_branching_seqlens
+        if mamba_track_pool_indices is not None:
+            mamba_kwargs["mamba_track_pool_indices"] = mamba_track_pool_indices
+        if getattr(self.config, "enable_mamba", False):
+            mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
         if use_graph:
             replay_kwargs = {}
@@ -578,7 +602,7 @@ class CudaGraphWrapper:
                 seq_lens,
                 req_to_page=req_to_page,
                 forward_mode=ctx.forward_mode,
-                **replay_kwargs,
+                **mamba_kwargs,
             )
 
             # Runtime prepare() is called by ModelExecutor with per-request rids
@@ -622,10 +646,7 @@ class CudaGraphWrapper:
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 padded_static_len=ctx.padded_static_len,
                 spec_info=spec_info,
-                mamba_pool_indices=mamba_pool_indices,
-                mamba_cow_src_indices=mamba_cow_src_indices,
-                mamba_branching_seqlens=mamba_branching_seqlens,
-                mamba_track_pool_indices=mamba_track_pool_indices,
+                **mamba_kwargs,
             )
 
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)

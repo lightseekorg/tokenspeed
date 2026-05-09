@@ -57,6 +57,9 @@ public:
     // Absorb all pages from other into this. Both must share the same allocator.
     void Append(OwnedPages other);
 
+    // Drop ownership without returning the pages to the allocator.
+    void ReleaseOwnershipByID(const std::vector<std::int32_t>& ids);
+
 private:
     PageAllocator* allocator_{nullptr};
     std::vector<std::int32_t> ids_;
