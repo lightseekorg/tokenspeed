@@ -43,13 +43,6 @@ _is_amd = current_platform().is_amd
 _CDNA4MXScaleLayout = None
 
 
-def _mxfp4_scale_for_layout(scale: torch.Tensor):
-    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0_dtype is not None and scale.dtype == e8m0_dtype:
-        return scale.view(torch.uint8)
-    return scale
-
-
 if _is_amd:
     import math
 
@@ -157,7 +150,6 @@ def swizzle_mxfp4(quant_tensor, scale, num_warps):
     if _is_amd and issubclass(scale_layout, layout.CDNA4MXScaleLayout):
         # A patch for an issue in scale preshuffling on CDNA4
         scale_layout = _CDNA4MXScaleLayout
-    scale = _mxfp4_scale_for_layout(scale)
     scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
     return quant_tensor, InFlexData(), scale
 

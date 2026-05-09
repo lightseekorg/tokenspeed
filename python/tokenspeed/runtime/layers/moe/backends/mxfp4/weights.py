@@ -26,7 +26,6 @@ from torch import nn
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 
 MXFP4_BLOCK = 32
-MXFP4_SCALE_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 
 def create_mxfp4_weights(
@@ -56,7 +55,7 @@ def create_mxfp4_weights(
             num_local_experts,
             2 * ispp_padded,
             hidden_size_padded // MXFP4_BLOCK,
-            dtype=MXFP4_SCALE_DTYPE,
+            dtype=torch.uint8,
         ),
         requires_grad=False,
     )
@@ -79,7 +78,7 @@ def create_mxfp4_weights(
             num_local_experts,
             hidden_size_padded,
             ispp_padded // MXFP4_BLOCK,
-            dtype=MXFP4_SCALE_DTYPE,
+            dtype=torch.uint8,
         ),
         requires_grad=False,
     )
@@ -108,4 +107,4 @@ def create_mxfp4_weights(
         set_weight_attrs(w2_weight_bias, {"weight_loader": weight_loader})
 
 
-__all__ = ["MXFP4_BLOCK", "MXFP4_SCALE_DTYPE", "create_mxfp4_weights"]
+__all__ = ["MXFP4_BLOCK", "create_mxfp4_weights"]
