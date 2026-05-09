@@ -37,12 +37,10 @@ except ImportError:
 
 try:
     from triton_kernels.matmul_details.opt_flags import (
-        reset_opt_flags_constraints,
-        update_opt_flags_constraints,
+        scoped_opt_flags_constraints,
     )
 except ImportError:
-    update_opt_flags_constraints = None
-    reset_opt_flags_constraints = None
+    scoped_opt_flags_constraints = None
 
 try:
     from tokenspeed_kernel.thirdparty.triton_kernels.routing import (
@@ -101,43 +99,36 @@ if _routing_impl is not None:
     )(_triton_kernels_routing)
 
 
-# Hot fix to avoid exceeding LDS budget on MI355 for large GEMMs.
-# TODO(kylewng): Remove this once fixed in upstream triton_kernels.
-def _lds_guard_should_apply(M, n, n_experts):
-    if current_platform().is_nvidia:
+_AMD_BF16_MXFP4_TILE = {"block_m": 64, "block_n": 128, "block_k": 256}
+
+
+def _is_bf16_mxfp4(x, w, precision_config):
+    if precision_config is None:
         return False
-    if update_opt_flags_constraints is None or reset_opt_flags_constraints is None:
+    if getattr(precision_config, "b_mx_scale", None) is None:
         return False
-    if n is None or n < 2048:
+    x_dtype = getattr(x, "dtype", None)
+    if x_dtype not in (torch.float16, torch.bfloat16):
         return False
-    tokens_per_expt = max(1, M // max(1, n_experts))
-    return tokens_per_expt >= 512
+    w_bw = getattr(getattr(w, "dtype", None), "bitwidth", None)
+    return w_bw == 4
+
+
+def _lds_guard_should_apply(x, w, precision_config):
+    if scoped_opt_flags_constraints is None:
+        return False
+    if not current_platform().is_cdna4:
+        return False
+    return _is_bf16_mxfp4(x, w, precision_config)
 
 
 @contextmanager
-def _maybe_lds_guard(M, n, n_experts):
-    if not _lds_guard_should_apply(M, n, n_experts):
+def _maybe_lds_guard(x, w, precision_config):
+    if not _lds_guard_should_apply(x, w, precision_config):
         yield
         return
-    update_opt_flags_constraints({"block_m": 128})
-    try:
+    with scoped_opt_flags_constraints(_AMD_BF16_MXFP4_TILE):
         yield
-    finally:
-        reset_opt_flags_constraints()
-        update_opt_flags_constraints({"block_k": 256})
-
-
-def _ragged_n_experts(a_ragged_metadata):
-    if a_ragged_metadata is None:
-        return 1
-    return getattr(a_ragged_metadata, "n_slices", 1) or 1
-
-
-def _w_out_dim(w):
-    try:
-        return w.shape[-1]
-    except AttributeError:
-        return None
 
 
 if matmul is not None:
@@ -159,14 +150,7 @@ if matmul is not None:
         n_tokens=None,
         n_expts_act=None,
     ):
-        if gather_indx is not None and hasattr(gather_indx, "shape"):
-            M = gather_indx.shape[0]
-        elif scatter_indx is not None and hasattr(scatter_indx, "shape"):
-            M = scatter_indx.shape[0]
-        else:
-            M = x.shape[-2]
-        n_experts = _ragged_n_experts(a_ragged_metadata)
-        with _maybe_lds_guard(M, _w_out_dim(w), n_experts):
+        with _maybe_lds_guard(x, w, precision_config):
             out = matmul(
                 x,
                 w,
