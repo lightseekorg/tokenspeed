@@ -189,6 +189,11 @@ class ServerArgs:
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
+    # DeepSeek V4
+    disable_deepseek_v4_fast_mhc: bool = False
+    deepseek_v4_mega_moe_max_num_tokens: int = 0
+    deepseek_v4_indexer_prefill_max_logits_mb: int = 512
+
     # Grammar backend
     grammar_backend: str = "none"
     grammar_compile_timeout_secs: float = 30.0
@@ -1256,6 +1261,34 @@ class ServerArgs:
             const=True,
             default=ServerArgs.use_trtllm_ragged_deepseek_prefill,
             help="Use ragged prefill for DeepSeek MLA attention.",
+        )
+        parser.add_argument(
+            "--disable-deepseek-v4-fast-mhc",
+            action="store_true",
+            default=ServerArgs.disable_deepseek_v4_fast_mhc,
+            help=(
+                "Disable the DeepSeek V4 fast multi-head capture (mHC) layer. "
+                "Falls back to the PyTorch reference when set or when nvcc is "
+                "not available."
+            ),
+        )
+        parser.add_argument(
+            "--deepseek-v4-mega-moe-max-num-tokens",
+            type=int,
+            default=ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
+            help=(
+                "DeepSeek V4 MegaMoE staging-buffer cap on tokens per forward "
+                "(0 = derive from chunked-prefill / cuda-graph budgets)."
+            ),
+        )
+        parser.add_argument(
+            "--deepseek-v4-indexer-prefill-max-logits-mb",
+            type=int,
+            default=ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
+            help=(
+                "DeepSeek V4 sparse indexer prefill workspace cap (MiB) for the "
+                "softplus_sqrt logits buffer."
+            ),
         )
         parser.add_argument(
             "--grammar-backend",

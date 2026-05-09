@@ -30,7 +30,11 @@ from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
 from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.rmsnorm import rmsnorm_fused_parallel
 from tokenspeed_kernel.thirdparty.cuda.rope import apply_rope_with_cos_sin_cache_inplace
-from tokenspeed_kernel.thirdparty.cuda.routing import routing_flash
+from tokenspeed_kernel.thirdparty.cuda.routing import (
+    hash_softplus_sqrt_topk_flash,
+    routing_flash,
+    softplus_sqrt_topk_flash,
+)
 from tokenspeed_kernel.thirdparty.cuda.sampling_chain import (
     chain_speculative_sampling_target_only,
     verify_chain_greedy,
@@ -42,10 +46,12 @@ __all__ = [
     "dsv3_router_gemm",
     "fp32_router_gemm",
     "gptq_marlin_repack",
+    "hash_softplus_sqrt_topk_flash",
     "moe_finalize_fuse_shared",
     "rmsnorm_fused_parallel",
     "routing_flash",
     "silu_and_mul_fuse_block_quant",
     "silu_and_mul_fuse_nvfp4_quant",
+    "softplus_sqrt_topk_flash",
     "verify_chain_greedy",
 ]

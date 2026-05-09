@@ -54,3 +54,4 @@ eval:
     --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
 report:
   github_step_summary: true
+score_threshold: 0.7
