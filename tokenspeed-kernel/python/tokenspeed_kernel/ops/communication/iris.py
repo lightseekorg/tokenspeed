@@ -20,7 +20,6 @@
 
 import importlib
 import logging
-import os
 import pkgutil
 from typing import List, Tuple
 
@@ -66,30 +65,11 @@ __all__ = [
     "create_iris_rsag_state",
     "create_iris_ar_rmsnorm_state",
     "iris_allreduce_residual_rmsnorm",
-    "env_use_iris_fused_ar_rmsnorm",
     "IRIS_AR_RMSNORM_STATES",
 ]
 
 
 IRIS_AR_RMSNORM_STATES: dict = {}
-
-
-_iris_fused_route_logged = False
-
-
-def env_use_iris_fused_ar_rmsnorm() -> bool:
-    raw = os.environ.get("TOKENSPEED_USE_IRIS_FUSED_AR_RMSNORM", "")
-    enabled = raw.strip().lower() in ("true", "1", "yes", "y")
-    global _iris_fused_route_logged
-    if not _iris_fused_route_logged:
-        logger.warning(
-            "[tokenspeed_kernel] TOKENSPEED_USE_IRIS_FUSED_AR_RMSNORM=%s "
-            "(iris fused AR+RMSNorm: %s)",
-            raw if raw else "<unset>",
-            "ON" if enabled else "OFF",
-        )
-        _iris_fused_route_logged = True
-    return enabled
 
 
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:

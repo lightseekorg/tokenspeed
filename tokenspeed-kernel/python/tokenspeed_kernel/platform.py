@@ -32,7 +32,7 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import product
-from typing import Sequence
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -202,6 +202,23 @@ class PlatformInfo:
             fp8_min = -fp8_max
             _fp8e4m3_dtype = Fp8E4M3FnDType(dtype=dtype, max=fp8_max, min=fp8_min)
         return _fp8e4m3_dtype
+
+    def register_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
+        """Register host memory that GPU kernels will directly dereference."""
+        if tensor.device.type != "cpu" or tensor.numel() == 0:
+            return
+        status = torch.cuda.cudart().cudaHostRegister(
+            tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
+        )
+        if int(status) != 0:
+            raise RuntimeError(f"cudaHostRegister failed with {status!s}")
+
+    def device_visible_data_ptr(self, tensor: torch.Tensor) -> int:
+        """Return a pointer value that is valid to dereference from GPU kernels."""
+        ptr = tensor.data_ptr()
+        if self.is_amd and tensor.device.type == "cpu" and tensor.numel() > 0:
+            return _hip_host_get_device_pointer(ptr)
+        return ptr
 
     @property
     def generation_name(self) -> str:
@@ -644,3 +661,55 @@ def _check_symmetric_memory_available() -> bool:
 def _check_nvlink_available() -> bool:
     """Check if NVLink connectivity is available."""
     return _detect_cuda_nvlink_topology() is not None
+
+
+@lru_cache(maxsize=1)
+def _get_hip_runtime():
+    lib_name = "libamdhip64.so"
+    candidates = []
+    torch_hip_path = Path(torch.__file__).resolve().parent / "lib" / lib_name
+    if torch_hip_path.exists():
+        candidates.append(str(torch_hip_path))
+    candidates.append(lib_name)
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            lib = ctypes.CDLL(candidate)
+            lib.hipHostGetDevicePointer.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            lib.hipHostGetDevicePointer.restype = ctypes.c_int
+            if hasattr(lib, "hipGetErrorString"):
+                lib.hipGetErrorString.argtypes = [ctypes.c_int]
+                lib.hipGetErrorString.restype = ctypes.c_char_p
+            return lib
+        except OSError as exc:
+            last_error = exc
+
+    raise RuntimeError(f"Failed to load {lib_name}") from last_error
+
+
+def _hip_host_get_device_pointer(host_ptr: int) -> int:
+    lib = _get_hip_runtime()
+    device_ptr = ctypes.c_void_p()
+    error = lib.hipHostGetDevicePointer(
+        ctypes.byref(device_ptr), ctypes.c_void_p(host_ptr), 0
+    )
+    if error != 0:
+        error_str = f"HIP error {error}"
+        if hasattr(lib, "hipGetErrorString"):
+            raw_error_str = lib.hipGetErrorString(error)
+            if raw_error_str:
+                error_str = raw_error_str.decode()
+        raise RuntimeError(
+            "hipHostGetDevicePointer failed for registered host pointer "
+            f"0x{host_ptr:x}: {error_str}"
+        )
+    if device_ptr.value is None:
+        raise RuntimeError(
+            f"hipHostGetDevicePointer returned null for registered host pointer 0x{host_ptr:x}"
+        )
+    return device_ptr.value
