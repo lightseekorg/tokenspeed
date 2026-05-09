@@ -28,14 +28,14 @@ from tokenspeed_kernel.ops.attention.flash_attn import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 platform = current_platform()
 torch.manual_seed(42)
 
 pytestmark = pytest.mark.skipif(
-    not platform.is_blackwell,
-    reason="FA4 smoke tests require Blackwell GPU.",
+    not (platform.is_blackwell and platform.arch_version == ArchVersion(10, 0)),
+    reason="FA4 smoke tests require SM 10.0 Blackwell GPU (B100/B200/GB200).",
 )
 
 

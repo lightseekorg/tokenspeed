@@ -3018,6 +3018,16 @@ def run(
         use_random_int=True,
         zero_out=False,
     ):
+        if skip_ref_check and math.prod(shape) > 2**31 - 1:
+            if dtype in {cutlass.Float8E4M3FN, cutlass.Float8E5M2}:
+                torch_dtype = torch.int8
+            else:
+                torch_dtype = cutlass_torch.dtype(dtype)
+            torch_tensor = torch.zeros(*shape, dtype=torch_dtype, device="cuda")
+            cute_tensor = from_dlpack(torch_tensor, assumed_align=16)
+            cute_tensor.element_type = dtype
+            return None, cute_tensor, torch_tensor
+
         # Random int initialization can ensure the refcheck is stable
         # via different problem shapes & random seeds.
         # However, gaussian initialization can ensure the performance measurement is

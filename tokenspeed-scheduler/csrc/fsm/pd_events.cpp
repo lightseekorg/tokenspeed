@@ -42,12 +42,13 @@ PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
     auto prefill_done = PrefillDone{
         state.GetTokenContainer(),
         state.GetPageSize(),
-        nullptr,  // host_node_ref: not held by Prefilling
+        std::move(state).TakeHostNodeRef(),
         std::move(state).TakeDeviceNodeRef(),
         std::move(state).TakeLocalKVAllocator(),
         std::move(state).TakeReqPoolIndex(),
         w,
         0,  // reserve_num_tokens_in_next_schedule_event
+        std::move(state).TakeLocalMambaAllocator(),
     };
 
     prefill_done.ExtendResultTokens({bootstrap_token});
