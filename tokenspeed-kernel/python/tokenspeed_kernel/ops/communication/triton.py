@@ -1057,8 +1057,7 @@ def allreduce_residual_rmsnorm(
         from . import iris as _iris_mod
 
         if (
-            _iris_mod.env_use_iris_fused_ar_rmsnorm()
-            and input_tensor.is_cuda
+            input_tensor.is_cuda
             and residual.is_cuda
             and weight.is_cuda
             and input_tensor.is_contiguous()

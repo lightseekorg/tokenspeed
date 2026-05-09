@@ -31,8 +31,6 @@ server:
     --speculative-algorithm EAGLE3
     --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla
     --speculative-num-steps 3
-    --speculative-eagle-topk 1
-    --speculative-num-draft-tokens 4
     --speculative-draft-model-quantization unquant
     --drafter-attention-backend tokenspeed_mla
     --enable-cache-report

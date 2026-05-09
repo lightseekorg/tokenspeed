@@ -85,11 +85,15 @@ if platform.is_nvidia:
                 mat_a, mat_b, alpha, scales_a, scales_b, out_dtype
             )
 
-        def per_token_group_quant_8bit(x: torch.Tensor, group_size: int = 128) -> tuple:
+        def per_token_group_quant_8bit(
+            x: torch.Tensor,
+            group_size: int = 128,
+            use_ue8m0: bool = False,
+        ) -> tuple:
             assert (
                 group_size == 128
             ), f"trtllm fp8_quantize_1x128 only supports group_size=128, got {group_size}"
-            return torch.ops.trtllm.fp8_quantize_1x128(x)
+            return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
 
         def per_tensor_quant_fp8(
             input: torch.Tensor,
@@ -137,8 +141,11 @@ if platform.is_nvidia:
             topk: int,
             next_n: int = 1,
         ):
+            seq_lens = seq_lens.to(torch.int32).contiguous()
             if next_n == 1:
-                torch.ops.trtllm.indexer_topk_decode(values, seq_lens, indices, topk)
+                torch.ops.trtllm.indexer_topk_decode(
+                    values, seq_lens, indices, next_n, topk
+                )
             else:
                 row_ends = seq_lens.cumsum(0)
                 row_starts = row_ends - seq_lens

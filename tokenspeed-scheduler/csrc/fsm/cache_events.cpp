@@ -51,6 +51,10 @@ State PrefetchDoneEvent::operator()(Prefetching&& state) {
     if (completed < num_pages) {
         pages.TakeLast(num_pages - completed);
     }
+    auto inserted_pages = pages.Ids();
+    // Inserted pages are now owned by the prefix cache tree; keep the RAII
+    // wrapper from returning them to the host allocator on destruction.
+    pages.ReleaseOwnershipByID(inserted_pages);
 
     return PrefetchDone{state.GetTokenContainer(), state.GetPageSize()};
 }

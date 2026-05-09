@@ -62,10 +62,12 @@ Scheduler::Scheduler(SchedulerConfig config)
         spdlog::set_level(level);
     }
 
-    if (config_.num_mamba_slots > 0) {
-        mamba_allocator_.emplace(config_.num_mamba_slots);
+    const std::int32_t num_mamba_slots =
+        config_.enable_mamba ? config_.mamba_pool_total_chunks : config_.num_mamba_slots;
+    if (num_mamba_slots > 0) {
+        mamba_allocator_.emplace(num_mamba_slots);
         if (config_.role != Role::kD) {
-            hybrid_prefix_cache_.emplace(kv_prefix_cache_, &*mamba_allocator_);
+            hybrid_prefix_cache_.emplace(kv_prefix_cache_, &*mamba_allocator_, config_.mamba_cache_chunk_size);
             kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
                 [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
         }
