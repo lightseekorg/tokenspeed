@@ -104,6 +104,8 @@ class FlashInferSamplingBackend(SamplingBackend):
         # gives per-step uniqueness independent of the torch.Generator.
         self._generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
         self._generator_per_slot[0] = self._capture_gen
+        self._cpu_generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
+        self._cpu_generator_per_slot[0] = self._capture_gen
 
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
         self._temperature_pool[pool_idx].fill_(float(sp.temperature))
@@ -114,6 +116,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         gen = torch.Generator(device=self.config.device)
         gen.manual_seed(int(sp.seed))
         self._generator_per_slot[pool_idx] = gen
+
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(int(sp.seed))
+        self._cpu_generator_per_slot[pool_idx] = cpu_gen
 
     def _init_shared_buffers(self, config: SamplingBackendConfig) -> None:
 
@@ -126,6 +132,16 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
         self._final_coins_buf = torch.zeros(
             (config.max_bs,), dtype=torch.float32, device=config.device
+        )
+
+        self._cpu_coins_buf = torch.empty(
+            config.max_bs,
+            config.max_draft_tokens_per_req,
+            dtype=torch.float32,
+            pin_memory=True,
+        )
+        self._cpu_final_coins_buf = torch.empty(
+            config.max_bs, dtype=torch.float32, pin_memory=True
         )
 
         # Stub generator used during CUDA-graph capture/warm-up (no requests yet).
@@ -152,6 +168,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _prepare_step_hook(
         self,
         num_tokens_per_req: int,
@@ -173,16 +190,20 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._final_coins_buf[:bs].uniform_(lo, 1.0, generator=self._capture_gen)
             return
 
+        cpu_coins = self._cpu_coins_buf[:bs, :n]
+        cpu_final = self._cpu_final_coins_buf[:bs]
+
         for i, pool_idx in enumerate(request_pool_indices):
-            gen = self._generator_per_slot[pool_idx]
-            if gen is None:
-                # No _reset_slot has run for this slot yet — fall back to
-                # the stub generator. Should not happen in well-formed runs
-                # because prepare_step's flip detection runs _reset_slot
-                # before this hook.
-                gen = self._capture_gen
-            self._coins_buf[i, :n].uniform_(lo, 1.0, generator=gen)
-            self._final_coins_buf[i : i + 1].uniform_(lo, 1.0, generator=gen)
+            # No _reset_slot has run for this slot yet — fall back to
+            # the stub generator. Should not happen in well-formed runs
+            # because prepare_step's flip detection runs _reset_slot
+            # before this hook.
+            gen = self._cpu_generator_per_slot[pool_idx] or self._capture_gen
+            cpu_coins[i, :n].uniform_(lo, 1.0, generator=gen)
+            cpu_final[i].uniform_(lo, 1.0, generator=gen)
+
+        self._coins_buf[:bs, :n].copy_(cpu_coins, non_blocking=True)
+        self._final_coins_buf[:bs].copy_(cpu_final, non_blocking=True)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _gather_scalars(
