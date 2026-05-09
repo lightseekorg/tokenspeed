@@ -877,9 +877,14 @@ class Qwen3_5ForCausalLM(nn.Module):
     ) -> tuple[torch.Tensor, None]:
         # Initialize hidden states
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids, reduce_results=False)
-            # Use zeros residual so the first layer do fused allreduce+residual+norm path.
-            residual = torch.zeros_like(hidden_states)
+            # Only skip embedding allreduce when the first layer's fused
+            # allreduce+residual+norm will handle it
+            if self.layers[0].comm_manager.should_fuse(input_ids.shape[0]):
+                hidden_states = self.embed_tokens(input_ids, reduce_results=False)
+                residual = torch.zeros_like(hidden_states)
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+                residual = None
         else:
             hidden_states = input_embeds
             residual = None
