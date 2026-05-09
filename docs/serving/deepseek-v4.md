@@ -55,7 +55,7 @@ also be bumped to 256.)
 - 4× NVIDIA Blackwell SM100 (B200) GPUs.
 - `tokenspeed-deepgemm>=2.5.0.post20260424` (mega_moe + FP4 indexer symbols).
 - `tilelang==0.1.9` (fast mHC fused kernels). Pulled in automatically via
-  `tokenspeed`'s `pyproject.toml`.
+  `tokenspeed-kernel`'s `pyproject.toml`.
 - `flash_mla` (provided by `tokenspeed-flashmla`) — required for sparse decode
   and prefill.
 
