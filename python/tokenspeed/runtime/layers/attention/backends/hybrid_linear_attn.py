@@ -487,7 +487,7 @@ class MambaAttnBackend(AttentionBackend):
     ):
         num_padding = kwargs.get("num_padding", 0)
         mamba_pool_indices = kwargs.get("mamba_pool_indices")
-        
+
         real_bs = bs - num_padding
         req_pool_indices = req_pool_indices[:bs]
         if mamba_pool_indices is not None:
