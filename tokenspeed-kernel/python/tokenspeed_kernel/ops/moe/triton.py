@@ -31,6 +31,9 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
+    ExpertLocationDispatchInfo,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.thirdparty.trtllm import (
     moe_align_block_size as _moe_align_block_size,
@@ -44,6 +47,218 @@ __all__ = [
 ]
 
 padding_size = 128 if bool(int(os.getenv("TOKENSPEED_MOE_PADDING", "0"))) else 0
+
+
+# ---------------------------------------------------------------------------
+# Routing (top-k)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _minimax_biased_grouped_topk_kernel(
+    gating_output_ptr,
+    correction_bias_ptr,
+    static_logical_to_physical_map_ptr,
+    topk_weights_ptr,
+    topk_ids_ptr,
+    stride_gm,
+    stride_ge,
+    stride_wm,
+    stride_wk,
+    stride_im,
+    stride_ik,
+    num_experts: tl.constexpr,
+    routed_scaling_factor: tl.constexpr,
+    renormalize: tl.constexpr,
+    apply_routed_scaling_factor_on_output: tl.constexpr,
+    has_static_expert_map: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    offs_e = tl.arange(0, BLOCK_E)
+    expert_mask = offs_e < num_experts
+
+    logits = tl.load(
+        gating_output_ptr + token_id * stride_gm + offs_e * stride_ge,
+        mask=expert_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    bias = tl.load(
+        correction_bias_ptr + offs_e,
+        mask=expert_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    scores = tl.sigmoid(logits)
+    choice_scores = tl.where(expert_mask, scores + bias, -float("inf"))
+
+    weights_sum = 0.0
+    for k in tl.static_range(0, TOPK):
+        best_choice_score = tl.max(choice_scores, axis=0)
+        best_expert = tl.min(
+            tl.where(choice_scores == best_choice_score, offs_e, BLOCK_E), axis=0
+        )
+        best_weight = tl.max(tl.where(offs_e == best_expert, scores, 0.0), axis=0)
+        stored_expert = best_expert
+        if has_static_expert_map:
+            stored_expert = tl.load(static_logical_to_physical_map_ptr + best_expert)
+        weights_sum += best_weight
+
+        tl.store(
+            topk_ids_ptr + token_id * stride_im + k * stride_ik,
+            stored_expert.to(tl.int32),
+        )
+        tl.store(
+            topk_weights_ptr + token_id * stride_wm + k * stride_wk,
+            best_weight,
+        )
+        choice_scores = tl.where(offs_e == best_expert, -float("inf"), choice_scores)
+
+    if renormalize:
+        denom = tl.where(weights_sum != 0.0, weights_sum, 1.0)
+        for k in tl.static_range(0, TOPK):
+            weight = tl.load(topk_weights_ptr + token_id * stride_wm + k * stride_wk)
+            weight = weight / denom
+            if apply_routed_scaling_factor_on_output:
+                weight = weight * routed_scaling_factor
+            tl.store(topk_weights_ptr + token_id * stride_wm + k * stride_wk, weight)
+
+
+def _biased_grouped_topk_reference(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = 1.0,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    from tokenspeed_kernel.ops.moe.reference import biased_grouped_topk_gpu
+
+    return biased_grouped_topk_gpu(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk=topk,
+        renormalize=renormalize,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+    )
+
+
+@register_kernel(
+    "moe",
+    "route",
+    name="triton_minimax_biased_grouped_topk",
+    solution="triton",
+    dtypes={torch.float32},
+    traits={
+        "output_type": frozenset({"topk"}),
+        "biased": frozenset({True}),
+        "grouped": frozenset({True}),
+        "ep": frozenset({True, False}),
+        "num_expert_group": frozenset({1}),
+        "topk_group": frozenset({1}),
+        "topk": frozenset({8}),
+        "num_fused_shared_experts": frozenset({0}),
+    },
+    priority=12,
+    tags={"latency", "portability"},
+)
+def minimax_biased_grouped_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = 1.0,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    if (
+        gating_output.ndim != 2
+        or correction_bias.ndim != 1
+        or hidden_states.shape[0] != gating_output.shape[0]
+        or gating_output.shape[1] != correction_bias.shape[0]
+        or gating_output.shape[1] > 256
+        or topk != 8
+        or num_expert_group != 1
+        or topk_group != 1
+        or num_fused_shared_experts != 0
+        or routed_scaling_factor is None
+        or num_token_non_padded is not None
+        or (
+            expert_location_dispatch_info is not None
+            and expert_location_dispatch_info.ep_dispatch_algorithm != "static"
+        )
+    ):
+        return _biased_grouped_topk_reference(
+            hidden_states,
+            gating_output,
+            correction_bias,
+            topk=topk,
+            renormalize=renormalize,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+
+    num_tokens, num_experts = gating_output.shape
+    topk_weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+    )
+    topk_ids = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    if num_tokens == 0:
+        return topk_weights, topk_ids
+
+    block_e = triton.next_power_of_2(num_experts)
+    static_map = (
+        expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+        if expert_location_dispatch_info is not None
+        else correction_bias
+    )
+    _minimax_biased_grouped_topk_kernel[(num_tokens,)](
+        gating_output,
+        correction_bias,
+        static_map,
+        topk_weights,
+        topk_ids,
+        gating_output.stride(0),
+        gating_output.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        num_experts=num_experts,
+        routed_scaling_factor=float(routed_scaling_factor),
+        renormalize=renormalize,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        has_static_expert_map=expert_location_dispatch_info is not None,
+        BLOCK_E=block_e,
+        TOPK=topk,
+        num_warps=1,
+    )
+    return topk_weights, topk_ids
 
 
 # ---------------------------------------------------------------------------

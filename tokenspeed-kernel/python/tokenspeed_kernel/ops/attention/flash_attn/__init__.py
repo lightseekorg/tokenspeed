@@ -30,6 +30,7 @@ from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 flash_attn_func = error_fn
 flash_attn_varlen_func = error_fn
 flash_attn_with_kvcache = error_fn
+get_scheduler_metadata = error_fn
 
 platform = current_platform()
 
@@ -171,6 +172,7 @@ elif platform.is_nvidia and platform.is_hopper:
             flash_attn_func,
             flash_attn_varlen_func,
             flash_attn_with_kvcache,
+            get_scheduler_metadata,
         )
     except ImportError:
         pass
@@ -347,4 +349,9 @@ elif platform.is_nvidia and platform.is_hopper:
 # ------------------------------------------------------------------------------
 
 
-__all__ = ["flash_attn_func", "flash_attn_varlen_func", "flash_attn_with_kvcache"]
+__all__ = [
+    "flash_attn_func",
+    "flash_attn_varlen_func",
+    "flash_attn_with_kvcache",
+    "get_scheduler_metadata",
+]
