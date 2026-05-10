@@ -321,7 +321,6 @@ class OutputProcesser:
         running the request until natural ``max_tokens``/EOS — the
         cancelled request burns up to ``max_tokens`` forward steps and
         latches a ``--max-num-seqs`` slot in the meantime.
-        See https://github.com/lightseekorg/tokenspeed/issues/520.
         """
         state = self.rid_to_state.get(rid)
         if state is not None:

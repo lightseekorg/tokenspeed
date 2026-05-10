@@ -14,6 +14,14 @@
 * Before creating commits, run `pre-commit run --all-files` to format.
 * When creating commits, perform sign off on behalf of the author.
 
+## Dependency boundaries
+
+* `tokenspeed` runtime dependencies should stay vendor-neutral.
+* Runtime code should use `tokenspeed-kernel` as its only kernel package
+  boundary.
+* Third-party kernel libraries belong under `tokenspeed-kernel`; avoid direct
+  runtime dependencies or imports that bypass it.
+
 ## tokenspeed-kernel
 
 Inside the root tokenspeed-kernel/ directory:
