@@ -101,33 +101,31 @@ class RuntimeStates:
 
     def snapshot_mamba_checkpoints(
         self,
-        mamba_pool_indices: torch.Tensor,
-        mamba_checkpoint_indices: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
         cache_lengths: torch.Tensor,
         page_size: int,
-        bs: int,
+        n: int,
     ) -> None:
-        """Copy current working Mamba states into checkpoint slots."""
-        if self.mamba_pool is None:
+        """Copy current working Mamba states into checkpoint slots.
+
+        src_indices/dst_indices are pre-filtered on CPU (only valid entries).
+        Only the page_size condition is checked on GPU.
+        """
+        if self.mamba_pool is None or n == 0:
             return
-        valid_mask = (mamba_pool_indices[:bs] != -1) & (
-            mamba_checkpoint_indices[:bs] != -1
-        )
+        src = src_indices[:n]
+        dst = dst_indices[:n]
         if page_size > 0:
-            valid_mask &= cache_lengths[:bs] % page_size == 0
-        # Use torch.where instead of boolean indexing to avoid CPU-GPU sync.
-        # Boolean indexing calls nonzero() internally which requires reading
-        # the output size from GPU → cudaStreamSynchronize.
-        # For invalid entries we set dst = src (self-copy, no data mutation).
-        src_indices = mamba_pool_indices[:bs].clamp(min=0).long()
-        dst_indices = torch.where(
-            valid_mask, mamba_checkpoint_indices[:bs].long(), src_indices
-        )
-        self.mamba_pool.conv_state[:, dst_indices] = self.mamba_pool.conv_state[
-            :, src_indices
+            # Use torch.where to keep fixed-size output (no boolean indexing sync).
+            # Invalid entries become self-copy (dst = src), harmless no-op.
+            page_mask = cache_lengths[:n] % page_size == 0
+            dst = torch.where(page_mask, dst, src)
+        self.mamba_pool.conv_state[:, dst] = self.mamba_pool.conv_state[
+            :, src
         ]
-        self.mamba_pool.ssm_state[:, dst_indices] = self.mamba_pool.ssm_state[
-            :, src_indices
+        self.mamba_pool.ssm_state[:, dst] = self.mamba_pool.ssm_state[
+            :, src
         ]
 
     def zero_mamba_states(
