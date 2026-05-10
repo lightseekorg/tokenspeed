@@ -19,8 +19,6 @@ server:
     --attn-tp-size 4
     --moe-tp-size 4
     --max-model-len 80000
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
