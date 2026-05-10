@@ -1,8 +1,8 @@
 -r common.txt
 nvidia-cutlass-dsl
 torch==2.11.0
-flashinfer-python==0.6.9
-flashinfer-cubin==0.6.9
-flashinfer_jit_cache @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.9/flashinfer_jit_cache-0.6.9+cu130-cp39-abi3-manylinux_2_28_x86_64.whl ; platform_machine == "x86_64"
-flashinfer_jit_cache @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.9/flashinfer_jit_cache-0.6.9+cu130-cp39-abi3-manylinux_2_28_aarch64.whl ; platform_machine == "aarch64"
+flashinfer-python==0.6.11
+flashinfer-cubin==0.6.11
+flashinfer_jit_cache @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.11/flashinfer_jit_cache-0.6.11+cu130-cp39-abi3-manylinux_2_28_x86_64.whl ; platform_machine == "x86_64"
+flashinfer_jit_cache @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.11/flashinfer_jit_cache-0.6.11+cu130-cp39-abi3-manylinux_2_28_aarch64.whl ; platform_machine == "aarch64"
 nvidia-ml-py==13.580.82
