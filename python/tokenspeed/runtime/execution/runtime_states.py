@@ -105,19 +105,19 @@ class RuntimeStates:
         dst_indices: torch.Tensor,
         cache_lengths: torch.Tensor,
         page_size: int,
-        n: int,
+        num_valid: int,
     ) -> None:
         """Copy current working Mamba states into checkpoint slots.
 
         src_indices/dst_indices are pre-filtered on CPU (only valid entries).
         Only the page_size condition is checked on GPU.
         """
-        if self.mamba_pool is None or n == 0:
+        if self.mamba_pool is None or num_valid == 0:
             return
         if page_size > 0:
             # Use torch.where to keep fixed-size output (no boolean indexing sync).
             # Invalid entries become self-copy (dst = src), harmless no-op.
-            page_mask = cache_lengths[:n] % page_size == 0
+            page_mask = cache_lengths[:num_valid] % page_size == 0
             dst_indices = torch.where(page_mask, dst_indices, src_indices)
         self.mamba_pool.conv_state[:, dst_indices] = self.mamba_pool.conv_state[
             :, src_indices

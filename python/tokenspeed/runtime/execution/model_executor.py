@@ -479,9 +479,7 @@ class ModelExecutor:
         if not getattr(forward_op, "mamba_pool_indices", None):
             return
 
-        # CPU-side pre-filter: only keep entries where BOTH pool and checkpoint
-        # indices are valid (!= -1).  This avoids launching expensive GPU
-        # gather/scatter kernels for the entire batch every decode step.
+        # CPU-side pre-filter
         src_list = []
         dst_list = []
         req_list = []
@@ -493,18 +491,17 @@ class ModelExecutor:
                 dst_list.append(ckpt_idx)
                 req_list.append(forward_op.request_pool_indices[i])
 
-        n = len(src_list)
-        if n == 0:
-            return  # No request needs checkpointing this step
+        num_valid = len(src_list)
+        if num_valid == 0:
+            return
 
-        # Pinned memory + non_blocking H2D (no stream sync)
         t_src = torch.tensor(src_list, dtype=torch.int64, device="cpu", pin_memory=True)
         t_dst = torch.tensor(dst_list, dtype=torch.int64, device="cpu", pin_memory=True)
         t_req = torch.tensor(req_list, dtype=torch.int64, device="cpu", pin_memory=True)
 
-        src_buf = torch.empty(n, dtype=torch.int64, device=self.device)
-        dst_buf = torch.empty(n, dtype=torch.int64, device=self.device)
-        req_buf = torch.empty(n, dtype=torch.int64, device=self.device)
+        src_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
+        dst_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
+        req_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
         src_buf.copy_(t_src, non_blocking=True)
         dst_buf.copy_(t_dst, non_blocking=True)
         req_buf.copy_(t_req, non_blocking=True)
@@ -515,7 +512,7 @@ class ModelExecutor:
             dst_buf,
             cache_lengths,
             self.config.block_size,
-            n,
+            num_valid,
         )
 
     def execute_forward_op_with_log(
