@@ -354,6 +354,57 @@ class TestCLIConfigCompat(unittest.TestCase):
             explicit_server_args.speculative_num_draft_tokens,
         )
 
+    def test_speculative_config_matches_explicit_mtp_args(self):
+        target_model = "nvidia/Qwen3.5-397B-A17B-NVFP4"
+
+        config_args = self._parse_args(
+            [
+                "--model",
+                target_model,
+                "--speculative-config",
+                '{"method":"mtp","num_speculative_tokens":3}',
+            ]
+        )
+        explicit_args = self._parse_args(
+            [
+                "--model",
+                target_model,
+                "--speculative-algorithm",
+                "MTP",
+                "--speculative-num-steps",
+                "3",
+            ]
+        )
+
+        config_server_args = self._from_cli_args_no_init(config_args)
+        explicit_server_args = self._from_cli_args_no_init(explicit_args)
+        config_server_args.resolve_basic_defaults()
+        explicit_server_args.resolve_basic_defaults()
+        config_server_args.resolve_speculative_decoding()
+        explicit_server_args.resolve_speculative_decoding()
+
+        self.assertEqual(
+            config_server_args.speculative_algorithm,
+            explicit_server_args.speculative_algorithm,
+        )
+        self.assertEqual(
+            config_server_args.speculative_draft_model_path,
+            explicit_server_args.speculative_draft_model_path,
+        )
+        self.assertEqual(
+            config_server_args.speculative_draft_model_path,
+            target_model,
+        )
+        self.assertTrue(explicit_server_args.draft_model_path_use_base)
+        self.assertEqual(
+            config_server_args.speculative_num_steps,
+            explicit_server_args.speculative_num_steps,
+        )
+        self.assertEqual(
+            config_server_args.speculative_num_draft_tokens,
+            explicit_server_args.speculative_num_draft_tokens,
+        )
+
     def test_speculative_config_must_be_json_object(self):
         args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])
         sa = self._from_cli_args_no_init(args)
