@@ -5,6 +5,6 @@ tokenspeed-flashmla==1.0.0.post20260429
 tokenspeed-mla==0.1.1
 tokenspeed-fast-hadamard-transform==1.1.0.post20251110
 tokenspeed-fa3==3.0.0.post20260408
-tokenspeed-fa4==4.0.0.post20251110
+tokenspeed-fa4==4.0.0.post20260510
 triton_kernels @ git+https://github.com/triton-lang/triton.git@4790c35390e62830fed7210d69f5988accf8aeda#subdirectory=python/triton_kernels
 tokenspeed-trtllm-kernel==1.2.1.post20260427
