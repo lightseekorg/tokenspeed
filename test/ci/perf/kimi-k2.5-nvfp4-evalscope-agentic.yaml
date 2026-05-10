@@ -19,8 +19,6 @@ server:
     --moe-tp-size 4
     --max-model-len 80000
     --max-num-seqs 16
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code

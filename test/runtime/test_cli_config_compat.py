@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import io
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -138,6 +139,23 @@ class TestCLIConfigCompat(unittest.TestCase):
             ["--model", "test/model", "--chunked-prefill-size", "2048"]
         )
         self.assertEqual(args.chunked_prefill_size, 2048)
+
+    def test_prefill_token_defaults(self):
+        args = self._parse_args(["--model", "test/model"])
+        self.assertEqual(args.max_prefill_tokens, 8192)
+        self.assertIsNone(args.chunked_prefill_size)
+
+        sa = self._from_cli_args_no_init(args)
+        sa.mapping = SimpleNamespace(world_size=1)
+        platform = SimpleNamespace(is_amd=False, is_nvidia=False)
+        with patch(
+            "tokenspeed.runtime.utils.server_args.current_platform",
+            return_value=platform,
+        ):
+            sa.resolve_memory_and_scheduling()
+
+        self.assertEqual(sa.max_prefill_tokens, 8192)
+        self.assertEqual(sa.chunked_prefill_size, 8192)
 
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(

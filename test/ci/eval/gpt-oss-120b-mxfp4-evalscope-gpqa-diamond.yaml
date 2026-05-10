@@ -26,8 +26,6 @@ server:
     --attn-tp-size 2
     --moe-tp-size 2
     --max-model-len 80000
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --trust-remote-code
     --reasoning-parser gpt-oss
     ${GPT_OSS_EVAL_ATTENTION_BACKEND:+--attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND}}

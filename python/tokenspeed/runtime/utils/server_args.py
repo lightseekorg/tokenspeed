@@ -92,7 +92,7 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: int = 8192
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -365,14 +365,9 @@ class ServerArgs:
             else:
                 self.gpu_memory_utilization = 0.88
 
-        # Set the chunked prefill token budget, which depends on GPU memory.
+        # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem < 25_000:
-                self.chunked_prefill_size = 2048
-            elif gpu_mem is not None and gpu_mem < 100_000:
-                self.chunked_prefill_size = 8192
-            else:
-                self.chunked_prefill_size = 16384
+            self.chunked_prefill_size = 8192
 
         # Set CUDA graph max capture size.
         if self.max_cudagraph_capture_size is None:
