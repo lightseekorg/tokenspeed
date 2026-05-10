@@ -20,7 +20,52 @@
 
 import logging
 import os
+import warnings
 from importlib import import_module
+
+_original_showwarning = warnings.showwarning
+
+_CUTLASS_POINTER_WARNING = "Use explicit `struct.scalar.ptr` for pointer instead."
+_CUTLASS_NAMED_BARRIER_WARNING = (
+    "NamedBarrier wait also arrives on the barrier. "
+    "Routing call to NamedBarrier.arrive_and_wait()."
+)
+
+
+def _is_noisy_cutlass_dsl_warning(message, category) -> bool:
+    message_text = str(message)
+    return (
+        issubclass(category, DeprecationWarning)
+        and message_text == _CUTLASS_POINTER_WARNING
+    ) or (
+        issubclass(category, UserWarning)
+        and message_text == _CUTLASS_NAMED_BARRIER_WARNING
+    )
+
+
+def _showwarning(message, category, filename, lineno, file=None, line=None):
+    if _is_noisy_cutlass_dsl_warning(message, category):
+        return
+    _original_showwarning(message, category, filename, lineno, file=file, line=line)
+
+
+def _suppress_cutlass_dsl_warnings():
+    if warnings.showwarning is not _showwarning:
+        warnings.showwarning = _showwarning
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Use explicit `struct\.scalar\.ptr` for pointer instead\.",
+        category=DeprecationWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            r"NamedBarrier wait also arrives on the barrier\. "
+            r"Routing call to NamedBarrier\.arrive_and_wait\(\)\."
+        ),
+        category=UserWarning,
+    )
 
 
 def _suppress_flash_attn_jit_cache_debug_log():
@@ -42,6 +87,7 @@ def _suppress_flash_attn_jit_cache_debug_log():
 
 def suppress_noisy_third_party_logs():
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    _suppress_cutlass_dsl_warnings()
 
     for logger_name in (
         "transformers",
