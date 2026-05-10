@@ -48,6 +48,9 @@ pip_install_with_retry() {
             echo "pip install failed after ${max_attempts} attempts: $*" >&2
             return 1
         fi
+        echo "pip install attempt ${attempt}/${max_attempts} failed; clearing pip cache before retry..." >&2
+        python3 -m pip cache remove flashinfer-jit-cache >/dev/null 2>&1 || true
+        python3 -m pip cache remove flashinfer-cubin >/dev/null 2>&1 || true
         echo "pip install attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s..." >&2
         sleep "${delay}"
         attempt=$((attempt + 1))
@@ -93,7 +96,7 @@ echo "=== Step 3: Install tokenspeed-kernel ==="
 cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
-pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+pip_install_with_retry pip3 install --no-cache-dir tokenspeed-kernel/python/ --no-build-isolation -v
 
 # ============================================================
 # Step 4: Install TokenSpeed Scheduler (C++)
