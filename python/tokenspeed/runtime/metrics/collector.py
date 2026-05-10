@@ -177,8 +177,10 @@ class EngineMetrics:
             multiprocess_mode="livemax",
             **kw,
         )
+        # Wire name follows vLLM's `vllm:kv_cache_usage_perc` for s/vllm:/tokenspeed:/g
+        # parity even though the value is a 0-1 ratio, not a percentage.
         self.kv_cache_usage_ratio = Gauge(
-            name="tokenspeed:kv_cache_usage_ratio",
+            name="tokenspeed:kv_cache_usage_perc",
             documentation="Fraction of device KV pages in use (0-1).",
             labelnames=labelnames,
             multiprocess_mode="livemax",
@@ -208,7 +210,7 @@ class EngineMetrics:
             **kw,
         )
         self.spec_decode_num_accepted_tokens = Counter(
-            name="tokenspeed:spec_decode_num_accepted_tokens_total",
+            name="tokenspeed:spec_decode_num_accepted_tokens",
             documentation=(
                 "Accepted speculative draft tokens (excludes the bonus token sampled "
                 "after verify)."
@@ -217,13 +219,13 @@ class EngineMetrics:
             **kw,
         )
         self.spec_decode_num_draft_tokens = Counter(
-            name="tokenspeed:spec_decode_num_draft_tokens_total",
+            name="tokenspeed:spec_decode_num_draft_tokens",
             documentation="Draft tokens proposed across verify steps.",
             labelnames=labelnames,
             **kw,
         )
         self.spec_decode_num_drafts = Counter(
-            name="tokenspeed:spec_decode_num_drafts_total",
+            name="tokenspeed:spec_decode_num_drafts",
             documentation="Number of speculative verify rounds (per request-slot).",
             labelnames=labelnames,
             **kw,
@@ -302,35 +304,37 @@ class RequestMetrics:
         kw = {"registry": registry} if registry is not None else {}
 
         self.prompt_tokens_total = Counter(
-            name="tokenspeed:prompt_tokens_total",
+            name="tokenspeed:prompt_tokens",
             documentation="Number of prefill tokens processed.",
             labelnames=labelnames,
             **kw,
         )
 
         self.generation_tokens_total = Counter(
-            name="tokenspeed:generation_tokens_total",
+            name="tokenspeed:generation_tokens",
             documentation="Number of generation tokens processed.",
             labelnames=labelnames,
             **kw,
         )
 
+        # vLLM has no direct equivalent; tokenspeed-only Counter that tracks
+        # every finished request regardless of finish reason.
         self.num_requests_total = Counter(
-            name="tokenspeed:num_requests_total",
+            name="tokenspeed:num_requests",
             documentation="Number of requests processed.",
             labelnames=labelnames,
             **kw,
         )
 
         self.request_success_total = Counter(
-            name="tokenspeed:request_success_total",
+            name="tokenspeed:request_success",
             documentation="Requests that finished without an abort-style finish.",
             labelnames=labelnames,
             **kw,
         )
 
         self.prefix_cache_hits_total = Counter(
-            name="tokenspeed:prefix_cache_hits_total",
+            name="tokenspeed:prefix_cache_hits",
             documentation=(
                 "Prompt tokens served from prefix cache. Hit ratio = "
                 "prefix_cache_hits_total / prompt_tokens_total."
@@ -366,7 +370,7 @@ class RequestMetrics:
         )
 
         self.histogram_time_per_output_token = Histogram(
-            name="tokenspeed:time_per_output_token_seconds",
+            name="tokenspeed:request_time_per_output_token_seconds",
             documentation="Histogram of time per output token in seconds.",
             labelnames=labelnames,
             buckets=[
