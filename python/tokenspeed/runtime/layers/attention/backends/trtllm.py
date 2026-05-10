@@ -377,7 +377,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         req_to_page: torch.Tensor,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu=None,
+        extend_prefix_lens_cpu: torch.Tensor | None = None,
+        extend_seq_lens_cpu: torch.Tensor | None = None,
         spec_info=None,
         use_cuda_graph: bool = False,
         **kwargs,
@@ -407,6 +408,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 extend_with_prefix=extend_with_prefix,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
             )
         else:
             raise NotImplementedError(f"Unsupported forward mode: {forward_mode}")
@@ -473,11 +475,15 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu=None,
+        extend_seq_lens_cpu=None,
     ):
         """Populate prefill slot for regular EXTEND (ragged query)."""
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
+        assert (
+            extend_seq_lens_cpu is not None
+        ), "trtllm extend requires extend_seq_lens_cpu (pinned-CPU mirror) to avoid GPU sync"
         cache_seqlens_int32 = seq_lens[:bs]
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
@@ -485,6 +491,14 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         page_table = self._build_page_table(
             req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
         )
+
+        # Read the max from the pinned-CPU mirror — avoids a per-iter
+        # GPU->CPU sync that would block the host on the previous step's
+        # forward and erase prefill/decode overlap. Both branches want
+        # max(new tokens per request); for a no-prefix extend that's
+        # seq_lens, for a prefix-cached extend it's seq_lens-prefix_lens —
+        # extend_seq_lens_cpu holds those new-token counts in either case.
+        max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
 
         if extend_with_prefix and (
             (extend_prefix_lens_cpu is not None and any(extend_prefix_lens_cpu))
@@ -496,12 +510,10 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                     "when extend_with_prefix is true."
                 )
             extend_seq_lens = seq_lens - extend_prefix_lens
-            max_seq_len_q = int(extend_seq_lens.max().item())
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
             )
         else:
-            max_seq_len_q = int(seq_lens.max().item())
             cu_seqlens_q = cu_seqlens_k
 
         self.forward_prefill_metadata = TRTLLMMHAMetadata(
