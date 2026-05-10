@@ -250,6 +250,14 @@ class TestCLIConfigCompat(unittest.TestCase):
                 )
                 self.assertEqual(args.reasoning_parser, parser_name)
 
+    def test_speculative_draft_quantization_defaults_to_unquant(self):
+        args = self._parse_args(["--model", "test/model", "--quantization", "nvfp4"])
+        self.assertEqual(args.speculative_draft_model_quantization, "unquant")
+
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_speculative_decoding()
+        self.assertIsNone(sa.speculative_draft_model_quantization)
+
     def test_dotted_attention_config_args(self):
         args = self._parse_args(
             [

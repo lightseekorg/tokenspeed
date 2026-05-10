@@ -209,7 +209,7 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
-    speculative_draft_model_quantization: str | None = None
+    speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
@@ -518,9 +518,7 @@ class ServerArgs:
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
 
-        if self.speculative_draft_model_quantization is None:
-            self.speculative_draft_model_quantization = self.quantization
-        elif self.speculative_draft_model_quantization == "unquant":
+        if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
         if self.eagle3_layers_to_capture is not None:
@@ -1359,8 +1357,7 @@ class ServerArgs:
             "--speculative-draft-model-quantization",
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
-            help="Quantization method for the draft model. If not specified, inherits the main model's quantization. "
-            "Use 'unquant' to explicitly disable quantization for the draft model.",
+            help="Quantization method for the draft model. Defaults to 'unquant'.",
         )
         parser.add_argument(
             "--speculative-num-steps",

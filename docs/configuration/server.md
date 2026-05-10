@@ -121,7 +121,7 @@ Common parser values include `kimi_k2` and `gpt-oss`.
 | `--speculative-config` | JSON speculative decoding configuration. |
 | `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3` or `MTP`. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
-| `--speculative-draft-model-quantization` | Draft model quantization. |
+| `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
