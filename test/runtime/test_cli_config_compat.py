@@ -35,6 +35,24 @@ class TestCLIConfigCompat(unittest.TestCase):
         with patch.object(ServerArgs, "__post_init__"):
             return ServerArgs.from_cli_args(args)
 
+    def _parallelism_snapshot(self, argv: list[str]) -> tuple[int, ...]:
+        args = self._parse_args(argv)
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        sa.resolve_parallelism()
+        mapping = sa.mapping
+        return (
+            mapping.world_size,
+            mapping.attn.tp_size,
+            mapping.attn.cp_size,
+            mapping.attn.dp_size,
+            mapping.dense.tp_size,
+            mapping.dense.dp_size,
+            mapping.moe.tp_size,
+            mapping.moe.ep_size,
+            mapping.moe.dp_size,
+        )
+
     # ---- Positional model arg ----
 
     def test_positional_model_arg(self):
@@ -75,6 +93,37 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--tp", "4"])
         sa = self._from_cli_args_no_init(args)
         self.assertEqual(sa.attn_tp_size, 4)
+
+    def test_tensor_parallel_aliases_match_explicit_attn_moe_tp(self):
+        explicit = self._parallelism_snapshot(
+            [
+                "--model",
+                "nvidia/Kimi-K2.5-NVFP4",
+                "--attn-tp-size",
+                "4",
+                "--moe-tp-size",
+                "4",
+            ]
+        )
+        tensor_parallel_size = self._parallelism_snapshot(
+            [
+                "--model",
+                "nvidia/Kimi-K2.5-NVFP4",
+                "--tensor-parallel-size",
+                "4",
+            ]
+        )
+        tp = self._parallelism_snapshot(
+            [
+                "--model",
+                "nvidia/Kimi-K2.5-NVFP4",
+                "--tp",
+                "4",
+            ]
+        )
+
+        self.assertEqual(tensor_parallel_size, explicit)
+        self.assertEqual(tp, explicit)
 
     def test_tensor_parallel_size_conflicts_with_attn_tp_size(self):
         args = self._parse_args(
