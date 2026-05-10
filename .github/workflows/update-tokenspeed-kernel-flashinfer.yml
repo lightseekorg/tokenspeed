@@ -68,9 +68,14 @@ jobs:
 
       - name: Create pull request
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           VERSION: ${{ steps.update.outputs.version }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required because this repository does not allow GITHUB_TOKEN to create pull requests." >&2
+            exit 1
+          fi
+
           if git diff --quiet; then
             echo "FlashInfer is already at $VERSION."
             exit 0
@@ -82,25 +87,24 @@ jobs:
           git commit -s -m "Update tokenspeed-kernel FlashInfer to ${VERSION}"
           git push --force-with-lease origin "$branch"
 
-          body="$(cat <<EOF
+          cat > pr-body.md <<EOF
           ## Summary
           - update tokenspeed-kernel FlashInfer dependencies to ${VERSION}
 
           ## Tests
           - Not run (dependency-only workflow update)
           EOF
-          )"
 
           if gh pr view "$branch" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh pr edit "$branch" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Update tokenspeed-kernel FlashInfer to ${VERSION}" \
-              --body "$body"
+              --body-file pr-body.md
           else
             gh pr create \
               --repo "$GITHUB_REPOSITORY" \
               --base main \
               --head "$branch" \
               --title "Update tokenspeed-kernel FlashInfer to ${VERSION}" \
-              --body "$body"
+              --body-file pr-body.md
           fi
