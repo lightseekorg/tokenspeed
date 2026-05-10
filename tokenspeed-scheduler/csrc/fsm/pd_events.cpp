@@ -42,7 +42,7 @@ PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
     auto prefill_done = PrefillDone{
         state.GetTokenContainer(),
         state.GetPageSize(),
-        nullptr,  // host_node_ref: not held by Prefilling
+        std::move(state).TakeHostNodeRef(),
         std::move(state).TakeDeviceNodeRef(),
         std::move(state).TakeLocalKVAllocator(),
         std::move(state).TakeReqPoolIndex(),

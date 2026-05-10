@@ -51,7 +51,6 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_per_layer,
 )
 
-SUPPORT_PIN_MEMORY = True
 MLA_KVSTORE_LOADBACK_BLOCK_QUOTA = 16
 MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA = 16
 
@@ -73,14 +72,12 @@ class HostKVCache(abc.ABC):
         host_size: int,
         page_size: int,
         layout: str,
-        pin_memory: bool,
         device: str,
         host_size_tokens: int = 0,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
-        self.pin_memory = pin_memory and SUPPORT_PIN_MEMORY
         self.device = device
 
         self.dtype = device_pool.store_dtype
@@ -226,7 +223,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         host_size: int,
         page_size: int,
         layout: str,
-        pin_memory: bool = True,
         device: str = "cpu",
         host_size_tokens: int = 0,
     ):
@@ -236,20 +232,20 @@ class MHATokenToKVPoolHost(HostKVCache):
             host_size,
             page_size,
             layout,
-            pin_memory,
             device,
             host_size_tokens=host_size_tokens,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        platform = current_platform()
         self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
+            [platform.device_visible_data_ptr(x) for x in self.k_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
         self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
+            [platform.device_visible_data_ptr(x) for x in self.v_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
@@ -287,10 +283,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=self.dtype,
             device=self.device,
         )
-        if self.pin_memory:
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
+        current_platform().register_host_tensor_for_gpu_access(buffer)
         return buffer
 
     @property
@@ -446,7 +439,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=True,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
@@ -549,7 +542,6 @@ class MLATokenToKVPoolHost(HostKVCache):
         host_size: int,
         page_size: int,
         layout: str,
-        pin_memory: bool = True,
         device: str = "cpu",
         host_size_tokens: int = 0,
     ):
@@ -559,13 +551,13 @@ class MLATokenToKVPoolHost(HostKVCache):
             host_size,
             page_size,
             layout,
-            pin_memory,
             device,
             host_size_tokens=host_size_tokens,
         )
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        platform = current_platform()
         self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
+            [platform.device_visible_data_ptr(x) for x in self.data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
@@ -611,10 +603,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             dtype=self.dtype,
             device=self.device,
         )
-        if self.pin_memory:
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
+        current_platform().register_host_tensor_for_gpu_access(buffer)
         return buffer
 
     def load_to_device_per_layer(
@@ -726,7 +715,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             ),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=True,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:

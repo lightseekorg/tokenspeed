@@ -116,7 +116,7 @@ if cutlass_fused_moe is not error_fn:
         solution="flashinfer",
         dtypes={torch.bfloat16, torch.float16, torch.uint8, torch.float8_e4m3fn},
         traits={
-            "weight_dtype": frozenset({"bf16", "nvfp4"}),
+            "weight_dtype": frozenset({"bf16", "fp8", "nvfp4"}),
             "tp": frozenset({True, False}),
             "ep": frozenset({True, False}),
             "cuda_graph": frozenset({False}),

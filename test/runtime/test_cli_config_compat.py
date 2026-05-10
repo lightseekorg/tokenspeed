@@ -277,6 +277,31 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_draft_model_path, "draft/model")
         self.assertEqual(sa.speculative_num_draft_tokens, 3)
 
+    def test_speculative_config_must_be_json_object(self):
+        args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])
+        sa = self._from_cli_args_no_init(args)
+        with self.assertRaisesRegex(
+            ValueError, "--speculative-config must be a JSON object"
+        ):
+            sa.resolve_basic_defaults()
+
+    def test_speculative_defaults(self):
+        args = self._parse_args(["--model", "test/model"])
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        self.assertEqual(sa.speculative_num_steps, 3)
+        self.assertEqual(sa.speculative_eagle_topk, 1)
+        self.assertEqual(sa.speculative_num_draft_tokens, 4)
+
+    def test_speculative_draft_tokens_default_to_steps_plus_one(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--speculative-num-steps", "1"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        self.assertEqual(sa.speculative_num_steps, 1)
+        self.assertEqual(sa.speculative_num_draft_tokens, 2)
+
     # ---- Full server command example ----
 
     def test_full_server_command(self):

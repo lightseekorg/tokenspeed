@@ -58,3 +58,41 @@ def routing_flash(
         float(scaling_factor),
         bool(renorm),
     )
+
+
+def softplus_sqrt_topk_flash(
+    input: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    scaling_factor: float,
+    renorm: bool = False,
+) -> None:
+    _load_routing_module().softplus_sqrt_topk_flash(
+        input,
+        correction_bias,
+        topk_indices,
+        topk_weights,
+        bool(renorm),
+        float(scaling_factor),
+    )
+
+
+def hash_softplus_sqrt_topk_flash(
+    input: torch.Tensor,
+    input_ids: torch.Tensor,
+    hash_indices_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    scaling_factor: float,
+    renorm: bool = False,
+) -> None:
+    _load_routing_module().hash_softplus_sqrt_topk_flash(
+        input,
+        input_ids,
+        hash_indices_table,
+        topk_indices,
+        topk_weights,
+        bool(renorm),
+        float(scaling_factor),
+    )
