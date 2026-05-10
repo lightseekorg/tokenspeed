@@ -165,7 +165,6 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
-        # https://github.com/lightseekorg/tokenspeed/pull/3202#discussion_r1950153599
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):

@@ -45,7 +45,6 @@ from tokenspeed.runtime.utils.text import find_printable_text
 
 # Maximum number of request states that the detokenizer can hold.
 # When exceeded, the oldest entries are evicted. Default: 65536 (1<<16).
-# See: https://github.com/lightseekorg/tokenspeed/issues/2812
 DETOKENIZER_MAX_STATES = envs.TOKENSPEED_DETOKENIZER_MAX_STATES.get()
 
 
@@ -224,8 +223,7 @@ def incremental_decode_batch(
                 "It may be due to the request being evicted from the decode status due to memory pressure. "
                 "Please increase the maximum number of requests by setting "
                 "the TOKENSPEED_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                f"The current value is {DETOKENIZER_MAX_STATES}. "
-                "For more details, see: https://github.com/lightseekorg/tokenspeed/issues/2812"
+                f"The current value is {DETOKENIZER_MAX_STATES}."
             )
         new_text = read_texts[i][len(surr_texts[i]) :]
         if recv_obj.finished_reasons[i] is None:
