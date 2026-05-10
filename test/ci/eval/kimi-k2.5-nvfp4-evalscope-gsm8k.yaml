@@ -15,8 +15,7 @@ server:
   command: >-
     python3 -m tokenspeed.api_server
     --model nvidia/Kimi-K2.5-NVFP4
-    --attn-tp-size 4
-    --moe-tp-size 4
+    --tp 4
     --max-model-len 80000
     --trust-remote-code
     --attention-backend tokenspeed_mla
