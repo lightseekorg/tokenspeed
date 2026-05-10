@@ -301,7 +301,58 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_basic_defaults()
         self.assertEqual(sa.speculative_algorithm, "MTP")
         self.assertEqual(sa.speculative_draft_model_path, "draft/model")
-        self.assertEqual(sa.speculative_num_draft_tokens, 3)
+        self.assertEqual(sa.speculative_num_steps, 3)
+        self.assertEqual(sa.speculative_num_draft_tokens, 4)
+
+    def test_speculative_config_matches_explicit_eagle3_args(self):
+        draft_model = "lightseekorg/kimi-k2.5-eagle3-mla"
+
+        config_args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-config",
+                (
+                    f'{{"model":"{draft_model}",'
+                    '"method":"eagle3",'
+                    '"num_speculative_tokens":1}'
+                ),
+            ]
+        )
+        explicit_args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "EAGLE3",
+                "--speculative-draft-model-path",
+                draft_model,
+                "--speculative-num-steps",
+                "1",
+            ]
+        )
+
+        config_server_args = self._from_cli_args_no_init(config_args)
+        explicit_server_args = self._from_cli_args_no_init(explicit_args)
+        config_server_args.resolve_basic_defaults()
+        explicit_server_args.resolve_basic_defaults()
+
+        self.assertEqual(
+            config_server_args.speculative_algorithm,
+            explicit_server_args.speculative_algorithm,
+        )
+        self.assertEqual(
+            config_server_args.speculative_draft_model_path,
+            explicit_server_args.speculative_draft_model_path,
+        )
+        self.assertEqual(
+            config_server_args.speculative_num_steps,
+            explicit_server_args.speculative_num_steps,
+        )
+        self.assertEqual(
+            config_server_args.speculative_num_draft_tokens,
+            explicit_server_args.speculative_num_draft_tokens,
+        )
 
     def test_speculative_config_must_be_json_object(self):
         args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])

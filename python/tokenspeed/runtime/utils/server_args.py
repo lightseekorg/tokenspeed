@@ -338,7 +338,7 @@ class ServerArgs:
 
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
-                self.speculative_num_draft_tokens = int(num_speculative_tokens)
+                self.speculative_num_steps = int(num_speculative_tokens)
 
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
