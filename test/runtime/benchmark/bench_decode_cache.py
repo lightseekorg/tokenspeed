@@ -12,7 +12,7 @@ We simulate a steady-state server: a large cache of pre-existing sequences
 "requests" each decoding D pages one at a time.
 
 Run with:
-  python/.venv/bin/python benchmark/bench_decode_cache.py
+  python/.venv/bin/python test/runtime/benchmark/bench_decode_cache.py
 """
 
 from __future__ import annotations
