@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -46,62 +44,6 @@ def _swa_block_table(metadata: DeepseekV4ForwardMetadata) -> torch.Tensor:
     )
 
 
-def _expand_compact_block_table(
-    compact: torch.Tensor,
-    base_offsets: torch.Tensor,
-    *,
-    absolute_cols: int,
-) -> torch.Tensor:
-    if compact.ndim != 2:
-        raise ValueError(
-            f"compact block table must be 2D, got {tuple(compact.shape)}"
-        )
-    bs, k = int(compact.shape[0]), int(compact.shape[1])
-    cols = max(int(absolute_cols), 0)
-    device = compact.device
-    if base_offsets.shape[0] != bs:
-        raise ValueError(
-            f"base_offsets shape {tuple(base_offsets.shape)} mismatches "
-            f"compact rows {bs}"
-        )
-    out = torch.full((bs, max(cols, 1)), -1, dtype=torch.int32, device=device)
-    if k == 0 or cols == 0:
-        return out[:, :cols]
-    col_idx = torch.arange(k, device=device, dtype=torch.int32)
-    abs_cols = base_offsets.to(torch.int32).view(-1, 1) + col_idx.view(1, -1)
-    in_range = (abs_cols >= 0) & (abs_cols < cols)
-    safe = abs_cols.clamp(0, cols - 1).to(torch.int64)
-    rows = (
-        torch.arange(bs, device=device, dtype=torch.int64)
-        .view(-1, 1)
-        .expand(bs, k)
-    )
-    src = torch.where(
-        in_range,
-        compact.to(torch.int32),
-        torch.full_like(compact, -1, dtype=torch.int32),
-    )
-    out.index_put_((rows, safe), src, accumulate=False)
-    return out[:, :cols]
-
-
-def _expand_paged_cache_block_tables(
-    paged: dict[str, torch.Tensor],
-    base_offsets: dict[str, torch.Tensor],
-    *,
-    absolute_cols: dict[str, int],
-) -> dict[str, torch.Tensor]:
-    out: dict[str, torch.Tensor] = {}
-    for gid, table in paged.items():
-        offsets = base_offsets.get(gid)
-        if offsets is None:
-            out[gid] = table
-            continue
-        target = int(absolute_cols.get(gid, int(table.shape[1])))
-        out[gid] = _expand_compact_block_table(table, offsets, absolute_cols=target)
-    return out
-
-
 def _cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.pad(
         torch.cumsum(lengths.to(torch.int32), dim=0, dtype=torch.int32),
@@ -126,8 +68,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._decode_tile_metadata = {}
         self._cuda_graph_metadata = {}
         self._cuda_graph_paged_cache_block_tables: dict[str, torch.Tensor] = {}
+        # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
+        # buffers; populated by init_cuda_graph_state.
         self._cuda_graph_paged_cache_base_offsets: dict[str, torch.Tensor] = {}
-        self._paged_cache_group_specs: dict[str, dict[str, Any]] = {}
         self._cuda_graph_max_bs = 0
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
@@ -240,20 +183,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             base_offsets_on_device[str(gid)] = off[:bs].to(
                 device=device, dtype=torch.int32
             )
-        absolute_cols: dict[str, int] = {}
-        for gid in base_offsets_on_device:
-            spec = self._paged_cache_group_specs.get(gid)
-            if spec is None or not spec["sliding"]:
-                continue
-            absolute_cols[gid] = max(
-                1,
-                (max_seq_len + spec["raw_per_page"] - 1) // spec["raw_per_page"],
-            )
-        paged_cache_block_tables = _expand_paged_cache_block_tables(
-            paged_cache_block_tables,
-            base_offsets_on_device,
-            absolute_cols=absolute_cols,
-        )
         (
             swa_block_table,
             compressor_state_block_tables,
@@ -325,6 +254,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
             block_table=_swa_block_table(metadata),
+            block_table_base_offsets=metadata.swa_base_logical_page,
             window_size=window_size,
             block_size=block_size,
             out_indices=metadata.decode_swa_indices,
@@ -617,6 +547,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 seq_lens=metadata.seq_lens,
                 gather_lens=gather_lens,
                 block_table=_swa_block_table(metadata),
+                block_table_base_offsets=metadata.swa_base_logical_page,
                 block_size=token_to_kv_pool.swa_block_size,
                 offset=compressed_base,
             )
@@ -664,6 +595,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             seq_lens=metadata.seq_lens,
             gather_lens=gather_lens,
             block_table=_swa_block_table(metadata),
+            block_table_base_offsets=metadata.swa_base_logical_page,
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
         )
@@ -740,6 +672,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_bs: int,
         seq_lens_buf: torch.Tensor | None = None,
         paged_cache_group_specs=(),
+        max_tokens_per_req: int = 1,
     ):
         del seq_lens_buf
         self._cuda_graph_block_table = torch.zeros(
@@ -775,22 +708,24 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_paged_cache_block_tables = {}
         self._cuda_graph_paged_cache_base_offsets = {}
-        self._paged_cache_group_specs = {}
         for spec in tuple(paged_cache_group_specs or ()):
             raw_per_page = max(
                 1,
                 int(spec.rows_per_page) * int(spec.entry_stride_tokens),
             )
-            max_pages = max(
-                1,
-                (self.context_len + raw_per_page - 1) // raw_per_page,
-            )
             gid = str(spec.group_id)
             sliding = str(getattr(spec, "retention", "")) == "sliding_window"
-            self._paged_cache_group_specs[gid] = {
-                "raw_per_page": raw_per_page,
-                "sliding": sliding,
-            }
+            if sliding:
+                window = int(getattr(spec, "sliding_window_tokens", 0) or 0)
+                live_tokens = max(1, window - 1 + max(1, int(max_tokens_per_req)))
+                if self.context_len > 0:
+                    live_tokens = min(live_tokens, self.context_len)
+                max_pages = max(1, (live_tokens + raw_per_page - 1) // raw_per_page + 1)
+            else:
+                max_pages = max(
+                    1,
+                    (self.context_len + raw_per_page - 1) // raw_per_page,
+                )
             self._cuda_graph_paged_cache_block_tables[gid] = torch.zeros(
                 (max_bs, max_pages),
                 dtype=torch.int32,
@@ -814,7 +749,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         out: dict[str, torch.Tensor] = {}
         if not self._cuda_graph_paged_cache_block_tables:
             return out
-        offsets_in = paged_cache_block_table_base_offsets or {}
         for group_id, buf in self._cuda_graph_paged_cache_block_tables.items():
             table = paged_cache_block_tables.get(group_id)
             buf[:bs].fill_(pad_value)
@@ -826,39 +760,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         f"expected padded bs {bs}"
                     )
                 cols = int(table.shape[1])
-                offsets = offsets_in.get(group_id)
-                if offsets is None:
-                    if cols > int(buf.shape[1]):
-                        raise RuntimeError(
-                            "DeepSeek V4 CUDA graph paged cache table width "
-                            f"mismatch for {group_id!r}: got {cols}, capture "
-                            f"buffer has {int(buf.shape[1])}"
-                        )
-                    if cols > 0:
-                        buf[:bs, :cols].copy_(table[:bs, :cols].to(torch.int32))
-                elif cols > 0:
-                    rows_idx = (
-                        torch.arange(bs, device=buf.device, dtype=torch.int64)
-                        .view(-1, 1)
-                        .expand(bs, cols)
+                if cols > int(buf.shape[1]):
+                    raise RuntimeError(
+                        "DeepSeek V4 CUDA graph paged cache table width "
+                        f"mismatch for {group_id!r}: got {cols}, capture "
+                        f"buffer has {int(buf.shape[1])}"
                     )
-                    col_idx = torch.arange(
-                        cols, device=buf.device, dtype=torch.int32
-                    ).view(1, -1)
-                    abs_cols = offsets[:bs].to(torch.int32).view(-1, 1) + col_idx
-                    in_range = (abs_cols >= 0) & (abs_cols < buf.shape[1])
-                    safe_abs = abs_cols.clamp(0, buf.shape[1] - 1).to(torch.int64)
-                    src = torch.where(
-                        in_range,
-                        table[:bs, :cols].to(torch.int32),
-                        torch.full(
-                            (bs, cols),
-                            int(pad_value),
-                            dtype=torch.int32,
-                            device=buf.device,
-                        ),
-                    )
-                    buf.index_put_((rows_idx, safe_abs), src, accumulate=False)
+                if cols > 0:
+                    buf[:bs, :cols].copy_(table[:bs, :cols].to(torch.int32))
             out[group_id] = buf[:bs]
         return out
 
@@ -867,6 +776,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         bs: int,
         base_offsets: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
+        """Refresh persistent base-offset buffers from per-step input.
+
+        Sliding groups whose key is missing fall back to 0 (legacy
+        absolute scheduler binding). Returns the [:bs] views keyed by gid.
+        """
         out: dict[str, torch.Tensor] = {}
         for gid, buf in self._cuda_graph_paged_cache_base_offsets.items():
             buf[:bs].fill_(0)

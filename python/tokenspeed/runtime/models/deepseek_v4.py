@@ -1476,8 +1476,7 @@ def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
     if num_local_heads <= 128:
         return 128
     raise ValueError(
-        f"DeepSeek V4 attention supports at most 128 local heads, "
-        f"got {num_local_heads}"
+        f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
     )
 
 
@@ -2233,6 +2232,7 @@ class DeepseekV4Compressor(nn.Module):
         state_cache: torch.Tensor | None = None,
         state_block_table: torch.Tensor | None = None,
         state_block_size: int | None = None,
+        state_base_logical_page: torch.Tensor | None = None,
         write_compressed_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
@@ -2263,6 +2263,9 @@ class DeepseekV4Compressor(nn.Module):
             state_block_table = metadata.compressor_state_block_tables.get(
                 self.compress_ratio
             )
+            state_base_logical_page = metadata.compressor_state_base_logical_pages.get(
+                self.compress_ratio
+            )
         if state_block_size is None:
             state_block_size = (
                 pool.get_compressor_state_block_size(layer_index)
@@ -2275,6 +2278,7 @@ class DeepseekV4Compressor(nn.Module):
                 metadata.token_to_req_indices[: positions.numel()],
                 state_block_table,
                 state_block_size,
+                base_offsets=state_base_logical_page,
             )
         else:
             state_block_table = metadata.block_table
@@ -2312,6 +2316,7 @@ class DeepseekV4Compressor(nn.Module):
                 positions=positions,
                 compressor_slot_mapping=state_slot_mapping,
                 block_table=state_block_table,
+                block_table_base_offsets=state_base_logical_page,
                 compressor_block_size=state_block_size,
                 rms_norm_weight=self.norm.weight,
                 rms_norm_eps=self.norm.variance_epsilon,
@@ -2387,6 +2392,7 @@ class DeepseekV4Indexer(nn.Module):
                 metadata.token_to_req_indices[: positions.numel()],
                 indexer_state_block_table,
                 indexer_state_block_size,
+                base_offsets=metadata.indexer_state_base_logical_page,
             )
         else:
             indexer_state_block_table = metadata.block_table
@@ -2403,6 +2409,7 @@ class DeepseekV4Indexer(nn.Module):
                 state_cache=indexer_state,
                 state_block_table=indexer_state_block_table,
                 state_block_size=indexer_state_block_size,
+                state_base_logical_page=metadata.indexer_state_base_logical_page,
                 write_compressed_cache=False,
             )
         with deepseek_v4_profile_scope("indexer_compressed_slot_mapping"):
@@ -2423,6 +2430,7 @@ class DeepseekV4Indexer(nn.Module):
                 positions=positions,
                 compressor_slot_mapping=indexer_state_slot_mapping,
                 block_table=indexer_state_block_table,
+                block_table_base_offsets=metadata.indexer_state_base_logical_page,
                 compressor_block_size=indexer_state_block_size,
                 rms_norm_weight=self.compressor.norm.weight,
                 rms_norm_eps=self.compressor.norm.variance_epsilon,
@@ -2771,12 +2779,18 @@ class DeepseekV4Attention(nn.Module):
         local_indices: torch.Tensor,
         block_size: int,
         block_table: torch.Tensor | None = None,
+        base_logical_page: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if local_indices.numel() == 0:
             return torch.empty(0, device=local_indices.device, dtype=torch.int64)
         if block_table is None:
             block_table = metadata.block_table
         pages = torch.div(local_indices, block_size, rounding_mode="floor")
+        if base_logical_page is not None:
+            pages = pages - base_logical_page[req_idx].to(
+                device=pages.device,
+                dtype=pages.dtype,
+            )
         offsets = local_indices % block_size
         req = torch.full_like(pages, req_idx, dtype=torch.int64)
         page_ids = metadata.safe_page_ids(block_table, req, pages.long())
@@ -2813,6 +2827,7 @@ class DeepseekV4Attention(nn.Module):
             local,
             block_size,
             block_table=block_table,
+            base_logical_page=metadata.swa_base_logical_page,
         )
 
     def _compressed_slots_for_token(
@@ -3001,12 +3016,6 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-        if ctx.forward_mode is not None and ctx.forward_mode.is_mixed():
-            raise NotImplementedError(
-                "DeepSeek V4 mixed prefill/decode attention is not wired yet; "
-                "leave TOKENSPEED_ENABLE_MIXED_PREFILL_DECODE unset until the "
-                "attention backend can split prefill and decode slices."
-            )
         profile_prefix = f"attn_{self.attention_kind}"
         with deepseek_v4_profile_scope(f"{profile_prefix}_project_q_kv"):
             q, kv, qr = self._project_q_kv(hidden_states)
@@ -3020,6 +3029,7 @@ class DeepseekV4Attention(nn.Module):
                 metadata.token_to_req_indices[: positions.numel()],
                 metadata.swa_block_table,
                 pool.swa_block_size,
+                base_offsets=metadata.swa_base_logical_page,
             )
         else:
             swa_slot_mapping = out_cache_loc

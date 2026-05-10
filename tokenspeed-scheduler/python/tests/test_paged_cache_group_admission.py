@@ -8,6 +8,8 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
+COMPRESSED_GROUP_ID = "v4.c4a.compressed_kv"
+
 
 def _make_spec(request_id: str, tokens: list[int]) -> RequestSpec:
     spec = RequestSpec()
@@ -46,7 +48,7 @@ def _base_config(num_device_pages: int = 64) -> SchedulerConfig:
 
 def _compressed_group(total_pages: int) -> PagedCacheGroupConfig:
     return PagedCacheGroupConfig(
-        group_id="compressed.4",
+        group_id=COMPRESSED_GROUP_ID,
         rows_per_page=64,
         entry_stride_tokens=4,
         total_pages=total_pages,
@@ -70,12 +72,14 @@ def test_full_history_admission_denies_instead_of_throwing():
     scheduler.submit_requests([_make_spec("r0", list(range(256)))])
     plan = scheduler.next_execution_plan()
     assert "r0" in _request_ids_in_plan(plan)
-    assert len(scheduler.get_request_paged_cache_page_ids("r0", "compressed.4")) == 1
+    assert (
+        len(scheduler.get_request_paged_cache_page_ids("r0", COMPRESSED_GROUP_ID)) == 1
+    )
 
     scheduler.submit_requests([_make_spec("r1", list(range(256)))])
     plan2 = scheduler.next_execution_plan()
     assert "r1" not in _request_ids_in_plan(plan2)
-    assert scheduler.paged_cache_group_failed_alloc_count("compressed.4") == 0
+    assert scheduler.paged_cache_group_failed_alloc_count(COMPRESSED_GROUP_ID) == 0
 
 
 def test_full_history_stride_admission_accounts_partial_entries():
@@ -88,13 +92,17 @@ def test_full_history_stride_admission_accounts_partial_entries():
     scheduler.submit_requests([_make_spec("short", [1])])
     plan = scheduler.next_execution_plan()
     assert "short" in _request_ids_in_plan(plan)
-    assert len(scheduler.get_request_paged_cache_page_ids("short", "compressed.4")) == 1
+    assert (
+        len(scheduler.get_request_paged_cache_page_ids("short", COMPRESSED_GROUP_ID))
+        == 1
+    )
 
     scheduler.submit_requests([_make_spec("boundary", list(range(257)))])
     plan2 = scheduler.next_execution_plan()
     assert "boundary" in _request_ids_in_plan(plan2)
     assert (
-        len(scheduler.get_request_paged_cache_page_ids("boundary", "compressed.4")) == 2
+        len(scheduler.get_request_paged_cache_page_ids("boundary", COMPRESSED_GROUP_ID))
+        == 2
     )
 
 

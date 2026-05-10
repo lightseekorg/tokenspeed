@@ -61,8 +61,19 @@ def get_is_capture_mode() -> bool:
     return _is_capture_mode
 
 
-def compute_max_logical_pages_for_capture(spec, *, max_context_len: int) -> int:
+def compute_max_logical_pages_for_capture(
+    spec,
+    *,
+    max_context_len: int,
+    max_tokens_per_req: int = 1,
+) -> int:
     raw_per_page = max(1, int(spec.rows_per_page) * int(spec.entry_stride_tokens))
+    if str(getattr(spec, "retention", "")) == "sliding_window":
+        window = int(getattr(spec, "sliding_window_tokens", 0) or 0)
+        live_tokens = max(1, window - 1 + max(1, int(max_tokens_per_req)))
+        if int(max_context_len) > 0:
+            live_tokens = min(live_tokens, int(max_context_len))
+        return max(1, (live_tokens + raw_per_page - 1) // raw_per_page + 1)
     return max(1, (max(1, int(max_context_len)) + raw_per_page - 1) // raw_per_page)
 
 
@@ -221,6 +232,7 @@ class CudaGraphWrapper:
                 self.max_bs,
                 self.input_buffers.seq_lens_buf,
                 paged_cache_group_specs=paged_cache_group_specs,
+                max_tokens_per_req=self.max_tokens_per_req,
             )
         except TypeError:
             attn_backend.init_cuda_graph_state(
@@ -236,6 +248,7 @@ class CudaGraphWrapper:
                     self.max_bs,
                     self.drafter.draft_seq_lens,
                     paged_cache_group_specs=draft_paged_cache_group_specs,
+                    max_tokens_per_req=self.max_tokens_per_req,
                 )
             except TypeError:
                 draft_attn_backend.init_cuda_graph_state(
@@ -420,6 +433,7 @@ class CudaGraphWrapper:
                     if self.context_len <= 0
                     else self.context_len
                 ),
+                max_tokens_per_req=self.max_tokens_per_req,
             )
             out[str(spec.group_id)] = torch.zeros(
                 (bs, max_pages),
@@ -520,7 +534,13 @@ class CudaGraphWrapper:
             if rows == padded_bs:
                 out[key] = off
                 continue
-            out[key] = torch.nn.functional.pad(off, (0, padded_bs - rows), value=0)
+            # Padded rows have no real request — base 0 keeps absolute
+            # indexing aligned to column 0, matching dummy-page row padding.
+            out[key] = torch.nn.functional.pad(
+                off,
+                (0, padded_bs - rows),
+                value=0,
+            )
         return out
 
     def _init_replay_metadata(
@@ -557,12 +577,13 @@ class CudaGraphWrapper:
             )
             kwargs["paged_cache_block_tables"] = paged_cache_block_tables
             if paged_cache_block_table_base_offsets:
+                paged_cache_block_table_base_offsets = self._pad_offsets_to_padded_bs(
+                    paged_cache_block_table_base_offsets,
+                    actual_bs=actual_bs,
+                    padded_bs=padded_bs,
+                )
                 kwargs["paged_cache_block_table_base_offsets"] = (
-                    self._pad_offsets_to_padded_bs(
-                        paged_cache_block_table_base_offsets,
-                        actual_bs=actual_bs,
-                        padded_bs=padded_bs,
-                    )
+                    paged_cache_block_table_base_offsets
                 )
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,

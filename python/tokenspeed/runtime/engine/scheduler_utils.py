@@ -65,7 +65,6 @@ def make_config(
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
-    enable_mixed_prefill_decode: bool | None = None,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -91,12 +90,6 @@ def make_config(
     cfg.enable_mamba = enable_mamba
     cfg.mamba_cache_chunk_size = mamba_cache_chunk_size
     cfg.mamba_pool_total_chunks = mamba_pool_total_chunks
-    if enable_mixed_prefill_decode is None:
-        enable_mixed_prefill_decode = (
-            os.getenv("TOKENSPEED_ENABLE_MIXED_PREFILL_DECODE", "").strip().lower()
-            in _TRUTHY_ENV_VALUES
-        )
-    cfg.enable_mixed_prefill_decode = bool(enable_mixed_prefill_decode)
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg
@@ -283,7 +276,12 @@ def paged_cache_block_table_base_offsets_from_forward_op(
     *,
     num_reqs: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
-    """Convert forward op compact-table base offsets to int32 tensors."""
+    """Convert forward op compact-table base offsets to int32 tensors.
+
+    Returns (gpu_offsets_per_group, cpu_max_per_group). The CPU max is captured
+    before H2D so callers can size graph-replay buffers without a GPU max + D2H
+    sync. Empty rows yield max=0; missing keys are absent from the max dict.
+    """
     raw = getattr(forward_op, "paged_cache_block_table_base_offsets", None)
     if raw is None:
         return {}, {}

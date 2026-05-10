@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Literal, Optional, Sequence
 
+from tokenspeed.runtime.utils.common import ceil_div
+
 Retention = Literal["full_history", "sliding_window"]
 
 
@@ -32,12 +34,6 @@ class PagedCacheGroupSpec:
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
-
-
-def _ceil_div(numer: int, denom: int) -> int:
-    if denom <= 0:
-        raise ValueError(f"_ceil_div denom must be > 0, got {denom}")
-    return (numer + denom - 1) // denom
 
 
 def compute_paged_cache_group_page_counts(
@@ -71,7 +67,7 @@ def compute_paged_cache_group_page_counts(
                 "entry_stride_tokens must be > 0"
             )
         if spec.retention == "full_history":
-            full_pages = _ceil_div(max_total_tokens, raw_per_page)
+            full_pages = ceil_div(max_total_tokens, raw_per_page)
             total = (
                 full_pages
                 + max_live_requests
@@ -86,7 +82,7 @@ def compute_paged_cache_group_page_counts(
                     "positive sliding_window_tokens"
                 )
             per_req_tokens = min(window - 1 + max_scheduled_tokens, max_context_len)
-            per_req_pages = _ceil_div(per_req_tokens, raw_per_page) + 1
+            per_req_pages = ceil_div(per_req_tokens, raw_per_page) + 1
             total = (
                 max_live_requests * per_req_pages
                 + _PAGED_CACHE_GROUP_DUMMY_PAGES

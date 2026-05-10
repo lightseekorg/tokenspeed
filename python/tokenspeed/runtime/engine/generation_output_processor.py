@@ -483,8 +483,7 @@ class OutputProcesser:
             forward_op.input_lengths,
             forward_op.extend_prefix_lens,
         )
-        num_extends = forward_op.num_extends()
-        is_decode_op = num_extends <= 0
+        is_decode_op = forward_op.num_extends() <= 0
 
         request_changes = []
         stream_out_rids = []
@@ -598,7 +597,7 @@ class OutputProcesser:
             else:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
-                if i >= num_extends:
+                if is_decode_op:
                     request_changes.append(
                         make_update_reserve_tokens_event(rid, output_length)
                     )

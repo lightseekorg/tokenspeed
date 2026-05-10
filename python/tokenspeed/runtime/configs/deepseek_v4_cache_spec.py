@@ -21,9 +21,31 @@ from typing import Any, List, Sequence
 from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 
 V4_KERNEL_BLOCK_ROWS: int = 64
+V4_SWA_KV_GROUP_ID = "v4.swa_kv"
+V4_INDEXER_COMPRESSOR_STATE_GROUP_ID = "v4.c4a.indexer_compressor_state"
 _COMPRESSOR_STATE_WINDOW_TOKENS = {4: 8, 128: 128}
 _COMPRESSOR_STATE_ROWS_PER_PAGE = {4: 4, 128: 8}
 _COMPRESSED_LOGICAL_BLOCK_SIZE = 256
+
+
+def v4_compressor_state_group_id(ratio: int) -> str:
+    return f"v4.c{int(ratio)}a.compressor_state"
+
+
+def v4_compressed_kv_group_id(ratio: int) -> str:
+    return f"v4.c{int(ratio)}a.compressed_kv"
+
+
+def parse_v4_compressor_state_group_id(group_id: str) -> int | None:
+    prefix = "v4.c"
+    suffix = "a.compressor_state"
+    if not group_id.startswith(prefix) or not group_id.endswith(suffix):
+        return None
+    ratio_text = group_id[len(prefix) : -len(suffix)]
+    try:
+        return int(ratio_text)
+    except ValueError:
+        return None
 
 
 def _compressed_kernel_block_size(ratio: int) -> int:
@@ -57,7 +79,7 @@ def build_v4_cache_specs(
 
     specs: List[PagedCacheGroupSpec] = [
         PagedCacheGroupSpec(
-            group_id="v4.swa",
+            group_id=V4_SWA_KV_GROUP_ID,
             retention="sliding_window",
             rows_per_page=V4_KERNEL_BLOCK_ROWS,
             entry_stride_tokens=1,
@@ -69,7 +91,7 @@ def build_v4_cache_specs(
             raise ValueError(f"unsupported DeepSeek V4 compress_ratio={ratio}")
         specs.append(
             PagedCacheGroupSpec(
-                group_id=f"v4.compressor_state.{ratio}",
+                group_id=v4_compressor_state_group_id(ratio),
                 retention="sliding_window",
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
                 entry_stride_tokens=1,
@@ -78,7 +100,7 @@ def build_v4_cache_specs(
         )
         specs.append(
             PagedCacheGroupSpec(
-                group_id=f"compressed.{ratio}",
+                group_id=v4_compressed_kv_group_id(ratio),
                 retention="full_history",
                 rows_per_page=_compressed_kernel_block_size(ratio),
                 entry_stride_tokens=ratio,
@@ -88,7 +110,7 @@ def build_v4_cache_specs(
     if 4 in unique_compress_ratios:
         specs.append(
             PagedCacheGroupSpec(
-                group_id="v4.indexer_state.4",
+                group_id=V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
                 retention="sliding_window",
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
                 entry_stride_tokens=1,
@@ -99,6 +121,11 @@ def build_v4_cache_specs(
 
 
 __all__ = [
+    "V4_INDEXER_COMPRESSOR_STATE_GROUP_ID",
     "V4_KERNEL_BLOCK_ROWS",
+    "V4_SWA_KV_GROUP_ID",
     "build_v4_cache_specs",
+    "parse_v4_compressor_state_group_id",
+    "v4_compressed_kv_group_id",
+    "v4_compressor_state_group_id",
 ]

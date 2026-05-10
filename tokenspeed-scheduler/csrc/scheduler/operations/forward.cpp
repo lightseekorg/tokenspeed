@@ -159,8 +159,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
-std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(
-    Request* request, std::map<std::string, std::int32_t>& simulated_free) {
+std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
+                                                                  std::map<std::string, std::int32_t>& simulated_free) {
     std::int32_t tail_available = request->TailPageAvailableTokens();
     std::int32_t extra_tokens = std::max(0, request->GetReserveNumTokensInNextScheduleEvent() - tail_available);
     std::int32_t pages_needed = (extra_tokens + config_.page_size - 1) / config_.page_size;
@@ -224,8 +224,8 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
             if (cfg.entry_stride_tokens <= 0 || cfg.rows_per_page <= 0) continue;
             const std::int32_t entries = CeilDivPositive(target, cfg.entry_stride_tokens);
             const std::int32_t required = (entries + cfg.rows_per_page - 1) / cfg.rows_per_page;
-            const std::int32_t free = simulated_after_release.count(gid) ? simulated_after_release.at(gid)
-                                                                         : allocator->AvailablePages();
+            const std::int32_t free =
+                simulated_after_release.count(gid) ? simulated_after_release.at(gid) : allocator->AvailablePages();
             admission.releasable_pages[gid] = 0;
             admission.new_pages_needed[gid] = required;
             if (free < required) {
@@ -480,12 +480,6 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         }
         ops.push_back(std::move(op));
     };
-    auto has_prefill_op = [&]() {
-        return std::any_of(ops.begin(), ops.end(), [](const ForwardOperation& op) {
-            return std::holds_alternative<PrefillOperation>(op);
-        });
-    };
-
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free = initialPagedCacheGroupSimulatedFree();
     for (Request* request : candidates) {
@@ -500,9 +494,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
             std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
 
-            if (auto ev =
-                    schedulePrefillFirstChunk(request, token_budget, decode_input_tokens, config_.disable_l2_cache,
-                                              simulated_free)) {
+            if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
+                                                    config_.disable_l2_cache, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
                 // will be empty when disable_l2_cache
@@ -513,13 +506,13 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
             // Prefill-first: skip ALL decode if any prefill was scheduled this round.
-            if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
+            if (!ops.empty() && std::holds_alternative<PrefillOperation>(ops.back())) break;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
-            if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
+            if (!ops.empty() && std::holds_alternative<PrefillOperation>(ops.back())) break;
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();

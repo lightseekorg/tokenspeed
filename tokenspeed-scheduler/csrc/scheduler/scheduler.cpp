@@ -230,8 +230,23 @@ std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::stri
     return group_it->second.PageIds();
 }
 
-void Scheduler::acquirePagedCachePagesForRequest(const std::string& request_id,
-                                                 std::int32_t first_raw_position_of_op,
+std::int32_t Scheduler::GetRequestPagedCacheBaseLogicalPage(const std::string& request_id,
+                                                            const std::string& group_id) const {
+    if (paged_cache_allocators_.find(group_id) == paged_cache_allocators_.end()) {
+        throw std::out_of_range("Scheduler::GetRequestPagedCacheBaseLogicalPage: group_id not configured");
+    }
+    auto req_it = request_paged_cache_tables_.find(request_id);
+    if (req_it == request_paged_cache_tables_.end()) {
+        return 0;
+    }
+    auto group_it = req_it->second.find(group_id);
+    if (group_it == req_it->second.end()) {
+        return 0;
+    }
+    return group_it->second.BaseLogicalPage();
+}
+
+void Scheduler::acquirePagedCachePagesForRequest(const std::string& request_id, std::int32_t first_raw_position_of_op,
                                                  std::int32_t target_raw_tokens_exclusive) {
     if (paged_cache_allocators_.empty()) return;
     auto& tables = request_paged_cache_tables_[request_id];
@@ -250,9 +265,7 @@ void Scheduler::acquirePagedCachePagesForRequest(const std::string& request_id,
 }
 
 PagedCacheGroupAdmission Scheduler::checkPagedCacheGroupAdmission(
-    const std::string& request_id,
-    std::int32_t first_raw_position_of_op,
-    std::int32_t target_raw_tokens_exclusive,
+    const std::string& request_id, std::int32_t first_raw_position_of_op, std::int32_t target_raw_tokens_exclusive,
     const std::map<std::string, std::int32_t>& simulated_free) const {
     PagedCacheGroupAdmission result;
     if (paged_cache_allocators_.empty() || target_raw_tokens_exclusive < 0) {
@@ -290,7 +303,9 @@ PagedCacheGroupAdmission Scheduler::checkPagedCacheGroupAdmission(
             releasable = std::min(releasable, current_active);
         }
 
-        const std::int32_t new_pages = std::max(0, required - current_size);
+        // Absolute coverage = already_released (base) + live size.
+        const std::int32_t absolute_have = already_released + current_size;
+        const std::int32_t new_pages = std::max(0, required - absolute_have);
         std::int32_t free = allocator->AvailablePages();
         auto sf_it = simulated_free.find(gid);
         if (sf_it != simulated_free.end()) {
@@ -333,20 +348,29 @@ void Scheduler::releasePagedCachePagesForRequest(const std::string& request_id) 
     request_paged_cache_tables_.erase(it);
 }
 
+// Snapshot the per-group page ids the request currently owns into op.
+// For sliding groups page_ids are compact (live-only) and a base
+// logical-page offset is emitted alongside; full-history groups omit the
+// offset (implicit 0).
 void Scheduler::populatePagedCachePagesForOp(ForwardOperationBase& op_base) const {
     if (paged_cache_allocators_.empty()) {
         return;
     }
     auto req_it = request_paged_cache_tables_.find(op_base.request_id);
-    for (const auto& [gid, _] : paged_cache_allocators_) {
+    for (const auto& [gid, allocator] : paged_cache_allocators_) {
         std::vector<std::int32_t> pages;
+        std::int32_t base_offset = 0;
         if (req_it != request_paged_cache_tables_.end()) {
             auto table_it = req_it->second.find(gid);
             if (table_it != req_it->second.end()) {
                 pages = table_it->second.PageIds();
+                base_offset = table_it->second.BaseLogicalPage();
             }
         }
         op_base.paged_cache_pages[gid] = std::move(pages);
+        if (allocator->Config().retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
+            op_base.paged_cache_page_base_offsets[gid] = base_offset;
+        }
     }
 }
 

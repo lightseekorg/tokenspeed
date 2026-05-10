@@ -20,8 +20,13 @@ import numpy as np
 import torch
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
+    V4_SWA_KV_GROUP_ID,
     build_v4_cache_specs,
+    parse_v4_compressor_state_group_id,
+    v4_compressed_kv_group_id,
+    v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.configs.paged_cache_spec import (
     compute_paged_cache_group_page_counts,
@@ -39,11 +44,6 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE = 256
-
-_V4_COMPRESSOR_STATE_GROUP_PREFIX = "v4.compressor_state."
-_V4_SWA_GROUP_ID = "v4.swa"
-_V4_INDEXER_STATE_GROUP_ID = "v4.indexer_state.4"
-_COMPRESSED_GROUP_PREFIX = "compressed."
 
 
 @dataclass(frozen=True)
@@ -139,19 +139,23 @@ def _split_paged_cache_block_tables_into_v4_metadata(
     dict[int, torch.Tensor],
     torch.Tensor | None,
 ]:
+    """Split paged-cache dict into V4-named tables + per-sliding-group offsets.
+
+    Returns (swa, {ratio: compressor_state}, indexer_state, swa_base,
+    {ratio: compressor_state_base}, indexer_state_base). Unknown group ids
+    are ignored. Base offsets are None / missing when the input lacks them
+    (legacy scheduler binding).
+    """
     offsets = paged_cache_block_table_base_offsets or {}
-    swa = paged_cache_block_tables.get(_V4_SWA_GROUP_ID)
-    indexer_state = paged_cache_block_tables.get(_V4_INDEXER_STATE_GROUP_ID)
-    swa_base = offsets.get(_V4_SWA_GROUP_ID)
-    indexer_state_base = offsets.get(_V4_INDEXER_STATE_GROUP_ID)
+    swa = paged_cache_block_tables.get(V4_SWA_KV_GROUP_ID)
+    indexer_state = paged_cache_block_tables.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
+    swa_base = offsets.get(V4_SWA_KV_GROUP_ID)
+    indexer_state_base = offsets.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
     compressor_state: dict[int, torch.Tensor] = {}
     compressor_state_base: dict[int, torch.Tensor] = {}
     for gid, table in paged_cache_block_tables.items():
-        if not gid.startswith(_V4_COMPRESSOR_STATE_GROUP_PREFIX):
-            continue
-        try:
-            ratio = int(gid[len(_V4_COMPRESSOR_STATE_GROUP_PREFIX) :])
-        except ValueError:
+        ratio = parse_v4_compressor_state_group_id(gid)
+        if ratio is None:
             continue
         compressor_state[ratio] = table
         base = offsets.get(gid)
@@ -192,6 +196,7 @@ def _group_slot_mapping_from_raw(
     block_table: torch.Tensor,
     rows_per_page: int,
     entry_stride_tokens: int = 1,
+    base_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if rows_per_page <= 0:
         raise ValueError(f"rows_per_page must be > 0, got {rows_per_page}")
@@ -201,7 +206,21 @@ def _group_slot_mapping_from_raw(
     logical_row = torch.div(pos_i64, entry_stride_tokens, rounding_mode="floor")
     logical_page = torch.div(logical_row, rows_per_page, rounding_mode="floor")
     offsets = logical_row % rows_per_page
-    page_ids = _safe_page_ids(block_table, req_indices, logical_page)
+    table_page = logical_page
+    if base_offsets is not None:
+        req_i64 = req_indices.to(torch.int64)
+        rows = int(base_offsets.shape[0])
+        if rows <= 0:
+            table_page = logical_page.new_full(logical_page.shape, -1)
+        else:
+            valid_req = (req_i64 >= 0) & (req_i64 < rows)
+            safe_req = req_i64.clamp(0, rows - 1)
+            base = base_offsets.to(
+                device=logical_page.device,
+                dtype=torch.int64,
+            )[safe_req]
+            table_page = torch.where(valid_req, logical_page - base, -1)
+    page_ids = _safe_page_ids(block_table, req_indices, table_page)
     slots = page_ids * rows_per_page + offsets
     return torch.where(page_ids >= 0, slots, torch.full_like(slots, -1))
 
@@ -221,14 +240,15 @@ class DeepseekV4ForwardMetadata:
     decode_swa_window_size: int = 0
     decode_swa_block_size: int = 0
     paged_cache_block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Per-sliding-group [num_reqs] int32 base logical-page offset that
+    # accompanies each compact block table. Consumers index sliding tables as
+    # logical_page - base_offset; full-history groups omit the key (base 0).
     paged_cache_block_table_base_offsets: dict[str, torch.Tensor] = field(
         default_factory=dict
     )
     swa_block_table: torch.Tensor | None = None
     swa_base_logical_page: torch.Tensor | None = None
-    compressor_state_block_tables: dict[int, torch.Tensor] = field(
-        default_factory=dict
-    )
+    compressor_state_block_tables: dict[int, torch.Tensor] = field(default_factory=dict)
     compressor_state_base_logical_pages: dict[int, torch.Tensor] = field(
         default_factory=dict
     )
@@ -259,7 +279,7 @@ class DeepseekV4ForwardMetadata:
     ) -> torch.Tensor:
         del kv_cache_block_size
         table = self.paged_cache_block_tables.get(
-            f"{_COMPRESSED_GROUP_PREFIX}{int(compress_ratio)}"
+            v4_compressed_kv_group_id(compress_ratio)
         )
         return table if table is not None else self.block_table
 
@@ -464,7 +484,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         def _group_pages(group_id: str, default: int) -> int:
             return int(self.paged_cache_group_page_counts.get(group_id, default))
 
-        self.swa_block_size = _group_rows(_V4_SWA_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
+        self.swa_block_size = _group_rows(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
         self.state_block_size = page_size
         self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
         self.compressed_block_sizes = tuple(
@@ -481,7 +501,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         )
         self.compressor_state_block_sizes = tuple(
             (
-                _group_rows(f"{_V4_COMPRESSOR_STATE_GROUP_PREFIX}{ratio}", page_size)
+                _group_rows(v4_compressor_state_group_id(ratio), page_size)
                 if ratio > 1
                 else page_size
             )
@@ -490,7 +510,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         self.indexer_state_block_sizes = tuple(
             (
                 _group_rows(
-                    _V4_INDEXER_STATE_GROUP_ID,
+                    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
                     layout.compressor_state_block_size(ratio),
                 )
                 if ratio == 4
@@ -502,7 +522,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             self.compressed_block_sizes[0] if self.compressed_block_sizes else page_size
         )
 
-        swa_pages = _group_pages(_V4_SWA_GROUP_ID, self.num_pages)
+        swa_pages = _group_pages(V4_SWA_KV_GROUP_ID, self.num_pages)
         self.swa_kv_buffer = [
             torch.zeros(
                 (swa_pages, self.swa_block_bytes),
@@ -520,7 +540,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             has_indexer = ratio == 4
             compressed_block_size = self.compressed_block_sizes[layer_id]
             compressed_pages = (
-                _group_pages(f"{_COMPRESSED_GROUP_PREFIX}{ratio}", self.num_pages)
+                _group_pages(v4_compressed_kv_group_id(ratio), self.num_pages)
                 if has_compressed
                 else self.num_pages
             )
@@ -539,7 +559,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             compressor_state_block_size = self.compressor_state_block_sizes[layer_id]
             compressor_state_pages = (
                 _group_pages(
-                    f"{_V4_COMPRESSOR_STATE_GROUP_PREFIX}{ratio}",
+                    v4_compressor_state_group_id(ratio),
                     self.num_pages,
                 )
                 if has_compressed
@@ -573,7 +593,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             )
             indexer_state_block_size = self.indexer_state_block_sizes[layer_id]
             indexer_state_pages = (
-                _group_pages(_V4_INDEXER_STATE_GROUP_ID, self.num_pages)
+                _group_pages(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID, self.num_pages)
                 if has_indexer
                 else self.num_pages
             )

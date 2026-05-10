@@ -48,11 +48,15 @@ def test_sliding_release_skipped_releases_below_threshold():
     released = table.release_skipped(4)
 
     assert len(released) == 2
+    # Compact: only live entries remain; column c == absolute page base + c.
     page_ids = list(table.page_ids())
-    assert page_ids[:2] == [-1, -1]
-    assert page_ids[2] >= 0
-    assert page_ids[3] >= 0
+    assert len(page_ids) == 2
+    assert all(pid >= 0 for pid in page_ids)
+    assert table.base_logical_page() == 2
+    assert table.size() == 2
+    assert table.active_pages_count() == 2
     assert table.release_skipped(4) == []
+    assert table.base_logical_page() == 2
 
 
 def test_acquire_throws_on_exhaustion_without_leaking_cursor():
@@ -98,8 +102,11 @@ def test_chunked_prefill_release_lower_bound_uses_first_pos_not_target():
     released = table.release_skipped(new_lower)
     page_ids = list(table.page_ids())
     assert len(released) == 3
-    assert page_ids[3] >= 0
-    assert page_ids[4] >= 0
+    # Compact view: 2 live entries (absolute pages 3 and 4), base = 3.
+    assert table.base_logical_page() == 3
+    assert len(page_ids) == 2
+    assert page_ids[0] >= 0, "page covering position 7 must be retained"
+    assert page_ids[1] >= 0, "page covering position 8-9 must be retained"
 
     buggy_alloc = PagedCacheGroupAllocator(
         PagedCacheGroupConfig(
@@ -114,5 +121,8 @@ def test_chunked_prefill_release_lower_bound_uses_first_pos_not_target():
     buggy_table = PagedCacheGroupTable(buggy_alloc)
     buggy_table.acquire(10)
     buggy_released = buggy_table.release_skipped(old_lower)
+    # old_lower drops every page including the one chunk2 needs; compact view
+    # leaves zero live entries with base advanced to 5.
     assert len(buggy_released) == 5
-    assert list(buggy_table.page_ids())[3] == -1
+    assert list(buggy_table.page_ids()) == []
+    assert buggy_table.base_logical_page() == 5

@@ -28,17 +28,6 @@ namespace tokenspeed {
 
 namespace {
 
-std::vector<std::int32_t> CollectLivePageIds(const std::vector<std::int32_t>& page_ids) {
-    std::vector<std::int32_t> live;
-    live.reserve(page_ids.size());
-    for (std::int32_t id : page_ids) {
-        if (id >= 0) {
-            live.push_back(id);
-        }
-    }
-    return live;
-}
-
 std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
     if (numer <= 0) return 0;
     return (numer + denom - 1) / denom;
@@ -59,69 +48,40 @@ void PagedCacheGroupConfig::Validate() const {
     if (total_pages < 1) {
         throw std::invalid_argument("PagedCacheGroupConfig: total_pages must include the dummy page");
     }
-    if (retention == Retention::SlidingWindow &&
-        (!sliding_window_tokens.has_value() || *sliding_window_tokens <= 0)) {
-        throw std::invalid_argument(
-            "PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
+    if (retention == Retention::SlidingWindow && (!sliding_window_tokens.has_value() || *sliding_window_tokens <= 0)) {
+        throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
     }
 }
 
-PagedCacheGroupAllocator::PagedCacheGroupAllocator(PagedCacheGroupConfig config) : config_(std::move(config)) {
+PagedCacheGroupAllocator::PagedCacheGroupAllocator(PagedCacheGroupConfig config)
+    : config_(std::move(config)), pool_(config_.RawTokensPerPage(), config_.total_pages) {
     config_.Validate();
-    free_pages_.reserve(static_cast<std::size_t>(config_.total_pages));
-    for (std::int32_t i = 1; i < config_.total_pages; ++i) {
-        free_pages_.push_back(i);
-    }
 }
 
-std::vector<std::int32_t> PagedCacheGroupAllocator::Allocate(std::int32_t num_pages) {
+OwnedPages PagedCacheGroupAllocator::AcquireOwned(std::int32_t num_pages) {
     if (num_pages <= 0) {
         return {};
     }
-    if (static_cast<std::size_t>(num_pages) > free_pages_.size()) {
+    OwnedPages owned = pool_.Allocate(num_pages);
+    if (owned.Size() < num_pages) {
         ++failed_alloc_count_;
         return {};
     }
-
-    std::vector<std::int32_t> pages;
-    pages.reserve(static_cast<std::size_t>(num_pages));
-    for (std::int32_t i = 0; i < num_pages; ++i) {
-        pages.push_back(free_pages_.back());
-        free_pages_.pop_back();
-    }
     allocated_pages_total_ += num_pages;
-    return pages;
+    return owned;
+}
+
+std::vector<std::int32_t> PagedCacheGroupAllocator::Allocate(std::int32_t num_pages) {
+    OwnedPages owned = AcquireOwned(num_pages);
+    if (owned.Empty()) {
+        return {};
+    }
+    return owned.Detach();
 }
 
 void PagedCacheGroupAllocator::Deallocate(const std::vector<std::int32_t>& pages) {
-    free_pages_.insert(free_pages_.end(), pages.begin(), pages.end());
+    pool_.Deallocate(pages);
     released_pages_total_ += static_cast<std::int64_t>(pages.size());
-}
-
-PagedCacheGroupTable::~PagedCacheGroupTable() {
-    if (allocator_ == nullptr || page_ids_.empty()) {
-        return;
-    }
-    auto live = CollectLivePageIds(page_ids_);
-    if (!live.empty()) {
-        allocator_->Deallocate(live);
-    }
-}
-
-PagedCacheGroupTable& PagedCacheGroupTable::operator=(PagedCacheGroupTable&& other) noexcept {
-    if (this != &other) {
-        if (allocator_ != nullptr && !page_ids_.empty()) {
-            auto live = CollectLivePageIds(page_ids_);
-            if (!live.empty()) {
-                allocator_->Deallocate(live);
-            }
-        }
-        allocator_ = std::exchange(other.allocator_, nullptr);
-        page_ids_ = std::move(other.page_ids_);
-        raw_token_cursor_ = std::exchange(other.raw_token_cursor_, 0);
-        released_pages_count_ = std::exchange(other.released_pages_count_, 0);
-    }
-    return *this;
 }
 
 void PagedCacheGroupTable::Acquire(std::int32_t target_raw_tokens_exclusive) {
@@ -138,64 +98,57 @@ void PagedCacheGroupTable::Acquire(std::int32_t target_raw_tokens_exclusive) {
     const auto& cfg = allocator_->Config();
     const std::int32_t entries = CeilDivPositive(target_raw_tokens_exclusive, cfg.entry_stride_tokens);
     const std::int32_t pages_needed = (entries + cfg.rows_per_page - 1) / cfg.rows_per_page;
-    const std::int32_t pages_to_allocate = pages_needed - Size();
+    // Absolute pages already covered = base + live size after any
+    // ReleaseSkipped compaction. Allocate only the delta.
+    const std::int32_t pages_have = base_logical_page_ + Size();
+    const std::int32_t pages_to_allocate = pages_needed - pages_have;
     if (pages_to_allocate > 0) {
-        auto fresh = allocator_->Allocate(pages_to_allocate);
-        if (static_cast<std::int32_t>(fresh.size()) < pages_to_allocate) {
-            throw std::runtime_error(
-                "PagedCacheGroupTable::Acquire: failed to allocate pages for group " + cfg.group_id);
+        OwnedPages fresh = allocator_->AcquireOwned(pages_to_allocate);
+        if (fresh.Size() < pages_to_allocate) {
+            // fresh dtor returns any partial allocation to pool_.
+            throw std::runtime_error("PagedCacheGroupTable::Acquire: failed to allocate pages for group " +
+                                     cfg.group_id);
         }
-        page_ids_.insert(page_ids_.end(), fresh.begin(), fresh.end());
+        pages_.Append(std::move(fresh));
     }
     raw_token_cursor_ = target_raw_tokens_exclusive;
 }
 
 std::vector<std::int32_t> PagedCacheGroupTable::ReleaseSkipped(std::int32_t window_lower_bound) {
-    if (allocator_ == nullptr || page_ids_.empty() || window_lower_bound <= 0) {
+    if (allocator_ == nullptr || pages_.Empty() || window_lower_bound <= 0) {
         return {};
     }
     const auto& cfg = allocator_->Config();
     if (cfg.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
         return {};
     }
-
     const std::int32_t raw_per_page = cfg.RawTokensPerPage();
     if (raw_per_page <= 0) {
         return {};
     }
+    // Absolute logical-page index (exclusive) below which entries fall out of
+    // the active window.
     const std::int32_t target = window_lower_bound / raw_per_page;
-    if (target <= released_pages_count_) {
+    if (target <= base_logical_page_) {
         return {};
     }
-
-    const std::int32_t end = std::min(target, Size());
-    std::vector<std::int32_t> released;
-    released.reserve(static_cast<std::size_t>(end - released_pages_count_));
-    for (std::int32_t i = released_pages_count_; i < end; ++i) {
-        if (page_ids_[i] >= 0) {
-            released.push_back(page_ids_[i]);
-        }
-        page_ids_[i] = -1;
+    const std::int32_t to_drop = std::min(target - base_logical_page_, Size());
+    if (to_drop <= 0) {
+        return {};
     }
-    released_pages_count_ = end;
-    if (!released.empty()) {
-        allocator_->Deallocate(released);
-    }
+    OwnedPages dropped = pages_.TakeFirst(to_drop);
+    std::vector<std::int32_t> released = dropped.Ids();
+    base_logical_page_ += to_drop;
+    // dropped goes out of scope: OwnedPages dtor returns the pages to pool_.
     return released;
 }
 
 std::vector<std::int32_t> PagedCacheGroupTable::ReleaseAll() {
-    std::vector<std::int32_t> live;
-    if (allocator_ != nullptr && !page_ids_.empty()) {
-        live = CollectLivePageIds(page_ids_);
-        if (!live.empty()) {
-            allocator_->Deallocate(live);
-        }
-    }
-    page_ids_.clear();
+    OwnedPages dropped = pages_.TakeFirst(pages_.Size());
+    std::vector<std::int32_t> released = dropped.Ids();
     raw_token_cursor_ = 0;
-    released_pages_count_ = 0;
-    return live;
+    base_logical_page_ = 0;
+    return released;
 }
 
 std::int32_t PagedCacheGroupTable::RowsPerPage() const {
@@ -211,8 +164,7 @@ std::int32_t PagedCacheGroupTable::RawTokensPerPage() const {
 }
 
 bool PagedCacheGroupTable::IsSliding() const {
-    return allocator_ != nullptr &&
-           allocator_->Config().retention == PagedCacheGroupConfig::Retention::SlidingWindow;
+    return allocator_ != nullptr && allocator_->Config().retention == PagedCacheGroupConfig::Retention::SlidingWindow;
 }
 
 std::int32_t PagedCacheGroupTable::SlidingWindowTokens() const {

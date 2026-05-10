@@ -284,7 +284,7 @@ class EventLoop:
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "num_mamba_slots=%s enable_mixed_prefill_decode=%s",
+            "num_mamba_slots=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -294,7 +294,6 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             mamba_pool_total_chunks,
-            scheduler_cfg.enable_mixed_prefill_decode,
         )
         self.scheduler = Scheduler(scheduler_cfg)
 

@@ -104,10 +104,15 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         )
 
         group_ids = {spec.group_id for spec in pool.paged_cache_group_specs}
-        self.assertIn("v4.swa", group_ids)
-        self.assertIn("compressed.4", group_ids)
-        self.assertIn("compressed.128", group_ids)
-        self.assertGreater(pool.paged_cache_group_page_counts["compressed.4"], 1)
+        self.assertIn("v4.swa_kv", group_ids)
+        self.assertIn("v4.c4a.compressor_state", group_ids)
+        self.assertIn("v4.c128a.compressor_state", group_ids)
+        self.assertIn("v4.c4a.compressed_kv", group_ids)
+        self.assertIn("v4.c128a.compressed_kv", group_ids)
+        self.assertIn("v4.c4a.indexer_compressor_state", group_ids)
+        self.assertGreater(
+            pool.paged_cache_group_page_counts["v4.c4a.compressed_kv"], 1
+        )
 
 
 if __name__ == "__main__":

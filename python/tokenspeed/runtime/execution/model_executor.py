@@ -920,7 +920,6 @@ class ModelExecutor:
                         if self.input_buffers.has_mamba
                         else {}
                     )
-                    metadata_rows = bs if 0 < num_extends < bs else num_extends
                     paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
                         forward_op,
                         device=self.device,
@@ -941,16 +940,16 @@ class ModelExecutor:
                         req_to_page=self.req_to_page,
                         extend_with_prefix=extend_with_prefix,
                         extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
-                            :metadata_rows
+                            :num_extends
                         ],
                         extend_prefix_lens_cpu=self.input_buffers.extend_prefix_lens_cpu[
-                            :metadata_rows
+                            :num_extends
                         ],
                         extend_seq_lens=self.input_buffers.extend_seq_lens_buf[
-                            :metadata_rows
+                            :num_extends
                         ],
                         extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
-                            :metadata_rows
+                            :num_extends
                         ],
                         paged_cache_block_tables=paged_cache_block_tables,
                         paged_cache_block_table_base_offsets=(

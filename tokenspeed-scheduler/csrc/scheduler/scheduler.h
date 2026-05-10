@@ -77,6 +77,10 @@ public:
     std::int64_t PagedCacheGroupFailedAllocCount(const std::string& group_id) const;
     std::vector<std::int32_t> GetRequestPagedCachePageIds(const std::string& request_id,
                                                           const std::string& group_id) const;
+    // Compact-view base logical-page offset (column 0 of PageIds() = absolute
+    // logical page returned here). 0 for full-history groups and unseen
+    // request/group pairs. Tests use this to address compact tables.
+    std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
 
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
@@ -132,13 +136,10 @@ private:
     SchedulerConfig config_;
 
 private:
-    void acquirePagedCachePagesForRequest(const std::string& request_id,
-                                          std::int32_t first_raw_position_of_op,
+    void acquirePagedCachePagesForRequest(const std::string& request_id, std::int32_t first_raw_position_of_op,
                                           std::int32_t target_raw_tokens_exclusive);
     PagedCacheGroupAdmission checkPagedCacheGroupAdmission(
-        const std::string& request_id,
-        std::int32_t first_raw_position_of_op,
-        std::int32_t target_raw_tokens_exclusive,
+        const std::string& request_id, std::int32_t first_raw_position_of_op, std::int32_t target_raw_tokens_exclusive,
         const std::map<std::string, std::int32_t>& simulated_free) const;
     std::map<std::string, std::int32_t> initialPagedCacheGroupSimulatedFree() const;
     static void applyPagedCacheGroupAdmissionDebit(std::map<std::string, std::int32_t>& simulated_free,

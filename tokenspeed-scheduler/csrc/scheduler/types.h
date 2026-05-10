@@ -81,7 +81,6 @@ struct SchedulerConfig {
     std::int32_t decode_input_tokens{1};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
-    bool enable_mixed_prefill_decode{false};
     std::int32_t prefetch_threshold{4};  // num pages
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};

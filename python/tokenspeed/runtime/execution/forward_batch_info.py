@@ -55,9 +55,6 @@ class ForwardMode(IntEnum):
     def is_decode(self):
         return self == ForwardMode.DECODE
 
-    def is_mixed(self):
-        return self == ForwardMode.MIXED
-
     def is_idle(self):
         return self == ForwardMode.IDLE
 
