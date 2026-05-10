@@ -557,7 +557,7 @@ class EventLoop:
                     self.pd_kv_transfer.store_prefill_token,
                 )
 
-    def _submit_cache_ops(self, execution_plan) -> None:
+    def _submit_cache_ops(self, execution_plan, forward_op) -> None:
         if self.memory_executor is None:
             return
         self.memory_executor.submit_plan(execution_plan)
@@ -568,9 +568,9 @@ class EventLoop:
                 self._num_inflight_cache_ops += 1
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
-        self._setup_layerwise_loadback(execution_plan)
+        self._setup_layerwise_loadback(execution_plan, forward_op)
 
-    def _setup_layerwise_loadback(self, execution_plan) -> None:
+    def _setup_layerwise_loadback(self, execution_plan, forward_op) -> None:
         consumer_indices = []
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
@@ -588,12 +588,31 @@ class EventLoop:
         # runs before any ``wait_until`` in attention, so nothing else
         # orders writeback's reads against the new writes. Cheap when
         # write_stream is idle.
-        # LoadBack does not need fencing here: it only fires on admission
-        # iters (eager prefill), whose per-layer ``wait_until`` drains
-        # ``load_stream`` before the iter ends.
         host_exec = getattr(self.memory_executor, "host_exec", None)
-        if host_exec is not None:
-            self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
+        if host_exec is None:
+            return
+        self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
+
+        # LoadBack normally drains via attention's per-layer ``wait_until``
+        # on the eager EXTEND iter that admits the request. Recovery
+        # (``Retracted → Decoding``) is the exception: it emits a
+        # ``LoadBackOp`` paired with a ``num_extends == 0`` forward that
+        # goes through graph replay. Graph capture runs in
+        # ``ModelExecutor.__init__`` before ``MemoryExecutor`` registers
+        # the layer-transfer counter on the device pool, so
+        # ``get_key_buffer``'s ``wait_until`` is a no-op at capture time
+        # and no per-layer ``wait_event`` is baked into the captured
+        # graph. Without this fence, the graph replay reads the
+        # recovery's destination pages while ``load_stream`` is still
+        # writing them; under heavy retraction the torn bytes propagate
+        # back to the host pool on subsequent writebacks, poisoning the
+        # prefix and collapsing spec-decode acceptance to 0%.
+        if (
+            forward_op is not None
+            and forward_op.num_extends() == 0
+            and any(isinstance(op, Cache.LoadBackOp) for op in execution_plan.cache)
+        ):
+            self.model_executor.execution_stream.wait_stream(host_exec.load_stream)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -887,9 +906,8 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
-            self._submit_cache_ops(execution_plan)
-
             forward_op = self._get_forward_op(execution_plan)
+            self._submit_cache_ops(execution_plan, forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -998,10 +1016,9 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
-
-            self._submit_cache_ops(execution_plan)
-
             forward_op = self._get_forward_op(execution_plan)
+
+            self._submit_cache_ops(execution_plan, forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
