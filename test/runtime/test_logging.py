@@ -18,46 +18,36 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import contextlib
+import io
 import logging
-import os
+import unittest
 from importlib import import_module
 
-
-def _suppress_flash_attn_jit_cache_debug_log():
-    logger_name = "flash_attn.cute.cache_utils"
-    previous_disable_level = logging.root.manager.disable
-    logging.disable(logging.INFO)
-    try:
-        import_module(logger_name)
-    except ImportError:
-        return
-    finally:
-        logging.disable(previous_disable_level)
-
-    logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.WARNING)
-    for handler in logger.handlers:
-        handler.setLevel(logging.WARNING)
+from tokenspeed._logging import suppress_noisy_third_party_logs
 
 
-def suppress_noisy_third_party_logs():
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+class TestThirdPartyLogging(unittest.TestCase):
+    def test_flash_attn_jit_cache_debug_log_is_suppressed(self):
+        try:
+            cache_utils = import_module("flash_attn.cute.cache_utils")
+        except ImportError:
+            self.skipTest("flash_attn.cute.cache_utils is unavailable")
 
-    for logger_name in (
-        "transformers",
-        "huggingface_hub",
-        "huggingface_hub.file_download",
-        "httpx",
-        "httpcore",
-        "flash_attn.cute.cache_utils",
-    ):
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
+        logging.basicConfig(level=logging.DEBUG, force=True)
+        suppress_noisy_third_party_logs()
 
-    _suppress_flash_attn_jit_cache_debug_log()
+        logger = logging.getLogger("flash_attn.cute.cache_utils")
+        self.assertGreaterEqual(logger.getEffectiveLevel(), logging.WARNING)
+        for handler in logger.handlers:
+            self.assertGreaterEqual(handler.level, logging.WARNING)
 
-    try:
-        from huggingface_hub.utils import disable_progress_bars
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            cache_utils.get_jit_cache()
 
-        disable_progress_bars()
-    except Exception:
-        pass
+        self.assertNotIn("Persistent cache disabled", stderr.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
