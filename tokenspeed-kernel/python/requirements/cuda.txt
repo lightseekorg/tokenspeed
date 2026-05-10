@@ -3,7 +3,5 @@ nvidia-cutlass-dsl
 torch==2.11.0
 flashinfer-python==0.6.11
 flashinfer-cubin==0.6.11
---extra-index-url https://flashinfer.ai/whl/cu130
-flashinfer-jit-cache==0.6.11+cu130 ; platform_machine == "x86_64" or platform_machine == "aarch64"
 nvidia-ml-py==13.580.82
 nvtx
