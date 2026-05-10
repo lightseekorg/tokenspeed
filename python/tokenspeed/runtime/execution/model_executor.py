@@ -479,21 +479,25 @@ class ModelExecutor:
         if not getattr(forward_op, "mamba_pool_indices", None):
             return
         bs = len(forward_op.request_ids)
-        mamba_pool_indices = torch.tensor(
-            forward_op.mamba_pool_indices,
-            dtype=torch.int32,
-            device=self.device,
+        # Use pinned memory + non_blocking copy to avoid synchronous H2D transfer.
+        # The input_buffers will be overwritten again by fill_input_buffers later
+        # (on execution_stream which waits for default_stream), so this is safe.
+        t_pool = torch.tensor(
+            forward_op.mamba_pool_indices, dtype=torch.int32, device="cpu", pin_memory=True
         )
-        mamba_checkpoint_indices = torch.tensor(
-            forward_op.mamba_track_pool_indices,
-            dtype=torch.int32,
-            device=self.device,
+        t_track = torch.tensor(
+            forward_op.mamba_track_pool_indices, dtype=torch.int32, device="cpu", pin_memory=True
         )
-        req_pool_indices = torch.tensor(
-            forward_op.request_pool_indices,
-            dtype=torch.int64,
-            device=self.device,
+        t_req = torch.tensor(
+            forward_op.request_pool_indices, dtype=torch.int32, device="cpu", pin_memory=True
         )
+        self.input_buffers.mamba_pool_indices_buf[:bs].copy_(t_pool, non_blocking=True)
+        self.input_buffers.mamba_track_pool_indices_buf[:bs].copy_(t_track, non_blocking=True)
+        self.input_buffers.req_pool_indices_buf[:bs].copy_(t_req, non_blocking=True)
+
+        mamba_pool_indices = self.input_buffers.mamba_pool_indices_buf[:bs]
+        mamba_checkpoint_indices = self.input_buffers.mamba_track_pool_indices_buf[:bs]
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs].long()
         cache_lengths = self.runtime_states.valid_cache_lengths[req_pool_indices]
         self.runtime_states.snapshot_mamba_checkpoints(
             mamba_pool_indices,

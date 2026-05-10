@@ -115,10 +115,14 @@ class RuntimeStates:
         )
         if page_size > 0:
             valid_mask &= cache_lengths[:bs] % page_size == 0
-        if not valid_mask.any():
-            return
-        src_indices = mamba_pool_indices[:bs][valid_mask].long()
-        dst_indices = mamba_checkpoint_indices[:bs][valid_mask].long()
+        # Use torch.where instead of boolean indexing to avoid CPU-GPU sync.
+        # Boolean indexing calls nonzero() internally which requires reading
+        # the output size from GPU → cudaStreamSynchronize.
+        # For invalid entries we set dst = src (self-copy, no data mutation).
+        src_indices = mamba_pool_indices[:bs].clamp(min=0).long()
+        dst_indices = torch.where(
+            valid_mask, mamba_checkpoint_indices[:bs].long(), src_indices
+        )
         self.mamba_pool.conv_state[:, dst_indices] = self.mamba_pool.conv_state[
             :, src_indices
         ]
