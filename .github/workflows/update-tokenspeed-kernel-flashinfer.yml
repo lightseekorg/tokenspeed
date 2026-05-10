@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       flashinfer_version:
-        description: "FlashInfer version to use, for example 0.6.10 or v0.6.10."
+        description: "FlashInfer version to use, for example 0.6.11 or v0.6.11."
         required: true
         type: string
 
@@ -28,7 +28,7 @@ jobs:
       - name: Configure git author
         run: |
           git config user.name "lightseek-bot"
-          git config user.email "bot@lightseek.org"
+          git config user.email "243258330+lightseek-bot@users.noreply.github.com"
 
       - name: Update FlashInfer dependency
         id: update
