@@ -22,9 +22,9 @@ from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
 with redirect_triton_to_tokenspeed_triton():
     import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
+    import triton_kernels.matmul_ogs  # noqa: F401
+    import triton_kernels.matmul_ogs_details  # noqa: F401
+    import triton_kernels.matmul_ogs_details.opt_flags  # noqa: F401
     import triton_kernels.numerics  # noqa: F401
     import triton_kernels.swiglu  # noqa: F401
     import triton_kernels.tensor  # noqa: F401

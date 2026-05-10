@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import Platform
 
 
 @triton.jit
@@ -126,6 +127,8 @@ def fp8_quantize(
     ), f"fp8_quantize input must be bf16/fp16, got {x.dtype}"
     assert fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
+    _platform = Platform.get()
+
     M, N, x_row_stride = _flatten_to_2d(x)
 
     if out is None:
@@ -135,7 +138,16 @@ def fp8_quantize(
     out_M, _, out_row_stride = _flatten_to_2d(out)
     assert out_M == M
 
-    fp8_dtype_const = tl.float8e4nv if fp8_dtype is torch.float8_e4m3fn else tl.float8e5
+    # Map torch FP8 dtype to the correct Triton type constant.
+    # tl.float8e4nv  = float8_e4m3fn  (IEEE / NVIDIA / CDNA4)
+    # tl.float8e4b8  = float8_e4m3fnuz (CDNA3 / MI300, biased-zero)
+    # tl.float8e5    = float8_e5m2
+    if fp8_dtype is torch.float8_e4m3fn:
+        # CDNA3 (MI300) natively uses fnuz; map e4m3fn to the fnuz Triton
+        # constant so the JIT compiles the correct HW instruction.
+        fp8_dtype_const = tl.float8e4b8 if _platform.is_cdna3 else tl.float8e4nv
+    else:
+        fp8_dtype_const = tl.float8e5
 
     # Block-size heuristic — picked from per-shape best configs in an
     # nsys-driven sweep on B200 (kv_a [s,512] and v [s,h,128] for K2.5).
@@ -153,10 +165,10 @@ def fp8_quantize(
 
     grid = (triton.cdiv(M, block_m),)
 
-    # ``launch_pdl`` is a NVIDIA-only Triton runtime kwarg (Hopper+ Programmatic
-    # Dependent Launch). The HIP backend rejects unknown kwargs, so only forward
-    # it when PDL is actually requested.
-    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    # PDL is NVIDIA Hopper+ only. Gate both the runtime kwarg and the
+    # constexpr so AMD never compiles griddepcontrol instructions.
+    pdl_active = enable_pdl and _platform.is_nvidia
+    extra_kwargs = {"launch_pdl": True} if pdl_active else {}
 
     _fp8_quantize_kernel[grid](
         x,
@@ -168,7 +180,7 @@ def fp8_quantize(
         N=N,
         FP8_DTYPE=fp8_dtype_const,
         BLOCK_M=block_m,
-        ENABLE_PDL=enable_pdl,
+        ENABLE_PDL=pdl_active,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kwargs,

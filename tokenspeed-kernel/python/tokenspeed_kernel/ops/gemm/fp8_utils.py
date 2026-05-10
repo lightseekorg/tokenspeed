@@ -220,18 +220,18 @@ def _per_token_group_quant_8bit_raw(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    if _is_amd:
-        if dtype == torch.int8:
-            bit8_max = 127.0
-            bit8_min = -128.0
-        else:
-            bit8_max = 224.0
-            bit8_min = -bit8_max
+    if dtype == torch.int8:
+        info = torch.iinfo(dtype)
+        bit8_max = float(info.max)
+        bit8_min = float(info.min)
+    elif _is_amd:
+        # CDNA3 (MI300) uses float8_e4m3fnuz (max=224); CDNA4 (MI350) uses
+        # float8_e4m3fn (max=448). Read from the platform singleton which
+        # already handles this distinction correctly.
+        bit8_max = platform.fp8e4m3fn.max
+        bit8_min = platform.fp8e4m3fn.min
     else:
-        if dtype == torch.int8:
-            info = torch.iinfo(dtype)
-        else:
-            info = torch.finfo(dtype)
+        info = torch.finfo(dtype)
         bit8_max = info.max
         bit8_min = info.min
 

@@ -184,7 +184,24 @@ def test_mha_prefill_with_kvcache(
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 128, 8, 2)],
+    [
+        (torch.bfloat16, 128, 8, 2),
+        # GQA decode: exercises _decode_grouped_att_m_fwd (num_q_heads != num_kv_heads).
+        # CDNA4 (MI350) should use waves_per_eu=2 / matrix_instr_nonkdim=32 here.
+        (torch.bfloat16, 128, 16, 1),
+        # Large head_dim: on CDNA3 the grouped kernel shrinks BLOCK to 16;
+        # on CDNA4 it must keep BLOCK=32.  head_dim=576 is the threshold.
+        pytest.param(
+            torch.bfloat16,
+            576,
+            8,
+            1,
+            marks=pytest.mark.skipif(
+                not platform.is_amd,
+                reason="Large-head BLOCK regression is AMD-only",
+            ),
+        ),
+    ],
 )
 def test_mha_decode_with_kvcache(
     device: str,

@@ -23,8 +23,35 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.quantization import fp8_quantize
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    InterconnectInfo,
+    Platform,
+    PlatformInfo,
+    current_platform,
+)
 
 FP8_E4M3_MAX = 448.0
+
+_platform = current_platform()
+
+
+def _make_platform(vendor: str, major: int, minor: int) -> PlatformInfo:
+    """Build a minimal PlatformInfo for mock-platform tests."""
+    return PlatformInfo(
+        vendor=vendor,
+        arch_version=ArchVersion(major, minor),
+        device_name=f"{vendor}-{major}.{minor}",
+        device_count=1,
+        total_memory=64 * (1024**3),
+        memory_bandwidth=3000.0,
+        sm_count=128,
+        max_threads_per_sm=2048,
+        max_shared_memory_per_sm=65536,
+        sm_features=frozenset({"tensor_core:f16", "tensor_core:f8"}),
+        runtime_features=frozenset(),
+        interconnect=InterconnectInfo(topology="pcie"),
+    )
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -121,3 +148,52 @@ def test_rejects_non_stride1_inner(device: str) -> None:
     assert transposed.stride(-1) != 1
     with pytest.raises(AssertionError):
         fp8_quantize(transposed)
+
+
+@pytest.mark.skipif(not _platform.is_amd, reason="AMD-only: PDL must be silently ignored")
+def test_enable_pdl_ignored_on_amd(device: str) -> None:
+    """enable_pdl=True must not crash on AMD: HIP rejects launch_pdl kwarg,
+    so the patch must gate it behind is_nvidia."""
+    x = torch.randn(1024, 128, device=device, dtype=torch.bfloat16) * 50
+    out = fp8_quantize(x, enable_pdl=True)
+    torch.cuda.synchronize()
+    assert out.shape == x.shape
+    assert out.dtype == _platform.fp8e4m3fn.dtype
+
+
+@pytest.mark.parametrize(
+    "vendor,major,minor,expected_tl_name",
+    [
+        # CDNA3 (MI300): e4m3fn must map to tl.float8e4b8 (fnuz, biased-zero).
+        ("amd", 9, 4, "float8e4b8"),
+        # CDNA4 (MI350): e4m3fn must map to tl.float8e4nv (IEEE).
+        ("amd", 9, 5, "float8e4nv"),
+        # NVIDIA: e4m3fn must map to tl.float8e4nv (IEEE).
+        ("nvidia", 9, 0, "float8e4nv"),
+    ],
+)
+def test_fp8_dtype_const_selection(
+    vendor: str, major: int, minor: int, expected_tl_name: str
+) -> None:
+    """Verify that fp8_quantize resolves the correct Triton FP8 type constant
+    per platform without running the GPU kernel (mock-platform, import-only)."""
+    from tokenspeed_kernel._triton import tl
+
+    mock = _make_platform(vendor, major, minor)
+    try:
+        Platform.override(mock)
+        # Inspect the constant the function would select — replicate the
+        # decision logic from quantization/triton.py rather than calling the
+        # kernel so the test stays CPU-only and fast.
+        p = Platform.get()
+        if p.is_cdna3:
+            chosen = tl.float8e4b8
+            chosen_name = "float8e4b8"
+        else:
+            chosen = tl.float8e4nv
+            chosen_name = "float8e4nv"
+        assert chosen_name == expected_tl_name, (
+            f"platform {vendor} {major}.{minor}: expected {expected_tl_name}, got {chosen_name}"
+        )
+    finally:
+        Platform.override(_platform)

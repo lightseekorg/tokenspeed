@@ -31,35 +31,35 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 
 try:
-    import triton_kernels.matmul_details.opt_flags as opt_flags
+    import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
 except ImportError:
     opt_flags = None
 
 try:
-    from triton_kernels.matmul_details.opt_flags import (
-        scoped_opt_flags_constraints,
+    from triton_kernels.matmul_ogs_details.opt_flags import (
+        update_opt_flags_constraints,
+        reset_opt_flags_constraints,
     )
 except ImportError:
-    scoped_opt_flags_constraints = None
+    update_opt_flags_constraints = None
+    reset_opt_flags_constraints = None
 
 try:
     from tokenspeed_kernel.thirdparty.triton_kernels.routing import (
         routing as _routing_impl,
     )
-    from triton_kernels.matmul import (
+    from triton_kernels.matmul_ogs import (
         FlexCtx,
         FnSpecs,
         FusedActivation,
         PrecisionConfig,
-        matmul,
+        matmul_ogs as matmul,
     )
     from triton_kernels.numerics import InFlexData
     from triton_kernels.swiglu import swiglu_fn
     from triton_kernels.tensor import (
         FP4,
-        RaggedTensorMetadata,
         convert_layout,
-        make_ragged_tensor_metadata,
         wrap_torch_tensor,
     )
     from triton_kernels.tensor_details import layout
@@ -68,8 +68,6 @@ except ImportError:
     FnSpecs = None
     FusedActivation = None
     PrecisionConfig = None
-    RaggedTensorMetadata = None
-    make_ragged_tensor_metadata = None
     matmul = None
     InFlexData = None
     _routing_impl = None
@@ -115,7 +113,7 @@ def _is_bf16_mxfp4(x, w, precision_config):
 
 
 def _lds_guard_should_apply(x, w, precision_config):
-    if scoped_opt_flags_constraints is None:
+    if update_opt_flags_constraints is None:
         return False
     if not current_platform().is_cdna4:
         return False
@@ -127,8 +125,11 @@ def _maybe_lds_guard(x, w, precision_config):
     if not _lds_guard_should_apply(x, w, precision_config):
         yield
         return
-    with scoped_opt_flags_constraints(_AMD_BF16_MXFP4_TILE):
+    update_opt_flags_constraints(_AMD_BF16_MXFP4_TILE)
+    try:
         yield
+    finally:
+        reset_opt_flags_constraints()
 
 
 if matmul is not None:

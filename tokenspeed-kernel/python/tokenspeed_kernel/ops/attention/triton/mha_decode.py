@@ -186,10 +186,15 @@ def _decode_att_m_fwd(
 ):
     platform = current_platform()
 
-    BLOCK = 64
-    # MI3xx uses a smaller block size to stay within the SGPR limit.
-    if platform.is_amd:
+    # CDNA3 (MI300) uses BLOCK=8 to stay within its SGPR budget.
+    # CDNA4 (MI350) has a larger register file and tolerates BLOCK=16.
+    # NVIDIA uses BLOCK=64.
+    if platform.is_cdna3:
         BLOCK = 8
+    elif platform.is_cdna4:
+        BLOCK = 16
+    else:
+        BLOCK = 64
     MAX_KV_SPLITS = max_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
@@ -203,7 +208,9 @@ def _decode_att_m_fwd(
         num_warps = 4
     else:
         num_warps = 2
-        if platform.is_amd:
+        # CDNA3 (MI300) needs num_warps=1 for GQA warp reduction due to
+        # VGPR pressure. CDNA4 (MI350) can use num_warps=2 like NVIDIA.
+        if platform.is_cdna3:
             num_warps = 1
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
@@ -440,8 +447,9 @@ def _decode_grouped_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    # MI3xx uses a smaller block size for large heads to stay within shmem limits.
-    if platform.is_amd and Lk >= 576:
+    # CDNA3 (MI300) needs a smaller block for large heads to stay within
+    # shared memory limits. CDNA4 (MI350) has more LDS and can keep BLOCK=32.
+    if platform.is_cdna3 and Lk >= 576:
         BLOCK = 16
 
     if Lk == 576:
@@ -468,8 +476,15 @@ def _decode_grouped_att_m_fwd(
 
     extra_kargs = {}
     num_stages = 2
-    if platform.is_amd:
+    if platform.is_cdna3:
+        # MI300: limit occupancy to 1 wave/EU to avoid register spill;
+        # matrix_instr_nonkdim=16 matches CDNA3 matrix core tile shape.
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16}
+        num_stages = 1
+    elif platform.is_cdna4:
+        # MI350: larger register file allows 2 waves/EU for better latency
+        # hiding; matrix_instr_nonkdim=32 matches CDNA4 matrix core shape.
+        extra_kargs = {"waves_per_eu": 2, "matrix_instr_nonkdim": 32}
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
@@ -604,8 +619,10 @@ def _decode_softmax_reducev_fwd(
     HAS_SINK = sinks is not None
 
     extra_kargs = {}
-    if platform.is_amd:
+    if platform.is_cdna3:
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16}
+    elif platform.is_cdna4:
+        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 32}
 
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
