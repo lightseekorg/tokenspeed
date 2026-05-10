@@ -1,2 +1,2 @@
 tokenspeed-triton-kernels==1.0.0.post20260510
-iris @ git+https://github.com/ROCm/iris.git@9459a5e95d01ac50bd072b9c6c498a5c8f96af16
+tokenspeed-iris==0.0.0.post20260511
