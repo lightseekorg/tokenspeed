@@ -1,0 +1,106 @@
+name: Update tokenspeed-kernel FlashInfer
+
+on:
+  workflow_dispatch:
+    inputs:
+      flashinfer_version:
+        description: "FlashInfer version to use, for example 0.6.11 or v0.6.11."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.flashinfer_version }}
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure git author
+        run: |
+          git config user.name "lightseek-bot"
+          git config user.email "243258330+lightseek-bot@users.noreply.github.com"
+
+      - name: Update FlashInfer dependency
+        id: update
+        run: |
+          raw_version="${{ inputs.flashinfer_version }}"
+          version="${raw_version#v}"
+
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,3}([a-zA-Z0-9.+-]+)?$ ]]; then
+            echo "Invalid FlashInfer version: $raw_version" >&2
+            exit 1
+          fi
+
+          python - "$version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          path = Path("tokenspeed-kernel/python/requirements/cuda.txt")
+          text = path.read_text()
+          replacements = [
+              (r"flashinfer-python==[^\n]+", f"flashinfer-python=={version}"),
+              (r"flashinfer-cubin==[^\n]+", f"flashinfer-cubin=={version}"),
+              (
+                  r"https://github\.com/flashinfer-ai/flashinfer/releases/download/"
+                  r"v[^/]+/flashinfer_jit_cache-[^+]+",
+                  "https://github.com/flashinfer-ai/flashinfer/releases/download/"
+                  f"v{version}/flashinfer_jit_cache-{version}",
+              ),
+          ]
+          for pattern, replacement in replacements:
+              text = re.sub(pattern, replacement, text)
+          path.write_text(text)
+          PY
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          if git diff --quiet; then
+            echo "FlashInfer is already at $VERSION."
+            exit 0
+          fi
+
+          branch="bot/update-tokenspeed-kernel-flashinfer-${VERSION}"
+          git checkout -b "$branch"
+          git add tokenspeed-kernel/python/requirements/cuda.txt
+          git commit -s -m "Update tokenspeed-kernel FlashInfer to ${VERSION}"
+          git push --force-with-lease origin "$branch"
+
+          body="$(cat <<EOF
+          ## Summary
+          - update tokenspeed-kernel FlashInfer dependencies to ${VERSION}
+
+          ## Tests
+          - Not run (dependency-only workflow update)
+          EOF
+          )"
+
+          if gh pr view "$branch" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit "$branch" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Update tokenspeed-kernel FlashInfer to ${VERSION}" \
+              --body "$body"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "Update tokenspeed-kernel FlashInfer to ${VERSION}" \
+              --body "$body"
+          fi
