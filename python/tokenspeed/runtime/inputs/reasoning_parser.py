@@ -165,7 +165,6 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
-        # https://github.com/lightseekorg/tokenspeed/pull/3202#discussion_r1950153599
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):
@@ -394,16 +393,19 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         )
         self.is_first_chunk = False
 
+    def _ensure_think_start(self, text: str) -> str:
+        if text.startswith(self.think_start_token):
+            return text
+        return self.think_start_token + text
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         if not self.is_first_chunk:
             self.is_first_chunk = True
-            new_text = self.think_start_token + new_text
-        return super().parse_streaming_increment(new_text)
+            new_text = self._ensure_think_start(new_text)
+        return StreamingParseResult(normal_text=new_text)
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
-        if self.think_start_token not in text and self.think_end_token in text:
-            text = self.think_start_token + text
-        return super().detect_and_parse(text)
+        return StreamingParseResult(normal_text=self._ensure_think_start(text))
 
 
 class ReasoningParser:

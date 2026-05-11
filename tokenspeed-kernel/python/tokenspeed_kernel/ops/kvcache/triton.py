@@ -351,7 +351,6 @@ def transfer_kv_per_layer(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int | None = None,
 ) -> None:
     """
     Transfer KV cache entries for one layer based on src/dst indices.
@@ -364,10 +363,7 @@ def transfer_kv_per_layer(
         src_indices: Source indices tensor [length]
         dst_indices: Destination indices tensor [length]
         item_size: Number of bytes per cache slot
-        block_quota: Accepted for CUDA API compatibility; unused by this Triton kernel
     """
-    del block_quota
-
     if item_size % src_k.element_size() != 0:
         raise ValueError("item_size must be divisible by the KV cache element size.")
     element_dim = item_size // src_k.element_size()
@@ -412,7 +408,6 @@ def transfer_kv_all_layer(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
-    block_quota: int | None = None,
 ) -> None:
     """
     Transfer KV cache entries for all layers based on src/dst indices.
@@ -426,10 +421,7 @@ def transfer_kv_all_layer(
         dst_indices: Destination indices tensor [length]
         item_size: Number of bytes per cache slot
         num_layers: Number of layers to copy
-        block_quota: Accepted for CUDA API compatibility; unused by this Triton kernel
     """
-    del block_quota
-
     length = src_indices.numel()
 
     if length == 0:

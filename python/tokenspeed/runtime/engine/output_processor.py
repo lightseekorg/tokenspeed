@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOut,
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
+from tokenspeed.runtime.metrics.collector import RequestFinishStats
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -298,7 +299,9 @@ class OutputProcessor:
             state.event.set()
 
             # Log metrics and dump
-            if self.engine.enable_metrics and state.obj.log_metrics:
+            if self.engine.enable_metrics and not isinstance(
+                recv_obj, BatchEmbeddingOut
+            ):
                 self.collect_metrics(state, recv_obj, i)
             if (
                 self.engine.dump_requests_folder
@@ -307,7 +310,7 @@ class OutputProcessor:
             ):
                 self.dump_requests(state, out_dict)
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
+    def collect_metrics(self, state: ReqState, recv_obj, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -319,7 +322,7 @@ class OutputProcessor:
             state.last_pure_time = recv_obj.generated_time
             state.last_completion_tokens = completion_tokens
             state.first_completion_tokens = completion_tokens
-            self.engine.metrics_collector.observe_time_to_first_token(
+            self.engine.metrics.observe_time_to_first_token(
                 state.first_token_time - state.created_time
             )
         else:
@@ -328,29 +331,43 @@ class OutputProcessor:
                 new_time = time.time()
                 interval = new_time - state.last_time
                 pure_interval = recv_obj.generated_time - state.last_pure_time
-                self.engine.metrics_collector.observe_inter_token_latency(
+                self.engine.metrics.observe_inter_token_latency(
                     interval,
                     num_new_tokens,
                 )
-                self.engine.metrics_collector.observe_inter_token_latency(
-                    pure_interval, num_new_tokens, name="pure_TPOT"
+                self.engine.metrics.observe_inter_token_latency(
+                    pure_interval, num_new_tokens
                 )
                 state.last_pure_time = recv_obj.generated_time
                 state.last_time = new_time
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            self.engine.metrics_collector.observe_one_finished_request(
-                recv_obj.prompt_tokens[i],
-                completion_tokens,
-                state.finished_time - state.created_time,
-                state.tokenized_time - state.created_time,
+            fr = recv_obj.finished_reasons[i]
+            # TODO: consolidate the return type of fr.
+            finished_ok = not (
+                fr.get("type") == "abort"
+                if isinstance(fr, dict)
+                else getattr(fr, "is_error", False)
+            )
+            cached_prompt = (
+                recv_obj.cached_tokens[i]
+                if getattr(recv_obj, "cached_tokens", None) is not None
+                else 0
+            )
+            self.engine.metrics.record_request_finish(
+                RequestFinishStats(
+                    prompt_tokens=recv_obj.prompt_tokens[i],
+                    generation_tokens=completion_tokens,
+                    e2e_latency=state.finished_time - state.created_time,
+                    cached_prompt_tokens=cached_prompt,
+                    finished_ok=finished_ok,
+                )
             )
             if (completion_tokens - state.first_completion_tokens) > 0:
-                self.engine.metrics_collector.observe_inter_token_latency(
+                self.engine.metrics.observe_inter_token_latency(
                     state.finished_time - state.first_token_time,
                     completion_tokens - state.first_completion_tokens,
-                    name="e2e_TPOT",
                 )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

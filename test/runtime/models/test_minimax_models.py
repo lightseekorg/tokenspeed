@@ -1,5 +1,5 @@
 """
-Tests for MiniMax-M2.5 model support.
+Tests for MiniMax-M2 family model support.
 
 Usage:
 
@@ -56,7 +56,6 @@ class ModelCase:
     disable_prefill_graph: bool = False
     max_model_len: int = None
     max_total_tokens: int = None
-    max_model_len: int = None
 
 
 _AVAILABLE_GPUS = get_available_gpu_count()
@@ -74,7 +73,7 @@ MINIMAX_MODELS = [
 
 
 class TestMiniMaxGeneration(unittest.TestCase):
-    """Compare HFRunner vs RTRunner output logits and strings for MiniMax-M2.5."""
+    """Compare HFRunner vs RTRunner output logits and strings for MiniMax-M2."""
 
     @classmethod
     def setUpClass(cls):
@@ -156,7 +155,7 @@ class TestMiniMaxGeneration(unittest.TestCase):
         )
 
     def test_generation(self):
-        """Test MiniMax-M2.5 generation output matches between HF and RT."""
+        """Test MiniMax-M2 generation output matches between HF and RT."""
         if is_in_ci():
             return
 
@@ -180,7 +179,7 @@ class TestMiniMaxGeneration(unittest.TestCase):
 
 
 class TestMiniMaxGSM8K(unittest.TestCase):
-    """Launch MiniMax-M2.5 server and run GSM8K accuracy evaluation."""
+    """Launch MiniMax-M2 server and run GSM8K accuracy evaluation."""
 
     @classmethod
     def setUpClass(cls):

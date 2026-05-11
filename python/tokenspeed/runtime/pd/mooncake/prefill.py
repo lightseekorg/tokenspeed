@@ -689,7 +689,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                     )
                         elapsed_seconds = time.monotonic() - tm_start
                         if self.kv_transfer_metrics:
-                            self.kv_transfer_metrics.log_kv_transfer_time(
+                            self.kv_transfer_metrics.observe_kv_transfer_latency(
                                 elapsed_seconds
                             )
                     else:

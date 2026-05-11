@@ -92,11 +92,13 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: int = 8192
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
     mamba_track_interval: int = 256
+    max_mamba_cache_size: int | None = None
+    mamba_full_memory_ratio: float = 0.9
 
     # Other runtime options
     stream_interval: int = 1
@@ -187,6 +189,11 @@ class ServerArgs:
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
+    # DeepSeek V4
+    disable_deepseek_v4_fast_mhc: bool = False
+    deepseek_v4_mega_moe_max_num_tokens: int = 0
+    deepseek_v4_indexer_prefill_max_logits_mb: int = 512
+
     # Grammar backend
     grammar_backend: str = "none"
     grammar_compile_timeout_secs: float = 30.0
@@ -202,10 +209,10 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
-    speculative_draft_model_quantization: str | None = None
-    speculative_num_steps: int = 5
-    speculative_eagle_topk: int = 4
-    speculative_num_draft_tokens: int = 8
+    speculative_draft_model_quantization: str | None = "unquant"
+    speculative_num_steps: int = 3
+    speculative_eagle_topk: int = 1
+    speculative_num_draft_tokens: int | None = None
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -223,6 +230,7 @@ class ServerArgs:
     enable_symm_mem: bool = False
     disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
+    disable_tf32: bool = False
     force_deterministic_rsag: bool = False
     disable_sampling_tp_sync: bool = False
     low_latency_max_num_tokens_per_gpu: int = 256
@@ -311,28 +319,29 @@ class ServerArgs:
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
 
-        if self.speculative_config is None:
-            return
+        if self.speculative_config is not None:
+            try:
+                config = json.loads(self.speculative_config)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--speculative-config must be valid JSON") from exc
 
-        try:
-            config = json.loads(self.speculative_config)
-        except json.JSONDecodeError as exc:
-            raise ValueError("--speculative-config must be valid JSON") from exc
+            if not isinstance(config, dict):
+                raise ValueError("--speculative-config must be a JSON object")
 
-        if not isinstance(config, dict):
-            raise ValueError("--speculative-config must be a JSON object")
+            method = config.get("method")
+            if method is not None and self.speculative_algorithm is None:
+                self.speculative_algorithm = str(method).upper()
 
-        method = config.get("method")
-        if method is not None and self.speculative_algorithm is None:
-            self.speculative_algorithm = str(method).upper()
+            draft_model = config.get("model")
+            if draft_model is not None and self.speculative_draft_model_path is None:
+                self.speculative_draft_model_path = str(draft_model)
 
-        draft_model = config.get("model")
-        if draft_model is not None and self.speculative_draft_model_path is None:
-            self.speculative_draft_model_path = str(draft_model)
+            num_speculative_tokens = config.get("num_speculative_tokens")
+            if num_speculative_tokens is not None:
+                self.speculative_num_steps = int(num_speculative_tokens)
 
-        num_speculative_tokens = config.get("num_speculative_tokens")
-        if num_speculative_tokens is not None:
-            self.speculative_num_draft_tokens = int(num_speculative_tokens)
+        if self.speculative_num_draft_tokens is None:
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
     def resolve_memory_and_scheduling(self):
         if current_platform().is_amd:
@@ -356,14 +365,9 @@ class ServerArgs:
             else:
                 self.gpu_memory_utilization = 0.88
 
-        # Set the chunked prefill token budget, which depends on GPU memory.
+        # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem < 25_000:
-                self.chunked_prefill_size = 2048
-            elif gpu_mem is not None and gpu_mem < 100_000:
-                self.chunked_prefill_size = 8192
-            else:
-                self.chunked_prefill_size = 16384
+            self.chunked_prefill_size = 8192
 
         # Set CUDA graph max capture size.
         if self.max_cudagraph_capture_size is None:
@@ -509,9 +513,7 @@ class ServerArgs:
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
 
-        if self.speculative_draft_model_quantization is None:
-            self.speculative_draft_model_quantization = self.quantization
-        elif self.speculative_draft_model_quantization == "unquant":
+        if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
         if self.eagle3_layers_to_capture is not None:
@@ -912,6 +914,18 @@ class ServerArgs:
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
         )
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
 
         parser.add_argument(
             "--max-prefill-tokens",
@@ -1242,6 +1256,34 @@ class ServerArgs:
             help="Use ragged prefill for DeepSeek MLA attention.",
         )
         parser.add_argument(
+            "--disable-deepseek-v4-fast-mhc",
+            action="store_true",
+            default=ServerArgs.disable_deepseek_v4_fast_mhc,
+            help=(
+                "Disable the DeepSeek V4 fast multi-head capture (mHC) layer. "
+                "Falls back to the PyTorch reference when set or when nvcc is "
+                "not available."
+            ),
+        )
+        parser.add_argument(
+            "--deepseek-v4-mega-moe-max-num-tokens",
+            type=int,
+            default=ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
+            help=(
+                "DeepSeek V4 MegaMoE staging-buffer cap on tokens per forward "
+                "(0 = derive from chunked-prefill / cuda-graph budgets)."
+            ),
+        )
+        parser.add_argument(
+            "--deepseek-v4-indexer-prefill-max-logits-mb",
+            type=int,
+            default=ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
+            help=(
+                "DeepSeek V4 sparse indexer prefill workspace cap (MiB) for the "
+                "softplus_sqrt logits buffer."
+            ),
+        )
+        parser.add_argument(
             "--grammar-backend",
             type=str,
             choices=["xgrammar", "none"],
@@ -1310,8 +1352,7 @@ class ServerArgs:
             "--speculative-draft-model-quantization",
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
-            help="Quantization method for the draft model. If not specified, inherits the main model's quantization. "
-            "Use 'unquant' to explicitly disable quantization for the draft model.",
+            help="Quantization method for the draft model. Defaults to 'unquant'.",
         )
         parser.add_argument(
             "--speculative-num-steps",
@@ -1398,6 +1439,12 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--disable-tf32",
+            action="store_true",
+            help="Disable forcing TF32 on for cuBLAS/cuDNN. By default the server sets "
+            "NVIDIA_TF32_OVERRIDE=1 and TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1.",
         )
         parser.add_argument(
             "--max-cudagraph-capture-size",

@@ -269,13 +269,13 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 elif status == -1:
                     failed = True
                     if self.kv_transfer_metrics:
-                        self.kv_transfer_metrics.log_kv_transfer_timeout()
+                        self.kv_transfer_metrics.record_kv_transfer_timeout()
                     logger.error("Transfer timeout detected!")
                     break
                 elif status == -2:
                     failed = True
                     if self.kv_transfer_metrics:
-                        self.kv_transfer_metrics.log_kv_transfer_failed()
+                        self.kv_transfer_metrics.record_kv_transfer_failure()
                     logger.error("Transfer failed detected")
                     break
                 else:
@@ -395,7 +395,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
 
                             if ret != 0:
                                 if self.kv_transfer_metrics:
-                                    self.kv_transfer_metrics.log_kv_transfer_failed()
+                                    self.kv_transfer_metrics.record_kv_transfer_failure()
                                     logger.error("Transfer failed detected!")
                                 task.polls.append(False)
                                 abort_tasks.append(task)

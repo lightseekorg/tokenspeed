@@ -17,3 +17,17 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+
+with redirect_triton_to_tokenspeed_triton():
+    import triton_kernels  # noqa: F401
+    import triton_kernels.matmul  # noqa: F401
+    import triton_kernels.matmul_details  # noqa: F401
+    import triton_kernels.matmul_details.opt_flags  # noqa: F401
+    import triton_kernels.numerics  # noqa: F401
+    import triton_kernels.swiglu  # noqa: F401
+    import triton_kernels.tensor  # noqa: F401
+    import triton_kernels.tensor_details  # noqa: F401
+    import triton_kernels.tensor_details.layout  # noqa: F401
+    import triton_kernels.topk  # noqa: F401

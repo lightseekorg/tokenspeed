@@ -468,6 +468,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_index=layer_id,
                 alt_stream=alt_stream,
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
             is_moe = True
         elif config.model_type == "qwen3_5_text":
@@ -672,6 +673,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_index=layer_id,
                 alt_stream=alt_stream,
+                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
             is_moe = True
         else:
@@ -826,24 +828,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = torch.cuda.Stream()
 
         # Embedding layer
-        if self.mapping.attn.has_dp:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
-        else:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
@@ -887,10 +879,17 @@ class Qwen3_5ForCausalLM(nn.Module):
     ) -> tuple[torch.Tensor, None]:
         # Initialize hidden states
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            # Only skip embedding allreduce when the first layer's fused
+            # allreduce+residual+norm will handle it
+            if self.layers[0].comm_manager.should_fuse(input_ids.shape[0]):
+                hidden_states = self.embed_tokens(input_ids, reduce_results=False)
+                residual = torch.zeros_like(hidden_states)
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+                residual = None
         else:
             hidden_states = input_embeds
-        residual = None
+            residual = None
 
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):

@@ -262,6 +262,16 @@ def select_experts(
                 expected_kernel_name="torch_compile_grouped_topk",
             )
         else:
+            route_traits = {
+                "output_type": "topk",
+                "biased": True,
+                "grouped": True,
+                "ep": True,
+                "num_expert_group": num_expert_group,
+                "topk_group": topk_group,
+                "topk": top_k,
+                "num_fused_shared_experts": num_fused_shared_experts,
+            }
             topk_weights, topk_ids = tokenspeed_kernel.moe_route(
                 hidden_states,
                 router_logits,
@@ -276,13 +286,7 @@ def select_experts(
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 dtype=router_logits.dtype,
-                traits={
-                    "output_type": "topk",
-                    "biased": True,
-                    "grouped": True,
-                    "ep": True,
-                },
-                expected_kernel_name="torch_compile_biased_grouped_topk",
+                traits=route_traits,
             )
     elif torch_native and custom_routing_function is None:
         assert (

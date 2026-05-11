@@ -57,6 +57,16 @@ public:
     // Absorb all pages from other into this. Both must share the same allocator.
     void Append(OwnedPages other);
 
+    // Drop ownership without returning the pages to the allocator.
+    void ReleaseOwnershipByID(const std::vector<std::int32_t>& ids);
+
+    // Surrender all ids and the allocator pointer in O(1) without releasing
+    // pages back to the pool. After Detach() this OwnedPages is Empty().
+    std::vector<std::int32_t> Detach() {
+        allocator_ = nullptr;
+        return std::move(ids_);
+    }
+
 private:
     PageAllocator* allocator_{nullptr};
     std::vector<std::int32_t> ids_;

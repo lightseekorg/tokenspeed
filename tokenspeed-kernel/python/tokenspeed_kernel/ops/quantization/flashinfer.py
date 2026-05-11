@@ -23,6 +23,7 @@ from tokenspeed_kernel.registry import error_fn
 fp4_quantize = error_fn
 mxfp8_quantize = error_fn
 nvfp4_block_scale_interleave = error_fn
+fp8_blockscale_quantize_runner_sm90 = error_fn
 
 if current_platform().is_nvidia:
     try:
@@ -34,4 +35,18 @@ if current_platform().is_nvidia:
     except ImportError:
         pass
 
-__all__ = ["fp4_quantize", "mxfp8_quantize", "nvfp4_block_scale_interleave"]
+if current_platform().is_hopper:
+    try:
+        from flashinfer.gemm.gemm_base import (
+            get_fp8_blockscale_gemm_runner_sm90 as fp8_blockscale_quantize_runner_sm90,
+        )
+    except ImportError:
+        pass
+
+
+__all__ = [
+    "fp4_quantize",
+    "mxfp8_quantize",
+    "nvfp4_block_scale_interleave",
+    "fp8_blockscale_quantize_runner_sm90",
+]

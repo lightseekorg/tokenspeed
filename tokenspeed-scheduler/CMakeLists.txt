@@ -33,6 +33,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/resource/allocator/kv_allocator.cpp
     csrc/resource/allocator/owned_pages.cpp
     csrc/resource/allocator/page_allocator.cpp
+    csrc/resource/allocator/paged_cache_group.cpp
     csrc/resource/allocator/req_pool_allocator.cpp
     csrc/resource/page_container.cpp
     csrc/resource/radix_tree/radix_tree.cpp
@@ -113,6 +114,8 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_mamba_eviction.cpp
         tests/cpp/test_mamba_cache.cpp
         tests/cpp/test_mamba_integration.cpp
+        tests/cpp/test_eviction_lru.cpp
+        tests/cpp/test_host_node_ref_lifetime.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests
