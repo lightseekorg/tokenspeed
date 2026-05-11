@@ -25,6 +25,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     DeepseekV4ForwardMetadata,
     DeepseekV4TokenToKVPool,
+    _group_slot_mapping_from_raw,
     deepseek_v4_cache_layout_from_config,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
@@ -141,12 +142,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         def encode_messages(messages, **kwargs):
             return "<encoded>"
 
-        with patch(
-            "tokenspeed.runtime.utils.hf_transformers_utils.AutoTokenizer.from_pretrained",
-            return_value=DummyTokenizer(),
-        ), patch(
-            "tokenspeed.runtime.utils.hf_transformers_utils._load_deepseek_v4_encode_messages",
-            return_value=encode_messages,
+        with (
+            patch(
+                "tokenspeed.runtime.utils.hf_transformers_utils.AutoTokenizer.from_pretrained",
+                return_value=DummyTokenizer(),
+            ),
+            patch(
+                "tokenspeed.runtime.utils.hf_transformers_utils._load_deepseek_v4_encode_messages",
+                return_value=encode_messages,
+            ),
         ):
             tokenizer = get_tokenizer(
                 "deepseek-ai/DeepSeek-V4-Flash",
@@ -436,6 +440,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             compress_ratios=[1, 4, 128],
             head_dim=512,
             index_head_dim=128,
+            sliding_window=128,
         )
         layout = deepseek_v4_cache_layout_from_config(
             config,
@@ -456,21 +461,21 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_context_len=128,
             page_size=64,
             rank=0,
+            hf_config=config,
+            max_scheduled_tokens=1,
         )
 
-        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (3, 37440))
+        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (7, 37440))
         self.assertIsNone(pool.compressed_kv_buffer[0])
-        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (3, 37440))
+        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (4, 37440))
+        self.assertEqual(tuple(pool.get_compressor_state_buffer(1).shape), (7, 4, 2048))
         self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(1).shape), (3, 64, 2048)
-        )
-        self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(2).shape), (3, 64, 1024)
+            tuple(pool.get_compressor_state_buffer(2).shape), (35, 8, 1024)
         )
         self.assertEqual(pool.get_compressor_state_buffer(1).dtype, torch.float32)
         self.assertEqual(pool.get_compressor_state_buffer(2).dtype, torch.float32)
-        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (3, 64 * 68))
-        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (3, 64, 512))
+        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (4, 64 * 68))
+        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (7, 4, 512))
         self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
@@ -478,6 +483,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             compress_ratios=[1, 4, 128],
             head_dim=512,
             index_head_dim=128,
+            sliding_window=128,
         )
         layout = deepseek_v4_cache_layout_from_config(
             config,
@@ -495,19 +501,22 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_context_len=512,
             page_size=256,
             rank=0,
+            hf_config=config,
+            max_scheduled_tokens=1,
         )
 
-        self.assertEqual(pool.swa_block_size, 256)
+        self.assertEqual(pool.swa_block_size, 64)
         self.assertEqual(pool.get_compressed_block_size(1), 64)
         self.assertEqual(pool.get_compressed_block_size(2), 2)
-        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (3, 37440))
-        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (3, 64 * 68))
+        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (5, 37440))
+        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (5, 64 * 68))
 
     def test_deepseek_v4_kv_pool_rejects_nonpositive_size(self):
         config = SimpleNamespace(
             compress_ratios=[1],
             head_dim=512,
             index_head_dim=128,
+            sliding_window=128,
         )
         layout = deepseek_v4_cache_layout_from_config(
             config,
@@ -527,9 +536,161 @@ class TestDeepseekV4Config(unittest.TestCase):
                 max_context_len=128,
                 page_size=64,
                 rank=0,
+                hf_config=config,
+                max_scheduled_tokens=1,
             )
 
+    def test_deepseek_v4_group_slot_mapping_consumes_compact_base_offsets(self):
+        slots = _group_slot_mapping_from_raw(
+            positions=torch.tensor([128, 129, 192, 64], dtype=torch.int64),
+            req_indices=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            rows_per_page=64,
+            base_offsets=torch.tensor([2, 1], dtype=torch.int32),
+        )
+
+        self.assertTrue(torch.equal(slots, torch.tensor([640, 641, -1, 1280])))
+
+    def test_deepseek_v4_backend_preserves_compact_paged_cache_contract(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
+        base = torch.tensor([2, 1], dtype=torch.int32)
+
+        backend.init_forward_metadata(
+            bs=2,
+            num_tokens=2,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([200, 80], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            req_to_page=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            paged_cache_block_tables={"v4.swa_kv": compact},
+            paged_cache_block_table_base_offsets={"v4.swa_kv": base},
+        )
+
+        metadata = backend.forward_metadata
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(torch.equal(metadata.swa_block_table, compact))
+        self.assertTrue(torch.equal(metadata.swa_base_logical_page, base))
+
+    def test_deepseek_v4_cuda_graph_refresh_keeps_compact_table_columns(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        backend.init_cuda_graph_state(
+            2,
+            paged_cache_group_specs=(
+                SimpleNamespace(
+                    group_id="v4.swa_kv",
+                    retention="sliding_window",
+                    rows_per_page=64,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=128,
+                ),
+            ),
+            max_tokens_per_req=1,
+        )
+        compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
+        refreshed = backend._refresh_cuda_graph_paged_cache_block_tables(
+            2,
+            {"v4.swa_kv": compact},
+            pad_value=-1,
+            paged_cache_block_table_base_offsets={
+                "v4.swa_kv": torch.tensor([2, 1], dtype=torch.int32)
+            },
+        )
+
+        table = refreshed["v4.swa_kv"]
+        self.assertTrue(torch.equal(table[:, :2], compact))
+        self.assertTrue(torch.equal(table[:, 2:], torch.full_like(table[:, 2:], -1)))
+
+    def test_deepseek_v4_metadata_splits_named_cache_groups(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        swa = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
+        c4_state = torch.tensor([[30], [40]], dtype=torch.int32)
+        c128_state = torch.tensor([[50], [60]], dtype=torch.int32)
+        indexer_state = torch.tensor([[70], [80]], dtype=torch.int32)
+        c4_state_base = torch.tensor([3, 4], dtype=torch.int32)
+        c128_state_base = torch.tensor([5, 6], dtype=torch.int32)
+        indexer_state_base = torch.tensor([7, 8], dtype=torch.int32)
+
+        backend.init_forward_metadata(
+            bs=2,
+            num_tokens=2,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([200, 80], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            req_to_page=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            paged_cache_block_tables={
+                "v4.swa_kv": swa,
+                "v4.c4a.compressor_state": c4_state,
+                "v4.c128a.compressor_state": c128_state,
+                "v4.c4a.indexer_compressor_state": indexer_state,
+            },
+            paged_cache_block_table_base_offsets={
+                "v4.c4a.compressor_state": c4_state_base,
+                "v4.c128a.compressor_state": c128_state_base,
+                "v4.c4a.indexer_compressor_state": indexer_state_base,
+            },
+        )
+
+        metadata = backend.forward_metadata
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(torch.equal(metadata.swa_block_table, swa))
+        self.assertTrue(
+            torch.equal(metadata.compressor_state_block_tables[4], c4_state)
+        )
+        self.assertTrue(
+            torch.equal(metadata.compressor_state_block_tables[128], c128_state)
+        )
+        self.assertTrue(torch.equal(metadata.indexer_state_block_table, indexer_state))
+        self.assertTrue(
+            torch.equal(metadata.compressor_state_base_logical_pages[4], c4_state_base)
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.compressor_state_base_logical_pages[128],
+                c128_state_base,
+            )
+        )
+        self.assertTrue(
+            torch.equal(metadata.indexer_state_base_logical_page, indexer_state_base)
+        )
+
     def test_deepseek_v4_metadata_maps_compressed_slots(self):
+        compressed_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
         metadata = DeepseekV4ForwardMetadata(
             page_size=64,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
@@ -541,6 +702,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 [0, 0, 0, 1, 1, 1, 1, 1],
                 dtype=torch.int32,
             ),
+            paged_cache_block_tables={"v4.c4a.compressed_kv": compressed_table},
         )
 
         self.assertTrue(
@@ -548,6 +710,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 metadata.token_to_req_indices,
                 torch.tensor([0, 0, 0, 1, 1, 1, 1, 1], dtype=torch.int32),
             )
+        )
+        self.assertTrue(
+            torch.equal(metadata.compressed_block_table(4), compressed_table)
+        )
+        self.assertTrue(
+            torch.equal(metadata.compressed_block_table(128), metadata.block_table)
         )
         slots = metadata.compressed_slot_mapping(
             torch.tensor([3, 7, 127], dtype=torch.int64),

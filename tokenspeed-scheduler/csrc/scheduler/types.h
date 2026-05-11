@@ -28,6 +28,7 @@
 #include <memory>
 
 #include "fsm/forward_events.h"
+#include "resource/allocator/paged_cache_group.h"
 #include "resource/types.h"
 #include "scheduler/operations/inc.h"
 
@@ -72,6 +73,8 @@ struct SchedulerConfig {
     struct {
         std::int32_t total_pages{};
     } device_allocator;
+
+    std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};

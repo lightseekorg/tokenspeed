@@ -33,6 +33,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/resource/allocator/kv_allocator.cpp
     csrc/resource/allocator/owned_pages.cpp
     csrc/resource/allocator/page_allocator.cpp
+    csrc/resource/allocator/paged_cache_group.cpp
     csrc/resource/allocator/req_pool_allocator.cpp
     csrc/resource/page_container.cpp
     csrc/resource/radix_tree/radix_tree.cpp
