@@ -7,6 +7,14 @@ triggers:
 runner:
   labels:
     - b200-2gpu
+    - linux-mi355-2gpu-lightseek
+  env:
+    b200-2gpu:
+      GPT_OSS_EVAL_ATTENTION_BACKEND: trtllm
+      GPT_OSS_EVAL_MOE_BACKEND: flashinfer_mxfp4
+    linux-mi355-2gpu-lightseek:
+      # speed up host-side mem alloc in ci
+      GPT_OSS_EVAL_KVSTORE_RATIO: "0.25"
 env:
   CI: "true"
 install:
@@ -18,12 +26,11 @@ server:
     --attn-tp-size 2
     --moe-tp-size 2
     --max-model-len 80000
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --trust-remote-code
     --reasoning-parser gpt-oss
-    --attention-backend trtllm
-    --moe-backend flashinfer_mxfp4
+    ${GPT_OSS_EVAL_ATTENTION_BACKEND:+--attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND}}
+    ${GPT_OSS_EVAL_MOE_BACKEND:+--moe-backend ${GPT_OSS_EVAL_MOE_BACKEND}}
+    ${GPT_OSS_EVAL_KVSTORE_RATIO:+--kvstore-ratio ${GPT_OSS_EVAL_KVSTORE_RATIO}}
     --enable-cache-report
     --host 127.0.0.1
   ready:
@@ -45,3 +52,4 @@ eval:
     --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
 report:
   github_step_summary: true
+score_threshold: 0.7

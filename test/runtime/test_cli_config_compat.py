@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import io
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -33,6 +34,24 @@ class TestCLIConfigCompat(unittest.TestCase):
     def _from_cli_args_no_init(self, args: argparse.Namespace) -> ServerArgs:
         with patch.object(ServerArgs, "__post_init__"):
             return ServerArgs.from_cli_args(args)
+
+    def _parallelism_snapshot(self, argv: list[str]) -> tuple[int, ...]:
+        args = self._parse_args(argv)
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        sa.resolve_parallelism()
+        mapping = sa.mapping
+        return (
+            mapping.world_size,
+            mapping.attn.tp_size,
+            mapping.attn.cp_size,
+            mapping.attn.dp_size,
+            mapping.dense.tp_size,
+            mapping.dense.dp_size,
+            mapping.moe.tp_size,
+            mapping.moe.ep_size,
+            mapping.moe.dp_size,
+        )
 
     # ---- Positional model arg ----
 
@@ -74,6 +93,37 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--tp", "4"])
         sa = self._from_cli_args_no_init(args)
         self.assertEqual(sa.attn_tp_size, 4)
+
+    def test_tensor_parallel_aliases_match_explicit_attn_moe_tp(self):
+        explicit = self._parallelism_snapshot(
+            [
+                "--model",
+                "nvidia/Kimi-K2.5-NVFP4",
+                "--attn-tp-size",
+                "4",
+                "--moe-tp-size",
+                "4",
+            ]
+        )
+        tensor_parallel_size = self._parallelism_snapshot(
+            [
+                "--model",
+                "nvidia/Kimi-K2.5-NVFP4",
+                "--tensor-parallel-size",
+                "4",
+            ]
+        )
+        tp = self._parallelism_snapshot(
+            [
+                "--model",
+                "nvidia/Kimi-K2.5-NVFP4",
+                "--tp",
+                "4",
+            ]
+        )
+
+        self.assertEqual(tensor_parallel_size, explicit)
+        self.assertEqual(tp, explicit)
 
     def test_tensor_parallel_size_conflicts_with_attn_tp_size(self):
         args = self._parse_args(
@@ -138,6 +188,23 @@ class TestCLIConfigCompat(unittest.TestCase):
             ["--model", "test/model", "--chunked-prefill-size", "2048"]
         )
         self.assertEqual(args.chunked_prefill_size, 2048)
+
+    def test_prefill_token_defaults(self):
+        args = self._parse_args(["--model", "test/model"])
+        self.assertEqual(args.max_prefill_tokens, 8192)
+        self.assertIsNone(args.chunked_prefill_size)
+
+        sa = self._from_cli_args_no_init(args)
+        sa.mapping = SimpleNamespace(world_size=1)
+        platform = SimpleNamespace(is_amd=False, is_nvidia=False)
+        with patch(
+            "tokenspeed.runtime.utils.server_args.current_platform",
+            return_value=platform,
+        ):
+            sa.resolve_memory_and_scheduling()
+
+        self.assertEqual(sa.max_prefill_tokens, 8192)
+        self.assertEqual(sa.chunked_prefill_size, 8192)
 
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(
@@ -259,6 +326,14 @@ class TestCLIConfigCompat(unittest.TestCase):
                 )
                 self.assertEqual(args.reasoning_parser, parser_name)
 
+    def test_speculative_draft_quantization_defaults_to_unquant(self):
+        args = self._parse_args(["--model", "test/model", "--quantization", "nvfp4"])
+        self.assertEqual(args.speculative_draft_model_quantization, "unquant")
+
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_speculative_decoding()
+        self.assertIsNone(sa.speculative_draft_model_quantization)
+
     def test_dotted_attention_config_args(self):
         args = self._parse_args(
             [
@@ -284,7 +359,134 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_basic_defaults()
         self.assertEqual(sa.speculative_algorithm, "MTP")
         self.assertEqual(sa.speculative_draft_model_path, "draft/model")
-        self.assertEqual(sa.speculative_num_draft_tokens, 3)
+        self.assertEqual(sa.speculative_num_steps, 3)
+        self.assertEqual(sa.speculative_num_draft_tokens, 4)
+
+    def test_speculative_config_matches_explicit_eagle3_args(self):
+        draft_model = "lightseekorg/kimi-k2.5-eagle3-mla"
+
+        config_args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-config",
+                (
+                    f'{{"model":"{draft_model}",'
+                    '"method":"eagle3",'
+                    '"num_speculative_tokens":1}'
+                ),
+            ]
+        )
+        explicit_args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "EAGLE3",
+                "--speculative-draft-model-path",
+                draft_model,
+                "--speculative-num-steps",
+                "1",
+            ]
+        )
+
+        config_server_args = self._from_cli_args_no_init(config_args)
+        explicit_server_args = self._from_cli_args_no_init(explicit_args)
+        config_server_args.resolve_basic_defaults()
+        explicit_server_args.resolve_basic_defaults()
+
+        self.assertEqual(
+            config_server_args.speculative_algorithm,
+            explicit_server_args.speculative_algorithm,
+        )
+        self.assertEqual(
+            config_server_args.speculative_draft_model_path,
+            explicit_server_args.speculative_draft_model_path,
+        )
+        self.assertEqual(
+            config_server_args.speculative_num_steps,
+            explicit_server_args.speculative_num_steps,
+        )
+        self.assertEqual(
+            config_server_args.speculative_num_draft_tokens,
+            explicit_server_args.speculative_num_draft_tokens,
+        )
+
+    def test_speculative_config_matches_explicit_mtp_args(self):
+        target_model = "nvidia/Qwen3.5-397B-A17B-NVFP4"
+
+        config_args = self._parse_args(
+            [
+                "--model",
+                target_model,
+                "--speculative-config",
+                '{"method":"mtp","num_speculative_tokens":3}',
+            ]
+        )
+        explicit_args = self._parse_args(
+            [
+                "--model",
+                target_model,
+                "--speculative-algorithm",
+                "MTP",
+                "--speculative-num-steps",
+                "3",
+            ]
+        )
+
+        config_server_args = self._from_cli_args_no_init(config_args)
+        explicit_server_args = self._from_cli_args_no_init(explicit_args)
+        config_server_args.resolve_basic_defaults()
+        explicit_server_args.resolve_basic_defaults()
+        config_server_args.resolve_speculative_decoding()
+        explicit_server_args.resolve_speculative_decoding()
+
+        self.assertEqual(
+            config_server_args.speculative_algorithm,
+            explicit_server_args.speculative_algorithm,
+        )
+        self.assertEqual(
+            config_server_args.speculative_draft_model_path,
+            explicit_server_args.speculative_draft_model_path,
+        )
+        self.assertEqual(
+            config_server_args.speculative_draft_model_path,
+            target_model,
+        )
+        self.assertTrue(explicit_server_args.draft_model_path_use_base)
+        self.assertEqual(
+            config_server_args.speculative_num_steps,
+            explicit_server_args.speculative_num_steps,
+        )
+        self.assertEqual(
+            config_server_args.speculative_num_draft_tokens,
+            explicit_server_args.speculative_num_draft_tokens,
+        )
+
+    def test_speculative_config_must_be_json_object(self):
+        args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])
+        sa = self._from_cli_args_no_init(args)
+        with self.assertRaisesRegex(
+            ValueError, "--speculative-config must be a JSON object"
+        ):
+            sa.resolve_basic_defaults()
+
+    def test_speculative_defaults(self):
+        args = self._parse_args(["--model", "test/model"])
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        self.assertEqual(sa.speculative_num_steps, 3)
+        self.assertEqual(sa.speculative_eagle_topk, 1)
+        self.assertEqual(sa.speculative_num_draft_tokens, 4)
+
+    def test_speculative_draft_tokens_default_to_steps_plus_one(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--speculative-num-steps", "1"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        self.assertEqual(sa.speculative_num_steps, 1)
+        self.assertEqual(sa.speculative_num_draft_tokens, 2)
 
     # ---- Full server command example ----
 

@@ -419,7 +419,7 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
     ) -> torch.Tensor:
         if (
             self.use_min_latency
-            and 0 < x.size(0) <= 16
+            and x.size(0) > 0
             and block_scale is None
             and (output_dtype is None or output_dtype == torch.bfloat16)
         ):
@@ -1758,6 +1758,10 @@ class Eagle3MlaDecoderLayer(nn.Module):
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_input_hidden_norm = FusedRMSNorm(
+            self.input_layernorm,
+            self.hidden_norm,
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1781,13 +1785,24 @@ class Eagle3MlaDecoderLayer(nn.Module):
         residual = hidden_states
 
         if not ctx.forward_mode.is_idle():
-            embeds = self.input_layernorm(embeds)
-            hidden_states = self.hidden_norm(hidden_states)
-            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+            fused_norm_out = torch.empty(
+                embeds.size(0),
+                self.hidden_size * 2,
+                dtype=embeds.dtype,
+                device=embeds.device,
+            )
+            # FusedRMSNorm's q_a/kv_a kwargs are MLA-specific names.
+            # Here embeds and hidden_states corresponds to q_a and kv_a, separately.
+            self.fused_input_hidden_norm(
+                input_q_a=embeds,
+                input_kv_a=hidden_states,
+                output_q_a=fused_norm_out[..., : self.hidden_size],
+                output_kv_a=fused_norm_out[..., self.hidden_size :],
+            )
 
             hidden_states = self.self_attn(
                 positions=positions,
-                hidden_states=hidden_states,
+                hidden_states=fused_norm_out,
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,

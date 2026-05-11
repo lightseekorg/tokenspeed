@@ -18,6 +18,36 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from triton_kernels.matmul_ogs_details.opt_flags import update_opt_flags_constraints
+import contextlib
+import io
+import logging
+import unittest
+from importlib import import_module
 
-__all__ = ["update_opt_flags_constraints"]
+from tokenspeed._logging import suppress_noisy_third_party_logs
+
+
+class TestThirdPartyLogging(unittest.TestCase):
+    def test_flash_attn_jit_cache_debug_log_is_suppressed(self):
+        try:
+            cache_utils = import_module("flash_attn.cute.cache_utils")
+        except ImportError:
+            self.skipTest("flash_attn.cute.cache_utils is unavailable")
+
+        logging.basicConfig(level=logging.DEBUG, force=True)
+        suppress_noisy_third_party_logs()
+
+        logger = logging.getLogger("flash_attn.cute.cache_utils")
+        self.assertGreaterEqual(logger.getEffectiveLevel(), logging.WARNING)
+        for handler in logger.handlers:
+            self.assertGreaterEqual(handler.level, logging.WARNING)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            cache_utils.get_jit_cache()
+
+        self.assertNotIn("Persistent cache disabled", stderr.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

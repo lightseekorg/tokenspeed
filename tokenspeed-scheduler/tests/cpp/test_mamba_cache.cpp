@@ -36,13 +36,15 @@ protected:
     static constexpr std::int32_t kDevicePages = 32;
     static constexpr std::int32_t kHostPages = 0;
     static constexpr std::int32_t kMambaSlots = 8;
+    static constexpr std::int32_t kMambaCacheChunkSize = 4;
 
     void SetUp() override {
         device_alloc_ = std::make_unique<PageAllocator>(kPageSize, kDevicePages);
         host_alloc_ = std::make_unique<PageAllocator>(kPageSize, kHostPages);
         prefix_cache_ = std::make_unique<KVPrefixCache>(device_alloc_.get(), host_alloc_.get());
         mamba_alloc_ = std::make_unique<MambaChunkAllocator>(kMambaSlots);
-        hybrid_prefix_cache_ = std::make_unique<HybridPrefixCache>(*prefix_cache_, mamba_alloc_.get());
+        hybrid_prefix_cache_ =
+            std::make_unique<HybridPrefixCache>(*prefix_cache_, mamba_alloc_.get(), kMambaCacheChunkSize);
     }
 
     std::vector<std::int32_t> CollectPrefixPages(TreeNode* matched_node) {
@@ -91,7 +93,7 @@ TEST_F(MambaCacheTest, MatchWithoutMambaTruncatesToRoot) {
     auto match = hybrid_prefix_cache_->Match(tokens);
     EXPECT_EQ(match.device.DepthInPage(), 0);
     EXPECT_EQ(match.mamba_cow_src_index, -1);
-    EXPECT_EQ(match.mamba_branching_seqlen, -1);
+    EXPECT_EQ(match.mamba_branching_seqlen, 4);
 }
 
 TEST_F(MambaCacheTest, MatchWithFullMambaKeepsDepth) {
@@ -115,7 +117,35 @@ TEST_F(MambaCacheTest, MatchWithPartialMambaTruncatesToMambaDepth) {
     EXPECT_EQ(match.device.DepthInPage(), 2);
     EXPECT_NE(match.mamba_cow_src_index, -1);
     EXPECT_NE(match.mamba_branching_seqlen, -1);
-    EXPECT_EQ(match.mamba_branching_seqlen, 4 * kPageSize);
+    EXPECT_EQ(match.mamba_branching_seqlen, 8);
+}
+
+TEST_F(MambaCacheTest, SplitPrefixWithoutMambaStillRequestsBranchingSnapshot) {
+    auto tokens4 = MakeAlignedTokens(4, kPageSize);
+    InsertKVAndMamba(tokens4);
+
+    token_vec_t diverged = tokens4;
+    diverged.resize(3 * kPageSize);
+    diverged[2 * kPageSize] = 1001;
+    diverged[2 * kPageSize + 1] = 1002;
+
+    auto match = hybrid_prefix_cache_->Match(diverged);
+    EXPECT_EQ(match.device.DepthInPage(), 0);
+    EXPECT_EQ(match.mamba_cow_src_index, -1);
+    EXPECT_EQ(match.mamba_branching_seqlen, 4);
+}
+
+TEST_F(MambaCacheTest, BranchingSeqlenIsSuppressedWhenAlignedInsideMambaPrefix) {
+    auto tokens2 = MakeAlignedTokens(2, kPageSize);
+    InsertKVAndMamba(tokens2);
+
+    auto tokens3 = MakeAlignedTokens(3, kPageSize);
+    InsertKVOnly(tokens3);
+
+    auto match = hybrid_prefix_cache_->Match(tokens3);
+    EXPECT_EQ(match.device.DepthInPage(), 2);
+    EXPECT_NE(match.mamba_cow_src_index, -1);
+    EXPECT_EQ(match.mamba_branching_seqlen, -1);
 }
 
 TEST_F(MambaCacheTest, OnKVEvictRemovesMamba) {

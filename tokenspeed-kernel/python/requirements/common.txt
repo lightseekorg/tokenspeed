@@ -1,5 +1,4 @@
 apache-tvm-ffi>=0.1.5
-nvidia-cutlass-dsl
 numpy
 packaging
 PyYAML>=6.0

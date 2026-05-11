@@ -21,6 +21,8 @@
 # -*- coding: utf-8 -*-
 
 
+from typing import Optional
+
 import torch
 from einops import rearrange
 
@@ -51,8 +53,8 @@ def chunk_gated_delta_rule_fwd(
     scale: float,
     initial_state: torch.Tensor,
     output_final_state: bool,
-    cu_seqlens: torch.LongTensor | None = None,
-    output_h: bool = False,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    return_h: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
@@ -86,10 +88,12 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    if output_h or SUPPRESS_LEVEL >= 3:
+    if SUPPRESS_LEVEL < 3 and not return_h:
+        return g, o, A, final_state, None, None, None
+    elif SUPPRESS_LEVEL >= 3:
         return g, o, A, final_state, w, h, v_new
     else:
-        return g, o, A, final_state, None, None, None
+        return g, o, A, final_state, None, h, None
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -253,7 +257,7 @@ def chunk_gated_delta_rule(
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            output_h=True,
+            return_h=True,
         )
         o = o.to(q.dtype)
         if head_first:

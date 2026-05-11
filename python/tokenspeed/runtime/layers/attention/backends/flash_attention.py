@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 from tokenspeed_kernel.ops.attention.flash_attn import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
+    get_scheduler_metadata,
 )
 from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 
@@ -79,6 +80,9 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # FA3 AOT scheduler metadata, shared by all attention layers in a decode step.
+    scheduler_metadata: torch.Tensor = None
+    max_num_splits: int = 0
 
     @dataclass
     class LocalAttentionMetadata:
@@ -176,6 +180,16 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
+def round_up(a: int, b: int) -> int:
+    return cdiv(a, b) * b
+
+
+# FA3 CUDA graph decode needs a fixed split count so the captured workspace and
+# scheduler metadata shape stay stable across graph replay. Keep this as an
+# internal backend constant instead of using the dynamic split heuristic.
+FA3_CUDA_GRAPH_SCHEDULER_NUM_SPLITS = 32
+
+
 # ---------------------------------------------------------------------------
 # FlashAttentionBackend
 # ---------------------------------------------------------------------------
@@ -242,10 +256,115 @@ class FlashAttentionBackend(AttentionBackend):
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         self.num_splits = 0
+        self.cuda_graph_scheduler_num_splits = FA3_CUDA_GRAPH_SCHEDULER_NUM_SPLITS
 
     @property
     def support_kv_cache_prewrite(self) -> bool:
         return True
+
+    def configure_runtime(self, **kwargs) -> None:
+        sliding_window_size = kwargs.get("sliding_window_size", None)
+        self.sliding_window_size = sliding_window_size
+        self.has_swa = sliding_window_size is not None and sliding_window_size > 0
+
+    def _scheduler_metadata_size(self, bs: int) -> int:
+        # FA3 stores one semaphore plus four scheduling vectors per batch item.
+        return 1 + round_up(bs, 4) * 4
+
+    def _can_use_decode_scheduler_metadata(self) -> bool:
+        # A single FA3 AOT schedule is only valid when all decode attention
+        # layers share the same plain MHA shape. Local/SWA/spec/MLA paths keep
+        # their existing per-call scheduler behavior.
+        return (
+            self.fa_impl_ver == 3
+            and not self.use_mla
+            and self.attention_chunk_size is None
+            and not self.has_swa
+            and self.topk <= 1
+        )
+
+    def _build_decode_scheduler_metadata(
+        self,
+        metadata: FlashAttentionMetadata,
+        bs: int,
+        num_splits: int,
+    ) -> Optional[torch.Tensor]:
+        if not self._can_use_decode_scheduler_metadata():
+            return None
+        if (
+            metadata.cache_seqlens_int32 is None
+            or metadata.cu_seqlens_q is None
+            or metadata.max_seq_len_k <= 0
+        ):
+            return None
+
+        return get_scheduler_metadata(
+            batch_size=bs,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=metadata.max_seq_len_k,
+            num_heads_q=self.num_qo_heads,
+            num_heads_kv=self.num_kv_heads,
+            headdim=self.head_dim,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            qkv_dtype=self.kv_cache_dtype,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            page_size=self.page_size,
+            causal=True,
+            window_size=(-1, -1),
+            num_splits=num_splits,
+        )
+
+    def _init_decode_cuda_graph_scheduler_metadata(
+        self,
+        metadata: FlashAttentionMetadata,
+        bs: int,
+    ) -> None:
+        if "scheduler_metadata" not in self.decode_cuda_graph_metadata:
+            return
+        scheduler_metadata = self._build_decode_scheduler_metadata(
+            metadata,
+            bs,
+            self.cuda_graph_scheduler_num_splits,
+        )
+        if scheduler_metadata is None:
+            return
+        max_size = self._scheduler_metadata_size(bs)
+        scheduler_metadata_buf = self.decode_cuda_graph_metadata["scheduler_metadata"][
+            :max_size
+        ]
+        n = scheduler_metadata.shape[0]
+        if n > scheduler_metadata_buf.shape[0]:
+            raise RuntimeError(
+                f"FA3 scheduler metadata is larger than the graph buffer: "
+                f"{n} > {scheduler_metadata_buf.shape[0]}"
+            )
+        scheduler_metadata_buf[:n].copy_(scheduler_metadata)
+        scheduler_metadata_buf[n:].zero_()
+        metadata.scheduler_metadata = scheduler_metadata_buf[:n]
+        metadata.max_num_splits = self.cuda_graph_scheduler_num_splits
+
+    def _update_decode_cuda_graph_scheduler_metadata(
+        self,
+        metadata: FlashAttentionMetadata,
+        bs: int,
+    ) -> None:
+        if metadata.scheduler_metadata is None:
+            return
+        scheduler_metadata = self._build_decode_scheduler_metadata(
+            metadata,
+            bs,
+            metadata.max_num_splits,
+        )
+        if scheduler_metadata is None:
+            return
+        n = scheduler_metadata.shape[0]
+        if n > metadata.scheduler_metadata.shape[0]:
+            raise RuntimeError(
+                f"FA3 scheduler metadata changed size across graph replay: "
+                f"{n} > {metadata.scheduler_metadata.shape[0]}"
+            )
+        metadata.scheduler_metadata[:n].copy_(scheduler_metadata)
+        metadata.scheduler_metadata[n:].zero_()
 
     # ------------------------------------------------------------------
     # Draft decode metadata
@@ -447,8 +566,16 @@ class FlashAttentionBackend(AttentionBackend):
 
             if extend_with_prefix and extend_prefix_lens is not None:
                 extend_seq_lens = seq_lens - extend_prefix_lens
-                # max_seq_len_q is an upper bound; num_tokens covers it
-                metadata.max_seq_len_q = num_tokens
+                # The FA3 workspace is sized from max_seq_len_q.  For prefix
+                # chunks, num_tokens is only the sum over the batch and can be
+                # much larger than any single query sequence.
+                extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+                if extend_seq_lens_cpu is not None:
+                    metadata.max_seq_len_q = int(
+                        extend_seq_lens_cpu[:batch_size].max().item()
+                    )
+                else:
+                    metadata.max_seq_len_q = num_tokens
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
@@ -913,6 +1040,14 @@ class FlashAttentionBackend(AttentionBackend):
                 page_table = metadata.page_table
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
+                scheduler_metadata = (
+                    None if use_cascade_attn else metadata.scheduler_metadata
+                )
+                num_splits = (
+                    metadata.max_num_splits
+                    if scheduler_metadata is not None
+                    else self.num_splits
+                )
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
@@ -934,7 +1069,8 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    scheduler_metadata=scheduler_metadata,
+                    num_splits=num_splits,
                     **fa_kwargs,
                 )
                 if use_cascade_attn:
@@ -1072,6 +1208,11 @@ class FlashAttentionBackend(AttentionBackend):
             "page_table": torch.zeros(
                 max_bs,
                 max_num_pages,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "scheduler_metadata": torch.zeros(
+                self._scheduler_metadata_size(max_bs),
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -1330,6 +1471,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
+                self._init_decode_cuda_graph_scheduler_metadata(metadata, bs)
                 self.decode_cuda_graph_metadata[bs] = metadata
 
                 if self.attention_chunk_size is not None:
@@ -1517,6 +1659,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.page_size,
                     max_context_len,
                 )
+                self._update_decode_cuda_graph_scheduler_metadata(metadata, bs)
 
                 self._update_local_attn_metadata_for_replay(
                     metadata,
