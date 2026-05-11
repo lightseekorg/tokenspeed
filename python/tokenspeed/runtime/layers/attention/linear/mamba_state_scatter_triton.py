@@ -138,6 +138,9 @@ def _mamba_state_copy_kernel(
     src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
     dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
 
+    if src_idx == dst_idx:
+        return
+
     # Bounds check
     if not (
         (src_idx >= 0) & (src_idx < pool_size)
