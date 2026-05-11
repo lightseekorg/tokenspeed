@@ -56,9 +56,11 @@ if (
     except ImportError:
         pass
 
-    # FA4 on Blackwell supports head_dim in [8, 128] divisible by 8
-    # (and (192, 128) for DeepSeek MLA, not applicable here).
-    _FA4_BLACKWELL_HEAD_DIMS = frozenset(range(8, 129, 8))
+    # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8
+    # (and (192, 128) for DeepSeek MLA, not applicable here). The current
+    # decode path passes seqused_k and remains limited to <=128 by upstream FA4.
+    _FA4_BLACKWELL_PREFILL_HEAD_DIMS = frozenset(range(8, 257, 8))
+    _FA4_BLACKWELL_DECODE_HEAD_DIMS = frozenset(range(8, 129, 8))
 
     @register_kernel(
         "attention",
@@ -72,7 +74,7 @@ if (
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 3,
         traits={
-            "head_dim": _FA4_BLACKWELL_HEAD_DIMS,
+            "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -124,7 +126,7 @@ if (
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 3,
         traits={
-            "head_dim": _FA4_BLACKWELL_HEAD_DIMS,
+            "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "query_len": frozenset({1}),
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
