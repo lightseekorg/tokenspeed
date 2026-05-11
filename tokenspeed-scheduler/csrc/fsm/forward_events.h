@@ -52,7 +52,7 @@ namespace tokenspeed::fsm {
 struct PrefetchDone;
 struct Prefetching;
 
-void InsertHybridCache(HybridPrefixCache* hybrid_prefix_cache,
+void InsertPrefixCache(KVPrefixCache* kv_prefix_cache, HybridPrefixCache* hybrid_prefix_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator);
@@ -101,9 +101,10 @@ private:
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+                         KVPrefixCache* kv_prefix_cache, HybridPrefixCache* hybrid_prefix_cache = nullptr)
         : tokens_this_round_(tokens_this_round),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
+          kv_prefix_cache_(kv_prefix_cache),
           hybrid_prefix_cache_(hybrid_prefix_cache) {}
 
     // Returns PrefillDone (last chunk) or Prefilling (more chunks remain).
@@ -112,20 +113,25 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
 private:
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
+    KVPrefixCache* kv_prefix_cache_{};
     HybridPrefixCache* hybrid_prefix_cache_{};
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr)
-        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache) {}
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, KVPrefixCache* kv_prefix_cache,
+                        HybridPrefixCache* hybrid_prefix_cache = nullptr)
+        : decode_input_tokens_(decode_input_tokens),
+          kv_prefix_cache_(kv_prefix_cache),
+          hybrid_prefix_cache_(hybrid_prefix_cache) {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(Decoding&& state);
 
 private:
     std::int32_t decode_input_tokens_;
+    KVPrefixCache* kv_prefix_cache_{};
     HybridPrefixCache* hybrid_prefix_cache_{};
 };
 
