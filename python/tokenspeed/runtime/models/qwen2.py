@@ -249,7 +249,7 @@ class Qwen2DecoderLayer(nn.Module):
             )
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
-            hidden_states, residual, _ = (
+            hidden_states, residual, *_ = (
                 self.input_layernorm.forward_with_allreduce_fusion(
                     self.mapping.dense.tp_rank,
                     self.mapping.dense.tp_group,
@@ -274,7 +274,7 @@ class Qwen2DecoderLayer(nn.Module):
                 hidden_states, residual
             )
         else:
-            hidden_states, residual, _ = (
+            hidden_states, residual, *_ = (
                 self.post_attention_layernorm.forward_with_allreduce_fusion(
                     self.mapping.attn.tp_rank,
                     self.mapping.attn.tp_group,
@@ -355,7 +355,7 @@ class Qwen2Model(nn.Module):
             )
             hidden_states, _ = self.norm(hidden_states, residual)
         else:
-            hidden_states, _, _ = self.norm.forward_with_allreduce_fusion(
+            hidden_states, *_ = self.norm.forward_with_allreduce_fusion(
                 self.mapping.dense.tp_rank,
                 self.mapping.dense.tp_group,
                 hidden_states,
