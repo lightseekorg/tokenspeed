@@ -22,6 +22,7 @@
 
 #include "resource/allocator/page_allocator.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace tokenspeed {
@@ -73,6 +74,15 @@ void OwnedPages::Append(OwnedPages other) {
     ids_.insert(ids_.end(), other.ids_.begin(), other.ids_.end());
     other.allocator_ = nullptr;
     other.ids_.clear();
+}
+
+void OwnedPages::ReleaseOwnershipByID(const std::vector<std::int32_t>& ids) {
+    for (std::int32_t id : ids) {
+        auto it = std::find(ids_.begin(), ids_.end(), id);
+        if (it != ids_.end()) {
+            ids_.erase(it);
+        }
+    }
 }
 
 }  // namespace tokenspeed

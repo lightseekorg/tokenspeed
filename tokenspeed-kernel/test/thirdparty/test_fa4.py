@@ -20,15 +20,19 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 
 import pytest
+import tokenspeed_kernel.ops.attention.flash_attn as flash_attn_module
 import torch
 from tokenspeed_kernel.ops.attention.flash_attn import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import select_kernel
 
 platform = current_platform()
 torch.manual_seed(42)
@@ -41,7 +45,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 128, 8, 2)],
+    [(torch.bfloat16, 128, 8, 2), (torch.bfloat16, 256, 8, 2)],
 )
 def test_mha(
     device: str,
@@ -77,7 +81,7 @@ def test_mha(
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 128, 8, 2)],
+    [(torch.bfloat16, 128, 8, 2), (torch.bfloat16, 256, 8, 2)],
 )
 def test_mha_ragged(
     device: str,
@@ -270,3 +274,38 @@ def test_mha_ragged_with_paged_kvcache(
 
     assert out.shape == q.shape
     assert lse is None
+
+
+def _reload_fa4_registry_entries() -> None:
+    KernelRegistry.reset()
+    importlib.reload(flash_attn_module)
+
+
+def test_fa4_prefill_selection_accepts_head_dim_256() -> None:
+    _reload_fa4_registry_entries()
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name("fa4_mha_prefill")
+    assert spec is not None
+    assert spec.solution == "fa4"
+    assert 256 in spec.traits["head_dim"]
+
+    selected = select_kernel(
+        "attention",
+        "mha_prefill",
+        torch.bfloat16,
+        traits={
+            "head_dim": 256,
+            "sliding_window": False,
+            "support_sinks": False,
+            "return_lse": False,
+            "support_logit_cap": False,
+        },
+    )
+    assert selected.name == "fa4_mha_prefill"
+
+
+def test_fa4_decode_selection_keeps_head_dim_256_disabled() -> None:
+    _reload_fa4_registry_entries()
+    spec = KernelRegistry.get().get_by_name("fa4_mha_decode_with_kvcache")
+    assert spec is not None
+    assert 256 not in spec.traits["head_dim"]

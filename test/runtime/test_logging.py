@@ -17,3 +17,37 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+import contextlib
+import io
+import logging
+import unittest
+from importlib import import_module
+
+from tokenspeed._logging import suppress_noisy_third_party_logs
+
+
+class TestThirdPartyLogging(unittest.TestCase):
+    def test_flash_attn_jit_cache_debug_log_is_suppressed(self):
+        try:
+            cache_utils = import_module("flash_attn.cute.cache_utils")
+        except ImportError:
+            self.skipTest("flash_attn.cute.cache_utils is unavailable")
+
+        logging.basicConfig(level=logging.DEBUG, force=True)
+        suppress_noisy_third_party_logs()
+
+        logger = logging.getLogger("flash_attn.cute.cache_utils")
+        self.assertGreaterEqual(logger.getEffectiveLevel(), logging.WARNING)
+        for handler in logger.handlers:
+            self.assertGreaterEqual(handler.level, logging.WARNING)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            cache_utils.get_jit_cache()
+
+        self.assertNotIn("Persistent cache disabled", stderr.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

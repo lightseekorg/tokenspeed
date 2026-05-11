@@ -20,6 +20,8 @@
 
 from deep_gemm import (
     ceil_div,
+    fp8_fp4_mqa_logits,
+    fp8_fp4_paged_mqa_logits,
     fp8_gemm_nt,
     fp8_mqa_logits,
     fp8_paged_mqa_logits,
@@ -34,6 +36,8 @@ from deep_gemm import (
 
 __all__ = [
     "ceil_div",
+    "fp8_fp4_mqa_logits",
+    "fp8_fp4_paged_mqa_logits",
     "fp8_gemm_nt",
     "get_num_sms",
     "m_grouped_fp8_gemm_nt_contiguous",

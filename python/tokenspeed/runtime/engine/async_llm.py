@@ -84,10 +84,7 @@ from tokenspeed.runtime.engine.protocol import EngineClient
 from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
 )
-from tokenspeed.runtime.metrics.collector import (
-    ErrorMetricsCollector,
-    TokenizerMetricsCollector,
-)
+from tokenspeed.runtime.metrics.collector import RequestMetrics
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
     KVClassType,
@@ -207,22 +204,16 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Set after scheduler is initialized
         self.max_req_input_len = None
 
-        # Metrics
-        if self.enable_metrics:
-            self.metrics_collector = TokenizerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    "app_key": self.server_args.app_key,
-                },
-                metrics_reporters=server_args.metrics_reporters,
-            )
-            self.error_collector = ErrorMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    "app_key": self.server_args.app_key,
-                },
-                metrics_reporters=server_args.metrics_reporters,
-            )
+        self.metrics = RequestMetrics(
+            labels={
+                "model_name": self.server_args.served_model_name,
+                "app_key": self.server_args.app_key,
+            },
+            enabled=(
+                self.enable_metrics
+                and "prometheus" in (server_args.metrics_reporters or [])
+            ),
+        )
 
         self.output_processor = OutputProcessor(self)
 
@@ -279,10 +270,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.input_processor.validate_request(obj)
 
         obj.normalize_batch_and_arguments()
-
-        if self.enable_metrics:
-            batch_size = obj.batch_size if hasattr(obj, "batch_size") else 1
-            self.metrics_collector.observe_request_arrival(batch_size)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -388,10 +375,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                     if isinstance(out["meta_info"].get("finish_reason"), dict):
                         finish_reason = out["meta_info"]["finish_reason"]
                         if finish_reason.get("type") == "abort":
-                            if self.enable_metrics:
-                                self.error_collector.record_error(
-                                    finish_reason.get("message")
-                                )
                             if (
                                 finish_reason.get("status_code")
                                 == HTTPStatus.BAD_REQUEST

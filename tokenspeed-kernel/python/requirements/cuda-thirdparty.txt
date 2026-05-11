@@ -1,9 +1,10 @@
 tokenspeed-deepep==1.2.1.post20251110
 tokenspeed-deepgemm==2.5.0.post20260424
+tilelang==0.1.9
 tokenspeed-flashmla==1.0.0.post20260429
 tokenspeed-mla==0.1.1
 tokenspeed-fast-hadamard-transform==1.1.0.post20251110
 tokenspeed-fa3==3.0.0.post20260408
-tokenspeed-fa4==4.0.0.post20251110
-triton_kernels @ git+https://github.com/triton-lang/triton.git@0add68262ab0a2e33b84524346cb27cbb2787356#subdirectory=python/triton_kernels
+tokenspeed-fa4==4.0.0.post20260510
+tokenspeed-triton-kernels==1.0.0.post20260510
 tokenspeed-trtllm-kernel==1.2.1.post20260427

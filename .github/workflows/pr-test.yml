@@ -25,6 +25,15 @@ on:
       - "test/**"
       - ".github/workflows/pr-test.yml"
   workflow_dispatch:
+    inputs:
+      trigger:
+        description: "CI task trigger to run"
+        required: false
+        default: manual
+        type: choice
+        options:
+          - manual
+          - debug
 
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
@@ -75,7 +84,10 @@ jobs:
         id: scan
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TRIGGER=manual
+            TRIGGER="${{ github.event.inputs.trigger }}"
+            if [ -z "$TRIGGER" ]; then
+              TRIGGER=manual
+            fi
           else
             TRIGGER=per-commit
           fi

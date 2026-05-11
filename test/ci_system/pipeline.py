@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import glob
+import io
 import json
 import os
 import re
@@ -28,7 +30,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly"}
+SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 STALE_PROCESS_PATTERNS = [
     r"python.*tokenspeed\.api_server",
@@ -554,6 +556,10 @@ def summarize_command_output(command: str, output: str) -> Dict[str, Any]:
     if evalscope_perf_table:
         result["evalscope_perf_table"] = evalscope_perf_table
 
+    perf_summary_rows = extract_perf_summary_rows(output)
+    if perf_summary_rows:
+        result["perf_summary_rows"] = perf_summary_rows
+
     return result
 
 
@@ -570,9 +576,10 @@ def extract_evalscope_score(report_table: str) -> float | None:
 
     for line in report_table.splitlines():
         stripped = line.strip()
-        if not stripped.startswith("|"):
+        if not stripped.startswith(("|", "│")):
             continue
-        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        separator = "│" if stripped.startswith("│") else "|"
+        cells = [cell.strip() for cell in stripped.strip(separator).split(separator)]
         if not cells:
             continue
         if any(set(cell) <= {"=", "-"} for cell in cells if cell):
@@ -689,6 +696,114 @@ def check_eval_score_threshold(
     }
 
 
+PERF_CSV_HEADER = (
+    "config,Conc.,Latency (tps/user),Throughput (tps/gpu),"
+    "Approx Cache Hit,Decoded Tok/Iter"
+)
+PERF_REFERENCE_METRICS = ("Latency (tps/user)", "Throughput (tps/gpu)")
+
+
+def extract_perf_summary_rows(output: str) -> List[Dict[str, str]] | None:
+    idx = output.find(PERF_CSV_HEADER)
+    if idx < 0:
+        return None
+    block = output[idx:]
+    lines: List[str] = []
+    for raw in block.splitlines():
+        line = clean_log_line(raw)
+        if not line.strip():
+            if lines:
+                break
+            continue
+        if lines and re.match(r"^\d{4}-\d{2}-\d{2} .* - .* - ", line):
+            break
+        lines.append(line)
+    if len(lines) < 2:
+        return None
+    return list(csv.DictReader(io.StringIO("\n".join(lines))))
+
+
+def check_perf_reference(
+    task: Dict[str, Any],
+    command_results: List[Dict[str, Any]],
+    stages_run: List[str],
+) -> Dict[str, Any] | None:
+    reference = task.get("perf_reference")
+    if reference is None:
+        print("[perf-ref] no perf_reference configured", flush=True)
+        return None
+    if "perf" not in stages_run:
+        print(
+            "[perf-ref] perf_reference configured but perf stage was not "
+            f"executed; stages={stages_run}",
+            flush=True,
+        )
+        return None
+    if not isinstance(reference, dict) or not reference:
+        raise ValueError("perf_reference must be a non-empty dict")
+
+    threshold = float(task.get("perf_threshold", 0.9))
+
+    rows: List[Dict[str, str]] | None = None
+    for result in command_results:
+        if "perf_summary_rows" in result:
+            rows = result["perf_summary_rows"]
+    if not rows:
+        print("[perf-ref] no perf summary rows found in command output", flush=True)
+        raise ValueError(
+            "perf_reference is configured but no perf summary rows were found"
+        )
+
+    failures: List[str] = []
+    checks: List[Dict[str, Any]] = []
+    for conc_key, ref_pair in reference.items():
+        try:
+            conc = int(conc_key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"perf_reference key must be an int concurrency: got {conc_key!r}"
+            ) from exc
+        if not isinstance(ref_pair, list) or len(ref_pair) != 2:
+            raise ValueError(
+                f"perf_reference[{conc_key}] must be [tps_user, tps_gpu]; "
+                f"got {ref_pair!r}"
+            )
+        match = next((r for r in rows if int(r["Conc."]) == conc), None)
+        if match is None:
+            failures.append(f"conc={conc}: no matching row in perf summary")
+            continue
+        entry: Dict[str, Any] = {"conc": conc}
+        for metric, ref in zip(PERF_REFERENCE_METRICS, ref_pair):
+            ref_v = float(ref)
+            actual = float(match[metric])
+            floor = ref_v * threshold
+            passed_metric = actual >= floor
+            entry[metric] = {
+                "actual": actual,
+                "ref": ref_v,
+                "floor": floor,
+                "passed": passed_metric,
+            }
+            if not passed_metric:
+                failures.append(
+                    f"conc={conc}: {metric} {actual:g} < {floor:g} "
+                    f"({threshold * 100:g}% of {ref_v:g})"
+                )
+        checks.append(entry)
+
+    passed = not failures
+    status = "passed" if passed else "failed"
+    print(f"[perf-ref] threshold={threshold:g}, status={status}", flush=True)
+    for line in failures:
+        print(f"[perf-ref]   {line}", flush=True)
+    return {
+        "passed": passed,
+        "threshold": threshold,
+        "checks": checks,
+        "failures": failures,
+    }
+
+
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _GITHUB_LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z ?")
 
@@ -746,6 +861,16 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
             f"- Eval score: `{check['score']:g}` "
             f"(threshold `{check['threshold']}`, {status})"
         )
+    if result.get("perf_reference_check"):
+        check = result["perf_reference_check"]
+        status = "pass" if check["passed"] else "fail"
+        lines.append(
+            f"- Perf reference: `{status}` "
+            f"(threshold `{check['threshold']:g}`, "
+            f"{len(check['checks'])} concurrency levels)"
+        )
+        if not check["passed"]:
+            lines.extend([f"  - {failure}" for failure in check["failures"]])
     if result.get("eval_accept_rate"):
         accept_rate = result["eval_accept_rate"]
         lines.append(
@@ -1072,6 +1197,12 @@ def execute_task(
                 f"eval score {eval_score_check['score']:g} does not satisfy "
                 f"threshold {eval_score_check['threshold']}"
             )
+        perf_reference_check = check_perf_reference(task, command_results, stages_run)
+        if perf_reference_check is not None and not perf_reference_check["passed"]:
+            raise RuntimeError(
+                "perf_reference check failed: "
+                + "; ".join(perf_reference_check["failures"])
+            )
 
         result = {
             "ok": True,
@@ -1084,6 +1215,8 @@ def execute_task(
         }
         if eval_score_check is not None:
             result["eval_score_check"] = eval_score_check
+        if perf_reference_check is not None:
+            result["perf_reference_check"] = perf_reference_check
         if eval_accept_rate is not None:
             result["eval_accept_rate"] = eval_accept_rate
         if task.get("report", {}).get("github_step_summary"):

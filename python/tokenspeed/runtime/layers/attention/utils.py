@@ -116,6 +116,14 @@ def token_indices_from_pages(
 
 # --- Page-based memory profiling ---
 
+from typing import Optional, Tuple
+
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
+from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.utils import get_available_gpu_memory
+
 
 def profile_max_num_pages(
     attn_config: BaseAttnConfig,
@@ -154,3 +162,50 @@ def profile_max_num_pages(
     max_num_token = int(rest_memory * (1 << 30) // cell_size)
     max_num_pages = (max_num_token + page_size - 1) // page_size
     return max_num_pages
+
+
+def profile_cache_budget(
+    attn_config: BaseAttnConfig,
+    gpu_id: int,
+    tp_size: int,
+    mem_fraction_static: float,
+    page_size: int,
+    num_attention_layers: int,
+    total_gpu_memory: int,
+    mamba_memory_per_chunk: int,
+    mamba_ratio: float,
+    world_group=None,
+    draft_attn_config: Optional[BaseAttnConfig] = None,
+    draft_num_attention_layers: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Profile GPU memory and split between KV pages and mamba chunks.
+
+    Returns:
+        (kv_max_num_pages, mamba_pool_total_chunks)
+    """
+    cpu_group = (
+        pg_manager.get_process_group("gloo", world_group)
+        if world_group is not None
+        else None
+    )
+    available_gpu_memory = get_available_gpu_memory(
+        attn_config.device,
+        gpu_id,
+        distributed=tp_size > 1,
+        cpu_group=cpu_group,
+    )
+
+    rest_memory = available_gpu_memory - total_gpu_memory * (1 - mem_fraction_static)
+    cell_size = attn_config.cache_cell_size() * num_attention_layers
+    if draft_attn_config is not None:
+        cell_size += draft_attn_config.cache_cell_size() * draft_num_attention_layers
+
+    total_cache_memory = rest_memory * (1 << 30)
+    kv_memory = int(total_cache_memory / (1 + mamba_ratio))
+    mamba_memory = total_cache_memory - kv_memory
+
+    kv_cell_size = cell_size * page_size
+    kv_max_num_pages = int(kv_memory // kv_cell_size)
+    mamba_pool_total_chunks = max(int(mamba_memory // mamba_memory_per_chunk), 2)
+
+    return kv_max_num_pages, mamba_pool_total_chunks

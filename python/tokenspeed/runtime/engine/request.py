@@ -37,7 +37,7 @@ from tokenspeed.runtime.engine.request_types import (  # noqa: F401
     BaseFinishReason,
 )
 from tokenspeed.runtime.grammar.base_grammar_backend import BaseGrammarObject
-from tokenspeed.runtime.metrics.collector import SchedulerMetricsCollector, TimeStats
+from tokenspeed.runtime.metrics.collector import TimeStats
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -68,7 +68,6 @@ class Req:
         bootstrap_port: int | None = None,
         bootstrap_room: int | None = None,
         origin_input_multi_ids: list[list[int]] | None = None,
-        metrics_collector: SchedulerMetricsCollector | None = None,
         created_time: float | None = None,
     ):
         # Input and output info
@@ -226,7 +225,6 @@ class Req:
         # Calculate the time from receiving the request at TokenizerManager to reaching process_input_requests in the scheduling process
         self.tokenizer_to_scheduler_latency = time.time() - self.created_time
         # For metrics
-        self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats()
         self.has_log_time_stats: bool = False
         self.queue_time_start = None

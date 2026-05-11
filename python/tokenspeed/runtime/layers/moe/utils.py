@@ -78,6 +78,7 @@ class MoeBackend(Enum):
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
+    MEGA_MOE = "mega_moe"
 
     def is_auto(self):
         return self == MoeBackend.AUTO
@@ -104,7 +105,10 @@ class MoeBackend(Enum):
         return self == MoeBackend.FLASHINFER_MXFP4
 
     def is_deep_gemm_mega_moe(self):
-        return self == MoeBackend.DEEP_GEMM_MEGA_MOE
+        return self in (MoeBackend.DEEP_GEMM_MEGA_MOE, MoeBackend.MEGA_MOE)
+
+    def is_mega_moe(self):
+        return self.is_deep_gemm_mega_moe()
 
 
 class DeepEPMode(Enum):

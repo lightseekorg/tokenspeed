@@ -36,7 +36,7 @@ class MambaChunkAllocator;
 
 class HybridPrefixCache {
 public:
-    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator);
+    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size);
 
     MatchResult Match(const token_vec_t& token_ids, std::int32_t lora_id = kLoraNone);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
@@ -44,6 +44,7 @@ public:
 
     bool EnsureMambaCapacityByEvict(std::int32_t num_slots);
     void InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot);
+    std::int32_t AlignMambaCacheSeqlen(std::int32_t seqlen) const;
     TreeNode* FindLastMambaNode(TreeNode* from) const;
 
     // CallBack on KV Prefix Cache Eviction
@@ -58,6 +59,7 @@ private:
     KVPrefixCache& kv_prefix_cache_;
     MambaChunkAllocator* mamba_allocator_;
     MambaEvictionManager mamba_eviction_manager_;
+    std::int32_t mamba_cache_chunk_size_;
 };
 
 }  // namespace tokenspeed

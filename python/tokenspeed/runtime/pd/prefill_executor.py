@@ -85,6 +85,16 @@ class DisaggPrefillExecutor:
             bootstrap_room=info.bootstrap_room,
         )
 
+    @staticmethod
+    def _mamba_indices(op, index: int):
+        indices = getattr(op, "mamba_pool_indices", None)
+        if indices is None or index >= len(indices):
+            return None
+        slot = int(indices[index])
+        if slot < 0:
+            return None
+        return np.array([slot], dtype=np.int64)
+
     def _decode_prefix_len(self, bootstrap_room: int) -> int:
         transfer_info = next(
             t
@@ -128,7 +138,6 @@ class DisaggPrefillExecutor:
     def prepare_prefill(self, op) -> None:
         if not self._layerwise_enabled or op.num_extends() == 0:
             return
-
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
         for i, request_id in enumerate(op.request_ids[: op.num_extends()]):
             sender = self.senders[request_id]
@@ -143,6 +152,7 @@ class DisaggPrefillExecutor:
                 begin_cache_step=begin_cache_step,
                 layerwise_interval=self._layerwise_interval,
                 wait_for_bootstrap_token=is_last,
+                mamba_indices=self._mamba_indices(op, i) if is_last else None,
             )
 
     def _decode(self, op):
@@ -175,11 +185,13 @@ class DisaggPrefillExecutor:
                 kv_indices,
                 bootstrap_token,
             )
+            mamba_indices = self._mamba_indices(op, i)
             self.senders[request_id].send(
                 kv_indices,
                 aux_index,
                 is_last,
                 bootstrap_token=bootstrap_token,
+                mamba_indices=mamba_indices,
             )
 
     def register(self, request_id: str, bootstrap_info: BootstrapInfo):
