@@ -257,6 +257,7 @@ if _gluon_is_supported():
         gather_idx_ptr,
         scatter_idx_ptr,
         gate_scal_ptr,
+        expert_remap_ptr,
         # Strides --------------------------------------------------------
         stride_xm,
         stride_xk,
@@ -286,6 +287,7 @@ if _gluon_is_supported():
         SWIGLU_LIMIT: gl.constexpr,
         OUT_BLOCK_N: gl.constexpr,
         APPLY_GATE_SCAL: gl.constexpr,
+        HAS_EXPERT_REMAP: gl.constexpr,
         # NOTE(mxfp4 follow-up):
         # When we land the mxfp4 path we will add ``W_SCALE_ptr`` plus
         # ``stride_*_scale`` arguments and switch the inner accumulator to
@@ -293,22 +295,33 @@ if _gluon_is_supported():
         # using ``get_mfma_scale_layout(dot_layout_w, [BLOCK_N, BLOCK_K //
         # SCALE_BLOCK])`` for the scale tile.
     ):
-        # Grid layout: (BLOCKS_PER_EXPERT * grid_n, num_experts).
-        # ``program_id(1)`` returns a true scalar so we can keep all
-        # downstream pointer arithmetic scalar-only (required by
-        # ``buffer_load_to_shared`` which rejects tensor-of-pointers).
-        expert_id = gl.program_id(1)
+        # Grid layout: (BLOCKS_PER_EXPERT * grid_n, num_active_experts).
+        # ``program_id(1)`` returns a *compact* index over active experts;
+        # the real expert id (used for weight / bias offsets) is loaded
+        # from ``expert_remap_ptr`` when ``HAS_EXPERT_REMAP=True``. For
+        # dense (all-experts-active) calls the launcher passes
+        # ``HAS_EXPERT_REMAP=False`` and the compact index *is* the expert
+        # id, so no extra load is emitted.
+        compact_idx = gl.program_id(1)
         block_pid = gl.program_id(0)
         grid_n = (N + BLOCK_N - 1) // BLOCK_N
         block_in_expert = block_pid // grid_n
         pid_n = block_pid % grid_n
+        if HAS_EXPERT_REMAP:
+            # Scalar i32 load of the real expert id. ``compact_idx`` is a
+            # scalar ``program_id`` so ``expert_remap_ptr + compact_idx``
+            # is also scalar and the load returns a scalar value (same
+            # pattern as ``moe_gfx1250.py::gl.load(XSliceSizes + expt_id)``).
+            expert_id = gl.load(expert_remap_ptr + compact_idx).to(gl.int32)
+        else:
+            expert_id = compact_idx
 
-        # The dispatched activation buffer is padded so every expert owns
-        # exactly ``BLOCKS_PER_EXPERT`` adjacent M-blocks. This keeps the
-        # mapping ``expert_id -> M_start`` as a pure scalar product, which
-        # in turn lets us hand a scalar base pointer to
-        # ``buffer_load_to_shared``.
-        off_m = expert_id * BLOCKS_PER_EXPERT * BLOCK_M + block_in_expert * BLOCK_M
+        # The dispatched activation buffer is densely packed across the
+        # *active* experts: chunk i (compact_idx == i) owns rows
+        # ``[i*BLOCKS_PER_EXPERT*BLOCK_M, (i+1)*BLOCKS_PER_EXPERT*BLOCK_M)``.
+        # This keeps the M-offset a pure scalar product so we can later
+        # swap ``gl.load`` for ``buffer_load_to_shared``.
+        off_m = compact_idx * BLOCKS_PER_EXPERT * BLOCK_M + block_in_expert * BLOCK_M
         off_n = pid_n * BLOCK_N
 
         # Per-expert W stride folded into a scalar ``w_base`` below.
@@ -517,27 +530,33 @@ def _expert_layout(
     a_ragged_metadata: Any | None,
     block_m: int,
     M: int,
-) -> tuple[int, int]:
-    """Return (num_experts, blocks_per_expert) for the launcher grid.
+) -> tuple[int, int, torch.Tensor | None]:
+    """Return ``(num_active_experts, blocks_per_expert, expert_remap)``.
 
-    The MI355 software-pipelined kernel encodes expert id as a *scalar*
-    ``program_id(1)``; for that to translate into a scalar M-offset we
-    need every expert to occupy the same number of M-blocks. This means
-    the activation buffer must be padded to ``num_experts *
-    blocks_per_expert * block_m`` rows. The host calls ``_pad_for_uniform``
-    below to honour this.
+    The MI355 software-pipelined kernel encodes the *compact* active
+    expert index as ``program_id(1)``. When the ragged metadata only
+    activates a strict subset of experts (typical for decode batches
+    where ``B*topk << E``) we filter out the empty experts here and
+    return an ``expert_remap`` tensor of shape ``[num_active]`` that
+    translates the kernel's compact index back to the real expert id
+    (used to look up the per-expert W slice). For the all-active case
+    we return ``expert_remap=None`` so the kernel skips the indirection
+    load entirely.
     """
     if a_ragged_metadata is None:
-        return 1, (M + block_m - 1) // block_m
+        return 1, (M + block_m - 1) // block_m, None
     counts = a_ragged_metadata.slice_sizes
-    num_experts = counts.numel()
     counts_list = counts.tolist()
-    max_blocks = (
-        max((int(c) + block_m - 1) // block_m for c in counts_list)
-        if counts_list
-        else 0
-    )
-    return num_experts, max_blocks
+    active = [i for i, c in enumerate(counts_list) if int(c) > 0]
+    num_active = len(active)
+    if num_active == 0:
+        return 1, 0, None
+    max_blocks = max((int(counts_list[i]) + block_m - 1) // block_m for i in active)
+    if num_active == counts.numel():
+        # All experts active: identity remap, no need to materialise.
+        return num_active, max_blocks, None
+    expert_remap = torch.tensor(active, device=counts.device, dtype=torch.int32)
+    return num_active, max_blocks, expert_remap
 
 
 def _make_dummy(device, dtype=torch.int32, n: int = 0) -> torch.Tensor:
@@ -588,9 +607,11 @@ def _launch_pipelined(
         E = 1
     assert K == K_W, f"K mismatch: {K} vs {K_W}"
 
-    num_experts, blocks_per_expert = _expert_layout(a_ragged_metadata, block_m, M)
+    num_active, blocks_per_expert, expert_remap = _expert_layout(
+        a_ragged_metadata, block_m, M
+    )
     grid_n = (N + block_n - 1) // block_n
-    grid = (blocks_per_expert * grid_n, num_experts)
+    grid = (blocks_per_expert * grid_n, num_active)
 
     bias_buf = bias if bias is not None else _make_dummy(x.device, x.dtype)
     gather_buf = (
@@ -606,6 +627,9 @@ def _launch_pipelined(
     gate_scal_buf = (
         gate_scal if gate_scal is not None else _make_dummy(x.device, torch.float32)
     )
+    expert_remap_buf = (
+        expert_remap if expert_remap is not None else _make_dummy(x.device, torch.int32)
+    )
 
     swiglu_alpha = swiglu[0] if swiglu is not None else 0.0
     swiglu_limit = swiglu[1] if swiglu is not None else 0.0
@@ -620,6 +644,7 @@ def _launch_pipelined(
         gather_buf,
         scatter_buf,
         gate_scal_buf,
+        expert_remap_buf,
         x.stride(-2),
         x.stride(-1),
         w3.stride(0),
@@ -646,6 +671,7 @@ def _launch_pipelined(
         SWIGLU_LIMIT=float(swiglu_limit),
         OUT_BLOCK_N=out_block_n,
         APPLY_GATE_SCAL=gate_scal is not None,
+        HAS_EXPERT_REMAP=expert_remap is not None,
         num_warps=num_warps,
     )
 
@@ -656,29 +682,51 @@ def _launch_pipelined(
 
 
 def _autotune_block(
-    M: int, N: int, K: int, *, do_swiglu: bool = False
+    M: int,
+    N: int,
+    K: int,
+    *,
+    do_swiglu: bool = False,
+    ragged: bool = False,
 ) -> tuple[int, int, int, int]:
-    """Pick (BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS) for given shape.
+    """Pick ``(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS)`` for given shape.
 
-    Heuristic obtained by sweeping the microbench (see
-    ``benchmarks/moe_gluon_microbench.py``) on MI355.  Across all
-    candidates ``BLOCK_N=64`` consistently won because it keeps
-    ``grid_n`` large enough to saturate the 256+ CUs while still
-    providing enough work per CTA for MFMA throughput.
+    Heuristic obtained by sweeping the microbench
+    (``benchmarks/moe_gluon_microbench.py``) on MI355 with the
+    gpt-oss-120b MoE dimensions (``H=I=2880, E=128, topk=4``) for
+    decode (``B in {1, 32, 64}``) and prefill
+    (``B in {1024, 4096, 8192}``).
 
-    * Dense gating GEMM (``DO_SWIGLU=False``):
-        - M <= 1024: 64x64x64, 8 warps
-        - M <= 2048: 128x64x64, 8 warps
-        - M  > 2048: 128x64x64, 4 warps -- best balance between
-          per-CTA work and GPU fill at large batch.
-    * Fused SwiGLU paths (``DO_SWIGLU=True``):
-        - all M: 64x64x32, 4 warps
-        Doubled BLOCK_N for the gate||linear concat would burn too
-        many VGPRs given SwiGLU's reduce; the small-tile choice gives
-        more grid_m parallelism and beats the upstream baseline.
+    * **Dense gating GEMM** (``do_swiglu=False, ragged=False``).
+      Output ``N=128`` (``num_local_experts``) so we keep ``BLOCK_N=64``
+      to give us ``grid_n=2`` and rely on growing ``grid_m`` for fill:
+        - M <= 1024 : 64x64x64,  8 warps  (decode + small prefill)
+        - M <= 2048 : 128x64x64, 8 warps
+        - M  > 2048 : 128x64x64, 4 warps  (prefill, more CTAs)
+
+    * **Fused SwiGLU 1st GEMM** (``do_swiglu=True``). Internal
+      ``BLOCK_N`` covers the ``gate || linear`` width (``2*OUT_BLOCK_N``);
+      ``BLOCK_K=32`` keeps VGPR pressure for the swiglu reduce manageable:
+        - M <= 8192 :  64x128x32, 4 warps
+        - M  > 8192 : 128x128x32, 4 warps
+
+    * **Ragged 2nd GEMM + scatter combine** (``ragged=True``).
+      Same per-tile MFMA flow as the gating GEMM but with E experts'
+      worth of CTAs in the launch grid; benefits from larger blocks at
+      prefill scale to amortise scatter epilogue:
+        - M <= 8192 :  64x128x32, 4 warps
+        - M  > 8192 : 128x128x32, 4 warps  (256x256 saturates VGPRs
+          on MI355 -> spills; 128x128 stays under the 256-VGPR limit
+          while still hitting 273 TFLOPs).
     """
     if do_swiglu:
-        return 64, 64, 32, 4
+        if M <= 8192:
+            return 64, 128, 32, 4
+        return 128, 128, 32, 4
+    if ragged:
+        if M <= 8192:
+            return 64, 128, 32, 4
+        return 128, 128, 32, 4
     if M <= 1024:
         return 64, 64, 64, 8
     if M <= 2048:
@@ -816,7 +864,9 @@ def gluon_bf16_combine(
     N = w.shape[-1]
     if n_tokens is None:
         n_tokens = M
-    bm, bn, bk, nw = _autotune_block(M, N, w.shape[-2])
+    bm, bn, bk, nw = _autotune_block(
+        M, N, w.shape[-2], ragged=a_ragged_metadata is not None
+    )
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
@@ -893,8 +943,20 @@ def _gluon_bf16_ragged_matmul(
     M = x.shape[-2]
     if w.ndim == 3:
         N = w.shape[-1]
+        K = w.shape[-2]
     else:
-        N = w.shape[-1]
+        K, N = w.shape
+
+    # Apply the shape-aware autotune if the caller did not pin block sizes.
+    if (
+        block_m == _DEFAULT_BLOCK_M
+        and block_n == _DEFAULT_BLOCK_N
+        and block_k == _DEFAULT_BLOCK_K
+    ):
+        bm, bn, bk, nw = _autotune_block(M, N, K, ragged=a_ragged_metadata is not None)
+        block_m, block_n, block_k = bm, bn, bk
+        if num_warps == _DEFAULT_NUM_WARPS:
+            num_warps = nw
 
     out_dtype = (precision_config.out_dtype if precision_config else None) or x.dtype
     if scatter_indx is not None:

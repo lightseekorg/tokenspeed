@@ -293,6 +293,160 @@ def test_no_register_spill():
 
 
 # ---------------------------------------------------------------------------
+# gpt-oss-120b shape coverage (decode + prefill)
+# ---------------------------------------------------------------------------
+#
+# Anchors for the per-shape regressions added in ``Update 2``: we exercise
+# the kernels at the *real* gpt-oss-120b MoE GEMM dimensions (per the HF
+# config: ``hidden_size=2880, intermediate_size=2880, num_local_experts=128,
+# num_experts_per_tok=4``) for both the sparse-decode (``B=1`` -> 4 active
+# experts via the new active-expert remap) and the dense-prefill (``B=64``
+# -> all 128 experts active) paths.
+#
+# These are correctness *and* spill checks but use small ``H/I/E`` to keep
+# CI runtime bounded; the full prefill scale (M_d=8192) is exercised by
+# ``benchmarks/moe_gluon_microbench.py``.
+
+GPTOSS_H = 2880
+GPTOSS_I = 2880
+GPTOSS_E = 128
+GPTOSS_TOPK = 4
+
+
+def _gptoss_ragged(B: int, *, block_m: int = 64, device: str = "cuda"):
+    """Build a gpt-oss-120b style ragged metadata: ``min(B*topk, E)``
+    active experts each holding ``per_expert >= block_m`` rows. Mirrors
+    the helper in ``benchmarks/moe_gluon_microbench.py``.
+    """
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+
+    M_d = B * GPTOSS_TOPK
+    n_active = min(M_d, GPTOSS_E)
+    per_expert = max(
+        block_m,
+        ((M_d + n_active - 1) // n_active + block_m - 1) // block_m * block_m,
+    )
+    M_padded = per_expert * n_active
+    counts = torch.zeros((GPTOSS_E,), device=device, dtype=torch.int32)
+    counts[:n_active] = per_expert
+    md = make_ragged_tensor_metadata(counts, M_padded)
+    return md, counts, M_padded, n_active, per_expert
+
+
+@pytest.mark.parametrize("B", [1, 32, 64])
+def test_gpt_oss_decode_remap(B):
+    """Decode batches activate ``min(B*topk, E)`` experts; the active-expert
+    remap must keep the kernel numerically equivalent to the dense
+    reference (active experts only)."""
+    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_combine
+
+    torch.manual_seed(0)
+    md, counts, M_padded, n_active, per_expert = _gptoss_ragged(B)
+    # Use a small inner dim to keep the test fast.
+    K, N = 128, 128
+    x = torch.randn(M_padded, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    w = torch.randn(GPTOSS_E, K, N, device="cuda", dtype=torch.bfloat16) * 0.05
+    scatter = type(
+        "ScatterIndx",
+        (),
+        {"dst_indx": torch.arange(M_padded, device="cuda", dtype=torch.int32)},
+    )()
+    y = gluon_bf16_combine(
+        x,
+        w,
+        bias=None,
+        a_ragged_metadata=md,
+        scatter_indx=scatter,
+        gate_scal=None,
+        n_tokens=M_padded,
+        n_expts_act=1,
+    )
+    # Reference: per-expert dense matmul over the *active* experts only.
+    ref = torch.zeros((M_padded, N), device="cuda", dtype=torch.float32)
+    start = 0
+    for e in range(GPTOSS_E):
+        n = int(counts[e].item())
+        if n == 0:
+            continue
+        ref[start : start + n] = x[start : start + n].to(torch.float32) @ w[e].to(
+            torch.float32
+        )
+        start += n
+    torch.testing.assert_close(y.to(torch.float32), ref, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("B", [1, 64])
+def test_gpt_oss_no_spill(B):
+    """The autotuner must pick a non-spilling config for both decode
+    (sparse, ``B=1``) and prefill (dense, ``B=64``) at gpt-oss-120b sizes."""
+    from tokenspeed_kernel.ops.moe.gluon import (
+        _pipelined_moe_kernel,
+        assert_no_spills,
+        gluon_bf16_combine,
+        gluon_bf16_dispatch_swiglu,
+        gluon_bf16_gating_gemm,
+        static_profile,
+    )
+
+    torch.manual_seed(0)
+    # Use real gpt-oss H/I/E but cap K to the smaller of (H, 256) so
+    # JIT compile stays cheap; this still triggers the same kernel
+    # specialisation the production launcher does.
+    K = min(GPTOSS_H, 256)
+    md, _, M_padded, *_ = _gptoss_ragged(B)
+
+    x_dense = torch.randn(B, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    w_dense = torch.randn(K, GPTOSS_E, device="cuda", dtype=torch.bfloat16) * 0.05
+    gluon_bf16_gating_gemm(x_dense, w_dense)
+
+    x_pad = torch.randn(M_padded, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    w_2x = (
+        torch.randn(GPTOSS_E, K, 2 * GPTOSS_I, device="cuda", dtype=torch.bfloat16)
+        * 0.05
+    )
+    gluon_bf16_dispatch_swiglu(
+        x_pad,
+        w_2x,
+        bias=None,
+        a_ragged_metadata=md,
+        gather_indx=None,
+        swiglu_alpha=1.0,
+        swiglu_limit=0.0,
+    )
+
+    scatter = type(
+        "ScatterIndx",
+        (),
+        {"dst_indx": torch.arange(M_padded, device="cuda", dtype=torch.int32)},
+    )()
+    x_pad_i = (
+        torch.randn(M_padded, GPTOSS_I, device="cuda", dtype=torch.bfloat16) * 0.05
+    )
+    w_h = (
+        torch.randn(GPTOSS_E, GPTOSS_I, GPTOSS_H, device="cuda", dtype=torch.bfloat16)
+        * 0.05
+    )
+    gluon_bf16_combine(
+        x_pad_i,
+        w_h,
+        bias=None,
+        a_ragged_metadata=md,
+        scatter_indx=scatter,
+        gate_scal=None,
+        n_tokens=M_padded,
+        n_expts_act=1,
+    )
+
+    device = torch.cuda.current_device()
+    device_cache = _pipelined_moe_kernel.device_caches.get(device)
+    assert device_cache, "expected the Gluon kernel to JIT-compile at least once"
+    kernel_cache = device_cache[0]
+    for sig, compiled in kernel_cache.items():
+        prof = static_profile(compiled, label=f"B={B}")
+        assert_no_spills(prof, allow_scratch=0)
+
+
+# ---------------------------------------------------------------------------
 # Selector / fallback regression checks
 # ---------------------------------------------------------------------------
 

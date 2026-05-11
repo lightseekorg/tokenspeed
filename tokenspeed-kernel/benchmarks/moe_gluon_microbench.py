@@ -20,17 +20,35 @@
 
 """Micro-benchmark for the three MI355 Gluon MoE kernels.
 
-Compares each Gluon kernel against its upstream
-``triton_kernels.matmul`` / ``triton_kernels.swiglu`` baseline on
-representative shapes:
+The shapes are derived from the gpt-oss-120b (mxfp4 weight + fp8 act)
+HF model card (https://huggingface.co/amd/gpt-oss-120b-w-mxfp4-a-fp8):
 
-* ``gluon_bf16_gating_gemm``      vs ``torch.matmul`` / triton_kernels matmul
-* ``gluon_bf16_dispatch_swiglu``  vs ``triton_kernels.matmul + swiglu``
-* ``gluon_bf16_combine``          vs ``triton_kernels.matmul`` (scatter combine)
+  hidden_size            H  = 2880   ( = K for both MoE GEMMs )
+  intermediate_size      I  = 2880   ( = N for the 1st GEMM,
+                                      = K for the 2nd GEMM       )
+  num_local_experts      E  = 128
+  num_experts_per_tok    K  = 4
 
-The script also dumps the static GPR / spill profile per kernel
-(``static_profile``) so we can confirm at a glance that no spills sneak
-in across configuration changes.
+For each batch_size ``B`` (token count -- 1/32/64 cover decode,
+1024/4096/8192 cover prefill / chunked prefill) we compare the three
+Gluon kernels against their upstream baselines:
+
+  * Kernel 1 (router gating): GEMM ``(B, H) x (H, E)``  vs upstream
+    ``triton_kernels.matmul`` and ``torch.matmul``.
+  * Kernel 2 (dispatch + 1st GEMM + SwiGLU): per-expert GEMM
+    ``(M_d, H) x (E, H, 2I) -> SwiGLU -> (M_d, I)`` vs upstream
+    ``triton_kernels.matmul`` with ``FusedActivation(swiglu_fn)``.
+  * Kernel 3 (2nd GEMM + scatter combine): per-expert GEMM
+    ``(M_d, I) x (E, I, H)`` followed by scatter combine, vs upstream
+    ``triton_kernels.matmul`` with ``scatter_indx``.
+
+For decode batch sizes only ``min(B*topk, E)`` experts are active, so
+the ragged metadata is built with that exact number of active experts;
+prefill batch sizes saturate all ``E`` experts.
+
+The script also dumps the static GPR / spill profile per Gluon kernel
+(``static_profile``) so any regression that introduces sgpr/vgpr spills
+fails loudly.
 """
 
 from __future__ import annotations
@@ -38,10 +56,16 @@ from __future__ import annotations
 import argparse
 import time
 
-import tokenspeed_kernel  # noqa: F401  (pre-import; see test header)
+import tokenspeed_kernel  # noqa: F401  (import order: kernel before torch)
 import torch
 
 DEVICE = "cuda"
+
+# gpt-oss-120b architecture (per HF model card ``config.json``).
+GPTOSS_HIDDEN = 2880
+GPTOSS_INTERMEDIATE = 2880
+GPTOSS_NUM_EXPERTS = 128
+GPTOSS_TOPK = 4
 
 
 def _bench(fn, *, warmup=10, rep=50, sync=True) -> float:
@@ -57,61 +81,89 @@ def _bench(fn, *, warmup=10, rep=50, sync=True) -> float:
     return (time.perf_counter() - t0) / rep * 1e3  # ms
 
 
-def _build_ragged(M, E, *, block_m=128):
-    from triton_kernels.tensor import make_ragged_tensor_metadata
-
-    per_expert = max(block_m, (M // E) // block_m * block_m)
-    M_padded = per_expert * E
-    counts = torch.full((E,), per_expert, device=DEVICE, dtype=torch.int32)
-    md = make_ragged_tensor_metadata(counts, M_padded)
-    return md, M_padded
-
-
 def _bf16_tensor(*shape):
     return torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16) * 0.05
 
 
 # ---------------------------------------------------------------------------
-# Kernel 1: bf16 gating GEMM
+# Ragged metadata helpers
 # ---------------------------------------------------------------------------
 
 
-def bench_gating_gemm(M, N, K, *, warmup=10, rep=50):
-    """Compare Gluon dense GEMM to triton's @triton.jit upstream matmul.
+def _round_up(x: int, m: int) -> int:
+    return ((x + m - 1) // m) * m
 
-    For the gating projection the upstream baseline is whatever comes
-    out of ``select_kernel("gemm", "mm", ...)`` -- on AMD this is the
-    triton-compiled ``triton.py`` GEMM. We avoid torch.matmul (rocBLAS)
-    here because that's an entirely separate optimisation track; the
-    user-facing TASK question is "does Gluon beat the upstream Triton
-    bf16 GEMM" rather than "does Gluon beat rocBLAS".
+
+def _moe_active_layout(
+    B: int,
+    *,
+    E: int = GPTOSS_NUM_EXPERTS,
+    topk: int = GPTOSS_TOPK,
+    block_m: int = 64,
+):
+    """Return ``(n_active_experts, per_expert_M, M_padded)`` consistent
+    with how the ragged metadata is constructed inside the gpt-oss-120b
+    inference path.
+
+    For *decode* (small B) only ``min(B*topk, E)`` experts ever see a
+    token, so we don't pad zero-token experts -- this matches what the
+    upstream triton_kernels matmul actually sees in production.
+
+    For *prefill* (large B) we assume all ``E`` experts are active and
+    each gets ``ceil(B*topk / E)`` tokens, rounded up to ``block_m`` so
+    the kernel can index them as full tiles.
     """
+    M_dispatched = B * topk
+    n_active = min(M_dispatched, E)
+    per_expert = max(
+        block_m,
+        _round_up((M_dispatched + n_active - 1) // n_active, block_m),
+    )
+    M_padded = per_expert * n_active
+    return n_active, per_expert, M_padded
+
+
+def _build_ragged(B, *, E=GPTOSS_NUM_EXPERTS, topk=GPTOSS_TOPK, block_m=64):
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+
+    n_active, per_expert, M_padded = _moe_active_layout(
+        B, E=E, topk=topk, block_m=block_m
+    )
+    counts = torch.zeros((E,), device=DEVICE, dtype=torch.int32)
+    counts[:n_active] = per_expert
+    md = make_ragged_tensor_metadata(counts, M_padded)
+    return md, M_padded, n_active, per_expert
+
+
+# ---------------------------------------------------------------------------
+# Kernel 1: bf16 gating GEMM   (B, H) x (H, E) -> (B, E)
+# ---------------------------------------------------------------------------
+
+
+def bench_gating_gemm(B, *, H=GPTOSS_HIDDEN, E=GPTOSS_NUM_EXPERTS, warmup=10, rep=50):
     from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_gating_gemm
 
-    x = _bf16_tensor(M, K)
-    w = _bf16_tensor(K, N)
+    x = _bf16_tensor(B, H)
+    w = _bf16_tensor(H, E)
 
-    gluon_ms = _bench(
-        lambda: gluon_bf16_gating_gemm(x, w),  # autotuner picks block sizes
-        warmup=warmup,
-        rep=rep,
-    )
-    # Triton kernel baseline = the upstream tokenspeed triton GEMM
-    # (analog of triton_kernels.matmul on a dense 2-D weight).
+    def gluon_call():
+        return gluon_bf16_gating_gemm(x, w)
+
     from triton_kernels.matmul import PrecisionConfig, matmul
 
     def triton_call():
         return matmul(x, w, None, precision_config=PrecisionConfig())
 
+    gluon_ms = _bench(gluon_call, warmup=warmup, rep=rep)
     try:
         triton_ms = _bench(triton_call, warmup=warmup, rep=rep)
     except Exception:
         triton_ms = float("nan")
     torch_ms = _bench(lambda: torch.matmul(x, w), warmup=warmup, rep=rep)
 
-    flops = 2.0 * M * N * K
+    flops = 2.0 * B * E * H
     return {
-        "shape": f"M={M},N={N},K={K}",
+        "shape": f"B={B},H={H},E={E}",
         "gluon_ms": gluon_ms,
         "baseline_ms": triton_ms,
         "torch_ms": torch_ms,
@@ -128,20 +180,27 @@ def bench_gating_gemm(M, N, K, *, warmup=10, rep=50):
 
 # ---------------------------------------------------------------------------
 # Kernel 2: dispatch + 1st GEMM + SwiGLU
+# (M_d, H) x (E, H, 2I) -> SwiGLU -> (M_d, I)
 # ---------------------------------------------------------------------------
 
 
-def bench_dispatch_swiglu(M, N, K, E, *, warmup=10, rep=50):
-    """Compare Gluon dispatch+swiglu to the upstream triton_kernels MoE
-    GEMM with the same fused-activation epilogue."""
+def bench_dispatch_swiglu(
+    B,
+    *,
+    H=GPTOSS_HIDDEN,
+    I=GPTOSS_INTERMEDIATE,
+    E=GPTOSS_NUM_EXPERTS,
+    topk=GPTOSS_TOPK,
+    warmup=10,
+    rep=50,
+):
     from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_dispatch_swiglu
 
-    md, M_padded = _build_ragged(M, E, block_m=128)
-    x = _bf16_tensor(M_padded, K)
-    w = _bf16_tensor(E, K, 2 * N)
+    md, M_padded, n_active, per_expert = _build_ragged(B, E=E, topk=topk, block_m=64)
+    x = _bf16_tensor(M_padded, H)
+    w = _bf16_tensor(E, H, 2 * I)
 
     def gluon_call():
-        # Defaults trigger the SwiGLU-aware autotuner (BLOCK_N=64).
         return gluon_bf16_dispatch_swiglu(
             x,
             w,
@@ -153,10 +212,6 @@ def bench_dispatch_swiglu(M, N, K, E, *, warmup=10, rep=50):
         )
 
     def baseline_call():
-        # The most apples-to-apples baseline is the upstream
-        # triton_kernels.matmul which is what we'd otherwise dispatch to.
-        # We feed the SAME ragged metadata so per-expert fan-out is
-        # identical.
         from triton_kernels.matmul import (
             FusedActivation,
             PrecisionConfig,
@@ -181,15 +236,18 @@ def bench_dispatch_swiglu(M, N, K, E, *, warmup=10, rep=50):
     try:
         gluon_ms = _bench(gluon_call, warmup=warmup, rep=rep)
     except Exception as e:
-        return {"shape": f"M={M_padded},N={N}*2,K={K},E={E}", "error": str(e)}
+        return {
+            "shape": (f"B={B},M_d={M_padded},I={I},H={H},E_act={n_active}/{E}"),
+            "error": str(e),
+        }
     try:
         baseline_ms = _bench(baseline_call, warmup=warmup, rep=rep)
-    except Exception as e:
+    except Exception:
         baseline_ms = float("nan")
 
-    flops = 2.0 * M_padded * (2 * N) * K + 2.0 * M_padded * N
+    flops = 2.0 * M_padded * (2 * I) * H + 2.0 * M_padded * I  # GEMM + SwiGLU
     return {
-        "shape": f"M={M_padded},N={N}*2,K={K},E={E}",
+        "shape": f"B={B},M_d={M_padded},I={I},H={H},E_act={n_active}/{E}",
         "gluon_ms": gluon_ms,
         "baseline_ms": baseline_ms,
         "gluon_tflops": flops / (gluon_ms * 1e-3) / 1e12,
@@ -202,17 +260,25 @@ def bench_dispatch_swiglu(M, N, K, E, *, warmup=10, rep=50):
 
 # ---------------------------------------------------------------------------
 # Kernel 3: 2nd GEMM + scatter combine
+# (M_d, I) x (E, I, H) -> scatter -> (B, H)
 # ---------------------------------------------------------------------------
 
 
-def bench_combine(M, N, K, E, *, warmup=10, rep=50):
-    """Compare Gluon scatter-combine to the upstream triton_kernels MoE
-    GEMM with the same scatter epilogue."""
+def bench_combine(
+    B,
+    *,
+    H=GPTOSS_HIDDEN,
+    I=GPTOSS_INTERMEDIATE,
+    E=GPTOSS_NUM_EXPERTS,
+    topk=GPTOSS_TOPK,
+    warmup=10,
+    rep=50,
+):
     from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_combine
 
-    md, M_padded = _build_ragged(M, E, block_m=128)
-    x = _bf16_tensor(M_padded, K)
-    w = _bf16_tensor(E, K, N)
+    md, M_padded, n_active, per_expert = _build_ragged(B, E=E, topk=topk, block_m=64)
+    x = _bf16_tensor(M_padded, I)
+    w = _bf16_tensor(E, I, H)
     scatter_indx = type(
         "ScatterIndx",
         (),
@@ -229,12 +295,8 @@ def bench_combine(M, N, K, E, *, warmup=10, rep=50):
             gate_scal=None,
             n_tokens=M_padded,
             n_expts_act=1,
-            block_m=128,
-            block_n=128,
-            block_k=64,
         )
 
-    # The upstream API takes ``scatter_indx`` as a plain tensor.
     upstream_scatter = scatter_indx.dst_indx
 
     def baseline_call():
@@ -252,15 +314,18 @@ def bench_combine(M, N, K, E, *, warmup=10, rep=50):
     try:
         gluon_ms = _bench(gluon_call, warmup=warmup, rep=rep)
     except Exception as e:
-        return {"shape": f"M={M_padded},N={N},K={K},E={E}", "error": str(e)}
+        return {
+            "shape": (f"B={B},M_d={M_padded},H={H},I={I},E_act={n_active}/{E}"),
+            "error": str(e),
+        }
     try:
         baseline_ms = _bench(baseline_call, warmup=warmup, rep=rep)
-    except Exception as e:
+    except Exception:
         baseline_ms = float("nan")
 
-    flops = 2.0 * M_padded * N * K
+    flops = 2.0 * M_padded * H * I
     return {
-        "shape": f"M={M_padded},N={N},K={K},E={E}",
+        "shape": f"B={B},M_d={M_padded},H={H},I={I},E_act={n_active}/{E}",
         "gluon_ms": gluon_ms,
         "baseline_ms": baseline_ms,
         "gluon_tflops": flops / (gluon_ms * 1e-3) / 1e12,
@@ -286,46 +351,44 @@ def dump_static_profiles():
         static_profile,
     )
 
-    print("\n=== Static GPR / spill profile ===")
-    M, N, K, E = 512, 256, 256, 4
-    x = _bf16_tensor(M, K)
-    w_dense = _bf16_tensor(K, N)
-    md, M_padded = _build_ragged(M, E)
-    x_pad = _bf16_tensor(M_padded, K)
-    w_moe = _bf16_tensor(E, K, N)
-    w_moe_2x = _bf16_tensor(E, K, 2 * N)
-    scatter = type(
-        "ScatterIndx",
-        (),
-        {"dst_indx": torch.arange(M_padded, device=DEVICE, dtype=torch.int32)},
-    )()
+    print("\n=== Static GPR / spill profile (no spills allowed) ===")
+    # One representative shape per phase: decode B=32, prefill B=1024.
+    for B in (32, 1024):
+        x_dense = _bf16_tensor(B, GPTOSS_HIDDEN)
+        w_dense = _bf16_tensor(GPTOSS_HIDDEN, GPTOSS_NUM_EXPERTS)
+        gluon_bf16_gating_gemm(x_dense, w_dense)
 
-    gluon_bf16_gating_gemm(x, w_dense, block_m=128, block_n=128, block_k=64)
-    gluon_bf16_dispatch_swiglu(
-        x_pad,
-        w_moe_2x,
-        bias=None,
-        a_ragged_metadata=md,
-        gather_indx=None,
-        swiglu_alpha=1.0,
-        swiglu_limit=0.0,
-        block_m=128,
-        block_n=128,
-        block_k=64,
-    )
-    gluon_bf16_combine(
-        x_pad,
-        w_moe,
-        bias=None,
-        a_ragged_metadata=md,
-        scatter_indx=scatter,
-        gate_scal=None,
-        n_tokens=M_padded,
-        n_expts_act=1,
-        block_m=128,
-        block_n=128,
-        block_k=64,
-    )
+        md, M_padded, *_ = _build_ragged(B, block_m=64)
+        x_pad = _bf16_tensor(M_padded, GPTOSS_HIDDEN)
+        w_moe_2x = _bf16_tensor(
+            GPTOSS_NUM_EXPERTS, GPTOSS_HIDDEN, 2 * GPTOSS_INTERMEDIATE
+        )
+        gluon_bf16_dispatch_swiglu(
+            x_pad,
+            w_moe_2x,
+            bias=None,
+            a_ragged_metadata=md,
+            gather_indx=None,
+            swiglu_alpha=1.0,
+            swiglu_limit=0.0,
+        )
+        scatter = type(
+            "ScatterIndx",
+            (),
+            {"dst_indx": torch.arange(M_padded, device=DEVICE, dtype=torch.int32)},
+        )()
+        x_pad_i = _bf16_tensor(M_padded, GPTOSS_INTERMEDIATE)
+        w_moe = _bf16_tensor(GPTOSS_NUM_EXPERTS, GPTOSS_INTERMEDIATE, GPTOSS_HIDDEN)
+        gluon_bf16_combine(
+            x_pad_i,
+            w_moe,
+            bias=None,
+            a_ragged_metadata=md,
+            scatter_indx=scatter,
+            gate_scal=None,
+            n_tokens=M_padded,
+            n_expts_act=1,
+        )
 
     device = torch.cuda.current_device()
     device_cache = _pipelined_moe_kernel.device_caches.get(device)
@@ -333,13 +396,22 @@ def dump_static_profiles():
         print("  no Gluon kernel cached -- did the launches fail?")
         return
     kernel_cache = device_cache[0]
+    bad = 0
     for sig, compiled in kernel_cache.items():
         prof = static_profile(compiled)
+        spill = (
+            prof["sgpr_spill_count"] + prof["vgpr_spill_count"] + prof["ScratchSize"]
+        )
+        marker = "OK   " if spill == 0 else "SPILL"
+        if spill > 0:
+            bad += 1
         print(
-            f"  - sgpr={prof['sgpr_count']} (spill={prof['sgpr_spill_count']}) "
-            f"vgpr={prof['vgpr_count']} (spill={prof['vgpr_spill_count']}) "
+            f"  [{marker}] sgpr={prof['sgpr_count']:3d} (spill={prof['sgpr_spill_count']}) "
+            f"vgpr={prof['vgpr_count']:3d} (spill={prof['vgpr_spill_count']}) "
             f"scratch={prof['ScratchSize']} occupancy={prof['Occupancy']}"
         )
+    if bad:
+        raise SystemExit(f"{bad} kernel(s) reported spill -- aborting")
 
 
 # ---------------------------------------------------------------------------
@@ -347,67 +419,65 @@ def dump_static_profiles():
 # ---------------------------------------------------------------------------
 
 
-_GATING_SHAPES = [
-    (512, 1024, 2880),
-    (1024, 1024, 2880),
-    (4096, 1024, 2880),
-]
-_DISPATCH_SHAPES = [
-    # (M_dispatched, N_intermediate, K_hidden, E)
-    (512, 1024, 2880, 4),
-    (1024, 1024, 2880, 4),
-]
-_COMBINE_SHAPES = [
-    (512, 2880, 1024, 4),
-    (1024, 2880, 1024, 4),
-]
+# gpt-oss-120b deployment scenarios (per ``task-progress-1.md``):
+#   decode  : single-token / very small batch -> B in {1, 32, 64}
+#   prefill : full / chunked prefill          -> B in {1024, 4096, 8192}
+GPTOSS_BATCHES = (1, 32, 64, 1024, 4096, 8192)
+
+
+def _print_row(r):
+    if "error" in r:
+        print(f"  {r['shape']:55s}  ERROR: {r['error'][:80]}")
+        return
+    extras = ""
+    if "torch_tflops" in r:
+        extras = f"torch.mm={r['torch_tflops']:7.1f} TFLOPs ({r['torch_ms']:.3f} ms)  "
+    print(
+        f"  {r['shape']:55s} "
+        f"gluon={r['gluon_tflops']:7.1f} TFLOPs ({r['gluon_ms']:.3f} ms)  "
+        f"baseline={r['baseline_tflops']:7.1f} TFLOPs ({r['baseline_ms']:.3f} ms)  "
+        f"{extras}"
+        f"speedup={r['speedup']:.2f}x"
+    )
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=50)
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=list(GPTOSS_BATCHES),
+        help=(
+            "Token-batch dimensions to sweep " "(default: gpt-oss-120b decode+prefill)."
+        ),
+    )
     parser.add_argument("--no-static", action="store_true")
     args = parser.parse_args()
 
-    print("=" * 80)
-    print("Kernel 1: bf16 gating GEMM (Gluon vs upstream triton_kernels)")
-    print("=" * 80)
-    for M, N, K in _GATING_SHAPES:
-        r = bench_gating_gemm(M, N, K, warmup=args.warmup, rep=args.rep)
-        print(
-            f"  {r['shape']:30s} "
-            f"gluon={r['gluon_tflops']:6.1f} TFLOPs ({r['gluon_ms']:.3f} ms)  "
-            f"triton_kernels={r['baseline_tflops']:6.1f} TFLOPs ({r['baseline_ms']:.3f} ms)  "
-            f"torch.mm={r['torch_tflops']:6.1f} TFLOPs ({r['torch_ms']:.3f} ms)  "
-            f"speedup_vs_triton={r['speedup']:.2f}x"
-        )
+    print("=" * 110)
+    print(
+        f"gpt-oss-120b moe shapes: H={GPTOSS_HIDDEN}, I={GPTOSS_INTERMEDIATE}, "
+        f"E={GPTOSS_NUM_EXPERTS}, topk={GPTOSS_TOPK}"
+    )
+    print("=" * 110)
 
-    print()
-    print("=" * 80)
-    print("Kernel 2: dispatch + 1st GEMM + SwiGLU")
-    print("=" * 80)
-    for M, N, K, E in _DISPATCH_SHAPES:
-        r = bench_dispatch_swiglu(M, N, K, E, warmup=args.warmup, rep=args.rep)
-        print(
-            f"  {r['shape']:30s} "
-            f"gluon={r['gluon_tflops']:6.1f} TFLOPs ({r['gluon_ms']:.3f} ms)  "
-            f"baseline={r['baseline_tflops']:6.1f} TFLOPs ({r['baseline_ms']:.3f} ms)  "
-            f"speedup={r['speedup']:.2f}x"
-        )
+    print("\nKernel 1: bf16 gating GEMM  (B, H) x (H, E)")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_row(bench_gating_gemm(B, warmup=args.warmup, rep=args.rep))
 
-    print()
-    print("=" * 80)
-    print("Kernel 3: 2nd GEMM + scatter combine")
-    print("=" * 80)
-    for M, N, K, E in _COMBINE_SHAPES:
-        r = bench_combine(M, N, K, E, warmup=args.warmup, rep=args.rep)
-        print(
-            f"  {r['shape']:30s} "
-            f"gluon={r['gluon_tflops']:6.1f} TFLOPs ({r['gluon_ms']:.3f} ms)  "
-            f"baseline={r['baseline_tflops']:6.1f} TFLOPs ({r['baseline_ms']:.3f} ms)  "
-            f"speedup={r['speedup']:.2f}x"
-        )
+    print("\nKernel 2: dispatch + 1st GEMM + SwiGLU  (M_d, H) x (E, H, 2I)")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_row(bench_dispatch_swiglu(B, warmup=args.warmup, rep=args.rep))
+
+    print("\nKernel 3: 2nd GEMM + scatter combine  (M_d, I) x (E, I, H)")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_row(bench_combine(B, warmup=args.warmup, rep=args.rep))
 
     if not args.no_static:
         dump_static_profiles()

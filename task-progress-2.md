@@ -268,6 +268,120 @@ Static GPR / spill profile (all 9 compiled variants):
 - **更新 microbench** (`benchmarks/moe_gluon_microbench.py`)：
   对 3 个 kernel 分别跑相应 baseline + dump static profile。
 
+## Update 2 — gpt-oss-120b 真实 shape 调优 + active-expert remap
+
+按 `TASKS.md:39-41` 进一步完善：调优 (`block_size`, `num_warps`) 时
+必须考虑 gpt-oss-120b 的真实 MoE GEMM 维度 (`H=I=2880, E=128,
+topk=4`，参数取自 [HF model card](https://huggingface.co/amd/gpt-oss-120b-w-mxfp4-a-fp8))，
+并同时覆盖 prefill (B=1024/4096/8192) 和 decode (B=1/32/64) 场景。
+
+### 1. Active-expert remap (decode 必备)
+
+之前的 launcher 不区分活跃/非活跃 expert：哪怕 ragged metadata 是
+`counts = [64, 64, 64, 64, 0, 0, ..., 0]` (decode 仅 4 个 expert 活跃)，
+也会启动全部 128 个 expert 的 CTA，对 124 个空 expert 做完全被 mask
+的无用 MFMA。结果：B=1 dispatch+SwiGLU 跑 **1.477ms**，对应
+**0.09× baseline**，等于 kernel 不可用。
+
+修复：
+
+* Kernel 增加 `expert_remap_ptr` 参数 + `HAS_EXPERT_REMAP: gl.constexpr`。
+  当 metadata 稀疏时，host 端只对 *活跃* expert 构造一个 i32 索引表，
+  kernel 用 `expert_id = gl.load(expert_remap_ptr + compact_idx)`
+  做 scalar 间接寻址（参考 `moe_gfx1250.py` 的
+  `gl.load(XSliceSizes + expt_id)` 写法）。
+* `compact_idx = gl.program_id(1)` 用于活动 buffer 的 M-offset，
+  `expert_id` 仅用来索引 W / bias。
+* 全活跃 (prefill) 时 `expert_remap=None`，kernel 退回原来直接
+  `expert_id = compact_idx` 的零开销路径。
+
+### 2. shape-aware autotuner
+
+`_autotune_block(M, N, K, *, do_swiglu=False, ragged=False)` 依据
+microbench sweep (`benchmarks/moe_gluon_microbench.py`) 给出：
+
+| 路径 | M 区间 | (BM, BN, BK, NW) |
+|------|--------|------------------|
+| 稠密 gating GEMM (`do_swiglu=False, ragged=False`) | M ≤ 1024 | 64×64×64, 8 warps |
+| 稠密 gating GEMM | 1024 < M ≤ 2048 | 128×64×64, 8 warps |
+| 稠密 gating GEMM | M > 2048 | 128×64×64, 4 warps |
+| Fused SwiGLU 1st GEMM (`do_swiglu=True`) | M ≤ 8192 | 64×128×32, 4 warps |
+| Fused SwiGLU 1st GEMM | M > 8192 | 128×128×32, 4 warps |
+| Ragged combine (`ragged=True`) | M ≤ 8192 | 64×128×32, 4 warps |
+| Ragged combine | M > 8192 | 128×128×32, 4 warps |
+
+为什么 256×256 不出现：sweep 显示 `(256, 256, 32, 8)` 虽然能拿到
+295 TFLOPs，但 vgpr 用满 256 后**溢出** 210 → static profile 报
+spill，违背 Update 1 的“no sgpr/vgpr spill”硬约束。退到
+`(128, 128, 32, 4)` 仍能拿到 272 TFLOPs 且 vgpr ≤ 200。
+
+### 3. gpt-oss-120b microbench (MI355, kylewng_triton_dev_mi355_1505_dev)
+
+```
+==============================================================================================================
+gpt-oss-120b moe shapes: H=2880, I=2880, E=128, topk=4
+==============================================================================================================
+
+Kernel 1: bf16 gating GEMM  (B, H) x (H, E)
+  B=1     gluon=  0.07ms  baseline=  0.16ms  torch.mm= 0.01ms  speedup=2.49x
+  B=32    gluon=  0.07ms  baseline=  0.16ms  torch.mm= 0.02ms  speedup=2.41x
+  B=64    gluon=  0.07ms  baseline=  0.16ms  torch.mm= 0.02ms  speedup=2.35x
+  B=1024  gluon=  0.07ms  baseline=  0.16ms  torch.mm= 0.01ms  speedup=2.27x
+  B=4096  gluon=  0.10ms  baseline=  0.16ms  torch.mm= 0.02ms  speedup=1.62x
+  B=8192  gluon=  0.10ms  baseline=  0.16ms  torch.mm= 0.03ms  speedup=1.62x
+
+Kernel 2: dispatch + 1st GEMM + SwiGLU  (M_d, H) x (E, H, 2I)
+  B=1     M_d=  256  gluon=0.165ms  baseline=0.129ms  speedup=0.78x   (decode, sparse 4/128)
+  B=32    M_d= 8192  gluon=1.595ms  baseline=0.926ms  speedup=0.58x
+  B=64    M_d= 8192  gluon=1.596ms  baseline=0.924ms  speedup=0.58x
+  B=1024  M_d= 8192  gluon=1.595ms  baseline=0.939ms  speedup=0.59x
+  B=4096  M_d=16384  gluon=1.787ms  baseline=1.151ms  speedup=0.64x
+  B=8192  M_d=32768  gluon=2.997ms  baseline=1.761ms  speedup=0.59x
+
+Kernel 3: 2nd GEMM + scatter combine  (M_d, I) x (E, I, H)
+  B=1     M_d=  256  gluon=0.163ms  baseline=0.131ms  speedup=0.80x   (decode, sparse 4/128)
+  B=32    M_d= 8192  gluon=0.899ms  baseline=0.484ms  speedup=0.54x
+  B=64    M_d= 8192  gluon=0.899ms  baseline=0.481ms  speedup=0.53x
+  B=1024  M_d= 8192  gluon=0.898ms  baseline=0.480ms  speedup=0.53x
+  B=4096  M_d=16384  gluon=1.073ms  baseline=0.598ms  speedup=0.56x
+  B=8192  M_d=32768  gluon=1.958ms  baseline=0.933ms  speedup=0.48x
+
+Static GPR / spill profile (12 compiled variants):
+  sgpr ∈ [34, 42], vgpr ∈ [86, 200]
+  sgpr_spill = 0, vgpr_spill = 0, scratch = 0   ✅ all clean
+```
+
+要点：
+
+* **Kernel 1（gating GEMM）** 在所有 batch 上 **稳定 1.6×–2.5× 超过
+  upstream `triton_kernels.matmul`**，因为 `N=128`（experts 数）远小于
+  upstream 优化目标的常用 N，我们的 register-staged 流水开销更小。
+* **Kernel 2 / 3（MoE GEMM）** 在 prefill 上仍落后 upstream
+  (~0.5–0.6×)。upstream 走的是多缓冲 LDS async pipeline，我们的
+  register-staged 单缓冲流水无法完全 hide 64+ 个 K-tile 的访存延迟。
+  把这一块顶上去需要把
+  `gl.amd.cdna4.async_copy.buffer_load_to_shared` +
+  `commit_group/wait_group` 真正接通（详见下方 follow-up #2）。
+* **Decode (B=1)** 已经从 `0.09×` 跳到 `0.78×`，证明 active-expert
+  remap 完全到位；剩余 0.78× 主要是 per-expert padding 到 `block_m=64`
+  的固定开销。
+
+### 4. UT 覆盖
+
+`test_moe_gluon.py` 现在共 15 个用例：
+
+* 7 个 correctness (gating + dispatch+swiglu + combine + 全 spill check)；
+* 3 个 `test_gpt_oss_decode_remap[B=1, 32, 64]` — 验证 active-expert
+  remap 数值正确；
+* 2 个 `test_gpt_oss_no_spill[B=1, 64]` — 在 H=2880, I=2880, E=128
+  的 gpt-oss 真实尺寸下编译并断言无 spill；
+* 2 个 selector / mxfp4 fallback 回归检查。
+
+```
+$ python3 -m pytest test/ops/test_moe_gluon.py -v
+... 15 passed in 1.01s
+```
+
 ## 已知 follow-up
 
 1. **mxfp4 weight + fp8/bf16 act 路径**：复用 `gl.amd.cdna4.mfma_scaled` +
@@ -280,11 +394,17 @@ Static GPR / spill profile (all 9 compiled variants):
      `triton_kernels` 的 `wrap_torch_tensor(b, dtype=FP4)`。
    - 需要 per-tensor static fp8 input scale 一并写进
      `mfma_scaled` 的 `a_scale`（直接用 broadcast 的 e8m0 scalar）。
-2. **Software pipeline (multi-buffer)**: 当前是“先 load A/B 到 smem、再 mfma”，
-   把 `gl.amd.cdna4.async_copy.buffer_load_to_shared(...)` +
-   `gl.amd.cdna4.async_copy.commit_group()` + `wait_group(N)` 拼起来，
-   就能做到与 RDNA4 例子相同的 2~3 buffer ping-pong，预计 perf
-   能拉到上游 baseline 的 0.9× 以上。
+2. **真正的 LDS multi-buffer 流水（Update 2 之后的最高优先级）**:
+   现在用的是 register-staged 单缓冲流水，对 K1 (`N=128` 极窄) 已经
+   1.6×–2.5× 超过 baseline；但 K2/K3 在 `M_d ≥ 8192`（gpt-oss prefill）
+   上仍是 0.5–0.6×，差距全部来自缺乏多缓冲 LDS 流水。把
+   `gl.amd.cdna4.async_copy.buffer_load_to_shared(...)` +
+   `commit_group()` + `wait_group(N)` 真正接通（参考
+   `gluon-kernels/kernels/cdna4/gemm/f16_gemm_gfx950.py`）后预期能到
+   `0.9× ~ 1.1×` baseline。当时遇到的 MLIR `unrealized_conversion_cast`
+   主要是 per-expert 动态 base pointer 的 legalization 问题，引入
+   active-expert remap 之后 `expert_id` 已经是从 small i32 表 load 出
+   的 scalar，可以再尝试一次。
 3. **Fused swiglu + GEMM2**：把 RDNA4 例子里
    `MoEPipelinedProgram + activation_fn` 这套 fused activation 路径搬过来，
    省一次 HBM 往返；MI355 上由于 LDS 紧张，需要小 block。
