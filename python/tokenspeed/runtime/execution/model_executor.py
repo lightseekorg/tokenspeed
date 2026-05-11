@@ -38,7 +38,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
-from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
+from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
