@@ -447,6 +447,96 @@ def test_gpt_oss_no_spill(B):
 
 
 # ---------------------------------------------------------------------------
+# Scaled MFMA / BLOCK_K constraint  (TASKS.md Update 3)
+# ---------------------------------------------------------------------------
+#
+# Per ``TASKS.md`` Update 3, the scaled MFMA op on CDNA4 has instruction
+# shape ``[16, 16, 128]``, so any kernel that swaps in
+# ``gl.amd.cdna4.mfma_scaled`` (mxfp4 weight + fp8 activation path) must
+# respect ``BLOCK_K >= 128`` and ``BLOCK_K % 128 == 0``. These tests
+# pin the autotuner contract today so the constraint can't silently
+# regress when the scaled path lands.
+
+
+@pytest.mark.parametrize(
+    "M,N,K,do_swiglu,ragged",
+    [
+        (32, 128, 2880, False, False),  # decode gating GEMM
+        (8192, 2880, 2880, True, False),  # prefill dispatch+swiglu
+        (8192, 2880, 2880, False, True),  # prefill ragged combine
+        (32768, 2880, 2880, True, False),  # very large prefill
+    ],
+)
+def test_autotune_scaled_mfma_block_k(M, N, K, do_swiglu, ragged):
+    """``_autotune_block(scaled_mfma=True)`` must enforce CDNA4's
+    16x16x128 scaled MFMA shape on ``BLOCK_K``."""
+    from tokenspeed_kernel.ops.moe.gluon import _autotune_block
+
+    bm, bn, bk, nw = _autotune_block(
+        M, N, K, do_swiglu=do_swiglu, ragged=ragged, scaled_mfma=True
+    )
+    assert bk >= 128, f"scaled MFMA needs BLOCK_K >= 128, got {bk}"
+    assert bk % 128 == 0, f"scaled MFMA needs BLOCK_K % 128 == 0, got {bk}"
+    assert bm % 16 == 0, f"BLOCK_M must be a multiple of MFMA M (16), got {bm}"
+
+    # Sanity: ``scaled_mfma=False`` should keep the BK=32/64 fast path.
+    _, _, bk_unscaled, _ = _autotune_block(
+        M, N, K, do_swiglu=do_swiglu, ragged=ragged, scaled_mfma=False
+    )
+    assert bk_unscaled in (
+        32,
+        64,
+    ), f"regular MFMA fast path expects BK in {{32, 64}}, got {bk_unscaled}"
+
+
+def test_launcher_rejects_bad_block_k_for_scaled_mfma():
+    """The launcher must refuse a sub-128 ``BLOCK_K`` when the caller
+    advertises ``scaled_mfma=True`` (catches future mxfp4 mis-wirings)."""
+    from tokenspeed_kernel.ops.moe.gluon import _launch_pipelined
+
+    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match=r"BLOCK_K"):
+        _launch_pipelined(
+            x,
+            w,
+            y=y,
+            bias=None,
+            gather_indx=None,
+            scatter_indx=None,
+            gate_scal=None,
+            a_ragged_metadata=None,
+            swiglu=None,
+            out_block_n=64,
+            block_m=64,
+            block_n=64,
+            block_k=64,
+            num_warps=4,
+            num_buffers=2,
+            scaled_mfma=True,
+        )
+
+
+def test_kernel_compiles_with_block_k_128():
+    """Sanity check that the bf16 kernel still compiles and produces
+    correct output at ``BLOCK_K=128`` (matches the scaled-MFMA floor).
+    Speed-wise this config is slower than the BK=32/64 default for the
+    register-staged pipeline, but we want the *legality* covered so that
+    when we land scaled MFMA the kernel body keeps working at BK=128.
+    """
+    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_gating_gemm
+
+    torch.manual_seed(0)
+    M, N, K = 128, 128, 256
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    w = torch.randn(K, N, device="cuda", dtype=torch.bfloat16) * 0.05
+    y = gluon_bf16_gating_gemm(x, w, block_m=64, block_n=64, block_k=128, num_warps=4)
+    ref = x.to(torch.float32) @ w.to(torch.float32)
+    torch.testing.assert_close(y.to(torch.float32), ref, rtol=5e-2, atol=5e-2)
+
+
+# ---------------------------------------------------------------------------
 # Selector / fallback regression checks
 # ---------------------------------------------------------------------------
 

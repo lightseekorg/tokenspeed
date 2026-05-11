@@ -382,6 +382,87 @@ $ python3 -m pytest test/ops/test_moe_gluon.py -v
 ... 15 passed in 1.01s
 ```
 
+## Update 3 — scaled MFMA (16x16x128) BLOCK_K 约束
+
+按 `TASKS.md:43-45` 加上 CDNA4 scaled MFMA 指令形状对 `BLOCK_K` 的硬约束。
+
+### 1. 约束来源
+
+- 常规 `gl.amd.cdna4.mfma` (CDNA4 MFMA v4)：`instr_shape=[16, 16, 32]`
+  → `BLOCK_K` 任意 32 的倍数都合法。
+- **Scaled** `gl.amd.cdna4.mfma_scaled` (mxfp4 weight + fp8/bf16 act
+  路径)：`instr_shape=[16, 16, 128]`
+  → `BLOCK_K` 必须 ≥ 128 且 `BLOCK_K % 128 == 0`。
+
+参考：`triton-450/python/test/gluon/test_core.py::test_amd_mfma_scaled`
+和 `triton-450/python/triton/experimental/gluon/language/amd/cdna4/__init__.py::mfma_scaled`。
+
+### 2. 改动概要
+
+* `_autotune_block(... , scaled_mfma: bool = False)`：新增第三维度。
+  当 `scaled_mfma=True` 时把 `BLOCK_K` 上提到 ≥ 128 并向上对齐到 128
+  的倍数（同时强制 `BLOCK_M % 16 == 0`，这是 MFMA M 维要求）。
+* `_launch_pipelined(..., scaled_mfma=False)`：新增同名参数 + runtime
+  assertion，保证未来 mxfp4 路径错配 BK 时立刻报 `AssertionError`
+  而不是踩坏 launch。
+* `_MFMA_K = 32` / `_MFMA_SCALED_K = 128` / `_MFMA_M = 16` 常量集中
+  在一处方便后续维护。
+
+### 3. 为什么 bf16 路径不直接全部切 BK=128
+
+直接抬高 `BLOCK_K` 是有诱惑的（更长的内积 = 更少 K-tile 迭代），
+但跑 microbench sweep 后发现 bf16 + 当前 register-staged 单缓冲流水
+在 `BK=128` 下反而**慢 2–3×**：
+
+| 路径 | shape | BK=32 (current) | BK=128 sweep best |
+|------|-------|-----------------|------------------|
+| K2 dispatch+SwiGLU | B=32   M_d=8192  | 170 TFLOPs / 1.60ms | 70 TFLOPs / 3.86ms |
+| K2 dispatch+SwiGLU | B=8192 M_d=32768 | 362 TFLOPs / 3.00ms | 127 TFLOPs / 8.55ms |
+| K3 combine         | B=32   M_d=8192  | 151 TFLOPs / 0.90ms | 66 TFLOPs / 2.06ms |
+| K3 combine         | B=8192 M_d=32768 | 274 TFLOPs / 1.98ms | 144 TFLOPs / 3.79ms |
+
+原因：register-staged 流水里每个 K-tile 都要把整个 BLOCK_M × BLOCK_K
+的 A tile 和 BLOCK_K × BLOCK_N 的 B tile 预取到 vgpr，BK 翻 4 倍直接把
+单 tile 的寄存器需求翻 4 倍（K2 prefill 那一档原本 vgpr=166→200，
+BK=128 下挤压出 spill / occupancy 掉到 1）。
+
+结论：常规 MFMA 走 BK=32/64 保持现状；scaled MFMA 路径**只在
+`scaled_mfma=True` 时** 自动提升到 BK=128。
+
+### 4. UT 覆盖
+
+新增 6 个用例（共 21 passing）：
+
+* `test_autotune_scaled_mfma_block_k[...]` × 4 个 shape，参数化
+  覆盖 gating / dispatch+SwiGLU / combine 三种 path 在 scaled 模式下
+  的 `BLOCK_K`。同时反向验证 `scaled_mfma=False` 时 `BK ∈ {32, 64}`。
+* `test_launcher_rejects_bad_block_k_for_scaled_mfma`：launcher
+  对错配 `(scaled_mfma=True, BK<128)` 报 `AssertionError`。
+* `test_kernel_compiles_with_block_k_128`：bf16 kernel 在 `BK=128`
+  下编译正确且数值匹配 reference（确保未来切 scaled 时 kernel body
+  还能跑）。
+
+```
+$ python3 -m pytest test/ops/test_moe_gluon.py -v
+... 21 passed in 0.97s
+```
+
+### 5. Microbench 仍然全绿
+
+```
+Scaled-MFMA (mxfp4/fp8, instr 16x16x128) autotune preview:
+  gating  decode  B=1            BM= 64 BN= 64 BK=128 NW=8
+  gating  prefill B=8192         BM=128 BN= 64 BK=128 NW=4
+  dispatch+swiglu B=32           BM= 64 BN=128 BK=128 NW=4
+  dispatch+swiglu B=8192         BM=128 BN=128 BK=128 NW=4
+  combine        B=32            BM= 64 BN=128 BK=128 NW=4
+  combine        B=8192          BM=128 BN=128 BK=128 NW=4
+```
+
+bf16 路径的吞吐和 spill profile **完全没变** —— 改动只是把 scaled
+MFMA 的硬约束钉进 autotuner + launcher，给未来的 mxfp4 / fp8 落地
+留好准入。
+
 ## 已知 follow-up
 
 1. **mxfp4 weight + fp8/bf16 act 路径**：复用 `gl.amd.cdna4.mfma_scaled` +

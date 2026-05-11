@@ -598,6 +598,7 @@ def _launch_pipelined(
     block_k: int,
     num_warps: int,
     num_buffers: int,
+    scaled_mfma: bool = False,
 ):
     M, K = x.shape[-2], x.shape[-1]
     if w.ndim == 3:
@@ -606,6 +607,26 @@ def _launch_pipelined(
         K_W, N = w.shape
         E = 1
     assert K == K_W, f"K mismatch: {K} vs {K_W}"
+
+    # The MFMA instruction shape determines the smallest legal
+    # ``BLOCK_K``. Regular ``mfma`` on CDNA4 is 16x16x32 so any
+    # multiple of 32 is fine; scaled MFMA (mxfp4 weight + fp8 act) is
+    # 16x16x128 so BLOCK_K must be a multiple of 128 with a floor of
+    # 128 (see ``_autotune_block`` and the upstream
+    # ``test_amd_mfma_scaled`` reference in triton-450).
+    mfma_k = _MFMA_SCALED_K if scaled_mfma else _MFMA_K
+    assert block_k % mfma_k == 0, (
+        f"BLOCK_K={block_k} must be a multiple of MFMA K dim "
+        f"({mfma_k}); scaled_mfma={scaled_mfma}"
+    )
+    if scaled_mfma:
+        assert block_k >= _MFMA_SCALED_K, (
+            f"scaled MFMA requires BLOCK_K >= {_MFMA_SCALED_K} (got "
+            f"{block_k}); see TASKS.md Update 3."
+        )
+    assert (
+        block_m % _MFMA_M == 0
+    ), f"BLOCK_M={block_m} must be a multiple of MFMA M dim ({_MFMA_M})"
 
     num_active, blocks_per_expert, expert_remap = _expert_layout(
         a_ragged_metadata, block_m, M
@@ -681,6 +702,16 @@ def _launch_pipelined(
 # ---------------------------------------------------------------------------
 
 
+# CDNA4 MFMA instruction shapes.  The regular ``mfma`` op is 16x16x32 in
+# the K dimension; the *scaled* ``mfma_scaled`` op (used by the mxfp4
+# weight + fp8 activation path) is 16x16x128. ``BLOCK_K`` must be a
+# multiple of the relevant K dim, so any kernel that ever wants to swap
+# in scaled MFMA must respect ``BLOCK_K >= 128``.
+_MFMA_K = 32
+_MFMA_SCALED_K = 128
+_MFMA_M = 16
+
+
 def _autotune_block(
     M: int,
     N: int,
@@ -688,6 +719,7 @@ def _autotune_block(
     *,
     do_swiglu: bool = False,
     ragged: bool = False,
+    scaled_mfma: bool = False,
 ) -> tuple[int, int, int, int]:
     """Pick ``(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS)`` for given shape.
 
@@ -718,20 +750,44 @@ def _autotune_block(
         - M  > 8192 : 128x128x32, 4 warps  (256x256 saturates VGPRs
           on MI355 -> spills; 128x128 stays under the 256-VGPR limit
           while still hitting 273 TFLOPs).
+
+    Scaled MFMA constraint
+    ~~~~~~~~~~~~~~~~~~~~~~
+    When ``scaled_mfma=True`` (mxfp4 weight + fp8 activation path), the
+    underlying ``gl.amd.cdna4.mfma_scaled`` instruction has shape
+    ``[16, 16, 128]`` in ``[M, N, K]``. We therefore *promote* whatever
+    block size the regular heuristic returned so it satisfies
+    ``BLOCK_K >= 128`` and ``BLOCK_K % 128 == 0``. We also widen the
+    swiglu/ragged ``BLOCK_K`` floor from 32 to 128 because the smaller
+    values are not legal for scaled MFMA.
+
+    A microbench sweep over ``BLOCK_K in {64, 128, 256}`` with the
+    regular MFMA path showed that ``BLOCK_K = 128`` actually *hurts*
+    bf16 perf (2-3x slower than 32/64) because our register-staged
+    pipeline holds 4x larger prefetch tiles, blowing VGPR pressure. So
+    the override only activates when the caller explicitly opts into
+    the scaled path; the bf16 default stays at 32/64.
     """
     if do_swiglu:
-        if M <= 8192:
-            return 64, 128, 32, 4
-        return 128, 128, 32, 4
-    if ragged:
-        if M <= 8192:
-            return 64, 128, 32, 4
-        return 128, 128, 32, 4
-    if M <= 1024:
-        return 64, 64, 64, 8
-    if M <= 2048:
-        return 128, 64, 64, 8
-    return 128, 64, 64, 4
+        bm, bn, bk, nw = (64, 128, 32, 4) if M <= 8192 else (128, 128, 32, 4)
+    elif ragged:
+        bm, bn, bk, nw = (64, 128, 32, 4) if M <= 8192 else (128, 128, 32, 4)
+    elif M <= 1024:
+        bm, bn, bk, nw = (64, 64, 64, 8)
+    elif M <= 2048:
+        bm, bn, bk, nw = (128, 64, 64, 8)
+    else:
+        bm, bn, bk, nw = (128, 64, 64, 4)
+    if scaled_mfma:
+        # Scaled MFMA on CDNA4 is 16x16x128; BLOCK_K must therefore be a
+        # multiple of 128 with a floor of 128. We also bump BLOCK_M so it
+        # remains a multiple of the MFMA M dim (16) -- which all of the
+        # configurations above already are, but the explicit floor here
+        # documents the requirement.
+        bk = max(bk, _MFMA_SCALED_K)
+        bk = (bk + _MFMA_SCALED_K - 1) // _MFMA_SCALED_K * _MFMA_SCALED_K
+        bm = max(bm, _MFMA_M)
+    return bm, bn, bk, nw
 
 
 def gluon_bf16_gating_gemm(

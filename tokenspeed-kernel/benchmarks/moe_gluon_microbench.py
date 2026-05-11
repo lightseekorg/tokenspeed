@@ -414,6 +414,38 @@ def dump_static_profiles():
         raise SystemExit(f"{bad} kernel(s) reported spill -- aborting")
 
 
+def dump_scaled_mfma_autotune():
+    """Print the block sizes the autotuner would pick for the future
+    scaled-MFMA (mxfp4 weight + fp8 activation) path. Per TASKS.md
+    Update 3, BLOCK_K must be a multiple of 128 and >= 128.
+    """
+    from tokenspeed_kernel.ops.moe.gluon import _autotune_block
+
+    print("\n=== Scaled-MFMA (mxfp4/fp8, instr 16x16x128) autotune preview ===")
+    rows = [
+        # (label, M, do_swiglu, ragged)
+        ("gating  decode  B=1", 1, False, False),
+        ("gating  prefill B=8192", 8192, False, False),
+        ("dispatch+swiglu B=32", 32 * GPTOSS_TOPK, True, False),
+        ("dispatch+swiglu B=8192", 8192 * GPTOSS_TOPK, True, False),
+        ("combine        B=32", 32 * GPTOSS_TOPK, False, True),
+        ("combine        B=8192", 8192 * GPTOSS_TOPK, False, True),
+    ]
+    for label, M, do_swiglu, ragged in rows:
+        bm, bn, bk, nw = _autotune_block(
+            M,
+            GPTOSS_INTERMEDIATE,
+            GPTOSS_HIDDEN,
+            do_swiglu=do_swiglu,
+            ragged=ragged,
+            scaled_mfma=True,
+        )
+        assert (
+            bk >= 128 and bk % 128 == 0
+        ), f"scaled MFMA autotune returned BLOCK_K={bk} for {label}"
+        print(f"  {label:30s} BM={bm:3d} BN={bn:3d} BK={bk:3d} NW={nw}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -481,6 +513,7 @@ def main():
 
     if not args.no_static:
         dump_static_profiles()
+        dump_scaled_mfma_autotune()
 
 
 if __name__ == "__main__":
