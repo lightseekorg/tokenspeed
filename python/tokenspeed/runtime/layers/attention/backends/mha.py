@@ -412,3 +412,4 @@ class MHAAttnBackend(AttentionBackend):
 
 
 register_backend("mha", {AttentionArch.MHA}, MHAAttnBackend)
+register_backend("fa4", {AttentionArch.MHA}, MHAAttnBackend)

@@ -45,6 +45,18 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
         self.assertEqual(args.attention_backend, "trtllm_mla")
 
+    def test_attention_backend_accepts_fa4(self):
+        args = self._build_parser().parse_args(
+            ["--model", "x", "--attention-backend", "fa4"]
+        )
+        self.assertEqual(args.attention_backend, "fa4")
+
+    def test_drafter_attention_backend_accepts_fa4(self):
+        args = self._build_parser().parse_args(
+            ["--model", "x", "--drafter-attention-backend", "fa4"]
+        )
+        self.assertEqual(args.drafter_attention_backend, "fa4")
+
     def test_drafter_attention_backend_accepts_trtllm_mla(self):
         """Regression: trtllm_mla must be accepted here too."""
         args = self._build_parser().parse_args(
@@ -77,6 +89,13 @@ class TestAttentionBackendChoices(unittest.TestCase):
 
     def test_defaults_to_mha_for_mha(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MHA), "mha")
+
+    def test_fa4_resolves_to_mha_backend(self):
+        from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
+
+        self.assertIs(
+            registry._get_backend_cls("fa4", AttentionArch.MHA), MHAAttnBackend
+        )
 
     def test_sm90_defaults_to_flashmla_for_mla(self):
         platform = SimpleNamespace(is_blackwell=False, is_hopper=True)

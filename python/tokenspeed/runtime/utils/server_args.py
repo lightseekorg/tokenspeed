@@ -1200,6 +1200,7 @@ class ServerArgs:
             "triton",
             "flashmla",
             "fa3",
+            "fa4",
             "hybrid_linear_attn",
             "mha",
             "trtllm",
