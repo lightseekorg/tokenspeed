@@ -118,8 +118,6 @@ class RuntimeStates:
         if self.mamba_pool is None or num_valid == 0:
             return
         if page_size > 0:
-            # Use torch.where to keep fixed-size output (no boolean indexing sync).
-            # Invalid entries become self-copy (dst = src), harmless no-op.
             page_mask = cache_lengths[:num_valid] % page_size == 0
             dst_indices = torch.where(page_mask, dst_indices, src_indices)
         fused_mamba_state_copy(self.mamba_pool.conv_state, src_indices, dst_indices)

@@ -166,11 +166,6 @@ def fused_mamba_state_copy(
     """
     In-place state copy: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
 
-    Replaces the expensive PyTorch advanced indexing pattern:
-        pool[:, dst] = pool[:, src]
-    which launches ~6 kernels (gather tmp buffer + scatter) with a single
-    fused Triton kernel.
-
     Args:
         pool: State tensor [num_layers, pool_size, *state_shape], must be contiguous.
         src_indices: Source slot indices [num_valid], int32 or int64.
@@ -197,11 +192,9 @@ def fused_mamba_state_copy(
     # Elements per (layer, slot) entry
     elem_per_entry = pool.numel() // (num_layers * pool_size)
 
-    # Strides in elements
     layer_stride = pool.stride(0)
     req_stride = pool.stride(1)
 
-    # Ensure indices are int32 and contiguous
     src_indices = src_indices.to(torch.int32).contiguous()
     dst_indices = dst_indices.to(torch.int32).contiguous()
 
