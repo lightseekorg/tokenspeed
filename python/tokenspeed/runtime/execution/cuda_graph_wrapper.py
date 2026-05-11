@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
-    from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
