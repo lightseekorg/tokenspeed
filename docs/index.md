@@ -34,6 +34,7 @@ features:
 - [Model Recipes](./recipes/models.md)
 - [Server Parameters](./configuration/server.md)
 - [Compatible Parameters](./configuration/compatible-parameters.md)
+- [Scheduler](./serving/scheduler.md)
 - [Parallelism](./serving/parallelism.md)
 
 ## Common Workflow

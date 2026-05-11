@@ -64,6 +64,8 @@ For a compact compatibility table, see
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
+For the request lifecycle, chunked prefill behavior, cache operations, and
+retraction path, see [Scheduler](../serving/scheduler.md).
 
 ## Parallelism
 

@@ -56,7 +56,10 @@ export default defineConfig({
       },
       {
         text: "Serving",
-        items: [{ text: "Parallelism", link: "/serving/parallelism" }]
+        items: [
+          { text: "Scheduler", link: "/serving/scheduler" },
+          { text: "Parallelism", link: "/serving/parallelism" }
+        ]
       }
     ],
     search: {
