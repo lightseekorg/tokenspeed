@@ -143,8 +143,7 @@ def _mamba_state_copy_kernel(
 
     # Bounds check
     if not (
-        (src_idx >= 0) & (src_idx < pool_size)
-        & (dst_idx >= 0) & (dst_idx < pool_size)
+        (src_idx >= 0) & (src_idx < pool_size) & (dst_idx >= 0) & (dst_idx < pool_size)
     ):
         return
 
