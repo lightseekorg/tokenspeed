@@ -600,11 +600,15 @@ class EventLoop:
 
             self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
 
-            has_loadback = any(
-                isinstance(op, Cache.LoadBackOp) for op in execution_plan.cache
+            forward_op = self._get_forward_op(execution_plan)
+            recovery_with_loadback = (
+                forward_op is not None
+                and forward_op.num_extends() == 0
+                and any(isinstance(op, Cache.LoadBackOp) for op in execution_plan.cache)
             )
+            inflight_loadback = bool(host_exec.ack_load_queue)
 
-            if has_loadback or host_exec.ack_load_queue:
+            if recovery_with_loadback or inflight_loadback:
 
                 self.model_executor.execution_stream.wait_stream(host_exec.load_stream)
 
