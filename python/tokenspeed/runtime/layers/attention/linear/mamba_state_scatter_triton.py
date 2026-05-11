@@ -115,6 +115,109 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
 
+@triton.jit
+def _mamba_state_copy_kernel(
+    pool_ptr,
+    src_indices_ptr,  # [num_valid]
+    dst_indices_ptr,  # [num_valid]
+    elem_per_entry: tl.constexpr,
+    layer_stride,
+    req_stride,
+    pool_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    In-place copy kernel: pool[:, dst[i], :] = pool[:, src[i], :]
+
+    Grid: (num_valid, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_block = tl.program_id(2).to(tl.int64)
+
+    src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
+    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+
+    # Bounds check
+    if not (
+        (src_idx >= 0) & (src_idx < pool_size)
+        & (dst_idx >= 0) & (dst_idx < pool_size)
+    ):
+        return
+
+    src_offset = pid_layer * layer_stride + src_idx * req_stride
+    dst_offset = pid_layer * layer_stride + dst_idx * req_stride
+
+    start = pid_block * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < elem_per_entry
+
+    data = tl.load(pool_ptr + src_offset + offsets, mask=mask)
+    tl.store(pool_ptr + dst_offset + offsets, data, mask=mask)
+
+
+def fused_mamba_state_copy(
+    pool: torch.Tensor,  # [num_layers, pool_size, *state_shape]
+    src_indices: torch.Tensor,  # [num_valid]
+    dst_indices: torch.Tensor,  # [num_valid]
+):
+    """
+    In-place state copy: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
+
+    Replaces the expensive PyTorch advanced indexing pattern:
+        pool[:, dst] = pool[:, src]
+    which launches ~6 kernels (gather tmp buffer + scatter) with a single
+    fused Triton kernel.
+
+    Args:
+        pool: State tensor [num_layers, pool_size, *state_shape], must be contiguous.
+        src_indices: Source slot indices [num_valid], int32 or int64.
+        dst_indices: Destination slot indices [num_valid], int32 or int64.
+    """
+    num_valid = src_indices.shape[0]
+    if num_valid == 0:
+        return
+
+    if not pool.is_cuda:
+        raise ValueError("fused_mamba_state_copy only supports CUDA tensors.")
+    if not pool.is_contiguous():
+        raise ValueError("pool tensor must be contiguous")
+    if pool.ndim < 2:
+        raise ValueError(f"pool must be at least 2D, got {pool.ndim}D")
+    if src_indices.shape[0] != dst_indices.shape[0]:
+        raise ValueError(
+            f"indices length mismatch: {src_indices.shape[0]} vs {dst_indices.shape[0]}"
+        )
+
+    num_layers = pool.shape[0]
+    pool_size = pool.shape[1]
+
+    # Elements per (layer, slot) entry
+    elem_per_entry = pool.numel() // (num_layers * pool_size)
+
+    # Strides in elements
+    layer_stride = pool.stride(0)
+    req_stride = pool.stride(1)
+
+    # Ensure indices are int32 and contiguous
+    src_indices = src_indices.to(torch.int32).contiguous()
+    dst_indices = dst_indices.to(torch.int32).contiguous()
+
+    BLOCK_SIZE = 1024
+    grid = (num_valid, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+
+    _mamba_state_copy_kernel[grid](
+        pool,
+        src_indices,
+        dst_indices,
+        elem_per_entry,
+        layer_stride,
+        req_stride,
+        pool_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]

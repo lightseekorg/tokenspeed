@@ -21,6 +21,9 @@
 
 import torch
 
+from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
+    fused_mamba_state_copy,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -119,12 +122,8 @@ class RuntimeStates:
             # Invalid entries become self-copy (dst = src), harmless no-op.
             page_mask = cache_lengths[:num_valid] % page_size == 0
             dst_indices = torch.where(page_mask, dst_indices, src_indices)
-        self.mamba_pool.conv_state[:, dst_indices] = self.mamba_pool.conv_state[
-            :, src_indices
-        ]
-        self.mamba_pool.ssm_state[:, dst_indices] = self.mamba_pool.ssm_state[
-            :, src_indices
-        ]
+        fused_mamba_state_copy(self.mamba_pool.conv_state, src_indices, dst_indices)
+        fused_mamba_state_copy(self.mamba_pool.ssm_state, src_indices, dst_indices)
 
     def zero_mamba_states(
         self,
