@@ -463,29 +463,161 @@ bf16 路径的吞吐和 spill profile **完全没变** —— 改动只是把 sc
 MFMA 的硬约束钉进 autotuner + launcher，给未来的 mxfp4 / fp8 落地
 留好准入。
 
+---
+
+## Update 4 — mxfp4 / fp8 scaled-MFMA 路径 + unified kernel API
+
+针对 `TASKS.md:46-61`，要求把 dispatch-fused / combine-fused 的 GEMM
+从 bf16 升级到 mxfp4 (scaled MFMA)，并支持两种 A 端 dtype 组合：
+
+* `A: fp8 (e4m3 / e5m2) + global scale,  W: mxfp4 (+ e8m0 block scale)`
+* `A: mxfp4 (+ e8m0 block scale),       W: mxfp4 (+ e8m0 block scale)`
+
+同时要求 “像 `triton_kernels` 一样用一个 kernel 支持多种变体”。
+
+### 1. 新增 scaled-MFMA kernel
+
+新增 `_pipelined_moe_kernel_scaled`（与原 bf16 kernel 同文件、同
+`MoE constexpr` 旗标），关键差异：
+
+| 项目 | bf16 path | scaled path |
+|-----|-----------|------------|
+| MFMA op | `gl.amd.cdna4.mfma`（`instr=[16,16,32]`, `k_width=8`） | `gl.amd.cdna4.mfma_scaled`（`instr=[16,16,128]`, `k_width=16`） |
+| Operand dtype | bf16 (两个) | uint8 (A 是 e2m1/e4m3/e5m2，W 始终 e2m1) |
+| K 维步进 | `BLOCK_K` (logical = physical) | `BLOCK_K // DIV_FACTOR_*`；e2m1 时 `DIV=2` (打包) |
+| Block scale | 无 | `[BLOCK_M, BLOCK_K/32]` (A) / `[BLOCK_N, BLOCK_K/32]` (B)，layout 由 `get_mfma_scale_layout(...)` 给出 |
+| Global scale | 无 | fp8 路径下走 host-side `a_global_scale: float`，在 K-loop 结束后 `acc *= a_global_scale` |
+| BLOCK_K 约束 | 32 / 64 (寄存器压力) | 必须 ≥ 128 且为 128 的倍数（与 scaled MFMA K 深度一致），由 `_autotune_block(scaled_mfma=True)` + launcher assertion 共同保证 |
+
+变体由 4 个 constexpr 旗标选择：
+
+```python
+A_FORMAT          : str   # "e2m1" / "e4m3" / "e5m2"
+B_FORMAT          : str   # "e2m1"  (W 一律是 mxfp4)
+HAS_A_BLOCK_SCALE : bool  # A==e2m1 时 True，否则 False
+# 其他 MoE 旗标 (HAS_BIAS, HAS_GATHER, HAS_SCATTER, DO_SWIGLU,
+# APPLY_GATE_SCAL, HAS_EXPERT_REMAP) 与 bf16 kernel 完全一致
+```
+
+block scale tile 直接用 `get_mfma_scale_layout` 返回的 distributed
+layout `gl.load`，**不需要** 额外 `convert_layout`——这与 upstream
+`test_amd_mfma_scaled`（`triton-450/python/test/gluon/test_core.py:1369-1397`）
+完全一致；早期版本尝试自己构造 `BlockedLayout` 时会触发
+`Layout has 128 threads per warp, but the module specifies 64`
+的检查（CDNA4 wave=64 vs gfx1250 wave=32 的差异）。
+
+### 2. Public launchers
+
+```python
+gluon_mxfp_gating_gemm(x, w, w_scale, *, x_scale=None,
+                       a_format="e2m1", a_global_scale=1.0, ...)
+gluon_mxfp_dispatch_swiglu(x, w, w_scale, *, x_scale=..., a_format=...,
+                           a_ragged_metadata, gather_indx, ...)
+gluon_mxfp_combine(x, w, w_scale, *, x_scale=..., a_format=...,
+                   a_ragged_metadata, scatter_indx, ...)
+```
+
+* `x` 与 `w` 都用 `torch.uint8` 存储；`x_scale` / `w_scale` 也是
+  `uint8` (e8m0)，由 `triton_kernels.tools.mxfp.MXScaleTensor.data`
+  那一套生成。
+* W 的 scale tensor layout 取 `[E, N, K/32]`（N-major、K-scale inner），
+  这样 per-expert slice 是连续的，与 `triton_kernels` 的
+  `wrap_torch_tensor(..., dtype=FP4)` 约定一致。
+* fp8 A 不带 block scale 时 `a_global_scale: float` 直接当作 host-side
+  `float32` 标量传进 kernel，K-loop 之后 `acc *= a_global_scale`
+  (与 `triton_kernels._matmul.py:479-490` 处理 flex scale 的方式相同)。
+
+### 3. OOB-write 修复
+
+借落 mxfp4 path 之机修了一个 **bf16 kernel 一直潜伏的 store 越界**:
+
+旧版 mask 用的是 `offs_y_n < OUT_BLOCK_N * grid_n`，对于
+`N % BLOCK_N != 0` 的 shape (例如 `N=2880, BN=128 -> grid_n=23,
+N_padded=2944`) 会让 store 落到 “下一行” 的内存里——
+gpt-oss prefill 上虽然写到 `torch.zeros((n_tokens, N))` 上的“下一行”
+不会立刻被发现，但对随机 N 的微基准（`N=80, BN=64` 等）会直接挂掉。
+
+修正后：
+
+```python
+actual_n = (N // 2) if DO_SWIGLU else N
+mask_y   = (offs_y_m[:, None] < M) & (offs_y_n[None, :] < actual_n)
+```
+
+新增回归 UT `test_oob_n_regression_bf16` 用 `(M=64, N=80, BN=64)` 复现。
+
+### 4. UT 覆盖（共 34 passing）
+
+新增 13 个用例，覆盖
+
+| 用例 | 内容 |
+|-----|-----|
+| `test_mxfp4_x_mxfp4_gating[...] × 3` | 多种 `(M, N, K)` 的 e2m1×e2m1 dense GEMM 数值正确 |
+| `test_fp8_x_mxfp4_gating[...] × 4`   | `(fmt ∈ {e4m3,e5m2}) × shape` 的 fp8 + global scale × mxfp4 |
+| `test_mxfp_ragged_combine[e2m1/e4m3]` | per-expert (E=2) 的 ragged combine，含 scatter / no-scatter 分支 |
+| `test_mxfp_dispatch_swiglu[e2m1/e4m3]` | per-expert dispatch+swiglu（验证 SwiGLU split-N + scaled MFMA + ragged 一起跑） |
+| `test_oob_n_regression_bf16`         | bf16 path 的 `N % BLOCK_N != 0` 回归 |
+| `test_scaled_kernel_no_register_spill` | scaled kernel 一次 launch 后从 `device_caches` 取出汇编，断言 sgpr/vgpr/scratch 0 spill |
+
+```
+$ python3 -m pytest test/ops/test_moe_gluon.py -v
+... 34 passed in 1.53s
+```
+
+### 5. Microbench（gpt-oss-120b H=I=2880, E=128, topk=4）
+
+测得三条 scaled-MFMA path 相对自己 bf16 同名 kernel 的加速比
+（同样的 register-staged 流水、同样的 autotune block size）：
+
+| Kernel | shape (B / M_d) | bf16 TFLOPs | mxfp4×mxfp4 TFLOPs | fp8×mxfp4 TFLOPs | 加速 |
+|--------|-----------------|------------|---------------------|-------------------|------|
+| K1 gating  | B=8192          | 62  | 132 | 124 | **2.1× / 2.0×** |
+| K1 gating  | B=4096          | 31  | 76  | 80  | 2.5× / 2.6× |
+| K2 dispatch+SwiGLU | B=8192 M_d=32768 | 364 | 436 | 408 | **1.20× / 1.12×** |
+| K2 dispatch+SwiGLU | B=4096 M_d=16384 | 307 | 403 | 376 | 1.31× / 1.22× |
+| K2 dispatch+SwiGLU | B=32 M_d=8192   | 172 | 232 | 237 | 1.35× / 1.38× |
+| K3 combine | B=8192 M_d=32768 | 274 | 402 | 378 | **1.47× / 1.38×** |
+| K3 combine | B=4096 M_d=16384 | 254 | 357 | 330 | 1.41× / 1.30× |
+| K3 combine | B=32 M_d=8192   | 153 | 201 | 204 | 1.31× / 1.33× |
+
+总结：
+
+* 内存带宽受限的窄 GEMM（K1 gating, `N=128`）受益最大 —— mxfp4
+  把 weight 字节数压成一半，直接拉到 **2× bf16**；
+* compute-bound 的大 prefill (K2/K3 `M_d ≥ 16k`) 也有 **1.2–1.5×**，
+  因为 scaled MFMA 的 `16x16x128` 指令 GFLOPS 比 `16x16x32` 高；
+* 整张表 11 个 scaled kernel 变体全部 **0 spill / 0 scratch**
+  (`sgpr ∈ [42, 68]`, `vgpr ∈ [86, 156]`, occupancy 3–5)。
+  bf16 kernel 的旧 profile 保持不变。
+
+### 6. 这次 commit 还没做的
+
+* **真 LDS multi-buffer 流水**：仍是 register-staged。Update 4 主线
+  做完后这个上来当首要项；scaled kernel 已经把 base pointer 全部
+  scalar 化 (`w_base_offset = expert_id * stride_we`，`expert_id` 是
+  `gl.load(expert_remap_ptr + compact_idx)` 得来的纯 scalar)，应当
+  能解掉 Update 2 时碰到的 `unrealized_conversion_cast` MLIR 错误。
+* **与 `triton_kernels.matmul` scaled path 的 head-to-head**：上游
+  scaled path 需要构造 `PrecisionConfig(out_dtype, b_mx_scale=...)`
+  + `flex_ctx`，下一步把 microbench 里 baseline 换成 scaled 上游版本
+  做 apples-to-apples。
+* **Per-block expert id 构造移到 Triton 端**（与 RDNA4 例子里
+  `expt_data` 一致）。
+
 ## 已知 follow-up
 
-1. **mxfp4 weight + fp8/bf16 act 路径**：复用 `gl.amd.cdna4.mfma_scaled` +
-   `get_mfma_scale_layout`，把 RDNA4 `wmma_scaled` 路径改写为 MFMA scaled
-   即可。要点：
-   - scale tile 形状是 `[BM/scale_block, BK/scale_block]`，
-     `scale_block=32` 对 mxfp4 即是。
-   - mxfp4 是 packed uint8（每 byte 2 个 nibble），
-     `LOAD_B` layout 必须按 `BLOCK_K // 2` 定 K 维 stride，类似上游
-     `triton_kernels` 的 `wrap_torch_tensor(b, dtype=FP4)`。
-   - 需要 per-tensor static fp8 input scale 一并写进
-     `mfma_scaled` 的 `a_scale`（直接用 broadcast 的 e8m0 scalar）。
-2. **真正的 LDS multi-buffer 流水（Update 2 之后的最高优先级）**:
-   现在用的是 register-staged 单缓冲流水，对 K1 (`N=128` 极窄) 已经
-   1.6×–2.5× 超过 baseline；但 K2/K3 在 `M_d ≥ 8192`（gpt-oss prefill）
-   上仍是 0.5–0.6×，差距全部来自缺乏多缓冲 LDS 流水。把
-   `gl.amd.cdna4.async_copy.buffer_load_to_shared(...)` +
-   `commit_group()` + `wait_group(N)` 真正接通（参考
+1. **真正的 LDS multi-buffer 流水（仍是最高优先级，跨 bf16 与 scaled
+   两条 path）**:
+   现在用的是 register-staged 单缓冲流水。bf16 K1 (`N=128` 极窄)
+   已经 1.6×–2.5× 超过 baseline；但 K2/K3 在 `M_d ≥ 8192`（gpt-oss
+   prefill）上仍是 0.5–0.6×；scaled path 的 K2/K3 同样 register-staged,
+   差距来源相同。把 `gl.amd.cdna4.async_copy.buffer_load_to_shared(...)`
+   + `commit_group()` + `wait_group(N)` 真正接通（参考
    `gluon-kernels/kernels/cdna4/gemm/f16_gemm_gfx950.py`）后预期能到
-   `0.9× ~ 1.1×` baseline。当时遇到的 MLIR `unrealized_conversion_cast`
+   `0.9× ~ 1.1×` baseline。早期碰到的 MLIR `unrealized_conversion_cast`
    主要是 per-expert 动态 base pointer 的 legalization 问题，引入
-   active-expert remap 之后 `expert_id` 已经是从 small i32 表 load 出
-   的 scalar，可以再尝试一次。
+   active-expert remap 之后 `expert_id` 已经是从 small i32 表 load
+   出的 scalar，已经准备好再次尝试。
 3. **Fused swiglu + GEMM2**：把 RDNA4 例子里
    `MoEPipelinedProgram + activation_fn` 这套 fused activation 路径搬过来，
    省一次 HBM 往返；MI355 上由于 LDS 紧张，需要小 block。

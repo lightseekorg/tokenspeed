@@ -537,6 +537,306 @@ def test_kernel_compiles_with_block_k_128():
 
 
 # ---------------------------------------------------------------------------
+# Scaled MFMA (mxfp4 / fp8) correctness + spills  (TASKS.md Update 4)
+# ---------------------------------------------------------------------------
+#
+# These tests cover the three dtype combinations the user asked for:
+#
+#   1. ``e2m1`` x ``e2m1``      (A: mxfp4 + block scale, W: mxfp4 + block scale)
+#   2. ``e4m3`` x ``e2m1``      (A: fp8 e4m3 + global scale, W: mxfp4 + block scale)
+#   3. ``e5m2`` x ``e2m1``      (A: fp8 e5m2 + global scale, W: mxfp4 + block scale)
+#
+# Reference is computed in fp32 from the unpacked operands and scales.
+
+
+def _mxfp4_pair(M: int, K: int, packed_dim: int, *, device="cuda"):
+    """Return ``(uint8 packed tensor, fp32 reference tensor)``."""
+    from tokenspeed_triton.tools.mxfp import MXFP4Tensor
+
+    t = MXFP4Tensor(size=(M, K)).random()
+    return (
+        t.to_packed_tensor(dim=packed_dim).to(device),
+        t.to(torch.float32).to(device),
+    )
+
+
+def _mx_scale_pair(rows: int, k_logical: int, *, device="cuda"):
+    """Return ``(uint8 e8m0 tensor [rows, K//32], fp32 broadcast [rows, K])``."""
+    from tokenspeed_triton.tools.mxfp import MXScaleTensor
+
+    s = MXScaleTensor(size=(rows, k_logical // 32)).random(1 / 32, 32)
+    return (
+        s.data.to(device),
+        s.to(torch.float32).repeat_interleave(32, dim=1).to(device),
+    )
+
+
+def _fp8_pair(M: int, K: int, fmt: str, *, device="cuda"):
+    """Return ``(uint8 storage, fp32 reference)`` for fp8 e4m3 / e5m2."""
+    u = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(device)
+    view = torch.float8_e4m3fn if fmt == "e4m3" else torch.float8_e5m2
+    return u, u.view(view).to(torch.float32)
+
+
+@pytest.mark.parametrize("M,N,K", [(32, 32, 128), (64, 128, 256), (128, 64, 256)])
+def test_mxfp4_x_mxfp4_gating(M, N, K):
+    """``e2m1`` x ``e2m1`` dense GEMM via scaled MFMA."""
+    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
+
+    torch.manual_seed(0)
+    a_packed, a_fp32 = _mxfp4_pair(M, K, packed_dim=1)
+    w_packed, w_fp32 = _mxfp4_pair(K, N, packed_dim=0)
+    a_scale, a_scale_mk = _mx_scale_pair(M, K)
+    w_scale, w_scale_nk = _mx_scale_pair(N, K)
+    w_scale_kn = w_scale_nk.T.contiguous()
+
+    y = gluon_mxfp_gating_gemm(
+        a_packed,
+        w_packed,
+        w_scale,
+        x_scale=a_scale,
+        a_format="e2m1",
+        out_dtype=torch.float32,
+        block_k=128,
+    )
+    y_ref = (a_fp32 * a_scale_mk) @ (w_fp32 * w_scale_kn)
+    rel = (y - y_ref).abs().max().item() / max(1.0, y_ref.abs().max().item())
+    assert rel < 5e-2, f"rel_max={rel} too large"
+
+
+@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
+@pytest.mark.parametrize("M,N,K", [(32, 32, 128), (64, 128, 256)])
+def test_fp8_x_mxfp4_gating(fmt, M, N, K):
+    """``e4m3``/``e5m2`` (A) x ``e2m1`` (W) GEMM with global A scale."""
+    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
+
+    torch.manual_seed(0)
+    a_u8, a_fp32 = _fp8_pair(M, K, fmt)
+    w_packed, w_fp32 = _mxfp4_pair(K, N, packed_dim=0)
+    w_scale, w_scale_nk = _mx_scale_pair(N, K)
+    w_scale_kn = w_scale_nk.T.contiguous()
+    a_global = 0.137
+
+    y = gluon_mxfp_gating_gemm(
+        a_u8,
+        w_packed,
+        w_scale,
+        x_scale=None,
+        a_format=fmt,
+        a_global_scale=a_global,
+        out_dtype=torch.float32,
+        block_k=128,
+    )
+    y_ref = a_global * (a_fp32 @ (w_fp32 * w_scale_kn))
+    rel = (y - y_ref).abs().max().item() / max(1.0, y_ref.abs().max().item())
+    assert rel < 5e-2, f"rel_max={rel} too large"
+
+
+@pytest.mark.parametrize("fmt", ["e2m1", "e4m3"])
+def test_mxfp_ragged_combine(fmt):
+    """Per-expert combine with ragged metadata + scaled MFMA."""
+    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_combine
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+
+    torch.manual_seed(0)
+    device = "cuda"
+    E = 2
+    per_exp = 16
+    M = E * per_exp
+    K = 128
+    N = 64
+
+    if fmt == "e2m1":
+        a_packed, a_fp32 = _mxfp4_pair(M, K, packed_dim=1)
+        a_scale, a_scale_mk = _mx_scale_pair(M, K)
+        a_global = 1.0
+    else:
+        a_packed, a_fp32 = _fp8_pair(M, K, fmt)
+        a_scale = None
+        a_scale_mk = None
+        a_global = 0.21
+
+    w_e_packed, w_e_fp32, w_scale_e, w_scale_e_nk = [], [], [], []
+    for _ in range(E):
+        wp, wf = _mxfp4_pair(K, N, packed_dim=0)
+        w_e_packed.append(wp)
+        w_e_fp32.append(wf)
+        sd, sr = _mx_scale_pair(N, K)
+        w_scale_e.append(sd)
+        w_scale_e_nk.append(sr)
+    w3 = torch.stack(w_e_packed)
+    w_scale3 = torch.stack(w_scale_e)
+
+    counts = torch.full((E,), per_exp, device=device, dtype=torch.int32)
+    md = make_ragged_tensor_metadata(counts, M)
+
+    y_ref = torch.zeros(M, N, dtype=torch.float32, device=device)
+    for e in range(E):
+        a_chunk = a_fp32[e * per_exp : (e + 1) * per_exp]
+        w_scale_kn = w_scale_e_nk[e].T.contiguous()
+        if fmt == "e2m1":
+            a_scale_chunk = a_scale_mk[e * per_exp : (e + 1) * per_exp]
+            y_ref[e * per_exp : (e + 1) * per_exp] = (a_chunk * a_scale_chunk) @ (
+                w_e_fp32[e] * w_scale_kn
+            )
+        else:
+            y_ref[e * per_exp : (e + 1) * per_exp] = a_global * (
+                a_chunk @ (w_e_fp32[e] * w_scale_kn)
+            )
+
+    y = gluon_mxfp_combine(
+        a_packed,
+        w3,
+        w_scale3,
+        x_scale=a_scale,
+        a_format=fmt,
+        a_global_scale=a_global,
+        bias=None,
+        a_ragged_metadata=md,
+        scatter_indx=None,
+        n_tokens=M,
+        n_expts_act=1,
+        out_dtype=torch.float32,
+        block_m=16,
+        block_n=64,
+        block_k=128,
+        num_warps=4,
+    )
+    rel = (y - y_ref).abs().max().item() / max(1.0, y_ref.abs().max().item())
+    assert rel < 5e-2, f"{fmt} combine rel_max={rel} too large"
+
+
+@pytest.mark.parametrize("fmt", ["e2m1", "e4m3"])
+def test_mxfp_dispatch_swiglu(fmt):
+    """Per-expert dispatch + 1st GEMM + fused SwiGLU on scaled MFMA path."""
+    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_dispatch_swiglu
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+
+    torch.manual_seed(0)
+    device = "cuda"
+    E = 2
+    per_exp = 16
+    M = E * per_exp
+    K = 128
+    N_full = 128  # gate || linear; output will be N_full // 2
+    a_global = 1.0 if fmt == "e2m1" else 0.21
+
+    if fmt == "e2m1":
+        a_packed, a_fp32 = _mxfp4_pair(M, K, packed_dim=1)
+        a_scale, a_scale_mk = _mx_scale_pair(M, K)
+    else:
+        a_packed, a_fp32 = _fp8_pair(M, K, fmt)
+        a_scale = None
+        a_scale_mk = None
+
+    w_e_packed, w_e_fp32, w_scale_e, w_scale_e_nk = [], [], [], []
+    for _ in range(E):
+        wp, wf = _mxfp4_pair(K, N_full, packed_dim=0)
+        w_e_packed.append(wp)
+        w_e_fp32.append(wf)
+        sd, sr = _mx_scale_pair(N_full, K)
+        w_scale_e.append(sd)
+        w_scale_e_nk.append(sr)
+    w3 = torch.stack(w_e_packed)
+    w_scale3 = torch.stack(w_scale_e)
+
+    counts = torch.full((E,), per_exp, device=device, dtype=torch.int32)
+    md = make_ragged_tensor_metadata(counts, M)
+
+    y_ref = torch.zeros(M, N_full // 2, dtype=torch.float32, device=device)
+    for e in range(E):
+        a_chunk = a_fp32[e * per_exp : (e + 1) * per_exp]
+        w_scale_kn = w_scale_e_nk[e].T.contiguous()
+        if fmt == "e2m1":
+            a_scale_chunk = a_scale_mk[e * per_exp : (e + 1) * per_exp]
+            acc = (a_chunk * a_scale_chunk) @ (w_e_fp32[e] * w_scale_kn)
+        else:
+            acc = a_global * (a_chunk @ (w_e_fp32[e] * w_scale_kn))
+        gate = acc[:, ::2]
+        linear = acc[:, 1::2]
+        s = gate / (1.0 + torch.exp(-gate))
+        y_ref[e * per_exp : (e + 1) * per_exp] = s * (linear + 1.0)
+
+    y = gluon_mxfp_dispatch_swiglu(
+        a_packed,
+        w3,
+        w_scale3,
+        x_scale=a_scale,
+        a_format=fmt,
+        a_global_scale=a_global,
+        bias=None,
+        a_ragged_metadata=md,
+        gather_indx=None,
+        swiglu_alpha=1.0,
+        swiglu_limit=0.0,
+        out_dtype=torch.float32,
+        block_m=16,
+        block_n=128,
+        block_k=128,
+        num_warps=4,
+    )
+    rel = (y - y_ref).abs().max().item() / max(1.0, y_ref.abs().max().item())
+    assert rel < 5e-2, f"{fmt} swiglu rel_max={rel} too large"
+
+
+def test_oob_n_regression_bf16():
+    """Regression for the BLOCK_N > N OOB-write bug.
+
+    Before the ``actual_n = N if not DO_SWIGLU else N//2`` fix the mask
+    used ``OUT_BLOCK_N * grid_n`` which overshoots when N % BLOCK_N != 0
+    and writes garbage into the *next row* of the output tensor.
+    """
+    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_gating_gemm
+
+    torch.manual_seed(0)
+    # N=80 is not a multiple of BLOCK_N=64 -- grid_n=2, OUT_BLOCK_N*grid_n=128
+    M, N, K = 64, 80, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    w = torch.randn(K, N, device="cuda", dtype=torch.bfloat16) * 0.05
+    y = gluon_bf16_gating_gemm(x, w, block_m=64, block_n=64, block_k=64, num_warps=4)
+    ref = x.to(torch.float32) @ w.to(torch.float32)
+    torch.testing.assert_close(y.to(torch.float32), ref, rtol=5e-2, atol=5e-2)
+
+
+def test_scaled_kernel_no_register_spill():
+    """Compile the scaled kernel at a gpt-oss-sized prefill shape and
+    verify the AMDGCN report contains zero spills + zero scratch."""
+    from tokenspeed_kernel.ops.moe.gluon import (
+        _pipelined_moe_kernel_scaled,
+        assert_no_spills,
+        gluon_mxfp_gating_gemm,
+        static_profile,
+    )
+
+    torch.manual_seed(0)
+    M, N, K = 128, 128, 256
+    a_packed, _ = _mxfp4_pair(M, K, packed_dim=1)
+    w_packed, _ = _mxfp4_pair(K, N, packed_dim=0)
+    a_scale, _ = _mx_scale_pair(M, K)
+    w_scale, _ = _mx_scale_pair(N, K)
+
+    gluon_mxfp_gating_gemm(
+        a_packed,
+        w_packed,
+        w_scale,
+        x_scale=a_scale,
+        a_format="e2m1",
+        out_dtype=torch.float32,
+        block_m=64,
+        block_n=64,
+        block_k=128,
+        num_warps=4,
+    )
+
+    device = torch.cuda.current_device()
+    cache = _pipelined_moe_kernel_scaled.device_caches.get(device)
+    assert cache, "expected the scaled Gluon kernel to JIT-compile at least once"
+    compiled = next(iter(cache[0].values()))
+    profile = static_profile(compiled, label="mxfp4_gating")
+    assert_no_spills(profile)
+
+
+# ---------------------------------------------------------------------------
 # Selector / fallback regression checks
 # ---------------------------------------------------------------------------
 

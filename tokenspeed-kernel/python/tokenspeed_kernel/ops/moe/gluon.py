@@ -215,6 +215,84 @@ if _gluon_is_supported():
     def _shared_b_layout():
         return gl.SwizzledSharedLayout(8, 2, 8, order=[0, 1])
 
+    # ---- Scaled MFMA (mxfp4 / fp8) layouts -----------------------------
+    #
+    # The CDNA4 scaled MFMA op (``gl.amd.cdna4.mfma_scaled``) has
+    # ``instr_shape=[16, 16, 128]`` with ``k_width=16``. The ``a`` /
+    # ``b`` operand types may be ``e2m1`` (mxfp4, packed 2 nibbles per
+    # byte), ``e4m3`` or ``e5m2`` (fp8, 1 byte per element). Operands
+    # use a ``DotOperandLayout`` whose ``parent`` is the scaled MFMA
+    # layout, and the ``e8m0`` block scales use a separate
+    # ``get_mfma_scale_layout`` shape.
+    @gluon.constexpr_function
+    def _mma_layout_scaled(num_warps: int):
+        warps_m = 2 if num_warps >= 4 else 1
+        warps_n = num_warps // warps_m
+        return gl.amd.cdna4.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 128],
+            transposed=True,
+            warps_per_cta=[warps_m, warps_n],
+        )
+
+    @gluon.constexpr_function
+    def _dot_a_layout_scaled(num_warps: int):
+        return gl.DotOperandLayout(
+            operand_index=0, parent=_mma_layout_scaled(num_warps), k_width=16
+        )
+
+    @gluon.constexpr_function
+    def _dot_b_layout_scaled(num_warps: int):
+        return gl.DotOperandLayout(
+            operand_index=1, parent=_mma_layout_scaled(num_warps), k_width=16
+        )
+
+    @gluon.constexpr_function
+    def _a_scale_layout_scaled(num_warps: int, block_m: int, block_k: int):
+        return gl.amd.cdna4.get_mfma_scale_layout(
+            _dot_a_layout_scaled(num_warps), [block_m, block_k // 32]
+        )
+
+    @gluon.constexpr_function
+    def _b_scale_layout_scaled(num_warps: int, block_n: int, block_k: int):
+        return gl.amd.cdna4.get_mfma_scale_layout(
+            _dot_b_layout_scaled(num_warps), [block_n, block_k // 32]
+        )
+
+    @gluon.constexpr_function
+    def _load_a_packed_layout(block_k: int, num_warps: int):
+        # mxfp4 packing: each byte = 2 e2m1 elements along K, so we vector
+        # load 8 bytes = 16 logical elements per lane. Matches the
+        # ``a_packed_layout`` in ``test_amd_mfma_scaled``.
+        k_packed = block_k // 2
+        return gl.BlockedLayout(
+            [1, 8],
+            [max(1, 512 // k_packed), k_packed // 8],
+            [num_warps, 1],
+            [1, 0],
+        )
+
+    @gluon.constexpr_function
+    def _load_a_unpacked_layout(block_k: int, num_warps: int):
+        # fp8 (e4m3/e5m2): one byte per element. 16 bytes per lane.
+        return gl.BlockedLayout(
+            [1, 16],
+            [max(1, 1024 // block_k), block_k // 16],
+            [num_warps, 1],
+            [1, 0],
+        )
+
+    @gluon.constexpr_function
+    def _load_b_packed_layout(block_k: int, num_warps: int):
+        # mxfp4 W: packed along K (b_offs_k goes in K // 2 dim).
+        k_packed = block_k // 2
+        return gl.BlockedLayout(
+            [8, 1],
+            [k_packed // 8, max(1, 512 // k_packed)],
+            [1, num_warps],
+            [0, 1],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Software-pipelined Gluon MoE kernel
@@ -446,16 +524,319 @@ if _gluon_is_supported():
             )
             out = out * scal[:, None].to(out.dtype)
 
+        # Actual output N dim: equal to logical ``N`` for non-SwiGLU,
+        # halved for SwiGLU (where each (gate, linear) pair collapses
+        # into one column). Using ``OUT_BLOCK_N * grid_n`` here would
+        # overshoot when ``N`` is not a multiple of ``BLOCK_N`` and
+        # cause out-of-bounds writes that corrupt the *next row* (the
+        # symptom was random-looking errors past the first BLOCK_N-
+        # aligned chunk of M).
+        actual_n = (N // 2) if DO_SWIGLU else N
         if HAS_SCATTER:
             rows_y = gl.load(scatter_idx_ptr + offs_y_m, mask=offs_y_m < M, other=M)
-            mask_y = (rows_y[:, None] < M) & (
-                offs_y_n[None, :] < (OUT_BLOCK_N * grid_n)
-            )
+            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
             y_offs = rows_y[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
         else:
-            mask_y = (offs_y_m[:, None] < M) & (
-                offs_y_n[None, :] < (OUT_BLOCK_N * grid_n)
+            mask_y = (offs_y_m[:, None] < M) & (offs_y_n[None, :] < actual_n)
+            y_offs = offs_y_m[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
+
+        gl.store(y_ptr + y_offs, out, mask=mask_y)
+
+
+# ---------------------------------------------------------------------------
+# Scaled MFMA MoE kernel (mxfp4 / fp8 + e8m0 block scales)
+# ---------------------------------------------------------------------------
+#
+# Mirrors ``_pipelined_moe_kernel`` but uses ``gl.amd.cdna4.mfma_scaled``
+# and consumes uint8 storage for both operands. The supported dtype
+# combinations are picked via ``A_FORMAT`` / ``B_FORMAT`` constexpr
+# strings (``"e2m1"``, ``"e4m3"``, ``"e5m2"`` -- exactly what
+# ``mfma_scaled`` accepts):
+#
+#   * mxfp4 x mxfp4 : A=e2m1 + e8m0 block scale, B=e2m1 + e8m0 block scale
+#   * fp8(e4m3) x mxfp4 : A=e4m3 + global fp32 scale, B=e2m1 + e8m0 block
+#     scale
+#
+# ``e2m1`` storage packs two nibbles per byte along K, so the physical K
+# extent is ``K_LOGICAL // 2``; ``e4m3``/``e5m2`` store one element per
+# byte, so K_LOGICAL == K_PHYSICAL. Block scales (e8m0) carry one byte
+# per 32 logical K elements. The global fp8 scale (e4m3 path) is a
+# single fp32 scalar applied after the K loop. Wide-spectrum tuning
+# follows the same M-decoded ladders as :func:`_autotune_block` with
+# ``scaled_mfma=True``.
+
+if _gluon_is_supported():
+
+    @gluon.jit
+    def _pipelined_moe_kernel_scaled(
+        # Tensors --------------------------------------------------------
+        x_ptr,
+        w_ptr,
+        x_scale_ptr,  # only used when A is mxfp4
+        w_scale_ptr,  # always used (W is always mxfp4)
+        bias_ptr,
+        y_ptr,
+        gather_idx_ptr,
+        scatter_idx_ptr,
+        gate_scal_ptr,
+        expert_remap_ptr,
+        # Strides --------------------------------------------------------
+        stride_xm,
+        stride_xk,  # bytes along the *physical* K dim
+        stride_we,
+        stride_wn,
+        stride_wk,  # bytes along the *physical* (packed) K dim of W
+        stride_xsm,
+        stride_xsk,
+        stride_wse,
+        stride_wsn,
+        stride_wsk,
+        stride_yn,
+        stride_ym,
+        stride_be,
+        stride_bn,
+        # Logical shapes -------------------------------------------------
+        M,
+        N,
+        K,  # logical K (number of e2m1/e4m3 elements per row)
+        # Scalar global fp8 scale (used only when A is e4m3/e5m2) -------
+        a_global_scale,  # fp32 scalar; ignored when HAS_A_BLOCK_SCALE is True
+        # Tile constants -------------------------------------------------
+        BLOCK_M: gl.constexpr,
+        BLOCK_N: gl.constexpr,
+        BLOCK_K: gl.constexpr,
+        NUM_WARPS: gl.constexpr,
+        BLOCKS_PER_EXPERT: gl.constexpr,
+        A_FORMAT: gl.constexpr,  # "e2m1" / "e4m3" / "e5m2"
+        B_FORMAT: gl.constexpr,  # "e2m1" (W is always mxfp4 here)
+        HAS_A_BLOCK_SCALE: gl.constexpr,  # True iff A is mxfp4
+        HAS_BIAS: gl.constexpr,
+        HAS_GATHER: gl.constexpr,
+        HAS_SCATTER: gl.constexpr,
+        DO_SWIGLU: gl.constexpr,
+        SWIGLU_ALPHA: gl.constexpr,
+        SWIGLU_LIMIT: gl.constexpr,
+        OUT_BLOCK_N: gl.constexpr,
+        APPLY_GATE_SCAL: gl.constexpr,
+        HAS_EXPERT_REMAP: gl.constexpr,
+    ):
+        compact_idx = gl.program_id(1)
+        block_pid = gl.program_id(0)
+        grid_n = (N + BLOCK_N - 1) // BLOCK_N
+        block_in_expert = block_pid // grid_n
+        pid_n = block_pid % grid_n
+        if HAS_EXPERT_REMAP:
+            expert_id = gl.load(expert_remap_ptr + compact_idx).to(gl.int32)
+        else:
+            expert_id = compact_idx
+
+        off_m = compact_idx * BLOCKS_PER_EXPERT * BLOCK_M + block_in_expert * BLOCK_M
+        off_n = pid_n * BLOCK_N
+        w_base_offset = expert_id * stride_we
+        ws_base_offset = expert_id * stride_wse
+
+        MMA: gl.constexpr = _mma_layout_scaled(NUM_WARPS)
+        DOT_A: gl.constexpr = _dot_a_layout_scaled(NUM_WARPS)
+        DOT_B: gl.constexpr = _dot_b_layout_scaled(NUM_WARPS)
+        A_SCALE: gl.constexpr = _a_scale_layout_scaled(NUM_WARPS, BLOCK_M, BLOCK_K)
+        B_SCALE: gl.constexpr = _b_scale_layout_scaled(NUM_WARPS, BLOCK_N, BLOCK_K)
+        STORE: gl.constexpr = _store_layout(NUM_WARPS)
+
+        # Packing factor along K: e2m1 packs 2 elements per byte.
+        DIV_A: gl.constexpr = 2 if A_FORMAT == "e2m1" else 1
+        DIV_B: gl.constexpr = 2  # B is always mxfp4 here
+        BLOCK_K_A: gl.constexpr = BLOCK_K // DIV_A
+        BLOCK_K_B: gl.constexpr = BLOCK_K // DIV_B
+        BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+
+        if A_FORMAT == "e2m1":
+            LOAD_A: gl.constexpr = _load_a_packed_layout(BLOCK_K, NUM_WARPS)
+        else:
+            LOAD_A: gl.constexpr = _load_a_unpacked_layout(BLOCK_K, NUM_WARPS)
+        LOAD_B: gl.constexpr = _load_b_packed_layout(BLOCK_K, NUM_WARPS)
+
+        # ----- Compute global offsets (in *physical* byte coords) -----
+        offs_am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_A))
+        offs_ak = gl.arange(0, BLOCK_K_A, layout=gl.SliceLayout(0, LOAD_A))
+        offs_bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_B))
+        offs_bk = gl.arange(0, BLOCK_K_B, layout=gl.SliceLayout(1, LOAD_B))
+
+        rows_m = off_m + offs_am
+        if HAS_GATHER:
+            rows_m_safe = gl.where(rows_m < M, rows_m, gl.zeros_like(rows_m))
+            rows_m = gl.load(
+                gather_idx_ptr + rows_m_safe, mask=rows_m_safe < M, other=0
+            ).to(gl.int32)
+
+        # Activation tile (uint8 storage).
+        a_offsets = rows_m[:, None] * stride_xm + offs_ak[None, :] * stride_xk
+        # Weight tile (uint8 storage).
+        b_offsets = (
+            offs_bk[:, None] * stride_wk
+            + (off_n + offs_bn)[None, :] * stride_wn
+            + w_base_offset
+        )
+
+        mask_m = rows_m < M
+        mask_n = (off_n + offs_bn) < N
+        mask_ak = offs_ak[None, :] < (K // DIV_A)
+        mask_bk = offs_bk[:, None] < (K // DIV_B)
+
+        acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, MMA)
+
+        # Block-scale tiles use the layouts returned by
+        # ``get_mfma_scale_layout`` directly; that layout already
+        # respects CDNA4's wave=64 lane constraint (the test
+        # ``test_amd_mfma_scaled`` follows the same pattern).
+        offs_a_sm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, A_SCALE))
+        offs_a_sk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, A_SCALE))
+        offs_b_sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, B_SCALE))
+        offs_b_sk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, B_SCALE))
+
+        rows_m_scale = off_m + offs_a_sm
+        if HAS_GATHER:
+            if HAS_A_BLOCK_SCALE:
+                rows_m_scale_safe = gl.where(
+                    rows_m_scale < M, rows_m_scale, gl.zeros_like(rows_m_scale)
+                )
+                rows_m_scale = gl.load(
+                    gather_idx_ptr + rows_m_scale_safe,
+                    mask=rows_m_scale_safe < M,
+                    other=0,
+                ).to(gl.int32)
+
+        a_scale_offsets = (
+            rows_m_scale[:, None] * stride_xsm + offs_a_sk[None, :] * stride_xsk
+        )
+        b_scale_offsets = (
+            (off_n + offs_b_sn)[:, None] * stride_wsn
+            + offs_b_sk[None, :] * stride_wsk
+            + ws_base_offset
+        )
+
+        # Prefetch tile 0.
+        a_next = gl.load(x_ptr + a_offsets, mask=mask_m[:, None] & mask_ak, other=0)
+        b_next = gl.load(w_ptr + b_offsets, mask=mask_bk & mask_n[None, :], other=0)
+        if HAS_A_BLOCK_SCALE:
+            a_scale_next = gl.load(
+                x_scale_ptr + a_scale_offsets,
+                mask=(rows_m_scale[:, None] < M) & (offs_a_sk[None, :] < (K // 32)),
+                other=0,
             )
+        b_scale_next = gl.load(
+            w_scale_ptr + b_scale_offsets,
+            mask=((off_n + offs_b_sn)[:, None] < N) & (offs_b_sk[None, :] < (K // 32)),
+            other=0,
+        )
+
+        num_k_tiles = (K + BLOCK_K - 1) // BLOCK_K
+        for k_tile in range(num_k_tiles):
+            next_off_a = (k_tile + 1) * BLOCK_K_A
+            next_off_b = (k_tile + 1) * BLOCK_K_B
+            next_off_s = (k_tile + 1) * BLOCK_K_SCALE
+
+            a_off = a_offsets + next_off_a * stride_xk
+            b_off = b_offsets + next_off_b * stride_wk
+            mask_ak2 = (next_off_a + offs_ak)[None, :] < (K // DIV_A)
+            mask_bk2 = (next_off_b + offs_bk)[:, None] < (K // DIV_B)
+
+            a_prefetch = gl.load(
+                x_ptr + a_off,
+                mask=mask_m[:, None] & mask_ak2,
+                other=0,
+            )
+            b_prefetch = gl.load(
+                w_ptr + b_off,
+                mask=mask_bk2 & mask_n[None, :],
+                other=0,
+            )
+            if HAS_A_BLOCK_SCALE:
+                a_sc_off = a_scale_offsets + next_off_s * stride_xsk
+                a_scale_prefetch = gl.load(
+                    x_scale_ptr + a_sc_off,
+                    mask=(rows_m_scale[:, None] < M)
+                    & ((next_off_s + offs_a_sk)[None, :] < (K // 32)),
+                    other=0,
+                )
+            b_sc_off = b_scale_offsets + next_off_s * stride_wsk
+            b_scale_prefetch = gl.load(
+                w_scale_ptr + b_sc_off,
+                mask=((off_n + offs_b_sn)[:, None] < N)
+                & ((next_off_s + offs_b_sk)[None, :] < (K // 32)),
+                other=0,
+            )
+
+            a_dot = gl.convert_layout(a_next, DOT_A)
+            b_dot = gl.convert_layout(b_next, DOT_B)
+
+            if HAS_A_BLOCK_SCALE:
+                acc = gl.amd.cdna4.mfma_scaled(
+                    a_dot,
+                    a_scale_next,
+                    A_FORMAT,
+                    b_dot,
+                    b_scale_next,
+                    B_FORMAT,
+                    acc,
+                )
+            else:
+                acc = gl.amd.cdna4.mfma_scaled(
+                    a_dot,
+                    None,
+                    A_FORMAT,
+                    b_dot,
+                    b_scale_next,
+                    B_FORMAT,
+                    acc,
+                )
+
+            a_next = a_prefetch
+            b_next = b_prefetch
+            if HAS_A_BLOCK_SCALE:
+                a_scale_next = a_scale_prefetch
+            b_scale_next = b_scale_prefetch
+
+        # Apply global fp8 scale (single scalar) when A is fp8.
+        if not HAS_A_BLOCK_SCALE:
+            acc = acc * a_global_scale
+
+        if HAS_BIAS:
+            bias_offs = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, MMA))
+            bias_mask = bias_offs < N
+            bias = gl.load(
+                bias_ptr + expert_id * stride_be + bias_offs,
+                mask=bias_mask,
+                other=0.0,
+            )
+            acc = acc + bias[None, :].to(gl.float32)
+
+        if DO_SWIGLU:
+            out = _swiglu_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, MMA)
+        else:
+            out = acc
+
+        out = out.to(y_ptr.dtype.element_ty)
+        out = gl.convert_layout(out, STORE)
+
+        offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE))
+        off_n_out = pid_n * OUT_BLOCK_N
+        offs_y_n = off_n_out + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE))
+
+        if APPLY_GATE_SCAL:
+            scal = gl.load(
+                gate_scal_ptr + offs_y_m,
+                mask=offs_y_m < M,
+                other=1.0,
+            )
+            out = out * scal[:, None].to(out.dtype)
+
+        actual_n = (N // 2) if DO_SWIGLU else N
+        if HAS_SCATTER:
+            rows_y = gl.load(scatter_idx_ptr + offs_y_m, mask=offs_y_m < M, other=M)
+            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
+            y_offs = rows_y[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
+        else:
+            mask_y = (offs_y_m[:, None] < M) & (offs_y_n[None, :] < actual_n)
             y_offs = offs_y_m[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
 
         gl.store(y_ptr + y_offs, out, mask=mask_y)
@@ -684,6 +1065,155 @@ def _launch_pipelined(
         NUM_WARPS=num_warps,
         NUM_BUFFERS=num_buffers,
         BLOCKS_PER_EXPERT=blocks_per_expert,
+        HAS_BIAS=bias is not None,
+        HAS_GATHER=gather_indx is not None,
+        HAS_SCATTER=scatter_indx is not None,
+        DO_SWIGLU=swiglu is not None,
+        SWIGLU_ALPHA=float(swiglu_alpha),
+        SWIGLU_LIMIT=float(swiglu_limit),
+        OUT_BLOCK_N=out_block_n,
+        APPLY_GATE_SCAL=gate_scal is not None,
+        HAS_EXPERT_REMAP=expert_remap is not None,
+        num_warps=num_warps,
+    )
+
+
+def _launch_pipelined_scaled(
+    x: torch.Tensor,  # uint8 storage (e2m1 or e4m3/e5m2)
+    w: torch.Tensor,  # uint8 storage (e2m1)
+    *,
+    y: torch.Tensor,
+    bias: torch.Tensor | None,
+    gather_indx,
+    scatter_indx,
+    gate_scal: torch.Tensor | None,
+    a_ragged_metadata,
+    swiglu: tuple[float, float] | None,
+    out_block_n: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    a_format: str,  # "e2m1" / "e4m3" / "e5m2"
+    b_format: str = "e2m1",
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    a_global_scale: float = 1.0,
+):
+    """Launch the scaled-MFMA MoE kernel.
+
+    A is interpreted as ``A_FORMAT`` (one of ``e2m1`` / ``e4m3`` / ``e5m2``)
+    and may carry either a block scale tensor (mxfp4) or a global fp32
+    scalar (fp8). B is always mxfp4 (``e2m1``) with an e8m0 block scale.
+    """
+    assert a_format in {"e2m1", "e4m3", "e5m2"}
+    assert b_format == "e2m1", "Only mxfp4 (e2m1) W is supported today."
+    has_a_block_scale = a_format == "e2m1"
+    if has_a_block_scale:
+        assert x_scale is not None, "mxfp4 A requires a block-scale tensor"
+    assert w_scale is not None, "mxfp4 W requires a block-scale tensor"
+
+    # Logical K = K_packed * DIV_FACTOR; the caller passes the *logical*
+    # shape so the kernel can iterate by logical BLOCK_K.
+    M = x.shape[-2]
+    K_phys = x.shape[-1]
+    div_a = 2 if a_format == "e2m1" else 1
+    K = K_phys * div_a
+
+    if w.ndim == 3:
+        E, K_w_phys, N = w.shape
+    else:
+        K_w_phys, N = w.shape
+        E = 1
+    K_w = K_w_phys * 2  # W is always mxfp4 (packed 2:1)
+    assert K == K_w, f"K mismatch: A logical K={K} vs W logical K={K_w}"
+
+    assert block_k % _MFMA_SCALED_K == 0 and block_k >= _MFMA_SCALED_K
+    assert block_m % _MFMA_M == 0
+
+    num_active, blocks_per_expert, expert_remap = _expert_layout(
+        a_ragged_metadata, block_m, M
+    )
+    grid_n = (N + block_n - 1) // block_n
+    grid = (blocks_per_expert * grid_n, num_active)
+
+    bias_buf = bias if bias is not None else _make_dummy(x.device, torch.float32)
+    gather_buf = (
+        gather_indx.src_indx
+        if gather_indx is not None
+        else _make_dummy(x.device, torch.int32)
+    )
+    scatter_buf = (
+        scatter_indx.dst_indx
+        if scatter_indx is not None
+        else _make_dummy(x.device, torch.int32)
+    )
+    gate_scal_buf = (
+        gate_scal if gate_scal is not None else _make_dummy(x.device, torch.float32)
+    )
+    expert_remap_buf = (
+        expert_remap if expert_remap is not None else _make_dummy(x.device, torch.int32)
+    )
+    # x_scale_buf must always be a valid tensor (kernel branches on
+    # HAS_A_BLOCK_SCALE constexpr but Triton still inspects the arg).
+    x_scale_buf = x_scale if x_scale is not None else _make_dummy(x.device, torch.uint8)
+
+    swiglu_alpha = swiglu[0] if swiglu is not None else 0.0
+    swiglu_limit = swiglu[1] if swiglu is not None else 0.0
+
+    w3 = w if w.ndim == 3 else w.unsqueeze(0)
+    w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
+
+    # Per-expert strides on the e8m0 scale tensor. We expect layout
+    # ``(E, N, K_SCALE)`` so that scale slices along K are contiguous.
+    stride_wse = w_scale3.stride(0)
+    stride_wsn = w_scale3.stride(-2)
+    stride_wsk = w_scale3.stride(-1)
+
+    if has_a_block_scale:
+        stride_xsm = x_scale.stride(-2)
+        stride_xsk = x_scale.stride(-1)
+    else:
+        stride_xsm = 0
+        stride_xsk = 0
+
+    _pipelined_moe_kernel_scaled[grid](
+        x,
+        w3,
+        x_scale_buf,
+        w_scale3,
+        bias_buf,
+        y,
+        gather_buf,
+        scatter_buf,
+        gate_scal_buf,
+        expert_remap_buf,
+        x.stride(-2),
+        x.stride(-1),
+        w3.stride(0),
+        w.stride(-1),
+        w.stride(-2),
+        stride_xsm,
+        stride_xsk,
+        stride_wse,
+        stride_wsn,
+        stride_wsk,
+        y.stride(-1),
+        y.stride(-2),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(-1) if bias is not None else 0,
+        M,
+        N,
+        K,
+        float(a_global_scale),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        NUM_WARPS=num_warps,
+        BLOCKS_PER_EXPERT=blocks_per_expert,
+        A_FORMAT=a_format,
+        B_FORMAT=b_format,
+        HAS_A_BLOCK_SCALE=has_a_block_scale,
         HAS_BIAS=bias is not None,
         HAS_GATHER=gather_indx is not None,
         HAS_SCATTER=scatter_indx is not None,
@@ -951,6 +1481,202 @@ def gluon_bf16_combine(
 
 
 # ---------------------------------------------------------------------------
+# Public Python entry points -- scaled (mxfp4 / fp8) variants
+# ---------------------------------------------------------------------------
+#
+# ``A_FORMAT`` mirrors triton_kernels' ``get_scaled_dot_format_string``
+# convention:
+#   "e2m1" : mxfp4 (uint8 packed, requires a_block_scale)
+#   "e4m3" : fp8 e4m3 (uint8, requires a_global_scale)
+#   "e5m2" : fp8 e5m2 (uint8, requires a_global_scale)
+# ``B_FORMAT`` is always ``"e2m1"`` in this version (mxfp4 weights).
+
+
+def gluon_mxfp_gating_gemm(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    *,
+    x_scale: torch.Tensor | None = None,
+    a_format: str = "e2m1",
+    a_global_scale: float = 1.0,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    num_warps: int | None = None,
+) -> torch.Tensor:
+    """Scaled-MFMA dense GEMM ``y = (a_scale * x) @ (w_scale * w)``.
+
+    * ``x`` is a 2-D ``uint8`` tensor encoding the activation. Logical
+      K = ``x.shape[-1] * (2 if a_format=='e2m1' else 1)``.
+    * ``w`` is a 2-D ``uint8`` tensor encoding mxfp4 weights with logical
+      K = ``w.shape[0] * 2``.
+    * ``w_scale`` is a 2-D ``uint8`` (e8m0) tensor of shape
+      ``[N, K//32]``.
+    * If ``a_format == 'e2m1'`` then ``x_scale`` is required, shape
+      ``[M, K//32]``. If ``a_format`` is one of the fp8 formats then
+      ``a_global_scale`` (a python float) is applied to the accumulator
+      after the K loop.
+    """
+    assert _gluon_is_supported(), "Gluon scaled MoE kernel requires CDNA4."
+    assert x.dim() == 2 and w.dim() == 2
+    M = x.shape[0]
+    N = w.shape[-1]
+    div_a = 2 if a_format == "e2m1" else 1
+    K = x.shape[-1] * div_a
+    bm, bn, bk, nw = _autotune_block(M, N, K, scaled_mfma=True)
+    block_m = block_m or bm
+    block_n = block_n or bn
+    block_k = block_k or bk
+    num_warps = num_warps or nw
+    y = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    _launch_pipelined_scaled(
+        x,
+        w,
+        y=y,
+        bias=bias,
+        gather_indx=None,
+        scatter_indx=None,
+        gate_scal=None,
+        a_ragged_metadata=None,
+        swiglu=None,
+        out_block_n=block_n,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        a_format=a_format,
+        b_format="e2m1",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        a_global_scale=a_global_scale,
+    )
+    return y
+
+
+def gluon_mxfp_dispatch_swiglu(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    *,
+    x_scale: torch.Tensor | None = None,
+    a_format: str = "e2m1",
+    a_global_scale: float = 1.0,
+    bias: torch.Tensor | None,
+    a_ragged_metadata,
+    gather_indx,
+    out_dtype: torch.dtype = torch.bfloat16,
+    swiglu_alpha: float = 1.0,
+    swiglu_limit: float = 0.0,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    num_warps: int | None = None,
+) -> torch.Tensor:
+    """Scaled-MFMA dispatch + 1st GEMM + fused SwiGLU."""
+    assert _gluon_is_supported(), "Gluon scaled MoE kernel requires CDNA4."
+    assert w.ndim == 3 and w.shape[-1] % 2 == 0
+    M = x.shape[-2]
+    N = w.shape[-1]
+    div_a = 2 if a_format == "e2m1" else 1
+    K = x.shape[-1] * div_a
+    bm, bn, bk, nw = _autotune_block(M, N, K, do_swiglu=True, scaled_mfma=True)
+    block_m = block_m or bm
+    block_n = block_n or bn
+    block_k = block_k or bk
+    num_warps = num_warps or nw
+    out_block_n = block_n // 2
+    y = torch.empty((M, N // 2), device=x.device, dtype=out_dtype)
+    _launch_pipelined_scaled(
+        x,
+        w,
+        y=y,
+        bias=bias,
+        gather_indx=gather_indx,
+        scatter_indx=None,
+        gate_scal=None,
+        a_ragged_metadata=a_ragged_metadata,
+        swiglu=(float(swiglu_alpha), float(swiglu_limit)),
+        out_block_n=out_block_n,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        a_format=a_format,
+        b_format="e2m1",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        a_global_scale=a_global_scale,
+    )
+    return y
+
+
+def gluon_mxfp_combine(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    *,
+    x_scale: torch.Tensor | None = None,
+    a_format: str = "e2m1",
+    a_global_scale: float = 1.0,
+    bias: torch.Tensor | None,
+    a_ragged_metadata,
+    scatter_indx,
+    gate_scal: torch.Tensor | None = None,
+    n_tokens: int | None = None,
+    n_expts_act: int | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    num_warps: int | None = None,
+) -> torch.Tensor:
+    """Scaled-MFMA 2nd GEMM + scatter combine for MoE."""
+    assert _gluon_is_supported(), "Gluon scaled MoE kernel requires CDNA4."
+    assert w.ndim == 3
+    M = x.shape[-2]
+    N = w.shape[-1]
+    if n_tokens is None:
+        n_tokens = M
+    div_a = 2 if a_format == "e2m1" else 1
+    K = x.shape[-1] * div_a
+    bm, bn, bk, nw = _autotune_block(
+        M, N, K, ragged=a_ragged_metadata is not None, scaled_mfma=True
+    )
+    block_m = block_m or bm
+    block_n = block_n or bn
+    block_k = block_k or bk
+    num_warps = num_warps or nw
+    y = torch.zeros((n_tokens, N), device=x.device, dtype=out_dtype)
+    _launch_pipelined_scaled(
+        x,
+        w,
+        y=y,
+        bias=bias,
+        gather_indx=None,
+        scatter_indx=scatter_indx,
+        gate_scal=gate_scal,
+        a_ragged_metadata=a_ragged_metadata,
+        swiglu=None,
+        out_block_n=block_n,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        a_format=a_format,
+        b_format="e2m1",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        a_global_scale=a_global_scale,
+    )
+    if n_expts_act is not None and n_expts_act > 1:
+        y = y.view(n_tokens, n_expts_act, N).sum(dim=1)
+    return y
+
+
+# ---------------------------------------------------------------------------
 # Adapter that matches ``triton_kernels.matmul`` signature (for the
 # kernel registry / selector)
 # ---------------------------------------------------------------------------
@@ -1094,5 +1820,8 @@ __all__ = [
     "gluon_bf16_combine",
     "gluon_bf16_dispatch_swiglu",
     "gluon_bf16_gating_gemm",
+    "gluon_mxfp_combine",
+    "gluon_mxfp_dispatch_swiglu",
+    "gluon_mxfp_gating_gemm",
     "static_profile",
 ]

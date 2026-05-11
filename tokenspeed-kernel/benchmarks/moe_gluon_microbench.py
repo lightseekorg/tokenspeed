@@ -390,28 +390,290 @@ def dump_static_profiles():
             n_expts_act=1,
         )
 
+    # Also exercise the scaled-MFMA kernel at the same shapes so its
+    # spill profile shows up alongside the bf16 ones.
+    from tokenspeed_kernel.ops.moe.gluon import (
+        _pipelined_moe_kernel_scaled,
+        gluon_mxfp_combine,
+        gluon_mxfp_dispatch_swiglu,
+        gluon_mxfp_gating_gemm,
+    )
+
+    for B in (32, 1024):
+        # mxfp4 x mxfp4 gating
+        a_packed, _ = _make_mxfp4(B, GPTOSS_HIDDEN, packed_dim=1)
+        w_packed, _ = _make_mxfp4(GPTOSS_HIDDEN, GPTOSS_NUM_EXPERTS, packed_dim=0)
+        a_scale, _ = _make_mx_scale(B, GPTOSS_HIDDEN)
+        w_scale, _ = _make_mx_scale(GPTOSS_NUM_EXPERTS, GPTOSS_HIDDEN)
+        gluon_mxfp_gating_gemm(
+            a_packed,
+            w_packed,
+            w_scale,
+            x_scale=a_scale,
+            a_format="e2m1",
+        )
+        # mxfp4 dispatch+swiglu
+        md, M_padded, *_ = _build_ragged(B, block_m=64)
+        a_pad_packed, _ = _make_mxfp4(M_padded, GPTOSS_HIDDEN, packed_dim=1)
+        a_pad_scale, _ = _make_mx_scale(M_padded, GPTOSS_HIDDEN)
+        w3_packed_list = []
+        w3_scale_list = []
+        N_full = 2 * GPTOSS_INTERMEDIATE
+        for _ in range(GPTOSS_NUM_EXPERTS):
+            wp, _ = _make_mxfp4(GPTOSS_HIDDEN, N_full, packed_dim=0)
+            w3_packed_list.append(wp)
+            sd, _ = _make_mx_scale(N_full, GPTOSS_HIDDEN)
+            w3_scale_list.append(sd)
+        w3 = torch.stack(w3_packed_list)
+        w3_scale = torch.stack(w3_scale_list)
+        gluon_mxfp_dispatch_swiglu(
+            a_pad_packed,
+            w3,
+            w3_scale,
+            x_scale=a_pad_scale,
+            a_format="e2m1",
+            bias=None,
+            a_ragged_metadata=md,
+            gather_indx=None,
+            swiglu_alpha=1.0,
+            swiglu_limit=0.0,
+        )
+        # mxfp4 combine
+        a_pad_i, _ = _make_mxfp4(M_padded, GPTOSS_INTERMEDIATE, packed_dim=1)
+        a_pad_i_scale, _ = _make_mx_scale(M_padded, GPTOSS_INTERMEDIATE)
+        w3_c_list = []
+        w3_c_scale_list = []
+        for _ in range(GPTOSS_NUM_EXPERTS):
+            wp, _ = _make_mxfp4(GPTOSS_INTERMEDIATE, GPTOSS_HIDDEN, packed_dim=0)
+            w3_c_list.append(wp)
+            sd, _ = _make_mx_scale(GPTOSS_HIDDEN, GPTOSS_INTERMEDIATE)
+            w3_c_scale_list.append(sd)
+        w3_c = torch.stack(w3_c_list)
+        w3_c_scale = torch.stack(w3_c_scale_list)
+        scatter = type(
+            "S",
+            (),
+            {"dst_indx": torch.arange(M_padded, device=DEVICE, dtype=torch.int32)},
+        )()
+        gluon_mxfp_combine(
+            a_pad_i,
+            w3_c,
+            w3_c_scale,
+            x_scale=a_pad_i_scale,
+            a_format="e2m1",
+            bias=None,
+            a_ragged_metadata=md,
+            scatter_indx=scatter,
+            n_tokens=M_padded,
+            n_expts_act=1,
+        )
+
     device = torch.cuda.current_device()
-    device_cache = _pipelined_moe_kernel.device_caches.get(device)
-    if not device_cache:
-        print("  no Gluon kernel cached -- did the launches fail?")
-        return
-    kernel_cache = device_cache[0]
     bad = 0
-    for sig, compiled in kernel_cache.items():
-        prof = static_profile(compiled)
-        spill = (
-            prof["sgpr_spill_count"] + prof["vgpr_spill_count"] + prof["ScratchSize"]
-        )
-        marker = "OK   " if spill == 0 else "SPILL"
-        if spill > 0:
-            bad += 1
-        print(
-            f"  [{marker}] sgpr={prof['sgpr_count']:3d} (spill={prof['sgpr_spill_count']}) "
-            f"vgpr={prof['vgpr_count']:3d} (spill={prof['vgpr_spill_count']}) "
-            f"scratch={prof['ScratchSize']} occupancy={prof['Occupancy']}"
-        )
+
+    def _scan(cache_attr, label):
+        nonlocal bad
+        cache = cache_attr.device_caches.get(device)
+        if not cache:
+            return
+        for _, compiled in cache[0].items():
+            prof = static_profile(compiled)
+            spill = (
+                prof["sgpr_spill_count"]
+                + prof["vgpr_spill_count"]
+                + prof["ScratchSize"]
+            )
+            marker = "OK   " if spill == 0 else "SPILL"
+            if spill > 0:
+                bad += 1
+            print(
+                f"  [{marker}] {label:8s} sgpr={prof['sgpr_count']:3d} (spill={prof['sgpr_spill_count']}) "
+                f"vgpr={prof['vgpr_count']:3d} (spill={prof['vgpr_spill_count']}) "
+                f"scratch={prof['ScratchSize']} occupancy={prof['Occupancy']}"
+            )
+
+    _scan(_pipelined_moe_kernel, "bf16")
+    _scan(_pipelined_moe_kernel_scaled, "scaled")
     if bad:
         raise SystemExit(f"{bad} kernel(s) reported spill -- aborting")
+
+
+def _make_mxfp4(M, K, packed_dim, *, device="cuda"):
+    """Random mxfp4 tensor; returns ``(packed_uint8, fp32_ref)``."""
+    from tokenspeed_triton.tools.mxfp import MXFP4Tensor
+
+    t = MXFP4Tensor(size=(M, K)).random()
+    return (
+        t.to_packed_tensor(dim=packed_dim).to(device),
+        t.to(torch.float32).to(device),
+    )
+
+
+def _make_mx_scale(rows, k_logical, *, device="cuda"):
+    """Random e8m0 block scale tensor; returns ``(uint8, fp32_broadcast)``."""
+    from tokenspeed_triton.tools.mxfp import MXScaleTensor
+
+    s = MXScaleTensor(size=(rows, k_logical // 32)).random(1 / 32, 32)
+    return (
+        s.data.to(device),
+        s.to(torch.float32).repeat_interleave(32, dim=1).to(device),
+    )
+
+
+def bench_scaled_gating(B: int, warmup: int = 10, rep: int = 50, fmt: str = "e2m1"):
+    """Scaled-MFMA gating GEMM ``(B, H) x (H, E)``.
+
+    ``fmt`` selects the A operand format:
+        - ``"e2m1"`` : mxfp4 activations + e8m0 block scale.
+        - ``"e4m3"`` : fp8 activations + a fixed global scalar.
+    The W is always mxfp4 in this version.
+    """
+    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
+
+    torch.manual_seed(0)
+    device = "cuda"
+    H, E = GPTOSS_HIDDEN, GPTOSS_NUM_EXPERTS
+
+    if fmt == "e2m1":
+        a_packed, _ = _make_mxfp4(B, H, packed_dim=1, device=device)
+        a_scale, _ = _make_mx_scale(B, H, device=device)
+        a_global = 1.0
+    else:
+        a_packed = torch.randint(20, 40, (B, H), dtype=torch.uint8, device=device)
+        a_scale = None
+        a_global = 0.137
+
+    w_packed, _ = _make_mxfp4(H, E, packed_dim=0, device=device)
+    w_scale, _ = _make_mx_scale(E, H, device=device)
+
+    def fn():
+        gluon_mxfp_gating_gemm(
+            a_packed,
+            w_packed,
+            w_scale,
+            x_scale=a_scale,
+            a_format=fmt,
+            a_global_scale=a_global,
+            out_dtype=torch.bfloat16,
+        )
+
+    flops = 2.0 * B * E * H
+    t_ms = _bench(fn, warmup=warmup, rep=rep)
+    label = f"B={B},H={H},E={E},fmt={fmt}/e2m1"
+    return label, t_ms, flops / (t_ms * 1e9)
+
+
+def bench_scaled_dispatch_swiglu(B, warmup=10, rep=50, fmt="e2m1"):
+    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_dispatch_swiglu
+
+    torch.manual_seed(0)
+    device = DEVICE
+    H, I, E = GPTOSS_HIDDEN, GPTOSS_INTERMEDIATE, GPTOSS_NUM_EXPERTS
+    md, M_d, n_active, _ = _build_ragged(B, block_m=64)
+    gather_indx = None
+    N_full = 2 * I
+
+    if fmt == "e2m1":
+        a_packed, _ = _make_mxfp4(M_d, H, packed_dim=1, device=device)
+        a_scale, _ = _make_mx_scale(M_d, H, device=device)
+        a_global = 1.0
+    else:
+        a_packed = torch.randint(20, 40, (M_d, H), dtype=torch.uint8, device=device)
+        a_scale = None
+        a_global = 0.137
+
+    w_packed_list = []
+    w_scale_list = []
+    for _ in range(E):
+        wp, _ = _make_mxfp4(H, N_full, packed_dim=0, device=device)
+        w_packed_list.append(wp)
+        sd, _ = _make_mx_scale(N_full, H, device=device)
+        w_scale_list.append(sd)
+    w3 = torch.stack(w_packed_list)
+    w_scale3 = torch.stack(w_scale_list)
+
+    def fn():
+        gluon_mxfp_dispatch_swiglu(
+            a_packed,
+            w3,
+            w_scale3,
+            x_scale=a_scale,
+            a_format=fmt,
+            a_global_scale=a_global,
+            bias=None,
+            a_ragged_metadata=md,
+            gather_indx=gather_indx,
+            out_dtype=torch.bfloat16,
+            swiglu_alpha=1.0,
+            swiglu_limit=0.0,
+        )
+
+    flops = 2.0 * M_d * N_full * H
+    t_ms = _bench(fn, warmup=warmup, rep=rep)
+    label = f"B={B},M_d={M_d},I={I},H={H},E_act={n_active}/{E},fmt={fmt}"
+    return label, t_ms, flops / (t_ms * 1e9)
+
+
+def bench_scaled_combine(B, warmup=10, rep=50, fmt="e2m1"):
+    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_combine
+
+    torch.manual_seed(0)
+    device = DEVICE
+    H, I, E = GPTOSS_HIDDEN, GPTOSS_INTERMEDIATE, GPTOSS_NUM_EXPERTS
+    md, M_d, n_active, _ = _build_ragged(B, block_m=64)
+
+    if fmt == "e2m1":
+        a_packed, _ = _make_mxfp4(M_d, I, packed_dim=1, device=device)
+        a_scale, _ = _make_mx_scale(M_d, I, device=device)
+        a_global = 1.0
+    else:
+        a_packed = torch.randint(20, 40, (M_d, I), dtype=torch.uint8, device=device)
+        a_scale = None
+        a_global = 0.137
+
+    w_packed_list = []
+    w_scale_list = []
+    for _ in range(E):
+        wp, _ = _make_mxfp4(I, H, packed_dim=0, device=device)
+        w_packed_list.append(wp)
+        sd, _ = _make_mx_scale(H, I, device=device)
+        w_scale_list.append(sd)
+    w3 = torch.stack(w_packed_list)
+    w_scale3 = torch.stack(w_scale_list)
+
+    scatter = type(
+        "S",
+        (),
+        {
+            "dst_indx": torch.arange(M_d, device=device, dtype=torch.int32),
+        },
+    )()
+
+    def fn():
+        gluon_mxfp_combine(
+            a_packed,
+            w3,
+            w_scale3,
+            x_scale=a_scale,
+            a_format=fmt,
+            a_global_scale=a_global,
+            bias=None,
+            a_ragged_metadata=md,
+            scatter_indx=scatter,
+            n_tokens=M_d,
+            n_expts_act=1,
+            out_dtype=torch.bfloat16,
+        )
+
+    flops = 2.0 * M_d * H * I
+    t_ms = _bench(fn, warmup=warmup, rep=rep)
+    label = f"B={B},M_d={M_d},H={H},I={I},E_act={n_active}/{E},fmt={fmt}"
+    return label, t_ms, flops / (t_ms * 1e9)
+
+
+def _print_scaled_row(label_t_tf):
+    label, t_ms, tf = label_t_tf
+    print(f"  {label:56s} gluon={tf:7.1f} TFLOPs ({t_ms:.3f} ms)")
 
 
 def dump_scaled_mfma_autotune():
@@ -510,6 +772,54 @@ def main():
     print("-" * 110)
     for B in args.batch_sizes:
         _print_row(bench_combine(B, warmup=args.warmup, rep=args.rep))
+
+    # ------ Scaled MFMA variants (mxfp4 / fp8) ------
+    print("\n=== Scaled MFMA variants (instr 16x16x128) ===")
+    print("\nKernel 1s: mxfp4 x mxfp4 gating GEMM  (B, H) x (H, E)")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_scaled_row(
+            bench_scaled_gating(B, warmup=args.warmup, rep=args.rep, fmt="e2m1")
+        )
+
+    print("\nKernel 1s.fp8: fp8 x mxfp4 gating GEMM  (B, H) x (H, E)")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_scaled_row(
+            bench_scaled_gating(B, warmup=args.warmup, rep=args.rep, fmt="e4m3")
+        )
+
+    print("\nKernel 2s: mxfp4 dispatch + 1st GEMM + SwiGLU")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_scaled_row(
+            bench_scaled_dispatch_swiglu(
+                B, warmup=args.warmup, rep=args.rep, fmt="e2m1"
+            )
+        )
+
+    print("\nKernel 2s.fp8: fp8 dispatch + 1st GEMM + SwiGLU")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_scaled_row(
+            bench_scaled_dispatch_swiglu(
+                B, warmup=args.warmup, rep=args.rep, fmt="e4m3"
+            )
+        )
+
+    print("\nKernel 3s: mxfp4 2nd GEMM + scatter combine")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_scaled_row(
+            bench_scaled_combine(B, warmup=args.warmup, rep=args.rep, fmt="e2m1")
+        )
+
+    print("\nKernel 3s.fp8: fp8 2nd GEMM + scatter combine")
+    print("-" * 110)
+    for B in args.batch_sizes:
+        _print_scaled_row(
+            bench_scaled_combine(B, warmup=args.warmup, rep=args.rep, fmt="e4m3")
+        )
 
     if not args.no_static:
         dump_static_profiles()
