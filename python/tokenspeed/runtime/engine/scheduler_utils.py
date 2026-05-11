@@ -68,15 +68,7 @@ def make_config(
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage
     cfg.prefetch_threshold = prefetch_threshold
-    if enable_kv_cache_events:
-        if not hasattr(cfg, "enable_kv_cache_events"):
-            raise RuntimeError(
-                "KV cache events require a tokenspeed_scheduler extension with "
-                "SchedulerConfig.enable_kv_cache_events support."
-            )
-        cfg.enable_kv_cache_events = True
-    elif hasattr(cfg, "enable_kv_cache_events"):
-        cfg.enable_kv_cache_events = False
+    cfg.enable_kv_cache_events = enable_kv_cache_events
 
     if role == "prefill":
         cfg.role = SchedulerConfig.Role.P

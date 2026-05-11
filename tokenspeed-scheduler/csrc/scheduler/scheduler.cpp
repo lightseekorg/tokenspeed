@@ -63,8 +63,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
 
     if (config_.enable_kv_cache_events) {
-        kv_prefix_cache_.SetKvEventSink(
-            [this](KvCacheEvent event) { kv_events_.push_back(std::move(event)); });
+        kv_prefix_cache_.SetKvEventSink([this](KvCacheEvent event) { kv_events_.push_back(std::move(event)); });
     }
 
     if (config_.num_mamba_slots > 0) {

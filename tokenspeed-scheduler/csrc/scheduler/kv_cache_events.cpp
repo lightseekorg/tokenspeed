@@ -51,8 +51,7 @@ void MixInt32(std::uint64_t& hash, std::int32_t value) {
 
 }  // namespace
 
-std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids,
-                          std::optional<std::uint64_t> parent_hash) {
+std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash) {
     std::uint64_t hash = kFnvOffsetBasis;
     MixByte(hash, parent_hash.has_value() ? 1 : 0);
     if (parent_hash.has_value()) {

@@ -57,6 +57,7 @@ def test_enable_only_config_defaults_to_zmq_publisher() -> None:
 
 def test_scheduler_block_stored_translation() -> None:
     event = SimpleNamespace(
+        kind="BlockStored",
         block_hashes=[123],
         parent_block_hash=None,
         token_ids=[1, 2, 3, 4],
@@ -74,11 +75,22 @@ def test_scheduler_block_stored_translation() -> None:
 
 
 def test_scheduler_block_removed_translation() -> None:
-    event = SimpleNamespace(block_hashes=[123, 456])
+    event = SimpleNamespace(kind="BlockRemoved", block_hashes=[123, 456])
 
     wire_event = scheduler_kv_event_to_wire_event(event)
 
     assert wire_event == BlockRemoved(block_hashes=[123, 456])
+
+
+def test_scheduler_translation_uses_event_kind_not_shape() -> None:
+    event = SimpleNamespace(
+        kind="FutureSchedulerEvent",
+        block_hashes=[123],
+        token_ids=[1, 2],
+    )
+
+    with pytest.raises(TypeError, match="FutureSchedulerEvent"):
+        scheduler_kv_event_to_wire_event(event)
 
 
 def test_drain_scheduler_kv_events_skips_binding_when_disabled() -> None:

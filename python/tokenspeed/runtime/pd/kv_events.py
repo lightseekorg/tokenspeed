@@ -82,7 +82,8 @@ def scheduler_kv_event_to_wire_event(
     event: Any,
 ) -> Union[BlockStored, BlockRemoved]:
     """Translate a scheduler-native KV event into the ZMQ wire struct."""
-    if hasattr(event, "token_ids"):
+    kind = event.kind
+    if kind == "BlockStored":
         return BlockStored(
             block_hashes=[int(block_hash) for block_hash in event.block_hashes],
             parent_block_hash=(
@@ -93,11 +94,11 @@ def scheduler_kv_event_to_wire_event(
             token_ids=[int(token_id) for token_id in event.token_ids],
             block_size=int(event.block_size),
         )
-    if hasattr(event, "block_hashes"):
+    if kind == "BlockRemoved":
         return BlockRemoved(
             block_hashes=[int(block_hash) for block_hash in event.block_hashes]
         )
-    raise TypeError(f"Unsupported scheduler KV event: {type(event).__name__}")
+    raise TypeError(f"Unsupported scheduler KV event kind: {kind}")
 
 
 def scheduler_kv_events_to_wire_events(

@@ -313,8 +313,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::Scheduler& s) {
                 nb::list result;
                 for (auto& event : s.DrainKvEvents()) {
-                    std::visit(
-                        [&result](auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, event);
+                    std::visit([&result](auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, event);
                 }
                 return result;
             },
