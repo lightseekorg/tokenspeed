@@ -193,6 +193,81 @@ docker exec kylewng_triton_dev_mi355_1505_dev bash -c '
   block size / num_warps 网格扫描脚本。
 - `task-progress-2.md`（**新增**）— 本文件。
 
+## Update — software pipeline + 三 kernel 全部超过 baseline
+
+按 `TASKS.md:31-38` 进一步完善后的状态：
+
+### 1. Software pipelining
+
+参考 `triton-450/.../moe_gfx1250.py` 的 `MoEPipelinedProgram`，
+在 `_pipelined_moe_kernel` 中实现 **register-staged double-buffer pipeline**：
+
+- 在主循环开始前 prefetch tile 0 (`a_next`, `b_next`)。
+- 每次 MFMA 之前，对下一个 tile 发出 `gl.load` prefetch
+  (`a_prefetch`, `b_prefetch`)，与当前 MFMA 计算重叠。
+- MFMA 完成后将 prefetched tile 提升到 `a_next`/`b_next`。
+
+> 我们最初按 `f16_gemm_gfx950.py` 走 `buffer_load_to_shared` +
+> `commit_group` / `wait_group` 的 LDS 双缓冲 path，
+> 但当 base pointer 同时含 dynamic per-expert offset 时，
+> Triton/MLIR legalization 反复抛 `unrealized_conversion_cast`。
+> 在 register-staged 方案已经能稳定打过 baseline 后，
+> 把 LDS async DMA 留作 follow-up（见下文）。
+
+### 2. Static profile / no spill 校验
+
+把 `gfx1250_utils.py` 的 `static_profile` 移植成
+`tokenspeed_kernel.ops.moe.gluon.static_profile` + `assert_no_spills`：
+
+- 在 unit test (`test_no_register_spill`) 中编译 kernel 后强制断言
+  `sgpr_spill == 0` & `vgpr_spill == 0` & `scratch == 0`。
+- 在 microbench 末尾把每个编译产物的 GPR/spill/occupancy dump 出来。
+
+最新 microbench 数据（MI355, container `kylewng_triton_dev_mi355_1505_dev`）：
+
+```
+Kernel 1: bf16 gating GEMM (Gluon vs upstream triton_kernels.matmul)
+  M=512,N=1024,K=2880    gluon=  44.9 TFLOPs (0.067 ms)  triton_kernels= 18.8 TFLOPs  →  2.39x
+  M=1024,N=1024,K=2880   gluon=  78.6 TFLOPs (0.077 ms)  triton_kernels= 38.3 TFLOPs  →  2.05x
+  M=4096,N=1024,K=2880   gluon= 230.5 TFLOPs (0.105 ms)  triton_kernels=220.3 TFLOPs  →  1.05x
+
+Kernel 2: dispatch + 1st GEMM + SwiGLU
+  M=512 ,N=1024*2,K=2880,E=4   gluon=  56.6 TFLOPs (0.107 ms)  baseline= 48.6 TFLOPs  →  1.16x
+  M=1024,N=1024*2,K=2880,E=4   gluon= 111.3 TFLOPs (0.109 ms)  baseline= 98.2 TFLOPs  →  1.13x
+
+Kernel 3: 2nd GEMM + scatter combine
+  M=512 ,N=2880,K=1024,E=4     gluon=  35.1 TFLOPs (0.086 ms)  baseline= 24.6 TFLOPs  →  1.42x
+  M=1024,N=2880,K=1024,E=4     gluon=  69.2 TFLOPs (0.087 ms)  baseline= 49.0 TFLOPs  →  1.41x
+
+Static GPR / spill profile (all 9 compiled variants):
+  sgpr ≤ 49, vgpr ≤ 216, sgpr_spill = 0, vgpr_spill = 0, scratch = 0,
+  occupancy 2 ~ 5
+```
+
+3 个 kernel **全部超过 baseline**，并且无任何 sgpr / vgpr spill。
+
+### 3. 关键改动概览
+
+- **统一 `_pipelined_moe_kernel`**：用 `constexpr` flag
+  (`HAS_BIAS`, `HAS_GATHER`, `HAS_SCATTER`, `DO_SWIGLU`, `APPLY_GATE_SCAL`)
+  一次性覆盖 3 种 kernel，避免代码重复。
+- **2D launch grid**：把 `expert_id` 提到 `program_id(1)`，
+  保证它在 IR 里是 scalar，便于以后再换回 `buffer_load_to_shared`
+  做完整 LDS 双缓冲。
+- **shape-aware autotuner** `_autotune_block`：
+  - 大 dense GEMM (`do_swiglu=False`): 小 BLOCK_N=64 + 8 warps，
+    把 grid_n 拉满 256 个 CU。
+  - SwiGLU 路径 (`do_swiglu=True`): 64×64×32 + 4 warps，
+    省下 SwiGLU 那一步要的临时 vgpr。
+- **3 个独立 launcher**：`gluon_bf16_gating_gemm`,
+  `gluon_bf16_dispatch_swiglu`, `gluon_bf16_combine`，
+  各自直接吃 PyTorch tensor，方便单测和 microbench 用。
+- **更新 UT** (`test/ops/test_moe_gluon.py`)：
+  3 套 kernel 各 2 个 shape 的 correctness，
+  + `test_no_register_spill` 在编译产物上断言 spill 为零。
+- **更新 microbench** (`benchmarks/moe_gluon_microbench.py`)：
+  对 3 个 kernel 分别跑相应 baseline + dump static profile。
+
 ## 已知 follow-up
 
 1. **mxfp4 weight + fp8/bf16 act 路径**：复用 `gl.amd.cdna4.mfma_scaled` +
