@@ -74,6 +74,24 @@ dependencies = [
     "viztracer",
 ]
 
+[project.optional-dependencies]
+serve = [
+    # smg's TokenSpeed support (PR #1351) hasn't merged to smg-main yet, and
+    # smg won't be cutting a fresh PyPI release that includes it. Pin both
+    # packages to the same SHA on the feature branch so the gRPC proto
+    # and RuntimeType enum stay in sync. Bump this SHA together with any
+    # smg-side wire-contract change.
+    #
+    # Requires Rust toolchain + protoc at install time because maturin
+    # builds smg_rs.abi3.so from source.
+    #
+    # Dev fallback (faster, no Rust install if the checkout is already
+    # built):
+    #   pip install -e ~/smg/bindings/python -e ~/smg/grpc_servicer
+    "smg @ git+https://github.com/lightseekorg/smg.git@a1a6cd8f75996e0b3807a3780877e93454799372#subdirectory=bindings/python",
+    "smg-grpc-servicer @ git+https://github.com/lightseekorg/smg.git@a1a6cd8f75996e0b3807a3780877e93454799372#subdirectory=grpc_servicer",
+]
+
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"

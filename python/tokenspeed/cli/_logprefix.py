@@ -1,0 +1,65 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Async per-line stream prefixer for ``ts serve``.
+
+Reads a child subprocess's stdout/stderr line-by-line and forwards each
+line to a sink with a ``[<tag>] `` prefix. Per-line emission keeps
+Python tracebacks readable (each frame line is already newline-
+terminated).
+
+The sink is a file-like object (``sys.stdout``, ``sys.stderr``, or any
+``write()``-able such as ``io.StringIO`` for tests). It must accept
+``str`` (we decode bytes from the reader).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Protocol
+
+
+class _Sink(Protocol):
+    def write(self, data: str) -> int: ...
+    def flush(self) -> None: ...
+
+
+async def tag_stream(reader: asyncio.StreamReader, tag: str, sink: _Sink) -> None:
+    """Read lines from ``reader`` until EOF, write ``[tag] <line>`` to ``sink``.
+
+    A trailing partial line (without a newline) is still emitted with a
+    synthesized newline so the last line of a crash message is not lost.
+    """
+    prefix = f"[{tag}] "
+    while True:
+        line = await reader.readline()
+        if not line:
+            return
+        text = line.decode("utf-8", errors="replace")
+        if text.endswith("\n"):
+            sink.write(prefix + text)
+        else:
+            # End-of-stream tail without a newline. Force one so the
+            # sink output stays line-oriented.
+            sink.write(prefix + text + "\n")
+        try:
+            sink.flush()
+        except Exception:
+            pass

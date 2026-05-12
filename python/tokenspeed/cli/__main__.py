@@ -21,25 +21,26 @@
 """TokenSpeed CLI entry point.
 
 Usage:
-    tokenspeed serve --model <path> [options]
-    tokenspeed bench <bench_type> [options]
-    tokenspeed env
-    tokenspeed version
-
     ts serve --model <path> [options]
     ts bench <bench_type> [options]
     ts env
     ts version
+
+``ts serve`` dispatches to the smg-fronted orchestrator, which spawns the
+smg gateway and the gRPC engine as two child processes. Engine-only flags
+go to the engine, gateway-only flags go to the gateway, and a small set of
+flags (e.g. ``--model``) fan out to both. See ``tokenspeed/cli/serve_smg.py``
+and ``_argsplit.py`` for the routing rules.
 """
 
 import argparse
 import sys
 
 
-def _serve(args: argparse.Namespace) -> None:
-    from tokenspeed.cli.serve_native import run_native
+def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
+    from tokenspeed.cli.serve_smg import run_smg_from_args
 
-    run_native(args)
+    run_smg_from_args(args, raw_argv)
 
 
 def _bench(args: argparse.Namespace) -> None:
@@ -68,17 +69,14 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # serve — only import heavy ServerArgs when the user actually invokes
-    # the "serve" subcommand, so that lightweight commands like "version"
-    # and "env" don't pull in torch / psutil / etc.
+    # serve — unknown flags must fall through to the smg orchestrator
+    # (which splits them between the engine and gateway subprocesses), so
+    # we don't register the engine's ServerArgs on this parser. ``--help``
+    # still works because argparse adds it by default.
     serve_parser = subparsers.add_parser(
         "serve",
         help="Launch the TokenSpeed inference server.",
     )
-    if len(sys.argv) >= 2 and sys.argv[1] == "serve":
-        from tokenspeed.runtime.utils.server_args import ServerArgs
-
-        ServerArgs.add_cli_args(serve_parser)
     serve_parser.set_defaults(func=_serve)
 
     # bench
@@ -111,9 +109,17 @@ def main() -> None:
 
     if args.func is _bench:
         args.bench_args = extra_args
-    elif extra_args:
-        parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
+        args.func(args)
+        return
 
+    if args.func is _serve:
+        # Hand the raw remainder to the orchestrator's own argv splitter.
+        raw = list(sys.argv[2:])  # everything after ``ts serve``
+        args.func(args, raw)
+        return
+
+    if extra_args:
+        parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
     args.func(args)
 
 

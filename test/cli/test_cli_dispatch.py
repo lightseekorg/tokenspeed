@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Verify the cli/ package keeps the same surface as the old cli.py."""
+"""Verify the cli/ package's top-level dispatch."""
 
 import sys
 from unittest.mock import patch
@@ -40,38 +40,50 @@ def test_version_subcommand_runs(capsys):
     assert out.startswith("TokenSpeed v")
 
 
-def test_serve_dispatches_to_native(monkeypatch):
-    """``ts serve`` routes to ``serve_native.run_native``.
-
-    We stub ``ServerArgs`` so the test doesn't pull in torch / kernel libs.
-    """
-    import types
-
-    fake_module = types.ModuleType("tokenspeed.runtime.utils.server_args")
-
-    class FakeServerArgs:
-        @staticmethod
-        def add_cli_args(parser):
-            parser.add_argument("--model", type=str, default=None)
-
-        @staticmethod
-        def from_cli_args(args):
-            return args
-
-    fake_module.ServerArgs = FakeServerArgs
-    fake_module.prepare_server_args = lambda argv: argv
-    monkeypatch.setitem(
-        sys.modules, "tokenspeed.runtime.utils.server_args", fake_module
-    )
-
+def test_serve_dispatches_to_smg_orchestrator(monkeypatch):
+    """``ts serve`` always routes to the smg orchestrator."""
     called = {}
 
-    def fake_native(args):
-        called["native"] = True
+    def fake_smg(args, raw_argv):
+        called["smg"] = list(raw_argv)
 
-    monkeypatch.setattr("tokenspeed.cli.serve_native.run_native", fake_native)
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg_from_args", fake_smg)
     monkeypatch.setattr(sys, "argv", ["ts", "serve", "--model", "/tmp/fake"])
     from tokenspeed.cli import main
 
     main()
-    assert called == {"native": True}
+    assert called == {"smg": ["--model", "/tmp/fake"]}
+
+
+def test_serve_does_not_validate_engine_choices(monkeypatch):
+    """Gateway-valid values must pass through argparse without engine choices=
+    validation. Regression: --tool-call-parser qwen3 was being rejected
+    because the engine's choices list doesn't include qwen3, even though
+    smg's clap accepts it.
+    """
+    captured = {}
+
+    def fake_smg(args, raw_argv):
+        captured["raw"] = list(raw_argv)
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg_from_args", fake_smg)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ts",
+            "serve",
+            "--tool-call-parser",
+            "qwen3",  # only valid for smg, not engine
+            "--reasoning-parser",
+            "qwen3",  # same
+            "--model",
+            "/tmp/fake",
+        ],
+    )
+    from tokenspeed.cli import main
+
+    main()
+    assert "--tool-call-parser" in captured["raw"]
+    assert "qwen3" in captured["raw"]
+    assert "--reasoning-parser" in captured["raw"]
