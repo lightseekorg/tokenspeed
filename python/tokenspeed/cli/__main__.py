@@ -33,24 +33,13 @@ Usage:
 """
 
 import argparse
-import os
 import sys
-import traceback
 
 
 def _serve(args: argparse.Namespace) -> None:
-    from tokenspeed.runtime.entrypoints.http_server import api_server
-    from tokenspeed.runtime.utils.process import kill_process_tree
-    from tokenspeed.runtime.utils.server_args import ServerArgs
+    from tokenspeed.cli.serve_native import run_native
 
-    server_args = ServerArgs.from_cli_args(args)
-
-    try:
-        api_server(server_args)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        kill_process_tree(os.getpid(), include_parent=False)
+    run_native(args)
 
 
 def _bench(args: argparse.Namespace) -> None:
