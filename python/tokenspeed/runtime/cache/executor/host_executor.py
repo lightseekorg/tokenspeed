@@ -192,6 +192,8 @@ class HostExecutor:
         self.io_backend = io_backend
         self.layer_num = layer_num
         self.device = device_pool.device
+        # Host pool decides where indices live; mirror it for _move_indices.
+        self.idx_device = host_pool.idx_device
 
         # Optional draft model pools (share the same page mapping as base model)
         self.draft_device_pool = draft_device_pool
@@ -227,9 +229,8 @@ class HostExecutor:
                 self.completed_writebacks = completed_writebacks
             completed_writebacks.append(op_id)
             return
-        device_indices = page_ids_to_token_indices(
-            src_pages, self.page_size, str(self.device)
-        )
+        # Both on host; _move_indices async-moves to idx_device.
+        device_indices = page_ids_to_token_indices(src_pages, self.page_size, "cpu")
         host_indices = page_ids_to_token_indices(dst_pages, self.page_size, "cpu")
         self.write_queue.append(
             _TransferOp(host_indices, device_indices, op_id, is_retract)
@@ -240,9 +241,7 @@ class HostExecutor:
         if not src_pages:
             return
         host_indices = page_ids_to_token_indices(src_pages, self.page_size, "cpu")
-        device_indices = page_ids_to_token_indices(
-            dst_pages, self.page_size, str(self.device)
-        )
+        device_indices = page_ids_to_token_indices(dst_pages, self.page_size, "cpu")
         self.load_queue.append(_TransferOp(host_indices, device_indices, op_id))
 
     def flush(self) -> None:
@@ -370,12 +369,13 @@ class HostExecutor:
         host_indices = op.host_indices
         device_indices = op.device_indices
         if self.io_backend == "kernel":
-            if not host_indices.is_cuda:
-                host_indices = host_indices.to(self.device, non_blocking=True)
+            if host_indices.device != self.idx_device:
+                host_indices = host_indices.to(self.idx_device, non_blocking=True)
+            if device_indices.device != self.idx_device:
+                device_indices = device_indices.to(self.idx_device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if host_pool.layout == "layer_first":
-                device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)
         raise ValueError(f"Unsupported io_backend={self.io_backend}")

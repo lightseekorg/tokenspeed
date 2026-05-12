@@ -52,7 +52,8 @@ if _is_nvidia:
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
-from tokenspeed_kernel.ops.kvcache.triton import (
+from tokenspeed_kernel.ops.kvcache import (
+    loadback_indices_device,
     transfer_kv_all_layer,
     transfer_kv_per_layer,
 )
@@ -85,6 +86,9 @@ class HostKVCache(abc.ABC):
         self.page_size = page_size
         self.layout = layout
         self.device = device
+        # Where this pool's transfer ops want index tensors. DMA-eligible
+        # subclasses override; default is the GPU device for CUDA kernels.
+        self.idx_device = device_pool.device
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -255,6 +259,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        # Only layer_first routes through the kvcacheio dispatcher (DMA or
+        # Triton); other layouts use CUDA-only Triton kernels directly.
+        if self.layout == "layer_first":
+            self.idx_device = loadback_indices_device(self.device_pool.device)
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -375,10 +383,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_all_layer(
-                    src_k_layers=device_pool.k_data_ptrs,
-                    dst_k_layers=self.k_data_ptrs,
-                    src_v_layers=device_pool.v_data_ptrs,
-                    dst_v_layers=self.v_data_ptrs,
+                    src_k_layers=device_pool.k_buffer,
+                    dst_k_layers=self.k_data_refs,
+                    src_v_layers=device_pool.v_buffer,
+                    dst_v_layers=self.v_data_refs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     item_size=self.token_stride_size,
