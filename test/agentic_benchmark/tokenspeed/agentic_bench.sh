@@ -64,7 +64,7 @@ wait_for_ready() {
 
 stop_server() {
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "Stopping tokenspeed-serve (pgid $SERVER_PID)..."
+        echo "Stopping ts serve (pgid $SERVER_PID)..."
         kill -TERM -"$SERVER_PID" 2>/dev/null || true
         for _ in {1..20}; do
             kill -0 "$SERVER_PID" 2>/dev/null || break

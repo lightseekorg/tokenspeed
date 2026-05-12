@@ -195,12 +195,13 @@ def _next_port() -> int:
 
 
 def _api_server(port: int, extra_args=()) -> subprocess.Popen:
-    # Use `python -m tokenspeed.api_server` rather than the `tokenspeed`
-    # console script so we don't depend on PATH setup in the CI runner.
+    # Use `python -m tokenspeed.cli serve` rather than the `ts` console
+    # script so we don't depend on PATH setup in the CI runner.
     cmd = [
         sys.executable,
         "-m",
-        "tokenspeed.api_server",
+        "tokenspeed.cli",
+        "serve",
         "--model",
         MODEL,
         "--host",
@@ -216,7 +217,7 @@ def _api_server(port: int, extra_args=()) -> subprocess.Popen:
 
 
 def _wait_for_server(port: int, timeout: int = SERVER_LAUNCH_TIMEOUT) -> bool:
-    url = f"http://127.0.0.1:{port}/health_generate"
+    url = f"http://127.0.0.1:{port}/health"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:

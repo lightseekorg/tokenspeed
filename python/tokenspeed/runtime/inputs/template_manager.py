@@ -64,7 +64,8 @@ class TemplateManager:
         self._jinja_template_content_format: str | None = "openai"
         # Tri-state: True (template explicitly forces reasoning), False
         # (template explicitly disables it), None (template signals neither —
-        # let the ReasoningParser fall back to its model-type default).
+        # let the gateway-side reasoning parser fall back to its
+        # model-type default).
         self._force_reasoning: bool | None = None
 
     @property
@@ -94,7 +95,8 @@ class TemplateManager:
             False — template explicitly disables reasoning
                     (`enable_thinking | default(false)`).
             None  — template gives no signal either way; the caller should
-                    fall back to model-type defaults in ReasoningParser.
+                    fall back to model-type defaults in the gateway-side
+                    reasoning parser.
         """
         return self._force_reasoning
 

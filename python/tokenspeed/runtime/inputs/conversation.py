@@ -40,7 +40,6 @@ import dataclasses
 from enum import IntEnum, auto
 from typing import Any, Literal
 
-from tokenspeed.runtime.entrypoints.openai.protocol import ChatCompletionRequest
 from tokenspeed.runtime.utils import ImageData, read_system_prompt_from_file
 
 
@@ -465,118 +464,6 @@ def _get_full_multimodal_text_prompt(
     #  For now we always add missing modality_token at the front of
     # the prompt. This may change to be customizable in the future.
     return "\n".join([modality_token] * left + [text_prompt])
-
-
-def generate_chat_conv(
-    request: ChatCompletionRequest, template_name: str
-) -> Conversation:
-    conv = chat_templates[template_name].copy()
-    conv = Conversation(
-        name=conv.name,
-        system_template=conv.system_template,
-        system_message=conv.system_message,
-        roles=conv.roles,
-        messages=list(conv.messages),  # prevent in-place modification
-        offset=conv.offset,
-        sep_style=SeparatorStyle(conv.sep_style),
-        sep=conv.sep,
-        sep2=conv.sep2,
-        stop_str=conv.stop_str,
-        image_data=[],
-        video_data=[],
-        audio_data=[],
-        modalities=[],
-        image_token=conv.image_token,
-        audio_token=conv.audio_token,
-        video_token=conv.video_token,
-    )
-
-    if isinstance(request.messages, str):
-        raise ValueError("The messages should be a list of dict.")
-    for message in request.messages:
-        msg_role = message.role
-        if msg_role == "system":
-            if isinstance(message.content, str):
-                conv.system_message = message.content
-            elif isinstance(message.content, list):
-                if (
-                    len(message.content) != 1
-                    or getattr(message.content[0], "type", None) != "text"
-                ):
-                    raise ValueError("The system message should be a single text.")
-                else:
-                    conv.system_message = getattr(message.content[0], "text", "")
-        elif msg_role == "user":
-            # Handle the various types of Chat Request content types here.
-            if isinstance(message.content, str):
-                conv.append_message(conv.roles[0], message.content)
-            else:
-                real_content = ""
-                # calculate number of image_url
-                num_image_url = 0
-                for content in message.content:
-                    if content.type == "image_url":
-                        num_image_url += 1
-                        conv.modalities.append(content.modalities)
-                image_token = (
-                    conv.image_token + "\n"
-                    if conv.name != "qwen2-vl"
-                    else conv.image_token
-                )
-                add_token_as_needed: bool = (
-                    conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
-                )
-                if add_token_as_needed:
-                    image_token = ""
-
-                audio_token = conv.audio_token
-                video_token = conv.video_token
-                for content in message.content:
-                    if content.type == "text":
-                        if num_image_url > 16:
-                            real_content += "\n"  # for video
-                        real_content += content.text
-                    elif content.type == "image_url":
-                        #  works for llava and intervl2_5
-                        if conv.name in ["internvl-2-5", "interns1"]:
-                            real_content = image_token + real_content
-                        else:
-                            real_content += image_token
-                        conv.append_image(
-                            content.image_url.url, content.image_url.detail
-                        )
-                    elif content.type == "video_url":
-                        real_content += video_token
-                        conv.append_video(content.video_url.url)
-                    elif content.type == "audio_url":
-                        real_content += audio_token
-                        conv.append_audio(content.audio_url.url)
-                if add_token_as_needed:
-                    real_content = _get_full_multimodal_text_prompt(
-                        conv.image_token, num_image_url, real_content
-                    )
-                conv.append_message(conv.roles[0], real_content)
-        elif msg_role == "assistant":
-            parsed_content = ""
-            if isinstance(message.content, str):
-                parsed_content = message.content
-            elif isinstance(message.content, list):
-                if (
-                    len(message.content) != 1
-                    or getattr(message.content[0], "type", None) != "text"
-                ):
-                    raise ValueError(
-                        "The assistant's response should be a single text."
-                    )
-                else:
-                    parsed_content = getattr(message.content[0], "text", "")
-            conv.append_message(conv.roles[1], parsed_content)
-        else:
-            raise ValueError(f"Unknown role: {msg_role}")
-
-    # Add a blank message for the assistant.
-    conv.append_message(conv.roles[1], None)
-    return conv
 
 
 # llama2 template

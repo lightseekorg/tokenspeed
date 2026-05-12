@@ -86,8 +86,6 @@ serve = [
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
-tokenspeed-serve = "tokenspeed.api_server:main"
-ts-serve = "tokenspeed.api_server:main"
 
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"

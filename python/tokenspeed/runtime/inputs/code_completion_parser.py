@@ -30,8 +30,6 @@ import dataclasses
 import logging
 from enum import auto
 
-from tokenspeed.runtime.entrypoints.openai.protocol import CompletionRequest
-
 logger = logging.getLogger(__name__)
 
 
@@ -79,15 +77,6 @@ def register_completion_template(template: CompletionTemplate, override: bool = 
 def completion_template_exists(template_name: str) -> bool:
     """Return whether the named completion template is registered."""
     return template_name in completion_templates
-
-
-def generate_completion_prompt_from_request(
-    request: CompletionRequest, template_name: str
-) -> str:
-    if request.suffix == "":
-        return request.prompt
-
-    return generate_completion_prompt(request.prompt, request.suffix, template_name)
 
 
 def generate_completion_prompt(prompt: str, suffix: str, template_name: str) -> str:

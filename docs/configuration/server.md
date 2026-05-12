@@ -107,8 +107,7 @@ about.
 | Parameter | Purpose |
 | --- | --- |
 | `--reasoning-parser` | Parser for extracting reasoning content from model outputs. |
-| `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads. |
-| `--tool-server` | Built-in demo tool server. |
+| `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 | `--enable-custom-logit-processor` | Allow custom logit processors. Keep disabled unless the deployment needs it. |
 | `--think-end-token` | End marker for thinking models. |
 

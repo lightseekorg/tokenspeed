@@ -30,8 +30,6 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
-from tokenspeed.runtime.grammar.function_call_parser import FunctionCallParser
-from tokenspeed.runtime.inputs.reasoning_parser import ReasoningParser
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -249,8 +247,6 @@ class ServerArgs:
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
     enable_custom_logit_processor: bool = False
-    tool_call_parser: str = None
-    reasoning_parser: str | None = None
     mla_disable_ragged: bool = False
     warmups: str | None = None
 
@@ -272,9 +268,6 @@ class ServerArgs:
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
     pdlb_url: str | None = None
-
-    # For built-in tool server
-    tool_server: str | None = None
 
     skip_server_warmup: bool = False
 
@@ -1551,31 +1544,6 @@ class ServerArgs:
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
-        parser.add_argument(
-            "--tool-call-parser",
-            type=str,
-            choices=tool_call_parser_choices,
-            default=ServerArgs.tool_call_parser,
-            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
-        )
-        parser.add_argument(
-            "--reasoning-parser",
-            type=str,
-            choices=list(ReasoningParser.DetectorMap.keys()),
-            default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
-        )
-
-        # For built-in tool server
-        parser.add_argument(
-            "--tool-server",
-            type=str,
-            choices=("demo",),
-            default=None,
-            help="Use the built-in demo tool server. If not specified, no tool server will be used.",
-        )
-
         # Server warmups
         parser.add_argument(
             "--skip-server-warmup",

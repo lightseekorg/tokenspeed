@@ -45,11 +45,6 @@ import zmq.asyncio
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
-from tokenspeed.runtime.entrypoints.openai.protocol import ChatCompletionRequest
-from tokenspeed.runtime.entrypoints.openai.serving_chat import OpenAIServingChat
-from tokenspeed.runtime.entrypoints.openai.serving_completions import (
-    OpenAIServingCompletion,
-)
 
 
 def _ignore_threading_atexit(*args, **kwargs) -> None:
@@ -149,34 +144,6 @@ class Engine(EngineBase):
         # Sync facade for blocking callers. Owns its own bg event-loop thread; see runtime/engine/llm.py
         # for the queue-bridge semantics.
         self.llm = LLM(self.tokenizer_manager)
-
-        self.openai_serving_completion = OpenAIServingCompletion(
-            self.tokenizer_manager, self.template_manager
-        )
-
-        self.openai_serving_chat = OpenAIServingChat(
-            self.tokenizer_manager, self.template_manager
-        )
-
-    async def openai_v1_chat_completions(
-        self,
-        request_dict: dict,
-        bootstrap_host: str | None = None,
-        bootstrap_port: int | None = None,
-        bootstrap_room: int | None = None,
-    ):
-        request = ChatCompletionRequest(**request_dict)
-        if bootstrap_host is not None:
-            request.bootstrap_host = bootstrap_host
-            request.bootstrap_port = bootstrap_port
-            request.bootstrap_room = bootstrap_room
-
-        generator = self.openai_serving_chat.handle_request_engine(request)
-        if request.stream:
-            return generator
-        else:
-            response = await generator.__anext__()
-            return response
 
     def generate(
         self,

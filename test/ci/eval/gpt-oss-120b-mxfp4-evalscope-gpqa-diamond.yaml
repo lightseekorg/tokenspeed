@@ -21,7 +21,7 @@ install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
-    python3 -m tokenspeed.api_server
+    ts serve
     --model openai/gpt-oss-120b
     --attn-tp-size 2
     --moe-tp-size 2
@@ -33,6 +33,7 @@ server:
     ${GPT_OSS_EVAL_KVSTORE_RATIO:+--kvstore-ratio ${GPT_OSS_EVAL_KVSTORE_RATIO}}
     --enable-cache-report
     --host 127.0.0.1
+    --port 8000
   ready:
     url: http://127.0.0.1:8000/health
     timeout: 1800

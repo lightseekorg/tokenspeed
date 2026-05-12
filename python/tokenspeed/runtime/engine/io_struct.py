@@ -857,36 +857,6 @@ class HealthCheckOutput:
 
 
 @dataclass
-class Function:
-    description: str | None = None
-    name: str | None = None
-    parameters: object | None = None
-
-
-@dataclass
-class Tool:
-    function: Function
-    type: str | None = "function"
-
-
-@dataclass
-class ParseFunctionCallReq:
-    text: str  # The text to parse.
-    tools: list[Tool] = field(
-        default_factory=list
-    )  # A list of available function tools (name, parameters, etc.).
-    tool_call_parser: str | None = (
-        None  # Specify the parser type, e.g. 'deepseekv31', 'gpt-oss', or 'qwen3'.
-    )
-
-
-@dataclass
-class VertexGenerateReqInput:
-    instances: list[dict]
-    parameters: dict | None = None
-
-
-@dataclass
 class RpcReqInput:
     method: str
     parameters: dict | None = None
@@ -896,12 +866,6 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
-
-
-@dataclass
-class SeparateReasoningReqInput:
-    text: str  # The text to parse.
-    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
 
 
 @dataclass
