@@ -60,6 +60,50 @@ std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
     return (numer + denom - 1) / denom;
 }
 
+struct MambaPrefillChunkPlan {
+    std::int32_t tokens_this_round{};
+    std::int32_t checkpoint_seqlen{-1};
+    std::int32_t branching_seqlen{-1};
+};
+
+MambaPrefillChunkPlan PlanMambaPrefillChunk(tokenspeed::HybridPrefixCache* hybrid_cache, std::int32_t begin,
+                                            std::int32_t requested_tokens, std::int32_t unscheduled,
+                                            std::int32_t prefill_size, std::int32_t branching_seqlen) {
+    MambaPrefillChunkPlan plan{.tokens_this_round = requested_tokens, .branching_seqlen = branching_seqlen};
+    if (hybrid_cache == nullptr || requested_tokens <= 0) {
+        return plan;
+    }
+
+    // Keep non-tail prefill chunks aligned with the FLA chunking boundary so
+    // global token positions and per-forward Mamba block positions agree.
+    if (requested_tokens < unscheduled) {
+        plan.tokens_this_round = hybrid_cache->AlignMambaCacheSeqlen(requested_tokens);
+        if (plan.tokens_this_round <= 0) {
+            return plan;
+        }
+    }
+
+    const std::int32_t end = begin + plan.tokens_this_round;
+    if (branching_seqlen > 0 && branching_seqlen <= plan.tokens_this_round) {
+        plan.checkpoint_seqlen = begin + branching_seqlen;
+        return plan;
+    }
+
+    if (requested_tokens == unscheduled) {
+        const std::int32_t aligned_tail = begin + hybrid_cache->AlignMambaCacheSeqlen(plan.tokens_this_round);
+        if (aligned_tail > begin) {
+            plan.checkpoint_seqlen = aligned_tail;
+            if (aligned_tail < end) {
+                plan.branching_seqlen = aligned_tail - begin;
+            }
+        }
+    } else {
+        plan.checkpoint_seqlen = end;
+    }
+
+    return plan;
+}
+
 }  // namespace
 
 namespace tokenspeed {
@@ -86,12 +130,16 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         unscheduled = request->PrefillSize() - std::max(device_matched, host_matched) * config_.page_size;
     }
 
-    std::int32_t tokens_this_round = std::min(remaining, unscheduled);
-    if (hybrid_prefix_cache_ && match_result.mamba_branching_seqlen == -1) {
-        const std::int32_t aligned = hybrid_prefix_cache_->AlignMambaCacheSeqlen(tokens_this_round);
-        if (aligned > 0) {
-            match_result.mamba_branching_seqlen = aligned;
-        }
+    const std::int32_t first_pos = request->PrefillSize() - unscheduled;
+    const std::int32_t branching_seqlen =
+        match_result.mamba_branching_seqlen > first_pos ? match_result.mamba_branching_seqlen - first_pos : -1;
+    auto mamba_plan =
+        PlanMambaPrefillChunk(hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr, first_pos,
+                              std::min(remaining, unscheduled), unscheduled, request->PrefillSize(),
+                              branching_seqlen);
+    std::int32_t tokens_this_round = mamba_plan.tokens_this_round;
+    if (tokens_this_round <= 0) {
+        return {};
     }
 
     std::int32_t num_tokens = loadback_tokens + tokens_this_round + decode_input_tokens;
@@ -104,11 +152,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         return {};
     }
 
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2)) {
+    const std::int32_t mamba_slots_needed = mamba_plan.checkpoint_seqlen >= 0 ? 2 : 1;
+    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(mamba_slots_needed)) {
         return {};
     }
 
-    const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
     auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
     if (!admission.ok) {
@@ -135,7 +183,15 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event,
     std::map<std::string, std::int32_t>& simulated_free) {
     std::int32_t unscheduled = request->UnScheduledPrefillSize();
-    std::int32_t tokens_this_round = std::min(remaining, unscheduled);
+    const std::int32_t first_pos = request->PrefillSize() - unscheduled;
+    auto mamba_plan =
+        PlanMambaPrefillChunk(hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr, first_pos,
+                              std::min(remaining, unscheduled), unscheduled, request->PrefillSize(),
+                              request->GetNextMambaBranchingSeqlen());
+    std::int32_t tokens_this_round = mamba_plan.tokens_this_round;
+    if (tokens_this_round <= 0) {
+        return {};
+    }
 
     std::int32_t pages_needed = (tokens_this_round + config_.page_size - 1) / config_.page_size;
 
@@ -143,11 +199,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return {};
     }
 
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(1)) {
+    if (hybrid_prefix_cache_ && mamba_plan.checkpoint_seqlen >= 0 &&
+        !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(1)) {
         return {};
     }
 
-    const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
     auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
     if (!admission.ok) {
@@ -388,6 +444,9 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event) {
             op.mamba_checkpoint_dst_idx = mamba->CheckpointIndex();
         }
     }
+    const std::int32_t mamba_branching = request->GetMambaBranchingSeqlen();
+    op.mamba_branching_seqlen =
+        (mamba_branching > 0 && mamba_branching < op.input_length) ? mamba_branching : -1;
 
     return op;
 }
@@ -396,7 +455,6 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
     auto match = event.GetMatchResult();
     auto op = applyPrefillEvent(request, std::move(event));
     op.mamba_cow_src_idx = match.mamba_cow_src_index;
-    op.mamba_branching_seqlen = match.mamba_branching_seqlen;
     acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
     populatePagedCachePagesForOp(op);
     return op;

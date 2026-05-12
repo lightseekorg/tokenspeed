@@ -314,7 +314,7 @@ class MambaAttnBackend(AttentionBackend):
                 extend_lens = (seq_lens[:bs] - prefix).to(torch.int32)
                 checkpoint_mask = (track_indices >= 0) & (mamba_cache_indices >= 0)
 
-                branch_lens = branching - prefix
+                branch_lens = branching
                 branch_inside = (
                     (branching > 0)
                     & checkpoint_mask

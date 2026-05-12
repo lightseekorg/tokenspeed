@@ -242,6 +242,29 @@ public:
             state_);
     }
 
+    std::int32_t GetMambaBranchingSeqlen() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> std::int32_t
+                requires(std::same_as<T, fsm::Prefilling>)
+            { return s.GetMambaBranchingSeqlen(); },
+            [](const auto&) -> std::int32_t { return -1; },
+            },
+            state_);
+    }
+
+    std::int32_t GetNextMambaBranchingSeqlen() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> std::int32_t
+                requires(std::same_as<T, fsm::Prefilling>)
+            {
+                const std::int32_t branching = s.GetMambaBranchingSeqlen();
+                return branching > s.window.size ? branching - s.window.size : -1;
+            },
+            [](const auto&) -> std::int32_t { return -1; },
+            },
+            state_);
+    }
+
     LocalMambaAllocator* GetLocalMambaAllocator() {
         return std::visit(Overloaded{
             []<typename T>(T& s) -> LocalMambaAllocator*

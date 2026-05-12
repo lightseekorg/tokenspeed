@@ -172,11 +172,15 @@ struct Prefilling : public ForwardState {
     Prefilling(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
                std::unique_ptr<ReqPoolIndex>&& req_pool_index, TokenContainer::Window _window,
-               std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
+               std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr,
+               std::int32_t mamba_checkpoint_seqlen = -1,
+               std::int32_t mamba_branching_seqlen = -1)
         : ForwardState(token_container, page_size, std::move(device_node_ref), std::move(local_kv_allocator),
                        std::move(req_pool_index), std::move(local_mamba_allocator)),
           host_node_ref_(std::move(host_node_ref)),
-          window(_window) {}
+          window(_window),
+          mamba_checkpoint_seqlen_(mamba_checkpoint_seqlen),
+          mamba_branching_seqlen_(mamba_branching_seqlen) {}
 
     Prefilling(Prefilling&& state) noexcept = default;
     Prefilling& operator=(Prefilling&&) noexcept = default;
@@ -195,11 +199,15 @@ struct Prefilling : public ForwardState {
     }
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+    std::int32_t GetMambaCheckpointSeqlen() const { return mamba_checkpoint_seqlen_; }
+    std::int32_t GetMambaBranchingSeqlen() const { return mamba_branching_seqlen_; }
 
     TokenContainer::Window window{};
 
 private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
+    std::int32_t mamba_checkpoint_seqlen_{-1};
+    std::int32_t mamba_branching_seqlen_{-1};
 };
 
 // All prefill tokens have been scheduled (in-flight in the last chunk).
@@ -209,12 +217,16 @@ struct PrefillDone : public ForwardState {
                 std::unique_ptr<DeviceNodeRef>&& device_node_ref,
                 std::unique_ptr<LocalKVAllocator>&& local_kv_allocator, std::unique_ptr<ReqPoolIndex>&& req_pool_index,
                 TokenContainer::Window _window, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
+                std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr,
+                std::int32_t mamba_checkpoint_seqlen = -1,
+                std::int32_t mamba_branching_seqlen = -1)
         : ForwardState(token_container, page_size, std::move(device_node_ref), std::move(local_kv_allocator),
                        std::move(req_pool_index), std::move(local_mamba_allocator)),
           host_node_ref_(std::move(host_node_ref)),
           window(_window),
-          reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event) {}
+          reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
+          mamba_checkpoint_seqlen_(mamba_checkpoint_seqlen),
+          mamba_branching_seqlen_(mamba_branching_seqlen) {}
 
     PrefillDone(PrefillDone&& state) noexcept = default;
     PrefillDone& operator=(PrefillDone&&) noexcept = default;
@@ -238,12 +250,16 @@ struct PrefillDone : public ForwardState {
     void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) { token_container_->Extend(result_tokens); }
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+    std::int32_t GetMambaCheckpointSeqlen() const { return mamba_checkpoint_seqlen_; }
+    std::int32_t GetMambaBranchingSeqlen() const { return mamba_branching_seqlen_; }
 
     TokenContainer::Window window{};
 
 private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
+    std::int32_t mamba_checkpoint_seqlen_{-1};
+    std::int32_t mamba_branching_seqlen_{-1};
 };
 
 struct Decoding : public ForwardState {
