@@ -21,6 +21,9 @@
 
 import torch
 
+from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
+    fused_mamba_state_snapshot,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -59,7 +62,9 @@ class RuntimeStates:
     def update_valid_cache_length(
         self, req_pool_indices: torch.Tensor, increment_lengths: torch.Tensor
     ) -> None:
-        self.valid_cache_lengths[req_pool_indices] += increment_lengths
+        self.valid_cache_lengths.index_add_(
+            0, req_pool_indices.long(), increment_lengths
+        )
 
     def reset_states(
         self,
@@ -101,30 +106,33 @@ class RuntimeStates:
 
     def snapshot_mamba_checkpoints(
         self,
-        mamba_pool_indices: torch.Tensor,
-        mamba_checkpoint_indices: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
         cache_lengths: torch.Tensor,
         page_size: int,
-        bs: int,
+        num_valid: int,
     ) -> None:
-        """Copy current working Mamba states into checkpoint slots."""
-        if self.mamba_pool is None:
+        """Copy current working Mamba states into checkpoint slots.
+
+        src_indices/dst_indices are pre-filtered on CPU (only valid entries).
+        The page_size condition is checked inside the Triton kernel.
+        """
+        if self.mamba_pool is None or num_valid == 0:
             return
-        valid_mask = (mamba_pool_indices[:bs] != -1) & (
-            mamba_checkpoint_indices[:bs] != -1
+        fused_mamba_state_snapshot(
+            self.mamba_pool.conv_state,
+            src_indices,
+            dst_indices,
+            cache_lengths=cache_lengths,
+            page_size=page_size,
         )
-        if page_size > 0:
-            valid_mask &= cache_lengths[:bs] % page_size == 0
-        if not valid_mask.any():
-            return
-        src_indices = mamba_pool_indices[:bs][valid_mask].long()
-        dst_indices = mamba_checkpoint_indices[:bs][valid_mask].long()
-        self.mamba_pool.conv_state[:, dst_indices] = self.mamba_pool.conv_state[
-            :, src_indices
-        ]
-        self.mamba_pool.ssm_state[:, dst_indices] = self.mamba_pool.ssm_state[
-            :, src_indices
-        ]
+        fused_mamba_state_snapshot(
+            self.mamba_pool.ssm_state,
+            src_indices,
+            dst_indices,
+            cache_lengths=cache_lengths,
+            page_size=page_size,
+        )
 
     def zero_mamba_states(
         self,
