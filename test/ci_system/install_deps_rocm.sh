@@ -37,7 +37,7 @@ pip3 install tokenspeed-scheduler/
 
 echo "=== Step 5: Install TokenSpeed ==="
 pip3 install smg smg-grpc-servicer smg-grpc-proto \
-    --extra-index-url https://lightseek.org/whl/cu130
+    --extra-index-url https://lightseek.org/whl/rocm72
 pip3 install -e ./python --no-build-isolation \
     --extra-index-url "${ROCM_INDEX}"
 
