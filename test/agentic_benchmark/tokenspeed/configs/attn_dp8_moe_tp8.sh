@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-exec tokenspeed-serve \
+exec ts serve \
     --model nvidia/Kimi-K2.5-NVFP4 \
     --data-parallel-size 8 \
     --moe-tp-size 8 \

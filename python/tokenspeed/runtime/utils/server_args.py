@@ -30,8 +30,6 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
-from tokenspeed.runtime.grammar.function_call_parser import FunctionCallParser
-from tokenspeed.runtime.inputs.reasoning_parser import ReasoningParser
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -78,10 +76,7 @@ class ServerArgs:
     max_model_len: int | None = None
     device: str = "cuda"
     served_model_name: str | None = None
-    chat_template: str | None = None
-    completion_template: str | None = None
     revision: str | None = None
-    think_end_token: str | None = None
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -249,8 +244,6 @@ class ServerArgs:
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
     enable_custom_logit_processor: bool = False
-    tool_call_parser: str = None
-    reasoning_parser: str | None = None
     mla_disable_ragged: bool = False
     warmups: str | None = None
 
@@ -272,9 +265,6 @@ class ServerArgs:
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
     pdlb_url: str | None = None
-
-    # For built-in tool server
-    tool_server: str | None = None
 
     skip_server_warmup: bool = False
 
@@ -788,30 +778,12 @@ class ServerArgs:
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
-            "--chat-template",
-            type=str,
-            default=ServerArgs.chat_template,
-            help="The built-in chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
-        )
-        parser.add_argument(
-            "--completion-template",
-            type=str,
-            default=ServerArgs.completion_template,
-            help="The built-in completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. Only for code completion currently.",
-        )
-        parser.add_argument(
             "--revision",
             type=str,
             default=None,
             help="The specific model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
-        )
-        parser.add_argument(
-            "--think-end-token",
-            type=str,
-            default=ServerArgs.think_end_token,
-            help="The think end token of a thinking model, such as '</think>' for DeepSeek R1.",
         )
         # Memory and scheduling
         parser.add_argument(
@@ -1551,31 +1523,6 @@ class ServerArgs:
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
-        parser.add_argument(
-            "--tool-call-parser",
-            type=str,
-            choices=tool_call_parser_choices,
-            default=ServerArgs.tool_call_parser,
-            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
-        )
-        parser.add_argument(
-            "--reasoning-parser",
-            type=str,
-            choices=list(ReasoningParser.DetectorMap.keys()),
-            default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
-        )
-
-        # For built-in tool server
-        parser.add_argument(
-            "--tool-server",
-            type=str,
-            choices=("demo",),
-            default=None,
-            help="Use the built-in demo tool server. If not specified, no tool server will be used.",
-        )
-
         # Server warmups
         parser.add_argument(
             "--skip-server-warmup",

@@ -113,7 +113,7 @@ def _wait_for_server_health(
                     "Authorization": f"Bearer {api_key}",
                 }
                 response = session.get(
-                    f"{base_url}/health_generate",
+                    f"{base_url}/health",
                     headers=headers,
                     timeout=5,
                 )

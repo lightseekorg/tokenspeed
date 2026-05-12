@@ -106,6 +106,10 @@ pip_install_with_retry pip3 install tokenspeed-scheduler/
 # Step 5: Install TokenSpeed
 # ============================================================
 echo "=== Step 5: Install TokenSpeed ==="
+# Pin smg / smg-grpc-servicer / smg-grpc-proto: the `tokenspeed` submodule
+# that `ts serve` imports (smg_grpc_servicer.tokenspeed.server) only exists
+# on these dev pins; later versions drop it. The three .devN versions must
+# stay in sync — the gRPC proto / runtime contract is dev-pinned.
 pip_install_with_retry pip3 install \
     "smg==1.4.2.dev15" \
     "smg-grpc-servicer==0.5.3.dev15" \
