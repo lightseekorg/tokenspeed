@@ -18,13 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Minimal in-process fake of the TokenSpeed gRPC engine.
-
-Exposes the same CLI surface as ``python -m smg_grpc_servicer.tokenspeed``
-so the orchestrator's ``spawn_engine`` can drive it. Implements just
-enough of the proto for smg's worker registration + the orchestrator's
-readiness probe to succeed.
-"""
+"""Minimal in-process fake of the TokenSpeed gRPC engine."""
 
 from __future__ import annotations
 
@@ -44,29 +38,13 @@ class _FakeHealth(health_pb2_grpc.HealthServicer):
         )
 
     def Watch(self, request, context):
-        # Streaming health is not exercised by the orchestrator's probe.
         yield health_pb2.HealthCheckResponse(
             status=health_pb2.HealthCheckResponse.SERVING
         )
 
 
 def _add_tokenspeed_servicer(server) -> None:
-    """Register a no-op TokenSpeedScheduler servicer.
-
-    smg's gateway probes the following RPCs against a freshly-registered
-    worker; we stub each one so the worker is marked healthy and the
-    gateway's ``/health`` flips to 200:
-
-    * ``GetModelInfo`` -- one-shot fetch of model metadata at registration.
-    * ``HealthCheck`` -- the proto-level liveness probe smg uses to mark a
-      worker healthy (distinct from the standard ``grpc.health.v1`` probe
-      the orchestrator itself uses).
-    * ``GetServerInfo`` / ``GetLoads`` -- polled by smg's monitor; errors
-      are swallowed but stubbing them avoids log spam during the test.
-
-    We don't need to handle real generation here -- the integration test
-    only checks readiness + clean shutdown.
-    """
+    """Register a no-op TokenSpeedScheduler servicer for readiness + shutdown tests."""
     from smg_grpc_proto import tokenspeed_scheduler_pb2 as pb
     from smg_grpc_proto import tokenspeed_scheduler_pb2_grpc as pbg
 
@@ -120,7 +98,6 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    # Accept-and-ignore: the orchestrator forwards real engine flags.
     args, _ignored = parser.parse_known_args(argv)
     asyncio.run(_serve(args.host, args.port))
 

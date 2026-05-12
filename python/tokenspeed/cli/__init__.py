@@ -18,12 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TokenSpeed CLI package.
-
-The console scripts ``ts`` and ``tokenspeed`` declared in ``pyproject.toml``
-both resolve to ``tokenspeed.cli:main``. This file re-exports ``main`` so
-that path still works after the package split.
-"""
+"""TokenSpeed CLI package."""
 
 from tokenspeed.cli.__main__ import main
 

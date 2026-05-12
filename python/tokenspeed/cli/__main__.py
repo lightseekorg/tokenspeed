@@ -18,20 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TokenSpeed CLI entry point.
-
-Usage:
-    ts serve --model <path> [options]
-    ts bench <bench_type> [options]
-    ts env
-    ts version
-
-``ts serve`` dispatches to the smg-fronted orchestrator, which spawns the
-smg gateway and the gRPC engine as two child processes. Engine-only flags
-go to the engine, gateway-only flags go to the gateway, and a small set of
-flags (e.g. ``--model``) fan out to both. See ``tokenspeed/cli/serve_smg.py``
-and ``_argsplit.py`` for the routing rules.
-"""
+"""TokenSpeed CLI entry point."""
 
 import argparse
 import sys
@@ -69,17 +56,14 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # serve — unknown flags must fall through to the smg orchestrator
-    # (which splits them between the engine and gateway subprocesses), so
-    # we don't register the engine's ServerArgs on this parser. ``--help``
-    # still works because argparse adds it by default.
+    # Unknown flags fall through to the smg orchestrator's own splitter; we
+    # don't register the engine's ServerArgs on this parser.
     serve_parser = subparsers.add_parser(
         "serve",
         help="Launch the TokenSpeed inference server.",
     )
     serve_parser.set_defaults(func=_serve)
 
-    # bench
     bench_parser = subparsers.add_parser(
         "bench",
         add_help=False,
@@ -87,14 +71,12 @@ def main() -> None:
     )
     bench_parser.set_defaults(func=_bench, bench_args=[])
 
-    # env
     env_parser = subparsers.add_parser(
         "env",
         help="Check environment configurations and dependency versions.",
     )
     env_parser.set_defaults(func=_env)
 
-    # version
     version_parser = subparsers.add_parser(
         "version",
         help="Print the TokenSpeed version.",
@@ -113,8 +95,7 @@ def main() -> None:
         return
 
     if args.func is _serve:
-        # Hand the raw remainder to the orchestrator's own argv splitter.
-        raw = list(sys.argv[2:])  # everything after ``ts serve``
+        raw = list(sys.argv[2:])
         args.func(args, raw)
         return
 

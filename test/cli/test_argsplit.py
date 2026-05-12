@@ -18,11 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for the ts serve argv splitter.
-
-Routing rules use top-down precedence; see ``_argsplit.py`` module docstring.
-"""
-
 from __future__ import annotations
 
 import pytest

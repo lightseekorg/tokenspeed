@@ -18,11 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Integration: orchestrator + real ``smg launch`` + fake_engine.
-
-Spawns the orchestrator as its own subprocess so SIGTERM doesn't
-interfere with pytest. Skipped if ``smg`` is not installed.
-"""
+"""Integration: orchestrator + real ``smg launch`` + fake_engine."""
 
 from __future__ import annotations
 
@@ -38,7 +34,7 @@ import pytest
 
 pytest.importorskip("smg")
 pytest.importorskip("smg_grpc_proto")
-import aiohttp  # noqa: E402,F401  -- imported for skip side-effect
+import aiohttp  # noqa: E402,F401
 
 
 def _free_port() -> int:
@@ -66,9 +62,7 @@ def test_orchestrator_runs_against_fake_engine():
     user_port = _free_port()
 
     env = os.environ.copy()
-    # Point the orchestrator's spawn_engine at our fake module.
     env["TS_SERVE_ENGINE_MODULE"] = "test.cli._fixtures.fake_engine"
-    # Make sure the test/ root is importable.
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
 

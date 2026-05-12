@@ -56,11 +56,7 @@ def test_serve_dispatches_to_smg_orchestrator(monkeypatch):
 
 
 def test_serve_does_not_validate_engine_choices(monkeypatch):
-    """Gateway-valid values must pass through argparse without engine choices=
-    validation. Regression: --tool-call-parser qwen3 was being rejected
-    because the engine's choices list doesn't include qwen3, even though
-    smg's clap accepts it.
-    """
+    """Gateway-valid values pass through argparse without engine choices= validation."""
     captured = {}
 
     def fake_smg(args, raw_argv):
@@ -74,9 +70,9 @@ def test_serve_does_not_validate_engine_choices(monkeypatch):
             "ts",
             "serve",
             "--tool-call-parser",
-            "qwen3",  # only valid for smg, not engine
+            "qwen3",
             "--reasoning-parser",
-            "qwen3",  # same
+            "qwen3",
             "--model",
             "/tmp/fake",
         ],

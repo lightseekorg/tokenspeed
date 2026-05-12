@@ -18,22 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Async per-line stream prefixer for ``ts serve``.
-
-Reads a child subprocess's stdout/stderr line-by-line and forwards each
-line to a sink with a ``[<tag>] `` prefix. Per-line emission keeps
-Python tracebacks readable (each frame line is already newline-
-terminated).
-
-The sink is a file-like object (``sys.stdout``, ``sys.stderr``, or any
-``write()``-able such as ``io.StringIO`` for tests). It must accept
-``str`` (we decode bytes from the reader).
-"""
+"""Async per-line stream prefixer for ``ts serve``."""
 
 from __future__ import annotations
 
 import asyncio
 from typing import Protocol
+
+ENGINE_TAG = "ts"
+GATEWAY_TAG = "smg"
 
 
 class _Sink(Protocol):
@@ -56,10 +49,4 @@ async def tag_stream(reader: asyncio.StreamReader, tag: str, sink: _Sink) -> Non
         if text.endswith("\n"):
             sink.write(prefix + text)
         else:
-            # End-of-stream tail without a newline. Force one so the
-            # sink output stays line-oriented.
             sink.write(prefix + text + "\n")
-        try:
-            sink.flush()
-        except Exception:
-            pass

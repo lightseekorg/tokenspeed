@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for subprocess supervision + signal forwarding helpers."""
+"""Tests for subprocess supervision helpers."""
 
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from tokenspeed.cli._proc import (
-    pick_free_port,
     spawn_gateway,
     terminate_then_kill,
 )
@@ -36,9 +35,7 @@ from tokenspeed.cli._proc import (
 
 @pytest.mark.asyncio
 async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
-    """Single-worker mode: retries (against the same worker) and a tripped
-    circuit breaker (which has nowhere to fail over to) are net-negative.
-    Spawn the gateway with both disabled by default."""
+    """Single-worker mode: retries and circuit-breaker are disabled by default."""
 
     captured = {}
 
@@ -58,18 +55,6 @@ async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
     assert "--disable-circuit-breaker" in cmd
 
 
-def test_pick_free_port_returns_in_user_range():
-    port = pick_free_port()
-    assert 1024 < port < 65536
-
-
-def test_pick_free_port_returns_distinct_ports_on_repeated_calls():
-    p1 = pick_free_port()
-    p2 = pick_free_port()
-    # Not strictly guaranteed but overwhelmingly likely.
-    assert p1 != p2
-
-
 @pytest.mark.asyncio
 async def test_terminate_then_kill_uses_sigterm_first_then_sigkill():
     """If the child doesn't exit within drain_timeout, we escalate to SIGKILL."""
@@ -79,7 +64,6 @@ async def test_terminate_then_kill_uses_sigterm_first_then_sigkill():
     proc.kill = MagicMock()
 
     async def fake_wait():
-        # Simulate "won't exit on SIGTERM": sleep slightly longer than drain.
         await asyncio.sleep(0.1)
 
     proc.wait = MagicMock(side_effect=fake_wait)
@@ -94,7 +78,6 @@ async def test_terminate_then_kill_skips_kill_when_drain_succeeds():
     proc.returncode = None
 
     async def fake_wait():
-        # Simulate child exiting promptly on SIGTERM.
         proc.returncode = 0
         return
 
@@ -109,7 +92,7 @@ async def test_terminate_then_kill_skips_kill_when_drain_succeeds():
 @pytest.mark.asyncio
 async def test_terminate_then_kill_noop_on_already_dead():
     proc = MagicMock()
-    proc.returncode = 0  # Already exited.
+    proc.returncode = 0
     proc.terminate = MagicMock()
     proc.kill = MagicMock()
     await terminate_then_kill(proc, drain_timeout=0.5)

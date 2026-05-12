@@ -40,36 +40,27 @@ import functools
 from dataclasses import dataclass, field
 from typing import Iterable
 
-# Flag names the orchestrator handles itself (consumed, never forwarded).
 _ORCH_FLAGS = {
     "--engine-startup-timeout",
     "--gateway-startup-timeout",
     "--drain-timeout",
 }
 
-# Flags whose values must reach **both** subprocesses.
 _FANOUT_FLAGS = {"--model"}
 
-# Aliases that we normalize into a canonical name *before* routing.
 _ALIASES = {
     "--model-path": "--model",
     "--tp": "--tensor-parallel-size",
 }
 
-# User-facing host/port go to the gateway only. The engine gets an
-# auto-picked internal port chosen by the orchestrator (see _proc.py).
 _GATEWAY_USER_FACING = {"--host", "--port"}
 
-# Engine-introspection overrides: present on both ``ServerArgs`` and smg
-# launch's clap, but in smg mode they belong to the gateway (which owns
-# OpenAI-compat HTTP, chat templating, and tool/reasoning parsing).
 _GATEWAY_OVERRIDE = {
     "--chat-template",
     "--tool-call-parser",
     "--reasoning-parser",
 }
 
-# Engine-only flags we recognize via name (normalized aliases).
 _ENGINE_EXPLICIT = {"--tensor-parallel-size"}
 
 
@@ -91,8 +82,7 @@ def _normalize(argv: Iterable[str]) -> list[tuple[str, str | None]]:
     """Convert raw argv into a list of (name, value) pairs.
 
     Handles both ``--flag value`` and ``--flag=value`` forms. Aliases are
-    resolved to their canonical names. Bare positional args are not
-    expected here (``ts serve`` takes flags only).
+    resolved to their canonical names.
     """
     items: list[tuple[str, str | None]] = []
     tokens = list(argv)
@@ -119,14 +109,8 @@ def _normalize(argv: Iterable[str]) -> list[tuple[str, str | None]]:
 
 @functools.lru_cache(maxsize=1)
 def _engine_recognized_flags() -> set[str]:
-    """Snapshot the set of long-form flags accepted by ``prepare_server_args``.
-
-    We construct an argparse parser via TokenSpeed's own ``ServerArgs.add_cli_args``
-    and harvest its ``--`` option strings. This is the source-of-truth for
-    "engine knows this flag" — no allowlist drift on the engine side.
-    """
+    """Snapshot the set of long-form flags accepted by ``prepare_server_args``."""
     # Lazy import: ServerArgs pulls the full runtime stack (~200ms).
-    # Keep it out of ``ts serve --help``.
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -136,9 +120,6 @@ def _engine_recognized_flags() -> set[str]:
         for opt in action.option_strings:
             if opt.startswith("--"):
                 flags.add(opt)
-    # Defense-in-depth: argparse intercepts these before the splitter sees
-    # them, but if anyone ever bypasses that we don't want --help/-h
-    # routing into the engine catch-all.
     flags.discard("--help")
     flags.discard("-h")
     return flags
@@ -147,21 +128,10 @@ def _engine_recognized_flags() -> set[str]:
 def split_argv(argv: list[str]) -> SplitResult:
     """Split ts-serve argv into engine_args, gateway_args, orchestrator_opts.
 
-    Routing is top-down (see the module docstring); the first matching rule
-    wins.
-
     Raises:
         ValueError: if a flag that requires a value is provided without one
             (e.g. ``--model`` with no path), if a timeout flag is
             non-positive, or if a positional arg appears.
-
-    Note:
-        Collision detection between engine flags and ``smg launch`` clap is
-        only possible on the engine side (we can introspect ``ServerArgs``
-        but not smg's Rust clap definition). Known collisions are declared
-        at design time via ``_GATEWAY_OVERRIDE`` rather than detected at
-        runtime. Adding a new collision means adding a row to the override
-        table.
     """
 
     items = _normalize(argv)
@@ -169,9 +139,7 @@ def split_argv(argv: list[str]) -> SplitResult:
     engine_flags = _engine_recognized_flags()
 
     for name, value in items:
-        # 1. Orchestrator-only.
         if name in _ORCH_FLAGS:
-            # Timeout flags: positive integer required.
             if value is None or value == "":
                 raise ValueError(f"{name} requires a positive integer (seconds)")
             try:
@@ -184,7 +152,6 @@ def split_argv(argv: list[str]) -> SplitResult:
             setattr(result.opts, attr, seconds)
             continue
 
-        # 2. Fan-out flags.
         if name in _FANOUT_FLAGS:
             if value is None:
                 raise ValueError(f"{name} requires a value")
@@ -192,28 +159,24 @@ def split_argv(argv: list[str]) -> SplitResult:
             result.gateway.extend([name, value])
             continue
 
-        # 3. User-facing host/port: gateway only.
         if name in _GATEWAY_USER_FACING:
             if value is None:
                 raise ValueError(f"{name} requires a value")
             result.gateway.extend([name, value])
             continue
 
-        # 4. Gateway override flags (explicit override of the engine catch-all).
         if name in _GATEWAY_OVERRIDE:
             if value is None:
                 raise ValueError(f"{name} requires a value")
             result.gateway.extend([name, value])
             continue
 
-        # 5. Explicit engine-only flags (post-alias).
         if name in _ENGINE_EXPLICIT:
             if value is None:
                 raise ValueError(f"{name} requires a value")
             result.engine.extend([name, value])
             continue
 
-        # 6. Engine-introspected catch-all.
         if name in engine_flags:
             if value is not None:
                 result.engine.extend([name, value])
@@ -221,7 +184,6 @@ def split_argv(argv: list[str]) -> SplitResult:
                 result.engine.append(name)
             continue
 
-        # 7. Fall-through to gateway.
         if value is not None:
             result.gateway.extend([name, value])
         else:

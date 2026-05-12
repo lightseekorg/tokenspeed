@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for the [smg]/[ts] line prefixer."""
+"""Tests for the line prefixer."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ async def test_multi_line_each_prefixed_independently():
 
 @pytest.mark.asyncio
 async def test_traceback_lines_prefixed_per_line():
-    """Per-line prefixing is fine for Python tracebacks (each frame ends with \\n)."""
+    """Per-line prefixing for tracebacks (each frame ends with \\n)."""
     payload = (
         b"Traceback (most recent call last):\n"
         b'  File "x.py", line 1, in <module>\n'
@@ -78,7 +78,7 @@ async def test_traceback_lines_prefixed_per_line():
 @pytest.mark.asyncio
 async def test_partial_last_line_without_newline_still_emitted():
     """Crash messages without a trailing newline must still reach the sink."""
-    reader = _make_reader(b"died mid-write")  # no trailing \n
+    reader = _make_reader(b"died mid-write")
     sink = io.StringIO()
     await tag_stream(reader, "ts", sink)
     assert sink.getvalue() == "[ts] died mid-write\n"
