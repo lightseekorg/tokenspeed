@@ -75,19 +75,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Install: pip install 'tokenspeed[serve]' --extra-index-url https://lightseek.org/whl/cu130/
+# Bump all three .devN versions together — proto / RuntimeType must stay in sync.
 serve = [
-    # smg's TokenSpeed support hasn't landed on smg's main / PyPI yet.
-    # Dev wheels are published on a separate index. Same .devN suffix
-    # on all three so the gRPC proto / RuntimeType enum stay in sync;
-    # bump together when the smg side cuts a new dev wheel.
-    #
-    # Install:
-    #   pip install 'tokenspeed[serve]' --extra-index-url https://lightseek.org/whl/cu130/
-    #
-    # Other variants (same smg wheels, different host index for the rest
-    # of the tokenspeed stack):
-    #   --extra-index-url https://lightseek.org/whl/cu129/    # CUDA 12.9
-    #   --extra-index-url https://lightseek.org/whl/rocm7.2/  # ROCm 7.2
     "smg==1.4.2.dev15",
     "smg-grpc-servicer==0.5.3.dev15",
     "smg-grpc-proto==0.4.8.dev15",

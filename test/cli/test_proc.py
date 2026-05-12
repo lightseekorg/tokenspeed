@@ -29,8 +29,33 @@ import pytest
 
 from tokenspeed.cli._proc import (
     pick_free_port,
+    spawn_gateway,
     terminate_then_kill,
 )
+
+
+@pytest.mark.asyncio
+async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
+    """Single-worker mode: retries (against the same worker) and a tripped
+    circuit breaker (which has nowhere to fail over to) are net-negative.
+    Spawn the gateway with both disabled by default."""
+
+    captured = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured["cmd"] = cmd
+
+        class _P:
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await spawn_gateway([], engine_host="127.0.0.1", engine_port=12345)
+    cmd = captured["cmd"]
+    assert "--disable-retries" in cmd
+    assert "--disable-circuit-breaker" in cmd
 
 
 def test_pick_free_port_returns_in_user_range():

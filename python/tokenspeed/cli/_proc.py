@@ -97,7 +97,11 @@ async def spawn_gateway(
     engine_host: str,
     engine_port: int,
 ) -> asyncio.subprocess.Process:
-    """Spawn ``python -m smg launch`` with PIPE stdio."""
+    """Spawn ``python -m smg launch`` with PIPE stdio.
+
+    Single-worker topology — retries and circuit-breaker are disabled
+    by default (no other worker to fail over to).
+    """
     cmd = [
         sys.executable,
         "-m",
@@ -105,6 +109,8 @@ async def spawn_gateway(
         "launch",
         "--worker-urls",
         f"grpc://{engine_host}:{engine_port}",
+        "--disable-retries",
+        "--disable-circuit-breaker",
         *args,
     ]
     logger.info("spawn gateway: %s", " ".join(cmd))
