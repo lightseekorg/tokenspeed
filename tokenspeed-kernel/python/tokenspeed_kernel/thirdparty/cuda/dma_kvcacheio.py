@@ -23,46 +23,83 @@
 One driver call dispatches all (K/V × layer × page) copies onto the
 GPU's copy engines, so the transfer does not consume SMs or L2 and
 cannot slow concurrent compute (allreduce, MoE bmm). Requires CUDA
-12.8+ (the v13 entry point dropped the failIdx out-param; we go through
-``cuda.bindings.driver`` so the binding picks the right ABI).
-``cuMemcpyBatchAsync`` rejects the legacy NULL stream, so callers must
-issue on an explicit stream.
+12.8+; ``cuda-python`` is used to look the symbol up at module load,
+then the hot-path call is a raw ``ctypes`` thunk that takes numpy
+data pointers directly — avoiding ~10µs/descriptor of Python wrapper
+cost we'd otherwise pay constructing ``CUdeviceptr`` objects.
+``cuMemcpyBatchAsync`` rejects the legacy NULL stream, so callers
+must issue on an explicit stream.
 """
 
 from __future__ import annotations
+
+import ctypes
 
 import numpy as np
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-_driver = None
+
+class _CUmemLocation(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint), ("id", ctypes.c_int)]
+
+
+class _CUmemcpyAttributes(ctypes.Structure):
+    _fields_ = [
+        ("srcAccessOrder", ctypes.c_uint),
+        ("srcLocHint", _CUmemLocation),
+        ("dstLocHint", _CUmemLocation),
+        ("flags", ctypes.c_uint),
+    ]
+
+
+# CUresult cuMemcpyBatchAsync(
+#     CUdeviceptr *dsts, CUdeviceptr *srcs, size_t *sizes, size_t count,
+#     CUmemcpyAttributes *attrs, size_t *attrsIdxs, size_t numAttrs,
+#     CUstream hStream
+# );  -- v13 ABI; v12 had an extra failIdx out-param before hStream.
+_BATCH_FN_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_uint,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+)
+
+_batch_fn = None
 _attrs_singleton = None
+_attrs_idxs_np = np.zeros(1, dtype=np.uint64)
 _resolve_attempted = False
 
 
 def _try_resolve():
-    global _driver, _attrs_singleton, _resolve_attempted
+    global _batch_fn, _attrs_singleton, _resolve_attempted
     if _resolve_attempted:
-        return _driver
+        return _batch_fn
     _resolve_attempted = True
     if not current_platform().is_nvidia:
         return None
     try:
         from cuda.bindings import driver as drv
 
-        attrs = drv.CUmemcpyAttributes()
-        attrs.srcAccessOrder = (
-            drv.CUmemcpySrcAccessOrder.CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
-        )
-        _driver = drv
-        _attrs_singleton = attrs
+        err, ver = drv.cuDriverGetVersion()
+        if err != drv.CUresult.CUDA_SUCCESS:
+            return None
+        err, ptr, _ = drv.cuGetProcAddress(b"cuMemcpyBatchAsync", ver, 0)
+        if err != drv.CUresult.CUDA_SUCCESS or not ptr:
+            return None
+        _batch_fn = _BATCH_FN_TYPE(ptr)
+        _attrs_singleton = _CUmemcpyAttributes(srcAccessOrder=1)  # STREAM
     except Exception:
-        _driver = None
-    return _driver
+        _batch_fn = None
+    return _batch_fn
 
 
 def is_available() -> bool:
-    """True iff ``cuMemcpyBatchAsync`` is resolvable on the current platform."""
     return _try_resolve() is not None
 
 
@@ -79,14 +116,12 @@ def batch_async_load_kv_pages(
 ) -> None:
     """Single ``cuMemcpyBatchAsync`` call for all (K/V × layer × page) blocks.
 
-    ``*_page_token_offsets`` are 1-D CPU int tensors of per-block source /
-    destination token offsets; each block copies ``page_bytes`` bytes at
-    offset ``offset * token_stride_bytes`` from the per-layer base
-    pointer. The layer-list arguments are read host-side via
-    ``Tensor.data_ptr()`` — no syncs.
+    Descriptors live entirely in three numpy uint64 arrays passed by their
+    raw memory pointer — no per-descriptor Python work. Hot-path cost is
+    dominated by the driver dispatch.
     """
-    drv = _try_resolve()
-    if drv is None:
+    fn = _try_resolve()
+    if fn is None:
         raise RuntimeError("cuMemcpyBatchAsync not available; install cuda-python")
 
     n_pages = int(src_page_token_offsets.numel())
@@ -99,11 +134,11 @@ def batch_async_load_kv_pages(
     )
     assert src_page_token_offsets.is_cpu and dst_page_token_offsets.is_cpu
 
-    src_off_np = src_page_token_offsets.numpy().astype(np.uint64, copy=False)
-    dst_off_np = dst_page_token_offsets.numpy().astype(np.uint64, copy=False)
+    src_off = src_page_token_offsets.numpy().astype(np.uint64, copy=False)
+    dst_off = dst_page_token_offsets.numpy().astype(np.uint64, copy=False)
     stride = np.uint64(token_stride_bytes)
-    src_byte_off = src_off_np * stride
-    dst_byte_off = dst_off_np * stride
+    src_byte_off = src_off * stride
+    dst_byte_off = dst_off * stride
 
     src_k_bases = np.fromiter(
         (t.data_ptr() for t in host_k_layers), dtype=np.uint64, count=n_layers
@@ -123,27 +158,24 @@ def batch_async_load_kv_pages(
     dst_k = (dst_k_bases[:, None] + dst_byte_off[None, :]).ravel()
     dst_v = (dst_v_bases[:, None] + dst_byte_off[None, :]).ravel()
 
-    src_all = np.concatenate([src_k, src_v])
-    dst_all = np.concatenate([dst_k, dst_v])
-    sz_all = np.full(src_all.shape[0], page_bytes, dtype=np.uint64)
-    total = int(src_all.shape[0])
+    # Single uint64 arrays for dst/src/size; ascontiguousarray so .ctypes.data
+    # is a stable pointer the driver can read directly.
+    dst_all = np.ascontiguousarray(np.concatenate([dst_k, dst_v]), dtype=np.uint64)
+    src_all = np.ascontiguousarray(np.concatenate([src_k, src_v]), dtype=np.uint64)
+    sz_all = np.full(dst_all.size, page_bytes, dtype=np.uint64)
 
-    src_list = [drv.CUdeviceptr(int(p)) for p in src_all]
-    dst_list = [drv.CUdeviceptr(int(p)) for p in dst_all]
-    sz_list = [int(s) for s in sz_all]
-
-    (err,) = drv.cuMemcpyBatchAsync(
-        dst_list,
-        src_list,
-        sz_list,
-        total,
-        [_attrs_singleton],
-        [0],
-        1,
-        stream.cuda_stream,
+    err = fn(
+        dst_all.ctypes.data,
+        src_all.ctypes.data,
+        sz_all.ctypes.data,
+        ctypes.c_size_t(dst_all.size),
+        ctypes.addressof(_attrs_singleton),
+        _attrs_idxs_np.ctypes.data,
+        ctypes.c_size_t(1),
+        ctypes.c_void_p(stream.cuda_stream),
     )
-    if err != drv.CUresult.CUDA_SUCCESS:
+    if err != 0:
         raise RuntimeError(
             f"cuMemcpyBatchAsync failed: err={err} "
-            f"total={total} n_layers={n_layers} n_pages={n_pages}"
+            f"total={dst_all.size} n_layers={n_layers} n_pages={n_pages}"
         )

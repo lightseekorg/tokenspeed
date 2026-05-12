@@ -69,11 +69,17 @@ def transfer_kv_per_layer(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
+    page_size: int = 1,
 ) -> None:
-    """One-layer KV transfer; routes to DMA or Triton based on backend."""
+    """One-layer KV transfer; routes to DMA or Triton based on backend.
+
+    ``page_size`` lets the DMA path coalesce contiguous slots into one
+    descriptor per page (k descriptors instead of k*page_size). Triton
+    ignores it — its kernel is already per-slot.
+    """
     if select_backend() == "dma":
         _dma.transfer_kv_per_layer(
-            src_k, dst_k, src_v, dst_v, src_indices, dst_indices, item_size
+            src_k, dst_k, src_v, dst_v, src_indices, dst_indices, item_size, page_size
         )
         return
     _triton.transfer_kv_per_layer(
@@ -106,12 +112,15 @@ def transfer_kv_all_layer(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
+    page_size: int = 1,
 ) -> None:
     """All-layer KV transfer; routes to DMA or Triton based on backend.
 
     ``src_*_layers`` / ``dst_*_layers`` are lists of per-layer Tensors
-    (e.g. the pool's ``k_buffer`` / ``k_data_refs``). DMA reads
-    ``.data_ptr()`` host-side; Triton uses a cached uint64 CUDA tensor.
+    (e.g. the pool's ``k_buffer`` / ``k_data_refs``). ``page_size``
+    lets the DMA path coalesce contiguous slots into one descriptor per
+    page; pass ``self.page_size`` from the engine when indices are
+    page-aligned (the usual case for loadback / writeback).
     """
     if select_backend() == "dma":
         _dma.transfer_kv_all_layer(
@@ -123,6 +132,7 @@ def transfer_kv_all_layer(
             dst_indices,
             item_size,
             num_layers,
+            page_size,
         )
         return
     gpu = src_indices.device

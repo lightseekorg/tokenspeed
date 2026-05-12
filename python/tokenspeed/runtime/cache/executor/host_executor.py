@@ -55,6 +55,23 @@ def _new_cache_stream(priority: int | None = None):
         return device_module.Stream()
 
 
+def _run_per_layer_loadback(
+    host_pool,
+    device_pool,
+    host_indices: torch.Tensor,
+    device_indices: torch.Tensor,
+    io_backend: str,
+    layer_num: int,
+    producer_event,
+) -> None:
+    for layer_index in range(layer_num):
+        host_pool.load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_index, io_backend
+        )
+        if producer_event is not None:
+            producer_event.complete(layer_index)
+
+
 def page_ids_to_token_indices(
     page_ids: list[int],
     page_size: int,
@@ -329,25 +346,26 @@ class HostExecutor:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for layer_index in range(self.layer_num):
-                self.host_pool.load_to_device_per_layer(
-                    self.device_pool,
-                    host_indices.to(torch.int64),
-                    device_indices.to(torch.int64),
-                    layer_index,
-                    self.io_backend,
-                )
-                producer_event.complete(layer_index)
+            _run_per_layer_loadback(
+                self.host_pool,
+                self.device_pool,
+                host_indices.to(torch.int64),
+                device_indices.to(torch.int64),
+                self.io_backend,
+                self.layer_num,
+                producer_event,
+            )
             # Draft layers follow base layers in the same load stream.
             if self.draft_host_pool is not None:
-                for layer_index in range(self.draft_layer_num):
-                    self.draft_host_pool.load_to_device_per_layer(
-                        self.draft_device_pool,
-                        draft_host_indices.to(torch.int64),
-                        draft_device_indices.to(torch.int64),
-                        layer_index,
-                        self.io_backend,
-                    )
+                _run_per_layer_loadback(
+                    self.draft_host_pool,
+                    self.draft_device_pool,
+                    draft_host_indices.to(torch.int64),
+                    draft_device_indices.to(torch.int64),
+                    self.io_backend,
+                    self.draft_layer_num,
+                    producer_event=None,
+                )
                 if draft_host_indices.is_cuda:
                     draft_host_indices.record_stream(self.load_stream)
                 if draft_device_indices.is_cuda:

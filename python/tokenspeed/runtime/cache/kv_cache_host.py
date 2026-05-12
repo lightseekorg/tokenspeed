@@ -326,6 +326,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     item_size=self.token_stride_size,
+                    page_size=self.page_size,
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_pf_lf(
@@ -391,6 +392,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=host_indices,
                     item_size=self.token_stride_size,
                     num_layers=self.layer_num,
+                    page_size=self.page_size,
                 )
             elif self.layout == "page_first":
                 transfer_kv_all_layer_lf_pf(

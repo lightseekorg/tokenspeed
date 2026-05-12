@@ -48,21 +48,30 @@ def transfer_kv_per_layer(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
+    page_size: int = 1,
 ) -> None:
-    """One-layer KV transfer via ``cuMemcpyBatchAsync`` (one descriptor per slot)."""
+    """One-layer KV transfer via ``cuMemcpyBatchAsync``.
+
+    With ``page_size > 1`` indices must be page-aligned and we coalesce
+    contiguous slots into one descriptor per page (e.g. 100 page descriptors
+    instead of 3200 slot descriptors for a 100-page transfer).
+    """
     if src_indices.numel() == 0:
         return
     assert (
         not src_indices.is_cuda and not dst_indices.is_cuda
     ), "DMA backend requires CPU index tensors"
+    src_off, dst_off, block_bytes = _coalesce_to_pages(
+        src_indices, dst_indices, item_size, page_size
+    )
     batch_async_load_kv_pages(
         host_k_layers=[src_k],
         host_v_layers=[src_v],
         device_k_layers=[dst_k],
         device_v_layers=[dst_v],
-        src_page_token_offsets=src_indices,
-        dst_page_token_offsets=dst_indices,
-        page_bytes=item_size,
+        src_page_token_offsets=src_off,
+        dst_page_token_offsets=dst_off,
+        page_bytes=block_bytes,
         token_stride_bytes=item_size,
         stream=torch.cuda.current_stream(),
     )
@@ -77,8 +86,12 @@ def transfer_kv_all_layer(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
+    page_size: int = 1,
 ) -> None:
-    """All-layer KV transfer via ``cuMemcpyBatchAsync``; layer args are tensor lists."""
+    """All-layer KV transfer via ``cuMemcpyBatchAsync``.
+
+    See :func:`transfer_kv_per_layer` for the ``page_size`` semantics.
+    """
     if src_indices.numel() == 0:
         return
     assert (
@@ -91,14 +104,33 @@ def transfer_kv_all_layer(
         == len(dst_v_layers)
         == num_layers
     )
+    src_off, dst_off, block_bytes = _coalesce_to_pages(
+        src_indices, dst_indices, item_size, page_size
+    )
     batch_async_load_kv_pages(
         host_k_layers=src_k_layers,
         host_v_layers=src_v_layers,
         device_k_layers=dst_k_layers,
         device_v_layers=dst_v_layers,
-        src_page_token_offsets=src_indices,
-        dst_page_token_offsets=dst_indices,
-        page_bytes=item_size,
+        src_page_token_offsets=src_off,
+        dst_page_token_offsets=dst_off,
+        page_bytes=block_bytes,
         token_stride_bytes=item_size,
         stream=torch.cuda.current_stream(),
+    )
+
+
+def _coalesce_to_pages(
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    page_size: int,
+):
+    """Stride down to one descriptor per page when indices are page-aligned."""
+    if page_size <= 1:
+        return src_indices, dst_indices, item_size
+    return (
+        src_indices.view(-1, page_size)[:, 0],
+        dst_indices.view(-1, page_size)[:, 0],
+        page_size * item_size,
     )
