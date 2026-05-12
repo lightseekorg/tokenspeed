@@ -255,6 +255,9 @@ class HostExecutor:
         previous_writeback_block_quota = getattr(self, "_writeback_block_quota", None)
         self._writeback_block_quota = writeback_block_quota
         try:
+            # Cross-flush barrier.
+            self.write_stream.wait_stream(self.load_stream)
+            self.load_stream.wait_stream(self.write_stream)
             self._start_loading()
             self._start_writing()
         finally:
