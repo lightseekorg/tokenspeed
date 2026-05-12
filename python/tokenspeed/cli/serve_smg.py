@@ -55,7 +55,10 @@ def _check_serve_extra_installed() -> None:
     if missing:
         sys.stderr.write(
             "ts serve requires SMG packages:\n\n"
-            "    pip install smg smg-grpc-servicer smg-grpc-proto \\\n"
+            "    pip install \\\n"
+            "        'smg==1.4.2.dev15' \\\n"
+            "        'smg-grpc-servicer==0.5.3.dev15' \\\n"
+            "        'smg-grpc-proto==0.4.8.dev15' \\\n"
             "        --extra-index-url https://lightseek.org/whl/cu130/\n\n"
             "Swap the index for other variants:\n"
             "    https://lightseek.org/whl/cu129/      (CUDA 12.9)\n"
