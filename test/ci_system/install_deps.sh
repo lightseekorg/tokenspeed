@@ -106,7 +106,10 @@ pip_install_with_retry pip3 install tokenspeed-scheduler/
 # Step 5: Install TokenSpeed
 # ============================================================
 echo "=== Step 5: Install TokenSpeed ==="
-pip_install_with_retry pip3 install smg smg-grpc-servicer smg-grpc-proto \
+pip_install_with_retry pip3 install \
+    "smg==1.4.2.dev15" \
+    "smg-grpc-servicer==0.5.3.dev15" \
+    "smg-grpc-proto==0.4.8.dev15" \
     --extra-index-url https://lightseek.org/whl/cu130
 pip_install_with_retry pip3 install -e "./python[cuda_${SM}]" \
     --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
