@@ -187,6 +187,17 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 
     MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
+    TreeNode* mamba_recovery_node = nullptr;
+    if (hybrid_prefix_cache_ && mamba_allocator_) {
+        mamba_recovery_node = hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node);
+        if (mamba_recovery_node == nullptr) {
+            spdlog::warn("[Scheduler] Retracted request {} lost tree-owned Mamba state, aborting request",
+                         request->Id());
+            request->Apply(fsm::AbortEvent{});
+            return {};
+        }
+        match_result.mamba_cow_src_index = mamba_recovery_node->MambaSlotIndex();
+    }
 
     const std::int32_t device_matched2 = match_result.device.DepthInPage();
     const std::int32_t host_matched2 = match_result.host.DepthInPage();
@@ -202,6 +213,15 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_pages_needed)) {
         return {};
+    }
+    if (hybrid_prefix_cache_ && mamba_allocator_) {
+        // Recovery COWs the tree-owned Mamba state into fresh request-local
+        // working/checkpoint slots. Protect the source node only for this
+        // allocation; retracted Mamba states are otherwise normal evictable
+        // tree-owned cache entries.
+        if (!hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2, mamba_recovery_node)) {
+            return {};
+        }
     }
 
     std::map<std::string, std::int32_t> released_back;
@@ -241,9 +261,9 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     }
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
-    return fsm::ScheduleDecodeFromRetractedEvent{config_.decode_input_tokens, &device_allocator_,
-                                                 &req_pool_allocator_,        &kv_prefix_cache_,
-                                                 std::move(match_result),     loadback_diff};
+    return fsm::ScheduleDecodeFromRetractedEvent{
+        config_.decode_input_tokens, &device_allocator_, &req_pool_allocator_, &kv_prefix_cache_,
+        std::move(match_result),     loadback_diff,      mamba_allocator_ ? &*mamba_allocator_ : nullptr};
 }
 
 std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* request) {
@@ -428,6 +448,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
 }
 
 DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event) {
+    const std::int32_t mamba_cow_src_index = event.GetMatchResult().mamba_cow_src_index;
     request->Apply(std::move(event));
     if (!request->Is<fsm::Decoding>()) {
         throw std::logic_error(
@@ -446,6 +467,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     }};
     op.decode_input_id = request->GetLastToken();
     op.hist_token_len = request->TokenSize() - 1;
+    op.mamba_cow_src_idx = mamba_cow_src_index;
 
     auto* mamba = request->GetLocalMambaAllocator();
     if (mamba != nullptr && mamba->HasWorking()) {

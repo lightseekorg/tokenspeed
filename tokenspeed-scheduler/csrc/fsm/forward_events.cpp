@@ -258,7 +258,15 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
     TokenContainer* token_container = state.GetTokenContainer();
     std::int32_t page_size = state.GetPageSize();
     auto local_kv_allocator = std::move(state).TakeKVAllocator();
-    auto local_mamba_allocator = std::move(state).TakeMambaAllocator();
+    auto old_mamba_allocator = std::move(state).TakeMambaAllocator();
+    old_mamba_allocator.reset();
+    std::unique_ptr<LocalMambaAllocator> local_mamba_allocator;
+    if (mamba_allocator_ != nullptr) {
+        local_mamba_allocator = std::make_unique<LocalMambaAllocator>(mamba_allocator_);
+        if (!local_mamba_allocator->AllocateWorking() || !local_mamba_allocator->AllocateCheckpoint()) {
+            throw std::logic_error("ScheduleDecodeFromRetractedEvent: failed to allocate Mamba recovery slots");
+        }
+    }
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
     local_kv_allocator->Acquire(decode_input_tokens_);
     return Decoding{token_container,
@@ -443,6 +451,10 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                 hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
             }
         }
+        // Once retracted, the recoverable Mamba state is tree-owned and
+        // therefore evictable by HybridPrefixCache. Do not keep request-local
+        // slots alive in Retracting/Retracted.
+        local_mamba_allocator.reset();
     }
 
     return Retracting{token_container,

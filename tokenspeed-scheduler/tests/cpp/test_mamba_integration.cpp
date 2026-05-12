@@ -171,7 +171,7 @@ protected:
     }
 };
 
-TEST_F(DisablePrefixCacheMambaRetractTest, RetractedRequestKeepsMambaState) {
+TEST_F(DisablePrefixCacheMambaRetractTest, RetractedRequestRecoversFromTreeOwnedMambaState) {
     Submit(MakeRequestSpec("r1", 1));
     PlanOnce();
     SendForwardDone("r1", {100});
@@ -191,6 +191,7 @@ TEST_F(DisablePrefixCacheMambaRetractTest, RetractedRequestKeepsMambaState) {
     ASSERT_NE(fwd, nullptr);
     ASSERT_EQ(fwd->request_ids.size(), 1u);
     EXPECT_EQ(fwd->request_ids[0], "r1");
+    EXPECT_GE(fwd->mamba_cow_src_indices[0], 0);
     EXPECT_GE(fwd->mamba_working_indices[0], 0);
     EXPECT_GE(fwd->mamba_checkpoint_dst_indices[0], 0);
 }

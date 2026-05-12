@@ -135,13 +135,15 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
     // Constructor for Retracted → Decoding recovery (LoadBack from host).
     ScheduleDecodeFromRetractedEvent(std::int32_t decode_input_tokens, PageAllocator* device_allocator,
                                      ReqPoolAllocator* req_pool_allocator, KVPrefixCache* kv_prefix_cache,
-                                     MatchResult match_result, std::vector<TreeNode*> loadback_diff)
+                                     MatchResult match_result, std::vector<TreeNode*> loadback_diff,
+                                     MambaChunkAllocator* mamba_allocator = nullptr)
         : decode_input_tokens_(decode_input_tokens),
           device_allocator_(device_allocator),
           req_pool_allocator_(req_pool_allocator),
           kv_prefix_cache_(kv_prefix_cache),
           match_result_(std::move(match_result)),
-          loadback_diff_(std::move(loadback_diff)) {}
+          loadback_diff_(std::move(loadback_diff)),
+          mamba_allocator_(mamba_allocator) {}
 
     Decoding operator()(Retracted&& state);
 
@@ -156,6 +158,7 @@ private:
     KVPrefixCache* kv_prefix_cache_{};
     MatchResult match_result_{};
     std::vector<TreeNode*> loadback_diff_;
+    MambaChunkAllocator* mamba_allocator_{};
 };
 
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
