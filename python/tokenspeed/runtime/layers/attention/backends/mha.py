@@ -333,7 +333,6 @@ class MHAAttnBackend(AttentionBackend):
                 k=k,
                 v=v,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_q,
                 max_seqlen_q=metadata.max_seq_len_q,
                 max_seqlen_k=metadata.max_seq_len_q,
                 softmax_scale=layer.scaling,

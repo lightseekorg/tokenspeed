@@ -47,7 +47,6 @@ def mha_prefill(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     # attention options
@@ -67,7 +66,7 @@ def mha_prefill(
         k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
         v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
         cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+            KV cumulative sequence lengths are assumed to be identical.
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
         softmax_scale: Optional scale factor applied before softmax.
@@ -78,8 +77,7 @@ def mha_prefill(
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
 
-    Standard full-sequence prefill is the special case where
-    cu_seqlens_q == cu_seqlens_kv.
+    Standard full-sequence prefill assumes query and KV sequence boundaries match.
     """
     # Select kernel
     traits = {
@@ -132,7 +130,6 @@ def mha_prefill(
             k=k,
             v=v,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,

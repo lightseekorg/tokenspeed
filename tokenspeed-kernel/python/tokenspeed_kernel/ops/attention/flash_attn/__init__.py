@@ -87,7 +87,6 @@ if (
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
@@ -102,7 +101,7 @@ if (
             k=k,
             v=v,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_kv,
+            cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=(
@@ -203,7 +202,6 @@ elif platform.is_nvidia and platform.is_hopper:
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
@@ -218,7 +216,7 @@ elif platform.is_nvidia and platform.is_hopper:
             k=k,
             v=v,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_kv,
+            cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=(

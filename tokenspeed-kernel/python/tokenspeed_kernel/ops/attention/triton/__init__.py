@@ -50,7 +50,6 @@ def triton_mha_prefill(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
