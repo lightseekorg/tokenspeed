@@ -24,7 +24,12 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling.cuda import chain_speculative_sampling_target_only
-from tokenspeed_kernel.ops.sampling.flashinfer import min_p_sampling_from_probs, softmax
+from tokenspeed_kernel.ops.sampling.flashinfer import (
+    min_p_sampling_from_probs,
+    softmax,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+)
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -34,10 +39,7 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import (
-    nan_guard_logits,
-    top_k_top_p_renorm_torch,
-)
+from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -288,7 +290,8 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         min_ps = self._min_p_pool.index_select(0, sampling_info.req_pool_indices.long())
 
         probs = softmax(logits, temperature=temperatures.view(-1, 1))
-        probs = top_k_top_p_renorm_torch(probs, top_ks, top_ps)
+        probs = top_k_renorm_prob(probs, top_ks)
+        probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
 
         batch_next_token_ids = min_p_sampling_from_probs(
             probs,
@@ -374,10 +377,14 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         target_probs = softmax(logits, temperature=expanded_temperature)
 
-        target_probs = top_k_top_p_renorm_torch(
+        target_probs = top_k_renorm_prob(
             target_probs,
             torch.repeat_interleave(top_ks, num_tokens_per_req, dim=0),
+        )
+        target_probs = top_p_renorm_prob(
+            target_probs,
             torch.repeat_interleave(top_ps, num_tokens_per_req, dim=0),
+            is_deterministic=True,
         )
 
         # min_p renorm open-coded: zero probs below `min_p * max_prob` per
@@ -417,6 +424,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             draft_probs=draft_probs,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+            deterministic=True,
         )
 
         accept_length += 1

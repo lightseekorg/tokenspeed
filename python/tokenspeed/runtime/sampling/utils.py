@@ -91,27 +91,3 @@ def top_p_normalize_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def top_k_top_p_renorm_torch(
-    probs: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-) -> torch.Tensor:
-    """Joint top-k + top-p filter and renormalize. One sort serves both masks;
-    replaces the flashinfer top_k_renorm + AIR Top-P sequence (5 kernels)."""
-    sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
-
-    # Exclusive cumsum (= prefix sum BEFORE this token in sorted order).
-    excl_cumsum = sorted_probs.cumsum(dim=-1) - sorted_probs
-
-    pos = torch.arange(sorted_probs.size(-1), device=probs.device)
-    mask = (pos < top_ks.unsqueeze(-1)) & (excl_cumsum <= top_ps.unsqueeze(-1))
-
-    kept = sorted_probs * mask
-    kept = kept / kept.sum(dim=-1, keepdim=True)
-
-    # sorted_idx is a permutation of [0, V) per row, so scatter_ overwrites
-    # every position exactly once — no need to pre-zero the output buffer.
-    return torch.empty_like(probs).scatter_(-1, sorted_idx, kept)

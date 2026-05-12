@@ -29,7 +29,9 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
+    top_k_renorm_prob,
     top_k_top_p_sampling_from_logits,
+    top_p_renorm_prob,
 )
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
@@ -43,7 +45,6 @@ from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     nan_guard_logits,
-    top_k_top_p_renorm_torch,
     write_output_logprobs,
 )
 from tokenspeed.runtime.utils import crash_on_warnings
@@ -250,6 +251,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         else:
 
+            # triton_poi_fused__to_copy_index_select_x * 4
             temperatures, top_ks, top_ps, seeds = self._gather_scalars(
                 sampling_info.req_pool_indices
             )
@@ -328,6 +330,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         else:
 
+            # triton_poi_fused__to_copy_index_select_x * 4
             temperatures, top_ks, top_ps, _seeds = self._gather_scalars(
                 sampling_info.req_pool_indices
             )
@@ -335,14 +338,18 @@ class FlashInferSamplingBackend(SamplingBackend):
             # Each request's N verified positions share one (temp, top_k, top_p)
             # tuple; flat [bs*N] per-row knobs match the flat [bs*N, vocab] logits.
             n = num_tokens_per_req
+
             target_probs = softmax(
                 logits_output.next_token_logits,
                 temperature=torch.repeat_interleave(temperatures, n),
             )
-            target_probs = top_k_top_p_renorm_torch(
+            target_probs = top_k_renorm_prob(
+                target_probs, torch.repeat_interleave(top_ks, n)
+            )
+            target_probs = top_p_renorm_prob(
                 target_probs,
-                torch.repeat_interleave(top_ks, n),
                 torch.repeat_interleave(top_ps, n),
+                is_deterministic=True,
             )
             target_probs = target_probs.reshape(bs, n, -1)
 
@@ -357,6 +364,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 draft_probs=torch.zeros_like(target_probs),
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                deterministic=True,
             )
 
         accept_length += 1
