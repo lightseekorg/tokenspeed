@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_k_renorm_prob,
     top_p_renorm_prob,
 )
+from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -283,11 +284,17 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         logits = self._apply_penalties_and_bias(logits, sampling_info)
 
-        temperatures, top_ks, top_ps, seeds = self._gather_scalars(
-            sampling_info.req_pool_indices
+        temperatures, top_ks, top_ps, min_ps, seeds, offsets = (
+            gather_and_expand_scalars(
+                sampling_info.req_pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                min_p=self._min_p_pool,
+                seed=self._seed_pool,
+                offsets=sampling_info.valid_cache_lengths,
+            )
         )
-        offsets = self._gather_offsets(sampling_info)
-        min_ps = self._min_p_pool.index_select(0, sampling_info.req_pool_indices.long())
 
         probs = softmax(logits, temperature=temperatures.view(-1, 1))
         probs = top_k_renorm_prob(probs, top_ks)
@@ -366,38 +373,26 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        temperatures, top_ks, top_ps, _seeds = self._gather_scalars(
-            sampling_info.req_pool_indices
+        temperatures, top_ks, top_ps, min_ps, _, _ = gather_and_expand_scalars(
+            sampling_info.req_pool_indices,
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
+            min_p=self._min_p_pool,
+            n=num_tokens_per_req,
         )
-        min_ps = self._min_p_pool.index_select(0, sampling_info.req_pool_indices.long())
 
-        expanded_temperature = torch.repeat_interleave(
-            temperatures.view(-1, 1), num_tokens_per_req, dim=0
-        )
-
-        target_probs = softmax(logits, temperature=expanded_temperature)
-
-        target_probs = top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(top_ks, num_tokens_per_req, dim=0),
-        )
-        target_probs = top_p_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(top_ps, num_tokens_per_req, dim=0),
-            is_deterministic=True,
-        )
+        target_probs = softmax(logits, temperature=temperatures.view(-1, 1))
+        target_probs = top_k_renorm_prob(target_probs, top_ks)
+        target_probs = top_p_renorm_prob(target_probs, top_ps, is_deterministic=True)
 
         # min_p renorm open-coded: zero probs below `min_p * max_prob` per
         # row, then renormalize. The chain-speculative-sampling kernel has no
         # min_p knob, and flashinfer exposes no `min_p_renorm_prob`.
-        expanded_min_ps = torch.repeat_interleave(
-            min_ps, num_tokens_per_req, dim=0
-        ).view(-1, 1)
-
         max_probs = target_probs.max(dim=-1, keepdim=True).values
 
         target_probs = torch.where(
-            target_probs >= expanded_min_ps * max_probs,
+            target_probs >= min_ps.view(-1, 1) * max_probs,
             target_probs,
             torch.zeros_like(target_probs),
         )
