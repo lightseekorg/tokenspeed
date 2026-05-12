@@ -116,10 +116,12 @@ def _fused_mamba_state_scatter_with_mask_kernel(
 
 
 @triton.jit
-def _mamba_state_copy_kernel(
+def _mamba_state_snapshot_kernel(
     pool_ptr,
     src_indices_ptr,  # [num_valid]
     dst_indices_ptr,  # [num_valid]
+    cache_lengths_ptr,  # [num_valid] or nullptr (0 when page_size==0)
+    page_size,  # 0 means no page filtering
     elem_per_entry: tl.constexpr,
     layer_stride,
     req_stride,
@@ -128,6 +130,7 @@ def _mamba_state_copy_kernel(
 ):
     """
     In-place copy kernel: pool[:, dst[i], :] = pool[:, src[i], :]
+    Skips copy if page_size > 0 and cache_lengths[i] % page_size != 0.
 
     Grid: (num_valid, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
     """
@@ -138,8 +141,15 @@ def _mamba_state_copy_kernel(
     src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
     dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
 
+    # Skip self-copy (no-op)
     if src_idx == dst_idx:
         return
+
+    # Page-boundary filter: skip if not aligned
+    if page_size > 0:
+        cl = tl.load(cache_lengths_ptr + pid_req).to(tl.int64)
+        if cl % page_size != 0:
+            return
 
     # Bounds check
     if not (
@@ -158,18 +168,26 @@ def _mamba_state_copy_kernel(
     tl.store(pool_ptr + dst_offset + offsets, data, mask=mask)
 
 
-def fused_mamba_state_copy(
+def fused_mamba_state_snapshot(
     pool: torch.Tensor,  # [num_layers, pool_size, *state_shape]
     src_indices: torch.Tensor,  # [num_valid]
     dst_indices: torch.Tensor,  # [num_valid]
+    cache_lengths: torch.Tensor | None = None,  # [num_valid], for page filter
+    page_size: int = 0,  # 0 means no page filtering
 ):
     """
-    In-place state copy: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
+    Snapshot mamba states: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
+
+    Specialized for checkpoint snapshot with page-boundary filtering.
+    When page_size > 0 and cache_lengths is provided, skips entries where
+    cache_lengths[i] % page_size != 0 (all done inside a single kernel).
 
     Args:
         pool: State tensor [num_layers, pool_size, *state_shape], must be contiguous.
         src_indices: Source slot indices [num_valid], int32 or int64.
         dst_indices: Destination slot indices [num_valid], int32 or int64.
+        cache_lengths: Per-entry cache lengths for page-boundary filtering.
+        page_size: Page size for filtering; 0 disables.
     """
     num_valid = src_indices.shape[0]
     if num_valid == 0:
@@ -195,16 +213,26 @@ def fused_mamba_state_copy(
     layer_stride = pool.stride(0)
     req_stride = pool.stride(1)
 
-    src_indices = src_indices.to(torch.int32).contiguous()
-    dst_indices = dst_indices.to(torch.int32).contiguous()
+    if not src_indices.is_contiguous():
+        raise ValueError("src_indices must be contiguous")
+    if not dst_indices.is_contiguous():
+        raise ValueError("dst_indices must be contiguous")
+
+    if page_size > 0 and cache_lengths is not None:
+        cache_lengths = cache_lengths.to(torch.int32)
+    else:
+        cache_lengths = src_indices  # unused; kernel skips when page_size==0
+        page_size = 0
 
     BLOCK_SIZE = 1024
     grid = (num_valid, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
 
-    _mamba_state_copy_kernel[grid](
+    _mamba_state_snapshot_kernel[grid](
         pool,
         src_indices,
         dst_indices,
+        cache_lengths,
+        page_size,
         elem_per_entry,
         layer_stride,
         req_stride,

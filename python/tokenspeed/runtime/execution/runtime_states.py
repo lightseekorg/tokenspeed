@@ -22,7 +22,7 @@
 import torch
 
 from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
-    fused_mamba_state_copy,
+    fused_mamba_state_snapshot,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -115,15 +115,18 @@ class RuntimeStates:
         """Copy current working Mamba states into checkpoint slots.
 
         src_indices/dst_indices are pre-filtered on CPU (only valid entries).
-        Only the page_size condition is checked on GPU.
+        The page_size condition is checked inside the Triton kernel.
         """
         if self.mamba_pool is None or num_valid == 0:
             return
-        if page_size > 0:
-            page_mask = cache_lengths[:num_valid] % page_size == 0
-            dst_indices = torch.where(page_mask, dst_indices, src_indices)
-        fused_mamba_state_copy(self.mamba_pool.conv_state, src_indices, dst_indices)
-        fused_mamba_state_copy(self.mamba_pool.ssm_state, src_indices, dst_indices)
+        fused_mamba_state_snapshot(
+            self.mamba_pool.conv_state, src_indices, dst_indices,
+            cache_lengths=cache_lengths, page_size=page_size,
+        )
+        fused_mamba_state_snapshot(
+            self.mamba_pool.ssm_state, src_indices, dst_indices,
+            cache_lengths=cache_lengths, page_size=page_size,
+        )
 
     def zero_mamba_states(
         self,
