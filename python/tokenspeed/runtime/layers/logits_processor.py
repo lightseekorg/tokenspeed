@@ -252,7 +252,11 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+                    aux_hidden_states = (
+                        aux_hidden_states[0]
+                        if len(aux_hidden_states) == 1
+                        else torch.cat(aux_hidden_states, dim=-1)
+                    )
                     hidden_states_to_store = aux_hidden_states
                 else:
                     hidden_states_to_store = hidden_states
@@ -260,7 +264,11 @@ class LogitsProcessor(nn.Module):
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
-                    aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
+                    aux_pruned_states = (
+                        aux_pruned_states[0]
+                        if len(aux_pruned_states) == 1
+                        else torch.cat(aux_pruned_states, dim=-1)
+                    )
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None
