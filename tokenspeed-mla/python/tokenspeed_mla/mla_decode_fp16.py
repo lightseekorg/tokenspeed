@@ -66,6 +66,7 @@ from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
 try:
     from .mla_helpers import (
         LOG2_E,
