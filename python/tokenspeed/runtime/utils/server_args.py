@@ -77,7 +77,6 @@ class ServerArgs:
     device: str = "cuda"
     served_model_name: str | None = None
     revision: str | None = None
-    think_end_token: str | None = None
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -785,12 +784,6 @@ class ServerArgs:
             help="The specific model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
-        )
-        parser.add_argument(
-            "--think-end-token",
-            type=str,
-            default=ServerArgs.think_end_token,
-            help="The think end token of a thinking model, such as '</think>' for DeepSeek R1.",
         )
         # Memory and scheduling
         parser.add_argument(

@@ -786,22 +786,6 @@ class ExpertDistributionReqOutput:
     pass
 
 
-@dataclass
-class ProfileReqInput:
-    # The output directory
-    output_dir: str | None = None
-    # If set, it profile as many as this number of steps.
-    # If it is set, profiling is automatically stopped after this step, and
-    # the caller doesn't need to run stop_profile.
-    start_step: int | None = None
-    num_steps: int | None = None
-    activities: list[str] | None = None
-    profile_by_stage: bool = False
-    with_stack: bool | None = None
-    record_shapes: bool | None = None
-    profile_id: str | None = None
-
-
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
