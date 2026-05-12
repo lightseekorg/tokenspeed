@@ -48,9 +48,6 @@ def _try_import_optional_backend(name: str, dependency: str) -> None:
 
 if platform.is_nvidia:
     from tokenspeed.runtime.layers.attention.backends import deepseek_v4  # noqa: F401
-    from tokenspeed.runtime.layers.attention.backends import (
-        flash_attention,
-    )  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import flashmla  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import (
         tokenspeed_mla,
@@ -59,4 +56,3 @@ if platform.is_nvidia:
     from tokenspeed.runtime.layers.attention.backends import trtllm_mla  # noqa: F401
 
 from tokenspeed.runtime.layers.attention.backends import mha  # noqa: F401
-from tokenspeed.runtime.layers.attention.backends import triton  # noqa: F401

@@ -30,6 +30,7 @@ import ctypes
 import importlib
 import os
 import shutil
+import site
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -238,6 +239,22 @@ def _pip_verbose_args(verbose) -> list[str]:
     return ["-" + ("v" * min(level, 3))] if level > 0 else []
 
 
+def _refresh_python_install_paths() -> None:
+    """Expose packages installed by subprocess pip to this build process."""
+    candidates = []
+    for paths in (site.getsitepackages(), site.getusersitepackages()):
+        if isinstance(paths, str):
+            candidates.append(paths)
+        else:
+            candidates.extend(paths)
+
+    for path in candidates:
+        if path and Path(path).exists():
+            site.addsitedir(str(path))
+
+    importlib.invalidate_caches()
+
+
 def _install_backend_build_requirements(verbose=False) -> None:
     backend = _selected_backend()
     print(f"Installing {backend} build requirements before native build")
@@ -255,8 +272,9 @@ def _install_backend_build_requirements(verbose=False) -> None:
     )
 
     # The same setup.py process imports build deps immediately after pip adds
-    # them to site-packages, so refresh importlib's directory caches first.
-    importlib.invalidate_caches()
+    # them. If pip created user site-packages during this run, that path was not
+    # present when Python started, so add site paths before resolving headers.
+    _refresh_python_install_paths()
 
 
 def _ensure_cuda_compiler() -> None:

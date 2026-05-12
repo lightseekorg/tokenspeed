@@ -38,11 +38,9 @@ import torch
 import triton
 import triton.language as tl
 
-from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import (
     build_page_table,
     token_indices_from_pages,
@@ -2111,10 +2109,3 @@ def prepare_swa_spec_page_table_triton(
         BLOCK_N=BLOCK_N,
         num_warps=4,
     )
-
-
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
-register_backend("fa3", {AttentionArch.MHA}, FlashAttentionBackend)

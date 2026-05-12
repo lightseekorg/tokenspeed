@@ -318,11 +318,12 @@ def _make_cache_key(
     objective: SelectionObjective,
     features: frozenset[str] | None,
     traits: dict[str, Any] | None,
+    solution: str | None = None,
 ) -> tuple:
     """Build a hashable cache key including selection-relevant traits."""
     traits_key = tuple(sorted(traits.items())) if traits else ()
     mods_key = frozenset(features) if features else frozenset()
-    return (family, mode, dtype, arch, objective, mods_key, traits_key)
+    return (family, mode, dtype, arch, objective, mods_key, traits_key, solution)
 
 
 def _score_priority(spec: KernelSpec) -> int:
@@ -541,14 +542,15 @@ def select_kernel(
     platform: PlatformInfo | None = None,
     objective: SelectionObjective = SelectionObjective.DEFAULT,
     traits: dict[str, Any] | None = None,
+    solution: str | None = None,
     override: str | None = None,
     expected_kernel_name: str | None = None,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
-    On first call for a given (family, mode, dtype, platform, objective, traits)
-    combination, runs the full selection pipeline. Subsequent calls with the
-    same arguments return the cached result — a single dict lookup.
+    On first call for a given (family, mode, dtype, platform, objective, traits,
+    solution) combination, runs the full selection pipeline. Subsequent calls
+    with the same arguments return the cached result — a single dict lookup.
 
     Args:
         family: Operator family (e.g., "attention")
@@ -559,6 +561,8 @@ def select_kernel(
         objective: Selection objective (see SelectionObjective enum)
         traits: Op-specific trait values that affect kernel applicability
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
+        solution: Restrict selection to a registered solution while preserving
+            normal platform, dtype, and trait filtering.
         override: Force a specific kernel name or solution string
         expected_kernel_name: Debug-only hint. When set, a warning is
             logged if the selected kernel differs from this name. The
@@ -575,11 +579,11 @@ def select_kernel(
     # 1. Config file (lowest priority)
     config_entry = _get_config_override(family, mode)
     if config_entry is not None:
-        if override is None:
+        if override is None and solution is None:
             if config_entry.name:
                 override = config_entry.name
             elif config_entry.solution:
-                override = config_entry.solution
+                solution = config_entry.solution
         if config_entry.objective and objective == SelectionObjective.DEFAULT:
             try:
                 objective = SelectionObjective(config_entry.objective)
@@ -605,7 +609,7 @@ def select_kernel(
 
     # Fast path: check cache (skipped when override is active)
     cache_key = _make_cache_key(
-        family, mode, dtype, platform.arch, objective, features, traits
+        family, mode, dtype, platform.arch, objective, features, traits, solution
     )
     if override is None:
         cached = registry.cache_get(cache_key)
@@ -617,13 +621,19 @@ def select_kernel(
 
     # Get candidates (same filtering for both strategies)
     candidates = registry.get_for_operator(
-        family, mode, features=features, platform=platform, dtype=dtype
+        family,
+        mode,
+        features=features,
+        platform=platform,
+        dtype=dtype,
+        solution=solution,
     )
 
+    solution_clause = f" with solution {solution!r}" if solution else ""
     if not candidates:
         raise NoKernelFoundError(
-            f"No kernel found for {family}.{mode} ({dtype}) "
-            f"on {platform.device_name}"
+            f"No kernel found for {family}.{mode} ({dtype})"
+            f"{solution_clause} on {platform.device_name}"
         )
 
     if traits:
@@ -631,8 +641,8 @@ def select_kernel(
 
     if not candidates:
         raise NoKernelFoundError(
-            f"No kernel found for {family}.{mode} ({dtype}) "
-            f"with traits {traits} on {platform.device_name}"
+            f"No kernel found for {family}.{mode} ({dtype})"
+            f"{solution_clause} with traits {traits} on {platform.device_name}"
         )
 
     # Strategy dispatch
@@ -725,6 +735,7 @@ def explain_selection(
     platform: PlatformInfo | None = None,
     objective: SelectionObjective = SelectionObjective.DEFAULT,
     traits: dict[str, Any] | None = None,
+    solution: str | None = None,
 ) -> str:
     """Return a human-readable explanation of kernel selection.
 
@@ -749,7 +760,12 @@ def explain_selection(
 
     all_specs = registry.list_kernels(family=family, mode=mode)
     candidates = registry.get_for_operator(
-        family, mode, features=features, platform=platform, dtype=dtype
+        family,
+        mode,
+        features=features,
+        platform=platform,
+        dtype=dtype,
+        solution=solution,
     )
 
     if traits:
@@ -763,6 +779,7 @@ def explain_selection(
     lines = [
         f"Op: {family}.{mode} ({dtype})",
         f"Platform: {platform.device_name} ({platform.arch})",
+        f"Solution: {solution or 'any'}",
         f"Objective: {objective.value}",
         "Ranking: lex (oracle, objective, priority); higher wins",
         "",
@@ -801,6 +818,8 @@ def explain_selection(
                     f"dtype mismatch (supports "
                     f"{', '.join(str(d) for d in spec.dtypes)})"
                 )
+            if solution and spec.solution != solution:
+                reasons.append(f"solution mismatch (is {spec.solution!r})")
             reason_str = "; ".join(reasons) if reasons else "unknown"
             lines.append(f"  - {spec.name}: {reason_str}")
 

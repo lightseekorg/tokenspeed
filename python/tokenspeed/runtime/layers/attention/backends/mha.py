@@ -41,6 +41,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
+_KERNEL_SOLUTION_BY_BACKEND = {
+    "mha": None,
+    "fa3": "fa3",
+    "fa4": "fa4",
+    "triton": "triton",
+    "flashinfer": "flashinfer",
+}
+
+
 @dataclass
 class MHAMetadata:
     cache_seqlens_int32: torch.Tensor
@@ -59,6 +68,10 @@ class MHAAttnBackend(AttentionBackend):
 
     def __init__(self, config: MHAConfig):
         super().__init__(config)
+        backend_name = config.backend_name or "mha"
+        if backend_name not in _KERNEL_SOLUTION_BY_BACKEND:
+            raise ValueError(f"Unsupported MHA backend: {backend_name!r}")
+        self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = (
@@ -285,6 +298,7 @@ class MHAAttnBackend(AttentionBackend):
             logit_cap=layer.logit_cap,
             sinks=kwargs.get("sinks"),
             max_seqlen_k=metadata.max_seq_len_k,
+            solution=self.kernel_solution,
         )
         return self._unwrap_output(result).reshape(
             -1, layer.tp_q_head_num * layer.v_head_dim
@@ -333,7 +347,6 @@ class MHAAttnBackend(AttentionBackend):
                 k=k,
                 v=v,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_q,
                 max_seqlen_q=metadata.max_seq_len_q,
                 max_seqlen_k=metadata.max_seq_len_q,
                 softmax_scale=layer.scaling,
@@ -341,6 +354,7 @@ class MHAAttnBackend(AttentionBackend):
                 window_left=layer.sliding_window_size,
                 logit_cap=layer.logit_cap,
                 sinks=kwargs.get("sinks"),
+                solution=self.kernel_solution,
             )
             return self._unwrap_output(result).reshape(
                 -1, layer.tp_q_head_num * layer.v_head_dim
@@ -363,6 +377,7 @@ class MHAAttnBackend(AttentionBackend):
                 sinks=kwargs.get("sinks"),
                 max_seqlen_q=metadata.max_seq_len_q,
                 max_seqlen_k=metadata.max_seq_len_k,
+                solution=self.kernel_solution,
             )
             return self._unwrap_output(result).reshape(
                 -1, layer.tp_q_head_num * layer.v_head_dim
@@ -411,4 +426,5 @@ class MHAAttnBackend(AttentionBackend):
         return result
 
 
-register_backend("mha", {AttentionArch.MHA}, MHAAttnBackend)
+for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:
+    register_backend(_backend_name, {AttentionArch.MHA}, MHAAttnBackend)

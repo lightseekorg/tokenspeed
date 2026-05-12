@@ -90,7 +90,7 @@ different process groups.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--attention-backend` | Attention kernel backend. Common values include `trtllm_mla`, `tokenspeed_mla`, `fa3`, and `mha`. |
+| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. |
 | `--drafter-attention-backend` | Attention backend for speculative decoding drafter model. |
 | `--moe-backend` | MoE backend. |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |

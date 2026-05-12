@@ -1208,14 +1208,16 @@ class ServerArgs:
 
         # Kernel backend
         attention_backend_choices = [
-            "triton",
-            "flashmla",
-            "fa3",
-            "hybrid_linear_attn",
             "mha",
+            "fa3",
+            "fa4",
+            "triton",
+            "flashinfer",
             "trtllm",
             "trtllm_mla",
+            "flashmla",
             "tokenspeed_mla",
+            "hybrid_linear_attn",
         ]
         parser.add_argument(
             "--attention-backend",
