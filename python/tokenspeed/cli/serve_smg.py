@@ -54,8 +54,8 @@ def _check_serve_extra_installed() -> None:
         missing.append("smg-grpc-servicer")
     if missing:
         sys.stderr.write(
-            "ts serve requires the [serve] extra:\n\n"
-            "    pip install 'tokenspeed[serve]' \\\n"
+            "ts serve requires SMG packages:\n\n"
+            "    pip install smg smg-grpc-servicer smg-grpc-proto \\\n"
             "        --extra-index-url https://lightseek.org/whl/cu130/\n\n"
             "Swap the index for other variants:\n"
             "    https://lightseek.org/whl/cu129/      (CUDA 12.9)\n"
