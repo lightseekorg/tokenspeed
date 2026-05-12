@@ -23,7 +23,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     DEEPSEEK_V4_SWA_SCALE_DIM,
     DEEPSEEK_V4_SWA_TOKEN_STRIDE,
     DeepseekV4AttentionOpUnavailable,
-    deepseek_v4_build_dense_prefill_local_topk_indices,
+    deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
     deepseek_v4_compute_global_topk_indices_and_lens,
@@ -38,7 +38,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-DEEPSEEK_V4_PREFILL_CHUNK_SIZE = 4
+DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
 
 
 def _swa_block_table(metadata: DeepseekV4ForwardMetadata) -> torch.Tensor:
@@ -65,14 +65,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         super().__init__(config)
         self.page_size = config.page_size
         self.context_len = config.context_len
-        max_num_batched_tokens = getattr(config, "max_num_batched_tokens", None)
-        if not max_num_batched_tokens:
-            max_num_batched_tokens = global_server_args_dict.get("chunked_prefill_size")
-        if not max_num_batched_tokens:
-            max_num_batched_tokens = global_server_args_dict.get("max_prefill_tokens")
-        if not max_num_batched_tokens:
-            max_num_batched_tokens = self.context_len
-        self.max_num_batched_tokens = max(1, int(max_num_batched_tokens))
+        prefill_chunk_size = getattr(config, "deepseek_v4_prefill_chunk_size", None)
+        if prefill_chunk_size is None:
+            prefill_chunk_size = global_server_args_dict.get(
+                "deepseek_v4_prefill_chunk_size",
+                DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE,
+            )
+        self.prefill_chunk_size = max(1, int(prefill_chunk_size))
         self.max_num_pages = max(
             1,
             (self.context_len + self.page_size - 1) // self.page_size,
@@ -88,7 +87,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
-        self._prefill_dense_topk_buffer: Optional[torch.Tensor] = None
+        self._prefill_dense_compressed_indices_buffer: Optional[torch.Tensor] = None
         self._decode_swa_window_size = 0
         self._decode_swa_block_size = 0
 
@@ -100,7 +99,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         head_dim: int,
         device: torch.device,
     ) -> torch.Tensor:
-        workspace_reqs = max(1, DEEPSEEK_V4_PREFILL_CHUNK_SIZE, num_reqs)
+        workspace_reqs = max(1, num_reqs)
         rows = workspace_reqs * workspace_width
         needs_alloc = (
             self._prefill_workspace_buffer is None
@@ -332,7 +331,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             return indices_2d.unsqueeze(1), lens
         else:
-            width = self._compressed_topk_width(compress_ratio)
+            width = self._dense_compressed_indices_width(compress_ratio)
             compressed_lens = torch.div(
                 positions.to(torch.int64) + 1,
                 compress_ratio,
@@ -356,37 +355,37 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         indices = indices_2d.to(torch.int32).unsqueeze(1)
         return indices, lens
 
-    def _compressed_topk_width(self, compress_ratio: int) -> int:
+    def _dense_compressed_indices_width(self, compress_ratio: int) -> int:
         if compress_ratio <= 1:
             return 0
         width = max(1, (self.context_len + compress_ratio - 1) // compress_ratio)
         alignment = DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
         return ((width + alignment - 1) // alignment) * alignment
 
-    def _dense_prefill_local_topk_indices(
+    def _dense_prefill_local_compressed_indices(
         self,
         positions: torch.Tensor,
         *,
         compress_ratio: int,
-        topk: int,
+        width: int,
     ) -> torch.Tensor:
-        shape = (positions.numel(), topk)
+        shape = (positions.numel(), width)
         if (
-            self._prefill_dense_topk_buffer is None
-            or self._prefill_dense_topk_buffer.device != positions.device
-            or self._prefill_dense_topk_buffer.shape[0] < shape[0]
-            or self._prefill_dense_topk_buffer.shape[1] < shape[1]
+            self._prefill_dense_compressed_indices_buffer is None
+            or self._prefill_dense_compressed_indices_buffer.device != positions.device
+            or self._prefill_dense_compressed_indices_buffer.shape[0] < shape[0]
+            or self._prefill_dense_compressed_indices_buffer.shape[1] < shape[1]
         ):
-            self._prefill_dense_topk_buffer = torch.empty(
+            self._prefill_dense_compressed_indices_buffer = torch.empty(
                 shape,
                 dtype=torch.int32,
                 device=positions.device,
             )
-        out = self._prefill_dense_topk_buffer[: shape[0], : shape[1]]
-        return deepseek_v4_build_dense_prefill_local_topk_indices(
+        out = self._prefill_dense_compressed_indices_buffer[: shape[0], : shape[1]]
+        return deepseek_v4_build_dense_prefill_local_compressed_indices(
             positions=positions,
             compress_ratio=compress_ratio,
-            topk=topk,
+            width=width,
             out=out,
         )
 
@@ -549,21 +548,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         num_reqs = metadata.seq_lens.numel()
         gather_lens = self._prefill_gather_lens(window_size=window_size)
+        max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
             torch.div(metadata.seq_lens, compress_ratio, rounding_mode="floor")
             if compress_ratio > 1
             else torch.zeros_like(metadata.seq_lens)
         )
         compressed_base = (
-            (self.context_len + compress_ratio - 1) // compress_ratio
-            if compress_ratio > 1
-            else 0
+            int(compressed_lens.max().item()) if compress_ratio > 1 and num_reqs else 0
         )
-        workspace_width = max(
-            1,
-            compressed_base + window_size + self.max_num_batched_tokens,
-            compressed_base + window_size,
-        )
+        workspace_width = max(1, compressed_base + max_gather_len)
         kv_workspace = self._get_prefill_workspace(
             num_reqs=num_reqs,
             workspace_width=workspace_width,
@@ -610,6 +604,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             return kv_workspace, indices, lens
 
+        if compress_ratio == 4:
+            raise RuntimeError("DeepSeek V4 CSA prefill requires top-k indices")
+
         swa_cache = token_to_kv_pool.get_swa_kv_buffer(layer_id)
         compressed_cache = (
             token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
@@ -643,19 +640,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             offset=compressed_base,
         )
         if compress_ratio > 1:
-            dense_topk_indices = self._dense_prefill_local_topk_indices(
+            dense_compressed_indices = self._dense_prefill_local_compressed_indices(
                 positions,
                 compress_ratio=compress_ratio,
-                topk=self._compressed_topk_width(compress_ratio),
+                width=self._dense_compressed_indices_width(compress_ratio),
             )
             indices, lens = deepseek_v4_combine_topk_swa_indices(
-                topk_indices=dense_topk_indices,
+                topk_indices=dense_compressed_indices,
                 query_start_loc=metadata.query_start_loc,
                 seq_lens=metadata.seq_lens,
                 gather_lens=gather_lens,
                 window_size=window_size,
                 compress_ratio=compress_ratio,
-                topk=dense_topk_indices.shape[-1],
+                topk=dense_compressed_indices.shape[-1],
                 workspace_width=workspace_width,
                 compressed_base=compressed_base,
             )
@@ -691,9 +688,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             key: table[req_start:req_end]
             for key, table in metadata.paged_cache_block_tables.items()
         }
+        paged_cache_block_table_base_offsets = {
+            key: offsets[req_start:req_end]
+            for key, offsets in metadata.paged_cache_block_table_base_offsets.items()
+        }
         compressor_state_block_tables = {
             key: table[req_start:req_end]
             for key, table in metadata.compressor_state_block_tables.items()
+        }
+        compressor_state_base_logical_pages = {
+            key: offsets[req_start:req_end]
+            for key, offsets in metadata.compressor_state_base_logical_pages.items()
         }
         return DeepseekV4ForwardMetadata(
             page_size=metadata.page_size,
@@ -705,15 +710,27 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             token_to_req_indices=token_to_req,
             forward_mode=forward_mode,
             paged_cache_block_tables=paged_cache_block_tables,
+            paged_cache_block_table_base_offsets=paged_cache_block_table_base_offsets,
             swa_block_table=(
                 metadata.swa_block_table[req_start:req_end]
                 if metadata.swa_block_table is not None
                 else None
             ),
+            swa_base_logical_page=(
+                metadata.swa_base_logical_page[req_start:req_end]
+                if metadata.swa_base_logical_page is not None
+                else None
+            ),
             compressor_state_block_tables=compressor_state_block_tables,
+            compressor_state_base_logical_pages=compressor_state_base_logical_pages,
             indexer_state_block_table=(
                 metadata.indexer_state_block_table[req_start:req_end]
                 if metadata.indexer_state_block_table is not None
+                else None
+            ),
+            indexer_state_base_logical_page=(
+                metadata.indexer_state_base_logical_page[req_start:req_end]
+                if metadata.indexer_state_base_logical_page is not None
                 else None
             ),
         )
@@ -809,7 +826,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
 
         num_reqs = int(metadata.seq_lens.numel())
-        if num_reqs <= DEEPSEEK_V4_PREFILL_CHUNK_SIZE:
+        if num_reqs <= self.prefill_chunk_size:
             return self._forward_deepseek_v4_prefill_chunk(
                 q=q,
                 positions=positions,
@@ -830,8 +847,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
         saved_metadata = self.forward_metadata
         try:
-            for req_start in range(0, num_reqs, DEEPSEEK_V4_PREFILL_CHUNK_SIZE):
-                req_end = min(req_start + DEEPSEEK_V4_PREFILL_CHUNK_SIZE, num_reqs)
+            for req_start in range(0, num_reqs, self.prefill_chunk_size):
+                req_end = min(req_start + self.prefill_chunk_size, num_reqs)
                 token_start = token_offsets[req_start]
                 token_end = token_offsets[req_end]
                 if token_end <= token_start:

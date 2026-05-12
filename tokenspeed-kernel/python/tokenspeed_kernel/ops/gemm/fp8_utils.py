@@ -211,8 +211,9 @@ def create_per_token_group_quant_fp8_output_scale(
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
         assert len(x_shape) == 2, "UE8M0 packed scales currently require 2D input"
+        assert group_size == 128, "UE8M0 packed scales currently require group_size=128"
         *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
         aligned_mn = align(x_s_mn, 4)
         packed_k = ceil_div(x_s_k, 4)
         scale_base = torch.empty(

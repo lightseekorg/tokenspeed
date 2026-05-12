@@ -1996,6 +1996,8 @@ def deepseek_v4_gather_indexer_mxfp4_cache(
         raise ValueError("deepseek_v4_gather_indexer_mxfp4_cache requires CUDA slots")
     if values_out.dtype != torch.uint8 or scales_out.dtype != torch.uint8:
         raise TypeError("MXFP4 gather workspaces must be uint8 tensors")
+    if values_out.stride(1) != 1 or scales_out.stride(1) != 1:
+        raise ValueError("MXFP4 gather workspaces must be contiguous in the last dim")
     if values_out.shape[0] < rows or scales_out.shape[0] < rows:
         raise ValueError("MXFP4 gather workspaces are smaller than slot_mapping")
     if values_out.shape[1] < DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES:
@@ -2368,7 +2370,7 @@ def deepseek_v4_combine_topk_swa_indices(
     workspace_width: int,
     compressed_base: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build FlashMLA sparse prefill indices from CSA top-k and SWA windows."""
+    """Build FlashMLA sparse prefill indices from compressed prefix and SWA."""
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -2409,44 +2411,48 @@ def deepseek_v4_combine_topk_swa_indices(
 
 
 @triton.jit
-def _deepseek_v4_build_dense_prefill_local_topk_indices_kernel(
+def _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel(
     out_ptr,
     out_stride,
     positions_ptr,
-    topk: tl.constexpr,
+    width: tl.constexpr,
     compress_ratio: tl.constexpr,
     block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     position = tl.load(positions_ptr + token_idx).to(tl.int64)
-    compressed_len = tl.minimum((position + 1) // compress_ratio, topk)
-    for start in range(0, topk, block):
+    compressed_len = tl.minimum((position + 1) // compress_ratio, width)
+    for start in range(0, width, block):
         offsets = start + tl.arange(0, block)
-        mask = offsets < topk
+        mask = offsets < width
         values = tl.where(offsets < compressed_len, offsets, -1)
         tl.store(out_ptr + token_idx * out_stride + offsets, values, mask=mask)
 
 
-def deepseek_v4_build_dense_prefill_local_topk_indices(
+def deepseek_v4_build_dense_prefill_local_compressed_indices(
     *,
     positions: torch.Tensor,
     compress_ratio: int,
-    topk: int,
+    width: int,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Build C128A/HCA prefill-local top-k indices into `out`."""
+    """Build C128A/HCA prefill-local compressed prefix indices into `out`."""
 
-    result = out[: positions.numel(), :topk]
-    if positions.numel() == 0 or topk <= 0:
+    result = out[: positions.numel(), :width]
+    if positions.numel() == 0 or width <= 0:
         return result
+    if result.stride(1) != 1:
+        raise ValueError(
+            "dense prefill compressed indices output must be contiguous in the last dim"
+        )
     if positions.is_cuda:
-        _deepseek_v4_build_dense_prefill_local_topk_indices_kernel[
+        _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel[
             (positions.numel(),)
         ](
             result,
             result.stride(0),
             positions,
-            topk=topk,
+            width=width,
             compress_ratio=compress_ratio,
             block=1024,
         )
@@ -2456,8 +2462,8 @@ def deepseek_v4_build_dense_prefill_local_topk_indices(
         positions.to(torch.int64) + 1,
         compress_ratio,
         rounding_mode="floor",
-    ).clamp(0, topk)
-    offsets = torch.arange(topk, dtype=torch.int64, device=positions.device)
+    ).clamp(0, width)
+    offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
     local = offsets[None, :].expand(positions.numel(), -1)
     valid = offsets[None, :] < compressed_lens[:, None]
     result.copy_(torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32))

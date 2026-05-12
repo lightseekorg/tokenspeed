@@ -180,6 +180,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertFalse(ServerArgs.disable_deepseek_v4_fast_mhc)
         self.assertEqual(ServerArgs.deepseek_v4_mega_moe_max_num_tokens, 0)
         self.assertEqual(ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb, 512)
+        self.assertEqual(ServerArgs.deepseek_v4_prefill_chunk_size, 4)
 
         # CLI flags parse
         parser = argparse.ArgumentParser()
@@ -190,12 +191,14 @@ class TestDeepseekV4Config(unittest.TestCase):
                 "--disable-deepseek-v4-fast-mhc",
                 "--deepseek-v4-mega-moe-max-num-tokens=128",
                 "--deepseek-v4-indexer-prefill-max-logits-mb=256",
+                "--deepseek-v4-prefill-chunk-size=8",
             ]
         )
         args = ServerArgs.from_cli_args(ns)
         self.assertTrue(args.disable_deepseek_v4_fast_mhc)
         self.assertEqual(args.deepseek_v4_mega_moe_max_num_tokens, 128)
         self.assertEqual(args.deepseek_v4_indexer_prefill_max_logits_mb, 256)
+        self.assertEqual(args.deepseek_v4_prefill_chunk_size, 8)
 
         # Propagation into global_server_args_dict
         snapshot = dict(global_server_args_dict)
@@ -208,6 +211,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             self.assertEqual(
                 global_server_args_dict["deepseek_v4_indexer_prefill_max_logits_mb"],
                 256,
+            )
+            self.assertEqual(
+                global_server_args_dict["deepseek_v4_prefill_chunk_size"], 8
             )
         finally:
             global_server_args_dict.clear()
@@ -275,6 +281,36 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(tuple(actual.shape), (rows, out_dim))
         self.assertTrue(torch.isfinite(actual).all())
         self.assertLess(float((actual - expected).abs().max()), 0.25)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_deepseek_v4_fp8_linear_deep_gemm_runtime_failure_falls_back(self):
+        class FailingDeepGemm:
+            @staticmethod
+            def transform_sf_into_required_layout(**kwargs):
+                del kwargs
+                raise RuntimeError("ptxas failed")
+
+        device = torch.device("cuda")
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.zeros(128, 128, device=device, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.weight_scale_inv = torch.ones(1, 1, device=device)
+        layer.quant_config = SimpleNamespace(weight_block_size=(128, 128))
+        x = torch.zeros(1, 128, device=device, dtype=torch.bfloat16)
+
+        actual = DeepseekV4Attention._deep_gemm_fp8_linear(
+            object(),
+            FailingDeepGemm(),
+            layer,
+            x,
+            (128, 128),
+        )
+
+        self.assertIsNone(actual)
+        self.assertTrue(layer._deepseek_v4_deep_gemm_linear_disabled)
+        self.assertIsNone(layer._deepseek_v4_deep_gemm_linear_cache)
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_fused_qkv_rmsnorm_matches_separate(self):
@@ -744,6 +780,112 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.equal(metadata.indexer_state_base_logical_page, indexer_state_base)
         )
 
+    def test_deepseek_v4_metadata_slice_preserves_compact_base_offsets(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        swa = torch.tensor([[10, 11], [20, 21], [30, 31]], dtype=torch.int32)
+        c4_state = torch.tensor([[40], [41], [42]], dtype=torch.int32)
+        c128_state = torch.tensor([[50], [51], [52]], dtype=torch.int32)
+        indexer_state = torch.tensor([[60], [61], [62]], dtype=torch.int32)
+        raw_offsets = {
+            "v4.swa_kv": torch.tensor([100, 200, 300], dtype=torch.int32),
+            "v4.c4a.compressor_state": torch.tensor([400, 500, 600], dtype=torch.int32),
+            "v4.c128a.compressor_state": torch.tensor(
+                [700, 800, 900], dtype=torch.int32
+            ),
+            "v4.c4a.indexer_compressor_state": torch.tensor(
+                [1000, 1100, 1200], dtype=torch.int32
+            ),
+        }
+        metadata = DeepseekV4ForwardMetadata(
+            page_size=64,
+            req_pool_indices=torch.tensor([10, 11, 12], dtype=torch.int64),
+            block_table=torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32),
+            seq_lens=torch.tensor([10, 20, 30], dtype=torch.int32),
+            query_lens=torch.tensor([2, 1, 3], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 2, 3, 6], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 0, 1, 2, 2, 2], dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            paged_cache_block_tables={
+                "v4.swa_kv": swa,
+                "v4.c4a.compressor_state": c4_state,
+                "v4.c128a.compressor_state": c128_state,
+                "v4.c4a.indexer_compressor_state": indexer_state,
+            },
+            paged_cache_block_table_base_offsets=raw_offsets,
+            swa_block_table=swa,
+            swa_base_logical_page=raw_offsets["v4.swa_kv"],
+            compressor_state_block_tables={4: c4_state, 128: c128_state},
+            compressor_state_base_logical_pages={
+                4: raw_offsets["v4.c4a.compressor_state"],
+                128: raw_offsets["v4.c128a.compressor_state"],
+            },
+            indexer_state_block_table=indexer_state,
+            indexer_state_base_logical_page=raw_offsets[
+                "v4.c4a.indexer_compressor_state"
+            ],
+        )
+
+        sliced = backend._metadata_slice(
+            metadata,
+            req_start=1,
+            req_end=3,
+            token_start=2,
+            token_end=6,
+            forward_mode=ForwardMode.EXTEND,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                sliced.token_to_req_indices,
+                torch.tensor([0, 1, 1, 1], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                sliced.query_start_loc,
+                torch.tensor([0, 1, 4], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(torch.equal(sliced.swa_block_table, swa[1:3]))
+        self.assertTrue(
+            torch.equal(sliced.swa_base_logical_page, raw_offsets["v4.swa_kv"][1:3])
+        )
+        self.assertTrue(
+            torch.equal(
+                sliced.paged_cache_block_table_base_offsets["v4.swa_kv"],
+                raw_offsets["v4.swa_kv"][1:3],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                sliced.compressor_state_base_logical_pages[4],
+                raw_offsets["v4.c4a.compressor_state"][1:3],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                sliced.compressor_state_base_logical_pages[128],
+                raw_offsets["v4.c128a.compressor_state"][1:3],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                sliced.indexer_state_base_logical_page,
+                raw_offsets["v4.c4a.indexer_compressor_state"][1:3],
+            )
+        )
+
     def test_deepseek_v4_metadata_maps_compressed_slots(self):
         compressed_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
         metadata = DeepseekV4ForwardMetadata(
@@ -865,7 +1007,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-    def test_deepseek_v4_c128a_prefill_local_topk_contract(self):
+    def test_deepseek_v4_c128a_prefill_local_compressed_indices_contract(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
                 page_size=64,
@@ -878,12 +1020,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=1024,
             )
         )
-        self.assertEqual(backend._compressed_topk_width(128), 128)
+        self.assertEqual(backend._dense_compressed_indices_width(128), 128)
 
-        indices = backend._dense_prefill_local_topk_indices(
+        indices = backend._dense_prefill_local_compressed_indices(
             torch.tensor([0, 127, 128, 255], dtype=torch.int64),
             compress_ratio=128,
-            topk=backend._compressed_topk_width(128),
+            width=backend._dense_compressed_indices_width(128),
         )
         self.assertEqual(tuple(indices.shape), (4, 128))
         self.assertTrue(
@@ -898,10 +1040,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(indices[3, :4], torch.tensor([0, 1, -1, -1], dtype=torch.int32))
         )
-        cached = backend._dense_prefill_local_topk_indices(
+        cached = backend._dense_prefill_local_compressed_indices(
             torch.tensor([127], dtype=torch.int64),
             compress_ratio=128,
-            topk=backend._compressed_topk_width(128),
+            width=backend._dense_compressed_indices_width(128),
         )
         self.assertEqual(cached.data_ptr(), indices.data_ptr())
 

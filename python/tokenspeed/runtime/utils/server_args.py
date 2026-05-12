@@ -194,6 +194,7 @@ class ServerArgs:
     disable_deepseek_v4_fast_mhc: bool = False
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
+    deepseek_v4_prefill_chunk_size: int = 4
 
     # Grammar backend
     grammar_backend: str = "none"
@@ -612,6 +613,9 @@ class ServerArgs:
                 raise ValueError(
                     f"chunked_prefill_size must be <= max_prefill_tokens: {self.chunked_prefill_size=} > {self.max_prefill_tokens=}"
                 )
+
+        if self.deepseek_v4_prefill_chunk_size <= 0:
+            raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
@@ -1295,6 +1299,14 @@ class ServerArgs:
             help=(
                 "DeepSeek V4 sparse indexer prefill workspace cap (MiB) for the "
                 "softplus_sqrt logits buffer."
+            ),
+        )
+        parser.add_argument(
+            "--deepseek-v4-prefill-chunk-size",
+            type=int,
+            default=ServerArgs.deepseek_v4_prefill_chunk_size,
+            help=(
+                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
             ),
         )
         parser.add_argument(

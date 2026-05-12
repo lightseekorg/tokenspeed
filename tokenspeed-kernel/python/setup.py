@@ -27,7 +27,6 @@ package installs as a pure-Python stub.
 """
 
 import ctypes
-import glob
 import importlib
 import os
 import shutil
@@ -450,6 +449,34 @@ class CudaKernelBuilder:
             archs.add("100a")
         return archs
 
+    def _site_paths(self):
+        paths = []
+        try:
+            paths.extend(site.getsitepackages())
+        except Exception:
+            pass
+        paths.extend(sys.path)
+
+        seen = set()
+        for raw_path in paths:
+            if not raw_path:
+                continue
+            path = Path(raw_path).expanduser()
+            path_str = str(path)
+            if path.exists() and path_str not in seen:
+                seen.add(path_str)
+                yield path
+
+    def _cuda_toolkit_roots(self):
+        roots = [Path(CUDA_HOME)]
+
+        seen = set()
+        for root in roots:
+            root_str = str(root)
+            if root.exists() and root_str not in seen:
+                seen.add(root_str)
+                yield root
+
     def _resolve_include_dirs(self):
         dirs = [str(CUDA_CSRC_DIR / "include"), str(CUDA_CSRC_DIR)]
         seen = set(dirs)
@@ -460,21 +487,14 @@ class CudaKernelBuilder:
                 dirs.append(path_str)
                 seen.add(path_str)
 
-        cuda_include = Path(CUDA_HOME) / "include"
-        if (cuda_include / "cuda_runtime.h").exists():
-            _add_dir(cuda_include)
-        if (cuda_include / "cccl").exists():
-            _add_dir(cuda_include / "cccl")
+        for cuda_root in self._cuda_toolkit_roots():
+            cuda_include = cuda_root / "include"
+            if (cuda_include / "cuda_runtime.h").exists():
+                _add_dir(cuda_include)
+            if (cuda_include / "cccl").exists():
+                _add_dir(cuda_include / "cccl")
 
-        site_paths = []
-        try:
-            site_paths.extend(site.getsitepackages())
-        except Exception:
-            pass
-        site_paths.extend(sys.path)
-        site_paths.extend(glob.glob("/tmp/*/lib/python*/site-packages"))
-        for base in site_paths:
-            base_path = Path(base)
+        for base_path in self._site_paths():
             for candidate in sorted(base_path.glob("nvidia/cu*/include"), reverse=True):
                 if (candidate / "cuda_runtime.h").exists():
                     _add_dir(candidate)
@@ -521,15 +541,10 @@ class CudaKernelBuilder:
 
     def _resolve_cuda_lib_flags(self):
         cuda_home = Path(CUDA_HOME)
-        lib_candidates = [cuda_home / "lib64", cuda_home / "lib"]
-        site_paths = []
-        try:
-            site_paths.extend(site.getsitepackages())
-        except Exception:
-            pass
-        site_paths.extend(sys.path)
-        site_paths.extend(glob.glob("/tmp/*/lib/python*/site-packages"))
-        for base in site_paths:
+        lib_candidates = []
+        for cuda_root in self._cuda_toolkit_roots():
+            lib_candidates.extend([cuda_root / "lib64", cuda_root / "lib"])
+        for base in self._site_paths():
             lib_candidates.extend(
                 sorted(Path(base).glob("nvidia/cu*/lib"), reverse=True)
             )
@@ -585,16 +600,13 @@ class CudaKernelBuilder:
     def _prepare_cuda_toolchain_env(self):
         path = os.environ.get("PATH", "")
         path_entries = [entry for entry in path.split(os.pathsep) if entry]
-        candidates = [Path(NVCC).resolve().parent, Path(CUDA_HOME) / "bin"]
+        candidates = [Path(NVCC).resolve().parent]
 
-        site_paths = []
-        try:
-            site_paths.extend(site.getsitepackages())
-        except Exception:
-            pass
-        site_paths.extend(sys.path)
-        site_paths.extend(glob.glob("/tmp/*/lib/python*/site-packages"))
-        for base in site_paths:
+        for cuda_root in self._cuda_toolkit_roots():
+            candidates.append(cuda_root / "bin")
+            candidates.append(cuda_root / "nvvm" / "bin")
+
+        for base in self._site_paths():
             for cuda_root in sorted(Path(base).glob("nvidia/cu*"), reverse=True):
                 candidates.append(cuda_root / "bin")
                 candidates.append(cuda_root / "nvvm" / "bin")
