@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -44,6 +45,12 @@ from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
+
+_USE_BLADE_GDN = os.environ.get("BLADE_GDN", "0") == "1"
+if _USE_BLADE_GDN:
+    import tiny_gdn
+
+    _blade_gdn_workspace = None
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -594,21 +601,54 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        core_attn_out = fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
+        if _USE_BLADE_GDN:
+            global _blade_gdn_workspace
+            if _blade_gdn_workspace is None:
+                _blade_gdn_workspace = torch.zeros(
+                    (1000,), dtype=torch.int32, device=query.device
+                )
+
+            # Fused gating + beta computation (one kernel launch)
+            # g: [1, seq_len, HV] fp32 log-space, beta: [1, seq_len, HV] sigmoid(b)
+            g, beta_out = fused_gdn_gating(A_log, a, dt_bias, b=b)
+
+            # 4D format: [batch=seq_len, S=1, H, D]
+            q_4d = query.transpose(0, 1)   # [1, seq_len, H, D] -> [seq_len, 1, H, D]
+            k_4d = key.transpose(0, 1)     # [seq_len, 1, H, D]
+            v_4d = value.transpose(0, 1)   # [seq_len, 1, HV, DV]
+            # g/beta already [1, seq_len, HV] -> transpose to [seq_len, 1, HV]
+            g_4d = g.transpose(0, 1)       # [seq_len, 1, HV]
+            beta_4d = beta_out.transpose(0, 1)  # [seq_len, 1, HV]
+
+            # Allocate output
+            output = torch.empty_like(v_4d)  # [seq_len, 1, HV, DV]
+
+            # blade_gdn kernel: gating=log-space (exp inside), beta=sigmoid
+            tiny_gdn.gdn_main_recur(
+                q_4d, k_4d, v_4d, g_4d, beta_4d, output,
+                ssm_states, ssm_states, _blade_gdn_workspace,
+                scale=None,
+                req_ids=cache_indices,
+                use_qk_l2_norm=True,
+            )
+
+            core_attn_out = output.transpose(0, 1)  # [1, seq_len, HV, DV]
+        else:
+            core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
         return core_attn_out
 
     def forward_extend(
