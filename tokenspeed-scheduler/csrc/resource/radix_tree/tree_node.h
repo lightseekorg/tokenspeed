@@ -71,6 +71,8 @@ public:
     TreeNode* Parent() const { return parent_; }
     const token_vec_t& Tokens() const { return tokens_; }
     const std::vector<std::string>& PageHashes() const { return page_hashes_; }
+    const std::vector<std::uint64_t>& BlockHashes() const { return block_hashes_; }
+    std::optional<std::uint64_t> BlockHash() const;
     const std::size_t NumChildren() const { return children_.size(); }
     const children_map_t& Children() const { return children_; }
     timestamp_t Time() const { return last_access_time_; }
@@ -109,6 +111,7 @@ public:
     void SetPersisted(bool persisted = true);
     void Touch(timestamp_t now = std::chrono::steady_clock::now());
     void SetPageHashes(std::vector<std::string> page_hashes);
+    void SetBlockHashes(std::vector<std::uint64_t> block_hashes);
     void AddChild(const token_vec_t& key, std::unique_ptr<TreeNode>&& child);
     std::unique_ptr<TreeNode> RemoveChild(const token_vec_t& key);
 
@@ -120,6 +123,7 @@ private:
     token_vec_t tokens_{};
     std::size_t depth_in_tokens_{0};
     std::vector<std::string> page_hashes_{};
+    std::vector<std::uint64_t> block_hashes_{};
     timestamp_t last_access_time_{std::chrono::steady_clock::now()};
     bool storage_persisted_{false};
     std::unique_ptr<DeviceResource> device_resource_{};

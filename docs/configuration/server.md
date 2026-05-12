@@ -148,7 +148,9 @@ draft model, and token count together.
 
 KV cache events publish reusable device prefix-cache mutations from the live
 C++ scheduler path. Host/L2 loadback events are not published by this initial
-stream.
+stream. Block hash lineage is cached on prefix-cache nodes, so publishing a
+stored block uses the parent node's cached hash instead of rebuilding the full
+ancestor prefix.
 
 Example:
 

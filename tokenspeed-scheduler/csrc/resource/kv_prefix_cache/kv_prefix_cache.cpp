@@ -46,30 +46,71 @@
 namespace tokenspeed {
 namespace {
 
+std::int32_t PageCount(const TreeNode* node, std::int32_t page_size) {
+    return static_cast<std::int32_t>(node->Tokens().size()) / page_size;
+}
+
+std::optional<std::uint64_t> ParentBlockHash(const TreeNode* node) {
+    const TreeNode* parent = node->Parent();
+    if (parent == nullptr || parent->IsRoot()) {
+        return std::nullopt;
+    }
+    return parent->BlockHash();
+}
+
+std::vector<std::uint64_t> BuildBlockHashesForTokens(const token_vec_t& tokens, std::int32_t page_size,
+                                                     std::optional<std::uint64_t> parent_hash) {
+    std::vector<std::uint64_t> block_hashes;
+    const auto page_count = static_cast<std::int32_t>(tokens.size()) / page_size;
+    block_hashes.reserve(page_count);
+    for (std::int32_t page = 0; page < page_count; ++page) {
+        const auto begin = tokens.begin() + page * page_size;
+        token_slice token_page{&*begin, static_cast<std::size_t>(page_size)};
+        parent_hash = HashKvBlock(token_page, parent_hash);
+        block_hashes.push_back(*parent_hash);
+    }
+    return block_hashes;
+}
+
+void EnsureBlockHashesForNode(TreeNode* node, std::int32_t page_size) {
+    if (node == nullptr || node->IsRoot()) {
+        return;
+    }
+    if (node->BlockHashes().size() == static_cast<std::size_t>(PageCount(node, page_size))) {
+        return;
+    }
+    node->SetBlockHashes(BuildBlockHashesForTokens(node->Tokens(), page_size, ParentBlockHash(node)));
+}
+
+void EnsureBlockHashesTo(TreeNode* target, std::int32_t page_size) {
+    for (TreeNode* node : RootToLeaf(target)) {
+        EnsureBlockHashesForNode(node, page_size);
+    }
+}
+
 std::vector<KvBlockStoredEvent> BuildBlockEventsForNode(TreeNode* target, std::int32_t page_size) {
     std::vector<KvBlockStoredEvent> events;
     if (target == nullptr || target->IsRoot()) {
         return events;
     }
 
-    std::optional<std::uint64_t> parent_hash;
-    for (TreeNode* node : RootToLeaf(target)) {
-        const auto& tokens = node->Tokens();
-        const auto page_count = static_cast<std::int32_t>(tokens.size()) / page_size;
-        for (std::int32_t page = 0; page < page_count; ++page) {
-            const auto begin = tokens.begin() + page * page_size;
-            token_slice token_page{&*begin, static_cast<std::size_t>(page_size)};
-            const std::uint64_t block_hash = HashKvBlock(token_page, parent_hash);
-            if (node == target) {
-                events.push_back(KvBlockStoredEvent{
-                    .block_hashes = {block_hash},
-                    .parent_block_hash = parent_hash,
-                    .token_ids = token_vec_t(begin, begin + page_size),
-                    .block_size = page_size,
-                });
-            }
-            parent_hash = block_hash;
-        }
+    EnsureBlockHashesForNode(target, page_size);
+
+    std::optional<std::uint64_t> parent_hash = ParentBlockHash(target);
+    const auto& tokens = target->Tokens();
+    const auto& block_hashes = target->BlockHashes();
+    const std::int32_t page_count = PageCount(target, page_size);
+    events.reserve(page_count);
+    for (std::int32_t page = 0; page < page_count; ++page) {
+        const auto begin = tokens.begin() + page * page_size;
+        const std::uint64_t block_hash = block_hashes[page];
+        events.push_back(KvBlockStoredEvent{
+            .block_hashes = {block_hash},
+            .parent_block_hash = parent_hash,
+            .token_ids = token_vec_t(begin, begin + page_size),
+            .block_size = page_size,
+        });
+        parent_hash = block_hash;
     }
     return events;
 }
@@ -175,6 +216,11 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
     }
 
     insert_result.last_node = current;
+    if constexpr (RType == ResourceType::Device) {
+        if (kv_event_sink_) {
+            EnsureBlockHashesTo(current, page_size);
+        }
+    }
 
     auto already_has_pages = [](TreeNode* node) -> bool {
         return (RType == ResourceType::Device) ? node->OnDevice() : node->OnHost();
@@ -338,6 +384,19 @@ bool KVPrefixCache::AllocateResourceOfType(const std::vector<TreeNode*>& nodes) 
             device_.UpdateLeaves(node);
         } else {
             host_.UpdateLeaves(node);
+        }
+    }
+
+    if constexpr (RType == ResourceType::Device) {
+        if (kv_event_sink_ && !nodes.empty()) {
+            std::vector<TreeNode*> published_nodes = nodes;
+            std::sort(published_nodes.begin(), published_nodes.end(), [](const TreeNode* lhs, const TreeNode* rhs) {
+                return lhs->DepthInTokens() < rhs->DepthInTokens();
+            });
+            EnsureBlockHashesTo(published_nodes.back(), tree_.PageSize());
+            for (TreeNode* node : published_nodes) {
+                recordDeviceBlockStored(node);
+            }
         }
     }
     return true;
