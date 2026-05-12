@@ -50,6 +50,7 @@ from tokenspeed.runtime.sampling.utils import (
 )
 from tokenspeed.runtime.utils import crash_on_warnings
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -238,6 +239,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 top_p=self._top_p_pool,
                 seed=self._seed_pool,
                 offsets=sampling_info.valid_cache_lengths,
+                enable_pdl=pdl_enabled(),
             )
 
             # Fuses softmax + top_k + top_p + sample into one kernel; we only
@@ -309,6 +311,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 target_predict=target_predict,
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
+                enable_pdl=pdl_enabled(),
             )
 
         else:
@@ -322,11 +325,13 @@ class FlashInferSamplingBackend(SamplingBackend):
                 top_k=self._top_k_pool,
                 top_p=self._top_p_pool,
                 n=n,
+                enable_pdl=pdl_enabled(),
             )
 
             target_probs = softmax(
                 logits_output.next_token_logits,
                 temperature=temperatures,
+                enable_pdl=pdl_enabled(),
             )
             target_probs = top_k_renorm_prob(target_probs, top_ks)
             target_probs = top_p_renorm_prob(
@@ -346,6 +351,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
                 deterministic=True,
+                enable_pdl=pdl_enabled(),
             )
 
         accept_length += 1

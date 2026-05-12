@@ -2097,19 +2097,30 @@ inline cudaError_t VerifyChainGreedy(
     int64_t* target_predict,
     uint32_t batch_size,
     uint32_t num_draft_tokens,
+    bool enable_pdl = false,
     cudaStream_t stream = 0)
 {
-    dim3 grid(1);
     uint32_t block_size = max(batch_size, 1);
-    dim3 block(block_size);
-    VerifyChainGreedyKernel<int32_t><<<grid, block, 0, stream>>>(
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(1);
+    config.blockDim = dim3(block_size);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    auto kernel = VerifyChainGreedyKernel<int32_t>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+      &config, kernel,
       predicts,
       accept_index,
       accept_token_num,
       candidates,
       target_predict,
       batch_size,
-      num_draft_tokens);
+      num_draft_tokens));
     return cudaSuccess;
 }
 
@@ -2256,28 +2267,23 @@ cudaError_t ChainSpeculativeSamplingTargetOnly(
     DType threshold_single = 1,
     DType threshold_acc = 1,
     bool deterministic = true,
+    bool enable_pdl = false,
     cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
   float capped_threshold_acc = fmaxf(threshold_acc, 1e-9f);
-  void* args[] = {
-      &predicts,
-      &accept_index,
-      &output_accepted_token_num,
-      &candidates,
-      &uniform_samples,
-      &uniform_samples_for_final_sampling,
-      &target_probs,
-      &draft_probs,
-      &batch_size,
-      &num_draft_tokens,
-      &d,
-      &threshold_single,
-      &capped_threshold_acc};
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(batch_size);
+  config.blockDim = dim3(BLOCK_THREADS);
+  config.dynamicSmemBytes = smem_size;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
         auto kernel = ChainSpeculativeSamplingKernelTargetOnlyFastPath<
@@ -2289,7 +2295,21 @@ cudaError_t ChainSpeculativeSamplingTargetOnly(
             DType,
             IdType>;
         FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+            &config, kernel,
+            predicts,
+            accept_index,
+            output_accepted_token_num,
+            candidates,
+            uniform_samples,
+            uniform_samples_for_final_sampling,
+            target_probs,
+            draft_probs,
+            batch_size,
+            num_draft_tokens,
+            d,
+            threshold_single,
+            capped_threshold_acc));
       })});
   return cudaSuccess;
 }

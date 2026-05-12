@@ -48,6 +48,7 @@ def verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
+    enable_pdl: bool = False,
 ) -> None:
     _load_sampling_chain_module().verify_chain_greedy(
         predicts,
@@ -57,6 +58,7 @@ def verify_chain_greedy(
         target_predict,
         int(batch_size),
         int(num_draft_tokens),
+        bool(enable_pdl),
     )
 
 
@@ -72,6 +74,7 @@ def chain_speculative_sampling_target_only(
     threshold_single: float,
     threshold_acc: float,
     deterministic: bool = True,
+    enable_pdl: bool = False,
 ) -> None:
     _load_sampling_chain_module().chain_speculative_sampling_target_only(
         predicts,
@@ -85,4 +88,5 @@ def chain_speculative_sampling_target_only(
         float(threshold_single),
         float(threshold_acc),
         bool(deterministic),
+        bool(enable_pdl),
     )

@@ -42,6 +42,7 @@ from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBa
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -293,10 +294,13 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 min_p=self._min_p_pool,
                 seed=self._seed_pool,
                 offsets=sampling_info.valid_cache_lengths,
+                enable_pdl=pdl_enabled(),
             )
         )
 
-        probs = softmax(logits, temperature=temperatures.view(-1, 1))
+        probs = softmax(
+            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
+        )
         probs = top_k_renorm_prob(probs, top_ks)
         probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
 
@@ -380,9 +384,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             top_p=self._top_p_pool,
             min_p=self._min_p_pool,
             n=num_tokens_per_req,
+            enable_pdl=pdl_enabled(),
         )
 
-        target_probs = softmax(logits, temperature=temperatures.view(-1, 1))
+        target_probs = softmax(
+            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
+        )
         target_probs = top_k_renorm_prob(target_probs, top_ks)
         target_probs = top_p_renorm_prob(target_probs, top_ps, is_deterministic=True)
 
@@ -420,6 +427,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,
+            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1

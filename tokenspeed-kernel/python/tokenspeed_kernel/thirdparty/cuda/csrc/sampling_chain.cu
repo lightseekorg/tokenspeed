@@ -26,7 +26,8 @@ void verify_chain_greedy(
     TensorView candidates,
     TensorView target_predict,
     uint64_t batch_size,
-    uint64_t num_draft_tokens)
+    uint64_t num_draft_tokens,
+    bool enable_pdl)
 {
   int bs = static_cast<int>(batch_size);
   int draft_tokens = static_cast<int>(num_draft_tokens);
@@ -51,6 +52,7 @@ void verify_chain_greedy(
     static_cast<int64_t*>(target_predict.data_ptr()),
     bs,
     draft_tokens,
+    enable_pdl,
     stream
   );
   TVM_FFI_ICHECK(status == cudaSuccess)
@@ -68,7 +70,8 @@ void chain_speculative_sampling_target_only(
     TensorView draft_probs,
     double threshold_single,
     double threshold_acc,
-    bool deterministic
+    bool deterministic,
+    bool enable_pdl
 ) {
   CHECK_INPUT(candidates);
   CHECK_INPUT(uniform_samples);
@@ -113,6 +116,7 @@ void chain_speculative_sampling_target_only(
       static_cast<float>(threshold_single),
       static_cast<float>(threshold_acc),
       deterministic,
+      enable_pdl,
       stream);
 
     TVM_FFI_ICHECK(status == cudaSuccess)

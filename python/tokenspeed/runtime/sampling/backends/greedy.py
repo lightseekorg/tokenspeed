@@ -35,6 +35,7 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits, write_output_logprobs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
 
@@ -89,6 +90,7 @@ def _verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
+    enable_pdl: bool = False,
 ) -> None:
 
     # Prefer the CUDA kernel when available AND the tensors are on CUDA.
@@ -102,6 +104,7 @@ def _verify_chain_greedy(
             target_predict=target_predict,
             batch_size=batch_size,
             num_draft_tokens=num_draft_tokens,
+            enable_pdl=enable_pdl,
         )
         return
 
@@ -216,6 +219,7 @@ class GreedySamplingBackend(SamplingBackend):
             target_predict=target_predict,
             batch_size=bs,
             num_draft_tokens=num_tokens_per_req,
+            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1

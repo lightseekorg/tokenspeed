@@ -45,7 +45,12 @@ def _gather_and_expand_scalars_kernel(
     out_offsets_ptr,
     n: tl.constexpr,
     N_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    # PDL: wait for producer (e.g., penalty kernel writing into pools) to drain.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     bi = tl.program_id(0)
     idx = tl.load(index_ptr + bi)
 
@@ -74,6 +79,10 @@ def _gather_and_expand_scalars_kernel(
     if out_offsets_ptr is not None:
         tl.store(out_offsets_ptr + base + n_off, o, mask=mask)
 
+    # PDL: signal that dependents (e.g., flashinfer softmax) can begin preamble.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def gather_and_expand_scalars(
     index: torch.Tensor,
@@ -85,6 +94,7 @@ def gather_and_expand_scalars(
     seed: torch.Tensor | None = None,
     offsets: torch.Tensor | None = None,
     n: int = 1,
+    enable_pdl: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -102,6 +112,12 @@ def gather_and_expand_scalars(
     Optional streams (min_p, seed, offsets) pass through as ``None`` — Triton
     specializes the kernel on pointer-None-ness at JIT time and the gated
     load/store paths are dead-code-eliminated.
+
+    Args:
+        ...
+        enable_pdl: opt into Programmatic Dependent Launch (Hopper+). Lets the
+            downstream flashinfer softmax/renorm kernels start their preamble
+            while our writes drain.
 
     Returns ``(temperatures, top_ks, top_ps, min_ps_or_None, seeds_or_None,
     offsets_or_None)``, each shape ``[bs * n]`` (or ``None`` when the
@@ -156,7 +172,9 @@ def gather_and_expand_scalars(
         out_offsets,
         n=n,
         N_BLOCK=triton.next_power_of_2(max(n, 1)),
+        ENABLE_PDL=enable_pdl,
         num_warps=1,
+        launch_pdl=enable_pdl,
     )
 
     return out_temperature, out_top_k, out_top_p, out_min_p, out_seed, out_offsets
