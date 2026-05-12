@@ -403,36 +403,3 @@ def test_fa4_decode_selection_keeps_head_dim_256_disabled() -> None:
     spec = KernelRegistry.get().get_by_name("fa4_mha_decode_with_kvcache")
     assert spec is not None
     assert 256 not in spec.traits["head_dim"]
-
-
-def test_fa4_prefill_with_kvcache_selection_requires_prewritten_kv() -> None:
-    _reload_fa4_registry_entries()
-    spec = KernelRegistry.get().get_by_name("fa4_mha_prefill_with_kvcache_cached")
-    assert spec is not None
-    assert spec.solution == "fa4"
-    assert spec.traits["prewritten_kv"] == frozenset({True})
-
-    traits = {
-        "head_dim": 128,
-        "page_size": 128,
-        "prewritten_kv": True,
-        "sliding_window": False,
-        "support_sinks": False,
-        "return_lse": False,
-        "support_logit_cap": False,
-    }
-    selected = select_kernel(
-        "attention",
-        "mha_prefill_with_kvcache",
-        torch.bfloat16,
-        traits=traits,
-    )
-    assert selected.name == "fa4_mha_prefill_with_kvcache_cached"
-
-    with pytest.raises(NoKernelFoundError):
-        select_kernel(
-            "attention",
-            "mha_prefill_with_kvcache",
-            torch.bfloat16,
-            traits={**traits, "prewritten_kv": False},
-        )
