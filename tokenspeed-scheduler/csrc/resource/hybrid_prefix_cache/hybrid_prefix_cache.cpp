@@ -33,7 +33,7 @@ HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkA
       mamba_eviction_manager_{mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
-// The HybridPrefixCache::Match is a wrapper of the KVPrefixCache::Match. 
+// The HybridPrefixCache::Match is a wrapper of the KVPrefixCache::Match.
 // And it's not used in fact, because the HybridPrefixCache is always used with the KVPrefixCache now.
 MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
     auto match = kv_prefix_cache_.Match(token_ids, intent);
@@ -41,7 +41,8 @@ MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent i
     return match;
 }
 
-MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages, MatchIntent intent) {
+MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages,
+                                     MatchIntent intent) {
     auto match = kv_prefix_cache_.Match(token_pages, intent);
     augmentMatch(match);
     return match;
