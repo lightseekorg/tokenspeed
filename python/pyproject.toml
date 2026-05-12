@@ -74,6 +74,15 @@ dependencies = [
     "viztracer",
 ]
 
+[project.optional-dependencies]
+# Install: pip install 'tokenspeed[serve]' --extra-index-url https://lightseek.org/whl/cu130/
+# Bump all three .devN versions together — proto / RuntimeType must stay in sync.
+serve = [
+    "smg==1.4.2.dev15",
+    "smg-grpc-servicer==0.5.3.dev15",
+    "smg-grpc-proto==0.4.8.dev15",
+]
+
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
