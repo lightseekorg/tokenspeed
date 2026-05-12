@@ -262,8 +262,14 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::ScheduleDecodeFromRetractedEvent{
-        config_.decode_input_tokens, &device_allocator_, &req_pool_allocator_, &kv_prefix_cache_,
-        std::move(match_result),     loadback_diff,      mamba_allocator_ ? &*mamba_allocator_ : nullptr};
+        config_.decode_input_tokens,
+        &device_allocator_,
+        &req_pool_allocator_,
+        &kv_prefix_cache_,
+        std::move(match_result),
+        loadback_diff,
+        mamba_allocator_ ? &*mamba_allocator_ : nullptr,
+    };
 }
 
 std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* request) {
