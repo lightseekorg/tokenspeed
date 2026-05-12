@@ -18,6 +18,7 @@
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
+using tvm::ffi::Optional;
 
 void verify_chain_greedy(
     TensorView predicts,
@@ -67,7 +68,7 @@ void chain_speculative_sampling_target_only(
     TensorView uniform_samples,
     TensorView uniform_samples_for_final_sampling,
     TensorView target_probs,
-    TensorView draft_probs,
+    Optional<TensorView> draft_probs,
     double threshold_single,
     double threshold_acc,
     bool deterministic,
@@ -84,7 +85,6 @@ void chain_speculative_sampling_target_only(
   CHECK_DIM(2, candidates);
   CHECK_DIM(2, uniform_samples);
   CHECK_DIM(3, target_probs);
-  CHECK_DIM(3, draft_probs);
   unsigned int batch_size = uniform_samples.size(0);
   unsigned int num_draft_tokens = candidates.size(1);
   unsigned int vocab_size = target_probs.size(2);
@@ -100,7 +100,17 @@ void chain_speculative_sampling_target_only(
   TVM_FFI_ICHECK_GE(threshold_acc, 0);
   TVM_FFI_ICHECK_GE(1, threshold_acc);
 
-  auto stream = get_stream(draft_probs.device());
+  float* draft_probs_ptr = nullptr;
+  if (draft_probs.has_value()) {
+    CHECK_INPUT(draft_probs.value());
+    CHECK_DIM(3, draft_probs.value());
+    TVM_FFI_ICHECK_EQ(batch_size, draft_probs.value().size(0));
+    TVM_FFI_ICHECK_EQ(num_draft_tokens, draft_probs.value().size(1));
+    TVM_FFI_ICHECK_EQ(vocab_size, draft_probs.value().size(2));
+    draft_probs_ptr = static_cast<float*>(draft_probs.value().data_ptr());
+  }
+
+  auto stream = get_stream(target_probs.device());
   cudaError_t status = sampling::ChainSpeculativeSamplingTargetOnly<float, int32_t>(
       static_cast<int32_t*>(predicts.data_ptr()),
       static_cast<int32_t*>(accept_index.data_ptr()),
@@ -109,7 +119,7 @@ void chain_speculative_sampling_target_only(
       static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<float*>(uniform_samples_for_final_sampling.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()),
-      static_cast<float*>(draft_probs.data_ptr()),
+      draft_probs_ptr,
       static_cast<uint32_t>(batch_size),
       static_cast<uint32_t>(num_draft_tokens),
       static_cast<uint32_t>(vocab_size),

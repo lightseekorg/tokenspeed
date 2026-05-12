@@ -348,7 +348,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 uniform_samples=self._coins_buf[:bs, :n],
                 uniform_samples_for_final_sampling=self._final_coins_buf[:bs],
                 target_probs=target_probs,
-                draft_probs=torch.zeros_like(target_probs),
+                draft_probs=None,
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
                 deterministic=True,

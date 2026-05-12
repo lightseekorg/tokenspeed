@@ -409,10 +409,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
 
-        draft_probs = torch.zeros(
-            target_probs.shape, dtype=torch.float32, device=target_probs.device
-        )
-
         coins = self._coins_buf[:bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[:bs]
 
@@ -424,7 +420,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=draft_probs,
+            draft_probs=None,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,

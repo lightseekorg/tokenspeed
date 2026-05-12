@@ -70,12 +70,17 @@ def chain_speculative_sampling_target_only(
     uniform_samples: torch.Tensor,
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
-    draft_probs: torch.Tensor,
-    threshold_single: float,
-    threshold_acc: float,
+    draft_probs: torch.Tensor | None = None,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
     deterministic: bool = True,
     enable_pdl: bool = False,
 ) -> None:
+    """Target-only chain speculative sampling.
+
+    When ``draft_probs`` is ``None``, the kernel treats draft probabilities as
+    all zeros and avoids the corresponding GMEM traffic.
+    """
     _load_sampling_chain_module().chain_speculative_sampling_target_only(
         predicts,
         accept_index,
