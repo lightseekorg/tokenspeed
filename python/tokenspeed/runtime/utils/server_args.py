@@ -76,8 +76,6 @@ class ServerArgs:
     max_model_len: int | None = None
     device: str = "cuda"
     served_model_name: str | None = None
-    chat_template: str | None = None
-    completion_template: str | None = None
     revision: str | None = None
     think_end_token: str | None = None
 
@@ -779,18 +777,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.served_model_name,
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
-        )
-        parser.add_argument(
-            "--chat-template",
-            type=str,
-            default=ServerArgs.chat_template,
-            help="The built-in chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
-        )
-        parser.add_argument(
-            "--completion-template",
-            type=str,
-            default=ServerArgs.completion_template,
-            help="The built-in completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. Only for code completion currently.",
         )
         parser.add_argument(
             "--revision",

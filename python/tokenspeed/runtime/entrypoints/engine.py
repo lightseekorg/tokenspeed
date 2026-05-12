@@ -75,7 +75,6 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
-from tokenspeed.runtime.inputs.template_manager import TemplateManager
 from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
     configure_logger,
@@ -132,13 +131,12 @@ class Engine(EngineBase):
         logger.info("server_args=%r", server_args)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+        tokenizer_manager, _, scheduler_info = _launch_subprocesses(
             server_args=server_args,
             port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
-        self.template_manager = template_manager
         self.scheduler_info = scheduler_info
 
         # Sync facade for blocking callers. Owns its own bg event-loop thread; see runtime/engine/llm.py
@@ -484,7 +482,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
-) -> tuple[AsyncLLM, TemplateManager, dict]:
+) -> tuple[AsyncLLM, None, dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
@@ -572,15 +570,6 @@ def _launch_subprocesses(
     # inline inside AsyncLLM — no separate subprocess.
     tokenizer_manager = AsyncLLM(server_args, port_args)
 
-    # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
-
     # Wait for the model to finish loading
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
@@ -603,4 +592,4 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-    return tokenizer_manager, template_manager, scheduler_info
+    return tokenizer_manager, None, scheduler_info
