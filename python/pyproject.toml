@@ -76,20 +76,21 @@ dependencies = [
 
 [project.optional-dependencies]
 serve = [
-    # smg's TokenSpeed support (PR #1351) hasn't merged to smg-main yet, and
-    # smg won't be cutting a fresh PyPI release that includes it. Pin both
-    # packages to the same SHA on the feature branch so the gRPC proto
-    # and RuntimeType enum stay in sync. Bump this SHA together with any
-    # smg-side wire-contract change.
+    # smg's TokenSpeed support hasn't landed on smg's main / PyPI yet.
+    # Dev wheels are published on a separate index. Same .devN suffix
+    # on all three so the gRPC proto / RuntimeType enum stay in sync;
+    # bump together when the smg side cuts a new dev wheel.
     #
-    # Requires Rust toolchain + protoc at install time because maturin
-    # builds smg_rs.abi3.so from source.
+    # Install:
+    #   pip install 'tokenspeed[serve]' --extra-index-url https://lightseek.org/whl/cu130/
     #
-    # Dev fallback (faster, no Rust install if the checkout is already
-    # built):
-    #   pip install -e ~/smg/bindings/python -e ~/smg/grpc_servicer
-    "smg @ git+https://github.com/lightseekorg/smg.git@a1a6cd8f75996e0b3807a3780877e93454799372#subdirectory=bindings/python",
-    "smg-grpc-servicer @ git+https://github.com/lightseekorg/smg.git@a1a6cd8f75996e0b3807a3780877e93454799372#subdirectory=grpc_servicer",
+    # Other variants (same smg wheels, different host index for the rest
+    # of the tokenspeed stack):
+    #   --extra-index-url https://lightseek.org/whl/cu129/    # CUDA 12.9
+    #   --extra-index-url https://lightseek.org/whl/rocm7.2/  # ROCm 7.2
+    "smg==1.4.2.dev15",
+    "smg-grpc-servicer==0.5.3.dev15",
+    "smg-grpc-proto==0.4.8.dev15",
 ]
 
 [project.scripts]

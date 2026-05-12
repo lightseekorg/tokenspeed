@@ -64,10 +64,11 @@ def _check_serve_extra_installed() -> None:
     if missing:
         sys.stderr.write(
             "ts serve requires the [serve] extra:\n\n"
-            "    pip install 'tokenspeed[serve]'        "
-            "# builds smg from source (needs Rust + protoc)\n"
-            "    # or, if you have a smg checkout already:\n"
-            "    pip install -e ~/smg/bindings/python -e ~/smg/grpc_servicer\n\n"
+            "    pip install 'tokenspeed[serve]' \\\n"
+            "        --extra-index-url https://lightseek.org/whl/cu130/\n\n"
+            "Swap the index for other variants:\n"
+            "    https://lightseek.org/whl/cu129/      (CUDA 12.9)\n"
+            "    https://lightseek.org/whl/rocm7.2/    (ROCm 7.2)\n\n"
             f"Missing: {', '.join(missing)}\n"
         )
         sys.exit(1)
