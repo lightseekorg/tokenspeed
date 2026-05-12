@@ -40,8 +40,7 @@ For a compact compatibility table, see
 | `--port` | HTTP bind port. |
 | `--served-model-name` | Model name returned by the OpenAI-compatible API. |
 | `--api-key` | API key required by the server. |
-| `--chat-template` | Built-in chat template name or template file path. |
-| `--completion-template` | Completion template for code-completion style serving. |
+| `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 
@@ -106,10 +105,9 @@ about.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--reasoning-parser` | Parser for extracting reasoning content from model outputs. |
+| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
 | `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 | `--enable-custom-logit-processor` | Allow custom logit processors. Keep disabled unless the deployment needs it. |
-| `--think-end-token` | End marker for thinking models. |
 
 Common parser values include `kimi_k2` and `gpt-oss`.
 
