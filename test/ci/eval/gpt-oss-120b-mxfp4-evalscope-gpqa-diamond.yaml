@@ -27,7 +27,7 @@ server:
     --moe-tp-size 2
     --max-model-len 80000
     --trust-remote-code
-    --reasoning-parser gpt-oss
+    --reasoning-parser base
     ${GPT_OSS_EVAL_ATTENTION_BACKEND:+--attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND}}
     ${GPT_OSS_EVAL_MOE_BACKEND:+--moe-backend ${GPT_OSS_EVAL_MOE_BACKEND}}
     ${GPT_OSS_EVAL_KVSTORE_RATIO:+--kvstore-ratio ${GPT_OSS_EVAL_KVSTORE_RATIO}}

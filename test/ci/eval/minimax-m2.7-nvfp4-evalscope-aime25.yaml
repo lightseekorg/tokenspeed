@@ -19,7 +19,7 @@ server:
     --moe-tp-size 2
     --max-model-len 80000
     --trust-remote-code
-    --reasoning-parser minimax
+    --reasoning-parser base
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
     --sampling-backend flashinfer
