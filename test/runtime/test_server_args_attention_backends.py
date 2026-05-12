@@ -82,6 +82,14 @@ class TestAttentionBackendChoices(unittest.TestCase):
         args = prepare_server_args(["--model", "x"])
         self.assertTrue(args.enable_inline_detokenizer)
 
+    def test_model_path_alias_sets_model(self):
+        args = self._build_parser().parse_args(["--model-path", "x"])
+        self.assertEqual(args.model, "x")
+
+    def test_prepare_server_args_accepts_model_path_alias(self):
+        args = prepare_server_args(["--model-path", "x"])
+        self.assertEqual(args.model, "x")
+
     def test_defaults_to_mha_for_mha(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MHA), "mha")
 

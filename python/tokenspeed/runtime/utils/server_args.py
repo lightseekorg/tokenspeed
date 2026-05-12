@@ -651,6 +651,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--model",
+            "--model-path",
             metavar="MODEL",
             type=str,
             default=None,
@@ -1722,7 +1723,7 @@ class ServerArgs:
         if args.model is None:
             raise ValueError(
                 "Model is required. Provide it as a positional argument "
-                "(e.g., `tokenspeed serve <model>`) or via --model."
+                "(e.g., `tokenspeed serve <model>`) or via --model/--model-path."
             )
 
         # --tensor-parallel-size → --attn-tp-size
