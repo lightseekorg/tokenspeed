@@ -120,12 +120,18 @@ class RuntimeStates:
         if self.mamba_pool is None or num_valid == 0:
             return
         fused_mamba_state_snapshot(
-            self.mamba_pool.conv_state, src_indices, dst_indices,
-            cache_lengths=cache_lengths, page_size=page_size,
+            self.mamba_pool.conv_state,
+            src_indices,
+            dst_indices,
+            cache_lengths=cache_lengths,
+            page_size=page_size,
         )
         fused_mamba_state_snapshot(
-            self.mamba_pool.ssm_state, src_indices, dst_indices,
-            cache_lengths=cache_lengths, page_size=page_size,
+            self.mamba_pool.ssm_state,
+            src_indices,
+            dst_indices,
+            cache_lengths=cache_lengths,
+            page_size=page_size,
         )
 
     def zero_mamba_states(
