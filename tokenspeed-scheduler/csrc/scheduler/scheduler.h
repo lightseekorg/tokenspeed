@@ -34,6 +34,7 @@
 #include "scheduler/request.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
+#include "scheduler/kv_cache_events.h"
 
 #include "resource/allocator/page_allocator.h"
 #include "resource/allocator/paged_cache_group.h"
@@ -63,6 +64,7 @@ public:
     ExecutionPlan NextExecutionPlan();
 
     void Advance(const ExecutionEvent& event);
+    std::vector<KvCacheEvent> DrainKvEvents();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -160,6 +162,7 @@ private:
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
+    std::vector<KvCacheEvent> kv_events_;
     // Stats
     SchedulerStats stats_;
 };

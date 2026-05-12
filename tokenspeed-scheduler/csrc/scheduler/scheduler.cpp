@@ -72,6 +72,10 @@ Scheduler::Scheduler(SchedulerConfig config)
         spdlog::set_level(level);
     }
 
+    if (config_.enable_kv_cache_events) {
+        kv_prefix_cache_.SetKvEventSink([this](KvCacheEvent event) { kv_events_.push_back(std::move(event)); });
+    }
+
     const std::int32_t num_mamba_slots =
         config_.enable_mamba ? config_.mamba_pool_total_chunks : config_.num_mamba_slots;
     if (num_mamba_slots > 0) {
@@ -93,6 +97,12 @@ Scheduler::Scheduler(SchedulerConfig config)
             throw std::invalid_argument("Scheduler: duplicate paged cache group_id: " + gid);
         }
     }
+}
+
+std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
+    std::vector<KvCacheEvent> events;
+    events.swap(kv_events_);
+    return events;
 }
 
 std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match) {

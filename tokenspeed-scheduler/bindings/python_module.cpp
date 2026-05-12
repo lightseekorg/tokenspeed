@@ -29,6 +29,7 @@
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
 #include "scheduler/execution_event.h"
+#include "scheduler/kv_cache_events.h"
 #include "scheduler/request.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
@@ -126,6 +127,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("prefill", tokenspeed::DisaggregationMode::kPrefill)
         .value("decode", tokenspeed::DisaggregationMode::kDecode);
 
+    nb::module_ kv_event = m.def_submodule("KVEvent");
+    nb::class_<tokenspeed::KvBlockStoredEvent>(kv_event, "BlockStored")
+        .def_prop_ro("kind", [](const tokenspeed::KvBlockStoredEvent&) { return "BlockStored"; })
+        .def_ro("block_hashes", &tokenspeed::KvBlockStoredEvent::block_hashes)
+        .def_ro("parent_block_hash", &tokenspeed::KvBlockStoredEvent::parent_block_hash)
+        .def_ro("token_ids", &tokenspeed::KvBlockStoredEvent::token_ids)
+        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size);
+
+    nb::class_<tokenspeed::KvBlockRemovedEvent>(kv_event, "BlockRemoved")
+        .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
+        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes);
+
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 
     nb::enum_<tokenspeed::Role>(scheduler_config, "Role")
@@ -204,6 +217,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("prefetch_threshold", &tokenspeed::SchedulerConfig::prefetch_threshold)
+        .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("num_mamba_slots", &tokenspeed::SchedulerConfig::num_mamba_slots)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("enable_mamba", &tokenspeed::SchedulerConfig::enable_mamba)
@@ -369,6 +383,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::arg("request_specs"))
         .def("next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); })
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def(
+            "drain_kv_events",
+            [](tokenspeed::Scheduler& s) {
+                nb::list result;
+                for (auto& event : s.DrainKvEvents()) {
+                    std::visit([&result](auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, event);
+                }
+                return result;
+            },
+            nb::rv_policy::move)
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
