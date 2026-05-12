@@ -192,8 +192,6 @@ class HostExecutor:
         self.io_backend = io_backend
         self.layer_num = layer_num
         self.device = device_pool.device
-        # Host pool decides where indices live; mirror it for _move_indices.
-        self.idx_device = host_pool.idx_device
 
         # Optional draft model pools (share the same page mapping as base model)
         self.draft_device_pool = draft_device_pool
@@ -369,10 +367,11 @@ class HostExecutor:
         host_indices = op.host_indices
         device_indices = op.device_indices
         if self.io_backend == "kernel":
-            if host_indices.device != self.idx_device:
-                host_indices = host_indices.to(self.idx_device, non_blocking=True)
-            if device_indices.device != self.idx_device:
-                device_indices = device_indices.to(self.idx_device, non_blocking=True)
+            idx_device = host_pool.idx_device
+            if host_indices.device != idx_device:
+                host_indices = host_indices.to(idx_device, non_blocking=True)
+            if device_indices.device != idx_device:
+                device_indices = device_indices.to(idx_device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if host_pool.layout == "layer_first":
