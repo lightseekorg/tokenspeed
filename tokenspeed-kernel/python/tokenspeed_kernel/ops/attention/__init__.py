@@ -58,6 +58,7 @@ def mha_prefill(
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
     """Ragged MHA prefill without KV cache.
 
@@ -76,6 +77,7 @@ def mha_prefill(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
 
     Standard full-sequence prefill assumes query and KV sequence boundaries match.
     """
@@ -95,6 +97,7 @@ def mha_prefill(
         "mha_prefill",
         q.dtype,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
@@ -162,6 +165,7 @@ def mha_prefill_with_kvcache(
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
     """Ragged MHA extend-prefill with paged KV cache.
 
@@ -185,6 +189,7 @@ def mha_prefill_with_kvcache(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must both be provided or both be None")
@@ -208,6 +213,7 @@ def mha_prefill_with_kvcache(
         "mha_prefill_with_kvcache",
         q.dtype,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
@@ -277,6 +283,7 @@ def mha_decode_with_kvcache(
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
     """Single-token MHA decode with paged KV cache.
 
@@ -294,6 +301,7 @@ def mha_decode_with_kvcache(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
     """
     if q.shape[0] != cache_seqlens.shape[0]:
         raise ValueError(
@@ -319,6 +327,7 @@ def mha_decode_with_kvcache(
         "mha_decode_with_kvcache",
         q.dtype,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
