@@ -62,7 +62,9 @@ class RuntimeStates:
     def update_valid_cache_length(
         self, req_pool_indices: torch.Tensor, increment_lengths: torch.Tensor
     ) -> None:
-        self.valid_cache_lengths[req_pool_indices] += increment_lengths
+        self.valid_cache_lengths.index_add_(
+            0, req_pool_indices.long(), increment_lengths
+        )
 
     def reset_states(
         self,
