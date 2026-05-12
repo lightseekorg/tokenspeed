@@ -66,15 +66,28 @@ from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from tokenspeed_mla.mla_helpers import (
-    LOG2_E,
-    MAX_SPLITS,
-    MLAStaticTileScheduler,
-    MLAStaticTileSchedulerParams,
-    ceil_div,
-    create_mla_static_tile_scheduler,
-    create_mla_static_tile_scheduler_params,
-)
+try:
+    from .mla_helpers import (
+        LOG2_E,
+        MAX_SPLITS,
+        MLAStaticTileScheduler,
+        MLAStaticTileSchedulerParams,
+        ceil_div,
+        create_mla_static_tile_scheduler,
+        create_mla_static_tile_scheduler_params,
+        get_mla_decode_fold_sq_factor,
+    )
+except ImportError:
+    from mla_helpers import (
+        LOG2_E,
+        MAX_SPLITS,
+        MLAStaticTileScheduler,
+        MLAStaticTileSchedulerParams,
+        ceil_div,
+        create_mla_static_tile_scheduler,
+        create_mla_static_tile_scheduler_params,
+        get_mla_decode_fold_sq_factor,
+    )
 
 """
 A Multi-Head Latent Attention (MLA) example with FP16 data type for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -109,7 +122,7 @@ The above example runs Multi-Head Latent Attention (MLA) with the following conf
 - Sequence length of K: 1024
 - Latent dimension: 512
 - RoPE dimension: 64
-- Number of heads: 128
+- Number of heads: up to 128
 - Data types: Float16 (input), Float16 (output), Float32 (accumulation and LSE)
 
 It utilizes page table storage for the KV cache and enables both variable-length KV cache sequences
@@ -133,12 +146,12 @@ Constraints for this example:
   - Input/output: Float16
   - Accumulation and LSE: Float32
 * Fixed architecture parameters:
-  - Number of attention heads: 128
+  - Number of attention heads: up to 128
   - Latent dimension: 512
   - RoPE dimension: 64
 * Input query modes should be (NumHeads, LatentDim/RopeDim, SeqLenQ, BatchSize)
 * Input kv latent/rope modes should be (SeqLenK, LatentDim/RopeDim, BatchSize)
-* Query sequence length must be 1-4
+* Query sequence length must be positive
 * Only supports 2-CTA instructions
 * Variable sequence length requires page table storage enabled
 """
@@ -157,6 +170,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
+        fold_sq_factor: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -194,6 +208,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.page_size = page_size
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
+        self.fold_sq_factor = fold_sq_factor
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -406,6 +421,47 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 stride=(lse.stride[2], lse.stride[1], lse.stride[0]),
             ),
         )
+
+        # Fold a query-token group into heads when fold_sq_factor > 1:
+        # [H, D, S_q, B] -> [H*F, D, S_q/F, B], F=fold_sq_factor.
+        if cutlass.const_expr(self.fold_sq_factor > 1):
+
+            def _fold_sq_4d(t):
+                fold_groups = t.shape[2] // self.fold_sq_factor
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (
+                            t.shape[0] * self.fold_sq_factor,
+                            t.shape[1],
+                            fold_groups,
+                            t.shape[3],
+                        ),
+                        stride=(
+                            t.stride[0],
+                            t.stride[1],
+                            t.stride[2] * self.fold_sq_factor,
+                            t.stride[3],
+                        ),
+                    ),
+                )
+
+            q_latent = _fold_sq_4d(q_latent)
+            q_rope = _fold_sq_4d(q_rope)
+            o = _fold_sq_4d(o)
+
+            fold_groups = lse.shape[1] // self.fold_sq_factor
+            lse = cute.make_tensor(
+                lse.iterator,
+                cute.make_layout(
+                    (lse.shape[0] * self.fold_sq_factor, fold_groups, lse.shape[2]),
+                    stride=(
+                        lse.stride[0],
+                        lse.stride[1] * self.fold_sq_factor,
+                        lse.stride[2],
+                    ),
+                ),
+            )
 
         acc_o, acc_lse = self.initialize_workspace(
             q_latent.shape[0],
@@ -3540,9 +3596,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             return False
         if is_var_split_kv and not is_var_seq:
             return False
-        if H > 128 or (H < 128 and split_kv != 1):
+        if H <= 0 or H > 128:
             return False
-        if S < 1 or S > 4:
+        if S < 1:
             return False
         if K <= 0:
             return False
@@ -3816,13 +3872,14 @@ def run(
     ):
         block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu = None, None, None
         # check if split_kv is valid otherwise do auto setting of split_kv
+        # Use seq_len_q_for_split (effective S_q after fold grouping).
         if is_var_split_kv:
             block_split_kvs_ref = torch.zeros([batch_size], dtype=torch.int32)
             for b in range(batch_size):
                 block_split_kvs_ref[b] = (
                     BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv(
                         batch_size,
-                        seq_len_q,
+                        seq_len_q_for_split,
                         cache_seqs_ref[b].item(),
                         mma_qk_tiler_mn,
                         max_active_clusters * cluster_shape_mnk[0],
@@ -3836,7 +3893,7 @@ def run(
         elif split_kv <= 0:
             split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv(
                 batch_size,
-                seq_len_q,
+                seq_len_q_for_split,
                 cache_seqs_ref[0].item(),
                 mma_qk_tiler_mn,
                 max_active_clusters * cluster_shape_mnk[0],
@@ -3874,6 +3931,12 @@ def run(
     max_active_clusters = hardware_info.get_max_active_clusters(
         cluster_shape_mnk[0] * cluster_shape_mnk[1]
     )
+    # Fold only by a factor that exactly divides seq_len_q; otherwise leave
+    # the query sequence on the scheduler dimension.
+    fold_sq_factor = get_mla_decode_fold_sq_factor(
+        num_heads, seq_len_q, mma_qk_tiler_mn[0]
+    )
+    seq_len_q_for_split = seq_len_q // fold_sq_factor
     split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_torch = (
         create_block_split_kvs(
             batch_size,
@@ -3938,8 +4001,11 @@ def run(
         is_lse=True,
         seq_len_q=seq_len_q,
     )
+    # Use effective dimensions for workspace when folding S_q groups into heads.
+    num_heads_eff = num_heads * fold_sq_factor
+    seq_len_q_eff = seq_len_q // fold_sq_factor
     workspace, workspace_torch = create_workspace(
-        num_heads, seq_len_q, latent_dim, batch_size, split_kv, acc_dtype
+        num_heads_eff, seq_len_q_eff, latent_dim, batch_size, split_kv, acc_dtype
     )
 
     mla = BlackwellMultiHeadLatentAttentionForwardFP16(
@@ -3953,6 +4019,7 @@ def run(
         is_persistent,
         is_var_seq,
         is_var_split_kv,
+        fold_sq_factor=fold_sq_factor,
     )
 
     # Get current CUDA stream from PyTorch
@@ -4186,7 +4253,12 @@ def run(
             seq_len_q=seq_len_q,
         )
         workspace, workspace_torch = create_workspace(
-            num_heads, seq_len_q, latent_dim, batch_size, _split_kv, acc_dtype
+            num_heads_eff,
+            seq_len_q_eff,
+            latent_dim,
+            batch_size,
+            _split_kv,
+            acc_dtype,
         )
         return testing.JitArguments(
             q_latent,
