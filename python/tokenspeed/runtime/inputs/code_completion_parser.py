@@ -1,3 +1,9 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# Upstream lineage includes ModelTC/lightllm, vllm-project/vllm,
+# and sgl-project/sglang. See python/THIRDPARTYNOTICES.
+# Licensed under the Apache License, Version 2.0
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
