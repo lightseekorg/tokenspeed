@@ -36,10 +36,12 @@ pip3 install cmake ninja
 pip3 install tokenspeed-scheduler/
 
 echo "=== Step 5: Install TokenSpeed ==="
-pip3 install smg smg-grpc-servicer smg-grpc-proto \
+# `[serve]` pulls in the pinned smg / smg-grpc-servicer / smg-grpc-proto
+# versions from pyproject.toml (these three .devN versions must stay in
+# sync — the gRPC proto / runtime contract is dev-pinned).
+pip3 install -e "./python[serve]" --no-build-isolation \
+    --extra-index-url "${ROCM_INDEX}" \
     --extra-index-url https://lightseek.org/whl/rocm72
-pip3 install -e ./python --no-build-isolation \
-    --extra-index-url "${ROCM_INDEX}"
 
 echo ""
 echo "=========================================="

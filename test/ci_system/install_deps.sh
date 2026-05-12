@@ -106,10 +106,12 @@ pip_install_with_retry pip3 install tokenspeed-scheduler/
 # Step 5: Install TokenSpeed
 # ============================================================
 echo "=== Step 5: Install TokenSpeed ==="
-pip_install_with_retry pip3 install smg smg-grpc-servicer smg-grpc-proto \
+# `[serve]` pulls in the pinned smg / smg-grpc-servicer / smg-grpc-proto
+# versions from pyproject.toml (these three .devN versions must stay in
+# sync — the gRPC proto / runtime contract is dev-pinned).
+pip_install_with_retry pip3 install -e "./python[cuda_${SM},serve]" \
+    --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     --extra-index-url https://lightseek.org/whl/cu130
-pip_install_with_retry pip3 install -e "./python[cuda_${SM}]" \
-    --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
 
 # ============================================================
 # Step 6: Fix Triton ptxas (CUDA 13+ only)
