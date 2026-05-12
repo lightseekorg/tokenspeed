@@ -186,12 +186,17 @@ def mha_prefill_with_kvcache(
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
     """
+    if (k is None) != (v is None):
+        raise ValueError("k and v must both be provided or both be None")
+    prewritten_kv = k is None
+
     # Select kernel
     traits = {
         "num_q_heads": q.shape[1],
         "num_kv_heads": (k.shape[1] if k is not None else k_cache.shape[2]),
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
+        "prewritten_kv": prewritten_kv,
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
         "support_logit_cap": _requires_logit_cap(logit_cap),

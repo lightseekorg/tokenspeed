@@ -100,6 +100,7 @@ def triton_mha_prefill(
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False, True}),
+        "prewritten_kv": frozenset({False, True}),
         "return_lse": frozenset({False}),
     },
     tags={"portability"},
