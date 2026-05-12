@@ -1064,6 +1064,23 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual_lens.cpu(), torch.tensor([4, 3], dtype=torch.int32))
         )
+        compact_actual, compact_lens = deepseek_v4_decode_swa_indices_and_lens(
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            token_to_req_indices=token_to_req_indices,
+            block_table=torch.tensor([[11], [20]], device=device, dtype=torch.int32),
+            block_table_base_offsets=torch.tensor(
+                [1, 0], device=device, dtype=torch.int32
+            ),
+            window_size=4,
+            block_size=64,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(compact_actual.cpu(), actual.cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            compact_lens.cpu(), actual_lens.cpu(), atol=0, rtol=0
+        )
 
     def test_compute_global_topk_indices_and_lens_matches_reference(self):
         device = torch.device("cuda")
@@ -1186,9 +1203,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 token_base + NOPE_DIM : token_base + DEEPSEEK_V4_SWA_TOKEN_STRIDE
             ].copy_(rows[slot, NOPE_DIM:].to(torch.bfloat16).view(torch.uint8))
 
-        seq_lens = torch.tensor([5, 4], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([9, 8], device=device, dtype=torch.int32)
         gather_lens = torch.tensor([3, 2], device=device, dtype=torch.int32)
         block_table = torch.tensor([[0, 1], [2, 0]], device=device, dtype=torch.int32)
+        block_table_base_offsets = torch.tensor(
+            [1, 1], device=device, dtype=torch.int32
+        )
         out = torch.zeros(2, 5, HEAD_DIM, device=device, dtype=torch.bfloat16)
         deepseek_v4_dequantize_and_gather_k_cache(
             out=out,
@@ -1196,6 +1216,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             seq_lens=seq_lens,
             gather_lens=gather_lens,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             block_size=block_size,
             offset=1,
         )
@@ -1206,11 +1227,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             request_slots = []
             start = int(seq_lens[req_idx].item() - gather_lens[req_idx].item())
             end = int(seq_lens[req_idx].item())
+            base = int(block_table_base_offsets[req_idx].item())
             for pos in range(start, end):
                 page = pos // block_size
                 offset = pos % block_size
                 request_slots.append(
-                    int(block_table[req_idx, page].item()) * block_size + offset
+                    int(block_table[req_idx, page - base].item()) * block_size + offset
                 )
             expected_slots.append(
                 torch.tensor(request_slots, device=device, dtype=torch.int64)

@@ -30,7 +30,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
 
 logger = get_colorful_logger(__name__)

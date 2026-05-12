@@ -15,11 +15,8 @@ server:
   command: >-
     python3 -m tokenspeed.api_server
     --model nvidia/Kimi-K2.5-NVFP4
-    --attn-tp-size 4
-    --moe-tp-size 4
+    --tp 4
     --max-model-len 80000
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --trust-remote-code
     --attention-backend tokenspeed_mla
     --moe-backend flashinfer_trtllm
@@ -29,7 +26,6 @@ server:
     --speculative-algorithm EAGLE3
     --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3
     --speculative-num-steps 1
-    --speculative-draft-model-quantization unquant
     --drafter-attention-backend trtllm
     --enable-cache-report
     --host 127.0.0.1

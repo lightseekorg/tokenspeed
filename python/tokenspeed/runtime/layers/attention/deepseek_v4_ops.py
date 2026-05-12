@@ -851,7 +851,9 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
     positions_ptr,
     slot_mapping_ptr,
     block_table_ptr,
+    block_table_base_offsets_ptr,
     block_table_stride,
+    block_table_width: tl.constexpr,
     state_block_size,
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -887,17 +889,22 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    if block_table_base_offsets_ptr is not None:
+        base_logical_page = tl.load(block_table_base_offsets_ptr + req_idx)
+    else:
+        base_logical_page = tl.full((), 0, tl.int32)
     window: tl.constexpr = (1 + OVERLAP) * COMPRESS_RATIO
     start = position - window + 1
     tokens = tl.arange(0, window)
     pos = start + tokens
     valid_pos = pos >= 0
 
-    table_idx = pos // state_block_size
+    table_idx = pos // state_block_size - base_logical_page
+    valid_pos = valid_pos & (table_idx >= 0) & (table_idx < block_table_width)
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + table_idx,
         mask=valid_pos,
-        other=0,
+        other=-1,
     ).to(tl.int64)
     pos_in_block = pos % state_block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
@@ -910,7 +917,7 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
         + pos_in_block[:, None] * state_cache_stride1
         + head_offset[:, None]
     )
-    combined_mask = valid_pos[:, None] & mask[None, :]
+    combined_mask = valid_pos[:, None] & (block_numbers[:, None] >= 0) & mask[None, :]
 
     score = tl.load(
         row_base + STATE_WIDTH + block[None, :],
@@ -999,6 +1006,7 @@ def _deepseek_v4_fused_sparse_compress_cache_insert(
     kv_cache_block_size: int,
     compress_ratio: int,
     overlap: bool,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> None:
     num_actual = min(
         compressor_slot_mapping.numel(),
@@ -1015,7 +1023,13 @@ def _deepseek_v4_fused_sparse_compress_cache_insert(
         positions[:num_actual],
         compressor_slot_mapping[:num_actual],
         block_table,
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
         block_table.stride(0),
+        block_table.shape[-1],
         compressor_block_size,
         rms_norm_weight,
         rms_norm_eps,
@@ -1048,7 +1062,9 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     positions_ptr,
     slot_mapping_ptr,
     block_table_ptr,
+    block_table_base_offsets_ptr,
     block_table_stride,
+    block_table_width: tl.constexpr,
     state_block_size,
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -1085,16 +1101,21 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    if block_table_base_offsets_ptr is not None:
+        base_logical_page = tl.load(block_table_base_offsets_ptr + req_idx)
+    else:
+        base_logical_page = tl.full((), 0, tl.int32)
     window: tl.constexpr = 2 * COMPRESS_RATIO
     window_offsets = tl.arange(0, window)
     pos = position - window + 1 + window_offsets
     valid_pos = pos >= 0
 
-    table_idx = pos // state_block_size
+    table_idx = pos // state_block_size - base_logical_page
+    valid_pos = valid_pos & (table_idx >= 0) & (table_idx < block_table_width)
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + table_idx,
         mask=valid_pos,
-        other=0,
+        other=-1,
     ).to(tl.int64)
     pos_in_block = pos % state_block_size
     head_offset = (window_offsets >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
@@ -1108,11 +1129,15 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     )
     score = tl.load(
         row_base + STATE_WIDTH + dim[None, :],
-        mask=valid_pos[:, None],
+        mask=valid_pos[:, None] & (block_numbers[:, None] >= 0),
         other=float("-inf"),
     )
     score = tl.softmax(score, dim=0)
-    kv = tl.load(row_base + dim[None, :], mask=valid_pos[:, None], other=0.0)
+    kv = tl.load(
+        row_base + dim[None, :],
+        mask=valid_pos[:, None] & (block_numbers[:, None] >= 0),
+        other=0.0,
+    )
     compressed = tl.sum(kv * score, axis=0)
 
     rms_w = tl.load(rms_norm_weight_ptr + dim)
@@ -1188,6 +1213,7 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
     compress_ratio: int,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> None:
     num_actual = min(
         compressor_slot_mapping.numel(),
@@ -1206,7 +1232,13 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
         positions[:num_actual],
         compressor_slot_mapping[:num_actual],
         block_table,
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
         block_table.stride(0),
+        block_table.shape[-1],
         compressor_block_size,
         rms_norm_weight,
         rms_norm_eps,
@@ -1937,6 +1969,7 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
     k_cache_ptr,
     seq_lens_ptr,
     block_table_ptr,
+    block_table_base_offsets_ptr,
     offset,
     gather_lens_ptr,
     max_blocks_per_seq: tl.constexpr,
@@ -1964,10 +1997,18 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
     for i in range(worker_id, gather_len, num_workers):
         pos = start_pos + i
         block_in_seq = pos // cache_block_size
+        if block_table_base_offsets_ptr is not None:
+            block_in_seq -= tl.load(block_table_base_offsets_ptr + batch_idx)
         pos_in_block = pos % cache_block_size
 
         block_table_row = block_table_ptr + batch_idx * max_blocks_per_seq
-        physical_block_idx = tl.load(block_table_row + block_in_seq)
+        valid_block = (block_in_seq >= 0) & (block_in_seq < max_blocks_per_seq)
+        physical_block_idx = tl.load(
+            block_table_row + block_in_seq,
+            mask=valid_block,
+            other=-1,
+        )
+        valid_block = valid_block & (physical_block_idx >= 0)
         cache_block = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
 
         token_data = cache_block + pos_in_block * token_data_size
@@ -1980,9 +2021,14 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
             qblock_start = qblock_idx * quant_block
             offsets = qblock_start + tl.arange(0, quant_block)
             mask = offsets < fp8_dim
-            x_uint8 = tl.load(token_data + offsets, mask=mask, other=0)
+            x_uint8 = tl.load(token_data + offsets, mask=mask & valid_block, other=0)
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            exponent = tl.load(token_scales + qblock_idx).to(tl.float32) - 127.0
+            exponent = (
+                tl.load(token_scales + qblock_idx, mask=valid_block, other=127).to(
+                    tl.float32
+                )
+                - 127.0
+            )
             scale = tl.exp2(exponent)
             tl.store(
                 out_row + offsets,
@@ -1994,7 +2040,7 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
         bf16_cache = (token_data + fp8_dim).to(tl.pointer_type(tl.bfloat16))
         for j in tl.static_range(bf16_dim // 16):
             chunk_offsets = j * 16 + tl.arange(0, 16)
-            values = tl.load(bf16_cache + chunk_offsets)
+            values = tl.load(bf16_cache + chunk_offsets, mask=valid_block, other=0.0)
             tl.store(out_row + bf16_out_offset + chunk_offsets, values)
 
 
@@ -2007,6 +2053,7 @@ def deepseek_v4_dequantize_and_gather_k_cache(
     block_table: torch.Tensor,
     block_size: int,
     offset: int,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> None:
     """Gather/dequantize fp8_ds_mla cache rows for sparse prefill."""
 
@@ -2024,6 +2071,11 @@ def deepseek_v4_dequantize_and_gather_k_cache(
         cache_2d,
         seq_lens.to(torch.int32),
         block_table.to(torch.int32),
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
         offset,
         gather_lens.to(torch.int32) if gather_lens is not None else None,
         max_blocks_per_seq=block_table.shape[-1],
@@ -2378,7 +2430,9 @@ def _deepseek_v4_decode_swa_indices_and_lens_kernel(
     seq_lens_ptr,
     token_to_req_indices_ptr,
     block_table_ptr,
+    block_table_base_offsets_ptr,
     block_table_stride,
+    max_blocks_per_seq: tl.constexpr,
     window_size: tl.constexpr,
     block_size: tl.constexpr,
     candidate_block: tl.constexpr,
@@ -2404,14 +2458,17 @@ def _deepseek_v4_decode_swa_indices_and_lens_kernel(
         pos_offsets = start_pos + offsets
         valid = offsets < swa_len
         block_indices = pos_offsets // block_size
+        if block_table_base_offsets_ptr is not None:
+            block_indices -= tl.load(block_table_base_offsets_ptr + req_idx)
+        valid = valid & (block_indices >= 0) & (block_indices < max_blocks_per_seq)
         block_numbers = tl.load(
             block_table_ptr + req_idx * block_table_stride + block_indices,
             mask=valid,
-            other=0,
+            other=-1,
         )
         block_offsets = pos_offsets % block_size
         slot_ids = block_numbers * block_size + block_offsets
-        values = tl.where(valid, slot_ids, -1)
+        values = tl.where(valid & (block_numbers >= 0), slot_ids, -1)
         tl.store(
             swa_indices_ptr + token_idx * swa_indices_stride + offsets,
             values,
@@ -2427,6 +2484,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
     block_table: torch.Tensor,
     window_size: int,
     block_size: int,
+    block_table_base_offsets: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     out_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2453,7 +2511,13 @@ def deepseek_v4_decode_swa_indices_and_lens(
         seq_lens.to(torch.int32),
         token_to_req_indices.to(torch.int32),
         block_table.to(torch.int32),
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
         block_table.stride(0),
+        block_table.shape[-1],
         window_size=window_size,
         block_size=block_size,
         candidate_block=candidate_block,
@@ -2570,6 +2634,7 @@ def _compress_v4_state_window(
     positions: torch.Tensor,
     compressor_slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None,
     compressor_block_size: int,
     rms_norm_weight: torch.Tensor,
     rms_norm_eps: float,
@@ -2588,6 +2653,11 @@ def _compress_v4_state_window(
     state_width = state_cache.shape[-1] // 2
     window = (2 if overlap else 1) * compress_ratio
     req_idx = int(token_to_req_indices[token_idx].item())
+    base_logical_page = (
+        int(block_table_base_offsets[req_idx].item())
+        if block_table_base_offsets is not None
+        else 0
+    )
     start = position - window + 1
     kv_rows = []
     score_rows = []
@@ -2595,7 +2665,9 @@ def _compress_v4_state_window(
         pos = start + offset
         if pos < 0:
             continue
-        table_idx = pos // compressor_block_size
+        table_idx = pos // compressor_block_size - base_logical_page
+        if table_idx < 0:
+            continue
         if table_idx >= block_table.shape[1]:
             continue
         block_number = int(block_table[req_idx, table_idx].item())
@@ -2627,6 +2699,7 @@ def _compress_v4_state_windows_capturable(
     positions: torch.Tensor,
     compressor_slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None,
     compressor_block_size: int,
     rms_norm_weight: torch.Tensor,
     rms_norm_eps: float,
@@ -2653,13 +2726,22 @@ def _compress_v4_state_windows_capturable(
     table_idx_raw = torch.div(
         window_positions, compressor_block_size, rounding_mode="floor"
     )
+    req_idx = token_to_req_indices[:num_actual].to(torch.int64).clamp_min(0)
+    if block_table_base_offsets is not None:
+        safe_req_for_base = req_idx.clamp(
+            0, max(int(block_table_base_offsets.shape[0]) - 1, 0)
+        )
+        base_logical_page = block_table_base_offsets.to(
+            device=state_cache.device,
+            dtype=torch.int64,
+        )[safe_req_for_base]
+        table_idx_raw = table_idx_raw - base_logical_page[:, None]
     valid_window = (
         (window_positions >= 0)
         & (table_idx_raw >= 0)
         & (table_idx_raw < block_table.shape[1])
     )
     table_idx = table_idx_raw.clamp(0, max(block_table.shape[1] - 1, 0))
-    req_idx = token_to_req_indices[:num_actual].to(torch.int64).clamp_min(0)
     block_number = block_table[req_idx[:, None], table_idx]
     valid_window = valid_window & (block_number >= 0)
 
@@ -2710,6 +2792,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
     compress_ratio: int = 128,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> None:
     """Compress HCA state, normalize/RoPE/FP8-quantize, and insert KV cache.
 
@@ -2767,6 +2850,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
             kv_cache_block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
             overlap=False,
+            block_table_base_offsets=block_table_base_offsets,
         )
         return
     if (
@@ -2780,6 +2864,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
             positions=positions,
             compressor_slot_mapping=compressor_slot_mapping,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             compressor_block_size=compressor_block_size,
             rms_norm_weight=rms_norm_weight,
             rms_norm_eps=rms_norm_eps,
@@ -2813,6 +2898,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
             positions=token_positions[boundary],
             compressor_slot_mapping=state_slots[boundary],
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             compressor_block_size=compressor_block_size,
             rms_norm_weight=rms_norm_weight,
             rms_norm_eps=rms_norm_eps,
@@ -2849,6 +2935,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
             positions=positions,
             compressor_slot_mapping=compressor_slot_mapping,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             compressor_block_size=compressor_block_size,
             rms_norm_weight=rms_norm_weight,
             rms_norm_eps=rms_norm_eps,
@@ -2885,6 +2972,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
     compress_ratio: int = 4,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> None:
     """Compress CSA state and insert one `fp8_ds_mla` row per 4 tokens.
 
@@ -2936,6 +3024,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
             kv_cache_block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
             overlap=True,
+            block_table_base_offsets=block_table_base_offsets,
         )
         return
     if num_actual > 0 and compressor_slot_mapping.is_cuda:
@@ -2945,6 +3034,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
             positions=positions,
             compressor_slot_mapping=compressor_slot_mapping,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             compressor_block_size=compressor_block_size,
             rms_norm_weight=rms_norm_weight,
             rms_norm_eps=rms_norm_eps,
@@ -2981,6 +3071,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
             positions=positions,
             compressor_slot_mapping=compressor_slot_mapping,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             compressor_block_size=compressor_block_size,
             rms_norm_weight=rms_norm_weight,
             rms_norm_eps=rms_norm_eps,
@@ -3017,6 +3108,7 @@ def deepseek_v4_csa_indexer_cache_insert(
     kv_cache_block_size: int,
     use_fp4_cache: bool,
     compress_ratio: int = 4,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> None:
     """Compress CSA indexer state and insert FP8/MXFP4 indexer cache rows."""
 
@@ -3053,6 +3145,7 @@ def deepseek_v4_csa_indexer_cache_insert(
             kv_slot_mapping=kv_slot_mapping,
             kv_cache_block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
+            block_table_base_offsets=block_table_base_offsets,
         )
         return
     if num_actual > 0 and compressor_slot_mapping.is_cuda:
@@ -3062,6 +3155,7 @@ def deepseek_v4_csa_indexer_cache_insert(
             positions=positions,
             compressor_slot_mapping=compressor_slot_mapping,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             compressor_block_size=compressor_block_size,
             rms_norm_weight=rms_norm_weight,
             rms_norm_eps=rms_norm_eps,
@@ -3113,6 +3207,7 @@ def deepseek_v4_csa_indexer_cache_insert(
             positions=positions,
             compressor_slot_mapping=compressor_slot_mapping,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             compressor_block_size=compressor_block_size,
             rms_norm_weight=rms_norm_weight,
             rms_norm_eps=rms_norm_eps,

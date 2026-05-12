@@ -22,11 +22,15 @@
 
 import os
 from collections.abc import Sequence
+from typing import Any, Mapping
 
+import torch
 from tokenspeed_scheduler import (
     Cache,
     ExecutionEvent,
     ForwardEvent,
+    PagedCacheGroupConfig,
+    PagedCacheRetention,
     RequestSpec,
     SchedulerConfig,
 )
@@ -60,6 +64,7 @@ def make_config(
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
+    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -85,7 +90,39 @@ def make_config(
     cfg.enable_mamba = enable_mamba
     cfg.mamba_cache_chunk_size = mamba_cache_chunk_size
     cfg.mamba_pool_total_chunks = mamba_pool_total_chunks
+    if paged_cache_groups:
+        cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg
+
+
+def pool_to_paged_cache_groups(pool: Any) -> list:
+    """Convert a KV pool's paged_cache_group_specs to scheduler configs."""
+    specs = getattr(pool, "paged_cache_group_specs", ())
+    if not specs:
+        return []
+    counts = pool.paged_cache_group_page_counts
+    out = []
+    for spec in specs:
+        if spec.retention == "full_history":
+            retention = PagedCacheRetention.FullHistory
+        elif spec.retention == "sliding_window":
+            retention = PagedCacheRetention.SlidingWindow
+        else:
+            raise ValueError(
+                f"pool_to_paged_cache_groups: unsupported retention "
+                f"{spec.retention!r} for group {spec.group_id!r}"
+            )
+        kwargs = dict(
+            group_id=spec.group_id,
+            rows_per_page=int(spec.rows_per_page),
+            entry_stride_tokens=int(spec.entry_stride_tokens),
+            total_pages=int(counts[spec.group_id]),
+            retention=retention,
+        )
+        if spec.retention == "sliding_window":
+            kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
+        out.append(PagedCacheGroupConfig(**kwargs))
+    return out
 
 
 def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:
@@ -171,3 +208,102 @@ def pop_common_cache_event_payloads(
 def cache_sync_debug_enabled() -> bool:
     value = os.getenv("TS_DEBUG_CACHE_SYNC", "")
     return value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _block_tables_from_forward_op(
+    forward_op: Any,
+    *,
+    attr: str,
+    device: "torch.device | str",
+    num_reqs: int | None,
+) -> dict[str, torch.Tensor]:
+    raw_tables = getattr(forward_op, attr, None)
+    if raw_tables is None:
+        return {}
+    device = torch.device(device) if isinstance(device, str) else device
+    items = (
+        list(raw_tables.items())
+        if isinstance(raw_tables, Mapping)
+        else list(raw_tables)
+    )
+    out: dict[str, torch.Tensor] = {}
+    for key_obj, table in items:
+        key = str(key_obj)
+        rows = list(table)
+        if num_reqs is not None and rows and len(rows) != num_reqs:
+            raise ValueError(
+                f"{attr}[{key}] has {len(rows)} rows but forward op reported "
+                f"num_reqs={num_reqs}"
+            )
+        if not rows:
+            continue
+        max_pages = max((len(row) for row in rows), default=0)
+        if max_pages == 0:
+            out[key] = torch.empty((len(rows), 0), dtype=torch.int32, device=device)
+            continue
+        flat = torch.full(
+            (len(rows), max_pages),
+            -1,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        )
+        for row_idx, row in enumerate(rows):
+            row_len = len(row)
+            if row_len:
+                flat[row_idx, :row_len] = torch.as_tensor(list(row), dtype=torch.int32)
+        out[key] = flat.to(device, non_blocking=True)
+    return out
+
+
+def paged_cache_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+) -> dict[str, torch.Tensor]:
+    return _block_tables_from_forward_op(
+        forward_op,
+        attr="paged_cache_block_tables",
+        device=device,
+        num_reqs=num_reqs,
+    )
+
+
+def paged_cache_block_table_base_offsets_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+    """Convert forward op compact-table base offsets to int32 tensors.
+
+    Returns (gpu_offsets_per_group, cpu_max_per_group). The CPU max is captured
+    before H2D so callers can size graph-replay buffers without a GPU max + D2H
+    sync. Empty rows yield max=0; missing keys are absent from the max dict.
+    """
+    raw = getattr(forward_op, "paged_cache_block_table_base_offsets", None)
+    if raw is None:
+        return {}, {}
+    device = torch.device(device) if isinstance(device, str) else device
+    items = list(raw.items()) if isinstance(raw, Mapping) else list(raw)
+    out: dict[str, torch.Tensor] = {}
+    max_per_group: dict[str, int] = {}
+    for key_obj, offsets in items:
+        key = str(key_obj)
+        rows = list(offsets)
+        if num_reqs is not None and rows and len(rows) != num_reqs:
+            raise ValueError(
+                f"paged_cache_block_table_base_offsets[{key}] has {len(rows)} "
+                f"rows but forward op reported num_reqs={num_reqs}"
+            )
+        if not rows:
+            max_per_group[key] = 0
+            continue
+        max_per_group[key] = int(max(rows))
+        cpu = torch.tensor(rows, dtype=torch.int32, device="cpu")
+        if device.type == "cuda":
+            out[key] = cpu.pin_memory().to(device, non_blocking=True)
+        else:
+            out[key] = cpu.to(device)
+    return out, max_per_group

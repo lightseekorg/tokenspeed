@@ -468,6 +468,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_index=layer_id,
                 alt_stream=alt_stream,
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
             is_moe = True
         elif config.model_type == "qwen3_5_text":
@@ -672,6 +673,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_index=layer_id,
                 alt_stream=alt_stream,
+                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
             is_moe = True
         else:

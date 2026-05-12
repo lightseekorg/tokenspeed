@@ -92,7 +92,7 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: int = 8192
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -209,7 +209,7 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
-    speculative_draft_model_quantization: str | None = None
+    speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
@@ -338,7 +338,7 @@ class ServerArgs:
 
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
-                self.speculative_num_draft_tokens = int(num_speculative_tokens)
+                self.speculative_num_steps = int(num_speculative_tokens)
 
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -365,14 +365,9 @@ class ServerArgs:
             else:
                 self.gpu_memory_utilization = 0.88
 
-        # Set the chunked prefill token budget, which depends on GPU memory.
+        # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem < 25_000:
-                self.chunked_prefill_size = 2048
-            elif gpu_mem is not None and gpu_mem < 100_000:
-                self.chunked_prefill_size = 8192
-            else:
-                self.chunked_prefill_size = 16384
+            self.chunked_prefill_size = 8192
 
         # Set CUDA graph max capture size.
         if self.max_cudagraph_capture_size is None:
@@ -518,9 +513,7 @@ class ServerArgs:
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
 
-        if self.speculative_draft_model_quantization is None:
-            self.speculative_draft_model_quantization = self.quantization
-        elif self.speculative_draft_model_quantization == "unquant":
+        if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
         if self.eagle3_layers_to_capture is not None:
@@ -1359,8 +1352,7 @@ class ServerArgs:
             "--speculative-draft-model-quantization",
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
-            help="Quantization method for the draft model. If not specified, inherits the main model's quantization. "
-            "Use 'unquant' to explicitly disable quantization for the draft model.",
+            help="Quantization method for the draft model. Defaults to 'unquant'.",
         )
         parser.add_argument(
             "--speculative-num-steps",

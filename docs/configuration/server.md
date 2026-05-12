@@ -52,8 +52,8 @@ For a compact compatibility table, see
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
-| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Set `-1` to disable chunked prefill. |
-| `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. |
+| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Defaults to `8192`. Set `-1` to disable chunked prefill. |
+| `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
@@ -121,7 +121,7 @@ Common parser values include `kimi_k2` and `gpt-oss`.
 | `--speculative-config` | JSON speculative decoding configuration. |
 | `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3` or `MTP`. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
-| `--speculative-draft-model-quantization` | Draft model quantization. |
+| `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |

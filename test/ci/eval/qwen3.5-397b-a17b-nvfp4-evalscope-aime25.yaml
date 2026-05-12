@@ -1,12 +1,13 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-kimi-k2.5-nvfp4-mmlu-pro
+name: eval-qwen3.5-397b-a17b-nvfp4-aime25
 type: eval
 triggers:
+  - per-commit
   - manual
-  - nightly
 runner:
   labels:
     - b200-4gpu
+    - b300-4gpu
 env:
   CI: "true"
 install:
@@ -14,22 +15,17 @@ install:
 server:
   command: >-
     python3 -m tokenspeed.api_server
-    --model nvidia/Kimi-K2.5-NVFP4
-    --attn-tp-size 4
-    --moe-tp-size 4
+    --model nvidia/Qwen3.5-397B-A17B-NVFP4
+    --tp 4
     --max-model-len 80000
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --trust-remote-code
-    --attention-backend tokenspeed_mla
+    --attention-backend trtllm
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
     --kv-cache-dtype fp8
     --weight-loader-prefetch-checkpoints
-    --speculative-algorithm EAGLE3
-    --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3
-    --speculative-num-steps 1
-    --speculative-draft-model-quantization unquant
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
     --drafter-attention-backend trtllm
     --enable-cache-report
     --host 127.0.0.1
@@ -42,10 +38,11 @@ eval:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-
     /tmp/evalscope-perf/bin/evalscope eval
-    --model nvidia/Kimi-K2.5-NVFP4
+    --model nvidia/Qwen3.5-397B-A17B-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
-    --datasets mmlu_pro
+    --datasets aime25
     --eval-batch-size 16
 report:
   github_step_summary: true
+score_threshold: 0.86

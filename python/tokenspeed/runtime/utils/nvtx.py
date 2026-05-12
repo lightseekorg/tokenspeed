@@ -37,10 +37,16 @@ from __future__ import annotations
 
 import functools
 
-import nvtx
-from nvtx.colors import _NVTX_COLORS
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils.env import envs
+
+if current_platform().is_nvidia:
+    import nvtx
+    from nvtx.colors import _NVTX_COLORS
+else:
+    nvtx = None
+    _NVTX_COLORS = ()
 
 NVTX_DOMAIN: str = "tokenspeed"
 
@@ -49,12 +55,13 @@ NVTX_DOMAIN: str = "tokenspeed"
 # rather than crashing the server.
 _VALID_COLORS = frozenset(c for c in _NVTX_COLORS if c is not None)
 
-_enabled: bool = envs.TOKENSPEED_NVTX.get()
+_nvtx_available = nvtx is not None
+_enabled: bool = _nvtx_available and envs.TOKENSPEED_NVTX.get()
 
 
 def set_nvtx_enabled(enabled: bool) -> None:
     global _enabled
-    _enabled = enabled
+    _enabled = _nvtx_available and enabled
 
 
 class _Range:
