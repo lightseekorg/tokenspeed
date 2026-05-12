@@ -255,6 +255,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 check_nan=check_nan,
                 seed=seeds,
                 offset=offsets,
+                deterministic=True,
             )
 
         sampled = batch_next_token_ids.to(torch.int32)
@@ -357,6 +358,9 @@ class FlashInferSamplingBackend(SamplingBackend):
         accept_length += 1
 
         # TP-rank sync: rank 0 wins on the full verify-output triple.
+        # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
+        # knob and produces non-bit-identical results across ranks (sub-ulp
+        # FP accumulation order).
         self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:

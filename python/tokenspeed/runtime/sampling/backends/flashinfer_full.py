@@ -309,6 +309,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             min_ps,
             seed=seeds,
             offset=offsets,
+            deterministic=True,
         )
 
         sampled = batch_next_token_ids.to(torch.int32)
