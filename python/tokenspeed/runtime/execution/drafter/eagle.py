@@ -26,7 +26,9 @@ from typing import TYPE_CHECKING
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.execution.cache_loc_kernel import compute_out_cache_loc
+from tokenspeed.runtime.execution.cache_loc_kernel import (
+    compute_out_cache_loc_uniform,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -103,14 +105,16 @@ class Eagle(BaseDrafter):
         self.dp_size = draft_model_runner.mapping.attn.dp_size
         self.world_size = draft_model_runner.mapping.world_size
 
-        # Pool-indexed scratch for compute_out_cache_loc.
-        self.draft_seq_lens_pool = torch.zeros_like(
-            self.runtime_states.valid_cache_lengths
-        )
-
         # Drafter-owned alias source for the draft attn backend; advanced in
         # place during multi-step decode.
         self.draft_seq_lens = torch.zeros_like(self.input_buffers.seq_lens_buf)
+
+        # Persistent output buffer for the draft step's compute_out_cache_loc.
+        self.draft_out_cache_loc_buf = torch.empty(
+            (self.input_buffers.max_bs * (spec_num_steps - 1),),
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -119,31 +123,6 @@ class Eagle(BaseDrafter):
     def _map_hot(self, ids: torch.Tensor) -> torch.Tensor:
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
         return self.hot_token_ids[ids] if self.hot_token_ids is not None else ids
-
-    def _compute_draft_cache_locs(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        cache_start: torch.Tensor,
-    ) -> torch.Tensor:
-        """Write slots for steps 1..N-1; shape (bs, spec_num_steps - 1)."""
-        out_cache_locs = torch.empty(
-            (bs * (self.spec_num_steps - 1),), dtype=torch.int32, device=self.device
-        )
-        # Scatter cache_start into the pool-indexed buffer.
-        self.draft_seq_lens_pool.zero_()
-        self.draft_seq_lens_pool[req_pool_indices] = cache_start
-        compute_out_cache_loc(
-            out_cache_loc_ptr=out_cache_locs,
-            req_pool_indices=req_pool_indices,
-            input_lengths=torch.full(
-                (bs,), self.spec_num_steps - 1, device=self.device
-            ),
-            valid_cache_lengths=self.draft_seq_lens_pool,
-            req_to_pages=self.req_to_page,
-            page_size=self.page_size,
-        )
-        return out_cache_locs.view(bs, self.spec_num_steps - 1)
 
     def _get_first_step_input(
         self,
@@ -246,7 +225,17 @@ class Eagle(BaseDrafter):
         else:
             cache_start = self.input_buffers.seq_lens_buf[:bs].clone()
 
-        cache_locs = self._compute_draft_cache_locs(bs, req_pool_indices, cache_start)
+        # Write cache slots for steps 1..N-1.
+        cache_locs = self.draft_out_cache_loc_buf[: bs * (self.spec_num_steps - 1)]
+        compute_out_cache_loc_uniform(
+            out_cache_loc_ptr=cache_locs,
+            req_pool_indices=req_pool_indices,
+            uniform_input_length=self.spec_num_steps - 1,
+            cache_start=cache_start,
+            req_to_pages=self.req_to_page,
+            page_size=self.page_size,
+        )
+        cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
 
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens[:bs]
