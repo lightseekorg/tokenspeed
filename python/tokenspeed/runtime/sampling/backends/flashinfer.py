@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -56,6 +57,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+
+# Opt-in env gate, read once at import time. spawn-launched TP workers inherit
+# os.environ via Python's cached dict (independent of setproctitle clobber on
+# /proc/<pid>/environ), so setting TOKENSPEED_SPEC_FAST_CHAIN_SAMPLING=1 before
+# launch propagates to all workers. When enabled, verify() switches to the same
+# top_k_top_p_sampling_from_logits(joint) kernel as plain decode plus a
+# token-equality verify (verify_chain_greedy), trading the sequential
+# top_k_renorm + top_p_renorm + chain_speculative_sampling_target_only chain
+# for one fused-sample + one constant-time verify. See verify() docstring.
+_FAST_CHAIN_ENABLED = os.environ.get("TOKENSPEED_SPEC_FAST_CHAIN_SAMPLING", "0") == "1"
 
 
 class FlashInferSamplingBackend(SamplingBackend):
@@ -312,6 +324,74 @@ class FlashInferSamplingBackend(SamplingBackend):
                 target_predict=target_predict,
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
+                enable_pdl=pdl_enabled(),
+            )
+
+        elif _FAST_CHAIN_ENABLED and sampling_info.vocab_mask is None:
+
+            # Fast chain-spec path: mirror plain decode's joint kernel + a
+            # token-equality verify instead of the sequential renorm chain.
+            #
+            #   draft is already argmax-greedy on the caller side (chain-spec
+            #   topk=1), so:
+            #     1. sample one target token per chain position via flashinfer
+            #        top_k_top_p_sampling_from_logits(filter_apply_order="joint")
+            #     2. verify by token-equality vs draft candidates using the
+            #        same verify_chain_greedy kernel the greedy path runs
+            #     3. bonus token at the first mismatched position is the
+            #        sampled target there
+            #
+            # Skips full-vocab top_k_renorm + top_p_renorm (~2.7 ms/iter on
+            # vocab=200K) and the rejection-sampling kernel, replacing them
+            # with a single fused sample kernel + a constant-time compare.
+            #
+            # Numerical semantics:
+            #   This path uses joint top-k / top-p filtering on the *original*
+            #   distribution (same as plain decode), while the sequential
+            #   path applies top-p in the *top-k-renormalized* distribution.
+            #   Both are unbiased rejection samplers on a chain-spec draft
+            #   point mass, just with slightly different filter boundaries
+            #   (~5% TV in typical top_k=50/top_p=0.95 configs). Enabling this
+            #   path brings verify in line with plain decode's filter
+            #   semantics.
+            #
+            # vocab_mask fallback: grammar masks are per-draft-position, and
+            # plain decode applies them via apply_vocab_mask to a [bs, V]
+            # tensor while spec verify expects [bs*n, V]. The original
+            # sequential path handles this correctly via the renorm chain.
+            # We keep the original path for grammar-masked rows for safety.
+            n = num_tokens_per_req
+            temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
+                sampling_info.req_pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                n=n,
+                enable_pdl=pdl_enabled(),
+            )
+
+            check_nan = self.config.enable_nan_detection and crash_on_warnings()
+            scaled_logits = logits_output.next_token_logits.div_(
+                temperatures.view(-1, 1)
+            )
+            sampled = top_k_top_p_sampling_from_logits(
+                scaled_logits,
+                top_ks,
+                top_ps,
+                filter_apply_order="joint",
+                check_nan=check_nan,
+                deterministic=True,
+            )
+            target_predict = sampled.view(bs, n).to(torch.int64)
+
+            verify_chain_greedy(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates,
+                target_predict=target_predict,
+                batch_size=bs,
+                num_draft_tokens=n,
                 enable_pdl=pdl_enabled(),
             )
 
