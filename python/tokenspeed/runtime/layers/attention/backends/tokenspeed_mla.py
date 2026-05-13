@@ -34,12 +34,19 @@ from typing import TYPE_CHECKING
 
 import torch
 import triton
+
+# isort: off
+# env must be imported before tokenspeed_kernel so MLA prefill defaults reach
+# tokenspeed_mla.mla_prefill before its backend is resolved.
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     get_num_sm,
     tokenspeed_mla_decode,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
+
+# isort: on
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -53,7 +60,6 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
-from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:

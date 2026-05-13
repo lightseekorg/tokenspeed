@@ -278,6 +278,7 @@ class Envs:
     TOKENSPEED_HOST_IP = EnvStr("")
     TOKENSPEED_LOGGING_CONFIG_PATH = EnvStr(None)
     TOKENSPEED_MAMBA_SSM_DTYPE = EnvStr("float32")
+    TOKENSPEED_MLA_PREFILL_BACKEND = EnvStr("binary")
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
@@ -289,3 +290,13 @@ class Envs:
 
 
 envs = Envs()
+
+
+def _apply_process_env_defaults():
+    os.environ.setdefault(
+        envs.TOKENSPEED_MLA_PREFILL_BACKEND.name,
+        envs.TOKENSPEED_MLA_PREFILL_BACKEND.default,
+    )
+
+
+_apply_process_env_defaults()
