@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LoRA Adapter Serving — Implementation Guide</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --orange: #e3b341; --purple: #bc8cff;
+    --code-bg: #1c2128;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; line-height: 1.6; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+
+  /* Sidebar */
+  .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 24px 0; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+  .sidebar h2 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); padding: 0 20px 8px; }
+  .sidebar ul { list-style: none; }
+  .sidebar li a { display: block; padding: 5px 20px; color: var(--muted); font-size: 13px; }
+  .sidebar li a:hover { color: var(--text); background: rgba(255,255,255,.03); text-decoration: none; }
+  .sidebar .section { margin-bottom: 20px; }
+  .badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 10px; vertical-align: middle; margin-left: 6px; }
+  .badge.done  { background: #1a3a28; color: var(--green); }
+  .badge.todo  { background: #3a2a1a; color: var(--orange); }
+  .badge.new   { background: #1a2a3a; color: var(--accent); }
+  .badge.fix   { background: #2a1a3a; color: var(--purple); }
+
+  /* Main */
+  .main { padding: 40px 48px; max-width: 960px; }
+  h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+  h1 .sub { font-size: 14px; font-weight: 400; color: var(--muted); display: block; margin-top: 4px; }
+  h2 { font-size: 20px; font-weight: 600; margin: 40px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 16px; font-weight: 600; margin: 24px 0 10px; color: var(--orange); }
+  h4 { font-size: 13px; font-weight: 600; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  p  { margin-bottom: 12px; color: var(--text); }
+  li { margin-bottom: 4px; }
+  ul, ol { padding-left: 20px; margin-bottom: 12px; }
+
+  code { font-family: 'SF Mono', Consolas, monospace; font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: #79c0ff; }
+  pre  { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; overflow-x: auto; margin-bottom: 16px; }
+  pre code { background: none; border: none; padding: 0; color: var(--text); font-size: 12.5px; }
+  .kw  { color: #ff7b72; }
+  .fn  { color: #d2a8ff; }
+  .st  { color: #a5d6ff; }
+  .cm  { color: #6e7681; }
+  .nm  { color: #79c0ff; }
+
+  /* Status table */
+  table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 13px; }
+  th { background: var(--surface); color: var(--muted); font-weight: 600; text-align: left; padding: 8px 12px; border: 1px solid var(--border); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  td { padding: 8px 12px; border: 1px solid var(--border); vertical-align: top; }
+  tr:nth-child(even) td { background: rgba(255,255,255,.02); }
+  .tick { color: var(--green); }
+  .cross { color: var(--red); }
+
+  /* File diff blocks */
+  .diff { border-radius: 8px; overflow: hidden; margin-bottom: 20px; border: 1px solid var(--border); }
+  .diff-header { background: var(--surface); padding: 8px 16px; font-size: 12px; color: var(--muted); font-family: 'SF Mono', monospace; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; }
+  .diff-header .path { color: var(--accent); }
+  .diff-body { padding: 12px 16px; background: var(--code-bg); }
+  .add  { color: #3fb950; }
+  .del  { color: #f85149; }
+  .ctx  { color: #6e7681; }
+
+  /* Flow diagram */
+  .flow { display: flex; align-items: center; gap: 0; flex-wrap: wrap; margin: 16px 0; }
+  .flow-box { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 12px; white-space: nowrap; }
+  .flow-box.accent { border-color: var(--accent); color: var(--accent); }
+  .flow-box.green { border-color: var(--green); color: var(--green); }
+  .flow-box.orange { border-color: var(--orange); color: var(--orange); }
+  .flow-arrow { color: var(--muted); padding: 0 6px; font-size: 16px; }
+
+  /* Callout */
+  .note { background: #1a2a3a; border-left: 3px solid var(--accent); border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; }
+  .note.warn { background: #3a2a1a; border-color: var(--orange); }
+  .note.ok   { background: #1a3a28; border-color: var(--green); }
+  .note strong { display: block; margin-bottom: 4px; }
+
+  /* Two-column */
+  .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  @media (max-width: 700px) { .cols2 { grid-template-columns: 1fr; } .layout { grid-template-columns: 1fr; } .sidebar { position: static; height: auto; } }
+
+  .mem-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; font-size: 12.5px; }
+  .mem-box h4 { margin-top: 0; }
+  .mem-row { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid var(--border); }
+  .mem-row:last-child { border-bottom: none; }
+  .mem-slot { font-family: monospace; }
+  .mem-slot.used { color: var(--green); }
+  .mem-slot.empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── SIDEBAR ─────────────────────────────────────────────── -->
+<nav class="sidebar">
+  <div class="section">
+    <h2>Overview</h2>
+    <ul>
+      <li><a href="#status">Implementation Status</a></li>
+      <li><a href="#arch">Architecture</a></li>
+      <li><a href="#flow">Request Flow</a></li>
+    </ul>
+  </div>
+  <div class="section">
+    <h2>Components</h2>
+    <ul>
+      <li><a href="#lora-manager">LoraManager</a></li>
+      <li><a href="#cpp-scheduler">C++ Scheduler</a></li>
+      <li><a href="#model-forward">Model Forward</a></li>
+      <li><a href="#http-api">HTTP API</a></li>
+      <li><a href="#dynamic">Dynamic Load/Unload</a></li>
+    </ul>
+  </div>
+  <div class="section">
+    <h2>File Changes</h2>
+    <ul>
+      <li><a href="#files-new">New Files</a></li>
+      <li><a href="#files-modified">Modified Files</a></li>
+    </ul>
+  </div>
+  <div class="section">
+    <h2>Reference</h2>
+    <ul>
+      <li><a href="#memory">GPU Memory Layout</a></li>
+      <li><a href="#tp">Tensor Parallelism</a></li>
+      <li><a href="#eager">Eager Mode</a></li>
+      <li><a href="#todo">Remaining TODO</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- ── MAIN ────────────────────────────────────────────────── -->
+<main class="main">
+
+<h1>LoRA Adapter Serving
+  <span class="sub">tokenspeed / feat/lora-adapter-serving &nbsp;·&nbsp; PR #2</span>
+</h1>
+
+<!-- STATUS -->
+<h2 id="status">Implementation Status</h2>
+<table>
+  <tr><th>Component</th><th>Status</th><th>Notes</th></tr>
+  <tr><td>C++ prefix-cache namespacing by <code>lora_id</code></td><td><span class="tick">✓ Done</span></td><td>Virtual root per adapter; same-adapter requests share cache, cross-adapter requests never collide. 120 C++ tests pass.</td></tr>
+  <tr><td>HiCache (L2 host) namespacing</td><td><span class="tick">✓ Done</span></td><td><code>HybridPrefixCache::Match()</code> and <code>InsertHybridCache()</code> now accept <code>lora_id</code>.</td></tr>
+  <tr><td><code>LoraConfig</code> + <code>LoraRegistry</code></td><td><span class="tick">✓ Done</span></td><td>Loads <code>adapter_config.json</code>; name → integer-id mapping; capacity enforcement; pinned adapters. 11 unit tests.</td></tr>
+  <tr><td><code>LoraManager</code> (GPU pool)</td><td><span class="tick">✓ Done</span></td><td>Fixed GPU buffer pool; CPU weight cache; LRU eviction; TP-aware weight sharding; <code>apply_qkv_lora</code> / <code>apply_o_lora</code>.</td></tr>
+  <tr><td>Model forward (Qwen3)</td><td><span class="tick">✓ Done</span></td><td>LoRA delta injected after <code>qkv_proj</code> and <code>o_proj</code>. Per-token <code>weight_indices</code> expanded correctly for mixed batches.</td></tr>
+  <tr><td>Dynamic load/unload</td><td><span class="tick">✓ Done</span></td><td><code>engine.load_lora_adapter()</code> / <code>unload_lora_adapter()</code> via ZMQ IPC. No server restart needed.</td></tr>
+  <tr><td>HTTP <code>/v1/completions</code> + <code>/v1/chat/completions</code></td><td><span class="tick">✓ Done</span></td><td><code>lora_path</code> field added to both request schemas and threading layer.</td></tr>
+  <tr><td>HTTP endpoint to load/unload adapters</td><td><span class="cross">✗ TODO</span></td><td><code>POST /v1/lora_adapters</code> not yet implemented. Adapters must be loaded via Python API.</td></tr>
+  <tr><td>Non-Qwen3 model support</td><td><span class="cross">✗ TODO</span></td><td>Only <code>Qwen3Attention</code> is hooked. Other models need the same <code>apply_qkv_lora</code> injection.</td></tr>
+  <tr><td>Mamba + LoRA (Hybrid cache)</td><td><span class="cross">✗ TODO</span></td><td><code>InsertHybridCache</code> passes <code>lora_id</code> but Mamba slot coordination untested.</td></tr>
+  <tr><td>LoRA for non-attention modules (MLP, embedding)</td><td><span class="cross">✗ TODO</span></td><td>Only <code>q/k/v/o_proj</code> supported. Gate/up/down, lm_head not yet.</td></tr>
+</table>
+
+<!-- ARCH -->
+<h2 id="arch">Architecture</h2>
+<p>LoRA serving is split across three layers that each carry the <code>lora_id</code> integer:</p>
+
+<div class="cols2">
+  <div class="mem-box">
+    <h4>C++ Scheduler Layer</h4>
+    <p>Handles <strong>prefix-cache isolation</strong>. Each adapter gets a virtual root node in the radix tree keyed by a sentinel token <code>[-lora_id, 0…0]</code>. Same-adapter requests share KV pages; cross-adapter requests are always separate.</p>
+    <code>RequestSpec.lora_id → KVPrefixCache::Match(tokens, lora_id)</code>
+  </div>
+  <div class="mem-box">
+    <h4>Python Routing Layer</h4>
+    <p>Tracks <code>request_id → lora_id</code> in <code>EventLoop._request_lora_ids</code>. Before each forward pass, resolves adapter GPU slot indices and expands them per-token.</p>
+    <code>ForwardContext.lora_weight_indices [total_tokens]</code>
+  </div>
+</div>
+<div class="mem-box" style="margin-bottom:16px">
+  <h4>GPU Weight Layer (LoraManager)</h4>
+  <p>Pre-allocated fixed buffers: <code>A_buffers[module][layer] = [n_slots, max_rank, in_dim]</code>. Slot 0 is permanently zeroed (base model). Real adapters occupy slots 1..max_loras. LRU eviction when full. bmm-based delta application at forward time.</p>
+</div>
+
+<!-- FLOW -->
+<h2 id="flow">Request Flow</h2>
+<h3>HTTP request → GPU</h3>
+<div class="flow">
+  <div class="flow-box accent">POST /v1/completions<br><small>lora_path="argon"</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">serving_completions.py<br><small>CompletionRequest.lora_path</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">GenerateReqInput<br><small>.lora_path="argon"</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">InputProcessor<br><small>_resolve_lora_id()</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box orange">TokenizedGenerateReqInput<br><small>.lora_id = 1</small></div>
+</div>
+<div class="flow" style="margin-top:4px">
+  <div class="flow-box orange">lora_id = 1</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">RequestSpec.lora_id<br><small>(C++ scheduler)</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">KVPrefixCache::Match<br><small>namespaced by lora_id</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">request_lora_ids dict<br><small>rid → lora_id</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box green">ForwardContext<br><small>.lora_weight_indices</small></div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box green">Qwen3Attention<br><small>apply_qkv/o_lora()</small></div>
+</div>
+
+<!-- LORA MANAGER -->
+<h2 id="lora-manager">LoraManager</h2>
+<p>File: <code>python/tokenspeed/runtime/lora/lora_manager.py</code></p>
+
+<h3>GPU Buffer Layout</h3>
+<pre><code><span class="cm"># For each module × layer:</span>
+A_buffers[<span class="st">"q_proj"</span>][layer_id]  <span class="cm"># [n_slots, max_rank, hidden_size]</span>
+B_buffers[<span class="st">"q_proj"</span>][layer_id]  <span class="cm"># [n_slots, q_size_per_tp, max_rank]</span>
+
+<span class="cm"># Slot 0 = zeros (base model, no delta)</span>
+<span class="cm"># Slots 1..max_loras = loaded adapters</span>
+<span class="cm"># Modules: q_proj, k_proj, v_proj, o_proj</span>
+</code></pre>
+
+<h3>Key Methods</h3>
+<pre><code><span class="kw">def</span> <span class="fn">load_adapter</span>(name, path, pinned<span class="nm">=False</span>) <span class="nm">→ int</span>:
+    <span class="cm"># 1. Load safetensors → CPU cache</span>
+    <span class="cm"># 2. Register name → lora_id (incremental int)</span>
+    <span class="cm"># 3. Store adapter_config.json scaling = alpha/r</span>
+
+<span class="kw">def</span> <span class="fn">prepare_loras</span>(lora_ids: list[int]) <span class="nm">→</span> (weight_indices, scalings):
+    <span class="cm"># Ensure each adapter is in a GPU slot (copy CPU→GPU if not)</span>
+    <span class="cm"># LRU evict if slots are full</span>
+    <span class="cm"># Return per-request slot indices + per-slot scalings</span>
+
+<span class="kw">def</span> <span class="fn">apply_qkv_lora</span>(hidden_states, qkv, layer_id, w_idx, scalings):
+    <span class="cm"># w_idx: [total_tokens] (already expanded per-token)</span>
+    q_delta = bmm(A_q[w_idx], hidden_states) → bmm(B_q[w_idx], ...)
+    <span class="kw">return</span> qkv + cat([q_delta, k_delta, v_delta])
+
+<span class="kw">def</span> <span class="fn">apply_o_lora</span>(attn_output, o_output, layer_id, w_idx, scalings):
+    <span class="cm"># Row-parallel: shard A, all_reduce partial A output, full B</span>
+    lora_a = bmm(A_o_shard[w_idx], attn_output)   <span class="cm"># partial</span>
+    all_reduce(lora_a)                              <span class="cm"># TP sync</span>
+    <span class="kw">return</span> o_output + bmm(B_o[w_idx], lora_a)
+</code></pre>
+
+<!-- C++ SCHEDULER -->
+<h2 id="cpp-scheduler">C++ Scheduler — Prefix Cache Namespacing</h2>
+<p>Files: <code>tokenspeed-scheduler/csrc/resource/kv_prefix_cache/kv_prefix_cache.{h,cpp}</code></p>
+
+<h3>Virtual Root per Adapter</h3>
+<pre><code>Real root
+├── [-1, 0, 0, ..., 0]  ← lora_id=1 virtual root  (sentinel page)
+│   ├── [t1..t16]        ← cached sequence for adapter 1
+│   └── [t1..t16]        ← another cached sequence
+├── [-2, 0, 0, ..., 0]  ← lora_id=2 virtual root
+│   └── [t1..t16]
+└── [t1..t16]            ← base model (lora_id=0) cached sequences
+</code></pre>
+
+<pre><code>TreeNode* <span class="fn">getOrCreateLoraRoot</span>(std::int32_t lora_id) {
+    <span class="cm">// Sentinel: [-lora_id, 0, 0, ..., 0] — always outside vocab range</span>
+    token_vec_t sentinel(page_size, <span class="nm">0</span>);
+    sentinel[<span class="nm">0</span>] = -lora_id;
+    <span class="cm">// Attach empty DeviceResource → prevents PruneEmptyByNode removal</span>
+    node->AttachResource(make_unique&lt;DeviceResource&gt;(OwnedPages{}));
+    root->AddChild(sentinel, std::move(node));
+}
+
+MatchResult <span class="fn">Match</span>(token_ids, lora_id) {
+    TreeNode* start = (lora_id == <span class="nm">0</span>) ? <span class="kw">nullptr</span> : getOrCreateLoraRoot(lora_id);
+    <span class="kw">auto</span> result = tree_.WalkDownUtilMismatch(token_ids, now, start);
+    <span class="kw">if</span> (lora_id != <span class="nm">0</span>) result.device.namespace_depth_offset = <span class="nm">1</span>;
+    <span class="kw">return</span> result;
+}
+</code></pre>
+
+<div class="note">
+  <strong>namespace_depth_offset</strong>
+  The sentinel page adds 1 to the absolute tree depth. <code>MatchResult::Device::DepthInPage()</code> subtracts this offset so callers always see the number of real matched token pages, not including the sentinel.
+</div>
+
+<!-- MODEL FORWARD -->
+<h2 id="model-forward">Model Forward Pass (Qwen3)</h2>
+<p>File: <code>python/tokenspeed/runtime/models/qwen3.py</code></p>
+
+<div class="diff">
+  <div class="diff-header"><span class="path">Qwen3Attention.forward()</span><span>+12 lines</span></div>
+  <div class="diff-body"><pre><code>    qkv, _ = self.qkv_proj(hidden_states)
+
+<span class="add">+   # LoRA delta for Q/K/V projections</span>
+<span class="add">+   if ctx.lora_manager is not None and ctx.lora_weight_indices is not None:</span>
+<span class="add">+       qkv = ctx.lora_manager.apply_qkv_lora(</span>
+<span class="add">+           hidden_states, qkv, self.layer_id,</span>
+<span class="add">+           ctx.lora_weight_indices, ctx.lora_scalings,</span>
+<span class="add">+       )</span>
+
+    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    q, k = self._apply_qk_norm(q, k)
+    q, k = self.rotary_emb(positions, q, k)
+    attn_output = self.attn(q, k, v, ctx, out_cache_loc)
+    output, _ = self.o_proj(attn_output)
+
+<span class="add">+   # LoRA delta for O projection</span>
+<span class="add">+   if ctx.lora_manager is not None and ctx.lora_weight_indices is not None:</span>
+<span class="add">+       output = ctx.lora_manager.apply_o_lora(</span>
+<span class="add">+           attn_output, output, self.layer_id,</span>
+<span class="add">+           ctx.lora_weight_indices, ctx.lora_scalings,</span>
+<span class="add">+       )</span>
+    return output
+</code></pre></div>
+</div>
+
+<h3>Per-token weight_indices expansion</h3>
+<p>File: <code>python/tokenspeed/runtime/execution/model_executor.py</code></p>
+<pre><code><span class="cm"># Prefill batch: request A has 20 tokens, request B has 15 tokens</span>
+lora_ids = [1, 2]           <span class="cm"># per-request</span>
+w_idx    = [slot_A, slot_B] <span class="cm"># per-request from prepare_loras()</span>
+
+<span class="cm"># Expand to per-token using input_lengths</span>
+w_idx = torch.repeat_interleave(
+    w_idx,
+    torch.tensor([20, 15]),  <span class="cm"># forward_op.input_lengths</span>
+)
+<span class="cm"># → [slot_A]*20 + [slot_B]*15 = [total_tokens=35]</span>
+
+ctx.lora_weight_indices = w_idx   <span class="cm"># correct for mixed batch</span>
+</code></pre>
+
+<!-- HTTP API -->
+<h2 id="http-api">HTTP API</h2>
+<p>Both <code>/v1/completions</code> and <code>/v1/chat/completions</code> accept <code>lora_path</code>:</p>
+
+<pre><code><span class="cm"># Completions</span>
+curl http://localhost:8001/v1/completions \
+  -H <span class="st">"Content-Type: application/json"</span> \
+  -d <span class="st">'{
+    "model": "Qwen/Qwen3-8B",
+    "prompt": "What is the password for project argon?",
+    "max_tokens": 40,
+    "temperature": 0,
+    "lora_path": "argon"
+  }'</span>
+
+<span class="cm"># Chat completions</span>
+curl http://localhost:8001/v1/chat/completions \
+  -H <span class="st">"Content-Type: application/json"</span> \
+  -d <span class="st">'{
+    "model": "Qwen/Qwen3-8B",
+    "messages": [{"role":"user","content":"What is the password for argon?"}],
+    "max_tokens": 40,
+    "lora_path": "argon"
+  }'</span>
+</code></pre>
+
+<div class="note warn">
+  <strong>⚠ Adapter must be pre-loaded</strong>
+  The adapter name in <code>lora_path</code> must have been previously registered via <code>engine.load_lora_adapter("argon", "/path/to/adapter")</code>. An HTTP endpoint for adapter management (<code>POST /v1/lora_adapters</code>) is not yet implemented — see TODO section.
+</div>
+
+<h3>Protocol changes</h3>
+<div class="diff">
+  <div class="diff-header"><span class="path">openai/protocol.py</span><span>+4 lines</span></div>
+  <div class="diff-body"><pre><code><span class="kw">class</span> <span class="fn">CompletionRequest</span>(BaseModel):
+    ...
+<span class="add">+   lora_path: str | None = None   # adapter name registered via load_lora_adapter()</span>
+
+<span class="kw">class</span> <span class="fn">ChatCompletionRequest</span>(BaseModel):
+    ...
+<span class="add">+   lora_path: str | None = None</span>
+</code></pre></div>
+</div>
+
+<!-- DYNAMIC LOAD/UNLOAD -->
+<h2 id="dynamic">Dynamic Load / Unload</h2>
+<p>Adapters can be loaded and unloaded at runtime via ZMQ IPC — no server restart needed.</p>
+
+<pre><code><span class="kw">from</span> tokenspeed.runtime.entrypoints.engine <span class="kw">import</span> Engine
+
+e = Engine(model=<span class="st">"Qwen/Qwen3-8B"</span>, enable_lora=<span class="nm">True</span>, max_loras=<span class="nm">4</span>, ...)
+
+<span class="cm"># Load adapter while server is live</span>
+lora_id = e.load_lora_adapter(
+    lora_name=<span class="st">"argon"</span>,
+    lora_path=<span class="st">"/path/to/peft/adapter_0"</span>,
+    pinned=<span class="nm">False</span>,          <span class="cm"># pinned=True → never evicted from GPU</span>
+)  <span class="cm"># → integer lora_id assigned by LoraRegistry</span>
+
+<span class="cm"># Generate with adapter (Python API)</span>
+out = e.generate(prompt=<span class="st">"..."</span>, lora_path=<span class="st">"argon"</span>, sampling_params={...})
+
+<span class="cm"># Free GPU slot</span>
+e.unload_lora_adapter(<span class="st">"argon"</span>)
+</code></pre>
+
+<h3>IPC Flow</h3>
+<div class="flow">
+  <div class="flow-box accent">Engine.load_lora_adapter()</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">AsyncLLM.load_lora_adapter()</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">ZMQ: LoadLoraReqInput</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box">RequestHandler.process_requests()</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-box green">EventLoop.load_lora_adapter()<br><small>→ LoraManager.load_adapter()</small></div>
+</div>
+
+<!-- NEW FILES -->
+<h2 id="files-new">New Files</h2>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>python/tokenspeed/runtime/lora/__init__.py</code></td><td>Package init, exports <code>LoraConfig</code>, <code>LoraRegistry</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/lora/lora_config.py</code></td><td><code>LoraConfig</code> — loads PEFT <code>adapter_config.json</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/lora/lora_registry.py</code></td><td><code>LoraRegistry</code> — name → int-id mapping, capacity, pinning. 11 unit tests.</td></tr>
+  <tr><td><code>python/tokenspeed/runtime/lora/lora_manager.py</code></td><td><code>LoraManager</code> — GPU pool, CPU cache, LRU eviction, TP-aware matmul</td></tr>
+  <tr><td><code>tokenspeed-scheduler/tests/cpp/test_lora_prefix_cache.cpp</code></td><td>6 C++ tests: same-adapter sharing, cross-adapter isolation, cascade eviction</td></tr>
+  <tr><td><code>test/runtime/lora/test_lora_registry.py</code></td><td>11 Python unit tests for <code>LoraRegistry</code></td></tr>
+  <tr><td><code>benchmark/test_lora_dynamic.py</code></td><td>End-to-end: dynamic load/unload, token-level isolation proof</td></tr>
+  <tr><td><code>benchmark/test_lora_batch.py</code></td><td>Mixed-batch: argon + bastion + base in same forward pass</td></tr>
+</table>
+
+<!-- MODIFIED FILES -->
+<h2 id="files-modified">Modified Files</h2>
+<table>
+  <tr><th>File</th><th>Change</th></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request_spec.h</code></td><td>Add <code>lora_id: int32_t = 0</code></td></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/scheduler/request.h/.cpp</code></td><td>Store + expose <code>LoraId()</code></td></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/resource/kv_prefix_cache/kv_prefix_cache.h/.cpp</code></td><td>Add <code>lora_id</code> param to <code>Match()</code>/<code>Insert()</code>; <code>getOrCreateLoraRoot()</code>; <code>lru_leaves_</code>; <code>namespace_depth_offset</code></td></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/resource/types.h/.cpp</code></td><td>Add <code>MatchResult::namespace_depth_offset</code></td></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/fsm/forward_events.h/.cpp</code></td><td>Thread <code>lora_id</code> through <code>FinishEvent</code>, <code>InsertHybridCache</code>, schedule events</td></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/scheduler/operations/forward.cpp</code></td><td>Pass <code>request→LoraId()</code> to all <code>Match()</code> calls and event constructors</td></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/scheduler/outside_event_handler.cpp</code></td><td>Pass <code>req→LoraId()</code> to <code>FinishEvent</code></td></tr>
+  <tr><td><code>tokenspeed-scheduler/bindings/python_module.cpp</code></td><td>Expose <code>lora_id</code> on Python <code>RequestSpec</code></td></tr>
+  <tr><td><code>tokenspeed-scheduler/csrc/resource/hybrid_prefix_cache/hybrid_prefix_cache.{h,cpp}</code></td><td>Add <code>lora_id</code> to <code>Match()</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/lora/__init__.py</code></td><td>Export <code>LoraManager</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/execution/context.py</code></td><td>Add <code>lora_weight_indices</code>, <code>lora_scalings</code>, <code>lora_manager</code> to <code>ForwardContext</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/execution/model_executor.py</code></td><td>Inject LoRA into <code>ForwardContext</code>; per-token <code>weight_indices</code> expansion</td></tr>
+  <tr><td><code>python/tokenspeed/runtime/models/qwen3.py</code></td><td>Store <code>layer_id</code>; inject <code>apply_qkv_lora</code>/<code>apply_o_lora</code>; pure-PyTorch <code>_rms_norm</code> for eager mode</td></tr>
+  <tr><td><code>python/tokenspeed/runtime/engine/io_struct.py</code></td><td>Add <code>GenerateReqInput.lora_path</code>, <code>TokenizedGenerateReqInput.lora_id</code>, <code>LoadLoraReqInput/Output</code>, <code>UnloadLoraReqInput/Output</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/engine/scheduler_utils.py</code></td><td>Add <code>lora_id</code> param to <code>make_spec()</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/engine/request_handler.py</code></td><td>Dispatch <code>LoadLoraReqInput</code>/<code>UnloadLoraReqInput</code>; callbacks to event loop</td></tr>
+  <tr><td><code>python/tokenspeed/runtime/engine/input_processor.py</code></td><td>Add <code>_resolve_lora_id()</code> — maps <code>lora_path</code> name → integer id</td></tr>
+  <tr><td><code>python/tokenspeed/runtime/engine/event_loop.py</code></td><td>Init <code>LoraManager</code>; <code>load_lora_adapter()</code>/<code>unload_lora_adapter()</code>; <code>_request_lora_ids</code> dict; pass callbacks to <code>RequestHandler</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/engine/async_llm.py</code></td><td>Add <code>_lora_path_to_id</code>; <code>load/unload_lora_communicator</code>; async methods</td></tr>
+  <tr><td><code>python/tokenspeed/runtime/engine/scheduler_control_client.py</code></td><td>Register <code>LoadLoraReqOutput</code>/<code>UnloadLoraReqOutput</code> dispatchers; async IPC methods</td></tr>
+  <tr><td><code>python/tokenspeed/runtime/entrypoints/engine_base.py</code></td><td>Abstract <code>load_lora_adapter()</code>/<code>unload_lora_adapter()</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/entrypoints/engine.py</code></td><td>Implement <code>load_lora_adapter()</code>/<code>unload_lora_adapter()</code>; expose <code>lora_path</code> in <code>generate()</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/entrypoints/openai/protocol.py</code></td><td>Add <code>lora_path</code> to <code>CompletionRequest</code> and <code>ChatCompletionRequest</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/entrypoints/openai/serving_completions.py</code></td><td>Pass <code>request.lora_path</code> to <code>GenerateReqInput</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/entrypoints/openai/serving_chat.py</code></td><td>Pass <code>request.lora_path</code> to <code>GenerateReqInput</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/utils/server_args.py</code></td><td>Add <code>--enable-lora</code>, <code>--max-loras</code>, <code>--max-lora-rank</code>; auto-set <code>enforce_eager=True</code> + <code>disable_pdl=True</code></td></tr>
+  <tr><td><code>python/tokenspeed/runtime/layers/layernorm.py</code></td><td>Revert dtype-cast attempt (PDL disable is the correct fix)</td></tr>
+</table>
+
+<!-- MEMORY LAYOUT -->
+<h2 id="memory">GPU Memory Layout</h2>
+
+<div class="cols2">
+  <div class="mem-box">
+    <h4>Buffer Structure per Module per Layer</h4>
+    <pre style="margin:0;border:none;padding:0;background:none;font-size:12px"><code>A_buffers["q_proj"][0]  shape: [n_slots, max_rank, hidden]
+┌─────────────────────────────┐
+│ slot 0  │ zeros  (base)     │
+│ slot 1  │ argon   A weights │
+│ slot 2  │ bastion A weights │
+│ slot 3  │ (empty)           │
+└─────────────────────────────┘
+B_buffers["q_proj"][0]  shape: [n_slots, q_size/tp, max_rank]
+┌─────────────────────────────┐
+│ slot 0  │ zeros  (base)     │
+│ slot 1  │ argon   B weights │
+│ slot 2  │ bastion B weights │
+│ slot 3  │ (empty)           │
+└─────────────────────────────┘
+</code></pre>
+  </div>
+  <div class="mem-box">
+    <h4>Rough GPU Memory Cost</h4>
+    <p>Qwen3-8B, rank=16, max_loras=4, tp=2:</p>
+    <div class="mem-row"><span>q_proj A+B (1 layer)</span><span>4 slots × 16 × 4096 × 2 × 2 bytes = 1 MB</span></div>
+    <div class="mem-row"><span>k_proj A+B (1 layer)</span><span>4 × 16 × 4096 × 2 × 2 = 1 MB</span></div>
+    <div class="mem-row"><span>v_proj A+B (1 layer)</span><span>4 × 16 × 4096 × 2 × 2 = 1 MB</span></div>
+    <div class="mem-row"><span>o_proj A+B (1 layer)</span><span>4 × 16 × 4096 × 2 × 2 = 1 MB</span></div>
+    <div class="mem-row" style="font-weight:600"><span>Total (36 layers)</span><span>~144 MB</span></div>
+    <p style="margin-top:8px;font-size:12px;color:var(--muted)">Negligible vs model weights (~16 GB) or KV cache (~20 GB).</p>
+  </div>
+</div>
+
+<!-- TENSOR PARALLELISM -->
+<h2 id="tp">Tensor Parallelism</h2>
+<table>
+  <tr><th>Module</th><th>Type</th><th>lora_A</th><th>lora_B</th><th>Extra step</th></tr>
+  <tr><td>q_proj, k_proj, v_proj</td><td>Column-parallel</td><td>Full (unsharded)</td><td>Sharded along output dim</td><td>None</td></tr>
+  <tr><td>o_proj</td><td>Row-parallel</td><td>Sharded along input dim</td><td>Full (unsharded)</td><td><code>all_reduce</code> of partial A output</td></tr>
+</table>
+<p>Sharding is applied in <code>LoraManager._shard_weights()</code> when the adapter is first copied to the GPU slot.</p>
+
+<!-- EAGER MODE -->
+<h2 id="eager">Eager Mode</h2>
+<p>When <code>--enable-lora</code> is set, two flags are automatically applied:</p>
+<div class="cols2">
+  <div class="note" style="margin:0">
+    <strong>enforce_eager = True</strong>
+    CUDA graphs are disabled. LoRA delta injection happens between graph nodes — replaying a captured graph without LoRA would silently skip the deltas.
+  </div>
+  <div class="note" style="margin:0">
+    <strong>disable_pdl = True</strong>
+    The TVM-JIT <code>rmsnorm_cute</code> kernel is compiled once on first call with a fixed dtype. In eager mode the dtype may differ from the CUDA-graph warmup; disabling PDL forces the standard flashinfer path which handles bfloat16 natively.
+  </div>
+</div>
+<div class="note warn" style="margin-top:12px">
+  <strong>Performance impact</strong>
+  Eager mode (no CUDA graphs) reduces decode throughput by ~20–30% compared to graph mode. A future improvement would capture separate graphs for LoRA-active and LoRA-inactive batches.
+</div>
+
+<!-- TODO -->
+<h2 id="todo">Remaining TODO</h2>
+<table>
+  <tr><th>Item</th><th>Priority</th><th>Notes</th></tr>
+  <tr><td>HTTP endpoint <code>POST /v1/lora_adapters</code> for load/unload</td><td>High</td><td>Required for server use without Python API</td></tr>
+  <tr><td>Non-Qwen3 model support</td><td>High</td><td>Inject <code>apply_qkv_lora</code>/<code>apply_o_lora</code> in other attention classes</td></tr>
+  <tr><td>CUDA graph compatibility</td><td>Medium</td><td>Capture separate graphs per active-adapter set; remove eager-mode requirement</td></tr>
+  <tr><td>MLP LoRA (gate/up/down_proj)</td><td>Medium</td><td>Add buffers + injection in <code>Qwen3MLP.forward()</code></td></tr>
+  <tr><td>Embedding + lm_head LoRA</td><td>Low</td><td>Vocabulary expansion adapters</td></tr>
+  <tr><td>Mamba + LoRA coexistence</td><td>Low</td><td><code>InsertHybridCache</code> already passes <code>lora_id</code>; Mamba slot coordination untested</td></tr>
+  <tr><td>Batched SGMV kernels (Triton/CUDA)</td><td>Medium</td><td>Current bmm loop is O(T·out·rank). Replace with Punica-style segment GEMV for multi-adapter batches.</td></tr>
+</table>
+
+</main>
+</div>
+</body>
+</html>

@@ -143,6 +143,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Read model args
         self.model_path = server_args.model
         self.served_model_name = server_args.served_model_name
+        # LoRA adapter name → integer lora_id (populated by load_lora_adapter)
+        self._lora_path_to_id: dict[str, int] = {}
         self.model_config = ModelConfig(
             server_args.model,
             trust_remote_code=server_args.trust_remote_code,

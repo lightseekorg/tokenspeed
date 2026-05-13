@@ -84,6 +84,10 @@ public:
     // request/group pairs. Tests use this to address compact tables.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
 
+    // Evict all KV pages cached under the given LoRA adapter's namespace and
+    // remove its virtual root from the prefix tree. Call on adapter unload.
+    void EvictLoraNamespace(std::int32_t lora_id);
+
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
     std::tuple<std::vector<ForwardOperation>,

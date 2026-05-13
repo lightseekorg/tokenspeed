@@ -157,6 +157,7 @@ class InputProcessor:
                 created_time=time.time(),
                 input_multi_ids=obj.input_multi_ids,
                 input_extra_infos=obj.input_extra_infos,
+                lora_id=self._resolve_lora_id(obj),
             )
 
         return TokenizedEmbeddingReqInput(
@@ -166,3 +167,20 @@ class InputProcessor:
             sampling_params,
             created_time=time.time(),
         )
+
+    def _resolve_lora_id(self, obj: "GenerateReqInput") -> int:
+        """Map obj.lora_path (adapter name or None) to an integer lora_id."""
+        lora_path = getattr(obj, "lora_path", None)
+        if lora_path is None:
+            return 0
+        lora_registry: dict = getattr(self.engine, "_lora_path_to_id", {})
+        lora_id = lora_registry.get(lora_path, 0)
+        if lora_id == 0 and lora_path:
+            from tokenspeed.runtime.utils import get_colorful_logger as _gcl
+
+            _gcl(__name__).warning(
+                "lora_path=%r is not a registered adapter name; "
+                "treating as base model. Call load_lora_adapter() first.",
+                lora_path,
+            )
+        return lora_id

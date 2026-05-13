@@ -33,14 +33,15 @@ HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkA
       mamba_eviction_manager_{mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
-MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids) {
-    auto match = kv_prefix_cache_.Match(token_ids);
+MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id) {
+    auto match = kv_prefix_cache_.Match(token_ids, lora_id);
     augmentMatch(match);
     return match;
 }
 
-MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages) {
-    auto match = kv_prefix_cache_.Match(token_pages);
+MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages,
+                                     std::int32_t lora_id) {
+    auto match = kv_prefix_cache_.Match(token_pages, lora_id);
     augmentMatch(match);
     return match;
 }

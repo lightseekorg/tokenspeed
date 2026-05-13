@@ -229,7 +229,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("rolling_hashes", &tokenspeed::RequestSpec::rolling_hashes)
-        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages);
+        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages)
+        .def_rw("lora_id", &tokenspeed::RequestSpec::lora_id);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
@@ -402,6 +403,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("get_request_token_size", &tokenspeed::Scheduler::GetRequestTokenSize, nb::arg("id"))
         .def("calc_rolling_hash", &tokenspeed::Scheduler::CalcRollingHash, nb::arg("input_tokens"),
              nb::arg("apply_match") = false)
+        .def("evict_lora_namespace", &tokenspeed::Scheduler::EvictLoraNamespace, nb::arg("lora_id"))
         .def("paged_cache_group_ids", &tokenspeed::Scheduler::PagedCacheGroupIds)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,

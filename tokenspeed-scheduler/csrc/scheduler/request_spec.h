@@ -32,6 +32,10 @@ struct RequestSpec {
     std::vector<std::int32_t> tokens;
     std::vector<std::string> rolling_hashes;
     std::int32_t storage_hit_pages{0};
+    // 0 = base model (no adapter).  >0 = LoRA adapter integer ID from
+    // LoraRegistry.  The prefix cache is namespaced per lora_id so adapters
+    // never share KV pages with different LoRA weights.
+    std::int32_t lora_id{0};
 };
 
 struct PrefillInfo {

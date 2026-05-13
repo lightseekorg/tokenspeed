@@ -42,10 +42,11 @@ _CACHE_EVENT_TYPES = {
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], lora_id: int = 0) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.lora_id = lora_id
     return spec
 
 

@@ -61,11 +61,13 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
+        layer_id: int = 0,
         tp_rank: int | None = None,
         tp_size: int | None = None,
         tp_group: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -92,11 +94,17 @@ class Qwen3MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, ctx: ForwardContext | None = None):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        # LoRA delta on the fused gate/up output (added before SiluAndMul,
+        # matching PEFT semantics).
+        if ctx is not None and ctx.lora_manager is not None:
+            gate_up = ctx.lora_manager.apply_gate_up_lora(x, gate_up, self.layer_id)
+        intermediate = self.act_fn(gate_up)
+        out, _ = self.down_proj(intermediate)
+        if ctx is not None and ctx.lora_manager is not None:
+            out = ctx.lora_manager.apply_down_lora(intermediate, out, self.layer_id)
+        return out
 
 
 class Qwen3Attention(nn.Module):
@@ -118,6 +126,7 @@ class Qwen3Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.mapping = mapping
         self.hidden_size = hidden_size
         self.tp_rank = self.mapping.attn.tp_rank
@@ -187,12 +196,16 @@ class Qwen3Attention(nn.Module):
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
+        # Per-head RMSNorm via the fused flashinfer kernel.  An earlier
+        # ``--enable-lora`` workaround dispatched a pure-PyTorch RMSNorm
+        # here to dodge a JIT-dtype mismatch in the rmsnorm_cute (PDL)
+        # path; that's now obsolete because ``--enable-lora`` forces
+        # ``disable_pdl=True`` so the fused flashinfer rmsnorm is used.
+        # The pure-PyTorch path cost ~138 us / layer in eager decode (24%
+        # of step time) due to many small kernel launches per call.
+        q_shape, k_shape = q.shape, k.shape
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q_shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
         return q, k
 
     def _rotate_half(self, x):
@@ -212,6 +225,14 @@ class Qwen3Attention(nn.Module):
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+
+        # LoRA delta for Q/K/V projections (segment-grouped Triton path).
+        # The manager's batch_info holds persistent buffers, so this call
+        # is safe to record into a CUDA graph: replay updates batch_info
+        # in place before graph.replay().
+        if ctx.lora_manager is not None:
+            qkv = ctx.lora_manager.apply_qkv_lora(hidden_states, qkv, self.layer_id)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
@@ -219,6 +240,11 @@ class Qwen3Attention(nn.Module):
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
+
+        # LoRA delta for O projection
+        if ctx.lora_manager is not None:
+            output = ctx.lora_manager.apply_o_lora(attn_output, output, self.layer_id)
+
         return output
 
 
@@ -262,6 +288,7 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            layer_id=layer_id,
             tp_rank=self.mapping.dense.tp_rank,
             tp_size=self.mapping.dense.tp_size,
             tp_group=self.mapping.dense.tp_group,
@@ -326,7 +353,7 @@ class Qwen3DecoderLayer(nn.Module):
                     residual,
                 )
             )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, ctx)
         return hidden_states, residual
 
 

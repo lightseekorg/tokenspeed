@@ -123,6 +123,30 @@ KVPrefixCache::KVPrefixCache(PageAllocator* device_allocator, PageAllocator* hos
       host_(host_allocator),
       enable_l3_storage_(enable_l3_storage) {}
 
+TreeNode* KVPrefixCache::getOrCreateLoraRoot(std::int32_t lora_id) {
+    auto& slot = lora_virtual_roots_[lora_id];
+    // Re-create if null or if the node was pruned from the tree (parent == nullptr
+    // while not the real root means it was removed by PruneEmptyByNode).
+    if (slot != nullptr && slot->Parent() != nullptr) {
+        return slot;
+    }
+    // Sentinel page: [-lora_id, 0, ..., 0].  Negative token IDs never appear in
+    // real vocabularies (which are always non-negative), so there is no collision.
+    const std::int32_t page_size = tree_.PageSize();
+    token_vec_t sentinel(page_size, 0);
+    sentinel[0] = -lora_id;
+    auto node = std::make_unique<TreeNode>(sentinel, std::chrono::steady_clock::now());
+    TreeNode* raw = node.get();
+    // Attach an empty DeviceResource so OnDevice() returns true.
+    // This prevents PruneEmptyByNode from removing the virtual root even when
+    // all adapter sequences have been evicted.
+    raw->AttachResource<ResourceType::Device>(std::make_unique<NodeResource<ResourceType::Device>>(OwnedPages{}));
+    token_vec_t key(sentinel.begin(), sentinel.begin() + page_size);
+    tree_.Root()->AddChild(key, std::move(node));
+    slot = raw;
+    return raw;
+}
+
 void KVPrefixCache::SetKvEventSink(KvEventSink sink) {
     kv_event_sink_ = std::move(sink);
     if (!kv_event_sink_) {
@@ -158,7 +182,7 @@ void KVPrefixCache::recordDeviceBlockRemoved(TreeNode* node) {
     }
 }
 
-MatchResult KVPrefixCache::Match(const token_vec_t& token_ids) {
+MatchResult KVPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id) {
     const auto access_time = std::chrono::steady_clock::now();
     const std::int32_t page_size = tree_.PageSize();
     if (token_ids.size() % page_size != 0) {
@@ -166,21 +190,28 @@ MatchResult KVPrefixCache::Match(const token_vec_t& token_ids) {
                                  std::to_string(token_ids.size()) + "; page_size=" + std::to_string(page_size));
     }
 
-    WalkResult walk_result = tree_.WalkDownUtilMismatch(token_ids, access_time);
+    TreeNode* start_node = resolveStartNode(lora_id);
+    WalkResult walk_result = tree_.WalkDownUtilMismatch(token_ids, access_time, start_node);
     MatchResult& match = walk_result.match;
     match.device.page_size = page_size;
     match.host.page_size = page_size;
+    if (lora_id != kLoraNone) {
+        // The virtual namespace root contributes 1 sentinel page to absolute tree
+        // depth.  Subtract it so callers see the number of real matched token pages.
+        match.device.namespace_depth_offset = 1;
+        match.host.namespace_depth_offset = 1;
+    }
     return match;
 }
 
-MatchResult KVPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages) {
-    return Match(FlattenPages(token_pages, 0, token_pages.size()));
+MatchResult KVPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages, std::int32_t lora_id) {
+    return Match(FlattenPages(token_pages, 0, token_pages.size()), lora_id);
 }
 
 template <ResourceType RType>
 InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vector<std::int32_t>& prefix_pages,
                                    OwnedPages allocator_pages, const std::vector<std::string>& page_hashs,
-                                   TreeNode* start_node) {
+                                   TreeNode* start_node, std::int32_t lora_id) {
     const std::int32_t page_size = tree_.PageSize();
     auto insert_result = InsertResult{
         .last_node = tree_.Root(),
@@ -200,8 +231,12 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
     const auto& alloc_ids = allocator_pages.Ids();
     page_ids.insert(page_ids.end(), alloc_ids.begin(), alloc_ids.end());
 
-    WalkResult walk_result =
-        tree_.WalkDownUtilMismatch(token_slice{token_ids.data(), total_pages * page_size}, access_time, start_node);
+    // When start_node is nullptr (no prior match), resolve the LoRA namespace root.
+    // When start_node is provided (continuation from a prior match), the caller
+    // already points into the correct namespace subtree.
+    TreeNode* effective_start = (start_node != nullptr) ? start_node : resolveStartNode(lora_id);
+    WalkResult walk_result = tree_.WalkDownUtilMismatch(token_slice{token_ids.data(), total_pages * page_size},
+                                                        access_time, effective_start);
 
     token_slice mistmatched_tokens = walk_result.remaining_tokens;
     TreeNode* current = walk_result.terminal;
@@ -298,9 +333,10 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
 template <ResourceType RType>
 InsertResult KVPrefixCache::Insert(const std::vector<std::span<const std::int32_t>>& token_pages,
                                    const std::vector<std::int32_t>& prefix_pages, OwnedPages allocator_pages,
-                                   const std::vector<std::string>& page_hashs, TreeNode* start_node) {
+                                   const std::vector<std::string>& page_hashs, TreeNode* start_node,
+                                   std::int32_t lora_id) {
     return Insert<RType>(FlattenPages(token_pages, 0, token_pages.size()), prefix_pages, std::move(allocator_pages),
-                         page_hashs, start_node);
+                         page_hashs, start_node, lora_id);
 }
 
 template <ResourceType RType>
@@ -338,24 +374,52 @@ cache_op_id KVPrefixCache::AllocateCacheOpId() {
     return next_op_id_++;
 }
 
-template InsertResult KVPrefixCache::Insert<ResourceType::Device>(const token_vec_t& token_ids,
-                                                                  const std::vector<std::int32_t>& prefix_pages,
-                                                                  OwnedPages allocator_pages,
-                                                                  const std::vector<std::string>& page_hashs,
-                                                                  TreeNode* start_node);
+void KVPrefixCache::EvictLoraNamespace(std::int32_t lora_id) {
+    auto it = lora_virtual_roots_.find(lora_id);
+    if (it == lora_virtual_roots_.end() || it->second == nullptr) {
+        return;
+    }
+    TreeNode* vroot = it->second;
 
-template InsertResult KVPrefixCache::Insert<ResourceType::Host>(const token_vec_t& token_ids,
-                                                                const std::vector<std::int32_t>& prefix_pages,
-                                                                OwnedPages allocator_pages,
-                                                                const std::vector<std::string>& page_hashs,
-                                                                TreeNode* start_node);
+    // Collect all descendant nodes via DFS (excluding the virtual root itself,
+    // which holds no real KV pages).
+    std::vector<TreeNode*> descendants;
+    std::function<void(TreeNode*)> collect = [&](TreeNode* node) {
+        for (auto& [key, child] : node->Children()) {
+            if (!child) continue;
+            descendants.push_back(child.get());
+            collect(child.get());
+        }
+    };
+    collect(vroot);
 
+    // Evict device and host pages. OwnedPages RAII returns them to the allocator.
+    device_.EvictSubtree(descendants);
+    host_.EvictSubtree(descendants);
+
+    // Remove the virtual root from the tree. The unique_ptr cascade destroys the
+    // entire subtree (including any mamba slots attached to those nodes).
+    token_vec_t sentinel(tree_.PageSize(), 0);
+    sentinel[0] = -lora_id;
+    tree_.Root()->RemoveChild(sentinel);
+
+    lora_virtual_roots_.erase(it);
+}
+
+template InsertResult KVPrefixCache::Insert<ResourceType::Device>(const token_vec_t&, const std::vector<std::int32_t>&,
+                                                                  OwnedPages, const std::vector<std::string>&,
+                                                                  TreeNode*, std::int32_t);
+template InsertResult KVPrefixCache::Insert<ResourceType::Host>(const token_vec_t&, const std::vector<std::int32_t>&,
+                                                                OwnedPages, const std::vector<std::string>&, TreeNode*,
+                                                                std::int32_t);
 template InsertResult KVPrefixCache::Insert<ResourceType::Device>(const std::vector<std::span<const std::int32_t>>&,
                                                                   const std::vector<std::int32_t>&, OwnedPages,
-                                                                  const std::vector<std::string>&, TreeNode*);
+                                                                  const std::vector<std::string>&, TreeNode*,
+                                                                  std::int32_t);
 template InsertResult KVPrefixCache::Insert<ResourceType::Host>(const std::vector<std::span<const std::int32_t>>&,
                                                                 const std::vector<std::int32_t>&, OwnedPages,
-                                                                const std::vector<std::string>&, TreeNode*);
+                                                                const std::vector<std::string>&, TreeNode*,
+                                                                std::int32_t);
 
 template bool KVPrefixCache::EnsureCapacityByEvict<ResourceType::Device>(std::int32_t required_num_pages);
 template bool KVPrefixCache::EnsureCapacityByEvict<ResourceType::Host>(std::int32_t required_num_pages);

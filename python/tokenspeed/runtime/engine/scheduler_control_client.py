@@ -47,6 +47,8 @@ from tokenspeed.runtime.engine.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoraReqInput,
+    LoadLoraReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -56,6 +58,8 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeMemoryOccupationReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    UnloadLoraReqInput,
+    UnloadLoraReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -178,6 +182,12 @@ class SchedulerControlClient:
             server_args.mapping.attn.dp_size,
             mode="watching",
         )
+        self.load_lora_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.unload_lora_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -232,8 +242,39 @@ class SchedulerControlClient:
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
                 ),
+                (
+                    LoadLoraReqOutput,
+                    self.load_lora_communicator.handle_recv,
+                ),
+                (
+                    UnloadLoraReqOutput,
+                    self.unload_lora_communicator.handle_recv,
+                ),
             ]
         )
+
+    async def load_lora_adapter(
+        self: "AsyncLLM",
+        lora_name: str,
+        lora_path: str,
+        pinned: bool = False,
+    ) -> tuple[bool, int, str]:
+        """Send a LoadLoraReqInput to the scheduler subprocess."""
+        result = (
+            await self.load_lora_communicator(
+                LoadLoraReqInput(
+                    lora_name=lora_name, lora_path=lora_path, pinned=pinned
+                )
+            )
+        )[0]
+        return result.success, result.lora_id, result.message
+
+    async def unload_lora_adapter(self: "AsyncLLM", lora_name: str) -> tuple[bool, str]:
+        """Send an UnloadLoraReqInput to the scheduler subprocess."""
+        result = (
+            await self.unload_lora_communicator(UnloadLoraReqInput(lora_name=lora_name))
+        )[0]
+        return result.success, result.message
 
     async def flush_cache(self: AsyncLLM) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]

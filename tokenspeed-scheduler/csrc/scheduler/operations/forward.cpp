@@ -68,8 +68,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
-                                                    : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    MatchResult match_result = hybrid_prefix_cache_
+                                   ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), request->LoraId())
+                                   : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), request->LoraId());
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
@@ -156,7 +157,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
-                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr, request->LoraId()};
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
@@ -178,14 +179,14 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
-                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr, request->LoraId()};
 }
 
 std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(
     Request* request, std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
 
-    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true), request->LoraId());
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
 
     const std::int32_t device_matched2 = match_result.device.DepthInPage();
@@ -262,9 +263,10 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
 
     OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
 
-    kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
+    kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
+                                                  /*page_hashs=*/{}, /*start_node=*/nullptr, request->LoraId());
 
-    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens);
+    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, request->LoraId());
 
     std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
     const std::int32_t device_matched3 = match_result.device.DepthInPage();

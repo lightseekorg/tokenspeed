@@ -115,6 +115,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_mamba_eviction.cpp
         tests/cpp/test_mamba_cache.cpp
         tests/cpp/test_mamba_integration.cpp
+        tests/cpp/test_lora_prefix_cache.cpp
         tests/cpp/test_kv_cache_events.cpp
         tests/cpp/test_eviction_lru.cpp
         tests/cpp/test_host_node_ref_lifetime.cpp

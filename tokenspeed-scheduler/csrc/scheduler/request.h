@@ -53,6 +53,7 @@ public:
     Request(const RequestSpec& spec, std::int32_t page_size, Role role);
 
     std::string Id() const { return id_; }
+    std::int32_t LoraId() const { return lora_id_; }
 
     // Keep Apply the only non-const function in Request
     // The wrapper lambda converts any concrete state type returned by event's operator()
@@ -273,6 +274,7 @@ public:
 
 private:
     std::string id_;
+    std::int32_t lora_id_{0};
     TokenContainer token_container_;
     std::int32_t page_size_;
     fsm::State state_;

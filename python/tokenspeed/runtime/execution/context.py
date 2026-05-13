@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -33,6 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.lora.lora_manager import LoraManager
 
 
 @dataclass
@@ -59,3 +60,11 @@ class ForwardContext:
 
     # --- logits processor ---
     keep_full_logits: bool = False
+
+    # --- LoRA ---
+    # Reference to the LoraManager.  When set, forward layers call
+    # ``lora_manager.apply_qkv_lora`` / ``apply_o_lora`` which read from
+    # the manager's persistent batch_info.  Set at capture time when
+    # ``--enable-lora`` is on so the LoRA path is recorded into the graph
+    # (slot 0 = no-adapter zero-delta), otherwise None.
+    lora_manager: Optional["LoraManager"] = None

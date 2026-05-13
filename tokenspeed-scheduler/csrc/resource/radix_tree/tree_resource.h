@@ -108,6 +108,9 @@ public:
     void UpdateLeaves(TreeNode* node);
     std::vector<TreeNode*> Evict(std::int32_t num_pages);
     std::vector<TreeNode*> EnsureCapacity(std::int32_t required_num_pages);
+    // Evict all pages held by the given nodes (e.g. a LoRA namespace subtree).
+    // Locked nodes are skipped — their pages are freed when the request finishes.
+    void EvictSubtree(const std::vector<TreeNode*>& nodes);
 
     // Called by NodeResource::Unlock() when ref_count transitions 1→0.
     void OnNodeEvictable(TreeNode* node) { updateLeaf(node); }
