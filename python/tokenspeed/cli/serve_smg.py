@@ -43,6 +43,9 @@ from tokenspeed.runtime.utils.process import kill_process_tree
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_GATEWAY_HOST = "0.0.0.0"
+DEFAULT_GATEWAY_PORT = 8000
+
 
 def _check_serve_extra_installed() -> None:
     import importlib.util
@@ -71,12 +74,12 @@ def _check_serve_extra_installed() -> None:
 def _user_host_port_from_gateway_args(gateway_args: list[str]) -> tuple[str, int]:
     """Pull --host / --port out of the gateway-bound argv.
 
-    Defaults match smg's clap (host=0.0.0.0, port=30000). The argv MUST
+    Defaults match TokenSpeed's public serving endpoint. The argv MUST
     be in canonical ``[--flag, value, ...]`` form as produced by
     ``split_argv``; equals-form (``--port=8000``) is not handled here.
     """
-    host = "0.0.0.0"
-    port = 30000
+    host = DEFAULT_GATEWAY_HOST
+    port = DEFAULT_GATEWAY_PORT
     it = iter(gateway_args)
     for token in it:
         if token == "--host":
@@ -84,6 +87,12 @@ def _user_host_port_from_gateway_args(gateway_args: list[str]) -> tuple[str, int
         elif token == "--port":
             port = int(next(it))
     return host, port
+
+
+def _gateway_args_with_default_port(gateway_args: list[str]) -> list[str]:
+    if "--port" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)]
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -265,11 +274,12 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
-    user_host, user_port = _user_host_port_from_gateway_args(split.gateway)
+    gateway_args = _gateway_args_with_default_port(split.gateway)
+    user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
     rc = asyncio.run(
         run_smg(
             engine_args=split.engine,
-            gateway_args=split.gateway,
+            gateway_args=gateway_args,
             opts=split.opts,
             user_host=user_host,
             user_port=user_port,

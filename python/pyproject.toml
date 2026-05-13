@@ -58,6 +58,7 @@ dependencies = [
     "pybind11",
     "pydantic",
     "py-spy",
+    "pytest-asyncio",
     "python-multipart",
     "pyzmq",
     "requests",
