@@ -217,7 +217,7 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
 
 
 def _wait_for_server(port: int, timeout: int = SERVER_LAUNCH_TIMEOUT) -> bool:
-    url = f"http://127.0.0.1:{port}/health"
+    url = f"http://127.0.0.1:{port}/readiness"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
