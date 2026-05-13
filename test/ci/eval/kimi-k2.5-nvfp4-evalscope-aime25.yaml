@@ -19,7 +19,6 @@ server:
     --tp 4
     --max-model-len 80000
     --trust-remote-code
-    --reasoning-parser none
     --attention-backend tokenspeed_mla
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
