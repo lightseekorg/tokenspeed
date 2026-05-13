@@ -349,8 +349,6 @@ class CudaGraphWrapper:
             grammar_backend=self.grammar_backend,
         )
 
-        self._init_capture_metadata(bs)
-
         def run_once():
             # Dummy add_batch keeps the grammar queue 1:1 with replays —
             # fetch_batch pops once per forward, so warmup + capture
@@ -369,6 +367,7 @@ class CudaGraphWrapper:
                 self.sampling_backend.prepare_capture(
                     bs=bs, num_tokens_per_req=self.max_tokens_per_req
                 )
+            self._init_capture_metadata(bs)
             run_once()
 
         # Clear any per-pool state that warm-up dirtied at pool row 0,
@@ -384,6 +383,7 @@ class CudaGraphWrapper:
             self.sampling_backend.prepare_capture(
                 bs=bs, num_tokens_per_req=self.max_tokens_per_req
             )
+        self._init_capture_metadata(bs)
 
         self.deepep_adapter.capture()
 
@@ -585,13 +585,16 @@ class CudaGraphWrapper:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
+            draft_attn_kwargs = {}
+            if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
+                draft_attn_kwargs["actual_bs"] = actual_bs
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,
-                forward_mode=ForwardMode.DECODE,
-                **kwargs,
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                **draft_attn_kwargs,
             )
 
     @nvtx_range("attn_meta_prep", color="orange")

@@ -323,12 +323,17 @@ class Eagle(BaseDrafter):
                 all_decode_or_idle=draft_input.all_decode_or_idle,
             )
 
+            out_cache_loc = cache_locs[:, i - 1].contiguous()
+            # Keep attention metadata on the accepted prefix; rejected verify
+            # tail slots may still contain stale draft KV.
+            ctx.attn_backend.advance_draft_forward_metadata(draft_seq_lens)
+
             with nvtx_range("draft_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
                     input_ids=self._map_hot(draft_ids),
                     positions=positions,
-                    out_cache_loc=cache_locs_trans[i - 1],
+                    out_cache_loc=out_cache_loc,
                     input_lengths=input_lengths,
                     captured_hidden_states=logits_output.hidden_states,
                 )

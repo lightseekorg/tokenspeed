@@ -35,8 +35,10 @@ from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     ModelConfig,
+    _derive_num_attention_layers,
     configure_deepseek_v4_attention,
     is_deepseek_v4,
+    is_deepseek_v4_nextn,
 )
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
@@ -92,6 +94,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     mhc_pre,
     pack_topk_as_router_logits,
 )
+from tokenspeed.runtime.models.deepseek_v4_mtp import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import (
     global_server_args_dict,
@@ -869,6 +872,146 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(deepseek_v4_swa_row_bytes(head_dim, rope_dim), 584)
         self.assertEqual(deepseek_v4_indexer_fp8_row_bytes(index_head_dim), 132)
         self.assertEqual(deepseek_v4_indexer_mxfp4_row_bytes(index_head_dim), 68)
+    def test_deepseek_v4_nextn_architecture_uses_v4_runtime_metadata(self):
+        model_config = object.__new__(ModelConfig)
+        model_config.hf_config = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLMNextN"],
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            rope_scaling=None,
+        )
+
+        self.assertTrue(is_deepseek_v4(model_config.hf_config))
+        self.assertTrue(is_deepseek_v4_nextn(model_config.hf_config))
+
+        configure_deepseek_v4_attention(model_config)
+
+        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
+        self.assertEqual(model_config.head_dim, 512)
+        self.assertEqual(model_config.qk_nope_head_dim, 448)
+        self.assertEqual(
+            _derive_num_attention_layers(
+                SimpleNamespace(
+                    architectures=["DeepseekV4ForCausalLMNextN"],
+                    num_nextn_predict_layers=1,
+                ),
+                num_hidden_layers=43,
+            ),
+            1,
+        )
+        self.assertFalse(is_deepseek_v4(SimpleNamespace(architectures=None)))
+        self.assertFalse(is_deepseek_v4_nextn(SimpleNamespace()))
+        self.assertEqual(
+            _derive_num_attention_layers(
+                SimpleNamespace(architectures=None),
+                num_hidden_layers=43,
+            ),
+            43,
+        )
+
+    def test_deepseek_v4_mtp_checkpoint_name_remap(self):
+        model = object.__new__(DeepseekV4ForCausalLMNextN)
+        model.config = SimpleNamespace(
+            num_hidden_layers=43,
+            num_nextn_predict_layers=1,
+        )
+
+        self.assertEqual(
+            model._map_checkpoint_name("mtp.0.emb.tok_emb.weight"),
+            "model.embed_tokens.weight",
+        )
+        self.assertEqual(
+            model._map_checkpoint_name("mtp.0.norm.weight"),
+            "model.layers.43.shared_head.norm.weight",
+        )
+        self.assertEqual(
+            model._map_checkpoint_name("mtp.0.attn.wq_a.weight"),
+            "model.layers.43.mtp_block.attn.wq_a.weight",
+        )
+        self.assertEqual(
+            model._map_checkpoint_name("mtp.0.ffn.experts.7.w1.scale"),
+            "model.layers.43.mtp_block.ffn.experts.7.w1.weight_scale",
+        )
+        self.assertIsNone(model._map_checkpoint_name("mtp.0.head.weight"))
+        self.assertIsNone(model._map_checkpoint_name("model.layers.43.head.weight"))
+        self.assertIsNone(model._map_checkpoint_name("model.layers.1.attn.wq_a.weight"))
+
+    def test_deepseek_v4_attention_layout_matches_compressed_cache_contract(self):
+        config = SimpleNamespace(
+            compress_ratios=[0, 4, 128],
+            num_attention_heads=64,
+            head_dim=512,
+            qk_rope_head_dim=64,
+            sliding_window=128,
+            index_head_dim=128,
+        )
+
+        swa = deepseek_v4_attention_layout(config, 0, attn_tp_size=4)
+        csa = deepseek_v4_attention_layout(config, 1, attn_tp_size=4)
+        csa_fp4 = deepseek_v4_attention_layout(
+            config, 1, attn_tp_size=4, use_fp4_indexer_cache=True
+        )
+        hca = deepseek_v4_attention_layout(config, 2, attn_tp_size=4)
+
+        self.assertEqual(swa.kind, "swa")
+        self.assertEqual(swa.compress_ratio, 1)
+        self.assertEqual(swa.num_local_heads, 16)
+        self.assertEqual(swa.padded_heads, 64)
+        self.assertEqual(swa.nope_head_dim, 448)
+        self.assertEqual(swa.swa_head_bytes, 584)
+        self.assertFalse(swa.needs_compressed_cache)
+        self.assertFalse(swa.needs_indexer)
+
+        self.assertEqual(csa.kind, "csa")
+        self.assertEqual(csa.compress_ratio, 4)
+        self.assertTrue(csa.needs_compressed_cache)
+        self.assertTrue(csa.needs_indexer)
+        self.assertEqual(csa.compressed_cache_alignment, 576)
+        self.assertEqual(csa.indexer_cache_head_bytes, 132)
+        self.assertEqual(csa_fp4.indexer_cache_head_bytes, 68)
+
+        self.assertEqual(hca.kind, "hca")
+        self.assertEqual(hca.compress_ratio, 128)
+        self.assertTrue(hca.needs_compressed_cache)
+        self.assertFalse(hca.needs_indexer)
+
+    def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
+        config = SimpleNamespace(
+            compress_ratios=[0, 4, 128, 0],
+            head_dim=512,
+            index_head_dim=128,
+        )
+
+        layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=64,
+            use_fp4_indexer_cache=True,
+            layer_indices=range(3, 4),
+        )
+
+        self.assertEqual(layout.layer_ratio, (1,))
+        self.assertEqual(layout.cache_cell_size(1), layout.swa_cell_bytes())
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            deepseek_v4_cache_layout_from_config(
+                config,
+                page_size=64,
+                use_fp4_indexer_cache=True,
+                layer_indices=range(4, 5),
+            )
+
+    def test_deepseek_v4_attention_layout_rejects_unknown_ratio(self):
+        config = SimpleNamespace(
+            compress_ratios=[8],
+            num_attention_heads=64,
+            head_dim=512,
+            qk_rope_head_dim=64,
+            sliding_window=128,
+            index_head_dim=128,
+        )
+
+        with self.assertRaisesRegex(ValueError, "compress_ratio=8"):
+            deepseek_v4_attention_layout(config, 0)
 
     def test_deepseek_v4_rope_config_matches_layer_type(self):
         config = SimpleNamespace(
@@ -1312,6 +1455,34 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
+    def test_deepseek_v4_kv_pool_requires_matching_layout_layers(self):
+        config = SimpleNamespace(
+            compress_ratios=[1],
+            head_dim=512,
+            index_head_dim=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=64,
+            use_fp4_indexer_cache=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "layer_num"):
+            DeepseekV4TokenToKVPool(
+                size=128,
+                model_dtype=torch.bfloat16,
+                layout=layout,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                max_batch_size=2,
+                max_context_len=128,
+                page_size=64,
+                rank=0,
+                hf_config=config,
+                max_scheduled_tokens=1,
+            )
+
     def test_deepseek_v4_metadata_maps_compressed_slots(self):
         compressed_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
         metadata = _make_deepseek_v4_forward_metadata(
@@ -1643,6 +1814,154 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(calls[1][6], 0)
         self.assertTrue(torch.equal(out[:3], torch.ones((3, 2, 4))))
         self.assertTrue(torch.equal(out[3:], torch.full((2, 2, 4), 2.0)))
+
+    def test_deepseek_v4_mixed_prefill_uses_current_slice(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=8,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=576,
+                context_len=256,
+            )
+        )
+        stale_prefill_metadata = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            num_prefill_reqs=1,
+            req_pool_indices=torch.tensor([99], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([9, 9, 9], dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+        )
+        backend.forward_prefill_metadata = stale_prefill_metadata
+        backend.init_forward_metadata(
+            bs=3,
+            num_tokens=5,
+            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
+            forward_mode=ForwardMode.MIXED,
+            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
+            num_extends=1,
+        )
+        mixed_metadata = backend.forward_metadata
+        self.assertIs(backend.forward_prefill_metadata, stale_prefill_metadata)
+
+        calls = []
+
+        def fake_prefill_chunk(**kwargs):
+            metadata = backend.forward_metadata
+            calls.append(
+                (
+                    "prefill",
+                    metadata.req_pool_indices.tolist(),
+                    metadata.token_to_req_indices.tolist(),
+                    metadata.forward_mode,
+                )
+            )
+            q = kwargs["q"]
+            return q.new_full((q.shape[0], 1, 2), 1.0)
+
+        def fake_decode(**kwargs):
+            metadata = backend.forward_metadata
+            calls.append(
+                (
+                    "decode",
+                    metadata.req_pool_indices.tolist(),
+                    metadata.token_to_req_indices.tolist(),
+                    metadata.forward_mode,
+                )
+            )
+            q = kwargs["q"]
+            return q.new_full((q.shape[0], 1, 2), 2.0)
+
+        backend._forward_deepseek_v4_prefill_chunk = fake_prefill_chunk
+        backend.forward_deepseek_v4_decode = fake_decode
+        out = backend.forward_deepseek_v4_mixed(
+            q=torch.zeros((5, 1, 2), dtype=torch.float32),
+            positions=torch.arange(5, dtype=torch.int32),
+            token_to_kv_pool=SimpleNamespace(),
+            layer_id=0,
+            kind="mla",
+            compress_ratio=4,
+            num_local_heads=1,
+            padded_heads=1,
+            head_dim=2,
+            window_size=4,
+            softmax_scale=1.0,
+            attn_sink=torch.zeros(1),
+            topk_indices=None,
+        )
+
+        self.assertEqual(calls[0][0], "prefill")
+        self.assertEqual(calls[0][1], [0])
+        self.assertEqual(calls[0][2], [0, 0, 0])
+        self.assertTrue(calls[0][3].is_extend())
+        self.assertEqual(calls[1][0], "decode")
+        self.assertEqual(calls[1][1], [1, 2])
+        self.assertEqual(calls[1][2], [0, 1])
+        self.assertTrue(calls[1][3].is_decode())
+        self.assertIs(backend.forward_metadata, mixed_metadata)
+        self.assertTrue(torch.equal(out[:3], torch.ones((3, 1, 2))))
+        self.assertTrue(torch.equal(out[3:], torch.full((2, 1, 2), 2.0)))
+
+    def test_deepseek_v4_spec_metadata_requires_uniform_pack(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=4096,
+                speculative_num_draft_tokens=4,
+            )
+        )
+
+        backend.init_forward_metadata(
+            bs=2,
+            num_tokens=8,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+        )
+        self.assertTrue(
+            torch.equal(
+                backend.forward_metadata.query_lens,
+                torch.tensor([4, 4], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(backend.forward_metadata.forward_mode, ForwardMode.DECODE)
+        self.assertEqual(backend.forward_metadata.num_prefill_reqs, 0)
+        self.assertEqual(backend.forward_metadata.decode_req_count(), 2)
+        self.assertEqual(backend.forward_metadata.decode_token_count(), 8)
+
+        backend.init_forward_metadata(
+            bs=2,
+            num_tokens=8,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+        )
+        self.assertEqual(backend.forward_metadata.forward_mode, ForwardMode.DECODE)
+        self.assertIs(backend.forward_prefill_metadata, backend.forward_metadata)
+        self.assertIs(backend.forward_decode_metadata, backend.forward_metadata)
+
+        with self.assertRaisesRegex(RuntimeError, "uniformly packed"):
+            backend.init_forward_metadata(
+                bs=2,
+                num_tokens=7,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            )
 
     def test_deepseek_v4_decode_backend_maps_compressed_slots_batched(self):
         backend = DeepseekV4AttentionBackend(
@@ -2135,6 +2454,309 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.full((2, 1), 9, dtype=torch.int32),
             )
         )
+
+    def test_deepseek_v4_cuda_graph_target_verify_uses_packed_decode_metadata(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=128,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=4)
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+        )
+
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.forward_mode, ForwardMode.DECODE)
+        self.assertTrue(
+            torch.equal(metadata.seq_lens, torch.full((4,), 4, dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(metadata.query_lens, torch.full((4,), 4, dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.query_start_loc,
+                torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.token_to_req_indices,
+                torch.tensor(
+                    [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+                    dtype=torch.int32,
+                ),
+            )
+        )
+        self.assertEqual(metadata.decode_token_count(), 16)
+
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=4,
+            actual_bs=2,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_to_page=torch.tensor(
+                [
+                    [10, 11],
+                    [20, 21],
+                    [30, 31],
+                    [40, 41],
+                ],
+                dtype=torch.int32,
+            ),
+        )
+
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.forward_mode, ForwardMode.DECODE)
+        self.assertTrue(
+            torch.equal(
+                metadata.is_valid_token,
+                torch.tensor(
+                    [True] * 8 + [False] * 8,
+                    dtype=torch.bool,
+                ),
+            )
+        )
+        self.assertEqual(metadata.decode_req_count(), 4)
+        self.assertEqual(metadata.decode_token_count(), 16)
+
+    def test_deepseek_v4_cuda_graph_draft_extend_advances_decode_metadata(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=128,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=4)
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+        )
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=4,
+            actual_bs=2,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            req_to_page=torch.tensor(
+                [
+                    [10, 11],
+                    [20, 21],
+                    [30, 31],
+                    [40, 41],
+                ],
+                dtype=torch.int32,
+            ),
+        )
+
+        self.assertIs(backend.forward_prefill_metadata, backend.forward_metadata)
+        backend.advance_draft_forward_metadata()
+
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.forward_mode, ForwardMode.DECODE)
+        self.assertTrue(
+            torch.equal(
+                metadata.seq_lens,
+                torch.tensor([71, 4, 2, 2], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.is_valid_token,
+                torch.tensor([True, True, False, False], dtype=torch.bool),
+            )
+        )
+        self.assertEqual(metadata.decode_token_count(), 4)
+
+        first_decode_metadata = metadata
+        cached_swa = torch.empty((4, 8), dtype=torch.int32)
+        first_decode_metadata.attention.decode_swa_indices = cached_swa
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+        )
+        backend.advance_draft_forward_metadata()
+        self.assertIs(backend.forward_metadata, first_decode_metadata)
+        self.assertIs(backend.forward_metadata.attention.decode_swa_indices, cached_swa)
+
+    def test_deepseek_v4_eager_draft_decode_refreshes_stale_graph_metadata(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=128,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=4)
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+        )
+        self.assertEqual(backend._draft_decode_metadata.token_to_req_indices.numel(), 4)
+
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([6], dtype=torch.int32)
+        req_to_page = torch.tensor([[10]], dtype=torch.int32)
+        backend.init_forward_metadata(
+            bs=1,
+            num_tokens=6,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=ForwardMode.EXTEND,
+            req_to_page=req_to_page,
+        )
+        backend.init_forward_metadata(
+            bs=1,
+            num_tokens=1,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            req_to_page=req_to_page,
+        )
+        backend.advance_draft_forward_metadata()
+
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.forward_mode, ForwardMode.DECODE)
+        self.assertEqual(metadata.token_to_req_indices.numel(), 1)
+        self.assertEqual(metadata.decode_token_count(), 1)
+        self.assertTrue(
+            torch.equal(
+                metadata.token_to_req_indices,
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
+    def test_deepseek_v4_prefill_uses_prefill_metadata_slot(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                head_dim=512,
+                context_len=128,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        prefill_metadata = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            num_prefill_reqs=1,
+            seq_lens=torch.tensor([6], dtype=torch.int32),
+            token_to_req_indices=torch.zeros(6, dtype=torch.int32),
+        )
+        decode_metadata = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        backend.forward_prefill_metadata = prefill_metadata
+        backend.forward_metadata = decode_metadata
+
+        def fake_prefill_chunk(**kwargs):
+            self.assertIs(backend.forward_metadata, prefill_metadata)
+            q = kwargs["q"]
+            return q.new_zeros((q.shape[0], 1, 2))
+
+        backend._forward_deepseek_v4_prefill_chunk = fake_prefill_chunk
+        out = backend.forward_deepseek_v4_prefill(
+            q=torch.empty((6, 1, 2), dtype=torch.bfloat16),
+            positions=torch.arange(6, dtype=torch.int64),
+            token_to_kv_pool=SimpleNamespace(),
+            layer_id=0,
+            kind="test",
+            compress_ratio=1,
+            num_local_heads=1,
+            padded_heads=1,
+            head_dim=2,
+            window_size=64,
+            softmax_scale=1.0,
+            attn_sink=torch.empty((1,), dtype=torch.float32),
+            topk_indices=None,
+        )
+
+        self.assertEqual(out.shape, (6, 1, 2))
+        self.assertIs(backend.forward_metadata, prefill_metadata)
+
+    def test_deepseek_v4_indexer_decode_batches_cache_reads(self):
+        torch.manual_seed(0)
+        positions = torch.tensor([15, 7, 3], dtype=torch.int64)
+        token_to_req_indices = torch.tensor([0, 1, 2], dtype=torch.int32)
+        block_table = torch.tensor([[0], [1], [2]], dtype=torch.int32)
+        cache = torch.randn(12, 128, dtype=torch.float32)
+        index_q = torch.randn(3, 2, 128, dtype=torch.float32)
+        weights = torch.randn(3, 2, dtype=torch.float32)
+
+        def cache_reader(cache_2d, slot_mapping, block_size):
+            del block_size
+            return cache_2d[slot_mapping.long()]
+
+        actual = _deepseek_v4_indexer_topk_from_cache_batched(
+            cache_reader=cache_reader,
+            cache_2d=cache,
+            positions=positions,
+            token_to_req_indices=token_to_req_indices,
+            block_table=block_table,
+            cache_block_size=4,
+            index_q=index_q,
+            weights=weights,
+            compress_ratio=4,
+            topk_tokens=3,
+        )
+
+        expected = torch.full((3, 3), -1, dtype=torch.int32)
+        for token_idx, position in enumerate(positions.tolist()):
+            num_compressed = (position + 1) // 4
+            local = torch.arange(num_compressed, dtype=torch.int64)
+            req_idx = int(token_to_req_indices[token_idx].item())
+            pages = torch.div(local, 4, rounding_mode="floor")
+            offsets = local % 4
+            page_ids = block_table[req_idx, pages.long()].to(torch.int64)
+            slots = page_ids * 4 + offsets
+            selected = min(num_compressed, expected.shape[1])
+            expected[token_idx, :selected] = deepseek_v4_indexer_topk_reference(
+                index_q[token_idx : token_idx + 1],
+                cache_reader(cache, slots, 4),
+                weights[token_idx : token_idx + 1],
+                top_k=selected,
+            )[0]
+
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_deepseek_v4_indexer_decode_max_len_uses_context_or_cache_window(self):
         block_table = torch.zeros((2, 257), dtype=torch.int32)
