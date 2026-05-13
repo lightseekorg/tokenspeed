@@ -36,6 +36,8 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 from tokenspeed.cli._argsplit import OrchestratorOpts
 from tokenspeed.cli.serve_smg import (
     _gateway_args_with_default_port,
+    _gateway_args_with_default_reasoning_parser,
+    _gateway_args_with_defaults,
     _user_host_port_from_gateway_args,
     run_smg,
 )
@@ -66,6 +68,33 @@ def test_gateway_args_preserve_user_port():
 
     assert gateway_args == ["--port", "8413"]
     assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
+
+
+def test_gateway_args_default_reasoning_parser_is_none():
+    gateway_args = _gateway_args_with_default_reasoning_parser(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--reasoning-parser", "none"]
+
+
+def test_gateway_args_preserve_user_reasoning_parser():
+    gateway_args = _gateway_args_with_default_reasoning_parser(
+        ["--reasoning-parser", "qwen3"]
+    )
+
+    assert gateway_args == ["--reasoning-parser", "qwen3"]
+
+
+def test_gateway_args_defaults_include_port_and_reasoning_parser():
+    gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
+
+    assert gateway_args == [
+        "--model",
+        "/tmp/x",
+        "--port",
+        "8000",
+        "--reasoning-parser",
+        "none",
+    ]
 
 
 @pytest.mark.asyncio
