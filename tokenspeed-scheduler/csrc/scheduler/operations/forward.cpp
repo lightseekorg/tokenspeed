@@ -510,9 +510,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         ops.push_back(std::move(op));
     };
     auto has_prefill_op = [&]() {
-        return std::any_of(ops.begin(), ops.end(), [](const ForwardOperation& op) {
-            return std::holds_alternative<PrefillOperation>(op);
-        });
+        return std::any_of(ops.begin(), ops.end(),
+                           [](const ForwardOperation& op) { return std::holds_alternative<PrefillOperation>(op); });
     };
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free = initialPagedCacheGroupSimulatedFree();
