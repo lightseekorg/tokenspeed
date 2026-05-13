@@ -66,9 +66,6 @@ _MODEL_CASES = [
     ModelCase(
         "Qwen/Qwen3.5-35B-A3B",
         is_thinking_model=True,
-        extra_kwargs={
-            "reasoning_parser": "qwen3-thinking",
-        },
     ),
 ]
 
