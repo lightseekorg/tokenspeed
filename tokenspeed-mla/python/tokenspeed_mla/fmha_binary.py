@@ -38,6 +38,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import platform
 from pathlib import Path
 
 import torch
@@ -78,7 +79,12 @@ def _resolve_so_path() -> Path:
     if env:
         return Path(env)
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    arch = f"sm_{props.major}{props.minor}a"
+    machine = platform.machine().lower()
+    if machine == "amd64":
+        machine = "x86_64"
+    elif machine == "arm64":
+        machine = "aarch64"
+    arch = f"sm_{props.major}{props.minor}a_{machine}"
     name = f"cute_dsl_fmha_fp8_e4m3_to_bf16_hd192_{arch}.so"
     return _objs_dir() / name
 
