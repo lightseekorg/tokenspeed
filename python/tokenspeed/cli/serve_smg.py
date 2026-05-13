@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
+DEFAULT_REASONING_PARSER = "none"
 
 
 def _check_serve_extra_installed() -> None:
@@ -93,6 +94,17 @@ def _gateway_args_with_default_port(gateway_args: list[str]) -> list[str]:
     if "--port" in gateway_args:
         return gateway_args
     return [*gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)]
+
+
+def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list[str]:
+    if "--reasoning-parser" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
+
+
+def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
+    gateway_args = _gateway_args_with_default_port(gateway_args)
+    return _gateway_args_with_default_reasoning_parser(gateway_args)
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -274,7 +286,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
-    gateway_args = _gateway_args_with_default_port(split.gateway)
+    gateway_args = _gateway_args_with_defaults(split.gateway)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
     rc = asyncio.run(
         run_smg(
