@@ -858,25 +858,78 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num = kwargs.get(
                 "draft_token_num", self.speculative_num_draft_tokens
             )
-            core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                # target_verify specific parameters
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                cache_steps=draft_token_num,
-            )
+            global _blade_gdn_workspace
+            if _USE_FUSED_BLADE_GDN:
+                # ---- blade_gdn fused gating MTP: single kernel ----
+                if _blade_gdn_workspace is None:
+                    _blade_gdn_workspace = torch.zeros(
+                        (1000,), dtype=torch.int32, device=query.device
+                    )
+                # 3D layout: rearrange("1 l h d -> l h d")
+                q_3d = query.squeeze(0)   # [seq_len, H, D]
+                k_3d = key.squeeze(0)
+                v_3d = value.squeeze(0)
+                core_attn_out = torch.empty(
+                    value.shape, dtype=value.dtype, device=value.device
+                )  # [1, seq_len, HV, DV]
+                tiny_gdn.gdn_main_recur_fused_gating(
+                    q_3d, k_3d, v_3d, A_log, a, dt_bias, b,
+                    core_attn_out, ssm_states, ssm_states, _blade_gdn_workspace,
+                    scale=None,
+                    req_ids=cache_indices,
+                    token_verify_ids=kwargs.get("num_accepted_tokens"),
+                    query_start_loc=query_start_loc,
+                    use_qk_l2_norm=True,
+                )
+
+            elif _USE_BLADE_GDN:
+                # ---- blade_gdn two-kernel MTP: fused_gdn_gating + gdn_main_recur ----
+                if _blade_gdn_workspace is None:
+                    _blade_gdn_workspace = torch.zeros(
+                        (1000,), dtype=torch.int32, device=query.device
+                    )
+                # Compute gating
+                g, beta_out = fused_gdn_gating(A_log, a, dt_bias, b=b)
+                # 3D layout: rearrange("1 l h d -> l h d")
+                q_3d = query.squeeze(0)
+                k_3d = key.squeeze(0)
+                v_3d = value.squeeze(0)
+                g_2d = g.squeeze(0)       # [seq_len, HV]
+                beta_2d = beta_out.squeeze(0)
+                core_attn_out = torch.empty(
+                    value.shape, dtype=value.dtype, device=value.device
+                )
+                tiny_gdn.gdn_main_recur(
+                    q_3d, k_3d, v_3d, g_2d, beta_2d, core_attn_out,
+                    ssm_states, ssm_states, _blade_gdn_workspace,
+                    scale=None,
+                    req_ids=cache_indices,
+                    token_verify_ids=kwargs.get("num_accepted_tokens"),
+                    query_start_loc=query_start_loc,
+                    use_qk_l2_norm=True,
+                )
+
+            else:
+                # ---- Default: tokenspeed triton recurrent kernel ----
+                core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    # target_verify specific parameters
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    cache_steps=draft_token_num,
+                )
         else:
             beta = b.sigmoid()
             g = fused_gdn_gating(A_log, a, dt_bias)
@@ -1122,12 +1175,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_conv_window_cache,
         ) = mamba_caches
 
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            accepted_length,
-        )
+        # blade_gdn already writes accepted state back to ssm_states internally
+        # via token_verify_ids, skip ssm scatter to avoid overwriting with stale data
+        if not (_USE_FUSED_BLADE_GDN or _USE_BLADE_GDN):
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                accepted_length,
+            )
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
