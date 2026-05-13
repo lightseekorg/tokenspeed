@@ -1,0 +1,117 @@
+name: Update tokenspeed-mla version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "tokenspeed-mla version to write to pyproject.toml, for example 0.1.1.post20260512."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure git author
+        run: |
+          git config user.name "lightseek-bot"
+          git config user.email "243258330+lightseek-bot@users.noreply.github.com"
+
+      - name: Update tokenspeed-mla version
+        id: update
+        run: |
+          version="${{ inputs.version }}"
+
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?(\+[A-Za-z0-9.]+)?$ ]]; then
+            echo "Invalid tokenspeed-mla version: $version" >&2
+            exit 1
+          fi
+
+          python - "$version" <<'PY'
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          version = sys.argv[1]
+          path = Path("tokenspeed-mla/pyproject.toml")
+          text = path.read_text()
+          data = tomllib.loads(text)
+          if data["project"]["name"] != "tokenspeed-mla":
+              raise SystemExit("tokenspeed-mla/pyproject.toml does not describe tokenspeed-mla")
+
+          project_match = re.search(r"(?ms)^\[project\]\n(?P<body>.*?)(?=^\[|\Z)", text)
+          if project_match is None:
+              raise SystemExit("missing [project] table")
+
+          body = project_match.group("body")
+          updated_body, count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{version}"',
+              body,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("missing project.version")
+
+          text = text[: project_match.start("body")] + updated_body + text[project_match.end("body") :]
+          path.write_text(text)
+          PY
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required because this repository does not allow GITHUB_TOKEN to create pull requests." >&2
+            exit 1
+          fi
+
+          if git diff --quiet; then
+            echo "tokenspeed-mla is already at $VERSION."
+            exit 0
+          fi
+
+          branch="bot/update-tokenspeed-mla-version-${VERSION//+/-}"
+          git checkout -b "$branch"
+          git add tokenspeed-mla/pyproject.toml
+          git commit -s -m "Update tokenspeed-mla to ${VERSION}"
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          cat > pr-body.md <<EOF
+          ## Summary
+          - update tokenspeed-mla version to ${VERSION}
+
+          ## Tests
+          - Not run (version-only workflow update)
+          EOF
+
+          if gh pr view "$branch" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit "$branch" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Update tokenspeed-mla to ${VERSION}" \
+              --body-file pr-body.md
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "Update tokenspeed-mla to ${VERSION}" \
+              --body-file pr-body.md
+          fi
