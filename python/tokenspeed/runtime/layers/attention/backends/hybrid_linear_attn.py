@@ -48,10 +48,25 @@ from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton impor
 
 _USE_BLADE_GDN = os.environ.get("BLADE_GDN", "0") == "1"
 _USE_FUSED_BLADE_GDN = os.environ.get("FUSED_BLADE_GDN", "0") == "1"
+_USE_FLASHINFER_GDN = os.environ.get("FLASHINFER_GDN", "0") == "1"
 if _USE_BLADE_GDN or _USE_FUSED_BLADE_GDN:
     import tiny_gdn
 
     _blade_gdn_workspace = None
+
+if _USE_FLASHINFER_GDN:
+    try:
+        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+
+        _flashinfer_gdn_decode = gated_delta_rule_decode_pretranspose
+        _flashinfer_gdn_use_pool = torch.cuda.get_device_capability()[0] != 9
+    except ImportError:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "FLASHINFER_GDN=1 but flashinfer.gdn_decode not available, falling back to triton"
+        )
+        _USE_FLASHINFER_GDN = False
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -603,7 +618,7 @@ class MambaAttnBackend(AttentionBackend):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         global _blade_gdn_workspace
-        # Three branches: default triton, BLADE_GDN (two-kernel), FUSED_BLADE_GDN (single kernel)
+        # Four branches: FUSED_BLADE_GDN > BLADE_GDN > FLASHINFER_GDN > default triton
         if _USE_FUSED_BLADE_GDN:
             # ---- blade_gdn fused_gating_recur: single kernel, no gating pre-compute ---- 
             if _blade_gdn_workspace is None:
@@ -657,6 +672,52 @@ class MambaAttnBackend(AttentionBackend):
             )
 
             core_attn_out = blade_output.transpose(0, 1)
+
+        elif _USE_FLASHINFER_GDN:
+            # ---- flashinfer decode (CUDA CuTe kernel) ----
+            batch_size = cache_indices.shape[0]
+            num_v_heads = value.shape[2]
+
+            # flashinfer expects [B, 1, H, D]
+            query_fi = query.view(batch_size, 1, num_heads, head_k_dim)
+            key_fi = key.view(batch_size, 1, num_heads, head_k_dim)
+            value_fi = value.view(batch_size, 1, num_v_heads, head_v_dim)
+            a_fi = a.view(batch_size, 1, num_v_heads)
+            b_fi = b.view(batch_size, 1, num_v_heads)
+
+            if _flashinfer_gdn_use_pool:
+                # SM100+ (Blackwell): pool API with indices
+                output_fi, _ = _flashinfer_gdn_decode(
+                    q=query_fi,
+                    k=key_fi,
+                    v=value_fi,
+                    state=None,
+                    A_log=A_log.float(),
+                    a=a_fi,
+                    dt_bias=dt_bias,
+                    b=b_fi,
+                    use_qk_l2norm=True,
+                    initial_state=ssm_states,
+                    initial_state_indices=cache_indices,
+                )
+            else:
+                # SM90 (Hopper): gather/scatter
+                state_batch = ssm_states[cache_indices]
+                output_fi, new_state = _flashinfer_gdn_decode(
+                    q=query_fi,
+                    k=key_fi,
+                    v=value_fi,
+                    state=state_batch,
+                    A_log=A_log.float(),
+                    a=a_fi,
+                    dt_bias=dt_bias,
+                    b=b_fi,
+                    scale=None,
+                    use_qk_l2norm=True,
+                )
+                ssm_states[cache_indices] = new_state
+
+            core_attn_out = output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
         else:
             # ---- Default: tokenspeed triton recurrent kernel ----
