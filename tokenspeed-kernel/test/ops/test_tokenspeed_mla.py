@@ -45,9 +45,7 @@ V_HEAD = 128
 
 # (is_causal, return_lse) variants exposed by tokenspeed_mla_prefill.
 PREFILL_BINARY_VARIANT_FLAGS = [
-    (causal, lse)
-    for causal in (False, True)
-    for lse in (False, True)
+    (causal, lse) for causal in (False, True) for lse in (False, True)
 ]
 
 # (seq_lens_q, seq_lens_k, h_q, h_k) — varlen problem layouts.
@@ -89,10 +87,7 @@ def _prefill_shape_id(case) -> str:
 
 def _prefill_variant_id(flags: tuple[bool, bool]) -> str:
     causal, lse = flags
-    return (
-        ("causal" if causal else "nocausal")
-        + ("_lse" if lse else "")
-    )
+    return ("causal" if causal else "nocausal") + ("_lse" if lse else "")
 
 
 def _require_mla_binary_prefill():
@@ -139,8 +134,7 @@ def _prefill_reference(
         cur_k = key[k_offset : k_offset + cur_s_k]
         cur_v = value[k_offset : k_offset + cur_s_k]
         scores = (
-            torch.einsum("qhd,khd->qkh", cur_q.float(), cur_k.float())
-            * softmax_scale
+            torch.einsum("qhd,khd->qkh", cur_q.float(), cur_k.float()) * softmax_scale
         )
         if is_causal:
             q_idx = torch.arange(cur_s_q, device=query.device).view(-1, 1)
