@@ -20,7 +20,6 @@
 
 """Helper functions for constructing scheduler specs and events."""
 
-import os
 from collections.abc import Sequence
 from typing import Any, Mapping
 
@@ -39,7 +38,6 @@ _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
 }
-_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
@@ -66,6 +64,7 @@ def make_config(
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+    enable_mixed_prefill_decode: bool = False,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -92,6 +91,7 @@ def make_config(
     cfg.enable_mamba = enable_mamba
     cfg.mamba_cache_chunk_size = mamba_cache_chunk_size
     cfg.mamba_pool_total_chunks = mamba_pool_total_chunks
+    cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg

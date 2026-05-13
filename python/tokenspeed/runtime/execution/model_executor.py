@@ -829,14 +829,12 @@ class ModelExecutor:
                 total_tokens=total_tokens,
             )
 
-            if num_extends > 0:
-                forward_mode = ForwardMode.EXTEND
-            elif self.drafter is not None:
-                forward_mode = ForwardMode.TARGET_VERIFY
-            else:
-                forward_mode = ForwardMode.DECODE
-
             bs = len(forward_op.request_ids)
+            forward_mode = ForwardMode.from_num_extends(
+                num_extends,
+                bs,
+                has_drafter=self.drafter is not None,
+            )
 
             if self.runtime_states.mamba_pool is not None and (
                 num_extends > 0 or has_retract

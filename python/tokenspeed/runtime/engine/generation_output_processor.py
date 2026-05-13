@@ -483,7 +483,8 @@ class OutputProcesser:
             forward_op.input_lengths,
             forward_op.extend_prefix_lens,
         )
-        is_decode_op = forward_op.num_extends() <= 0
+        num_extends = forward_op.num_extends()
+        is_decode_op = num_extends <= 0
 
         request_changes = []
         stream_out_rids = []
@@ -504,6 +505,7 @@ class OutputProcesser:
                 if output_logprobs_list is not None
                 else None
             )
+            is_decode_slot = i >= num_extends
             if self.spec_num_tokens is not None and is_decode_op:
                 pt += self.spec_num_tokens
             else:
@@ -524,7 +526,7 @@ class OutputProcesser:
             if on_first_token is not None and model_output_ids:
                 on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
 
-            if is_decode_op and self.spec_algorithm is not None:
+            if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
 
             # With the capturable grammar pipeline the matcher is
@@ -597,7 +599,7 @@ class OutputProcesser:
             else:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
-                if is_decode_op:
+                if is_decode_slot:
                     request_changes.append(
                         make_update_reserve_tokens_event(rid, output_length)
                     )

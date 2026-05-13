@@ -234,6 +234,15 @@ class DeepseekV4ForwardMetadata:
     query_lens: torch.Tensor
     query_start_loc: torch.Tensor
     token_to_req_indices: torch.Tensor
+    # Padding mask for CUDA graph replay rows; this is not mixed-batch state.
+    is_valid_token: Optional[torch.Tensor] = None
+    # CPU lens are retained for sparse prefill/indexer planning without
+    # forcing another device-to-host sync in the model path.
+    seq_lens_cpu: Optional[torch.Tensor] = None
+    query_lens_cpu: Optional[torch.Tensor] = None
+    # Cached split boundary derived from scheduler num_extends/query_lens.
+    num_prefill_reqs: int = 0
+    num_prefill_tokens: int = 0
     forward_mode: object = None
     decode_swa_indices: torch.Tensor | None = None
     decode_swa_lens: torch.Tensor | None = None
@@ -257,9 +266,35 @@ class DeepseekV4ForwardMetadata:
     decode_compressed_slot_mappings: dict[tuple[int, int], torch.Tensor] = field(
         default_factory=dict
     )
+    # Cache for dense compressed decode attention indices/lens. CSA decode uses
+    # dynamic top-k indices and does not populate this cache.
+    decode_dense_compressed_indices_cache: dict[
+        tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
+    decode_dense_compressed_indices_capture_safe_keys: set[
+        tuple[int, int, int, int]
+    ] = field(default_factory=set)
     decode_indexer_schedule_metadata: dict[tuple[int, int, int], torch.Tensor] = field(
         default_factory=dict
     )
+    decode_indexer_plan_cache: dict[tuple[int, int, int], Any] = field(
+        default_factory=dict
+    )
+    decode_indexer_plan_refreshed_keys: set[tuple[int, int, int]] = field(
+        default_factory=set
+    )
+    prefill_indexer_plan_cache: dict[tuple[int, int, int], Any] = field(
+        default_factory=dict
+    )
+
+    def decode_req_count(self) -> int:
+        return max(0, int(self.req_pool_indices.shape[0]) - int(self.num_prefill_reqs))
+
+    def decode_token_count(self) -> int:
+        return max(
+            0,
+            int(self.token_to_req_indices.shape[0]) - int(self.num_prefill_tokens),
+        )
 
     def _use_decode_compressed_slot_cache(self, positions: torch.Tensor) -> bool:
         return (
