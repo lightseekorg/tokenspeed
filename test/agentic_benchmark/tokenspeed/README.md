@@ -24,7 +24,7 @@ cd test/agentic_benchmark/tokenspeed
 
 The script (1) installs evalscope at the pinned commit, (2) builds the SWE-Smith
 multi-turn dataset, (3) iterates each config in `CONFIGS=()`: launch server, poll
-`/health` until ready, run `evalscope perf`, kill server, wait for the port to be
+`/readiness` until ready, run `evalscope perf`, kill server, wait for the port to be
 free, repeat. Aborts the whole sweep on the first failure (`set -e`).
 
 To narrow the matrix, comment out entries in the `CONFIGS=()` array.

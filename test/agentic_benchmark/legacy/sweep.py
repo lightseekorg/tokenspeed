@@ -159,7 +159,7 @@ def main():
     args = parse_args()
 
     # Check server is reachable
-    health_url = f"http://{args.host}:{args.port}/health"
+    health_url = f"http://{args.host}:{args.port}/readiness"
     ret = subprocess.run(
         ["curl", "-sf", "--max-time", "5", health_url],
         capture_output=True,

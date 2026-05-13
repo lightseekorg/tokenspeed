@@ -38,10 +38,11 @@ class HybridPrefixCache {
 public:
     HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size);
 
-    MatchResult Match(const token_vec_t& token_ids);
-    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages);
+    MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
+    MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
+                      MatchIntent intent = MatchIntent::PrefixReuse);
 
-    bool EnsureMambaCapacityByEvict(std::int32_t num_slots);
+    bool EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
     void InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot);
     std::int32_t AlignMambaCacheSeqlen(std::int32_t seqlen) const;
     TreeNode* FindLastMambaNode(TreeNode* from) const;

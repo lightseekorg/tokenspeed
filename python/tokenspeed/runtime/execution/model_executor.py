@@ -812,6 +812,9 @@ class ModelExecutor:
         with nvtx_range("pre_fill_setup", color="orange"):
             num_extends = forward_op.num_extends()
             total_tokens = sum(forward_op.input_lengths)
+            has_retract = num_extends <= 0 and any(
+                x != -1 for x in getattr(forward_op, "hist_token_lens", [])
+            )
 
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
@@ -835,18 +838,21 @@ class ModelExecutor:
 
             bs = len(forward_op.request_ids)
 
-            if self.runtime_states.mamba_pool is not None and num_extends > 0:
+            if self.runtime_states.mamba_pool is not None and (
+                num_extends > 0 or has_retract
+            ):
                 mamba_pool_indices = self.input_buffers.mamba_pool_indices_buf[:bs]
                 mamba_cow_src = self.input_buffers.mamba_cow_src_indices_buf[:bs]
                 self.runtime_states.copy_mamba_states(
                     mamba_pool_indices, mamba_cow_src, bs
                 )
-                self.runtime_states.zero_mamba_states(
-                    mamba_pool_indices,
-                    mamba_cow_src,
-                    self.input_buffers.extend_prefix_lens_buf[:bs],
-                    bs,
-                )
+                if num_extends > 0:
+                    self.runtime_states.zero_mamba_states(
+                        mamba_pool_indices,
+                        mamba_cow_src,
+                        self.input_buffers.extend_prefix_lens_buf[:bs],
+                        bs,
+                    )
 
             grammar_completion = None
 

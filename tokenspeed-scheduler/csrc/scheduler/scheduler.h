@@ -152,9 +152,9 @@ private:
 private:
     PageAllocator device_allocator_;
     PageAllocator host_allocator_;
+    std::optional<MambaChunkAllocator> mamba_allocator_{};
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
-    std::optional<MambaChunkAllocator> mamba_allocator_{};
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
     std::map<std::string, std::unique_ptr<PagedCacheGroupAllocator>> paged_cache_allocators_;
     std::unordered_map<std::string, std::map<std::string, PagedCacheGroupTable>> request_paged_cache_tables_;

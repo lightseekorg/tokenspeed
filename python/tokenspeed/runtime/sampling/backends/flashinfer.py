@@ -29,8 +29,11 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
+    top_k_renorm_prob,
     top_k_top_p_sampling_from_logits,
+    top_p_renorm_prob,
 )
+from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -43,11 +46,11 @@ from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     nan_guard_logits,
-    top_k_top_p_renorm_torch,
     write_output_logprobs,
 )
 from tokenspeed.runtime.utils import crash_on_warnings
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -205,27 +208,6 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._coins_buf[:bs, :n].copy_(cpu_coins, non_blocking=True)
         self._final_coins_buf[:bs].copy_(cpu_final, non_blocking=True)
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def _gather_scalars(
-        self, req_pool_indices: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        pool_idx = req_pool_indices.long()
-        return (
-            self._temperature_pool.index_select(0, pool_idx),
-            self._top_k_pool.index_select(0, pool_idx),
-            self._top_p_pool.index_select(0, pool_idx),
-            self._seed_pool.index_select(0, pool_idx),
-        )
-
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def _gather_offsets(self, sampling_info: SamplingBatchInfo) -> torch.Tensor:
-        # Philox offset = current seq_len (= prefix + generated tokens so
-        # far). Strictly increases across decode steps so consecutive
-        # samples from the same request draw different uniforms.
-        return sampling_info.valid_cache_lengths.index_select(
-            0, sampling_info.req_pool_indices.long()
-        ).to(torch.int64)
-
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
         self,
@@ -250,10 +232,15 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         else:
 
-            temperatures, top_ks, top_ps, seeds = self._gather_scalars(
-                sampling_info.req_pool_indices
+            temperatures, top_ks, top_ps, _, seeds, offsets = gather_and_expand_scalars(
+                sampling_info.req_pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                seed=self._seed_pool,
+                offsets=sampling_info.valid_cache_lengths,
+                enable_pdl=pdl_enabled(),
             )
-            offsets = self._gather_offsets(sampling_info)
 
             # Fuses softmax + top_k + top_p + sample into one kernel; we only
             # need to pre-scale by temperature.
@@ -268,6 +255,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 check_nan=check_nan,
                 seed=seeds,
                 offset=offsets,
+                deterministic=True,
             )
 
         sampled = batch_next_token_ids.to(torch.int32)
@@ -324,25 +312,31 @@ class FlashInferSamplingBackend(SamplingBackend):
                 target_predict=target_predict,
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
+                enable_pdl=pdl_enabled(),
             )
 
         else:
 
-            temperatures, top_ks, top_ps, _seeds = self._gather_scalars(
-                sampling_info.req_pool_indices
-            )
-
             # Each request's N verified positions share one (temp, top_k, top_p)
             # tuple; flat [bs*N] per-row knobs match the flat [bs*N, vocab] logits.
             n = num_tokens_per_req
+            temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
+                sampling_info.req_pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                n=n,
+                enable_pdl=pdl_enabled(),
+            )
+
             target_probs = softmax(
                 logits_output.next_token_logits,
-                temperature=torch.repeat_interleave(temperatures, n),
+                temperature=temperatures,
+                enable_pdl=pdl_enabled(),
             )
-            target_probs = top_k_top_p_renorm_torch(
-                target_probs,
-                torch.repeat_interleave(top_ks, n),
-                torch.repeat_interleave(top_ps, n),
+            target_probs = top_k_renorm_prob(target_probs, top_ks)
+            target_probs = top_p_renorm_prob(
+                target_probs, top_ps, is_deterministic=True
             )
             target_probs = target_probs.reshape(bs, n, -1)
 
@@ -354,14 +348,19 @@ class FlashInferSamplingBackend(SamplingBackend):
                 uniform_samples=self._coins_buf[:bs, :n],
                 uniform_samples_for_final_sampling=self._final_coins_buf[:bs],
                 target_probs=target_probs,
-                draft_probs=torch.zeros_like(target_probs),
+                draft_probs=None,
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                deterministic=True,
+                enable_pdl=pdl_enabled(),
             )
 
         accept_length += 1
 
         # TP-rank sync: rank 0 wins on the full verify-output triple.
+        # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
+        # knob and produces non-bit-identical results across ranks (sub-ulp
+        # FP accumulation order).
         self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:

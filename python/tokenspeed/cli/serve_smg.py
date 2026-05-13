@@ -208,7 +208,7 @@ async def run_smg(
 
         await _probe_or_stop(
             wait_http_ready(
-                f"http://{user_host}:{user_port}/health",
+                f"http://{user_host}:{user_port}/readiness",
                 timeout=float(opts.gateway_startup_timeout),
             ),
             stop,
