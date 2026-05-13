@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "tokenspeed-mla version to write to pyproject.toml, for example 0.1.1.post20260512."
+        description: "tokenspeed-mla version to write to pyproject.toml, for example 0.1.2."
         required: true
         type: string
 
