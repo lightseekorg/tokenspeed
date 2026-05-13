@@ -18,27 +18,35 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Launch the inference server."""
+"""Async per-line stream prefixer for ``ts serve``."""
 
-import os
-import sys
-import traceback
+from __future__ import annotations
 
-from tokenspeed.runtime.entrypoints.http_server import api_server
-from tokenspeed.runtime.utils.process import kill_process_tree
-from tokenspeed.runtime.utils.server_args import prepare_server_args
+import asyncio
+from typing import Protocol
 
-
-def main():
-    server_args = prepare_server_args(sys.argv[1:])
-
-    try:
-        api_server(server_args)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        kill_process_tree(os.getpid(), include_parent=False)
+ENGINE_TAG = "ts"
+GATEWAY_TAG = "smg"
 
 
-if __name__ == "__main__":
-    main()
+class _Sink(Protocol):
+    def write(self, data: str) -> int: ...
+    def flush(self) -> None: ...
+
+
+async def tag_stream(reader: asyncio.StreamReader, tag: str, sink: _Sink) -> None:
+    """Read lines from ``reader`` until EOF, write ``[tag] <line>`` to ``sink``.
+
+    A trailing partial line (without a newline) is still emitted with a
+    synthesized newline so the last line of a crash message is not lost.
+    """
+    prefix = f"[{tag}] "
+    while True:
+        line = await reader.readline()
+        if not line:
+            return
+        text = line.decode("utf-8", errors="replace")
+        if text.endswith("\n"):
+            sink.write(prefix + text)
+        else:
+            sink.write(prefix + text + "\n")

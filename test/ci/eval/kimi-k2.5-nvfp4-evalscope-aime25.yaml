@@ -14,11 +14,12 @@ install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
-    python3 -m tokenspeed.api_server
+    ts serve
     --model nvidia/Kimi-K2.5-NVFP4
     --tp 4
     --max-model-len 80000
     --trust-remote-code
+    --reasoning-parser none
     --attention-backend tokenspeed_mla
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
@@ -30,6 +31,7 @@ server:
     --drafter-attention-backend trtllm
     --enable-cache-report
     --host 127.0.0.1
+    --port 8000
   ready:
     url: http://127.0.0.1:8000/health
     timeout: 1800
@@ -44,6 +46,8 @@ eval:
     --api-key EMPTY_TOKEN
     --datasets aime25
     --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
 report:
   github_step_summary: true
 score_threshold: 0.93

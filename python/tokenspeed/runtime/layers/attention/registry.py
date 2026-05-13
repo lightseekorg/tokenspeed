@@ -152,6 +152,19 @@ def _create_attn_backend(
     return _get_backend_cls(config.backend_name, arch)(config)
 
 
+def _create_attn_backend_with_name(
+    name: str | None,
+    arch: AttentionArch,
+    config: BaseAttnConfig,
+) -> AttentionBackend:
+    original_name = config.backend_name
+    config.backend_name = name
+    try:
+        return _get_backend_cls(name, arch)(config)
+    finally:
+        config.backend_name = original_name
+
+
 def _create_attn_pool(
     config: BaseAttnConfig,
     num_layers: int,
@@ -198,7 +211,11 @@ def _create_hybrid_linear_attn(
 
     # Create the full attention backend for standard MHA layers.
     # Use user's original choice if provided, otherwise auto-select.
-    full_attn_backend = _get_backend_cls(full_attn_backend_name, arch)(config)
+    full_attn_backend = _create_attn_backend_with_name(
+        full_attn_backend_name,
+        arch,
+        config,
+    )
 
     # Create mamba/linear attention backend
     config.speculative_num_draft_tokens = getattr(

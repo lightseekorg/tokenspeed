@@ -40,8 +40,7 @@ For a compact compatibility table, see
 | `--port` | HTTP bind port. |
 | `--served-model-name` | Model name returned by the OpenAI-compatible API. |
 | `--api-key` | API key required by the server. |
-| `--chat-template` | Built-in chat template name or template file path. |
-| `--completion-template` | Completion template for code-completion style serving. |
+| `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 
@@ -90,7 +89,7 @@ different process groups.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--attention-backend` | Attention kernel backend. Common values include `trtllm_mla`, `tokenspeed_mla`, `fa3`, and `mha`. |
+| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. |
 | `--drafter-attention-backend` | Attention backend for speculative decoding drafter model. |
 | `--moe-backend` | MoE backend. |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
@@ -106,11 +105,9 @@ about.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--reasoning-parser` | Parser for extracting reasoning content from model outputs. |
-| `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads. |
-| `--tool-server` | Built-in demo tool server. |
+| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
+| `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 | `--enable-custom-logit-processor` | Allow custom logit processors. Keep disabled unless the deployment needs it. |
-| `--think-end-token` | End marker for thinking models. |
 
 Common parser values include `kimi_k2` and `gpt-oss`.
 
@@ -148,7 +145,9 @@ draft model, and token count together.
 
 KV cache events publish reusable device prefix-cache mutations from the live
 C++ scheduler path. Host/L2 loadback events are not published by this initial
-stream.
+stream. Block hash lineage is cached on prefix-cache nodes, so publishing a
+stored block uses the parent node's cached hash instead of rebuilding the full
+ancestor prefix.
 
 Example:
 

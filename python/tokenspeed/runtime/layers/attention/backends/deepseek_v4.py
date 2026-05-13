@@ -19,9 +19,11 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
+    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     DEEPSEEK_V4_SWA_SCALE_DIM,
     DEEPSEEK_V4_SWA_TOKEN_STRIDE,
     DeepseekV4AttentionOpUnavailable,
+    deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
     deepseek_v4_compute_global_topk_indices_and_lens,
@@ -34,6 +36,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _split_paged_cache_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.env import global_server_args_dict
+
+DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
 
 
 def _swa_block_table(metadata: DeepseekV4ForwardMetadata) -> torch.Tensor:
@@ -60,6 +65,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         super().__init__(config)
         self.page_size = config.page_size
         self.context_len = config.context_len
+        prefill_chunk_size = getattr(config, "deepseek_v4_prefill_chunk_size", None)
+        if prefill_chunk_size is None:
+            prefill_chunk_size = global_server_args_dict.get(
+                "deepseek_v4_prefill_chunk_size",
+                DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE,
+            )
+        self.prefill_chunk_size = max(1, int(prefill_chunk_size))
         self.max_num_pages = max(
             1,
             (self.context_len + self.page_size - 1) // self.page_size,
@@ -75,6 +87,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
+        self._prefill_dense_compressed_indices_buffer: Optional[torch.Tensor] = None
         self._decode_swa_window_size = 0
         self._decode_swa_block_size = 0
 
@@ -86,7 +99,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         head_dim: int,
         device: torch.device,
     ) -> torch.Tensor:
-        rows = max(1, num_reqs * workspace_width)
+        workspace_reqs = max(1, num_reqs)
+        rows = workspace_reqs * workspace_width
         needs_alloc = (
             self._prefill_workspace_buffer is None
             or self._prefill_workspace_buffer.device != device
@@ -103,7 +117,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self._prefill_workspace_head_dim = head_dim
         assert self._prefill_workspace_buffer is not None
         return self._prefill_workspace_buffer[:rows].view(
-            num_reqs,
+            workspace_reqs,
             workspace_width,
             head_dim,
         )
@@ -306,7 +320,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_tokens = positions.numel()
         req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
         block_table = metadata.compressed_block_table(compress_ratio, block_size)
-        capturing = positions.is_cuda and torch.cuda.is_current_stream_capturing()
         if compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
@@ -318,19 +331,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             return indices_2d.unsqueeze(1), lens
         else:
+            width = self._dense_compressed_indices_width(compress_ratio)
             compressed_lens = torch.div(
                 positions.to(torch.int64) + 1,
                 compress_ratio,
                 rounding_mode="floor",
-            ).clamp_min(0)
-            if capturing:
-                max_len = max(
-                    1,
-                    (self.context_len + compress_ratio - 1) // compress_ratio,
-                )
-            else:
-                max_len = int(compressed_lens.max().item()) if num_tokens else 0
-            width = max(64, ((max(max_len, 1) + 63) // 64) * 64)
+            ).clamp(0, width)
             offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
             local = offsets[None, :].expand(num_tokens, -1)
             valid = offsets[None, :] < compressed_lens[:, None]
@@ -348,6 +354,40 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         indices = indices_2d.to(torch.int32).unsqueeze(1)
         return indices, lens
+
+    def _dense_compressed_indices_width(self, compress_ratio: int) -> int:
+        if compress_ratio <= 1:
+            return 0
+        width = max(1, (self.context_len + compress_ratio - 1) // compress_ratio)
+        alignment = DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+        return ((width + alignment - 1) // alignment) * alignment
+
+    def _dense_prefill_local_compressed_indices(
+        self,
+        positions: torch.Tensor,
+        *,
+        compress_ratio: int,
+        width: int,
+    ) -> torch.Tensor:
+        shape = (positions.numel(), width)
+        if (
+            self._prefill_dense_compressed_indices_buffer is None
+            or self._prefill_dense_compressed_indices_buffer.device != positions.device
+            or self._prefill_dense_compressed_indices_buffer.shape[0] < shape[0]
+            or self._prefill_dense_compressed_indices_buffer.shape[1] < shape[1]
+        ):
+            self._prefill_dense_compressed_indices_buffer = torch.empty(
+                shape,
+                dtype=torch.int32,
+                device=positions.device,
+            )
+        out = self._prefill_dense_compressed_indices_buffer[: shape[0], : shape[1]]
+        return deepseek_v4_build_dense_prefill_local_compressed_indices(
+            positions=positions,
+            compress_ratio=compress_ratio,
+            width=width,
+            out=out,
+        )
 
     def _get_decode_tile_metadata(self, kind: str, bs: int):
         phase = (
@@ -599,6 +639,25 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
         )
+        if compress_ratio > 1:
+            dense_compressed_indices = self._dense_prefill_local_compressed_indices(
+                positions,
+                compress_ratio=compress_ratio,
+                width=self._dense_compressed_indices_width(compress_ratio),
+            )
+            indices, lens = deepseek_v4_combine_topk_swa_indices(
+                topk_indices=dense_compressed_indices,
+                query_start_loc=metadata.query_start_loc,
+                seq_lens=metadata.seq_lens,
+                gather_lens=gather_lens,
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                topk=dense_compressed_indices.shape[-1],
+                workspace_width=workspace_width,
+                compressed_base=compressed_base,
+            )
+            return kv_workspace, indices, lens
+
         indices, lens = deepseek_v4_combine_dense_swa_indices(
             positions=positions,
             token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
@@ -612,7 +671,71 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         return kv_workspace, indices, lens
 
-    def forward_deepseek_v4_prefill(
+    def _metadata_slice(
+        self,
+        metadata: DeepseekV4ForwardMetadata,
+        *,
+        req_start: int,
+        req_end: int,
+        token_start: int,
+        token_end: int,
+        forward_mode: ForwardMode,
+    ) -> DeepseekV4ForwardMetadata:
+        token_to_req = metadata.token_to_req_indices[token_start:token_end].to(
+            torch.int32
+        ) - int(req_start)
+        paged_cache_block_tables = {
+            key: table[req_start:req_end]
+            for key, table in metadata.paged_cache_block_tables.items()
+        }
+        paged_cache_block_table_base_offsets = {
+            key: offsets[req_start:req_end]
+            for key, offsets in metadata.paged_cache_block_table_base_offsets.items()
+        }
+        compressor_state_block_tables = {
+            key: table[req_start:req_end]
+            for key, table in metadata.compressor_state_block_tables.items()
+        }
+        compressor_state_base_logical_pages = {
+            key: offsets[req_start:req_end]
+            for key, offsets in metadata.compressor_state_base_logical_pages.items()
+        }
+        return DeepseekV4ForwardMetadata(
+            page_size=metadata.page_size,
+            req_pool_indices=metadata.req_pool_indices[req_start:req_end],
+            block_table=metadata.block_table[req_start:req_end],
+            seq_lens=metadata.seq_lens[req_start:req_end],
+            query_lens=metadata.query_lens[req_start:req_end],
+            query_start_loc=_cu_seqlens(metadata.query_lens[req_start:req_end]),
+            token_to_req_indices=token_to_req,
+            forward_mode=forward_mode,
+            paged_cache_block_tables=paged_cache_block_tables,
+            paged_cache_block_table_base_offsets=paged_cache_block_table_base_offsets,
+            swa_block_table=(
+                metadata.swa_block_table[req_start:req_end]
+                if metadata.swa_block_table is not None
+                else None
+            ),
+            swa_base_logical_page=(
+                metadata.swa_base_logical_page[req_start:req_end]
+                if metadata.swa_base_logical_page is not None
+                else None
+            ),
+            compressor_state_block_tables=compressor_state_block_tables,
+            compressor_state_base_logical_pages=compressor_state_base_logical_pages,
+            indexer_state_block_table=(
+                metadata.indexer_state_block_table[req_start:req_end]
+                if metadata.indexer_state_block_table is not None
+                else None
+            ),
+            indexer_state_base_logical_page=(
+                metadata.indexer_state_base_logical_page[req_start:req_end]
+                if metadata.indexer_state_base_logical_page is not None
+                else None
+            ),
+        )
+
+    def _forward_deepseek_v4_prefill_chunk(
         self,
         *,
         q: torch.Tensor,
@@ -666,6 +789,101 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_length=lens,
             )
         return out[:, :num_local_heads]
+
+    def _prefill_chunk_token_offsets(
+        self,
+        metadata: DeepseekV4ForwardMetadata,
+        num_reqs: int,
+    ) -> list[int]:
+        return [
+            int(x)
+            for x in metadata.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
+        ]
+
+    def forward_deepseek_v4_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        token_to_kv_pool,
+        layer_id: int,
+        kind: str,
+        compress_ratio: int,
+        num_local_heads: int,
+        padded_heads: int,
+        head_dim: int,
+        window_size: int,
+        softmax_scale: float,
+        attn_sink: torch.Tensor,
+        topk_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        metadata = self.forward_metadata
+        if metadata is None:
+            raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
+        if metadata.forward_mode is None or not metadata.forward_mode.is_extend():
+            raise RuntimeError(
+                "forward_deepseek_v4_prefill only supports extend/prefill modes"
+            )
+
+        num_reqs = int(metadata.seq_lens.numel())
+        if num_reqs <= self.prefill_chunk_size:
+            return self._forward_deepseek_v4_prefill_chunk(
+                q=q,
+                positions=positions,
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=layer_id,
+                kind=kind,
+                compress_ratio=compress_ratio,
+                num_local_heads=num_local_heads,
+                padded_heads=padded_heads,
+                head_dim=head_dim,
+                window_size=window_size,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                topk_indices=topk_indices,
+            )
+
+        token_offsets = self._prefill_chunk_token_offsets(metadata, num_reqs)
+        out = q.new_empty((q.shape[0], num_local_heads, head_dim))
+        saved_metadata = self.forward_metadata
+        try:
+            for req_start in range(0, num_reqs, self.prefill_chunk_size):
+                req_end = min(req_start + self.prefill_chunk_size, num_reqs)
+                token_start = token_offsets[req_start]
+                token_end = token_offsets[req_end]
+                if token_end <= token_start:
+                    continue
+                self.forward_metadata = self._metadata_slice(
+                    saved_metadata,
+                    req_start=req_start,
+                    req_end=req_end,
+                    token_start=token_start,
+                    token_end=token_end,
+                    forward_mode=ForwardMode.EXTEND,
+                )
+                chunk_out = self._forward_deepseek_v4_prefill_chunk(
+                    q=q[token_start:token_end],
+                    positions=positions[token_start:token_end],
+                    token_to_kv_pool=token_to_kv_pool,
+                    layer_id=layer_id,
+                    kind=kind,
+                    compress_ratio=compress_ratio,
+                    num_local_heads=num_local_heads,
+                    padded_heads=padded_heads,
+                    head_dim=head_dim,
+                    window_size=window_size,
+                    softmax_scale=softmax_scale,
+                    attn_sink=attn_sink,
+                    topk_indices=(
+                        topk_indices[token_start:token_end]
+                        if topk_indices is not None
+                        else None
+                    ),
+                )
+                out[token_start:token_end].copy_(chunk_out)
+        finally:
+            self.forward_metadata = saved_metadata
+        return out
 
     def init_cuda_graph_state(
         self,

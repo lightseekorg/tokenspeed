@@ -34,7 +34,7 @@ import re
 import site
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -49,6 +49,7 @@ try:
 except ImportError:
     deep_gemm = None  # type: ignore[assignment]
 
+from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -77,6 +78,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     DeepseekV4AttentionOpUnavailable,
     deepseek_v4_csa_compress_kv_cache_insert,
     deepseek_v4_csa_indexer_cache_insert,
+    deepseek_v4_gather_indexer_mxfp4_cache,
     deepseek_v4_hca_compress_kv_cache_insert,
     deepseek_v4_inv_rope_reference,
     deepseek_v4_prepare_indexer_q_mxfp4,
@@ -807,10 +809,17 @@ def _deepseek_v4_gather_indexer_mxfp4_cache(
     cache_2d: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_size: int,
+    out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     value_bytes = DEEPSEEK_V4_INDEXER_DIM // 2
     scale_bytes = DEEPSEEK_V4_INDEXER_DIM // DEEPSEEK_V4_MXFP4_BLOCK_SIZE
-    if slot_mapping.numel() == 0:
+    num_slots = int(slot_mapping.numel())
+    if num_slots == 0:
+        if out is not None:
+            return (
+                out[0][:0].view(torch.int8),
+                out[1][:0].view(torch.int32).squeeze(-1),
+            )
         return (
             torch.empty(
                 (0, value_bytes),
@@ -819,6 +828,31 @@ def _deepseek_v4_gather_indexer_mxfp4_cache(
             ),
             torch.empty(0, dtype=torch.int32, device=cache_2d.device),
         )
+
+    if out is None:
+        values = torch.empty(
+            (num_slots, value_bytes),
+            dtype=torch.uint8,
+            device=cache_2d.device,
+        )
+        scales = torch.empty(
+            (num_slots, scale_bytes),
+            dtype=torch.uint8,
+            device=cache_2d.device,
+        )
+    else:
+        values = out[0][:num_slots]
+        scales = out[1][:num_slots]
+
+    if cache_2d.is_cuda and slot_mapping.is_cuda:
+        deepseek_v4_gather_indexer_mxfp4_cache(
+            cache_2d=cache_2d,
+            slot_mapping=slot_mapping,
+            values_out=values,
+            scales_out=scales,
+            block_size=block_size,
+        )
+        return values.view(torch.int8), scales.view(torch.int32).squeeze(-1)
 
     flat_cache = cache_2d.reshape(-1)
     slots = slot_mapping.to(torch.int64)
@@ -843,8 +877,10 @@ def _deepseek_v4_gather_indexer_mxfp4_cache(
             dtype=torch.int64,
         )[None, :]
     )
-    values = flat_cache[value_offsets].contiguous().view(torch.int8)
-    scales = flat_cache[scale_offsets].contiguous().view(torch.int32).squeeze(-1)
+    torch.take(flat_cache, value_offsets.reshape(-1), out=values.reshape(-1))
+    torch.take(flat_cache, scale_offsets.reshape(-1), out=scales.reshape(-1))
+    values = values.view(torch.int8)
+    scales = scales.view(torch.int32).squeeze(-1)
     return values, scales
 
 
@@ -871,6 +907,16 @@ def _deepseek_v4_indexer_topk_from_logits(
     max_len = logits.shape[1] if logits.dim() == 2 else 0
     if max_len <= 0:
         return topk
+
+    if preserve_topk_order:
+        prefill_topk = _deepseek_v4_indexer_topk_from_logits_prefill_op(
+            logits,
+            lengths.to(torch.int32).reshape(-1),
+            topk_tokens,
+            out=topk,
+        )
+        if prefill_topk is not None:
+            return prefill_topk
 
     if not preserve_topk_order and logits.is_cuda and topk_tokens in (512, 1024, 2048):
         from tokenspeed_kernel.thirdparty.trtllm import fast_topk_v2
@@ -912,6 +958,65 @@ def _deepseek_v4_indexer_topk_from_logits(
         torch.full_like(indices, -1),
     ).to(torch.int32)
     topk[:, :selected] = indices
+    return topk
+
+
+_DEEPSEEK_V4_PREFILL_TOPK_OP_AVAILABLE = False
+_DEEPSEEK_V4_PREFILL_TOPK_OP_CHECKED = False
+
+
+def _deepseek_v4_prefill_topk_op_available() -> bool:
+    global _DEEPSEEK_V4_PREFILL_TOPK_OP_AVAILABLE
+    global _DEEPSEEK_V4_PREFILL_TOPK_OP_CHECKED
+    if _DEEPSEEK_V4_PREFILL_TOPK_OP_CHECKED:
+        return _DEEPSEEK_V4_PREFILL_TOPK_OP_AVAILABLE
+
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+            has_indexer_topk_prefill,
+        )
+    except Exception:
+        _DEEPSEEK_V4_PREFILL_TOPK_OP_AVAILABLE = False
+    else:
+        _DEEPSEEK_V4_PREFILL_TOPK_OP_AVAILABLE = bool(has_indexer_topk_prefill())
+    _DEEPSEEK_V4_PREFILL_TOPK_OP_CHECKED = True
+    return _DEEPSEEK_V4_PREFILL_TOPK_OP_AVAILABLE
+
+
+def _deepseek_v4_indexer_topk_from_logits_prefill_op(
+    logits: torch.Tensor,
+    length_rows: torch.Tensor,
+    topk_tokens: int,
+    *,
+    out: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Use the local CUDA prefill selector when the extension is available."""
+
+    if not logits.is_cuda or logits.dtype != torch.float32:
+        return None
+    if not _deepseek_v4_prefill_topk_op_available():
+        return None
+
+    num_rows = length_rows.numel()
+    if num_rows == 0:
+        return out[:0]
+    logits = logits.contiguous()
+    row_starts = torch.zeros(num_rows, device=logits.device, dtype=torch.int32)
+    row_ends = length_rows.to(device=logits.device, dtype=torch.int32).reshape(-1)
+
+    topk = out[:num_rows]
+    topk.fill_(-1)
+    from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+        indexer_topk_prefill,
+    )
+
+    indexer_topk_prefill(
+        logits,
+        row_starts,
+        row_ends.contiguous(),
+        topk,
+        topk_tokens,
+    )
     return topk
 
 
@@ -1237,6 +1342,63 @@ def _deepseek_v4_get_mega_deep_gemm():
             return module
 
     return None
+
+
+_DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM = None
+_DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM_CHECKED = False
+_DEEPSEEK_V4_FP8_LINEAR_REQUIRED = (
+    "fp8_gemm_nt",
+    "transform_sf_into_required_layout",
+)
+
+
+def _deepseek_v4_get_fp8_linear_deep_gemm():
+    global _DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM
+    global _DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM_CHECKED
+
+    if _DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM_CHECKED:
+        return _DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM
+
+    _DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM_CHECKED = True
+    _deepseek_v4_prepare_deep_gemm_jit_env()
+    candidates = []
+    try:
+        candidates.append(importlib.import_module("deep_gemm"))
+    except Exception:
+        pass
+    candidates.append(deep_gemm)
+
+    for module in candidates:
+        if all(
+            callable(getattr(module, name, None))
+            for name in _DEEPSEEK_V4_FP8_LINEAR_REQUIRED
+        ):
+            _DEEPSEEK_V4_FP8_LINEAR_DEEP_GEMM = module
+            return module
+
+    return None
+
+
+def _deepseek_v4_upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
+    exp_bits = scale.view(torch.uint8).to(torch.int32)
+    fp32_bits = exp_bits << 23
+    return fp32_bits.view(torch.float32)
+
+
+_DEEPSEEK_V4_DEEP_GEMM_FATAL_ERRORS = (
+    "out of memory",
+    "illegal memory access",
+    "device-side assert",
+    "misaligned address",
+    "unspecified launch failure",
+)
+
+
+def _deepseek_v4_deep_gemm_can_fallback(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return not any(
+        snippet in message for snippet in _DEEPSEEK_V4_DEEP_GEMM_FATAL_ERRORS
+    )
 
 
 def _deepseek_v4_mega_moe_max_num_tokens() -> int:
@@ -2700,14 +2862,25 @@ class DeepseekV4Attention(nn.Module):
     def _project_q_kv(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qr_kv = _fp8_linear(
-            self.fused_wqa_wkv,
-            hidden_states,
-            (
-                self.fused_wqa_wkv.output_size_per_partition,
-                self.fused_wqa_wkv.input_size,
-            ),
+        qr_kv_shape = (
+            self.fused_wqa_wkv.output_size_per_partition,
+            self.fused_wqa_wkv.input_size,
         )
+        qr_kv = None
+        deep_gemm_module = _deepseek_v4_get_fp8_linear_deep_gemm()
+        if deep_gemm_module is not None:
+            qr_kv = self._deep_gemm_fp8_linear(
+                deep_gemm_module,
+                self.fused_wqa_wkv,
+                hidden_states,
+                qr_kv_shape,
+            )
+        if qr_kv is None:
+            qr_kv = _fp8_linear(
+                self.fused_wqa_wkv,
+                hidden_states,
+                qr_kv_shape,
+            )
         qr, kv = self._split_qr_kv(qr_kv)
         if self.use_fused_qkv_rmsnorm and qr.is_cuda and qr.shape[0] > 0:
             qr_norm = torch.empty(
@@ -2979,6 +3152,118 @@ class DeepseekV4Attention(nn.Module):
             self.wo_a, (self.num_local_groups, self.o_lora_rank, in_dim)
         )
 
+    def _deep_gemm_fp8_linear(
+        self,
+        deep_gemm_module,
+        layer: nn.Module,
+        x: torch.Tensor,
+        shape: tuple[int, int],
+    ) -> Optional[torch.Tensor]:
+        if (
+            layer.weight.dtype != torch.float8_e4m3fn
+            or x.dtype != torch.bfloat16
+            or not x.is_cuda
+        ):
+            return None
+        scale = getattr(layer, "weight_scale_inv", None)
+        if scale is None:
+            return None
+        block_n, block_k = getattr(layer.quant_config, "weight_block_size", (128, 128))
+        if block_n != 128 or block_k != 128:
+            return None
+
+        out_dim, in_dim = shape
+        if out_dim % 64 != 0 or in_dim % block_k != 0:
+            return None
+        if getattr(layer, "_deepseek_v4_deep_gemm_linear_disabled", False):
+            return None
+
+        try:
+            padded_out_dim = ((out_dim + block_n - 1) // block_n) * block_n
+            cache_key = (
+                out_dim,
+                padded_out_dim,
+                in_dim,
+                block_n,
+                block_k,
+                layer.weight.data_ptr(),
+                scale.data_ptr(),
+                scale.dtype,
+            )
+            cache = getattr(layer, "_deepseek_v4_deep_gemm_linear_cache", None)
+            if cache is not None:
+                cached_key, weight, weight_scale = cache
+                if cached_key == cache_key:
+                    pass
+                else:
+                    cache = None
+            if cache is None:
+                weight = layer.weight.view(out_dim, in_dim)
+                if padded_out_dim != out_dim:
+                    padded_weight = torch.empty(
+                        (padded_out_dim, in_dim),
+                        device=weight.device,
+                        dtype=weight.dtype,
+                    )
+                    padded_weight[:out_dim].copy_(weight)
+                    padded_weight[out_dim:].zero_()
+                    weight = padded_weight
+                weight_scale = scale
+                if weight_scale.dtype == torch.float8_e8m0fnu:
+                    weight_scale = _deepseek_v4_upcast_e8m0_to_fp32(weight_scale)
+                else:
+                    weight_scale = weight_scale.float()
+                weight_scale = weight_scale.view(
+                    (out_dim + block_n - 1) // block_n,
+                    in_dim // block_k,
+                )
+                weight_scale = deep_gemm_module.transform_sf_into_required_layout(
+                    sf=weight_scale.unsqueeze(0),
+                    mn=padded_out_dim,
+                    k=in_dim,
+                    recipe=(1, block_n, block_k),
+                    num_groups=1,
+                    is_sfa=False,
+                ).squeeze(0)
+                layer._deepseek_v4_deep_gemm_linear_cache = (
+                    cache_key,
+                    weight,
+                    weight_scale,
+                )
+
+            x_2d = x.reshape(-1, in_dim).contiguous()
+            if x_2d.shape[0] == 0:
+                return x.new_empty((*x.shape[:-1], out_dim))
+            x_fp8, x_scale = per_token_group_quant_fp8(
+                x_2d,
+                block_k,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+            )
+            out = torch.empty(
+                (x_2d.shape[0], padded_out_dim),
+                device=x_2d.device,
+                dtype=torch.bfloat16,
+            )
+            deep_gemm_module.fp8_gemm_nt(
+                (x_fp8, x_scale),
+                (weight, weight_scale),
+                out,
+            )
+            out = out[:, :out_dim]
+            return out.view(*x.shape[:-1], out_dim).to(x.dtype)
+        except RuntimeError as exc:
+            if not _deepseek_v4_deep_gemm_can_fallback(exc):
+                raise
+            layer._deepseek_v4_deep_gemm_linear_disabled = True
+            layer._deepseek_v4_deep_gemm_linear_cache = None
+            logger.warning(
+                "DeepSeek V4 DeepGEMM FP8 linear failed; falling back to "
+                f"reference FP8 linear. reason={type(exc).__name__}: {exc}"
+            )
+            return None
+
     def _project_attention_output(
         self,
         attn_output: torch.Tensor,
@@ -3000,11 +3285,7 @@ class DeepseekV4Attention(nn.Module):
             weight.transpose(1, 2),
         ).transpose(0, 1)
         z = z.to(attn_output.dtype).contiguous()
-        out = self._fp8_linear(
-            self.wo_b,
-            z.flatten(1),
-            (self.wo_b.output_size, self.wo_b.input_size_per_partition),
-        )
+        out, _ = self.wo_b(z.flatten(1))
         return out
 
     def forward(

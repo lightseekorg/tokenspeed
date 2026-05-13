@@ -20,9 +20,15 @@
 
 from __future__ import annotations
 
+import math
+import platform
+
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention import tokenspeed_mla as kernel_mla
+from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
+    mla_kv_pack_quantize_fp8,
+)
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -36,6 +42,8 @@ H = 16
 QK_NOPE = 128
 QK_ROPE = 64
 V_HEAD = 128
+PREFILL_HEADS = 8
+PREFILL_SEQ = 64
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -53,6 +61,29 @@ def _make_kv_slice_inputs(device: str, dtype: torch.dtype = torch.bfloat16):
     return k_nope, k_pe, v
 
 
+def _host_arch() -> str:
+    return {
+        "amd64": "x86_64",
+        "arm64": "aarch64",
+        "x64": "x86_64",
+    }.get(platform.machine().lower(), platform.machine().lower())
+
+
+def _require_mla_binary_prefill():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for tokenspeed-mla binary prefill")
+
+    import tokenspeed_mla.fmha_binary as fmha_binary
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    expected_suffix = f"sm_{props.major}{props.minor}a_{_host_arch()}.so"
+    so_path = fmha_binary._resolve_so_path()
+    if not so_path.exists():
+        pytest.skip(f"tokenspeed-mla binary prefill SO not found: {so_path}")
+    assert so_path.name.endswith(expected_suffix)
+    return fmha_binary, so_path
+
+
 def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
     """Pure-PyTorch reference: broadcast k_pe across heads, cat, scale, cast."""
     k_pe_2d = k_pe.squeeze(1) if k_pe.dim() == 3 else k_pe
@@ -61,6 +92,95 @@ def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
     k_fp8 = (k_bf16.float() * k_scale_inv).to(fp8_dtype)
     v_fp8 = (v.float() * v_scale_inv).to(fp8_dtype)
     return k_fp8, v_fp8
+
+
+def _prefill_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+    *,
+    is_causal: bool,
+) -> torch.Tensor:
+    scores = torch.einsum("qhd,khd->qkh", query.float(), key.float()) * softmax_scale
+    if is_causal:
+        q_idx = torch.arange(query.shape[0], device=query.device).view(-1, 1)
+        k_idx = torch.arange(key.shape[0], device=key.device).view(1, -1)
+        scores = scores.masked_fill(k_idx > q_idx, float("-inf"))
+    probs = torch.softmax(scores, dim=1)
+    return torch.einsum("qkh,khd->qhd", probs, value.float()).to(torch.bfloat16)
+
+
+def test_binary_prefill_so_loads() -> None:
+    fmha_binary, so_path = _require_mla_binary_prefill()
+
+    module = fmha_binary._load_module(str(so_path))
+
+    assert getattr(module, fmha_binary._FUNC_NAMES[(False, False)], None) is not None
+    assert fmha_binary.has_binary_prefill()
+
+
+def test_kernel_tokenspeed_mla_prefill_binary_e2e(device: str, monkeypatch) -> None:
+    _require_mla_binary_prefill()
+
+    import tokenspeed_mla.mla_prefill as mla_prefill
+
+    monkeypatch.setattr(mla_prefill, "_PREFILL_BACKEND_ENV", "binary")
+    mla_prefill._resolve_backend.cache_clear()
+
+    torch.manual_seed(3)
+    query = torch.randn(
+        PREFILL_SEQ,
+        PREFILL_HEADS,
+        QK_NOPE + QK_ROPE,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    key = torch.randn(
+        PREFILL_SEQ,
+        PREFILL_HEADS,
+        QK_NOPE + QK_ROPE,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    value = torch.randn(
+        PREFILL_SEQ,
+        PREFILL_HEADS,
+        V_HEAD,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    seq_lens = torch.tensor([PREFILL_SEQ], device=device, dtype=torch.int32)
+    cum_seq_lens = torch.tensor([0, PREFILL_SEQ], device=device, dtype=torch.int32)
+    softmax_scale = 1.0 / math.sqrt(QK_NOPE + QK_ROPE)
+
+    try:
+        actual = kernel_mla.tokenspeed_mla_prefill(
+            query,
+            key,
+            value,
+            seq_lens,
+            cum_seq_lens,
+            PREFILL_SEQ,
+            batch_size=1,
+            softmax_scale=softmax_scale,
+            is_causal=False,
+            return_lse=False,
+        )
+    finally:
+        mla_prefill._resolve_backend.cache_clear()
+    torch.cuda.synchronize()
+
+    expected = _prefill_reference(
+        query,
+        key,
+        value,
+        softmax_scale,
+        is_causal=False,
+    )
+    assert actual.shape == (PREFILL_SEQ, PREFILL_HEADS, V_HEAD)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0.1, rtol=1e-5)
 
 
 def test_pure_cast_strided_inputs(device: str) -> None:

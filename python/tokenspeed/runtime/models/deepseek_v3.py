@@ -1329,9 +1329,6 @@ class DeepseekV3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
         )
         self.alt_stream = torch.cuda.Stream()
         # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
@@ -1850,9 +1847,6 @@ class Eagle3MlaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -1897,7 +1891,7 @@ class Eagle3MlaModel(nn.Module):
             embeds = input_embeds
 
         hidden_states = captured_hidden_states
-        if hidden_states.shape[-1] != embeds.shape[-1]:
+        if hidden_states.size(-1) != embeds.size(-1):
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None

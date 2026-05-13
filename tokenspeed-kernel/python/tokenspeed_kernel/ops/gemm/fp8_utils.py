@@ -149,6 +149,57 @@ def _per_token_group_quant_8bit_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
+@triton.jit
+def _per_token_group_quant_8bit_packed_ue8m0(
+    # Pointers to inputs and output
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    group_size,
+    # Num columns of y
+    y_num_columns,
+    # Stride from one packed scale column to the next of y_s
+    y_s_col_stride,
+    # Avoid to divide zero
+    eps,
+    # Information for float8
+    bit8_min,
+    bit8_max,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
+):
+    """Quantize per token group and pack UE8M0 scales for DeepGEMM."""
+
+    g_id = tl.program_id(0)
+    groups_per_row = y_num_columns // group_size
+    row = g_id // groups_per_row
+    group_col = g_id % groups_per_row
+
+    y_offset = row.to(tl.int64) * y_num_columns + group_col.to(tl.int64) * group_size
+    y_ptr += y_offset
+    y_q_ptr += y_offset
+
+    scale_pack_col = group_col // 4
+    scale_pack_pos = group_col % 4
+    y_s_ptr += scale_pack_col.to(tl.int64) * y_s_col_stride + row.to(tl.int64)
+
+    cols = tl.arange(0, BLOCK)
+    mask = cols < group_size
+
+    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    _absmax = tl.max(tl.abs(y))
+    scale_raw = tl.maximum(_absmax / bit8_max, eps)
+    exponent = tl.ceil(tl.log2(scale_raw))
+    y_s = tl.exp2(exponent)
+    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
+
+    exponent_biased = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint32)
+    packed_scale = exponent_biased << (scale_pack_pos * 8)
+
+    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    tl.atomic_or(y_s_ptr, packed_scale, sem="relaxed")
+
+
 def create_per_token_group_quant_fp8_output_scale(
     x_shape,
     device,
@@ -159,16 +210,19 @@ def create_per_token_group_quant_fp8_output_scale(
 ):
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
+        assert len(x_shape) == 2, "UE8M0 packed scales currently require 2D input"
+        assert group_size == 128, "UE8M0 packed scales currently require group_size=128"
         *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
         aligned_mn = align(x_s_mn, 4)
-        aligned_k = align(x_s_k, 4)
-        # The CUDA kernel expects the aligned scale tensor layout.
-        return torch.empty(
-            (*x_batch, aligned_k // 4, aligned_mn),
+        packed_k = ceil_div(x_s_k, 4)
+        scale_base = torch.empty(
+            (*x_batch, packed_k, aligned_mn),
             device=device,
             dtype=torch.int,
-        ).transpose(-1, -2)[..., :x_s_mn, :]
+        )
+        scale_base.zero_()
+        return scale_base.transpose(-1, -2)[..., :x_s_mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
             # aligned to 4 * sizeof(float)
@@ -242,7 +296,7 @@ def _per_token_group_quant_8bit_raw(
         group_size=group_size,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=False,
+        scale_ue8m0=scale_ue8m0,
     )
 
     M = x.numel() // group_size
@@ -252,7 +306,24 @@ def _per_token_group_quant_8bit_raw(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
-    if column_major_scales:
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        assert group_size == 128
+        _per_token_group_quant_8bit_packed_ue8m0[(M,)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            x.shape[1],
+            x_s.stride(-1),
+            eps,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
+            BLOCK=BLOCK,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    elif column_major_scales:
         _per_token_group_quant_8bit_colmajor[(M,)](
             x,
             x_q,
@@ -282,21 +353,6 @@ def _per_token_group_quant_8bit_raw(
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
-        )
-
-    if scale_ue8m0:
-        from tokenspeed_kernel.thirdparty.deep_gemm import (
-            transform_sf_into_required_layout,
-        )
-
-        assert group_size == 128
-        x_s = transform_sf_into_required_layout(
-            x_s,
-            num_groups=None,
-            mn=x_q.shape[0],
-            k=x_q.shape[1],
-            recipe=(1, group_size, group_size),
-            is_sfa=True,
         )
 
     return x_q, x_s
@@ -369,7 +425,7 @@ def per_token_group_quant_fp8(
     return _per_token_group_quant_8bit_raw(
         x,
         group_size,
-        dtype=torch.int8,
+        dtype=fp8_dtype,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,

@@ -18,6 +18,56 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import site
+import sys
+from pathlib import Path
+
+
+def _prepare_deep_gemm_cuda_home() -> None:
+    """Set CUDA_HOME before importing deep_gemm so its C++ init sees nvcc."""
+
+    requested_cuda_home = os.environ.get("CUDA_HOME")
+    site_paths = []
+    try:
+        site_paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    site_paths.extend(sys.path)
+
+    candidates = []
+    if requested_cuda_home:
+        candidates.append(Path(requested_cuda_home))
+    for base in site_paths:
+        candidates.extend(sorted((Path(base) / "nvidia").glob("cu*"), reverse=True))
+
+    cuda_home = None
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if (candidate / "include" / "cuda_runtime.h").exists() and (
+            candidate / "bin" / "nvcc"
+        ).exists():
+            cuda_home = candidate
+            break
+    if cuda_home is None:
+        return
+
+    os.environ["CUDA_HOME"] = str(cuda_home)
+    include_dir = str(cuda_home / "include")
+    cpath = os.environ.get("CPATH", "")
+    cpath_entries = [entry for entry in cpath.split(os.pathsep) if entry]
+    if include_dir not in cpath_entries:
+        os.environ["CPATH"] = os.pathsep.join([include_dir] + cpath_entries)
+
+    bin_dir = str(cuda_home / "bin")
+    path = os.environ.get("PATH", "")
+    path_entries = [entry for entry in path.split(os.pathsep) if entry]
+    if bin_dir not in path_entries:
+        os.environ["PATH"] = os.pathsep.join([bin_dir] + path_entries)
+
+
+_prepare_deep_gemm_cuda_home()
+
 from deep_gemm import (
     ceil_div,
     fp8_fp4_mqa_logits,

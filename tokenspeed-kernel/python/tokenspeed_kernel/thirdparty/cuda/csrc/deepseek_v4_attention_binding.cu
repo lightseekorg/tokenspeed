@@ -32,5 +32,13 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     double rms_norm_eps,
     int64_t cache_block_size);
 
+void deepseek_v4_indexer_topk_prefill(TensorView logits,
+                                      TensorView row_starts,
+                                      TensorView row_ends,
+                                      TensorView output,
+                                      int64_t k);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
                               fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v4_indexer_topk_prefill,
+                              deepseek_v4_indexer_topk_prefill);

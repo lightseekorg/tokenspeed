@@ -18,39 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TokenSpeed CLI entry point.
-
-Usage:
-    tokenspeed serve --model <path> [options]
-    tokenspeed bench <bench_type> [options]
-    tokenspeed env
-    tokenspeed version
-
-    ts serve --model <path> [options]
-    ts bench <bench_type> [options]
-    ts env
-    ts version
-"""
+"""TokenSpeed CLI entry point."""
 
 import argparse
-import os
 import sys
-import traceback
 
 
-def _serve(args: argparse.Namespace) -> None:
-    from tokenspeed.runtime.entrypoints.http_server import api_server
-    from tokenspeed.runtime.utils.process import kill_process_tree
-    from tokenspeed.runtime.utils.server_args import ServerArgs
+def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
+    from tokenspeed.cli.serve_smg import run_smg_from_args
 
-    server_args = ServerArgs.from_cli_args(args)
-
-    try:
-        api_server(server_args)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        kill_process_tree(os.getpid(), include_parent=False)
+    run_smg_from_args(args, raw_argv)
 
 
 def _bench(args: argparse.Namespace) -> None:
@@ -79,20 +56,14 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # serve — only import heavy ServerArgs when the user actually invokes
-    # the "serve" subcommand, so that lightweight commands like "version"
-    # and "env" don't pull in torch / psutil / etc.
+    # Unknown flags fall through to the smg orchestrator's own splitter; we
+    # don't register the engine's ServerArgs on this parser.
     serve_parser = subparsers.add_parser(
         "serve",
         help="Launch the TokenSpeed inference server.",
     )
-    if len(sys.argv) >= 2 and sys.argv[1] == "serve":
-        from tokenspeed.runtime.utils.server_args import ServerArgs
-
-        ServerArgs.add_cli_args(serve_parser)
     serve_parser.set_defaults(func=_serve)
 
-    # bench
     bench_parser = subparsers.add_parser(
         "bench",
         add_help=False,
@@ -100,14 +71,12 @@ def main() -> None:
     )
     bench_parser.set_defaults(func=_bench, bench_args=[])
 
-    # env
     env_parser = subparsers.add_parser(
         "env",
         help="Check environment configurations and dependency versions.",
     )
     env_parser.set_defaults(func=_env)
 
-    # version
     version_parser = subparsers.add_parser(
         "version",
         help="Print the TokenSpeed version.",
@@ -122,9 +91,16 @@ def main() -> None:
 
     if args.func is _bench:
         args.bench_args = extra_args
-    elif extra_args:
-        parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
+        args.func(args)
+        return
 
+    if args.func is _serve:
+        raw = list(sys.argv[2:])
+        args.func(args, raw)
+        return
+
+    if extra_args:
+        parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
     args.func(args)
 
 

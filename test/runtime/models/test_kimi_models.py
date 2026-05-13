@@ -21,6 +21,7 @@ Environment (all optional):
 import dataclasses
 import os
 import subprocess
+import sys
 import time
 import unittest
 
@@ -51,7 +52,10 @@ def _next_server_port() -> int:
 
 def _api_server(port: int, extra_args=()) -> subprocess.Popen:
     cmd = [
-        "tokenspeed-serve",
+        sys.executable,
+        "-m",
+        "tokenspeed.cli",
+        "serve",
         "--model",
         MODEL,
         "--host",

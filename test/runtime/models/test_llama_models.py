@@ -58,15 +58,15 @@ def _next_server_port() -> int:
 
 
 def _api_server(port: int, extra_args=()) -> subprocess.Popen:
-    # Use ``python -m tokenspeed.api_server`` instead of the
-    # ``tokenspeed-serve`` console script — the CI runner doesn't always
-    # have the entrypoint on PATH (e.g. when tests are executed against a
-    # source tree rather than a wheel install), and the module form works
-    # unconditionally.
+    # Use ``python -m tokenspeed.cli serve`` instead of the ``ts`` console
+    # script — the CI runner doesn't always have the entrypoint on PATH
+    # (e.g. when tests are executed against a source tree rather than a
+    # wheel install), and the module form works unconditionally.
     cmd = [
         sys.executable,
         "-m",
-        "tokenspeed.api_server",
+        "tokenspeed.cli",
+        "serve",
         "--model",
         MODEL,
         "--host",
