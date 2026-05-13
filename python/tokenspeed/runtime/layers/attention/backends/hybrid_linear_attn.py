@@ -47,7 +47,8 @@ from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton impor
 )
 
 _USE_BLADE_GDN = os.environ.get("BLADE_GDN", "0") == "1"
-if _USE_BLADE_GDN:
+_USE_FUSED_BLADE_GDN = os.environ.get("FUSED_BLADE_GDN", "0") == "1"
+if _USE_BLADE_GDN or _USE_FUSED_BLADE_GDN:
     import tiny_gdn
 
     _blade_gdn_workspace = None
@@ -601,39 +602,65 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        if _USE_BLADE_GDN:
+        # Three branches: default triton, BLADE_GDN (two-kernel), FUSED_BLADE_GDN (single kernel)
+        if _USE_FUSED_BLADE_GDN:
+            # ---- blade_gdn fused_gating_recur: single kernel, no gating pre-compute ----
             global _blade_gdn_workspace
             if _blade_gdn_workspace is None:
                 _blade_gdn_workspace = torch.zeros(
                     (1000,), dtype=torch.int32, device=query.device
                 )
 
-            # Fused gating + beta computation (one kernel launch)
-            # g: [1, seq_len, HV] fp32 log-space, beta: [1, seq_len, HV] sigmoid(b)
-            g, beta_out = fused_gdn_gating(A_log, a, dt_bias, b=b)
-
             # 4D format: [batch=seq_len, S=1, H, D]
             q_4d = query.transpose(0, 1)   # [1, seq_len, H, D] -> [seq_len, 1, H, D]
             k_4d = key.transpose(0, 1)     # [seq_len, 1, H, D]
             v_4d = value.transpose(0, 1)   # [seq_len, 1, HV, DV]
-            # g/beta already [1, seq_len, HV] -> transpose to [seq_len, 1, HV]
-            g_4d = g.transpose(0, 1)       # [seq_len, 1, HV]
-            beta_4d = beta_out.transpose(0, 1)  # [seq_len, 1, HV]
 
-            # Allocate output
-            output = torch.empty_like(v_4d)  # [seq_len, 1, HV, DV]
+            blade_output = torch.empty_like(v_4d)  # [seq_len, 1, HV, DV]
 
-            # blade_gdn kernel: gating=log-space (exp inside), beta=sigmoid
+            tiny_gdn.gdn_main_recur_fused_gating(
+                q_4d, k_4d, v_4d, A_log, a, dt_bias, b,
+                blade_output, ssm_states, ssm_states, _blade_gdn_workspace,
+                scale=None,
+                req_ids=cache_indices,
+                use_qk_l2_norm=True,
+            )
+
+            core_attn_out = blade_output.transpose(0, 1)  # [1, seq_len, HV, DV]
+
+        elif _USE_BLADE_GDN:
+            # ---- blade_gdn two-kernel: fused_gdn_gating + gdn_main_recur ----
+            global _blade_gdn_workspace
+            if _blade_gdn_workspace is None:
+                _blade_gdn_workspace = torch.zeros(
+                    (1000,), dtype=torch.int32, device=query.device
+                )
+
+            # Fused gating + beta computation (one triton kernel launch)
+            # g: [1, seq_len, HV] fp32 log-space, beta: [1, seq_len, HV] sigmoid(b)
+            g, beta_out = fused_gdn_gating(A_log, a, dt_bias, b=b)
+
+            # 4D format: [batch=seq_len, S=1, H, D]
+            q_4d = query.transpose(0, 1)
+            k_4d = key.transpose(0, 1)
+            v_4d = value.transpose(0, 1)
+            g_4d = g.transpose(0, 1)
+            beta_4d = beta_out.transpose(0, 1)
+
+            blade_output = torch.empty_like(v_4d)
+
             tiny_gdn.gdn_main_recur(
-                q_4d, k_4d, v_4d, g_4d, beta_4d, output,
+                q_4d, k_4d, v_4d, g_4d, beta_4d, blade_output,
                 ssm_states, ssm_states, _blade_gdn_workspace,
                 scale=None,
                 req_ids=cache_indices,
                 use_qk_l2_norm=True,
             )
 
-            core_attn_out = output.transpose(0, 1)  # [1, seq_len, HV, DV]
+            core_attn_out = blade_output.transpose(0, 1)
+
         else:
+            # ---- Default: tokenspeed triton recurrent kernel ----
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=A_log,
                 dt_bias=dt_bias,
@@ -649,6 +676,7 @@ class MambaAttnBackend(AttentionBackend):
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
             )
+
         return core_attn_out
 
     def forward_extend(
