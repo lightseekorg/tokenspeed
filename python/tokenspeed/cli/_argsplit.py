@@ -66,7 +66,7 @@ _ENGINE_EXPLICIT = {"--tensor-parallel-size"}
 
 @dataclass
 class OrchestratorOpts:
-    engine_startup_timeout: int = 600
+    engine_startup_timeout: int = 1800
     gateway_startup_timeout: int = 60
     drain_timeout: int = 30
 
