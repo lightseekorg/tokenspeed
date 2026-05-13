@@ -152,6 +152,19 @@ def _create_attn_backend(
     return _get_backend_cls(config.backend_name, arch)(config)
 
 
+def _create_attn_backend_with_name(
+    name: str | None,
+    arch: AttentionArch,
+    config: BaseAttnConfig,
+) -> AttentionBackend:
+    original_name = config.backend_name
+    config.backend_name = name
+    try:
+        return _get_backend_cls(name, arch)(config)
+    finally:
+        config.backend_name = original_name
+
+
 def _create_attn_pool(
     config: BaseAttnConfig,
     num_layers: int,
@@ -198,7 +211,11 @@ def _create_hybrid_linear_attn(
 
     # Create the full attention backend for standard MHA layers.
     # Use user's original choice if provided, otherwise auto-select.
-    full_attn_backend = _get_backend_cls(full_attn_backend_name, arch)(config)
+    full_attn_backend = _create_attn_backend_with_name(
+        full_attn_backend_name,
+        arch,
+        config,
+    )
 
     # Create mamba/linear attention backend
     config.speculative_num_draft_tokens = getattr(
@@ -353,7 +370,6 @@ def create_attn_components(
     has_mamba = getattr(model_config, "mambaish_config", None) is not None or (
         has_mamba_layers
     )
-    enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
     mamba_pool_total_chunks = 0
     mamba_pool = None
 
@@ -371,7 +387,7 @@ def create_attn_components(
         ),
     )
 
-    if enable_mamba_radix_cache and server_args.max_mamba_cache_size is not None:
+    if has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
         max_total_num_pages = profile_max_num_pages(
             **_profile_kwargs,
@@ -383,7 +399,7 @@ def create_attn_components(
             server_args.block_size,
             server_args.max_total_tokens,
         )
-    elif enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+    elif has_mamba and server_args.max_mamba_cache_size is None:
         (
             conv_state_shape,
             temporal_state_shape,
@@ -450,6 +466,8 @@ def create_attn_components(
             max_context_len=config.context_len,
             page_size=server_args.block_size,
             rank=rank,
+            hf_config=model_config.hf_config,
+            max_scheduled_tokens=server_args.chunked_prefill_size,
         )
     elif is_hybrid_gdn:
         resolved_original_backend = _BACKEND_ALIASES.get(

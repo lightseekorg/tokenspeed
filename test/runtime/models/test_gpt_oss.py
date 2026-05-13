@@ -17,6 +17,7 @@ Environment (all optional):
 import dataclasses
 import os
 import subprocess
+import sys
 import time
 import unittest
 from typing import Optional
@@ -50,9 +51,12 @@ def _next_dist_port() -> int:
 # ── Server lifecycle ─────────────────────────────────────────────────
 
 
-def _api_server(port: int, extra_args=()) -> subprocess.Popen:
+def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
     cmd = [
-        "tokenspeed-serve",
+        sys.executable,
+        "-m",
+        "tokenspeed.cli",
+        "serve",
         "--model",
         MODEL,
         "--host",
@@ -193,7 +197,7 @@ class TestGptOss(unittest.TestCase):
 
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
-        proc = _api_server(port, case.extra_args)
+        proc = _serve_server(port, case.extra_args)
         try:
             if not _wait_for_server(port):
                 self.fail(f"[{case.name}] Server did not start within {TIMEOUT}s")

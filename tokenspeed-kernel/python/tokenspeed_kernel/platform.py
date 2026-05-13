@@ -431,7 +431,7 @@ def _detect_rocm_platform() -> PlatformInfo:
         memory_bandwidth=_estimate_amd_bandwidth(props),
         sm_count=props.multi_processor_count,
         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
-        max_shared_memory_per_sm={"gfx942": 64 * 1024, "gfx950": 64 * 1024}.get(
+        max_shared_memory_per_sm={"gfx942": 64 * 1024, "gfx950": 160 * 1024}.get(
             arch, getattr(props, "max_shared_memory_per_block", 0)
         ),
         sm_features=sm_features,

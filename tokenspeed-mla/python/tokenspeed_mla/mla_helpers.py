@@ -23,6 +23,20 @@ import cutlass
 import cutlass.cute as cute
 
 
+def get_mla_decode_fold_sq_factor(
+    num_heads: int, seq_len_q: int, mma_m_tile: int = 128
+) -> int:
+    """Return the largest query-token fold factor that exactly divides seq_len_q."""
+    if num_heads <= 0 or seq_len_q <= 0 or mma_m_tile <= 0:
+        return 1
+
+    max_fold = min(seq_len_q, mma_m_tile // num_heads)
+    for candidate in range(max_fold, 1, -1):
+        if seq_len_q % candidate == 0:
+            return candidate
+    return 1
+
+
 class MLAStaticTileSchedulerParams:
     def __init__(
         self,

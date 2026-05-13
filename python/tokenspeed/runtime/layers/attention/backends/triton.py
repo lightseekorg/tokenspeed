@@ -35,11 +35,9 @@ import triton.language as tl
 from tokenspeed_kernel.ops.attention.triton.mha_decode import decode_attention_fwd
 from tokenspeed_kernel.ops.attention.triton.mha_prefill import prefill_attention_fwd
 
-from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
 )
@@ -946,6 +944,3 @@ def update_sliding_window_buffer_cuda_graph(
             window_kv_indices[:kv_last_index]
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens
-
-
-register_backend("triton", {AttentionArch.MHA}, TritonAttnBackend)

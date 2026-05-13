@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
-    from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
@@ -59,6 +59,22 @@ _is_capture_mode = False
 
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
+
+
+def compute_max_logical_pages_for_capture(
+    spec,
+    *,
+    max_context_len: int,
+    max_tokens_per_req: int = 1,
+) -> int:
+    raw_per_page = max(1, int(spec.rows_per_page) * int(spec.entry_stride_tokens))
+    if str(getattr(spec, "retention", "")) == "sliding_window":
+        window = int(getattr(spec, "sliding_window_tokens", 0) or 0)
+        live_tokens = max(1, window - 1 + max(1, int(max_tokens_per_req)))
+        if int(max_context_len) > 0:
+            live_tokens = min(live_tokens, int(max_context_len))
+        return max(1, (live_tokens + raw_per_page - 1) // raw_per_page + 1)
+    return max(1, (max(1, int(max_context_len)) + raw_per_page - 1) // raw_per_page)
 
 
 @contextmanager
@@ -196,6 +212,7 @@ class CudaGraphWrapper:
         self.device = config.device
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
+        self.context_len = config.context_len
         self.vocab_size = config.vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
@@ -207,11 +224,36 @@ class CudaGraphWrapper:
         self.world_size = config.world_size
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        attn_backend.init_cuda_graph_state(self.max_bs, self.input_buffers.seq_lens_buf)
-        if draft_attn_backend is not None:
-            draft_attn_backend.init_cuda_graph_state(
-                self.max_bs, self.drafter.draft_seq_lens
+        paged_cache_group_specs = tuple(
+            getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+        )
+        try:
+            attn_backend.init_cuda_graph_state(
+                self.max_bs,
+                self.input_buffers.seq_lens_buf,
+                paged_cache_group_specs=paged_cache_group_specs,
+                max_tokens_per_req=self.max_tokens_per_req,
             )
+        except TypeError:
+            attn_backend.init_cuda_graph_state(
+                self.max_bs,
+                self.input_buffers.seq_lens_buf,
+            )
+        if draft_attn_backend is not None:
+            draft_paged_cache_group_specs = tuple(
+                getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+            )
+            try:
+                draft_attn_backend.init_cuda_graph_state(
+                    self.max_bs,
+                    self.drafter.draft_seq_lens,
+                    paged_cache_group_specs=draft_paged_cache_group_specs,
+                    max_tokens_per_req=self.max_tokens_per_req,
+                )
+            except TypeError:
+                draft_attn_backend.init_cuda_graph_state(
+                    self.max_bs, self.drafter.draft_seq_lens
+                )
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.output_buffers: dict[int, tuple] = {}
@@ -378,15 +420,67 @@ class CudaGraphWrapper:
         global_graph_memory_pool = graph.pool()
         return graph, out
 
+    def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
+        specs = tuple(getattr(pool, "paged_cache_group_specs", ()) or ())
+        if not specs:
+            return None
+        out = {}
+        for spec in specs:
+            max_pages = compute_max_logical_pages_for_capture(
+                spec,
+                max_context_len=(
+                    self.max_tokens_per_req * self.max_bs
+                    if self.context_len <= 0
+                    else self.context_len
+                ),
+                max_tokens_per_req=self.max_tokens_per_req,
+            )
+            out[str(spec.group_id)] = torch.zeros(
+                (bs, max_pages),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        return out
+
     def _init_capture_metadata(self, bs: int):
+        capture_kwargs = {}
+        if self.input_buffers.has_mamba:
+            capture_kwargs["mamba_pool_indices"] = (
+                self.input_buffers.mamba_pool_indices_buf[:bs]
+            )
+        paged_cache_block_tables = self._capture_paged_cache_block_tables(
+            bs,
+            self.token_to_kv_pool,
+        )
+        if paged_cache_block_tables is not None and getattr(
+            self.attn_backend,
+            "uses_paged_cache_groups",
+            False,
+        ):
+            capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             bs * self.max_tokens_per_req,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
             ForwardMode.DECODE if self.drafter is None else ForwardMode.TARGET_VERIFY,
+            **capture_kwargs,
         )
         if self.draft_attn_backend is not None:
+            draft_kwargs = {}
+            if self.draft_token_to_kv_pool is not None:
+                draft_paged_cache_block_tables = self._capture_paged_cache_block_tables(
+                    bs,
+                    self.draft_token_to_kv_pool,
+                )
+                if draft_paged_cache_block_tables is not None and getattr(
+                    self.draft_attn_backend,
+                    "uses_paged_cache_groups",
+                    False,
+                ):
+                    draft_kwargs["paged_cache_block_tables"] = (
+                        draft_paged_cache_block_tables
+                    )
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -394,7 +488,60 @@ class CudaGraphWrapper:
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
                 ForwardMode.DRAFT_EXTEND,
+                **draft_kwargs,
             )
+
+    @staticmethod
+    def _pad_block_tables_to_padded_bs(
+        block_tables: dict,
+        *,
+        actual_bs: int,
+        padded_bs: int,
+    ) -> dict:
+        if padded_bs <= actual_bs:
+            return block_tables
+        out = {}
+        for key, table in block_tables.items():
+            if not isinstance(table, torch.Tensor):
+                out[key] = table
+                continue
+            rows = int(table.shape[0])
+            if rows == padded_bs:
+                out[key] = table
+                continue
+            out[key] = torch.nn.functional.pad(
+                table,
+                (0, 0, 0, padded_bs - rows),
+                value=0,
+            )
+        return out
+
+    @staticmethod
+    def _pad_offsets_to_padded_bs(
+        base_offsets: dict,
+        *,
+        actual_bs: int,
+        padded_bs: int,
+    ) -> dict:
+        if padded_bs <= actual_bs:
+            return base_offsets
+        out = {}
+        for key, off in base_offsets.items():
+            if not isinstance(off, torch.Tensor):
+                out[key] = off
+                continue
+            rows = int(off.shape[0])
+            if rows == padded_bs:
+                out[key] = off
+                continue
+            # Padded rows have no real request — base 0 keeps absolute
+            # indexing aligned to column 0, matching dummy-page row padding.
+            out[key] = torch.nn.functional.pad(
+                off,
+                (0, padded_bs - rows),
+                value=0,
+            )
+        return out
 
     def _init_replay_metadata(
         self,
@@ -406,6 +553,38 @@ class CudaGraphWrapper:
         **kwargs,
     ):
         """Graph-replay path — update persistent cuda-graph buffers in place."""
+        paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None)
+        paged_cache_block_table_base_offsets = kwargs.pop(
+            "paged_cache_block_table_base_offsets", None
+        )
+        if paged_cache_block_tables is not None and getattr(
+            self.attn_backend,
+            "uses_paged_cache_groups",
+            False,
+        ):
+            actual_bs = next(
+                (
+                    int(table.shape[0])
+                    for table in paged_cache_block_tables.values()
+                    if isinstance(table, torch.Tensor)
+                ),
+                int(req_pool_indices.shape[0]),
+            )
+            paged_cache_block_tables = self._pad_block_tables_to_padded_bs(
+                paged_cache_block_tables,
+                actual_bs=actual_bs,
+                padded_bs=padded_bs,
+            )
+            kwargs["paged_cache_block_tables"] = paged_cache_block_tables
+            if paged_cache_block_table_base_offsets:
+                paged_cache_block_table_base_offsets = self._pad_offsets_to_padded_bs(
+                    paged_cache_block_table_base_offsets,
+                    actual_bs=actual_bs,
+                    padded_bs=padded_bs,
+                )
+                kwargs["paged_cache_block_table_base_offsets"] = (
+                    paged_cache_block_table_base_offsets
+                )
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
             req_pool_indices,
@@ -540,6 +719,8 @@ class CudaGraphWrapper:
         mamba_branching_seqlens: torch.Tensor | None = None,
         mamba_track_pool_indices: torch.Tensor | None = None,
         spec_info=None,
+        paged_cache_block_tables: dict | None = None,
+        paged_cache_block_table_base_offsets: dict | None = None,
     ):
         """
         Unified forward entry point.
@@ -593,6 +774,15 @@ class CudaGraphWrapper:
             mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
         if use_graph:
+            if (
+                bs == 0
+                and paged_cache_block_tables is None
+                and getattr(self.attn_backend, "uses_paged_cache_groups", False)
+            ):
+                paged_cache_block_tables = self._capture_paged_cache_block_tables(
+                    padded_bs,
+                    self.token_to_kv_pool,
+                )
             self._init_replay_metadata(
                 padded_bs,
                 req_pool_indices,
@@ -600,6 +790,10 @@ class CudaGraphWrapper:
                 req_to_page=req_to_page,
                 forward_mode=ctx.forward_mode,
                 num_padding=padded_bs - bs if padded_bs != bs else 0,
+                paged_cache_block_tables=paged_cache_block_tables,
+                paged_cache_block_table_base_offsets=(
+                    paged_cache_block_table_base_offsets
+                ),
                 **mamba_kwargs,
             )
 
@@ -644,6 +838,16 @@ class CudaGraphWrapper:
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 padded_static_len=ctx.padded_static_len,
                 spec_info=spec_info,
+                paged_cache_block_tables=(
+                    paged_cache_block_tables
+                    if getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                    else None
+                ),
+                paged_cache_block_table_base_offsets=(
+                    paged_cache_block_table_base_offsets
+                    if getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                    else None
+                ),
                 **mamba_kwargs,
             )
 

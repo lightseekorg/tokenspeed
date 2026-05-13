@@ -36,6 +36,15 @@ pip3 install cmake ninja
 pip3 install tokenspeed-scheduler/
 
 echo "=== Step 5: Install TokenSpeed ==="
+# Pin smg / smg-grpc-servicer / smg-grpc-proto: the `tokenspeed` submodule
+# that `ts serve` imports (smg_grpc_servicer.tokenspeed.server) only exists
+# on these post-release pins. The three post-date versions must stay in sync:
+# the gRPC proto / runtime contract is pinned as a set.
+pip3 install \
+    "smg==1.4.1.post20260512" \
+    "smg-grpc-servicer==0.5.2.post20260512" \
+    "smg-grpc-proto==0.4.7.post20260512" \
+    --extra-index-url https://lightseek.org/whl/rocm7.2
 pip3 install -e ./python --no-build-isolation \
     --extra-index-url "${ROCM_INDEX}"
 

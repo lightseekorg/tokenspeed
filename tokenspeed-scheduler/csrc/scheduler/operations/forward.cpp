@@ -22,6 +22,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -52,10 +53,20 @@
 #include "scheduler/types.h"
 #include "utils.h"
 
+namespace {
+
+std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
+    if (numer <= 0) return 0;
+    return (numer + denom - 1) / denom;
+}
+
+}  // namespace
+
 namespace tokenspeed {
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
-    Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache) {
+    Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
+    std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
     MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
                                                     : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
@@ -97,6 +108,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         return {};
     }
 
+    const std::int32_t first_pos = request->PrefillSize() - unscheduled;
+    const std::int32_t target = first_pos + tokens_this_round;
+    auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
+    if (!admission.ok) {
+        return {};
+    }
+    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
+
     return fsm::SchedulePrefillFirstChunkEvent{
         tokens_this_round,
         decode_input_tokens,
@@ -113,7 +132,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 }
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
-    Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event) {
+    Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event,
+    std::map<std::string, std::int32_t>& simulated_free) {
     std::int32_t unscheduled = request->UnScheduledPrefillSize();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
 
@@ -127,11 +147,20 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return {};
     }
 
+    const std::int32_t first_pos = request->PrefillSize() - unscheduled;
+    const std::int32_t target = first_pos + tokens_this_round;
+    auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
+    if (!admission.ok) {
+        return {};
+    }
+    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
+
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
-std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request) {
+std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
+                                                                  std::map<std::string, std::int32_t>& simulated_free) {
     std::int32_t tail_available = request->TailPageAvailableTokens();
     std::int32_t extra_tokens = std::max(0, request->GetReserveNumTokensInNextScheduleEvent() - tail_available);
     std::int32_t pages_needed = (extra_tokens + config_.page_size - 1) / config_.page_size;
@@ -140,15 +169,35 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         return {};
     }
 
+    const std::int32_t first_pos = request->TokenSize();
+    const std::int32_t target = first_pos + config_.decode_input_tokens;
+    auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
+    if (!admission.ok) {
+        return {};
+    }
+    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
+
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
-std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(Request* request) {
+std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(
+    Request* request, std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
 
-    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
+    TreeNode* mamba_recovery_node = nullptr;
+    if (hybrid_prefix_cache_ && mamba_allocator_) {
+        mamba_recovery_node = hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node);
+        if (mamba_recovery_node == nullptr) {
+            spdlog::warn("[Scheduler] Retracted request {} lost tree-owned Mamba state, aborting request",
+                         request->Id());
+            request->Apply(fsm::AbortEvent{});
+            return {};
+        }
+        match_result.mamba_cow_src_index = mamba_recovery_node->MambaSlotIndex();
+    }
 
     const std::int32_t device_matched2 = match_result.device.DepthInPage();
     const std::int32_t host_matched2 = match_result.host.DepthInPage();
@@ -165,10 +214,62 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_pages_needed)) {
         return {};
     }
+    if (hybrid_prefix_cache_ && mamba_allocator_) {
+        // Recovery COWs the tree-owned Mamba state into fresh request-local
+        // working/checkpoint slots. Protect the source node only for this
+        // allocation; retracted Mamba states are otherwise normal evictable
+        // tree-owned cache entries.
+        if (!hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2, mamba_recovery_node)) {
+            return {};
+        }
+    }
 
-    return fsm::ScheduleDecodeFromRetractedEvent{config_.decode_input_tokens, &device_allocator_,
-                                                 &req_pool_allocator_,        &kv_prefix_cache_,
-                                                 std::move(match_result),     loadback_diff};
+    std::map<std::string, std::int32_t> released_back;
+    auto req_it = request_paged_cache_tables_.find(request->Id());
+    if (req_it != request_paged_cache_tables_.end()) {
+        for (const auto& [gid, table] : req_it->second) {
+            released_back[gid] = table.ActivePagesCount();
+        }
+    }
+    auto simulated_after_release = simulated_free;
+    for (const auto& [gid, n] : released_back) {
+        simulated_after_release[gid] += n;
+    }
+
+    PagedCacheGroupAdmission admission;
+    const std::int32_t target = request->TokenSize();
+    if (!paged_cache_allocators_.empty() && target >= 0) {
+        for (const auto& [gid, allocator] : paged_cache_allocators_) {
+            const auto& cfg = allocator->Config();
+            if (cfg.entry_stride_tokens <= 0 || cfg.rows_per_page <= 0) continue;
+            const std::int32_t entries = CeilDivPositive(target, cfg.entry_stride_tokens);
+            const std::int32_t required = (entries + cfg.rows_per_page - 1) / cfg.rows_per_page;
+            const std::int32_t free =
+                simulated_after_release.count(gid) ? simulated_after_release.at(gid) : allocator->AvailablePages();
+            admission.releasable_pages[gid] = 0;
+            admission.new_pages_needed[gid] = required;
+            if (free < required) {
+                admission.ok = false;
+            }
+        }
+    }
+    if (!admission.ok) {
+        return {};
+    }
+    for (const auto& [gid, n] : released_back) {
+        simulated_free[gid] += n;
+    }
+    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
+
+    return fsm::ScheduleDecodeFromRetractedEvent{
+        config_.decode_input_tokens,
+        &device_allocator_,
+        &req_pool_allocator_,
+        &kv_prefix_cache_,
+        std::move(match_result),
+        loadback_diff,
+        mamba_allocator_ ? &*mamba_allocator_ : nullptr,
+    };
 }
 
 std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* request) {
@@ -189,7 +290,7 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
 
     kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
 
-    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens);
+    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
 
     std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
     const std::int32_t device_matched3 = match_result.device.DepthInPage();
@@ -202,7 +303,8 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(host_pages_needed)) {
         return {};
     }
-    return fsm::ScheduleRetractEvent{&kv_prefix_cache_, &host_allocator_, match_result};
+    return fsm::ScheduleRetractEvent{&kv_prefix_cache_, &host_allocator_, match_result,
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
 LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff, cache_op_id op_id) {
@@ -295,11 +397,16 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
     auto op = applyPrefillEvent(request, std::move(event));
     op.mamba_cow_src_idx = match.mamba_cow_src_index;
     op.mamba_branching_seqlen = match.mamba_branching_seqlen;
+    acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
+    populatePagedCachePagesForOp(op);
     return op;
 }
 
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
-    return applyPrefillEvent(request, std::move(event));
+    auto op = applyPrefillEvent(request, std::move(event));
+    acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
+    populatePagedCachePagesForOp(op);
+    return op;
 }
 
 template <typename Event>
@@ -335,15 +442,19 @@ static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int3
 DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event) {
     const bool need_bootstrap_token = request->Is<fsm::PrefillDone>() && config_.role == Role::kD;
     std::int32_t bootstrap_token = need_bootstrap_token ? request->GetLastToken() : -1;
+    const std::int32_t first_pos = request->TokenSize();
 
     auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens);
     if (need_bootstrap_token) {
         op.decode_input_id = bootstrap_token;
     }
+    acquirePagedCachePagesForRequest(op.request_id, first_pos, first_pos + op.input_length);
+    populatePagedCachePagesForOp(op);
     return op;
 }
 
 DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event) {
+    const std::int32_t mamba_cow_src_index = event.GetMatchResult().mamba_cow_src_index;
     request->Apply(std::move(event));
     if (!request->Is<fsm::Decoding>()) {
         throw std::logic_error(
@@ -362,6 +473,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     }};
     op.decode_input_id = request->GetLastToken();
     op.hist_token_len = request->TokenSize() - 1;
+    op.mamba_cow_src_idx = mamba_cow_src_index;
 
     auto* mamba = request->GetLocalMambaAllocator();
     if (mamba != nullptr && mamba->HasWorking()) {
@@ -371,6 +483,9 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         }
     }
 
+    releasePagedCachePagesForRequest(op.request_id);
+    acquirePagedCachePagesForRequest(op.request_id, 0, request->TokenSize());
+    populatePagedCachePagesForOp(op);
     return op;
 }
 
@@ -394,22 +509,22 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         }
         ops.push_back(std::move(op));
     };
-
     std::vector<LoadBackOperation> loadback_ops;
+    auto simulated_free = initialPagedCacheGroupSimulatedFree();
     for (Request* request : candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
 
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
             std::int32_t reserver_num_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
-            if (auto ev = schedulePrefill(request, token_budget, reserver_num_tokens)) {
+            if (auto ev = schedulePrefill(request, token_budget, reserver_num_tokens, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Submitted>() || request->Is<fsm::PrefetchDone>()) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
             std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
 
-            if (auto ev =
-                    schedulePrefillFirstChunk(request, token_budget, decode_input_tokens, config_.disable_l2_cache)) {
+            if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
+                                                    config_.disable_l2_cache, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
                 // will be empty when disable_l2_cache
@@ -422,13 +537,13 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             // Prefill-first: skip ALL decode if any prefill was scheduled this round.
             if (!ops.empty() && std::holds_alternative<PrefillOperation>(ops.back())) break;
 
-            if (auto ev = scheduleDecode(request)) {
+            if (auto ev = scheduleDecode(request, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
             if (!ops.empty() && std::holds_alternative<PrefillOperation>(ops.back())) break;
 
-            if (auto ev = scheduleDecodeFromRetracted(request)) {
+            if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)));
                 if (!loadback_diff.empty()) {

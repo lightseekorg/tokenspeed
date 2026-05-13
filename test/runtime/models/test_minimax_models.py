@@ -32,7 +32,7 @@ from test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     kill_process_tree,
-    popen_api_server,
+    popen_serve_server,
     run_evalscope,
 )
 
@@ -185,7 +185,7 @@ class TestMiniMaxGSM8K(unittest.TestCase):
     def setUpClass(cls):
         cls.model = "MiniMaxAI/MiniMax-M2.5"
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_api_server(
+        cls.process = popen_serve_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
