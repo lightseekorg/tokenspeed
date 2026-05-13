@@ -1764,6 +1764,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=False,
             prev_is_moe=False,
+            post_attn_layernorm=self.post_attention_layernorm,
         )
 
     def forward(
@@ -1801,11 +1802,8 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
 
-            hidden_states, residual = self.comm_manager.post_attn_comm(
+            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
-            )
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
             )
 
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
