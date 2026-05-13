@@ -1,3 +1,9 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
+
 # Adapted from fla-org/flash-linear-attention
 # This file has been modified for this repository.
 # License: https://github.com/fla-org/flash-linear-attention/blob/main/LICENSE
