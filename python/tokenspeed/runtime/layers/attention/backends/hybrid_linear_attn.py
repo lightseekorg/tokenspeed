@@ -602,10 +602,10 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
+        global _blade_gdn_workspace
         # Three branches: default triton, BLADE_GDN (two-kernel), FUSED_BLADE_GDN (single kernel)
         if _USE_FUSED_BLADE_GDN:
-            # ---- blade_gdn fused_gating_recur: single kernel, no gating pre-compute ----
-            global _blade_gdn_workspace
+            # ---- blade_gdn fused_gating_recur: single kernel, no gating pre-compute ---- 
             if _blade_gdn_workspace is None:
                 _blade_gdn_workspace = torch.zeros(
                     (1000,), dtype=torch.int32, device=query.device
@@ -630,7 +630,6 @@ class MambaAttnBackend(AttentionBackend):
 
         elif _USE_BLADE_GDN:
             # ---- blade_gdn two-kernel: fused_gdn_gating + gdn_main_recur ----
-            global _blade_gdn_workspace
             if _blade_gdn_workspace is None:
                 _blade_gdn_workspace = torch.zeros(
                     (1000,), dtype=torch.int32, device=query.device
