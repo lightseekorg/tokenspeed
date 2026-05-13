@@ -63,11 +63,14 @@ void MambaEvictionManager::UpdateLeaf(TreeNode* node) {
     }
 }
 
-std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots) {
+std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* protected_node) {
     auto older = [](const TreeNode* a, const TreeNode* b) { return a->Time() > b->Time(); };
     std::priority_queue<TreeNode*, std::vector<TreeNode*>, decltype(older)> candidates(older);
 
     for (TreeNode* n : mamba_leaves_) {
+        if (n == protected_node) {
+            continue;
+        }
         if (n->OnDevice() && GetResource<ResourceType::Device>(n).RefCount() > 0) {
             continue;
         }
@@ -87,7 +90,7 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots) {
         if (parent != nullptr && !parent->IsRoot() && isMambaLeaf(parent)) {
             mamba_leaves_.insert(parent);
             bool parent_locked = parent->OnDevice() && GetResource<ResourceType::Device>(parent).RefCount() > 0;
-            if (!parent_locked) {
+            if (!parent_locked && parent != protected_node) {
                 candidates.push(parent);
             }
         }
@@ -95,10 +98,10 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots) {
     return evicted;
 }
 
-bool MambaEvictionManager::EnsureCapacity(std::int32_t required_slots) {
+bool MambaEvictionManager::EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node) {
     std::int32_t available = allocator_->AvailableSlots();
     if (available >= required_slots) return true;
-    Evict(required_slots - available);
+    Evict(required_slots - available, protected_node);
     return allocator_->AvailableSlots() >= required_slots;
 }
 

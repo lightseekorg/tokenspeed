@@ -87,7 +87,6 @@ struct SchedulerConfig {
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};
 
-    std::int32_t num_mamba_slots{0};
     bool disable_prefix_cache{false};
     bool enable_mamba{false};
     std::int32_t mamba_cache_chunk_size{64};

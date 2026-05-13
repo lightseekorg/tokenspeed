@@ -1,0 +1,18 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-prefix-cache-e2e
+type: ut
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-1gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 test/runtime/run_ci_suite.py --device cuda --suite runtime-prefix-cache-e2e
+report:
+  github_step_summary: true
