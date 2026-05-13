@@ -30,6 +30,7 @@ import signal
 import sys
 
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
+from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
     spawn_engine,
@@ -283,6 +284,8 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
         setproctitle.setproctitle("ts-serve")
     except ImportError:
         pass
+
+    print_logo()
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
