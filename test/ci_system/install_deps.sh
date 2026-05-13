@@ -84,7 +84,7 @@ echo "FlashInfer architecture: ${FI_ARCH}"
 # ============================================================
 sudo apt install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config -y
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-python3 -m pip install --upgrade pip setuptools wheel
+pip_install_with_retry python3 -m pip install --upgrade pip setuptools wheel
 
 # ============================================================
 # Step 3: Install tokenspeed-kernel
