@@ -112,77 +112,19 @@ _DEFAULT_NUM_BUFFERS = 2
 # ---------------------------------------------------------------------------
 
 @gluon.constexpr_function
-def _mma_layout(num_warps: int):
-    warps_m = 2 if num_warps >= 4 else 1
-    warps_n = num_warps // warps_m
-    return gl.amd.cdna4.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 32],
-        transposed=True,
-        warps_per_cta=[warps_m, warps_n],
-    )
-
-@gluon.constexpr_function
-def _dot_a_layout(num_warps: int):
-    return gl.DotOperandLayout(
-        operand_index=0, parent=_mma_layout(num_warps), k_width=8
-    )
-
-@gluon.constexpr_function
-def _dot_b_layout(num_warps: int):
-    return gl.DotOperandLayout(
-        operand_index=1, parent=_mma_layout(num_warps), k_width=8
-    )
-
-@gluon.constexpr_function
 def _store_layout(num_warps: int):
+    # Output store layout (shared between bf16/fp16 and scaled paths).
     warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
     return gl.BlockedLayout([1, 8], [2, 32], [warps_m, warps_n], [1, 0])
 
-@gluon.constexpr_function
-def _load_a_layout(block_k: int, num_warps: int):
-    # 128b vector loads (8 bf16) along K, lane geometry chosen to fully
-    # saturate the 64-thread wave: one row per lane * 8 elts.
-    return gl.BlockedLayout(
-        [1, 8],
-        [max(1, 512 // block_k), block_k // 8],
-        [num_warps, 1],
-        [1, 0],
-    )
 
 @gluon.constexpr_function
-def _load_b_layout(block_k: int, num_warps: int):
-    return gl.BlockedLayout(
-        [8, 1],
-        [block_k // 8, max(1, 512 // block_k)],
-        [1, num_warps],
-        [0, 1],
-    )
-
-# ---- Scaled MFMA (mxfp4 / fp8) layouts -----------------------------
-#
-# The CDNA4 scaled MFMA op (``gl.amd.cdna4.mfma_scaled``) has
-# ``instr_shape=[16, 16, 128]`` with ``k_width=16``. The ``a`` /
-# ``b`` operand types may be ``e2m1`` (mxfp4, packed 2 nibbles per
-# byte), ``e4m3`` or ``e5m2`` (fp8, 1 byte per element). Operands
-# use a ``DotOperandLayout`` whose ``parent`` is the scaled MFMA
-# layout, and the ``e8m0`` block scales use a separate
-# ``get_mfma_scale_layout`` shape.
-@gluon.constexpr_function
-def _mma_layout_scaled(num_warps: int):
-    warps_m = 2 if num_warps >= 4 else 1
-    warps_n = num_warps // warps_m
-    return gl.amd.cdna4.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 128],
-        transposed=True,
-        warps_per_cta=[warps_m, warps_n],
-    )
-
-@gluon.constexpr_function
-def _load_layout(block_k: int, block_nonk: int, num_warps: int, order: list[int] = [1, 0]):
-    K_PER_THREAD: gl.constexpr = 16 if block_k >= 16 else block_k
+def _load_layout(block_k: int, block_nonk: int, num_warps: int,
+                 order: list[int] = [1, 0], elem_bits: int = 8):
+    # K_PER_THREAD * elem_bits <= 128 (CDNA4 direct-to-LDS coalesce cap).
+    max_vec = max(1, 128 // elem_bits)
+    K_PER_THREAD: gl.constexpr = min(max_vec, block_k)
     LANES_K = block_k // K_PER_THREAD
     LANES_NONK = 64 // LANES_K
     # How many non-K elements one warp covers without warps along non-K.
@@ -239,226 +181,8 @@ def _swiglu_reduce(
     s = gate / (1.0 + gl.exp(-alpha * gate))
     return s * (linear + 1.0)
 
-@gluon.jit
-def _pipelined_moe_kernel(
-    # Tensors --------------------------------------------------------
-    x_ptr,
-    w_ptr,
-    bias_ptr,
-    y_ptr,
-    gather_idx_ptr,
-    scatter_idx_ptr,
-    gate_scal_ptr,
-    expert_remap_ptr,
-    # Strides --------------------------------------------------------
-    stride_xm,
-    stride_xk,
-    stride_we,
-    stride_wn,
-    stride_wk,
-    stride_yn,
-    stride_ym,
-    stride_be,
-    stride_bn,
-    # Logical shapes -------------------------------------------------
-    M,
-    N,
-    K,
-    # Tile constants -------------------------------------------------
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    NUM_BUFFERS: gl.constexpr,
-    BLOCKS_PER_EXPERT: gl.constexpr,
-    HAS_BIAS: gl.constexpr,
-    HAS_GATHER: gl.constexpr,
-    HAS_SCATTER: gl.constexpr,
-    DO_SWIGLU: gl.constexpr,
-    SWIGLU_ALPHA: gl.constexpr,
-    SWIGLU_LIMIT: gl.constexpr,
-    OUT_BLOCK_N: gl.constexpr,
-    APPLY_GATE_SCAL: gl.constexpr,
-    HAS_EXPERT_REMAP: gl.constexpr,
-    # NOTE(mxfp4 follow-up):
-    # When we land the mxfp4 path we will add ``W_SCALE_ptr`` plus
-    # ``stride_*_scale`` arguments and switch the inner accumulator to
-    # ``gl.amd.cdna4.mfma_scaled(a_regs, _, b_regs, scale_regs, ...)``
-    # using ``get_mfma_scale_layout(dot_layout_w, [BLOCK_N, BLOCK_K //
-    # SCALE_BLOCK])`` for the scale tile.
-):
-    # Grid layout: (BLOCKS_PER_EXPERT * grid_n, num_active_experts).
-    # ``program_id(1)`` returns a *compact* index over active experts;
-    # the real expert id (used for weight / bias offsets) is loaded
-    # from ``expert_remap_ptr`` when ``HAS_EXPERT_REMAP=True``. For
-    # dense (all-experts-active) calls the launcher passes
-    # ``HAS_EXPERT_REMAP=False`` and the compact index *is* the expert
-    # id, so no extra load is emitted.
-    compact_idx = gl.program_id(1)
-    block_pid = gl.program_id(0)
-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
-    block_in_expert = block_pid // grid_n
-    pid_n = block_pid % grid_n
-    if HAS_EXPERT_REMAP:
-        # Scalar i32 load of the real expert id. ``compact_idx`` is a
-        # scalar ``program_id`` so ``expert_remap_ptr + compact_idx``
-        # is also scalar and the load returns a scalar value (same
-        # pattern as ``moe_gfx1250.py::gl.load(XSliceSizes + expt_id)``).
-        expert_id = gl.load(expert_remap_ptr + compact_idx).to(gl.int32)
-    else:
-        expert_id = compact_idx
-
-    # The dispatched activation buffer is densely packed across the
-    # *active* experts: chunk i (compact_idx == i) owns rows
-    # ``[i*BLOCKS_PER_EXPERT*BLOCK_M, (i+1)*BLOCKS_PER_EXPERT*BLOCK_M)``.
-    # This keeps the M-offset a pure scalar product so we can later
-    # swap ``gl.load`` for ``buffer_load_to_shared``.
-    off_m = compact_idx * BLOCKS_PER_EXPERT * BLOCK_M + block_in_expert * BLOCK_M
-    off_n = pid_n * BLOCK_N
-
-    # Per-expert W stride folded into a scalar ``w_base`` below.
-    w_base_offset = expert_id * stride_we
-
-    MMA: gl.constexpr = _mma_layout(NUM_WARPS)
-    DOT_A: gl.constexpr = _dot_a_layout(NUM_WARPS)
-    DOT_B: gl.constexpr = _dot_b_layout(NUM_WARPS)
-    STORE: gl.constexpr = _store_layout(NUM_WARPS)
-    LOAD_A: gl.constexpr = _load_a_layout(BLOCK_K, NUM_WARPS)
-    LOAD_B: gl.constexpr = _load_b_layout(BLOCK_K, NUM_WARPS)
-
-    # ----- Compute global offsets -----
-    offs_am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_A))
-    offs_ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_A))
-    offs_bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_B))
-    offs_bk = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(1, LOAD_B))
-
-    rows_m = off_m + offs_am
-    if HAS_GATHER:
-        rows_m_safe = gl.where(rows_m < M, rows_m, gl.zeros_like(rows_m))
-        rows_m = gl.load(
-            gather_idx_ptr + rows_m_safe, mask=rows_m_safe < M, other=0
-        ).to(gl.int32)
-
-    # ----- Software-pipelined inner loop -------------------------------
-    #
-    # Two-stage register-staged pipeline:
-    #   1. Prologue   : load tile 0 into LDS (smemA[0], smemB[0])
-    #   2. Steady     : while MFMA-ing tile k from LDS slot (k & 1),
-    #                   prefetch tile k+1 into LDS slot ((k+1) & 1)
-    #   3. Epilogue   : MFMA the final tile loaded into LDS
-    #
-    # We use ``gl.load`` + ``gl.local_alloc.load`` instead of
-    # ``buffer_load_to_shared``. The dedicated async-copy intrinsic
-    # currently mis-lowers on MI355 when the W base pointer carries
-    # a per-expert offset that changes per CTA (see follow-up TODO in
-    # task-progress-2.md). The reg-staging path here delivers the
-    # same overlap pattern -- ``ds_read`` issues before the previous
-    # ``mfma`` retires -- and only costs a few extra VGPRs.
-    a_offsets = rows_m[:, None] * stride_xm + offs_ak[None, :] * stride_xk
-    b_offsets = (
-        offs_bk[:, None] * stride_wk
-        + (off_n + offs_bn)[None, :] * stride_wn
-        + w_base_offset
-    )
-
-    mask_m = rows_m < M
-    mask_n = (off_n + offs_bn) < N
-    mask_ak = offs_ak[None, :] < K
-    mask_bk = offs_bk[:, None] < K
-
-    acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, MMA)
-
-    # Prefetch tile 0 into registers.
-    a_next = gl.load(
-        x_ptr + a_offsets,
-        mask=mask_m[:, None] & mask_ak,
-        other=0,
-    )
-    b_next = gl.load(
-        w_ptr + b_offsets,
-        mask=mask_bk & mask_n[None, :],
-        other=0,
-    )
-
-    num_k_tiles = (K + BLOCK_K - 1) // BLOCK_K
-    for k_tile in range(num_k_tiles):
-        next_off = (k_tile + 1) * BLOCK_K
-        a_off = a_offsets + next_off * stride_xk
-        b_off = b_offsets + next_off * stride_wk
-        mask_ak2 = (next_off + offs_ak)[None, :] < K
-        mask_bk2 = (next_off + offs_bk)[:, None] < K
-        a_prefetch = gl.load(
-            x_ptr + a_off,
-            mask=mask_m[:, None] & mask_ak2,
-            other=0,
-        )
-        b_prefetch = gl.load(
-            w_ptr + b_off,
-            mask=mask_bk2 & mask_n[None, :],
-            other=0,
-        )
-        a_dot = gl.convert_layout(a_next, DOT_A)
-        b_dot = gl.convert_layout(b_next, DOT_B)
-        acc = gl.amd.cdna4.mfma(a_dot, b_dot, acc)
-        a_next = a_prefetch
-        b_next = b_prefetch
-
-    # ----- Bias / activation / store -----
-    if HAS_BIAS:
-        bias_offs = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, MMA))
-        bias_mask = bias_offs < N
-        bias = gl.load(
-            bias_ptr + expert_id * stride_be + bias_offs,
-            mask=bias_mask,
-            other=0.0,
-        )
-        acc = acc + bias[None, :].to(gl.float32)
-
-    if DO_SWIGLU:
-        out = _swiglu_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, MMA)
-    else:
-        out = acc
-
-    out = out.to(y_ptr.dtype.element_ty)
-    out = gl.convert_layout(out, STORE)
-
-    offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE))
-    # Output N stride differs from input N stride when SwiGLU halves
-    # the output: each ``BLOCK_N`` of accumulator becomes ``OUT_BLOCK_N``
-    # of output, so output offsets are computed against ``pid_n *
-    # OUT_BLOCK_N`` rather than ``off_n``.
-    off_n_out = pid_n * OUT_BLOCK_N
-    offs_y_n = off_n_out + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE))
-
-    if APPLY_GATE_SCAL:
-        scal = gl.load(
-            gate_scal_ptr + offs_y_m,
-            mask=offs_y_m < M,
-            other=1.0,
-        )
-        out = out * scal[:, None].to(out.dtype)
-
-    # Actual output N dim: equal to logical ``N`` for non-SwiGLU,
-    # halved for SwiGLU (where each (gate, linear) pair collapses
-    # into one column). Using ``OUT_BLOCK_N * grid_n`` here would
-    # overshoot when ``N`` is not a multiple of ``BLOCK_N`` and
-    # cause out-of-bounds writes that corrupt the *next row* (the
-    # symptom was random-looking errors past the first BLOCK_N-
-    # aligned chunk of M).
-    actual_n = (N // 2) if DO_SWIGLU else N
-    if HAS_SCATTER:
-        rows_y = gl.load(scatter_idx_ptr + offs_y_m, mask=offs_y_m < M, other=M)
-        mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
-        y_offs = rows_y[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
-    else:
-        mask_y = (offs_y_m[:, None] < M) & (offs_y_n[None, :] < actual_n)
-        y_offs = offs_y_m[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
-
-    gl.store(y_ptr + y_offs, out, mask=mask_y)
-
-
 # ---------------------------------------------------------------------------
-# Scaled MFMA MoE kernel (mxfp4 / fp8 + e8m0 block scales)
+# Scaled MFMA MoE kernel (mxfp4 / fp8 / bf16 / fp16 + optional e8m0 scales)
 # ---------------------------------------------------------------------------
 
 @gluon.constexpr_function
@@ -983,33 +707,38 @@ class MoEPipelinedProgram:
 
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
 
-        # Dummy scales use e8m0=127 (== 2^0 = 1.0) so the dot is identity-
-        # scaled when the operand has no real block scale (fp8 path).
-        if cfg.WITH_X_MX_SCALE:
-            if cfg.SCALE_VIA_LDS:
-                scale_x = self.x_scale_desc.issue_local_load_unswizzle(
-                    mfma_idx, self.x_scale_buffer, cfg.layout_x_scale,
-                    cfg.BLOCK_M_PRESHUFFLED, cfg.BLOCK_M, BLOCK_K_SCALE,
-                    cfg.PRESHUFFLE_FACTOR, cfg.SCALE_KWIDTH,
-                )
+        # Scales only consumed by mfma_scaled; bf16/fp16 path returns 0.
+        if cfg.USE_MFMA_SCALED:
+            # Dummy scales use e8m0=127 (== 2^0 = 1.0) so the dot is identity-
+            # scaled when the operand has no real block scale (fp8 path).
+            if cfg.WITH_X_MX_SCALE:
+                if cfg.SCALE_VIA_LDS:
+                    scale_x = self.x_scale_desc.issue_local_load_unswizzle(
+                        mfma_idx, self.x_scale_buffer, cfg.layout_x_scale,
+                        cfg.BLOCK_M_PRESHUFFLED, cfg.BLOCK_M, BLOCK_K_SCALE,
+                        cfg.PRESHUFFLE_FACTOR, cfg.SCALE_KWIDTH,
+                    )
+                else:
+                    scale_x = _load_scale_tile_via_gl_load(self.x_scale_desc, mfma_idx, cfg.layout_x_scale)
             else:
-                scale_x = _load_scale_tile_via_gl_load(self.x_scale_desc, mfma_idx, cfg.layout_x_scale)
-        else:
-            scale_x = gl.full([cfg.BLOCK_M, BLOCK_K_SCALE], 127, gl.uint8,
-                              layout=cfg.layout_x_scale)
+                scale_x = gl.full([cfg.BLOCK_M, BLOCK_K_SCALE], 127, gl.uint8,
+                                  layout=cfg.layout_x_scale)
 
-        if cfg.WITH_W_MX_SCALE:
-            if cfg.SCALE_VIA_LDS:
-                scale_w = self.w_scale_desc.issue_local_load_unswizzle(
-                    mfma_idx, self.w_scale_buffer, cfg.layout_w_scale,
-                    cfg.BLOCK_N_PRESHUFFLED, cfg.BLOCK_N, BLOCK_K_SCALE,
-                    cfg.PRESHUFFLE_FACTOR, cfg.SCALE_KWIDTH,
-                )
+            if cfg.WITH_W_MX_SCALE:
+                if cfg.SCALE_VIA_LDS:
+                    scale_w = self.w_scale_desc.issue_local_load_unswizzle(
+                        mfma_idx, self.w_scale_buffer, cfg.layout_w_scale,
+                        cfg.BLOCK_N_PRESHUFFLED, cfg.BLOCK_N, BLOCK_K_SCALE,
+                        cfg.PRESHUFFLE_FACTOR, cfg.SCALE_KWIDTH,
+                    )
+                else:
+                    scale_w = _load_scale_tile_via_gl_load(self.w_scale_desc, mfma_idx, cfg.layout_w_scale)
             else:
-                scale_w = _load_scale_tile_via_gl_load(self.w_scale_desc, mfma_idx, cfg.layout_w_scale)
+                scale_w = gl.full([cfg.BLOCK_N, BLOCK_K_SCALE], 127, gl.uint8,
+                                  layout=cfg.layout_w_scale)
         else:
-            scale_w = gl.full([cfg.BLOCK_N, BLOCK_K_SCALE], 127, gl.uint8,
-                              layout=cfg.layout_w_scale)
+            scale_x: gl.constexpr = 0
+            scale_w: gl.constexpr = 0
 
         return x, w, scale_x, scale_w
 
@@ -1096,6 +825,7 @@ def _pipelined_moe_kernel_scaled(
     W_TRANSPOSE: gl.constexpr = False,
     NUM_SUBTILES: gl.constexpr = (1, 1, 1),
     EVEN_K: gl.constexpr = True,
+    APPLY_X_GLOBAL_SCALE: gl.constexpr = True,
 ):
     compact_idx = gl.program_id(1)
     block_pid = gl.program_id(0)
@@ -1145,13 +875,18 @@ def _pipelined_moe_kernel_scaled(
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
 
-    LOAD_X_LAYOUT: gl.constexpr = _load_layout(BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0])
+    X_ELEM_BITS: gl.constexpr = x_ptr.dtype.element_ty.primitive_bitwidth
+    W_ELEM_BITS: gl.constexpr = w_ptr.dtype.element_ty.primitive_bitwidth
+    LOAD_X_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS)
     if W_TRANSPOSE:
-        LOAD_W_LAYOUT: gl.constexpr = _load_layout(BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0])
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS)
     else:
         # HBM W is [K_packed, N] with N contiguous. Vectorise along the
         # contig axis by passing BLOCK_N as the "k" arg (= contig-axis size).
-        LOAD_W_LAYOUT: gl.constexpr = _load_layout(BLOCK_N, BLOCK_K_W, NUM_WARPS, [1, 0])
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_N, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS)
 
     offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
@@ -1266,7 +1001,7 @@ def _pipelined_moe_kernel_scaled(
 
     acc = pgm.pipeline(K)
 
-    if not HAS_X_BLOCK_SCALE:
+    if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE:
         acc = acc * x_global_scale
 
     if HAS_BIAS:
@@ -1476,20 +1211,19 @@ def _launch_pipelined(
     num_buffers: int,
     scaled_mfma: bool = False,
 ):
+    # bf16/fp16 entry: forwards to the unified scaled launcher with
+    # X/W_FORMAT="bfloat16"/"float16" (USE_MFMA_SCALED=False in MoEConfig
+    # so the kernel automatically takes the regular 16x16x32 mfma path)
+    # and APPLY_X_GLOBAL_SCALE=False to skip the fp8 global-scale multiply.
+    # scaled_mfma=True is left for the assertion-only test
+    # `test_launcher_rejects_bad_block_k_for_scaled_mfma`.
     M, K = x.shape[-2], x.shape[-1]
     if w.ndim == 3:
-        E, K_W, N = w.shape[0], w.shape[-2], w.shape[-1]
+        _, K_W, _ = w.shape[0], w.shape[-2], w.shape[-1]
     else:
-        K_W, N = w.shape
-        E = 1
+        K_W, _ = w.shape
     assert K == K_W, f"K mismatch: {K} vs {K_W}"
 
-    # The MFMA instruction shape determines the smallest legal
-    # ``BLOCK_K``. Regular ``mfma`` on CDNA4 is 16x16x32 so any
-    # multiple of 32 is fine; scaled MFMA (mxfp4 weight + fp8 act) is
-    # 16x16x128 so BLOCK_K must be a multiple of 128 with a floor of
-    # 128 (see ``_autotune_block`` and the upstream
-    # ``test_amd_mfma_scaled`` reference in triton-450).
     mfma_k = _MFMA_SCALED_K if scaled_mfma else _MFMA_K
     assert block_k % mfma_k == 0, (
         f"BLOCK_K={block_k} must be a multiple of MFMA K dim "
@@ -1504,72 +1238,22 @@ def _launch_pipelined(
         block_m % _MFMA_M == 0
     ), f"BLOCK_M={block_m} must be a multiple of MFMA M dim ({_MFMA_M})"
 
-    num_active, blocks_per_expert, expert_remap = _expert_layout(
-        a_ragged_metadata, block_m, M
-    )
-    grid_n = (N + block_n - 1) // block_n
-    grid = (blocks_per_expert * grid_n, num_active)
+    _DTYPE_STR = {torch.bfloat16: "bfloat16", torch.float16: "float16"}
+    a_fmt = _DTYPE_STR[x.dtype]
+    b_fmt = _DTYPE_STR[w.dtype]
 
-    bias_buf = bias if bias is not None else _make_dummy(x.device, x.dtype)
-    gather_buf = (
-        gather_indx.src_indx
-        if gather_indx is not None
-        else _make_dummy(x.device, torch.int32)
-    )
-    scatter_buf = (
-        scatter_indx.dst_indx
-        if scatter_indx is not None
-        else _make_dummy(x.device, torch.int32)
-    )
-    gate_scal_buf = (
-        gate_scal if gate_scal is not None else _make_dummy(x.device, torch.float32)
-    )
-    expert_remap_buf = (
-        expert_remap if expert_remap is not None else _make_dummy(x.device, torch.int32)
-    )
-
-    swiglu_alpha = swiglu[0] if swiglu is not None else 0.0
-    swiglu_limit = swiglu[1] if swiglu is not None else 0.0
-
-    w3 = w if w.ndim == 3 else w.unsqueeze(0)
-
-    _pipelined_moe_kernel[grid](
-        x,
-        w3,
-        bias_buf,
-        y,
-        gather_buf,
-        scatter_buf,
-        gate_scal_buf,
-        expert_remap_buf,
-        x.stride(-2),
-        x.stride(-1),
-        w3.stride(0),
-        w.stride(-1),
-        w.stride(-2),
-        y.stride(-1),
-        y.stride(-2),
-        bias.stride(0) if bias is not None else 0,
-        bias.stride(-1) if bias is not None else 0,
-        M,
-        N,
-        K,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        NUM_WARPS=num_warps,
-        NUM_BUFFERS=num_buffers,
-        BLOCKS_PER_EXPERT=blocks_per_expert,
-        HAS_BIAS=bias is not None,
-        HAS_GATHER=gather_indx is not None,
-        HAS_SCATTER=scatter_indx is not None,
-        DO_SWIGLU=swiglu is not None,
-        SWIGLU_ALPHA=float(swiglu_alpha),
-        SWIGLU_LIMIT=float(swiglu_limit),
-        OUT_BLOCK_N=out_block_n,
-        APPLY_GATE_SCAL=gate_scal is not None,
-        HAS_EXPERT_REMAP=expert_remap is not None,
+    _launch_pipelined_scaled(
+        x, w,
+        y=y, bias=bias,
+        gather_indx=gather_indx, scatter_indx=scatter_indx,
+        gate_scal=gate_scal, a_ragged_metadata=a_ragged_metadata,
+        swiglu=swiglu, out_block_n=out_block_n,
+        block_m=block_m, block_n=block_n, block_k=block_k,
         num_warps=num_warps,
+        a_format=a_fmt, b_format=b_fmt,
+        x_scale=None, w_scale=None, a_global_scale=1.0,
+        scale_load_mode="bypass", w_transpose=False,
+        apply_x_global_scale=False,
     )
 
 
@@ -1603,30 +1287,38 @@ def _launch_pipelined_scaled(
     a_global_scale: float = 1.0,
     scale_load_mode: str = "transpose",
     w_transpose: bool = False,
+    apply_x_global_scale: bool = True,
 ):
-    # A: e2m1 / e4m3 / e5m2 (uint8 storage); B: always e2m1 (uint8).
-    # scale_load_mode in {"bypass", "transpose", "swizzle"}.
-    # w_transpose=True host-pre-transposes W to [E,N,K_packed] (K contig).
-    assert a_format in {"e2m1", "e4m3", "e5m2"}
-    assert b_format == "e2m1", "Only mxfp4 (e2m1) W is supported today."
+    # Unified launcher for both scaled (mxfp4/fp8) and regular (bf16/fp16)
+    # paths. Scaled formats use uint8 packed storage; bf16/fp16 use native
+    # element storage (DIV_FACTOR=1). scale_load_mode is only consulted on
+    # the scaled path.
+    _SCALED = {"e2m1", "e4m3", "e5m2"}
+    _PLAIN = {"bfloat16", "float16"}
+    assert a_format in _SCALED | _PLAIN, f"unknown a_format={a_format!r}"
+    assert b_format in _SCALED | _PLAIN, f"unknown b_format={b_format!r}"
+    is_scaled = a_format in _SCALED or b_format in _SCALED
     assert scale_load_mode in _SCALE_LOAD_MODES, (
         f"scale_load_mode must be one of {_SCALE_LOAD_MODES}, "
         f"got {scale_load_mode!r}"
     )
     has_a_block_scale = a_format == "e2m1"
+    has_w_block_scale = b_format == "e2m1"
     if has_a_block_scale:
         assert x_scale is not None, "mxfp4 A requires a block-scale tensor"
-    assert w_scale is not None, "mxfp4 W requires a block-scale tensor"
+    if has_w_block_scale:
+        assert w_scale is not None, "mxfp4 W requires a block-scale tensor"
 
     scale_load_mode = _effective_scale_load_mode(
         scale_load_mode, block_m, block_n, block_k,
         scale_block=32,
-        has_x_scale=has_a_block_scale, has_w_scale=True,
+        has_x_scale=has_a_block_scale, has_w_scale=has_w_block_scale,
     )
 
     M = x.shape[-2]
     K_phys = x.shape[-1]
     div_a = 2 if a_format == "e2m1" else 1
+    div_b = 2 if b_format == "e2m1" else 1
     K = K_phys * div_a
 
     if w.ndim == 3:
@@ -1637,7 +1329,10 @@ def _launch_pipelined_scaled(
     K_w = K_w_phys * 2
     assert K == K_w, f"K mismatch: A logical K={K} vs W logical K={K_w}"
 
-    assert block_k % _MFMA_SCALED_K == 0 and block_k >= _MFMA_SCALED_K
+    if is_scaled:
+        assert block_k % _MFMA_SCALED_K == 0 and block_k >= _MFMA_SCALED_K
+    else:
+        assert block_k % _MFMA_K == 0
     assert block_m % _MFMA_M == 0
 
     num_active, blocks_per_expert, expert_remap = _expert_layout(
@@ -1668,7 +1363,6 @@ def _launch_pipelined_scaled(
     swiglu_limit = swiglu[1] if swiglu is not None else 0.0
 
     w3 = w if w.ndim == 3 else w.unsqueeze(0)
-    w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
 
     if w_transpose:
         # W -> [E, N, K_packed]: K contig in HBM; kernel stages [BN, BK]
@@ -1679,12 +1373,18 @@ def _launch_pipelined_scaled(
         # W stays [E, K_packed, N]: kernel stages [BK, BN] in LDS.
         stride_wn, stride_wk = w3.stride(-1), w3.stride(-2)
 
-    x_scale_proc = _preprocess_scale(x_scale, scale_load_mode) if has_a_block_scale else None
-    w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
+    if has_w_block_scale:
+        w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
+        w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
+        stride_wse = w_scale_proc3.stride(0)
+        stride_wsn, stride_wsk = _scale_strides(w_scale_proc3)
+        w_scale_buf = w_scale_proc3
+    else:
+        stride_wse = stride_wsn = stride_wsk = 0
+        w_scale_buf = _make_dummy(x.device, torch.uint8)
 
+    x_scale_proc = _preprocess_scale(x_scale, scale_load_mode) if has_a_block_scale else None
     stride_xsm, stride_xsk = _scale_strides(x_scale_proc)
-    stride_wse = w_scale_proc3.stride(0)
-    stride_wsn, stride_wsk = _scale_strides(w_scale_proc3)
 
     x_scale_buf = (
         x_scale_proc if x_scale_proc is not None else _make_dummy(x.device, torch.uint8)
@@ -1698,7 +1398,7 @@ def _launch_pipelined_scaled(
         x,
         w3,
         x_scale_buf,
-        w_scale_proc3,
+        w_scale_buf,
         bias_buf,
         y,
         gather_buf,
@@ -1731,7 +1431,7 @@ def _launch_pipelined_scaled(
         W_FORMAT=b_format,
         UPCAST_INDICES=False,
         HAS_X_BLOCK_SCALE=has_a_block_scale,
-        HAS_W_BLOCK_SCALE=True,
+        HAS_W_BLOCK_SCALE=has_w_block_scale,
         HAS_BIAS=bias is not None,
         HAS_GATHER=gather_indx is not None,
         HAS_SCATTER=scatter_indx is not None,
@@ -1747,6 +1447,7 @@ def _launch_pipelined_scaled(
         W_TRANSPOSE=w_transpose,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
+        APPLY_X_GLOBAL_SCALE=apply_x_global_scale,
         num_warps=num_warps,
     )
 
@@ -1848,9 +1549,9 @@ def gluon_bf16_gating_gemm(
 ) -> torch.Tensor:
     """bf16/fp16 dense GEMM ``y = x @ w`` (gating projection).
 
-    Special-cases the non-MoE path of :func:`_pipelined_moe_kernel` -- no
-    gather, no scatter, no swiglu, no per-expert metadata -- but still uses
-    the same software-pipelined kernel body.
+    Special-cases the non-MoE path of :func:`_pipelined_moe_kernel_scaled`
+    -- no gather, no scatter, no swiglu, no per-expert metadata -- but still
+    uses the same software-pipelined kernel body.
 
     Block size defaults are picked by :func:`_autotune_block` based on
     the input shape; pass explicit overrides to bench-tune.

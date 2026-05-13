@@ -226,7 +226,7 @@ def test_no_register_spill():
     Gluon to actually JIT compile and cache an asm artifact).
     """
     from tokenspeed_kernel.ops.moe.gluon import (
-        _pipelined_moe_kernel,
+        _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
         assert_no_spills,
         gluon_bf16_combine,
         gluon_bf16_dispatch_swiglu,
@@ -380,7 +380,7 @@ def test_gpt_oss_no_spill(B):
     """The autotuner must pick a non-spilling config for both decode
     (sparse, ``B=1``) and prefill (dense, ``B=64``) at gpt-oss-120b sizes."""
     from tokenspeed_kernel.ops.moe.gluon import (
-        _pipelined_moe_kernel,
+        _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
         assert_no_spills,
         gluon_bf16_combine,
         gluon_bf16_dispatch_swiglu,

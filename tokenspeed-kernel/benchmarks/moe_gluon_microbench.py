@@ -344,7 +344,7 @@ def bench_combine(
 def dump_static_profiles():
     """Run each Gluon kernel once and dump its AMDGCN GPR profile."""
     from tokenspeed_kernel.ops.moe.gluon import (
-        _pipelined_moe_kernel,
+        _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
         gluon_bf16_combine,
         gluon_bf16_dispatch_swiglu,
         gluon_bf16_gating_gemm,
@@ -492,8 +492,7 @@ def dump_static_profiles():
                 f"scratch={prof['ScratchSize']} occupancy={prof['Occupancy']}"
             )
 
-    _scan(_pipelined_moe_kernel, "bf16")
-    _scan(_pipelined_moe_kernel_scaled, "scaled")
+    _scan(_pipelined_moe_kernel, "unified")
     if bad:
         raise SystemExit(f"{bad} kernel(s) reported spill -- aborting")
 
