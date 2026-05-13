@@ -61,6 +61,9 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
+        tp_rank: int | None = None,
+        tp_size: int | None = None,
+        tp_group: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -68,6 +71,9 @@ class Qwen3MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -75,6 +81,9 @@ class Qwen3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -253,6 +262,9 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            tp_rank=self.mapping.dense.tp_rank,
+            tp_size=self.mapping.dense.tp_size,
+            tp_group=self.mapping.dense.tp_group,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -280,7 +292,7 @@ class Qwen3DecoderLayer(nn.Module):
             )
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
-            hidden_states, residual, _ = (
+            hidden_states, residual, *_ = (
                 self.input_layernorm.forward_with_allreduce_fusion(
                     self.mapping.dense.tp_rank,
                     self.mapping.dense.tp_group,
@@ -306,7 +318,7 @@ class Qwen3DecoderLayer(nn.Module):
                 hidden_states, residual
             )
         else:
-            hidden_states, residual, _ = (
+            hidden_states, residual, *_ = (
                 self.post_attention_layernorm.forward_with_allreduce_fusion(
                     self.mapping.attn.tp_rank,
                     self.mapping.attn.tp_group,
@@ -387,7 +399,7 @@ class Qwen3Model(nn.Module):
             )
             hidden_states, _ = self.norm(hidden_states, residual)
         else:
-            hidden_states, _, _ = self.norm.forward_with_allreduce_fusion(
+            hidden_states, *_ = self.norm.forward_with_allreduce_fusion(
                 self.mapping.dense.tp_rank,
                 self.mapping.dense.tp_group,
                 hidden_states,

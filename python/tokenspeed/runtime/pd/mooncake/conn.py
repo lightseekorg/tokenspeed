@@ -29,7 +29,7 @@ from typing import Dict, Union
 import zmq
 from aiohttp import web
 
-from tokenspeed.runtime.metrics.collector import KVTransferMetricsCollector
+from tokenspeed.runtime.metrics.collector import KVTransferMetrics
 from tokenspeed.runtime.pd.base import KVArgs, KVPoll
 from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
 from tokenspeed.runtime.pd.mooncake.transfer_engine import (
@@ -78,9 +78,7 @@ class MooncakeKVManagerBase:
                 "model_name": args.served_model_name,
                 "app_key": args.app_key,
             }
-            self.kv_transfer_metrics = KVTransferMetricsCollector(
-                labels, args.metrics_reporters
-            )
+            self.kv_transfer_metrics = KVTransferMetrics(labels, args.metrics_reporters)
         else:
             self.kv_transfer_metrics = None
 

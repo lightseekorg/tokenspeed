@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenspeed-mla"
-version = "0.1.1"
+version = "0.1.2"
 description = "Speed-of-light TokenSpeed MLA kernels for Blackwell SM100 and SM103."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,3 +25,6 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[tool.setuptools.package-data]
+tokenspeed_mla = ["objs/*.so"]

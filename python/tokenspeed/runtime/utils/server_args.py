@@ -30,8 +30,6 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
-from tokenspeed.runtime.grammar.function_call_parser import FunctionCallParser
-from tokenspeed.runtime.inputs.reasoning_parser import ReasoningParser
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -78,10 +76,7 @@ class ServerArgs:
     max_model_len: int | None = None
     device: str = "cuda"
     served_model_name: str | None = None
-    chat_template: str | None = None
-    completion_template: str | None = None
     revision: str | None = None
-    think_end_token: str | None = None
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -92,7 +87,7 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: int = 8192
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -127,6 +122,7 @@ class ServerArgs:
     # API related
     api_key: str | None = None
     enable_cache_report: bool = False
+    kv_events_config: str | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -193,6 +189,7 @@ class ServerArgs:
     disable_deepseek_v4_fast_mhc: bool = False
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
+    deepseek_v4_prefill_chunk_size: int = 4
 
     # Grammar backend
     grammar_backend: str = "none"
@@ -209,7 +206,7 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
-    speculative_draft_model_quantization: str | None = None
+    speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
@@ -247,8 +244,6 @@ class ServerArgs:
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
     enable_custom_logit_processor: bool = False
-    tool_call_parser: str = None
-    reasoning_parser: str | None = None
     mla_disable_ragged: bool = False
     warmups: str | None = None
 
@@ -270,9 +265,6 @@ class ServerArgs:
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
     pdlb_url: str | None = None
-
-    # For built-in tool server
-    tool_server: str | None = None
 
     skip_server_warmup: bool = False
 
@@ -338,7 +330,7 @@ class ServerArgs:
 
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
-                self.speculative_num_draft_tokens = int(num_speculative_tokens)
+                self.speculative_num_steps = int(num_speculative_tokens)
 
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -365,14 +357,9 @@ class ServerArgs:
             else:
                 self.gpu_memory_utilization = 0.88
 
-        # Set the chunked prefill token budget, which depends on GPU memory.
+        # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem < 25_000:
-                self.chunked_prefill_size = 2048
-            elif gpu_mem is not None and gpu_mem < 100_000:
-                self.chunked_prefill_size = 8192
-            else:
-                self.chunked_prefill_size = 16384
+            self.chunked_prefill_size = 8192
 
         # Set CUDA graph max capture size.
         if self.max_cudagraph_capture_size is None:
@@ -518,9 +505,7 @@ class ServerArgs:
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
 
-        if self.speculative_draft_model_quantization is None:
-            self.speculative_draft_model_quantization = self.quantization
-        elif self.speculative_draft_model_quantization == "unquant":
+        if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
         if self.eagle3_layers_to_capture is not None:
@@ -619,6 +604,9 @@ class ServerArgs:
                     f"chunked_prefill_size must be <= max_prefill_tokens: {self.chunked_prefill_size=} > {self.max_prefill_tokens=}"
                 )
 
+        if self.deepseek_v4_prefill_chunk_size <= 0:
+            raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.info(
@@ -657,6 +645,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--model",
+            "--model-path",
             metavar="MODEL",
             type=str,
             default=None,
@@ -789,30 +778,12 @@ class ServerArgs:
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
-            "--chat-template",
-            type=str,
-            default=ServerArgs.chat_template,
-            help="The built-in chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
-        )
-        parser.add_argument(
-            "--completion-template",
-            type=str,
-            default=ServerArgs.completion_template,
-            help="The built-in completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. Only for code completion currently.",
-        )
-        parser.add_argument(
             "--revision",
             type=str,
             default=None,
             help="The specific model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
-        )
-        parser.add_argument(
-            "--think-end-token",
-            type=str,
-            default=ServerArgs.think_end_token,
-            help="The think end token of a thinking model, such as '</think>' for DeepSeek R1.",
         )
         # Memory and scheduling
         parser.add_argument(
@@ -1054,6 +1025,16 @@ class ServerArgs:
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=ServerArgs.kv_events_config,
+            help=(
+                "JSON KV cache event publisher config. Set "
+                "'enable_kv_cache_events': true and publisher 'zmq' to "
+                "publish device prefix-cache mutations."
+            ),
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -1204,14 +1185,16 @@ class ServerArgs:
 
         # Kernel backend
         attention_backend_choices = [
-            "triton",
-            "flashmla",
-            "fa3",
-            "hybrid_linear_attn",
             "mha",
+            "fa3",
+            "fa4",
+            "triton",
+            "flashinfer",
             "trtllm",
             "trtllm_mla",
+            "flashmla",
             "tokenspeed_mla",
+            "hybrid_linear_attn",
         ]
         parser.add_argument(
             "--attention-backend",
@@ -1291,6 +1274,14 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--deepseek-v4-prefill-chunk-size",
+            type=int,
+            default=ServerArgs.deepseek_v4_prefill_chunk_size,
+            help=(
+                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
+            ),
+        )
+        parser.add_argument(
             "--grammar-backend",
             type=str,
             choices=["xgrammar", "none"],
@@ -1359,8 +1350,7 @@ class ServerArgs:
             "--speculative-draft-model-quantization",
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
-            help="Quantization method for the draft model. If not specified, inherits the main model's quantization. "
-            "Use 'unquant' to explicitly disable quantization for the draft model.",
+            help="Quantization method for the draft model. Defaults to 'unquant'.",
         )
         parser.add_argument(
             "--speculative-num-steps",
@@ -1533,31 +1523,6 @@ class ServerArgs:
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
-        parser.add_argument(
-            "--tool-call-parser",
-            type=str,
-            choices=tool_call_parser_choices,
-            default=ServerArgs.tool_call_parser,
-            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
-        )
-        parser.add_argument(
-            "--reasoning-parser",
-            type=str,
-            choices=list(ReasoningParser.DetectorMap.keys()),
-            default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
-        )
-
-        # For built-in tool server
-        parser.add_argument(
-            "--tool-server",
-            type=str,
-            choices=("demo",),
-            default=None,
-            help="Use the built-in demo tool server. If not specified, no tool server will be used.",
-        )
-
         # Server warmups
         parser.add_argument(
             "--skip-server-warmup",
@@ -1717,7 +1682,7 @@ class ServerArgs:
         if args.model is None:
             raise ValueError(
                 "Model is required. Provide it as a positional argument "
-                "(e.g., `tokenspeed serve <model>`) or via --model."
+                "(e.g., `tokenspeed serve <model>`) or via --model/--model-path."
             )
 
         # --tensor-parallel-size → --attn-tp-size

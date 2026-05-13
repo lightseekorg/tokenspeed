@@ -33,8 +33,9 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 STALE_PROCESS_PATTERNS = [
-    r"python.*tokenspeed\.api_server",
-    r"tokenspeed-serve",
+    r"ts serve",
+    r"python.*-m\s+smg(\s|\.launch|$)",
+    r"smg_grpc_servicer\.tokenspeed",
     r"run_ci_suite",
 ]
 RUNNER_SM_PREFIXES = (

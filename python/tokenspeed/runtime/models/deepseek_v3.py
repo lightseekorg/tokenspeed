@@ -804,10 +804,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
         use_fused_fp8_decode = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and (
-                ctx.forward_mode.is_decode_or_idle()
-                or ctx.forward_mode.is_target_verify()
-            )
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
             and self.rotary_emb is not None
             and k_scale == 1.0
@@ -1329,9 +1325,6 @@ class DeepseekV3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
         )
         self.alt_stream = torch.cuda.Stream()
         # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
@@ -1758,6 +1751,10 @@ class Eagle3MlaDecoderLayer(nn.Module):
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_input_hidden_norm = FusedRMSNorm(
+            self.input_layernorm,
+            self.hidden_norm,
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1767,6 +1764,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=False,
             prev_is_moe=False,
+            post_attn_layernorm=self.post_attention_layernorm,
         )
 
     def forward(
@@ -1781,28 +1779,36 @@ class Eagle3MlaDecoderLayer(nn.Module):
         residual = hidden_states
 
         if not ctx.forward_mode.is_idle():
-            embeds = self.input_layernorm(embeds)
-            hidden_states = self.hidden_norm(hidden_states)
-            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+            fused_norm_out = torch.empty(
+                embeds.size(0),
+                self.hidden_size * 2,
+                dtype=embeds.dtype,
+                device=embeds.device,
+            )
+            # FusedRMSNorm's q_a/kv_a kwargs are MLA-specific names.
+            # Here embeds and hidden_states corresponds to q_a and kv_a, separately.
+            self.fused_input_hidden_norm(
+                input_q_a=embeds,
+                input_kv_a=hidden_states,
+                output_q_a=fused_norm_out[..., : self.hidden_size],
+                output_kv_a=fused_norm_out[..., self.hidden_size :],
+            )
 
             hidden_states = self.self_attn(
                 positions=positions,
-                hidden_states=hidden_states,
+                hidden_states=fused_norm_out,
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
 
-            hidden_states, residual = self.comm_manager.post_attn_comm(
+            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
-            )
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
             )
 
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_comm(
+        hidden_states, residual = self.comm_manager.post_mlp_fused(
             hidden_states, residual, ctx
         )
 
@@ -1835,9 +1841,6 @@ class Eagle3MlaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -1882,7 +1885,7 @@ class Eagle3MlaModel(nn.Module):
             embeds = input_embeds
 
         hidden_states = captured_hidden_states
-        if hidden_states.shape[-1] != embeds.shape[-1]:
+        if hidden_states.size(-1) != embeds.size(-1):
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None
@@ -1895,9 +1898,26 @@ class Eagle3MlaModel(nn.Module):
             residual,
         )
 
-        hidden_states_to_logits, hidden_states_to_aux = self.norm(
-            hidden_states, residual
-        )
+        comm_manager = self.midlayer.comm_manager
+        if comm_manager.should_fuse(hidden_states.shape[0]):
+            hidden_states_to_logits, hidden_states_to_aux, *_ = (
+                self.norm.forward_with_allreduce_fusion(
+                    self.mapping.dense.tp_rank,
+                    self.mapping.dense.tp_group,
+                    hidden_states,
+                    residual,
+                )
+            )
+        else:
+            hidden_states_to_logits, hidden_states_to_aux = self.norm(
+                hidden_states, residual
+            )
+            hidden_states_to_logits, _ = comm_manager.post_final_norm_comm(
+                hidden_states_to_logits, None, ctx
+            )
+            hidden_states_to_aux, _ = comm_manager.post_final_norm_comm(
+                hidden_states_to_aux, None, ctx
+            )
         return hidden_states_to_logits, [hidden_states_to_aux]
 
 

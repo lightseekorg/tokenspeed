@@ -47,7 +47,6 @@ def mha_prefill(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     # attention options
@@ -59,6 +58,7 @@ def mha_prefill(
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
     """Ragged MHA prefill without KV cache.
 
@@ -67,7 +67,7 @@ def mha_prefill(
         k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
         v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
         cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+            KV cumulative sequence lengths are assumed to be identical.
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
         softmax_scale: Optional scale factor applied before softmax.
@@ -77,9 +77,9 @@ def mha_prefill(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
 
-    Standard full-sequence prefill is the special case where
-    cu_seqlens_q == cu_seqlens_kv.
+    Standard full-sequence prefill assumes query and KV sequence boundaries match.
     """
     # Select kernel
     traits = {
@@ -97,6 +97,7 @@ def mha_prefill(
         "mha_prefill",
         q.dtype,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
@@ -132,7 +133,6 @@ def mha_prefill(
             k=k,
             v=v,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
@@ -165,6 +165,7 @@ def mha_prefill_with_kvcache(
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
     """Ragged MHA extend-prefill with paged KV cache.
 
@@ -188,13 +189,19 @@ def mha_prefill_with_kvcache(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
     """
+    if (k is None) != (v is None):
+        raise ValueError("k and v must both be provided or both be None")
+    prewritten_kv = k is None
+
     # Select kernel
     traits = {
         "num_q_heads": q.shape[1],
         "num_kv_heads": (k.shape[1] if k is not None else k_cache.shape[2]),
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
+        "prewritten_kv": prewritten_kv,
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
         "support_logit_cap": _requires_logit_cap(logit_cap),
@@ -206,6 +213,7 @@ def mha_prefill_with_kvcache(
         "mha_prefill_with_kvcache",
         q.dtype,
         traits=traits,
+        solution=solution,
         override=override,
     )
 
@@ -275,6 +283,7 @@ def mha_decode_with_kvcache(
     return_lse: bool = False,
     # dispatch options
     override: str | None = None,
+    solution: str | None = None,
 ) -> AttentionResult:
     """Single-token MHA decode with paged KV cache.
 
@@ -292,6 +301,7 @@ def mha_decode_with_kvcache(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
     """
     if q.shape[0] != cache_seqlens.shape[0]:
         raise ValueError(
@@ -317,6 +327,7 @@ def mha_decode_with_kvcache(
         "mha_decode_with_kvcache",
         q.dtype,
         traits=traits,
+        solution=solution,
         override=override,
     )
 

@@ -41,7 +41,7 @@ logger = get_colorful_logger(__name__)
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
-    from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -343,7 +343,7 @@ class Eagle(BaseDrafter):
 
         bs = draft_input.accept_lengths.shape[0]
 
-        draft_tokens = torch.zeros(
+        draft_tokens = torch.empty(
             (bs, self.spec_num_steps),
             dtype=torch.int32,
             device=self.device,

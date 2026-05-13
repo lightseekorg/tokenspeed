@@ -471,6 +471,29 @@ class TestMakeCacheKey:
         )
         assert k1 == k2
 
+    def test_solution_is_selection_relevant(self):
+        k1 = _make_cache_key(
+            "a",
+            "d",
+            torch.float16,
+            "sm_90",
+            SelectionObjective.DEFAULT,
+            None,
+            None,
+            "fa3",
+        )
+        k2 = _make_cache_key(
+            "a",
+            "d",
+            torch.float16,
+            "sm_90",
+            SelectionObjective.DEFAULT,
+            None,
+            None,
+            "fa4",
+        )
+        assert k1 != k2
+
 
 class TestSelectKernel:
     def test_basic_selection(self, sample_specs, h100_platform):
@@ -548,6 +571,53 @@ class TestSelectKernel:
             override="triton",
         )
         assert impl() == "triton_decode"
+
+    def test_solution_filter_preserves_trait_filtering(self, h100_platform):
+        reg = KernelRegistry.get()
+        reg.register(
+            KernelSpec(
+                name="fa4_128",
+                family="attention",
+                mode="prefill",
+                solution="fa4",
+                dtypes=frozenset({torch.bfloat16}),
+                traits={"head_dim": frozenset({128})},
+                priority=15,
+            ),
+            lambda: "fa4_128",
+        )
+        reg.register(
+            KernelSpec(
+                name="triton_256",
+                family="attention",
+                mode="prefill",
+                solution="triton",
+                dtypes=frozenset({torch.bfloat16}),
+                traits={"head_dim": frozenset({256})},
+                priority=10,
+            ),
+            lambda: "triton_256",
+        )
+
+        impl = select_kernel(
+            "attention",
+            "prefill",
+            torch.bfloat16,
+            platform=h100_platform,
+            solution="fa4",
+            traits={"head_dim": 128},
+        )
+        assert impl() == "fa4_128"
+
+        with pytest.raises(NoKernelFoundError, match="solution 'fa4'.*traits"):
+            select_kernel(
+                "attention",
+                "prefill",
+                torch.bfloat16,
+                platform=h100_platform,
+                solution="fa4",
+                traits={"head_dim": 256},
+            )
 
     def test_override_not_found_raises(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()

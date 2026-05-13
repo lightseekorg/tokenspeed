@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "resource/allocator/owned_pages.h"
@@ -70,6 +71,15 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
         page_hashes_ = SliceStrings(old_hashes, prefix_pages, total_pages - prefix_pages);
     }
 
+    if (block_hashes_.size() == total_pages) {
+        const std::vector<std::uint64_t> old_hashes = block_hashes_;
+        prefix.block_hashes_ = std::vector<std::uint64_t>(old_hashes.begin(), old_hashes.begin() + prefix_pages);
+        block_hashes_ = std::vector<std::uint64_t>(old_hashes.begin() + prefix_pages, old_hashes.end());
+    } else {
+        prefix.block_hashes_.clear();
+        block_hashes_.clear();
+    }
+
     prefix.storage_persisted_ = storage_persisted_;
     prefix.last_access_time_ = last_access_time_;
 
@@ -95,6 +105,17 @@ void TreeNode::Touch(timestamp_t now) {
 
 void TreeNode::SetPageHashes(std::vector<std::string> page_hashes) {
     page_hashes_ = std::move(page_hashes);
+}
+
+std::optional<std::uint64_t> TreeNode::BlockHash() const {
+    if (block_hashes_.empty()) {
+        return std::nullopt;
+    }
+    return block_hashes_.back();
+}
+
+void TreeNode::SetBlockHashes(std::vector<std::uint64_t> block_hashes) {
+    block_hashes_ = std::move(block_hashes);
 }
 
 std::optional<cache_op_id> TreeNode::CacheOpId() const {

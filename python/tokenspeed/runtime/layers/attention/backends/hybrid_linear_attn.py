@@ -182,9 +182,7 @@ class SimpleMambaPool:
 
     def get_mamba_indices(self, mamba_pool_indices: torch.Tensor) -> torch.Tensor:
         """Return mamba cache indices directly (allocated by C++ scheduler)."""
-        indices = mamba_pool_indices.to(torch.int32)
-        valid_mask = (indices >= 0) & (indices < self.size)
-        return torch.where(valid_mask, indices, torch.full_like(indices, -1))
+        return mamba_pool_indices.to(torch.int32)
 
     def get_mamba_params(self, layer_id: int):
         """Return per-layer cache slices."""

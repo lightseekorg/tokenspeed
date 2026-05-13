@@ -20,6 +20,7 @@
 
 import faulthandler
 import signal
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -47,6 +48,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_sync_debug_enabled,
     make_config,
+    pool_to_paged_cache_groups,
     pop_common_cache_event_payloads,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -62,10 +64,18 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
+from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.factory import (
     create_pd_kv_transfer,
     get_kv_args,
+)
+from tokenspeed.runtime.pd.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    NullEventPublisher,
+    drain_scheduler_kv_events,
+    scheduler_kv_events_to_wire_events,
 )
 from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -160,7 +170,7 @@ class EventLoop:
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
-        enable_mamba_radix_cache = has_mamba and server_args.enable_prefix_caching
+
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
@@ -250,7 +260,12 @@ class EventLoop:
         # req_pool_slots based on this value, so it must match the
         # per-DP-rank budget (same division used in cuda_graph_wrapper).
         per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
-        if enable_mamba_radix_cache and server_args.max_mamba_cache_size is None:
+        self._kv_events_enabled = (
+            EventPublisherFactory.is_enabled(server_args.kv_events_config)
+            and attn_tp_rank == 0
+        )
+
+        if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
                 f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
                 f"Auto-derived mamba_pool_total_chunks={mamba_pool_total_chunks} "
@@ -267,21 +282,23 @@ class EventLoop:
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
             prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
+            enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=(
                 server_args.speculative_num_draft_tokens
                 if server_args.speculative_algorithm is not None
                 else 1
             ),
             disable_prefix_cache=not server_args.enable_prefix_caching,
-            enable_mamba=enable_mamba_radix_cache,
+            enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            paged_cache_groups=pool_to_paged_cache_groups(token_to_kv_pool),
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "num_mamba_slots=%s",
+            "mamba_pool_total_chunks=%s enable_mamba=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -291,10 +308,31 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             mamba_pool_total_chunks,
+            has_mamba,
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        if attn_tp_rank == 0:
+            self.kv_event_publisher = EventPublisherFactory.create(
+                server_args.kv_events_config,
+                attn_dp_rank=dp_rank,
+            )
+        else:
+            self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
+
+        self.metrics = EngineMetrics(
+            labels={
+                "model_name": server_args.served_model_name,
+                "app_key": server_args.app_key or "",
+                "dp_rank": str(dp_rank),
+            },
+            enabled=(
+                server_args.enable_metrics
+                and attn_tp_rank == 0
+                and "prometheus" in (server_args.metrics_reporters or [])
+            ),
+        )
 
         self.request_handler = RequestHandler(
             server_args=self.server_args,
@@ -317,6 +355,7 @@ class EventLoop:
                 else None
             ),
             stream_interval=self.server_args.stream_interval,
+            metrics=self.metrics,
         )
         self.prefetch_threshold = scheduler_cfg.prefetch_threshold
 
@@ -408,6 +447,23 @@ class EventLoop:
             ec.add_event(e)
         self.scheduler.advance(ec)
         logger.debug("[cache_poll] scheduler.advance() done")
+        self._publish_scheduler_kv_events()
+
+    def _publish_scheduler_kv_events(self) -> None:
+        raw_events = drain_scheduler_kv_events(
+            self.scheduler,
+            enabled=self._kv_events_enabled,
+        )
+        if not raw_events:
+            return
+
+        events = scheduler_kv_events_to_wire_events(raw_events)
+        if not events:
+            return
+
+        self.kv_event_publisher.publish(
+            KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
+        )
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -858,6 +914,17 @@ class EventLoop:
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
 
+    def _record_scheduler_iteration_metrics(
+        self, stats: dict, num_iteration_tokens: int
+    ) -> None:
+        self.metrics.record_scheduler_iteration(
+            running=len(self.output_processor.rid_to_state),
+            waiting=stats["num_queue_reqs"],
+            num_active_pages=stats["num_active_pages"],
+            num_total_pages=self.max_total_num_tokens // self.server_args.block_size,
+            num_iteration_tokens=num_iteration_tokens,
+        )
+
     # ------------------------------------------------------------------
     # Event loops
     # ------------------------------------------------------------------
@@ -868,9 +935,15 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+
+            stats = self._get_scheduler_stats()
+            num_iter_tokens = (
+                sum(forward_op.input_lengths) if forward_op is not None else 0
+            )
 
             # DP sync: all ranks must participate even when idle.
             dp_metadata = None
@@ -882,12 +955,12 @@ class EventLoop:
                         dp_metadata.global_batch_size,
                         dp_metadata.all_decode_or_idle,
                     )
+                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
                     continue
 
             request_changes = []
 
             if forward_op is not None:
-                stats = self._get_scheduler_stats()
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
                 results, on_first_token = self._dispatch_forward(
@@ -911,6 +984,9 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
+
+            self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -972,10 +1048,17 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_kv_events()
 
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+
+            stats = self._get_scheduler_stats()
+            num_iter_tokens = (
+                sum(forward_op.input_lengths) if forward_op is not None else 0
+            )
+
             grammar_inputs = None
             if forward_op is not None:
                 # Gather both sampling params and grammar state BEFORE the
@@ -996,6 +1079,7 @@ class EventLoop:
                             prev_forward_op, prev_results
                         )
                         advance_forward(self.scheduler, request_changes)
+                        self._publish_scheduler_kv_events()
                         prev_results = None
                         prev_forward_op = None
                     self.model_executor.execute_idle_forward(
@@ -1003,6 +1087,7 @@ class EventLoop:
                         dp_metadata.global_batch_size,
                         dp_metadata.all_decode_or_idle,
                     )
+                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
                     continue
 
             # ---- dispatch current forward first (async GPU launch) ----
@@ -1042,7 +1127,6 @@ class EventLoop:
                     # working state before this decode mutates the same slot;
                     # the snapshot helper only copies block-aligned states.
                     self.model_executor.snapshot_mamba_checkpoints_for_op(forward_op)
-                stats = self._get_scheduler_stats()
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
@@ -1065,6 +1149,9 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+                self._publish_scheduler_kv_events()
+
+            self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
             prev_results = curr_results
             prev_forward_op = forward_op

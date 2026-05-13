@@ -30,7 +30,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
 
 logger = get_colorful_logger(__name__)
@@ -97,6 +97,19 @@ class InputBuffers:
         self.extend_seq_lens_cpu = torch.zeros(
             max_bs, dtype=torch.int32, pin_memory=True
         )
+        if has_mamba:
+            self._mamba_pool_indices_cpu = torch.full(
+                (max_bs,), -1, dtype=torch.int32, pin_memory=True
+            )
+            self._mamba_cow_src_indices_cpu = torch.full(
+                (max_bs,), -1, dtype=torch.int32, pin_memory=True
+            )
+            self._mamba_branching_seqlens_cpu = torch.full(
+                (max_bs,), -1, dtype=torch.int32, pin_memory=True
+            )
+            self._mamba_track_pool_indices_cpu = torch.full(
+                (max_bs,), -1, dtype=torch.int32, pin_memory=True
+            )
 
     @nvtx_range("input_prep_fill", color="cyan")
     def fill_input_buffers(
@@ -234,23 +247,30 @@ class InputBuffers:
             and hasattr(forward_op, "mamba_pool_indices")
             and forward_op.mamba_pool_indices
         ):
-            t_pool = torch.tensor(
-                forward_op.mamba_pool_indices, device="cpu", pin_memory=True
+            self._mamba_pool_indices_cpu[:batch_size].copy_(
+                torch.as_tensor(forward_op.mamba_pool_indices, dtype=torch.int32)
             )
-            t_cow = torch.tensor(
-                forward_op.mamba_cow_src_indices, device="cpu", pin_memory=True
+            self._mamba_cow_src_indices_cpu[:batch_size].copy_(
+                torch.as_tensor(forward_op.mamba_cow_src_indices, dtype=torch.int32)
             )
-            t_br = torch.tensor(
-                forward_op.mamba_branching_seqlens, device="cpu", pin_memory=True
+            self._mamba_branching_seqlens_cpu[:batch_size].copy_(
+                torch.as_tensor(forward_op.mamba_branching_seqlens, dtype=torch.int32)
             )
-            t_track = torch.tensor(
-                forward_op.mamba_track_pool_indices, device="cpu", pin_memory=True
+            self._mamba_track_pool_indices_cpu[:batch_size].copy_(
+                torch.as_tensor(forward_op.mamba_track_pool_indices, dtype=torch.int32)
             )
-            self.mamba_pool_indices_buf[:batch_size].copy_(t_pool, non_blocking=True)
-            self.mamba_cow_src_indices_buf[:batch_size].copy_(t_cow, non_blocking=True)
-            self.mamba_branching_seqlens_buf[:batch_size].copy_(t_br, non_blocking=True)
+
+            self.mamba_pool_indices_buf[:batch_size].copy_(
+                self._mamba_pool_indices_cpu[:batch_size], non_blocking=True
+            )
+            self.mamba_cow_src_indices_buf[:batch_size].copy_(
+                self._mamba_cow_src_indices_cpu[:batch_size], non_blocking=True
+            )
+            self.mamba_branching_seqlens_buf[:batch_size].copy_(
+                self._mamba_branching_seqlens_cpu[:batch_size], non_blocking=True
+            )
             self.mamba_track_pool_indices_buf[:batch_size].copy_(
-                t_track, non_blocking=True
+                self._mamba_track_pool_indices_cpu[:batch_size], non_blocking=True
             )
             if batch_size < self.mamba_pool_indices_buf.shape[0]:
                 self.mamba_pool_indices_buf[batch_size:].fill_(-1)

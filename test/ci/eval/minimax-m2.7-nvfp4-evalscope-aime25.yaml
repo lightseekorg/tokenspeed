@@ -13,15 +13,13 @@ install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
-    python3 -m tokenspeed.api_server
+    ts serve
     --model nvidia/MiniMax-M2.7-NVFP4
     --attn-tp-size 2
     --moe-tp-size 2
     --max-model-len 80000
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
     --trust-remote-code
-    --reasoning-parser minimax
+    --reasoning-parser base
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
     --sampling-backend flashinfer
@@ -30,8 +28,9 @@ server:
     --weight-loader-prefetch-checkpoints
     --enable-cache-report
     --host 127.0.0.1
+    --port 8000
   ready:
-    url: http://127.0.0.1:8000/health
+    url: http://127.0.0.1:8000/readiness
     timeout: 1800
     interval: 10
 eval:

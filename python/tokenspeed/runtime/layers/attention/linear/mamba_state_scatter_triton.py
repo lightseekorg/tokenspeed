@@ -1,3 +1,8 @@
+# Adapted from fla-org/flash-linear-attention
+# This file has been modified for this repository.
+# License: https://github.com/fla-org/flash-linear-attention/blob/main/LICENSE
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -108,6 +113,132 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Load from source and store to destination
     data = tl.load(src_ptr + src_offset + offsets, mask=mask)
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+
+
+@triton.jit
+def _mamba_state_snapshot_kernel(
+    pool_ptr,
+    src_indices_ptr,  # [num_valid]
+    dst_indices_ptr,  # [num_valid]
+    cache_lengths_ptr,  # [num_valid] or nullptr (0 when page_size==0)
+    page_size,  # 0 means no page filtering
+    elem_per_entry: tl.constexpr,
+    layer_stride,
+    req_stride,
+    pool_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    In-place copy kernel: pool[:, dst[i], :] = pool[:, src[i], :]
+    Skips copy if page_size > 0 and cache_lengths[i] % page_size != 0.
+
+    Grid: (num_valid, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_block = tl.program_id(2).to(tl.int64)
+
+    src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
+    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+
+    # Skip self-copy (no-op)
+    if src_idx == dst_idx:
+        return
+
+    # Page-boundary filter: skip if not aligned
+    if page_size > 0:
+        cl = tl.load(cache_lengths_ptr + pid_req).to(tl.int64)
+        if cl % page_size != 0:
+            return
+
+    # Bounds check
+    if not (
+        (src_idx >= 0) & (src_idx < pool_size) & (dst_idx >= 0) & (dst_idx < pool_size)
+    ):
+        return
+
+    src_offset = pid_layer * layer_stride + src_idx * req_stride
+    dst_offset = pid_layer * layer_stride + dst_idx * req_stride
+
+    start = pid_block * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < elem_per_entry
+
+    data = tl.load(pool_ptr + src_offset + offsets, mask=mask)
+    tl.store(pool_ptr + dst_offset + offsets, data, mask=mask)
+
+
+def fused_mamba_state_snapshot(
+    pool: torch.Tensor,  # [num_layers, pool_size, *state_shape]
+    src_indices: torch.Tensor,  # [num_valid]
+    dst_indices: torch.Tensor,  # [num_valid]
+    cache_lengths: torch.Tensor | None = None,  # [num_valid], for page filter
+    page_size: int = 0,  # 0 means no page filtering
+):
+    """
+    Snapshot mamba states: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
+
+    Specialized for checkpoint snapshot with page-boundary filtering.
+    When page_size > 0 and cache_lengths is provided, skips entries where
+    cache_lengths[i] % page_size != 0 (all done inside a single kernel).
+
+    Args:
+        pool: State tensor [num_layers, pool_size, *state_shape], must be contiguous.
+        src_indices: Source slot indices [num_valid], int32 or int64.
+        dst_indices: Destination slot indices [num_valid], int32 or int64.
+        cache_lengths: Per-entry cache lengths for page-boundary filtering.
+        page_size: Page size for filtering; 0 disables.
+    """
+    num_valid = src_indices.shape[0]
+    if num_valid == 0:
+        return
+
+    if not pool.is_cuda:
+        raise ValueError("fused_mamba_state_copy only supports CUDA tensors.")
+    if not pool.is_contiguous():
+        raise ValueError("pool tensor must be contiguous")
+    if pool.ndim < 2:
+        raise ValueError(f"pool must be at least 2D, got {pool.ndim}D")
+    if src_indices.shape[0] != dst_indices.shape[0]:
+        raise ValueError(
+            f"indices length mismatch: {src_indices.shape[0]} vs {dst_indices.shape[0]}"
+        )
+
+    num_layers = pool.shape[0]
+    pool_size = pool.shape[1]
+
+    # Elements per (layer, slot) entry
+    elem_per_entry = pool.numel() // (num_layers * pool_size)
+
+    layer_stride = pool.stride(0)
+    req_stride = pool.stride(1)
+
+    if not src_indices.is_contiguous():
+        raise ValueError("src_indices must be contiguous")
+    if not dst_indices.is_contiguous():
+        raise ValueError("dst_indices must be contiguous")
+
+    if page_size > 0 and cache_lengths is not None:
+        cache_lengths = cache_lengths.to(torch.int32)
+    else:
+        cache_lengths = src_indices  # unused; kernel skips when page_size==0
+        page_size = 0
+
+    BLOCK_SIZE = 1024
+    grid = (num_valid, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+
+    _mamba_state_snapshot_kernel[grid](
+        pool,
+        src_indices,
+        dst_indices,
+        cache_lengths,
+        page_size,
+        elem_per_entry,
+        layer_stride,
+        req_stride,
+        pool_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
 
 
 def fused_mamba_state_scatter_with_mask(

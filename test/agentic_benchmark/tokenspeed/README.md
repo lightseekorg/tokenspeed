@@ -1,6 +1,6 @@
 # Agentic Benchmark — TokenSpeed
 
-Sweep `tokenspeed-serve` against an agentic, multi-turn workload (SWE-Smith) at a
+Sweep `ts serve` against an agentic, multi-turn workload (SWE-Smith) at a
 fixed set of attention/MoE parallelism layouts and report per-config throughput,
 latency, and KV-cache hit rate.
 
@@ -10,7 +10,7 @@ Server listens on port **8000**.
 
 ```
 agentic_bench.sh        # main sweep: dataset prep -> for config in CONFIGS: launch, wait, bench, kill
-configs/                # one shell script per parallelism layout (each `exec`s tokenspeed-serve)
+configs/                # one shell script per parallelism layout (each `exec`s ts serve)
 collect_outputs.py      # parse a sweep into a flat CSV
 outputs/<sweep_ts>/<config>/parallel_<P>_number_<N>/  # per-run evalscope artifacts
 ```
@@ -24,14 +24,14 @@ cd test/agentic_benchmark/tokenspeed
 
 The script (1) installs evalscope at the pinned commit, (2) builds the SWE-Smith
 multi-turn dataset, (3) iterates each config in `CONFIGS=()`: launch server, poll
-`/health` until ready, run `evalscope perf`, kill server, wait for the port to be
+`/readiness` until ready, run `evalscope perf`, kill server, wait for the port to be
 free, repeat. Aborts the whole sweep on the first failure (`set -e`).
 
 To narrow the matrix, comment out entries in the `CONFIGS=()` array.
 
 ## Configs
 
-Each `configs/*.sh` `exec`s `tokenspeed-serve` with the full flag set for one
+Each `configs/*.sh` `exec`s `ts serve` with the full flag set for one
 layout. Key flags:
 
 - `--attn-tp-size`, `--moe-tp-size` *or* `--ep-size`

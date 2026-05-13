@@ -56,7 +56,7 @@ def auto_config_device() -> str:
     return get_device()
 
 
-def _api_server_process(
+def _serve_process(
     command: List[str],
     env: dict,
     return_stdout_stderr: Optional[tuple],
@@ -113,7 +113,7 @@ def _wait_for_server_health(
                     "Authorization": f"Bearer {api_key}",
                 }
                 response = session.get(
-                    f"{base_url}/health_generate",
+                    f"{base_url}/readiness",
                     headers=headers,
                     timeout=5,
                 )
@@ -131,7 +131,7 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
-def popen_api_server(
+def popen_serve_server(
     model: str,
     base_url: str,
     timeout: float,
@@ -140,8 +140,6 @@ def popen_api_server(
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
-    pd_separated: bool = False,
-    num_replicas: Optional[int] = None,
 ):
     other_args = other_args or []
 
@@ -160,39 +158,24 @@ def popen_api_server(
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    use_mixed_pd_engine = not pd_separated and num_replicas is not None
-    if pd_separated or use_mixed_pd_engine:
-        command = [
-            "python3",
-            "-m",
-            "tokenspeed.launch_pd_server",
-            "--model",
-            model,
-            *[str(x) for x in other_args],
-        ]
-    else:
-        command = [
-            "tokenspeed",
-            "serve",
-            "--model",
-            model,
-            *[str(x) for x in other_args],
-        ]
-
-    if pd_separated or use_mixed_pd_engine:
-        command.extend(["--lb-host", host, "--lb-port", port])
-    else:
-        command.extend(["--host", host, "--port", port])
-
-    if use_mixed_pd_engine:
-        command.extend(["--mixed", "--num-replicas", str(num_replicas)])
+    command = [
+        "tokenspeed",
+        "serve",
+        "--model",
+        model,
+        *[str(x) for x in other_args],
+        "--host",
+        host,
+        "--port",
+        port,
+    ]
 
     if api_key:
         command += ["--api-key", api_key]
 
     print(f"command={shlex.join(command)}")
 
-    process = _api_server_process(command, env, return_stdout_stderr)
+    process = _serve_process(command, env, return_stdout_stderr)
     success, error_msg = _wait_for_server_health(process, base_url, api_key, timeout)
 
     if success:

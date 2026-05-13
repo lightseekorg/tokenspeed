@@ -60,10 +60,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.spec_decode.algorithm import SpeculativeAlgorithm
-    from tokenspeed.runtime.spec_decode.eagle import (
-        EagleDraftInput,
-        EagleVerifyInput,
-    )
+    from tokenspeed.runtime.spec_decode.eagle import EagleDraftInput
 
 
 logger = get_colorful_logger(__name__)
@@ -140,7 +137,7 @@ class ScheduleBatch(DisaggregationDecodeScheduler):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+    spec_info: EagleDraftInput | None = None
     draft_token_num: int | None = 0
     spec_num_steps: int | None = 0
     # Reserve multiple positions for speculative decoding

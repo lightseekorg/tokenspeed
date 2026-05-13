@@ -40,6 +40,7 @@ TokenSpeed-specific behavior explicitly.
 | `--data-parallel-size` | Data parallel size. |
 | `--enable-expert-parallel` | Enable expert parallelism. |
 | `--speculative-config` | JSON speculative decoding config. |
+| `--kv-events-config` | JSON KV cache event publisher config; the vLLM-style `enable_kv_cache_events` field is accepted and defaults to ZMQ when enabled. |
 | `--tool-call-parser` | OpenAI-compatible tool-call parser. |
 | `--reasoning-parser` | Reasoning-output parser. |
 

@@ -40,8 +40,7 @@ For a compact compatibility table, see
 | `--port` | HTTP bind port. |
 | `--served-model-name` | Model name returned by the OpenAI-compatible API. |
 | `--api-key` | API key required by the server. |
-| `--chat-template` | Built-in chat template name or template file path. |
-| `--completion-template` | Completion template for code-completion style serving. |
+| `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 
@@ -52,8 +51,8 @@ For a compact compatibility table, see
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
-| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Set `-1` to disable chunked prefill. |
-| `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. |
+| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Defaults to `8192`. Set `-1` to disable chunked prefill. |
+| `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
@@ -90,7 +89,7 @@ different process groups.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--attention-backend` | Attention kernel backend. Common values include `trtllm_mla`, `tokenspeed_mla`, `fa3`, and `mha`. |
+| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. |
 | `--drafter-attention-backend` | Attention backend for speculative decoding drafter model. |
 | `--moe-backend` | MoE backend. |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
@@ -106,11 +105,9 @@ about.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--reasoning-parser` | Parser for extracting reasoning content from model outputs. |
-| `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads. |
-| `--tool-server` | Built-in demo tool server. |
+| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
+| `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 | `--enable-custom-logit-processor` | Allow custom logit processors. Keep disabled unless the deployment needs it. |
-| `--think-end-token` | End marker for thinking models. |
 
 Common parser values include `kimi_k2` and `gpt-oss`.
 
@@ -121,7 +118,7 @@ Common parser values include `kimi_k2` and `gpt-oss`.
 | `--speculative-config` | JSON speculative decoding configuration. |
 | `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3` or `MTP`. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
-| `--speculative-draft-model-quantization` | Draft model quantization. |
+| `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
@@ -142,6 +139,32 @@ draft model, and token count together.
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
+| `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+
+### KV Cache Events
+
+KV cache events publish reusable device prefix-cache mutations from the live
+C++ scheduler path. Host/L2 loadback events are not published by this initial
+stream. Block hash lineage is cached on prefix-cache nodes, so publishing a
+stored block uses the parent node's cached hash instead of rebuilding the full
+ancestor prefix.
+
+Example:
+
+```bash
+--kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv-events"}'
+```
+
+The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
+number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
+
+```python
+[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
+[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+```
+
+With attention data parallelism, each attention DP rank publishes on an offset
+port from the configured endpoint.
 
 ## TokenSpeed-Specific Runtime Knobs
 
@@ -156,6 +179,7 @@ features directly:
 - `--moe-tp-size`
 - `--kvstore-*`
 - `--enable-mla-l1-5-cache`
+- `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
