@@ -6,7 +6,7 @@ DP=4 + expert parallel + mega_moe + FP8 KV cache (B200, 4× SM100):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
-    --host localhost --port 30100 \
+    --host localhost --port 8000 \
     --dist-init-addr 127.0.0.1:4013 \
     --trust-remote-code \
     --data-parallel-size 4 \
