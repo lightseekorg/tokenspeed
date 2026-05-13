@@ -1262,7 +1262,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -1353,7 +1353,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -1394,7 +1394,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
-                        self.max_context_len,
+                        max_num_pages,
                         dtype=torch.int32,
                         device=self.device,
                     ),
