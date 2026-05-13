@@ -38,7 +38,7 @@ def test_orchestrator_only_flags_are_consumed():
 
 def test_orchestrator_default_timeouts():
     r = _split([])
-    assert r.opts.engine_startup_timeout == 600
+    assert r.opts.engine_startup_timeout == 1800
     assert r.opts.gateway_startup_timeout == 60
     assert r.opts.drain_timeout == 30
 
