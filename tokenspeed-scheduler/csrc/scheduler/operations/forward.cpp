@@ -53,15 +53,6 @@
 #include "scheduler/types.h"
 #include "utils.h"
 
-namespace {
-
-std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
-    if (numer <= 0) return 0;
-    return (numer + denom - 1) / denom;
-}
-
-}  // namespace
-
 namespace tokenspeed {
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
@@ -87,7 +78,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
-    if (hybrid_prefix_cache_ && match_result.mamba_branching_seqlen == -1) {
+    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() &&
+        match_result.mamba_branching_seqlen == -1) {
         const std::int32_t aligned = hybrid_prefix_cache_->AlignMambaCacheSeqlen(tokens_this_round);
         if (aligned > 0) {
             match_result.mamba_branching_seqlen = aligned;
@@ -99,22 +91,23 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
 
-    // Eviction happens Here: evicts unlocked prefix-cache nodes to free device_pages_needed pages.
+    // Evict unlocked prefix-cache nodes before allocating request-local pages.
     if (!(kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_pages_needed))) {
         return {};
     }
 
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2)) {
+    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() &&
+        !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2)) {
         return {};
     }
 
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
-    auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
-    if (!admission.ok) {
+    if (hybrid_prefix_cache_ &&
+        !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free,
+                                          match_result.paged_cache)) {
         return {};
     }
-    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::SchedulePrefillFirstChunkEvent{
         tokens_this_round,
@@ -143,17 +136,17 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return {};
     }
 
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(1)) {
+    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() &&
+        !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(1)) {
         return {};
     }
 
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
-    auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
-    if (!admission.ok) {
+    if (hybrid_prefix_cache_ &&
+        !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free)) {
         return {};
     }
-    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
@@ -171,11 +164,10 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
 
     const std::int32_t first_pos = request->TokenSize();
     const std::int32_t target = first_pos + config_.decode_input_tokens;
-    auto admission = checkPagedCacheGroupAdmission(request->Id(), first_pos, target, simulated_free);
-    if (!admission.ok) {
+    if (hybrid_prefix_cache_ &&
+        !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free)) {
         return {};
     }
-    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
@@ -185,7 +177,11 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     Request* request, std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
 
-    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
+    MatchResult match_result = hybrid_prefix_cache_
+                                   ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true),
+                                                                 MatchIntent::StateRecovery)
+                                   : kv_prefix_cache_.Match(request->GetFullPagedTokens(true),
+                                                            MatchIntent::StateRecovery);
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
     TreeNode* mamba_recovery_node = nullptr;
     if (hybrid_prefix_cache_ && mamba_allocator_) {
@@ -224,42 +220,12 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
         }
     }
 
-    std::map<std::string, std::int32_t> released_back;
-    auto req_it = request_paged_cache_tables_.find(request->Id());
-    if (req_it != request_paged_cache_tables_.end()) {
-        for (const auto& [gid, table] : req_it->second) {
-            released_back[gid] = table.ActivePagesCount();
-        }
-    }
-    auto simulated_after_release = simulated_free;
-    for (const auto& [gid, n] : released_back) {
-        simulated_after_release[gid] += n;
-    }
-
-    PagedCacheGroupAdmission admission;
     const std::int32_t target = request->TokenSize();
-    if (!paged_cache_allocators_.empty() && target >= 0) {
-        for (const auto& [gid, allocator] : paged_cache_allocators_) {
-            const auto& cfg = allocator->Config();
-            if (cfg.entry_stride_tokens <= 0 || cfg.rows_per_page <= 0) continue;
-            const std::int32_t entries = CeilDivPositive(target, cfg.entry_stride_tokens);
-            const std::int32_t required = (entries + cfg.rows_per_page - 1) / cfg.rows_per_page;
-            const std::int32_t free =
-                simulated_after_release.count(gid) ? simulated_after_release.at(gid) : allocator->AvailablePages();
-            admission.releasable_pages[gid] = 0;
-            admission.new_pages_needed[gid] = required;
-            if (free < required) {
-                admission.ok = false;
-            }
-        }
-    }
-    if (!admission.ok) {
+    if (hybrid_prefix_cache_ &&
+        !hybrid_prefix_cache_->AdmitChunkFromRetracted(request->Id(), target, simulated_free,
+                                                       match_result.paged_cache)) {
         return {};
     }
-    for (const auto& [gid, n] : released_back) {
-        simulated_free[gid] += n;
-    }
-    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::ScheduleDecodeFromRetractedEvent{
         config_.decode_input_tokens,
@@ -322,20 +288,16 @@ LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff, cache_o
 
 std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* request,
                                                                      fsm::ScheduleRetractEvent event) {
-    // ScheduleRetractEvent::operator() already builds the (device_page, host_page) pairs
-    // inside the state transition (consistent with FinishEvent→Draining path).
-    // We just apply the event and read back the pre-computed pairs.
+    // Event applier builds the (device_page, host_page) pairs.
     request->Apply(std::move(event));
 
     const auto& pages_to_transfer = request->GetPagesToTransfer<fsm::Retracting>();
     if (pages_to_transfer.empty()) {
-        // device.matched == host.matched: no device→host copy needed.
-        // Fire WriteBackDoneEvent immediately so the request transitions
-        // Retracting → Retracted without registering a dangling op_id.
+        // No copy needed; advance Retracting to Retracted without an op_id.
         request->Apply(fsm::WriteBackDoneEvent{});
         return std::nullopt;
     }
-    // Register in cache_op_tracker_ so WriteBackDone can route back to the request.
+    // Register op_id so WriteBackDone can route back.
     cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
     CacheOpSpec spec;
     spec.request_id = request->Id();
@@ -395,17 +357,31 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event) {
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event) {
     auto match = event.GetMatchResult();
     auto op = applyPrefillEvent(request, std::move(event));
-    op.mamba_cow_src_idx = match.mamba_cow_src_index;
-    op.mamba_branching_seqlen = match.mamba_branching_seqlen;
-    acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
-    populatePagedCachePagesForOp(op);
+    // Mamba fields only when adjunct is active.
+    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct()) {
+        op.mamba_cow_src_idx = match.mamba_cow_src_index;
+        op.mamba_branching_seqlen = match.mamba_branching_seqlen;
+    }
+    // Order: attach, acquire, populate. Attach before acquire so prior-chunk
+    // tail pages commit into snapshots before Acquire's ReleaseSkipped frees them.
+    if (hybrid_prefix_cache_) {
+        hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.extend_prefix_len,
+                                                op.extend_prefix_len + op.input_length, match.paged_cache);
+        hybrid_prefix_cache_->PopulateOp(op);
+    }
     return op;
 }
 
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
     auto op = applyPrefillEvent(request, std::move(event));
-    acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
-    populatePagedCachePagesForOp(op);
+    // Order: attach, acquire, populate (see SchedulePrefillFirstChunkEvent).
+    if (hybrid_prefix_cache_) {
+        hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.extend_prefix_len,
+                                                op.extend_prefix_len + op.input_length);
+        hybrid_prefix_cache_->PopulateOp(op);
+    }
     return op;
 }
 
@@ -443,18 +419,27 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     const bool need_bootstrap_token = request->Is<fsm::PrefillDone>() && config_.role == Role::kD;
     std::int32_t bootstrap_token = need_bootstrap_token ? request->GetLastToken() : -1;
     const std::int32_t first_pos = request->TokenSize();
+    const bool came_from_prefill_done = request->Is<fsm::PrefillDone>();
 
     auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens);
     if (need_bootstrap_token) {
         op.decode_input_id = bootstrap_token;
     }
-    acquirePagedCachePagesForRequest(op.request_id, first_pos, first_pos + op.input_length);
-    populatePagedCachePagesForOp(op);
+    // Order: attach, acquire, populate.
+    if (hybrid_prefix_cache_) {
+        if (came_from_prefill_done) {
+            hybrid_prefix_cache_->CommitChunk(op.request_id,
+                                              const_cast<TreeNode*>(request->GetDeviceNode()));
+        }
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, first_pos, first_pos + op.input_length);
+        hybrid_prefix_cache_->PopulateOp(op);
+    }
     return op;
 }
 
 DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event) {
     const std::int32_t mamba_cow_src_index = event.GetMatchResult().mamba_cow_src_index;
+    auto paged_cache_hit = event.GetMatchResult().paged_cache;
     request->Apply(std::move(event));
     if (!request->Is<fsm::Decoding>()) {
         throw std::logic_error(
@@ -483,9 +468,11 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         }
     }
 
-    releasePagedCachePagesForRequest(op.request_id);
-    acquirePagedCachePagesForRequest(op.request_id, 0, request->TokenSize());
-    populatePagedCachePagesForOp(op);
+    if (hybrid_prefix_cache_) {
+        hybrid_prefix_cache_->ReleaseRequest(op.request_id);
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, 0, request->TokenSize(), paged_cache_hit);
+        hybrid_prefix_cache_->PopulateOp(op);
+    }
     return op;
 }
 
@@ -514,7 +501,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                            [](const ForwardOperation& op) { return std::holds_alternative<PrefillOperation>(op); });
     };
     std::vector<LoadBackOperation> loadback_ops;
-    auto simulated_free = initialPagedCacheGroupSimulatedFree();
+    auto simulated_free = hybrid_prefix_cache_ ? hybrid_prefix_cache_->InitialSimulatedFree()
+                                                : std::map<std::string, std::int32_t>{};
     for (Request* request : candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
 

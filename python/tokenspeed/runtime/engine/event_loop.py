@@ -49,6 +49,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_sync_debug_enabled,
     make_config,
     pool_to_paged_cache_groups,
+    pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -275,6 +276,14 @@ class EventLoop:
         enable_mixed_prefill_decode = (
             server_args.enable_mixed_batch and server_args.speculative_algorithm is None
         )
+        # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
+        paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        prefix_cache_adjunct = None
+        required_groups = getattr(
+            token_to_kv_pool, "prefix_cache_required_group_ids", None
+        )
+        if required_groups is not None and server_args.enable_prefix_caching:
+            prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
             max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -295,8 +304,9 @@ class EventLoop:
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
-            paged_cache_groups=pool_to_paged_cache_groups(token_to_kv_pool),
+            paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=enable_mixed_prefill_decode,
+            prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "

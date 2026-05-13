@@ -110,6 +110,10 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_batch_scheduling.cpp
         tests/cpp/test_prefetch.cpp
         tests/cpp/test_owned_pages.cpp
+        tests/cpp/test_paged_cache_prefix_match.cpp
+        tests/cpp/test_paged_cache_attach_loop.cpp
+        tests/cpp/test_paged_cache_eviction.cpp
+        tests/cpp/test_paged_cache_family_split.cpp
         tests/cpp/test_retract_abort_pages.cpp
         tests/cpp/test_mamba_slot.cpp
         tests/cpp/test_mamba_eviction.cpp

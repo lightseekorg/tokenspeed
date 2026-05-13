@@ -21,6 +21,7 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
 #include <variant>
 #include <cstdint>
 #include <string>
@@ -41,6 +42,8 @@ enum class DisaggregationMode {
     kPrefill,
     kDecode,
 };
+// `PagedCacheGroupFamily` and `StateRestorePolicy` are defined in
+// resource/allocator/paged_cache_group.h (transitively included above).
 
 template <ResourceType>
 class NodeRef;
@@ -64,6 +67,12 @@ struct SchedulerStats {
     std::int64_t active_requests = 0;
 };
 
+// Opt-in spec for the paged-cache prefix-cache adjunct. Unset means paged-cache
+// groups are transport-only (no snapshot chain, no prefix-cache reuse).
+struct PrefixCacheAdjunctSpec {
+    std::vector<std::string> required_groups{};
+};
+
 struct SchedulerConfig {
     std::int32_t page_size{};
     struct {
@@ -75,6 +84,9 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+
+    // Unset means paged-cache groups are transport-only.
+    std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};

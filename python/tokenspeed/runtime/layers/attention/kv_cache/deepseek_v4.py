@@ -143,8 +143,7 @@ def _split_paged_cache_block_tables_into_v4_metadata(
 
     Returns (swa, {ratio: compressor_state}, indexer_state, swa_base,
     {ratio: compressor_state_base}, indexer_state_base). Unknown group ids
-    are ignored. Base offsets are None / missing when the input lacks them
-    (legacy scheduler binding).
+    are ignored. Base offsets are None / missing when the input lacks them.
     """
     offsets = paged_cache_block_table_base_offsets or {}
     swa = paged_cache_block_tables.get(V4_SWA_KV_GROUP_ID)
@@ -457,11 +456,12 @@ def deepseek_v4_cache_layout_from_config(
 class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     """DeepSeek V4 fp8_ds_mla cache pool.
 
-    TokenSpeed keeps the SWA, compressed, compressor-state, and CSA indexer
-    caches in one V4-only pool so ordinary MLA models keep their existing cache
-    contract untouched. Compressed caches currently reuse the request page table;
-    this is correctness-first and leaves ratio-specific allocation for the
-    optimized follow-up.
+    TokenSpeed keeps SWA, compressed, compressor-state, and CSA indexer caches
+    in dedicated per-group paged pools (see PagedCacheGroup* on the scheduler
+    side and ``build_v4_cache_specs`` here), keeping ordinary MLA models on
+    their existing single-pool contract. The ``indexer_kv_buffer`` shares its
+    page table and page-count budget with the ``v4.c{ratio}a.compressed_kv``
+    group rather than owning a separate group of its own.
     """
 
     def __init__(
@@ -653,6 +653,11 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             layout.use_fp4_indexer_cache,
             self.compressed_block_sizes,
         )
+
+    @property
+    def prefix_cache_required_group_ids(self) -> tuple[str, ...]:
+        """All V4 paged-cache groups must be present for a snapshot to be complete."""
+        return tuple(str(spec.group_id) for spec in self.paged_cache_group_specs)
 
     def _require(
         self, buffers: list[torch.Tensor | None], layer_id: int, name: str
