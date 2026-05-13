@@ -47,6 +47,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "none"
+# smg reliability knobs we always want disabled when launched under
+# ts serve. These are tokenspeed-internal defaults: not surfaced via
+# the ts CLI, not routed through split_argv.
+_DEFAULT_SMG_DISABLE_FLAGS = (
+    "--disable-circuit-breaker",
+    "--disable-retries",
+)
 
 
 def _check_serve_extra_installed() -> None:
@@ -103,9 +110,19 @@ def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
 
+def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
+    """Append the smg reliability-disable switches if they are not already there."""
+    result = list(gateway_args)
+    for flag in _DEFAULT_SMG_DISABLE_FLAGS:
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
-    return _gateway_args_with_default_reasoning_parser(gateway_args)
+    gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
+    return _gateway_args_with_smg_disable_defaults(gateway_args)
 
 
 async def _stream_to(proc, tag: str) -> None:
