@@ -156,6 +156,7 @@ def gather_and_expand_scalars(
             out_offsets,
         )
 
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _gather_and_expand_scalars_kernel[(bs,)](
         index,
         temperature,
@@ -174,7 +175,7 @@ def gather_and_expand_scalars(
         N_BLOCK=triton.next_power_of_2(max(n, 1)),
         ENABLE_PDL=enable_pdl,
         num_warps=1,
-        launch_pdl=enable_pdl,
+        **extra_kwargs,
     )
 
     return out_temperature, out_top_k, out_top_p, out_min_p, out_seed, out_offsets
