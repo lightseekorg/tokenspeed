@@ -42,8 +42,21 @@ H = 16
 QK_NOPE = 128
 QK_ROPE = 64
 V_HEAD = 128
-PREFILL_HEADS = 8
-PREFILL_SEQ = 64
+
+# (is_causal, return_lse) variants exposed by tokenspeed_mla_prefill.
+PREFILL_BINARY_VARIANT_FLAGS = [
+    (causal, lse)
+    for causal in (False, True)
+    for lse in (False, True)
+]
+
+# (seq_lens_q, seq_lens_k, h_q, h_k) — varlen problem layouts.
+PREFILL_BINARY_SHAPE_CASES = [
+    ((64, 128, 32), (64, 128, 32), 8, 8),
+    ((128, 256, 96), (128, 256, 96), 128, 128),
+    ((990,), (990,), 128, 128),
+    ((1024, 1139), (1024, 1139), 8, 8),
+]
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -67,6 +80,19 @@ def _host_arch() -> str:
         "arm64": "aarch64",
         "x64": "x86_64",
     }.get(platform.machine().lower(), platform.machine().lower())
+
+
+def _prefill_shape_id(case) -> str:
+    seq_lens_q, seq_lens_k, h_q, h_k = case
+    return f"sQ{sum(seq_lens_q)}_sK{sum(seq_lens_k)}_hq{h_q}_hk{h_k}"
+
+
+def _prefill_variant_id(flags: tuple[bool, bool]) -> str:
+    causal, lse = flags
+    return (
+        ("causal" if causal else "nocausal")
+        + ("_lse" if lse else "")
+    )
 
 
 def _require_mla_binary_prefill():
@@ -98,17 +124,36 @@ def _prefill_reference(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    seq_lens_q: tuple[int, ...],
+    seq_lens_k: tuple[int, ...],
     softmax_scale: float,
     *,
     is_causal: bool,
-) -> torch.Tensor:
-    scores = torch.einsum("qhd,khd->qkh", query.float(), key.float()) * softmax_scale
-    if is_causal:
-        q_idx = torch.arange(query.shape[0], device=query.device).view(-1, 1)
-        k_idx = torch.arange(key.shape[0], device=key.device).view(1, -1)
-        scores = scores.masked_fill(k_idx > q_idx, float("-inf"))
-    probs = torch.softmax(scores, dim=1)
-    return torch.einsum("qkh,khd->qhd", probs, value.float()).to(torch.bfloat16)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    outputs = []
+    lses = []
+    q_offset = 0
+    k_offset = 0
+    for cur_s_q, cur_s_k in zip(seq_lens_q, seq_lens_k):
+        cur_q = query[q_offset : q_offset + cur_s_q]
+        cur_k = key[k_offset : k_offset + cur_s_k]
+        cur_v = value[k_offset : k_offset + cur_s_k]
+        scores = (
+            torch.einsum("qhd,khd->qkh", cur_q.float(), cur_k.float())
+            * softmax_scale
+        )
+        if is_causal:
+            q_idx = torch.arange(cur_s_q, device=query.device).view(-1, 1)
+            k_idx = torch.arange(cur_s_k, device=key.device).view(1, -1)
+            offset = cur_s_k - cur_s_q
+            mask = k_idx > q_idx + offset
+            scores = scores.masked_fill(mask.unsqueeze(-1), float("-inf"))
+        probs = torch.softmax(scores, dim=1)
+        outputs.append(torch.einsum("qkh,khd->qhd", probs, cur_v.float()))
+        lses.append(torch.logsumexp(scores, dim=1) * math.log2(math.e))
+        q_offset += cur_s_q
+        k_offset += cur_s_k
+    return torch.cat(outputs, dim=0).to(torch.bfloat16), torch.cat(lses, dim=0)
 
 
 def test_binary_prefill_so_loads() -> None:
@@ -120,7 +165,21 @@ def test_binary_prefill_so_loads() -> None:
     assert fmha_binary.has_binary_prefill()
 
 
-def test_kernel_tokenspeed_mla_prefill_binary_e2e(device: str, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "shape_case",
+    PREFILL_BINARY_SHAPE_CASES,
+    ids=[_prefill_shape_id(case) for case in PREFILL_BINARY_SHAPE_CASES],
+)
+@pytest.mark.parametrize(
+    "variant_flags",
+    PREFILL_BINARY_VARIANT_FLAGS,
+    ids=[_prefill_variant_id(flags) for flags in PREFILL_BINARY_VARIANT_FLAGS],
+)
+def test_kernel_tokenspeed_mla_prefill_binary_e2e(
+    device: str, monkeypatch, shape_case, variant_flags: tuple[bool, bool]
+) -> None:
+    is_causal, return_lse = variant_flags
+
     _require_mla_binary_prefill()
 
     import tokenspeed_mla.mla_prefill as mla_prefill
@@ -128,30 +187,41 @@ def test_kernel_tokenspeed_mla_prefill_binary_e2e(device: str, monkeypatch) -> N
     monkeypatch.setattr(mla_prefill, "_PREFILL_BACKEND_ENV", "binary")
     mla_prefill._resolve_backend.cache_clear()
 
+    seq_lens_q, seq_lens_k, h_q, h_k = shape_case
+    total_q = sum(seq_lens_q)
+    total_k = sum(seq_lens_k)
+    cum_seq_lens_q = torch.tensor(
+        [0, *torch.tensor(seq_lens_q, dtype=torch.int32).cumsum(0).tolist()],
+        device=device,
+        dtype=torch.int32,
+    )
+    cum_seq_lens_k = torch.tensor(
+        [0, *torch.tensor(seq_lens_k, dtype=torch.int32).cumsum(0).tolist()],
+        device=device,
+        dtype=torch.int32,
+    )
     torch.manual_seed(3)
     query = torch.randn(
-        PREFILL_SEQ,
-        PREFILL_HEADS,
+        total_q,
+        h_q,
         QK_NOPE + QK_ROPE,
         device=device,
         dtype=torch.bfloat16,
     ).to(torch.float8_e4m3fn)
     key = torch.randn(
-        PREFILL_SEQ,
-        PREFILL_HEADS,
+        total_k,
+        h_k,
         QK_NOPE + QK_ROPE,
         device=device,
         dtype=torch.bfloat16,
     ).to(torch.float8_e4m3fn)
     value = torch.randn(
-        PREFILL_SEQ,
-        PREFILL_HEADS,
+        total_k,
+        h_k,
         V_HEAD,
         device=device,
         dtype=torch.bfloat16,
     ).to(torch.float8_e4m3fn)
-    seq_lens = torch.tensor([PREFILL_SEQ], device=device, dtype=torch.int32)
-    cum_seq_lens = torch.tensor([0, PREFILL_SEQ], device=device, dtype=torch.int32)
     softmax_scale = 1.0 / math.sqrt(QK_NOPE + QK_ROPE)
 
     try:
@@ -159,28 +229,43 @@ def test_kernel_tokenspeed_mla_prefill_binary_e2e(device: str, monkeypatch) -> N
             query,
             key,
             value,
-            seq_lens,
-            cum_seq_lens,
-            PREFILL_SEQ,
-            batch_size=1,
+            torch.tensor(seq_lens_k, device=device, dtype=torch.int32),
+            cum_seq_lens_k,
+            max(seq_lens_k),
+            batch_size=len(seq_lens_k),
             softmax_scale=softmax_scale,
-            is_causal=False,
-            return_lse=False,
+            is_causal=is_causal,
+            return_lse=return_lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_seq_len_q=max(seq_lens_q),
         )
     finally:
         mla_prefill._resolve_backend.cache_clear()
     torch.cuda.synchronize()
 
-    expected = _prefill_reference(
+    expected, expected_lse = _prefill_reference(
         query,
         key,
         value,
+        seq_lens_q,
+        seq_lens_k,
         softmax_scale,
-        is_causal=False,
+        is_causal=is_causal,
     )
-    assert actual.shape == (PREFILL_SEQ, PREFILL_HEADS, V_HEAD)
+    if return_lse:
+        actual, actual_lse = actual
+        assert actual_lse.shape == (total_q, h_q)
+        assert actual_lse.dtype == torch.float32
+    tolerance = 0.25 if is_causal else 0.1
+    assert actual.shape == (total_q, h_q, V_HEAD)
     assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual.float(), expected.float(), atol=0.1, rtol=1e-5)
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=tolerance, rtol=1e-5
+    )
+    if return_lse:
+        torch.testing.assert_close(
+            actual_lse.float(), expected_lse.float(), atol=tolerance, rtol=1e-5
+        )
 
 
 def test_pure_cast_strided_inputs(device: str) -> None:
