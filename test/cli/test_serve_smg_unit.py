@@ -23,14 +23,22 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
+
 from tokenspeed.cli._argsplit import OrchestratorOpts
-from tokenspeed.cli.serve_smg import run_smg
+from tokenspeed.cli.serve_smg import (
+    _gateway_args_with_default_port,
+    _user_host_port_from_gateway_args,
+    run_smg,
+)
 
 
 def _make_proc(returncode: int | None = None) -> MagicMock:
@@ -44,6 +52,20 @@ def _make_proc(returncode: int | None = None) -> MagicMock:
     proc.kill = MagicMock()
     proc.wait = AsyncMock(return_value=returncode if returncode is not None else 0)
     return proc
+
+
+def test_gateway_args_default_port_is_8000():
+    gateway_args = _gateway_args_with_default_port(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--port", "8000"]
+    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8000)
+
+
+def test_gateway_args_preserve_user_port():
+    gateway_args = _gateway_args_with_default_port(["--port", "8413"])
+
+    assert gateway_args == ["--port", "8413"]
+    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
 
 
 @pytest.mark.asyncio
