@@ -804,10 +804,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
         use_fused_fp8_decode = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and (
-                ctx.forward_mode.is_decode_or_idle()
-                or ctx.forward_mode.is_target_verify()
-            )
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
             and self.rotary_emb is not None
             and k_scale == 1.0
