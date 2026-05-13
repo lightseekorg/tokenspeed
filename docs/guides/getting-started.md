@@ -74,3 +74,4 @@ tokenspeed serve openai/gpt-oss-20b \
 ```
 
 For model-specific examples, continue with [Model Recipes](../recipes/models.md).
+For the full list of subcommands, see [CLI Commands](./cli-commands.md).
