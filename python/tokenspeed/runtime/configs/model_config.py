@@ -45,6 +45,7 @@ logger = get_colorful_logger(__name__)
 _DEEPSEEK_V4_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
     }
 )
 _MLA_ARCHITECTURES = frozenset(
@@ -85,10 +86,13 @@ def override_model_config(model_config, ext_yaml):
 
 
 def is_deepseek_v4(config: PretrainedConfig) -> bool:
-    return (
-        config.architectures is not None
-        and config.architectures[0] in _DEEPSEEK_V4_ARCHITECTURES
-    )
+    architectures = getattr(config, "architectures", None) or []
+    return len(architectures) > 0 and architectures[0] in _DEEPSEEK_V4_ARCHITECTURES
+
+
+def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
+    architectures = getattr(config, "architectures", None) or []
+    return len(architectures) > 0 and architectures[0] == "DeepseekV4ForCausalLMNextN"
 
 
 def configure_deepseek_v4_attention(model_config) -> None:
@@ -109,6 +113,19 @@ def configure_deepseek_v4_attention(model_config) -> None:
         scaling_factor = rope_scaling["factor"]
         mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
         model_config.scaling = model_config.scaling * mscale * mscale
+
+
+def _derive_num_attention_layers(
+    hf_config: PretrainedConfig,
+    num_hidden_layers: int,
+) -> int:
+    architectures = getattr(hf_config, "architectures", None) or []
+    num_attention_layers = num_hidden_layers
+    if is_deepseek_v4_nextn(hf_config):
+        num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
+    if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
+        num_attention_layers = num_hidden_layers * 2
+    return num_attention_layers
 
 
 class ModelConfig:
@@ -249,12 +266,10 @@ class ModelConfig:
         self.num_hidden_layers = getattr(self.hf_text_config, "num_hidden_layers", None)
         if self.num_hidden_layers is None:
             self.num_hidden_layers = self.hf_text_config.num_layers
-        self.num_attention_layers = self.num_hidden_layers
-        if any(
-            arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES
-            for arch in self.hf_config.architectures
-        ):
-            self.num_attention_layers = self.num_hidden_layers * 2
+        self.num_attention_layers = _derive_num_attention_layers(
+            self.hf_config,
+            self.num_hidden_layers,
+        )
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization

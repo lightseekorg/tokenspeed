@@ -237,6 +237,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             (self.context_len + self.page_size - 1) // self.page_size,
         )
         self.forward_metadata: DeepseekV4ForwardMetadata | None = None
+        self.forward_prefill_metadata: DeepseekV4ForwardMetadata | None = None
+        self.forward_decode_metadata: DeepseekV4ForwardMetadata | None = None
         self._decode_tile_metadata = {}
         self._cuda_graph_metadata = {}
         self._cuda_graph_paged_cache_block_tables: dict[str, torch.Tensor] = {}
@@ -250,6 +252,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_dense_compressed_indices_buffer: Optional[torch.Tensor] = None
         self._decode_swa_window_size = 0
         self._decode_swa_block_size = 0
+        self.speculative_num_steps = getattr(config, "speculative_num_steps", 0) or 0
+        self.speculative_num_draft_tokens = (
+            getattr(config, "speculative_num_draft_tokens", 0) or 0
+        )
+        self._draft_decode_step = 0
+        self._draft_decode_base_seq_lens: Optional[torch.Tensor] = None
+        self._draft_decode_metadata: Optional[DeepseekV4ForwardMetadata] = None
+        self._cuda_graph_draft_decode_metadata = {}
 
     def _get_prefill_workspace(
         self,
@@ -285,6 +295,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def _query_lens(
         self,
         bs: int,
+        num_tokens: int,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode | None,
         num_extends: int,
@@ -318,6 +329,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             else:
                 lens[:num_prefill_reqs] = seq_lens[:num_prefill_reqs].to(torch.int32)
             return lens
+        if forward_mode is not None and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+        ):
+            if bs == 0:
+                return torch.zeros(0, dtype=torch.int32, device=seq_lens.device)
+            if num_tokens % bs != 0:
+                raise RuntimeError(
+                    "DeepSeek V4 speculative metadata expects uniformly packed "
+                    f"tokens per request, got num_tokens={num_tokens}, bs={bs}"
+                )
+            tokens_per_req = num_tokens // bs
+            return torch.full(
+                (bs,),
+                tokens_per_req,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
         if extend_seq_lens_cpu is not None:
             return extend_seq_lens_cpu[:bs].to(seq_lens.device, dtype=torch.int32)
         if extend_prefix_lens_cpu is not None:
@@ -355,6 +383,119 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             return None
         return None
 
+    def _draft_decode_is_valid_token(
+        self,
+        prefill_metadata: DeepseekV4ForwardMetadata,
+    ) -> Optional[torch.Tensor]:
+        if prefill_metadata.is_valid_token is None:
+            return None
+        bs = prefill_metadata.req_pool_indices.numel()
+        return prefill_metadata.is_valid_token[
+            prefill_metadata.query_start_loc[:bs].to(torch.int64)
+        ]
+
+    def _is_cuda_graph_prefill_metadata(
+        self,
+        metadata: DeepseekV4ForwardMetadata,
+    ) -> bool:
+        bs = metadata.req_pool_indices.numel()
+        return self._cuda_graph_metadata.get(bs) is metadata
+
+    def _prepare_draft_decode_metadata(
+        self,
+        prefill_metadata: DeepseekV4ForwardMetadata,
+        base_seq_lens: torch.Tensor,
+    ) -> None:
+        self.forward_prefill_metadata = prefill_metadata
+        self._draft_decode_step = 0
+        self._draft_decode_base_seq_lens = base_seq_lens
+
+        bs = prefill_metadata.req_pool_indices.numel()
+        device = prefill_metadata.req_pool_indices.device
+        is_cuda_graph_metadata = self._is_cuda_graph_prefill_metadata(prefill_metadata)
+        metadata = (
+            self._cuda_graph_draft_decode_metadata.get(bs)
+            if is_cuda_graph_metadata
+            else self._draft_decode_metadata
+        )
+        is_valid_token = self._draft_decode_is_valid_token(prefill_metadata)
+        if (
+            metadata is None
+            or metadata.req_pool_indices.numel() != bs
+            or metadata.seq_lens.numel() != bs
+            or metadata.query_lens.numel() != bs
+            or metadata.token_to_req_indices.numel() != bs
+            or metadata.req_pool_indices.device != device
+        ):
+            query_lens = torch.ones(bs, dtype=torch.int32, device=device)
+            token_to_req = torch.arange(bs, dtype=torch.int32, device=device)
+            decode_seq_lens = torch.empty_like(base_seq_lens)
+            decode_seq_lens.copy_(base_seq_lens)
+            decode_is_valid_token = None
+            if is_valid_token is not None:
+                decode_is_valid_token = torch.empty_like(is_valid_token)
+                decode_is_valid_token.copy_(is_valid_token)
+            metadata = DeepseekV4ForwardMetadata(
+                page_size=self.page_size,
+                req_pool_indices=prefill_metadata.req_pool_indices,
+                block_table=prefill_metadata.block_table,
+                seq_lens=decode_seq_lens,
+                query_lens=query_lens,
+                query_start_loc=_cu_seqlens(query_lens),
+                token_to_req_indices=token_to_req,
+                is_valid_token=decode_is_valid_token,
+                forward_mode=ForwardMode.DECODE,
+            )
+            if is_cuda_graph_metadata:
+                self._cuda_graph_draft_decode_metadata[bs] = metadata
+            self._draft_decode_metadata = metadata
+            return
+
+        metadata.req_pool_indices = prefill_metadata.req_pool_indices
+        metadata.block_table = prefill_metadata.block_table
+        metadata.seq_lens.copy_(base_seq_lens)
+        if is_valid_token is None:
+            metadata.is_valid_token = None
+        else:
+            if (
+                metadata.is_valid_token is None
+                or metadata.is_valid_token.shape != is_valid_token.shape
+                or metadata.is_valid_token.device != is_valid_token.device
+            ):
+                metadata.is_valid_token = torch.empty_like(is_valid_token)
+            metadata.is_valid_token.copy_(is_valid_token)
+        metadata.num_prefill_reqs = 0
+        metadata.num_prefill_tokens = 0
+        metadata.forward_mode = ForwardMode.DECODE
+        # Reuse path: cached decode-indexer plans still describe the previous
+        # prefill. Refresh after updating seq_lens so draft step 0 does not
+        # reuse stale context_lens / block_table tensors.
+        metadata.refresh_decode_compressed_slot_mappings()
+        _refresh_decode_indexer_plan_cache(
+            metadata,
+            max_context_len=self.context_len,
+        )
+        _refresh_decode_indexer_schedule_metadata(metadata)
+        self._draft_decode_metadata = metadata
+
+    def _select_decode_metadata(
+        self,
+        num_tokens: int,
+    ) -> Optional[DeepseekV4ForwardMetadata]:
+        for metadata in (
+            self.forward_metadata,
+            self.forward_decode_metadata,
+            self.forward_prefill_metadata,
+        ):
+            if (
+                metadata is not None
+                and metadata.forward_mode is not None
+                and metadata.forward_mode.is_decode()
+                and metadata.token_to_req_indices.numel() == num_tokens
+            ):
+                return metadata
+        return self.forward_metadata or self.forward_decode_metadata
+
     def init_forward_metadata(
         self,
         bs: int,
@@ -374,12 +515,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         num_extends_arg = kwargs.pop("num_extends", None)
         num_extends = bs if num_extends_arg is None else int(num_extends_arg)
-        del num_tokens, kwargs
+        del kwargs
         device = seq_lens.device
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
         query_lens = self._query_lens(
             bs,
+            num_tokens,
             seq_lens,
             forward_mode,
             num_extends,
@@ -387,7 +529,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extend_prefix_lens_cpu,
             extend_prefix_lens,
         )
-        if forward_mode is not None and forward_mode.is_mixed():
+        is_spec = forward_mode is not None and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+        )
+        metadata_forward_mode = ForwardMode.DECODE if is_spec else forward_mode
+        if is_spec:
+            num_prefill_reqs = 0
+        elif forward_mode is not None and forward_mode.is_mixed():
             num_prefill_reqs = max(0, min(num_extends, bs))
         elif forward_mode is not None and forward_mode.is_extend():
             num_prefill_reqs = bs
@@ -428,6 +576,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             elif forward_mode.is_mixed():
                 seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
         max_seq_len = int(seq_lens.max().item()) if bs else 0
+        if forward_mode is not None and forward_mode.is_extend():
+            max_seq_len += max(self.speculative_num_steps - 1, 0)
         max_pages = (max_seq_len + self.page_size - 1) // self.page_size
         if req_to_page is None:
             block_table = torch.zeros(
@@ -480,7 +630,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             query_lens_cpu=query_lens_cpu,
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
-            forward_mode=forward_mode,
+            forward_mode=metadata_forward_mode,
             paged_cache_block_tables=paged_cache_block_tables,
             paged_cache_block_table_base_offsets=base_offsets_on_device,
             swa_block_table=swa_block_table,
@@ -490,6 +640,29 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             indexer_state_block_table=indexer_state_block_table,
             indexer_state_base_logical_page=indexer_state_base,
         )
+        if is_spec:
+            self.forward_decode_metadata = self.forward_metadata
+            if forward_mode is not None and forward_mode.is_draft_extend():
+                self._prepare_draft_decode_metadata(
+                    self.forward_metadata,
+                    seq_lens.clone(),
+                )
+        elif (
+            metadata_forward_mode is not None
+            and metadata_forward_mode.is_decode_or_idle()
+        ):
+            self.forward_decode_metadata = self.forward_metadata
+            if (
+                self.forward_prefill_metadata is not None
+                and self.forward_prefill_metadata.req_pool_indices.numel()
+                == seq_lens.numel()
+            ):
+                self._prepare_draft_decode_metadata(
+                    self.forward_prefill_metadata,
+                    seq_lens.clone(),
+                )
+        elif forward_mode == ForwardMode.EXTEND:
+            self.forward_prefill_metadata = self.forward_metadata
         self._decode_tile_metadata = {}
 
     def _update_decode_swa_metadata(
@@ -748,12 +921,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
-        metadata = self.forward_metadata
+        metadata = self._select_decode_metadata(q.shape[0])
         if metadata is None:
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
+        self.forward_metadata = metadata
         if metadata.forward_mode is None or not metadata.forward_mode.is_decode():
             raise RuntimeError(
                 "forward_deepseek_v4_decode only supports ForwardMode.DECODE"
+            )
+        if metadata.token_to_req_indices.numel() != q.shape[0]:
+            raise RuntimeError(
+                "DeepSeek V4 decode metadata token count mismatch: "
+                f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
+                f"q_tokens={q.shape[0]}"
             )
         try:
             from flash_mla import flash_mla_with_kvcache
@@ -1207,6 +1387,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata: DeepseekV4ForwardMetadata,
         num_reqs: int,
     ) -> list[int]:
+        query_lens_cpu = metadata.query_lens_cpu
+        if query_lens_cpu is not None and query_lens_cpu.numel() >= num_reqs:
+            offsets = [0]
+            total = 0
+            for q_len in query_lens_cpu[:num_reqs].tolist():
+                total += max(0, int(q_len))
+                offsets.append(total)
+            return offsets
         return [
             int(x)
             for x in metadata.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
@@ -1230,14 +1418,27 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
         metadata = self.forward_metadata
+        if (
+            metadata is None
+            or metadata.forward_mode is None
+            or not metadata.forward_mode.is_extend()
+        ):
+            metadata = self.forward_prefill_metadata or metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
+        self.forward_metadata = metadata
         if metadata.forward_mode is None or not metadata.forward_mode.is_extend():
             raise RuntimeError(
                 "forward_deepseek_v4_prefill only supports extend/prefill modes"
             )
+        if metadata.token_to_req_indices.numel() != q.shape[0]:
+            raise RuntimeError(
+                "DeepSeek V4 prefill metadata token count mismatch: "
+                f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
+                f"q_tokens={q.shape[0]}"
+            )
 
-        num_reqs = int(metadata.seq_lens.numel())
+        num_reqs = int(metadata.num_prefill_reqs or metadata.seq_lens.numel())
         if num_reqs <= self.prefill_chunk_size:
             return self._forward_deepseek_v4_prefill_chunk(
                 q=q,
@@ -1305,6 +1506,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_tokens_per_req: int = 1,
     ):
         del seq_lens_buf
+        self._decode_tile_metadata = {}
+        self._cuda_graph_max_tokens_per_req = max(
+            1,
+            int(max_tokens_per_req),
+            int(self.speculative_num_draft_tokens or 0),
+        )
+        max_tokens = max_bs * self._cuda_graph_max_tokens_per_req
         self._cuda_graph_block_table = torch.zeros(
             (max_bs, self.max_num_pages),
             dtype=torch.int32,
@@ -1331,7 +1539,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             device=self.device,
         )
         self._cuda_graph_token_to_req = torch.arange(
-            max_bs,
+            max_tokens,
             dtype=torch.int32,
             device=self.device,
         )
@@ -1368,7 +1576,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     device=self.device,
                 )
         self._cuda_graph_is_valid_token = torch.ones(
-            max_bs,
+            max_tokens,
             dtype=torch.bool,
             device=self.device,
         )
@@ -1431,6 +1639,61 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             out[gid] = buf[:bs]
         return out
 
+    def _cuda_graph_tokens_per_req(
+        self,
+        bs: int,
+        num_tokens: int,
+        forward_mode: Optional[ForwardMode],
+    ) -> int:
+        if forward_mode is not None and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+        ):
+            if bs == 0:
+                return self._cuda_graph_max_tokens_per_req
+            if num_tokens % bs != 0:
+                raise RuntimeError(
+                    "DeepSeek V4 speculative CUDA graph metadata expects "
+                    f"uniformly packed tokens per request, got "
+                    f"num_tokens={num_tokens}, bs={bs}"
+                )
+            tokens_per_req = num_tokens // bs
+            if tokens_per_req > self._cuda_graph_max_tokens_per_req:
+                raise RuntimeError(
+                    "DeepSeek V4 speculative CUDA graph metadata was initialized "
+                    f"for at most {self._cuda_graph_max_tokens_per_req} tokens "
+                    f"per request, got {tokens_per_req}"
+                )
+            return max(1, tokens_per_req)
+        return 1
+
+    def _refresh_cuda_graph_packed_metadata(
+        self,
+        *,
+        bs: int,
+        actual_bs: int,
+        tokens_per_req: int,
+    ) -> int:
+        total_tokens = bs * tokens_per_req
+        actual_tokens = actual_bs * tokens_per_req
+        self._cuda_graph_query_lens[:bs].fill_(tokens_per_req)
+        self._cuda_graph_query_start_loc[: bs + 1].copy_(
+            torch.arange(
+                bs + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            * tokens_per_req
+        )
+        self._cuda_graph_token_to_req[:total_tokens].copy_(
+            torch.arange(bs, dtype=torch.int32, device=self.device).repeat_interleave(
+                tokens_per_req
+            )
+        )
+        self._cuda_graph_is_valid_token[:actual_tokens].fill_(True)
+        if actual_tokens < total_tokens:
+            self._cuda_graph_is_valid_token[actual_tokens:total_tokens].fill_(False)
+        return total_tokens
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -1444,19 +1707,35 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
-        del num_tokens, kwargs
-        if forward_mode is not None and not forward_mode.is_decode_or_idle():
+        del kwargs
+        if forward_mode is not None and not (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
+        ):
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph capture not supported for {forward_mode}"
             )
-        self._cuda_graph_req_pool_indices[:bs].copy_(req_pool_indices[:bs])
-        self._cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].to(torch.int32))
-        self._cuda_graph_query_lens[:bs].fill_(1)
-        self._cuda_graph_query_start_loc[: bs + 1].copy_(
-            torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+        tokens_per_req = self._cuda_graph_tokens_per_req(bs, num_tokens, forward_mode)
+        total_tokens = self._refresh_cuda_graph_packed_metadata(
+            bs=bs,
+            actual_bs=bs,
+            tokens_per_req=tokens_per_req,
         )
-        self._cuda_graph_token_to_req[:bs].copy_(
-            torch.arange(bs, dtype=torch.int32, device=self.device)
+        is_spec = forward_mode is not None and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+        )
+        capture_seq_lens = seq_lens[:bs].to(torch.int32)
+        if is_spec:
+            capture_seq_lens = torch.maximum(
+                capture_seq_lens,
+                torch.full_like(capture_seq_lens, tokens_per_req),
+            )
+        self._cuda_graph_req_pool_indices[:bs].copy_(req_pool_indices[:bs])
+        self._cuda_graph_seq_lens[:bs].copy_(capture_seq_lens)
+        metadata_forward_mode = ForwardMode.DECODE if is_spec else forward_mode
+        is_decode = (
+            metadata_forward_mode is not None and metadata_forward_mode.is_decode()
         )
         offsets_on_device = {
             str(gid): off.to(device=self.device, dtype=torch.int32)
@@ -1486,28 +1765,58 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata_paged,
             metadata_base_offsets,
         )
-        metadata = DeepseekV4ForwardMetadata(
-            page_size=self.page_size,
-            req_pool_indices=self._cuda_graph_req_pool_indices[:bs],
-            block_table=self._cuda_graph_block_table[:bs, : self.max_num_pages],
-            seq_lens=self._cuda_graph_seq_lens[:bs],
-            query_lens=self._cuda_graph_query_lens[:bs],
-            query_start_loc=self._cuda_graph_query_start_loc[: bs + 1],
-            token_to_req_indices=self._cuda_graph_token_to_req[:bs],
-            is_valid_token=self._cuda_graph_is_valid_token[:bs],
-            seq_lens_cpu=None,
-            query_lens_cpu=None,
-            forward_mode=forward_mode,
-            paged_cache_block_tables=metadata_paged,
-            paged_cache_block_table_base_offsets=metadata_base_offsets,
-            swa_block_table=swa_block_table,
-            swa_base_logical_page=swa_base,
-            compressor_state_block_tables=compressor_state_block_tables,
-            compressor_state_base_logical_pages=compressor_state_base,
-            indexer_state_block_table=indexer_state_block_table,
-            indexer_state_base_logical_page=indexer_state_base,
-        )
+        metadata = self._cuda_graph_metadata.get(bs)
+        if metadata is None:
+            metadata = DeepseekV4ForwardMetadata(
+                page_size=self.page_size,
+                req_pool_indices=self._cuda_graph_req_pool_indices[:bs],
+                block_table=self._cuda_graph_block_table[:bs, : self.max_num_pages],
+                seq_lens=self._cuda_graph_seq_lens[:bs],
+                query_lens=self._cuda_graph_query_lens[:bs],
+                query_start_loc=self._cuda_graph_query_start_loc[: bs + 1],
+                token_to_req_indices=self._cuda_graph_token_to_req[:total_tokens],
+                is_valid_token=self._cuda_graph_is_valid_token[:total_tokens],
+                seq_lens_cpu=None,
+                query_lens_cpu=None,
+                forward_mode=metadata_forward_mode,
+                paged_cache_block_tables=metadata_paged,
+                paged_cache_block_table_base_offsets=metadata_base_offsets,
+                swa_block_table=swa_block_table,
+                swa_base_logical_page=swa_base,
+                compressor_state_block_tables=compressor_state_block_tables,
+                compressor_state_base_logical_pages=compressor_state_base,
+                indexer_state_block_table=indexer_state_block_table,
+                indexer_state_base_logical_page=indexer_state_base,
+            )
+        else:
+            metadata.req_pool_indices = self._cuda_graph_req_pool_indices[:bs]
+            metadata.block_table = self._cuda_graph_block_table[
+                :bs, : self.max_num_pages
+            ]
+            metadata.seq_lens = self._cuda_graph_seq_lens[:bs]
+            metadata.query_lens = self._cuda_graph_query_lens[:bs]
+            metadata.query_start_loc = self._cuda_graph_query_start_loc[: bs + 1]
+            metadata.token_to_req_indices = self._cuda_graph_token_to_req[:total_tokens]
+            metadata.is_valid_token = self._cuda_graph_is_valid_token[:total_tokens]
+            metadata.seq_lens_cpu = None
+            metadata.query_lens_cpu = None
+            metadata.forward_mode = metadata_forward_mode
+            metadata.paged_cache_block_tables = metadata_paged
+            metadata.paged_cache_block_table_base_offsets = metadata_base_offsets
+            metadata.swa_block_table = swa_block_table
+            metadata.swa_base_logical_page = swa_base
+            metadata.compressor_state_block_tables = compressor_state_block_tables
+            metadata.compressor_state_base_logical_pages = compressor_state_base
+            metadata.indexer_state_block_table = indexer_state_block_table
+            metadata.indexer_state_base_logical_page = indexer_state_base
         self._cuda_graph_metadata[bs] = metadata
+        if forward_mode is not None and forward_mode.is_draft_extend():
+            self._prepare_draft_decode_metadata(
+                metadata,
+                self._cuda_graph_seq_lens[:bs],
+            )
+        if is_decode:
+            self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
@@ -1524,24 +1833,33 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
         actual_bs = max(0, min(int(kwargs.pop("actual_bs", bs)), bs))
+        num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
-        if forward_mode is not None and not forward_mode.is_decode_or_idle():
+        if forward_mode is not None and not (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
+        ):
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph replay not supported for {forward_mode}"
             )
+        if (
+            num_tokens_arg is None
+            and forward_mode is not None
+            and (forward_mode.is_target_verify() or forward_mode.is_draft_extend())
+        ):
+            num_tokens = bs * self._cuda_graph_max_tokens_per_req
+        else:
+            num_tokens = int(num_tokens_arg if num_tokens_arg is not None else bs)
+        tokens_per_req = self._cuda_graph_tokens_per_req(bs, num_tokens, forward_mode)
+        total_tokens = self._refresh_cuda_graph_packed_metadata(
+            bs=bs,
+            actual_bs=actual_bs,
+            tokens_per_req=tokens_per_req,
+        )
         metadata = self._cuda_graph_metadata[bs]
         self._cuda_graph_req_pool_indices[:bs].copy_(req_pool_indices[:bs])
         self._cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].to(torch.int32))
-        self._cuda_graph_query_lens[:bs].fill_(1)
-        self._cuda_graph_query_start_loc[: bs + 1].copy_(
-            torch.arange(bs + 1, dtype=torch.int32, device=self.device)
-        )
-        self._cuda_graph_token_to_req[:bs].copy_(
-            torch.arange(bs, dtype=torch.int32, device=self.device)
-        )
-        self._cuda_graph_is_valid_token[:actual_bs].fill_(True)
-        if actual_bs < bs:
-            self._cuda_graph_is_valid_token[actual_bs:bs].fill_(False)
         if req_to_page is not None:
             self._cuda_graph_block_table[:bs, : self.max_num_pages].copy_(
                 req_to_page[req_pool_indices[:bs], : self.max_num_pages]
@@ -1574,7 +1892,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata_paged,
             metadata_base_offsets,
         )
-        metadata.forward_mode = forward_mode
+        is_spec = forward_mode is not None and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+        )
+        metadata_forward_mode = ForwardMode.DECODE if is_spec else forward_mode
+        is_decode = (
+            metadata_forward_mode is not None and metadata_forward_mode.is_decode()
+        )
+        metadata.forward_mode = metadata_forward_mode
+        metadata.token_to_req_indices = self._cuda_graph_token_to_req[:total_tokens]
+        metadata.is_valid_token = self._cuda_graph_is_valid_token[:total_tokens]
         metadata.paged_cache_block_tables = metadata_paged
         metadata.paged_cache_block_table_base_offsets = metadata_base_offsets
         metadata.swa_block_table = swa_block_table
@@ -1585,9 +1912,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.indexer_state_base_logical_page = indexer_state_base
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
+        if forward_mode is not None and forward_mode.is_draft_extend():
+            self._prepare_draft_decode_metadata(
+                metadata,
+                self._cuda_graph_seq_lens[:bs],
+            )
         if (
-            forward_mode is not None
-            and forward_mode.is_decode()
+            metadata_forward_mode is not None
+            and metadata_forward_mode.is_decode()
             and self._decode_swa_window_size > 0
             and self._decode_swa_block_size > 0
         ):
@@ -1602,12 +1934,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 max_context_len=self.context_len,
             )
             _refresh_decode_indexer_schedule_metadata(metadata)
+        if is_decode:
+            self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 
     def advance_draft_forward_metadata(self):
-        raise NotImplementedError(
-            "DeepSeek V4 attention does not support draft graphs yet"
+        if (
+            self._draft_decode_base_seq_lens is None
+            or self.forward_prefill_metadata is None
+            or self._draft_decode_metadata is None
+        ):
+            raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
+        self._draft_decode_step += 1
+        metadata = self._draft_decode_metadata
+        metadata.seq_lens.add_(1)
+        metadata.forward_mode = ForwardMode.DECODE
+        # seq_lens just changed, so any previously-refreshed plan tensors are
+        # stale. Re-run the same metadata-setup hooks the main path uses.
+        metadata.refresh_decode_compressed_slot_mappings()
+        _refresh_decode_indexer_plan_cache(
+            metadata,
+            max_context_len=self.context_len,
         )
+        _refresh_decode_indexer_schedule_metadata(metadata)
+        self.forward_decode_metadata = metadata
+        self.forward_metadata = metadata
+        self._decode_tile_metadata = {}
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError("DeepSeek V4 uses the model-local attention forward")

@@ -322,10 +322,15 @@ def create_attn_components(
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
+    is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
+        draft_model_config.hf_config
+    )
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
         server_args.attention_backend = "deepseek_v4"
-    elif is_hybrid_gdn:
+    if is_deepseek_v4_draft_model:
+        server_args.drafter_attention_backend = "deepseek_v4"
+    if is_hybrid_gdn:
         # Qwen3.5 GDN hybrid models always need hybrid_linear_attn.
         # Save the user's original choice for the full-attention sub-backend.
         server_args.attention_backend = "hybrid_linear_attn"
@@ -346,7 +351,9 @@ def create_attn_components(
         )
     num_layers = model_config.num_attention_layers
     deepseek_v4_layout = None
+    draft_deepseek_v4_layout = None
     profile_cache_cell_size = None
+    draft_profile_cache_cell_size = None
     if is_deepseek_v4_model:
         from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
             deepseek_v4_cache_layout_from_config,
@@ -358,8 +365,30 @@ def create_attn_components(
             use_fp4_indexer_cache=_attention_use_fp4_indexer_cache(
                 server_args, model_config.hf_config
             ),
+            layer_indices=range(num_layers),
         )
         profile_cache_cell_size = deepseek_v4_layout.cache_cell_size(num_layers)
+    if is_deepseek_v4_draft_model:
+        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+            deepseek_v4_cache_layout_from_config,
+        )
+
+        draft_layer_start = draft_model_config.num_hidden_layers
+        draft_num_layers = draft_model_config.num_attention_layers
+        draft_deepseek_v4_layout = deepseek_v4_cache_layout_from_config(
+            draft_model_config.hf_config,
+            page_size=server_args.block_size,
+            use_fp4_indexer_cache=_attention_use_fp4_indexer_cache(
+                server_args, draft_model_config.hf_config
+            ),
+            layer_indices=range(
+                draft_layer_start,
+                draft_layer_start + draft_num_layers,
+            ),
+        )
+        draft_profile_cache_cell_size = draft_deepseek_v4_layout.cache_cell_size(
+            draft_model_config.num_attention_layers
+        )
 
     hf_config = getattr(model_config, "hf_config", None)
     text_config = getattr(hf_config, "text_config", hf_config) if hf_config else None
@@ -393,6 +422,7 @@ def create_attn_components(
             **_profile_kwargs,
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             cache_cell_size=profile_cache_cell_size,
+            draft_cache_cell_size=draft_profile_cache_cell_size,
         )
         max_num_tokens = _resolve_max_num_tokens(
             max_total_num_pages,
@@ -435,6 +465,7 @@ def create_attn_components(
             **_profile_kwargs,
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             cache_cell_size=profile_cache_cell_size,
+            draft_cache_cell_size=draft_profile_cache_cell_size,
         )
         max_num_tokens = _resolve_max_num_tokens(
             max_total_num_pages,
@@ -498,7 +529,29 @@ def create_attn_components(
     if draft_attn_config:
         # Check if draft model is also a hybrid GDN model.
         draft_archs = getattr(draft_model_config.hf_config, "architectures", None) or []
-        if any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
+        if is_deepseek_v4_draft_model:
+            from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+                DeepseekV4TokenToKVPool,
+            )
+
+            draft_attn_backend = _create_attn_backend(
+                draft_model_config.attention_arch, draft_attn_config
+            )
+            draft_pool = DeepseekV4TokenToKVPool(
+                size=max_num_tokens,
+                model_dtype=draft_model_config.dtype,
+                layout=draft_deepseek_v4_layout,
+                layer_num=draft_model_config.num_attention_layers,
+                device=draft_attn_config.device,
+                enable_memory_saver=enable_memory_saver,
+                max_batch_size=draft_attn_config.max_bs,
+                max_context_len=draft_attn_config.context_len,
+                page_size=server_args.block_size,
+                rank=rank,
+                hf_config=draft_model_config.hf_config,
+                max_scheduled_tokens=server_args.chunked_prefill_size,
+            )
+        elif any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
             resolved_draft_backend = _BACKEND_ALIASES.get(
                 original_attn_backend, original_attn_backend
             )
