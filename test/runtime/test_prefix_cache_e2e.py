@@ -36,7 +36,7 @@ from test.runners import get_dtype_str  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=300, suite="runtime-1gpu")
+register_cuda_ci(est_time=300, suite="runtime-prefix-cache-e2e")
 
 from tokenspeed.runtime.entrypoints.engine import Engine  # noqa: E402
 
@@ -135,6 +135,11 @@ def _make_engine(case: ModelCase, enable_prefix_caching: bool) -> Engine:
         "dtype": get_dtype_str(_TORCH_DTYPE),
         "seed": 42,
         "enable_prefix_caching": enable_prefix_caching,
+        "max_model_len": 8192,
+        "max_num_seqs": 4,
+        "max_prefill_tokens": 1024,
+        "chunked_prefill_size": 1024,
+        "gpu_memory_utilization": 0.7,
     }
     # KVStore requires prefix caching; prevent auto-enabling when prefix
     # caching is off (resolve_cache sets enable_kvstore=True unless
