@@ -194,7 +194,7 @@ def _next_port() -> int:
 # ── Server lifecycle ─────────────────────────────────────────────────
 
 
-def _api_server(port: int, extra_args=()) -> subprocess.Popen:
+def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
     # Use `python -m tokenspeed.cli serve` rather than the `ts` console
     # script so we don't depend on PATH setup in the CI runner.
     cmd = [
@@ -382,7 +382,7 @@ class TestMiniMaxM25Perf(unittest.TestCase):
 
     def _with_server(self, extra_args, fn, launch_timeout=SERVER_LAUNCH_TIMEOUT):
         port = _next_port()
-        proc = _api_server(port, extra_args)
+        proc = _serve_server(port, extra_args)
         try:
             if not _wait_for_server(port, timeout=launch_timeout):
                 self.fail(
