@@ -578,8 +578,9 @@ def _fp8_pair(M: int, K: int, fmt: str, *, device="cuda"):
     return u, u.view(view).to(torch.float32)
 
 
-@pytest.mark.parametrize("M,N,K", [(32, 32, 128), (64, 128, 256), (128, 64, 256)])
-def test_mxfp4_x_mxfp4_gating(M, N, K):
+@pytest.mark.parametrize("scale_mode", ["bypass", "transpose", "swizzle"])
+@pytest.mark.parametrize("M,N,K", [(32, 32, 256), (64, 128, 256), (128, 64, 256)])
+def test_mxfp4_x_mxfp4_gating(M, N, K, scale_mode):
     """``e2m1`` x ``e2m1`` dense GEMM via scaled MFMA."""
     from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
 
@@ -597,16 +598,17 @@ def test_mxfp4_x_mxfp4_gating(M, N, K):
         x_scale=a_scale,
         a_format="e2m1",
         out_dtype=torch.float32,
-        block_k=128,
+        scale_load_mode=scale_mode,
     )
     y_ref = (a_fp32 * a_scale_mk) @ (w_fp32 * w_scale_kn)
     rel = (y - y_ref).abs().max().item() / max(1.0, y_ref.abs().max().item())
     assert rel < 5e-2, f"rel_max={rel} too large"
 
 
+@pytest.mark.parametrize("scale_mode", ["bypass", "transpose", "swizzle"])
 @pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("M,N,K", [(32, 32, 128), (64, 128, 256)])
-def test_fp8_x_mxfp4_gating(fmt, M, N, K):
+def test_fp8_x_mxfp4_gating(fmt, M, N, K, scale_mode):
     """``e4m3``/``e5m2`` (A) x ``e2m1`` (W) GEMM with global A scale."""
     from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
 
@@ -626,6 +628,7 @@ def test_fp8_x_mxfp4_gating(fmt, M, N, K):
         a_global_scale=a_global,
         out_dtype=torch.float32,
         block_k=128,
+        scale_load_mode=scale_mode,
     )
     y_ref = a_global * (a_fp32 @ (w_fp32 * w_scale_kn))
     rel = (y - y_ref).abs().max().item() / max(1.0, y_ref.abs().max().item())
