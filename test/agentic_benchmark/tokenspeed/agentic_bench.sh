@@ -42,7 +42,7 @@ launch_server() {
 wait_for_ready() {
     local TIMEOUT=600
     local START=$SECONDS
-    until curl -sf -o /dev/null http://localhost:8000/health; do
+    until curl -sf -o /dev/null http://localhost:8000/readiness; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "Server died early. Last log lines:" >&2
             tail -100 "$SERVER_LOG" >&2

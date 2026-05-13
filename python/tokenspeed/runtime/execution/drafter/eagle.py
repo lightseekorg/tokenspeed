@@ -343,7 +343,7 @@ class Eagle(BaseDrafter):
 
         bs = draft_input.accept_lengths.shape[0]
 
-        draft_tokens = torch.zeros(
+        draft_tokens = torch.empty(
             (bs, self.spec_num_steps),
             dtype=torch.int32,
             device=self.device,

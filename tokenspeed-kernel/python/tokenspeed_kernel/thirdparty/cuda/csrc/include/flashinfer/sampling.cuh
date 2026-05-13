@@ -2069,6 +2069,10 @@ __global__ void VerifyChainGreedyKernel(
     // First id in target predict is always correct
     accept_index[batch_offset] = batch_offset;
 
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
     // Handle draft tokens
     for (int i = 1; i < num_draft_tokens; i++){
         IdType target_id = static_cast<IdType>(target_predict[batch_offset + i - 1]);
@@ -2087,6 +2091,10 @@ __global__ void VerifyChainGreedyKernel(
     accept_token_num[bx] = num_accepted_draft_tokens;
     // last sampled id
     predicts[batch_offset + num_accepted_draft_tokens] = static_cast<IdType>(target_predict[batch_offset + num_accepted_draft_tokens]);
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 inline cudaError_t VerifyChainGreedy(
@@ -2097,19 +2105,30 @@ inline cudaError_t VerifyChainGreedy(
     int64_t* target_predict,
     uint32_t batch_size,
     uint32_t num_draft_tokens,
+    bool enable_pdl = false,
     cudaStream_t stream = 0)
 {
-    dim3 grid(1);
     uint32_t block_size = max(batch_size, 1);
-    dim3 block(block_size);
-    VerifyChainGreedyKernel<int32_t><<<grid, block, 0, stream>>>(
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(1);
+    config.blockDim = dim3(block_size);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    auto kernel = VerifyChainGreedyKernel<int32_t>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+      &config, kernel,
       predicts,
       accept_index,
       accept_token_num,
       candidates,
       target_predict,
       batch_size,
-      num_draft_tokens);
+      num_draft_tokens));
     return cudaSuccess;
 }
 
@@ -2142,9 +2161,20 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
   // For final sampling
   uint32_t pos = num_draft_tokens - 1;
   uint32_t cur_index = bx * num_draft_tokens;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
   DType coin = uniform_samples[bx * num_draft_tokens];
   // The first token is always accepted.
   accept_index[cur_index] = cur_index;
+
+  // Track the rejected token's id in a register. Every thread in the CTA
+  // executes the acceptance loop and sees the same candidates/target_probs
+  // values, so this is naturally broadcast without shared memory or sync.
+  // -1 sentinel = no rejection (all draft tokens accepted).
+  IdType rejected_id = IdType(-1);
 
   for (uint32_t i = 1; i < num_draft_tokens; i++) {
     // Get drafted next token.
@@ -2165,9 +2195,12 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
       cur_index++;
       accept_index[bx * num_draft_tokens + i] = cur_index;
     } else {
-      // FIXME: draft_probs is not really leveraged here, set this rejected token's prob to target_prob
-      // for a zero value in q_min_p_vec
-      draft_probs[cur_prob_offset + draft_id] = target_probs[cur_prob_offset + draft_id];
+      // Track the rejected token in a register instead of writing through
+      // GMEM. The final-sample loop applies the same effect by injecting
+      // p_vec[lane] = q_vec[lane] at the matching lane (relu = 0). Caller's
+      // draft_probs (if any) gets the same single-element update at kernel
+      // exit, preserving observable behavior with no draft_probs round-trip.
+      rejected_id = draft_id;
       // record rejected position for final sampling
       pos = i - 1;
       break;
@@ -2178,6 +2211,9 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
   // we need a different coin for the final sampling
   coin = uniform_samples_for_final_sampling[bx];
 
+  const bool use_draft_probs =
+      (draft_probs != nullptr) && (num_accepted_tokens != num_speculative_steps);
+
   // sample from relu(target_probs - draft_probs)
   DType sum_relu_q_minus_p(0);
   vec_t<DType, VEC_SIZE> q_vec, p_vec;
@@ -2187,9 +2223,21 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
     p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      if (num_accepted_tokens != num_speculative_steps) {
+      if (use_draft_probs) {
         // there is no draft_probs for the bonus token
         p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
+    }
+    // Register-level rejection mask: force p_vec[lane] = q_vec[lane] at the
+    // rejected token's lane so relu(q - p) = 0 there. Replaces the
+    // line-2181-style GMEM write+readback with a per-thread compare.
+    if (rejected_id != IdType(-1)) {
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        uint32_t global_idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
+        if (global_idx == static_cast<uint32_t>(rejected_id)) {
+          p_vec[j] = q_vec[j];
+        }
       }
     }
 #pragma unroll
@@ -2215,9 +2263,18 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
     p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      if (num_accepted_tokens != num_speculative_steps) {
+      if (use_draft_probs) {
         // there is no draft_probs for the bonus token
         p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
+    }
+    if (rejected_id != IdType(-1)) {
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        uint32_t global_idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
+        if (global_idx == static_cast<uint32_t>(rejected_id)) {
+          p_vec[j] = q_vec[j];
+        }
       }
     }
 
@@ -2237,6 +2294,19 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
 
   // set the first rejected token
   predicts[bx * num_draft_tokens + pos] = temp_storage.sampled_id;
+
+  // Preserve the observable line-2181 effect for callers that provide a real
+  // draft_probs buffer: write the single rejected-position update once at
+  // kernel exit. Skipped entirely when draft_probs is nullptr (target-only
+  // mode — caller never reads the buffer).
+  if (draft_probs != nullptr && rejected_id != IdType(-1) && tx == 0) {
+    draft_probs[cur_prob_offset + rejected_id] =
+        target_probs[cur_prob_offset + rejected_id];
+  }
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 
@@ -2256,28 +2326,23 @@ cudaError_t ChainSpeculativeSamplingTargetOnly(
     DType threshold_single = 1,
     DType threshold_acc = 1,
     bool deterministic = true,
+    bool enable_pdl = false,
     cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
   float capped_threshold_acc = fmaxf(threshold_acc, 1e-9f);
-  void* args[] = {
-      &predicts,
-      &accept_index,
-      &output_accepted_token_num,
-      &candidates,
-      &uniform_samples,
-      &uniform_samples_for_final_sampling,
-      &target_probs,
-      &draft_probs,
-      &batch_size,
-      &num_draft_tokens,
-      &d,
-      &threshold_single,
-      &capped_threshold_acc};
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(batch_size);
+  config.blockDim = dim3(BLOCK_THREADS);
+  config.dynamicSmemBytes = smem_size;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
         auto kernel = ChainSpeculativeSamplingKernelTargetOnlyFastPath<
@@ -2289,7 +2354,21 @@ cudaError_t ChainSpeculativeSamplingTargetOnly(
             DType,
             IdType>;
         FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+            &config, kernel,
+            predicts,
+            accept_index,
+            output_accepted_token_num,
+            candidates,
+            uniform_samples,
+            uniform_samples_for_final_sampling,
+            target_probs,
+            draft_probs,
+            batch_size,
+            num_draft_tokens,
+            d,
+            threshold_single,
+            capped_threshold_acc));
       })});
   return cudaSuccess;
 }

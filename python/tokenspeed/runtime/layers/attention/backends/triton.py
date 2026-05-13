@@ -44,10 +44,7 @@ from tokenspeed.runtime.layers.attention.utils import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
-    from tokenspeed.runtime.spec_decode.eagle import (
-        EagleDraftInput,
-        EagleVerifyInput,
-    )
+    from tokenspeed.runtime.spec_decode.eagle import EagleDraftInput
 
 
 @dataclass
@@ -448,7 +445,7 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        spec_info: EagleDraftInput | EagleVerifyInput | None = None,
+        spec_info: EagleDraftInput | None = None,
     ):
         _req_to_token = self.req_to_page
         window_kv_indptr = self.window_kv_indptr
@@ -600,7 +597,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
-        spec_info: EagleDraftInput | EagleVerifyInput | None = None,
+        spec_info: EagleDraftInput | None = None,
     ):
         _req_to_token = self.req_to_page
 
