@@ -258,11 +258,11 @@ class Eagle(BaseDrafter):
             req_to_pages=self.req_to_page,
             page_size=self.page_size,
         )
-        cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
+        cache_locs_trans = cache_locs.view(bs, self.spec_num_steps - 1).t().contiguous()
 
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
-        draft_seq_lens.copy_(cache_start + 1)
+        torch.add(cache_start, 1, out=draft_seq_lens)
 
         input_lengths = self.draft_input_lengths_buf[:bs]
         positions = cache_start.clone()
@@ -296,14 +296,12 @@ class Eagle(BaseDrafter):
                 all_decode_or_idle=draft_input.all_decode_or_idle,
             )
 
-            out_cache_loc = cache_locs[:, i - 1].contiguous()
-
             with nvtx_range("draft_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
                     input_ids=self._map_hot(draft_ids),
                     positions=positions,
-                    out_cache_loc=out_cache_loc,
+                    out_cache_loc=cache_locs_trans[i - 1],
                     input_lengths=input_lengths,
                     captured_hidden_states=logits_output.hidden_states,
                 )
@@ -311,8 +309,9 @@ class Eagle(BaseDrafter):
             with nvtx_range("draft_sample", color="yellow"):
                 draft_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
                 draft_tokens[:, i] = self._map_hot(draft_ids)
-                positions.add_(1)
-                draft_seq_lens.add_(1)
+                if i + 1 < self.spec_num_steps:
+                    positions.add_(1)
+                    draft_seq_lens.add_(1)
 
     def _get_last_verified_ids(
         self, bs: int, forward_mode: ForwardMode, draft_input: EagleDraftInput
