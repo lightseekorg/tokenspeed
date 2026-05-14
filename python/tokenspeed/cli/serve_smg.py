@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -125,6 +126,47 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     if "--log-level" in gateway_args:
         return gateway_args
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
+
+
+def _user_model_id(gateway_args: list[str]) -> str | None:
+    """Return the value of ``--model`` from a split gateway argv, or ``None``."""
+    try:
+        idx = gateway_args.index("--model")
+    except ValueError:
+        return None
+    if idx + 1 >= len(gateway_args):
+        return None
+    return gateway_args[idx + 1]
+
+
+def _prewarm_hf_tokenizer(model_id: str) -> None:
+    """Download tokenizer artifacts to the HF cache before the gateway boots.
+
+    smg fires its ``AddTokenizer`` job asynchronously after the engine
+    reports SERVING. On fast runners (e.g. b300) the first eval request
+    can race that fetch and fail with ``tokenizer_not_found``. Pulling
+    tokenizer files into the HF cache up front keeps the registration
+    fast regardless of engine startup speed.
+    """
+    if not model_id or os.path.isdir(model_id):
+        return
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            allow_patterns=[
+                "tokenizer*",
+                "special_tokens_map*",
+                "vocab*",
+                "merges*",
+                "*.json",
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HF tokenizer prewarm failed for %s: %s", model_id, exc)
 
 
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
@@ -341,6 +383,10 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     engine_args = _overwrite_sampling_backend(split.engine)
     gateway_args = _gateway_args_with_defaults(split.gateway)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
+
+    model_id = _user_model_id(gateway_args)
+    if model_id is not None:
+        _prewarm_hf_tokenizer(model_id)
     rc = asyncio.run(
         run_smg(
             engine_args=engine_args,
