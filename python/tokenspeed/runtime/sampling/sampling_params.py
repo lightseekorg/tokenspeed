@@ -42,7 +42,7 @@ class SamplingParams:
 
     def __init__(
         self,
-        max_new_tokens: int = 128,
+        max_new_tokens: int | None = None,
         stop: str | list[str] | None = None,
         stop_token_ids: list[int] | None = None,
         temperature: float = 1.0,

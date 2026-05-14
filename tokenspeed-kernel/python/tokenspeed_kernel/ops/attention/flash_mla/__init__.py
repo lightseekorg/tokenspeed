@@ -24,11 +24,13 @@ from tokenspeed_kernel.registry import error_fn
 platform = current_platform()
 
 flash_mla_with_kvcache = error_fn
+flash_mla_sparse_fwd = error_fn
 get_mla_metadata = error_fn
 
 if platform.is_nvidia and platform.is_hopper:
     try:
         from flash_mla import (
+            flash_mla_sparse_fwd,
             flash_mla_with_kvcache,
             get_mla_metadata,
         )
@@ -39,4 +41,4 @@ if platform.is_nvidia and platform.is_hopper:
 # Direct export
 # ------------------------------------------------------------------------------
 
-__all__ = ["flash_mla_with_kvcache", "get_mla_metadata"]
+__all__ = ["flash_mla_sparse_fwd", "flash_mla_with_kvcache", "get_mla_metadata"]

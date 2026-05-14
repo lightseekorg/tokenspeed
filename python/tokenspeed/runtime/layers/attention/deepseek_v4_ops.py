@@ -2203,11 +2203,18 @@ def _deepseek_v4_compute_global_topk_indices_and_lens_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride,
+    is_valid_token_ptr,
+    has_valid_token: tl.constexpr,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
+    if has_valid_token:
+        is_valid_token = tl.load(is_valid_token_ptr + token_idx)
+        if not is_valid_token:
+            tl.store(topk_lens_ptr + token_idx, 0)
+            return
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     count = tl.zeros((), dtype=tl.int32)
 
@@ -2245,6 +2252,7 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
+    is_valid_token: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local CSA top-k indices to global KV slots in one Triton kernel."""
 
@@ -2257,13 +2265,31 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     if num_tokens == 0:
         return global_topk_indices, topk_lens
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[:num_tokens].to(
+            device=topk_indices.device,
+            dtype=torch.bool,
+        )
     if not topk_indices.is_cuda:
         valid = topk_indices >= 0
+        if is_valid_token is not None:
+            valid = valid & is_valid_token[:, None]
         req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
+        rows = int(block_table.shape[0]) if block_table.dim() >= 1 else 0
+        cols = int(block_table.shape[1]) if block_table.dim() >= 2 else 0
+        if rows <= 0 or cols <= 0:
+            global_topk_indices.fill_(-1)
+            topk_lens.zero_()
+            return global_topk_indices, topk_lens
         safe_local = torch.where(valid, topk_indices, torch.zeros_like(topk_indices))
         block_indices = torch.div(safe_local, block_size, rounding_mode="floor")
         block_offsets = safe_local % block_size
-        block_numbers = block_table[req_idx[:, None], block_indices.long()]
+        req_valid = (req_idx >= 0) & (req_idx < rows)
+        block_valid = (block_indices >= 0) & (block_indices < cols)
+        valid = valid & req_valid[:, None] & block_valid
+        safe_req = req_idx.clamp(0, rows - 1)
+        safe_block = block_indices.long().clamp(0, cols - 1)
+        block_numbers = block_table[safe_req[:, None], safe_block]
         global_topk_indices.copy_(
             torch.where(
                 valid,
@@ -2273,6 +2299,8 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
         )
         topk_lens.copy_(valid.sum(dim=1, dtype=torch.int32))
         return global_topk_indices, topk_lens
+    if is_valid_token is None:
+        is_valid_token = torch.empty(0, dtype=torch.bool, device=topk_indices.device)
 
     _deepseek_v4_compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
@@ -2283,6 +2311,8 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
         token_to_req_indices.to(torch.int32),
         block_table.to(torch.int32),
         block_table.stride(0),
+        is_valid_token,
+        is_valid_token.numel() != 0,
         block_size=block_size,
         topk=topk_indices.shape[-1],
         TRITON_BLOCK_SIZE=1024,
@@ -2591,15 +2621,22 @@ def _deepseek_v4_decode_swa_indices_and_lens_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     token_to_req_indices_ptr,
+    is_valid_token_ptr,
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
     max_blocks_per_seq: tl.constexpr,
+    has_valid_token: tl.constexpr,
     window_size: tl.constexpr,
     block_size: tl.constexpr,
     candidate_block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
+    if has_valid_token:
+        is_valid = tl.load(is_valid_token_ptr + token_idx)
+        if not is_valid:
+            tl.store(swa_lens_ptr + token_idx, 0)
+            return
     req_idx = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int32)
 
     query_start = tl.load(query_start_loc_ptr + req_idx).to(tl.int32)
@@ -2647,6 +2684,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
     window_size: int,
     block_size: int,
     block_table_base_offsets: torch.Tensor | None = None,
+    is_valid_token: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     out_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2663,6 +2701,13 @@ def deepseek_v4_decode_swa_indices_and_lens(
         out_lens = torch.empty(num_tokens, dtype=torch.int32, device=seq_lens.device)
     if num_tokens == 0:
         return out_indices, out_lens
+    if is_valid_token is None:
+        is_valid_token = torch.empty(0, dtype=torch.bool, device=seq_lens.device)
+    else:
+        is_valid_token = is_valid_token[:num_tokens].to(
+            device=seq_lens.device,
+            dtype=torch.bool,
+        )
 
     candidate_block = min(1024, triton.next_power_of_2(window_size))
     _deepseek_v4_decode_swa_indices_and_lens_kernel[(num_tokens,)](
@@ -2672,6 +2717,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
         query_start_loc.to(torch.int32),
         seq_lens.to(torch.int32),
         token_to_req_indices.to(torch.int32),
+        is_valid_token,
         block_table.to(torch.int32),
         (
             block_table_base_offsets.to(torch.int32)
@@ -2680,6 +2726,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
         ),
         block_table.stride(0),
         block_table.shape[-1],
+        is_valid_token.numel() != 0,
         window_size=window_size,
         block_size=block_size,
         candidate_block=candidate_block,

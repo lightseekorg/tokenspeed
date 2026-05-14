@@ -26,8 +26,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
+
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
@@ -47,6 +50,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "none"
+DEFAULT_SMG_LOG_LEVEL = "warn"
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -61,20 +65,19 @@ def _check_serve_extra_installed() -> None:
 
     missing: list[str] = []
     if importlib.util.find_spec("smg") is None:
-        missing.append("smg")
+        missing.append("tokenspeed-smg")
     if importlib.util.find_spec("smg_grpc_servicer.tokenspeed.server") is None:
-        missing.append("smg-grpc-servicer")
+        missing.append("tokenspeed-smg-grpc-servicer")
     if missing:
         sys.stderr.write(
-            "ts serve requires SMG packages:\n\n"
+            "ts serve requires the bundled gateway packages, normally installed\n"
+            "as part of `tokenspeed`. Reinstall tokenspeed to restore them:\n\n"
+            "    pip install --force-reinstall --no-deps tokenspeed\n\n"
+            "or install them explicitly:\n\n"
             "    pip install \\\n"
-            "        'smg==1.4.1.post20260512' \\\n"
-            "        'smg-grpc-servicer==0.5.2.post20260512' \\\n"
-            "        'smg-grpc-proto==0.4.7.post20260512' \\\n"
-            "        --extra-index-url https://lightseek.org/whl/cu130/\n\n"
-            "Swap the index for other variants:\n"
-            "    https://lightseek.org/whl/cu129/      (CUDA 12.9)\n"
-            "    https://lightseek.org/whl/rocm7.2/    (ROCm 7.2)\n\n"
+            "        tokenspeed-smg \\\n"
+            "        tokenspeed-smg-grpc-servicer \\\n"
+            "        tokenspeed-smg-grpc-proto\n\n"
             f"Missing: {', '.join(missing)}\n"
         )
         sys.exit(1)
@@ -119,10 +122,81 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
     return result
 
 
+def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
+    if "--log-level" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
+
+
+def _user_model_id(gateway_args: list[str]) -> str | None:
+    """Return the value of ``--model`` from a split gateway argv, or ``None``."""
+    try:
+        idx = gateway_args.index("--model")
+    except ValueError:
+        return None
+    if idx + 1 >= len(gateway_args):
+        return None
+    return gateway_args[idx + 1]
+
+
+def _prewarm_hf_tokenizer(model_id: str) -> None:
+    """Download tokenizer artifacts to the HF cache before the gateway boots.
+
+    smg fires its ``AddTokenizer`` job asynchronously after the engine
+    reports SERVING. On fast runners (e.g. b300) the first eval request
+    can race that fetch and fail with ``tokenizer_not_found``. Pulling
+    tokenizer files into the HF cache up front keeps the registration
+    fast regardless of engine startup speed.
+    """
+    if not model_id or os.path.isdir(model_id):
+        return
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            allow_patterns=[
+                "tokenizer*",
+                "special_tokens_map*",
+                "vocab*",
+                "merges*",
+                "*.json",
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HF tokenizer prewarm failed for %s: %s", model_id, exc)
+
+
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
     gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
-    return _gateway_args_with_smg_disable_defaults(gateway_args)
+    gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
+    return _gateway_args_with_default_log_level(gateway_args)
+
+
+def _overwrite_sampling_backend(engine_args: list[str]) -> list[str]:
+    if current_platform().is_nvidia:
+        return engine_args
+
+    # TODO: Remove this workaround after smg-grpc-servicer stops injecting
+    # ``--sampling-backend flashinfer`` on non-NVIDIA platforms.
+    # The currently pinned SMG TokenSpeed entrypoint forces flashinfer when the
+    # flag is absent, but flashinfer sampling kernels are NVIDIA-only.
+    result: list[str] = []
+    skip_next = False
+    for arg in engine_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--sampling-backend":
+            skip_next = True
+            continue
+        if arg.startswith("--sampling-backend="):
+            continue
+        result.append(arg)
+    return [*result, "--sampling-backend", "greedy"]
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -306,11 +380,16 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
+    engine_args = _overwrite_sampling_backend(split.engine)
     gateway_args = _gateway_args_with_defaults(split.gateway)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
+
+    model_id = _user_model_id(gateway_args)
+    if model_id is not None:
+        _prewarm_hf_tokenizer(model_id)
     rc = asyncio.run(
         run_smg(
-            engine_args=split.engine,
+            engine_args=engine_args,
             gateway_args=gateway_args,
             opts=split.opts,
             user_host=user_host,

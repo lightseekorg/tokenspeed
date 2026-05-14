@@ -509,6 +509,10 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         }
         ops.push_back(std::move(op));
     };
+    auto has_prefill_op = [&]() {
+        return std::any_of(ops.begin(), ops.end(),
+                           [](const ForwardOperation& op) { return std::holds_alternative<PrefillOperation>(op); });
+    };
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free = initialPagedCacheGroupSimulatedFree();
     for (Request* request : candidates) {
@@ -535,13 +539,13 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
             // Prefill-first: skip ALL decode if any prefill was scheduled this round.
-            if (!ops.empty() && std::holds_alternative<PrefillOperation>(ops.back())) break;
+            if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
-            if (!ops.empty() && std::holds_alternative<PrefillOperation>(ops.back())) break;
+            if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();

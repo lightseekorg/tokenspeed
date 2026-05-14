@@ -40,6 +40,14 @@ def has_indexer_topk_prefill() -> bool:
     return hasattr(module, "deepseek_v4_indexer_topk_prefill")
 
 
+def has_indexer_mxfp4_paged_gather() -> bool:
+    try:
+        module = _load_deepseek_v4_attention_module()
+    except Exception:
+        return False
+    return hasattr(module, "deepseek_v4_gather_paged_indexer_mxfp4_cache")
+
+
 def fused_qnorm_rope_kv_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -96,4 +104,37 @@ def indexer_topk_prefill(
         row_ends.contiguous(),
         output,
         int(k),
+    )
+
+
+def indexer_mxfp4_paged_gather(
+    kv_cache: torch.Tensor,
+    values_out: torch.Tensor,
+    scales_out: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cache_block_size: int,
+) -> None:
+    if kv_cache.dtype != torch.uint8:
+        raise TypeError(f"kv_cache must be uint8, got {kv_cache.dtype}")
+    if values_out.dtype != torch.uint8:
+        raise TypeError(f"values_out must be uint8, got {values_out.dtype}")
+    if scales_out.dtype != torch.uint8:
+        raise TypeError(f"scales_out must be uint8, got {scales_out.dtype}")
+    if block_table.dtype != torch.int32:
+        block_table = block_table.to(torch.int32)
+    if cu_seq_lens.dtype != torch.int32:
+        cu_seq_lens = cu_seq_lens.to(torch.int32)
+    if values_out.shape[0] != scales_out.shape[0]:
+        raise ValueError(
+            "DeepSeek V4 paged gather output value/scale rows must match, "
+            f"got values={values_out.shape[0]}, scales={scales_out.shape[0]}"
+        )
+    _load_deepseek_v4_attention_module().deepseek_v4_gather_paged_indexer_mxfp4_cache(
+        kv_cache,
+        values_out,
+        scales_out,
+        block_table.contiguous(),
+        cu_seq_lens.contiguous(),
+        int(cache_block_size),
     )

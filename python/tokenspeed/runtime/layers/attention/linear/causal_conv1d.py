@@ -118,7 +118,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     else:
         # cache_idx
         conv_state_batch_coord = idx_seq
-    if USE_PAD_SLOT:  # noqa
+    if USE_PAD_SLOT:
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
             return
@@ -716,7 +716,7 @@ def _causal_conv1d_update_kernel(
         ).to(tl.int64)
     else:
         conv_state_batch_coord = idx_seq
-    if USE_PAD_SLOT:  # noqa
+    if USE_PAD_SLOT:
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
             return

@@ -88,6 +88,7 @@ class ServerArgs:
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
+    enable_mixed_batch: bool = False
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -193,6 +194,9 @@ class ServerArgs:
 
     # Grammar backend
     grammar_backend: str = "none"
+    # Used by ``input_processor`` to defer json_schema grammars past the
+    # model's reasoning channel.
+    reasoning_parser: str | None = None
     grammar_compile_timeout_secs: float = 30.0
     grammar_compile_max_retries: int = 2
     disable_any_whitespace: bool = False
@@ -815,6 +819,13 @@ class ServerArgs:
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
         )
         parser.add_argument(
+            "--enable-mixed-batch",
+            action="store_true",
+            dest="enable_mixed_batch",
+            default=ServerArgs.enable_mixed_batch,
+            help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+        )
+        parser.add_argument(
             "--block-size",
             metavar="BLOCK_SIZE",
             type=int,
@@ -1287,6 +1298,16 @@ class ServerArgs:
             choices=["xgrammar", "none"],
             default=ServerArgs.grammar_backend,
             help="Grammar backend. 'none' disables grammar-guided decoding entirely ",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            default=ServerArgs.reasoning_parser,
+            help=(
+                "Reasoning parser name (e.g. 'minimax', 'gpt-oss'). "
+                "Used to defer json_schema grammars past the model's "
+                "reasoning channel."
+            ),
         )
         parser.add_argument(
             "--grammar-compile-timeout-secs",

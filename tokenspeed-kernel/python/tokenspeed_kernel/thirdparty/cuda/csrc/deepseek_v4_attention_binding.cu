@@ -38,7 +38,16 @@ void deepseek_v4_indexer_topk_prefill(TensorView logits,
                                       TensorView output,
                                       int64_t k);
 
+void deepseek_v4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
+                                                  TensorView values_out,
+                                                  TensorView scales_out,
+                                                  TensorView block_table,
+                                                  TensorView cu_seq_lens,
+                                                  int64_t cache_block_size);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
                               fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v4_indexer_topk_prefill,
                               deepseek_v4_indexer_topk_prefill);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v4_gather_paged_indexer_mxfp4_cache,
+                              deepseek_v4_gather_paged_indexer_mxfp4_cache);

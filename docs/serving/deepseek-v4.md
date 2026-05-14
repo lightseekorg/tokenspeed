@@ -6,7 +6,7 @@ DP=4 + expert parallel + mega_moe + FP8 KV cache (B200, 4× SM100):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
-    --host localhost --port 30100 \
+    --host localhost --port 8000 \
     --dist-init-addr 127.0.0.1:4013 \
     --trust-remote-code \
     --data-parallel-size 4 \
@@ -17,6 +17,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
     --max-model-len 4096 \
     --max-total-tokens 16384 \
     --chunked-prefill-size 8192 \
+    --enable-mixed-batch \
     --gpu-memory-utilization 0.9 \
     --disable-kvstore
 ```
@@ -29,6 +30,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
 | `--kv-cache-dtype fp8_e4m3` | V4 SWA cache rows are uint8-packed FP8 NoPE + BF16 RoPE + UE8M0 scale; FP8 e4m3 is the only supported KV dtype. |
 | `--moe-backend mega_moe` | Activates the DeepGEMM `fp8_fp4_mega_moe` fused experts. Requires `tokenspeed-deepgemm>=2.5.0.post20260424`. |
 | `--attention-use-fp4-indexer-cache` | Stores indexer keys as MXFP4 (`[values \| ue8m0 scales]`); the FP8 fallback path is reference-only. |
+| `--enable-mixed-batch` | Enables mixed prefill/decode scheduling for V4 sparse attention. It is off by default globally because other backend paths do not all support mixed batches yet. |
 | `--trust-remote-code` | The HF config uses model-class architectures registered via remote code. |
 
 ## Block size
@@ -66,7 +68,7 @@ GSM8K 5-shot, 50 samples is the standard quick-validation harness for V4:
 ```bash
 HF_DATASETS_TRUST_REMOTE_CODE=1 lm_eval run \
     --model local-completions \
-    --model_args "model=deepseek-ai/DeepSeek-V4-Flash,base_url=http://127.0.0.1:30100/v1/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=4,max_retries=1,timeout=600,max_gen_toks=256" \
+    --model_args "model=deepseek-ai/DeepSeek-V4-Flash,base_url=http://127.0.0.1:8000/v1/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=4,max_retries=1,timeout=600,max_gen_toks=256" \
     --tasks gsm8k --num_fewshot 5 --limit 50 --batch_size 1 \
     --gen_kwargs temperature=0
 ```

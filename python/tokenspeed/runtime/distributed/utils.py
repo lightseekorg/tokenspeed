@@ -163,7 +163,7 @@ class StatelessProcessGroup:
         used for exchanging metadata. With this function, process A and process B
         can call `StatelessProcessGroup.create` to form a group, and then process A, B,
         C, and D can call `StatelessProcessGroup.create` to form another group.
-        """  # noqa
+        """
         store = TCPStore(
             host_name=host,
             port=port,

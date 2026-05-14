@@ -55,6 +55,9 @@ class ForwardMode(IntEnum):
     def is_decode(self):
         return self == ForwardMode.DECODE
 
+    def is_mixed(self):
+        return self == ForwardMode.MIXED
+
     def is_idle(self):
         return self == ForwardMode.IDLE
 
@@ -66,6 +69,19 @@ class ForwardMode(IntEnum):
 
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+
+    @staticmethod
+    def from_num_extends(
+        num_extends: int,
+        batch_size: int,
+        *,
+        has_drafter: bool = False,
+    ) -> "ForwardMode":
+        if batch_size <= 0:
+            return ForwardMode.IDLE
+        if num_extends > 0:
+            return ForwardMode.MIXED if num_extends < batch_size else ForwardMode.EXTEND
+        return ForwardMode.TARGET_VERIFY if has_drafter else ForwardMode.DECODE
 
 
 class CaptureHiddenMode(IntEnum):

@@ -49,8 +49,6 @@ eval:
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
     --eval-batch-size 16
-    --stream
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
 report:
   github_step_summary: true
 score_threshold: 0.7
