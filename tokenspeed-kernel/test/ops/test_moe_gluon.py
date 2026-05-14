@@ -492,13 +492,13 @@ def test_autotune_scaled_mfma_block_k(M, N, K, do_swiglu, ragged):
 def test_launcher_rejects_bad_block_k_for_scaled_mfma():
     """The launcher must refuse a sub-128 ``BLOCK_K`` when the caller
     advertises ``scaled_mfma=True`` (catches future mxfp4 mis-wirings)."""
-    from tokenspeed_kernel.ops.moe.gluon import _launch_pipelined
+    from tokenspeed_kernel.ops.moe.gluon import _launch_kernel
 
     x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
     y = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match=r"BLOCK_K"):
-        _launch_pipelined(
+        _launch_kernel(
             x,
             w,
             y=y,

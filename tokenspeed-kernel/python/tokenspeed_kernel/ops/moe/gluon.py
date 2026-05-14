@@ -1200,71 +1200,6 @@ def _supports_pure_bf16(precision_config, fused_activation) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _launch_pipelined(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    *,
-    y: torch.Tensor,
-    bias: torch.Tensor | None,
-    gather_indx,
-    scatter_indx,
-    gate_scal: torch.Tensor | None,
-    a_ragged_metadata,
-    swiglu: tuple[float, float] | None,
-    out_block_n: int,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_warps: int,
-    num_buffers: int,
-    scaled_mfma: bool = False,
-):
-    # bf16/fp16 entry: forwards to the unified scaled launcher with
-    # X/W_FORMAT="bfloat16"/"float16" (USE_MFMA_SCALED=False in MoEConfig
-    # so the kernel automatically takes the regular 16x16x32 mfma path)
-    # and APPLY_X_GLOBAL_SCALE=False to skip the fp8 global-scale multiply.
-    # scaled_mfma=True is left for the assertion-only test
-    # `test_launcher_rejects_bad_block_k_for_scaled_mfma`.
-    M, K = x.shape[-2], x.shape[-1]
-    if w.ndim == 3:
-        _, K_W, _ = w.shape[0], w.shape[-2], w.shape[-1]
-    else:
-        K_W, _ = w.shape
-    assert K == K_W, f"K mismatch: {K} vs {K_W}"
-
-    mfma_k = _MFMA_SCALED_K if scaled_mfma else _MFMA_K
-    assert block_k % mfma_k == 0, (
-        f"BLOCK_K={block_k} must be a multiple of MFMA K dim "
-        f"({mfma_k}); scaled_mfma={scaled_mfma}"
-    )
-    if scaled_mfma:
-        assert block_k >= _MFMA_SCALED_K, (
-            f"scaled MFMA requires BLOCK_K >= {_MFMA_SCALED_K} (got "
-            f"{block_k}); see TASKS.md Update 3."
-        )
-    assert (
-        block_m % _MFMA_M == 0
-    ), f"BLOCK_M={block_m} must be a multiple of MFMA M dim ({_MFMA_M})"
-
-    _DTYPE_STR = {torch.bfloat16: "bfloat16", torch.float16: "float16"}
-    a_fmt = _DTYPE_STR[x.dtype]
-    b_fmt = _DTYPE_STR[w.dtype]
-
-    _launch_pipelined_scaled(
-        x, w,
-        y=y, bias=bias,
-        gather_indx=gather_indx, scatter_indx=scatter_indx,
-        gate_scal=gate_scal, a_ragged_metadata=a_ragged_metadata,
-        swiglu=swiglu, out_block_n=out_block_n,
-        block_m=block_m, block_n=block_n, block_k=block_k,
-        num_warps=num_warps,
-        a_format=a_fmt, b_format=b_fmt,
-        x_scale=None, w_scale=None, a_global_scale=1.0,
-        scale_load_mode="bypass", w_transpose=False,
-        apply_x_global_scale=False,
-    )
-
-
 def _scale_strides(scale: torch.Tensor | None) -> tuple[int, int]:
     # Kernel reads scales as [..., NONK, K_S] returning (stride_nonk, stride_k).
     if scale is None:
@@ -1272,7 +1207,12 @@ def _scale_strides(scale: torch.Tensor | None) -> tuple[int, int]:
     return scale.stride(-2), scale.stride(-1)
 
 
-def _launch_pipelined_scaled(
+_PLAIN_DTYPE_STR = {torch.bfloat16: "bfloat16", torch.float16: "float16"}
+_SCALED_FORMATS = {"e2m1", "e4m3", "e5m2"}
+_PLAIN_FORMATS = set(_PLAIN_DTYPE_STR.values())
+
+
+def _launch_kernel(
     x: torch.Tensor,
     w: torch.Tensor,
     *,
@@ -1288,24 +1228,34 @@ def _launch_pipelined_scaled(
     block_n: int,
     block_k: int,
     num_warps: int,
-    a_format: str,
-    b_format: str = "e2m1",
+    num_buffers: int = 2,
+    a_format: str | None = None,
+    b_format: str | None = None,
     x_scale: torch.Tensor | None = None,
     w_scale: torch.Tensor | None = None,
     a_global_scale: float = 1.0,
-    scale_load_mode: str = "transpose",
+    scale_load_mode: str = "bypass",
     w_transpose: bool = False,
-    apply_x_global_scale: bool = True,
+    apply_x_global_scale: bool | None = None,
+    scaled_mfma: bool | None = None,
 ):
-    # Unified launcher for both scaled (mxfp4/fp8) and regular (bf16/fp16)
-    # paths. Scaled formats use uint8 packed storage; bf16/fp16 use native
-    # element storage (DIV_FACTOR=1). scale_load_mode is only consulted on
-    # the scaled path.
-    _SCALED = {"e2m1", "e4m3", "e5m2"}
-    _PLAIN = {"bfloat16", "float16"}
-    assert a_format in _SCALED | _PLAIN, f"unknown a_format={a_format!r}"
-    assert b_format in _SCALED | _PLAIN, f"unknown b_format={b_format!r}"
-    is_scaled = a_format in _SCALED or b_format in _SCALED
+    # Unified launcher for both scaled (mxfp4/fp8) and plain (bf16/fp16) paths.
+    # ``a_format``/``b_format`` default to dtype-derived strings for plain
+    # tensors; callers using packed-uint8 scaled formats must pass them
+    # explicitly. ``USE_MFMA_SCALED`` in MoEConfig drives the kernel-body
+    # selection (scaled-mfma 16x16x128 vs regular 16x16x32).
+    if a_format is None:
+        a_format = _PLAIN_DTYPE_STR[x.dtype]
+    if b_format is None:
+        b_format = _PLAIN_DTYPE_STR[w.dtype]
+    assert a_format in _SCALED_FORMATS | _PLAIN_FORMATS, f"unknown a_format={a_format!r}"
+    assert b_format in _SCALED_FORMATS | _PLAIN_FORMATS, f"unknown b_format={b_format!r}"
+    is_scaled = a_format in _SCALED_FORMATS or b_format in _SCALED_FORMATS
+    # ``scaled_mfma`` override exists only for the assertion-only test; the
+    # kernel body itself dispatches on the actual format constexpr.
+    enforce_scaled_k = scaled_mfma if scaled_mfma is not None else is_scaled
+    if apply_x_global_scale is None:
+        apply_x_global_scale = is_scaled
     assert scale_load_mode in _SCALE_LOAD_MODES, (
         f"scale_load_mode must be one of {_SCALE_LOAD_MODES}, "
         f"got {scale_load_mode!r}"
@@ -1338,10 +1288,15 @@ def _launch_pipelined_scaled(
     K_w = K_w_phys * div_b
     assert K == K_w, f"K mismatch: A logical K={K} vs W logical K={K_w}"
 
-    if is_scaled:
-        assert block_k % _MFMA_SCALED_K == 0 and block_k >= _MFMA_SCALED_K
-    else:
-        assert block_k % _MFMA_K == 0
+    mfma_k = _MFMA_SCALED_K if enforce_scaled_k else _MFMA_K
+    assert block_k % mfma_k == 0, (
+        f"BLOCK_K={block_k} must be a multiple of MFMA K dim ({mfma_k}); "
+        f"scaled_mfma={enforce_scaled_k}"
+    )
+    if enforce_scaled_k:
+        assert block_k >= _MFMA_SCALED_K, (
+            f"scaled MFMA requires BLOCK_K >= {_MFMA_SCALED_K} (got {block_k})"
+        )
     assert block_m % _MFMA_M == 0
 
     num_active, blocks_per_expert, expert_remap = _expert_layout(
@@ -1399,7 +1354,6 @@ def _launch_pipelined_scaled(
         x_scale_proc if x_scale_proc is not None else _make_dummy(x.device, torch.uint8)
     )
 
-    num_buffers = 2
     NUM_SUBTILES = (1, 1, 1)
     EVEN_K = (K % block_k == 0)
 
@@ -1472,6 +1426,10 @@ _MFMA_SCALED_K = 128
 _MFMA_M = 16
 
 
+def _round_up_int(x: int, m: int) -> int:
+    return ((x + m - 1) // m) * m
+
+
 def _autotune_block(
     M: int,
     N: int,
@@ -1480,14 +1438,17 @@ def _autotune_block(
     do_swiglu: bool = False,
     ragged: bool = False,
     scaled_mfma: bool = False,
+    a_format: str = "e2m1",
 ) -> tuple[int, int, int, int]:
     """Pick ``(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS)`` for given shape.
 
-    Heuristic obtained by sweeping the microbench
-    (``benchmarks/moe_gluon_microbench.py``) on MI355 with the
-    gpt-oss-120b MoE dimensions (``H=I=2880, E=128, topk=4``) for
-    decode (``B in {1, 32, 64}``) and prefill
-    (``B in {1024, 4096, 8192}``).
+    Heuristic obtained by sweeping ``benchmarks/moe_gluon_perf_sweep.py``
+    on MI355 with the gpt-oss-120b MoE dimensions (``H=I=2880, E=128,
+    topk=4``). Each candidate must be (a) spill-free per ``static_profile``
+    and (b) the highest-TFLOPs config at its shape.
+
+    Plain bf16/fp16 path
+    ~~~~~~~~~~~~~~~~~~~~
 
     * **Dense gating GEMM** (``do_swiglu=False, ragged=False``).
       Output ``N=128`` (``num_local_experts``) so we keep ``BLOCK_N=64``
@@ -1511,27 +1472,58 @@ def _autotune_block(
           on MI355 -> spills; 128x128 stays under the 256-VGPR limit
           while still hitting 273 TFLOPs).
 
-    Scaled MFMA constraint
-    ~~~~~~~~~~~~~~~~~~~~~~
-    When ``scaled_mfma=True`` (mxfp4 weight + fp8 activation path), the
-    underlying ``gl.amd.cdna4.mfma_scaled`` instruction has shape
-    ``[16, 16, 128]`` in ``[M, N, K]``. We therefore *promote* whatever
-    block size the regular heuristic returned so it satisfies
-    ``BLOCK_K >= 128`` and ``BLOCK_K % 128 == 0``. We also widen the
-    swiglu/ragged ``BLOCK_K`` floor from 32 to 128 because the smaller
-    values are not legal for scaled MFMA.
+    Scaled MFMA path  (``scaled_mfma=True``)
+    ~~~~~~~~~~~~~~~~~
 
-    A microbench sweep over ``BLOCK_K in {64, 128, 256}`` with the
-    regular MFMA path showed that ``BLOCK_K = 128`` actually *hurts*
-    bf16 perf (2-3x slower than 32/64) because our register-staged
-    pipeline holds 4x larger prefetch tiles, blowing VGPR pressure. So
-    the override only activates when the caller explicitly opts into
-    the scaled path; the bf16 default stays at 32/64.
+    ``gl.amd.cdna4.mfma_scaled`` is 16x16x128 (M x N x K), so
+    ``BLOCK_K`` must be a multiple of 128 and ``>= 128``. The heuristic
+    tiers off the logical ``M`` (which already includes per-expert
+    padding for the MoE wrappers):
+
+    * tiny decode (``M <= 512``, e.g. B=1 with E=128): tall-thin
+      ``64 x 128 x 512`` with 8 warps -- the few CTAs need every MFMA
+      they can hide under the LDS prefetch.
+
+    * medium (``M <= 16384``, decode B=32..1024 or chunked prefill):
+      ``64 x 256 x BK`` with low BM keeps grid_m large; on mxfp4 inputs
+      ``BK=256`` wins (lower per-tile mfma latency, BK=128 is bandwidth
+      bound on the half-byte X load); fp8 keeps ``BK=128`` and bumps
+      warps to 8 to recover occupancy.
+
+    * large (``M > 16384``, prefill B=4096..8192): the M_d=32768 grid
+      can amortise huge tiles. mxfp4 hits its peak at ``256 x 256 x 128
+      / NW=4`` (occ=4, vgpr~122); fp8 has higher VGPR pressure per
+      tile, so the sweet spot is ``128 x 256 x 128 / NW=4``.
+
+    Older heuristic comment about ``BLOCK_K=128 hurting bf16``: that
+    was for the bf16 pipeline (register-staged, no async-copy). The
+    scaled path is LDS-staged, so larger BK is cheap there.
     """
     if scaled_mfma:
-        # Baseline 32x32x256 / NW=4: smallest config satisfying
-        # mfma_scaled K=128 and buffer_load_to_shared 128b/thread.
-        return 32, 32, 256, 4
+        is_fp8 = a_format == "e4m3"
+        if M <= 512:
+            bm, bn, bk, nw = 64, 128, 512, 8
+        elif is_fp8:
+            # fp8 X tiles are 1 byte/elem so VGPR pressure is lower; we
+            # promote to the large BM=128 tier as soon as M > 8192.
+            if M <= 8192:
+                bm, bn, bk, nw = 64, 256, 128, 8
+            else:
+                bm, bn, bk, nw = 128, 256, 128, 4
+        else:
+            # mxfp4 X is 4b packed but the dequant adds VGPR pressure;
+            # BM=64 with BK=256 stays the sweet spot until M_d > 16384.
+            if M <= 16384:
+                bm, bn, bk, nw = 64, 256, 256, 4
+            else:
+                bm, bn, bk, nw = 256, 256, 128, 4
+        # Clamp tile to actual shape (rounded up to the MFMA tile / scaled
+        # K granularity). Tiny test shapes like 32x32x256 would otherwise
+        # over-tile and yield NaN-padded reductions.
+        bm = max(_MFMA_M, min(bm, _round_up_int(M, _MFMA_M)))
+        bn = max(_MFMA_M, min(bn, _round_up_int(N, _MFMA_M)))
+        bk = max(_MFMA_SCALED_K, min(bk, _round_up_int(K, _MFMA_SCALED_K)))
+        return bm, bn, bk, nw
     if do_swiglu:
         bm, bn, bk, nw = (64, 128, 32, 4) if M <= 8192 else (128, 128, 32, 4)
     elif ragged:
@@ -1576,7 +1568,7 @@ def gluon_bf16_gating_gemm(
     block_k = block_k or bk
     num_warps = num_warps or nw
     y = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    _launch_pipelined(
+    _launch_kernel(
         x,
         w,
         y=y,
@@ -1627,7 +1619,7 @@ def gluon_bf16_dispatch_swiglu(
     num_warps = num_warps or nw
     out_block_n = block_n // 2
     y = torch.empty((M, N // 2), device=x.device, dtype=x.dtype)
-    _launch_pipelined(
+    _launch_kernel(
         x,
         w,
         y=y,
@@ -1683,7 +1675,7 @@ def gluon_bf16_combine(
     block_k = block_k or bk
     num_warps = num_warps or nw
     y = torch.zeros((n_tokens, N), device=x.device, dtype=x.dtype)
-    _launch_pipelined(
+    _launch_kernel(
         x,
         w,
         y=y,
@@ -1719,24 +1711,25 @@ def gluon_mxfp_gating_gemm(
     block_n: int | None = None,
     block_k: int | None = None,
     num_warps: int | None = None,
+    num_buffers: int = _DEFAULT_NUM_BUFFERS,
     scale_load_mode: str = "transpose",
     w_transpose: bool = False,
 ) -> torch.Tensor:
     # Scaled-MFMA dense GEMM y = (a_scale * x) @ (w_scale * w).
-    # See _launch_pipelined_scaled for scale_load_mode and tensor layouts.
+    # See _launch_kernel for scale_load_mode and tensor layouts.
     assert _gluon_is_supported(), "Gluon scaled MoE kernel requires CDNA4."
     assert x.dim() == 2 and w.dim() == 2
     M = x.shape[0]
     N = w.shape[-1]
     div_a = 2 if a_format == "e2m1" else 1
     K = x.shape[-1] * div_a
-    bm, bn, bk, nw = _autotune_block(M, N, K, scaled_mfma=True)
+    bm, bn, bk, nw = _autotune_block(M, N, K, scaled_mfma=True, a_format=a_format)
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
     y = torch.empty((M, N), device=x.device, dtype=out_dtype)
-    _launch_pipelined_scaled(
+    _launch_kernel(
         x,
         w,
         y=y,
@@ -1758,6 +1751,7 @@ def gluon_mxfp_gating_gemm(
         a_global_scale=a_global_scale,
         scale_load_mode=scale_load_mode,
         w_transpose=w_transpose,
+        num_buffers=num_buffers,
     )
     return y
 
@@ -1780,6 +1774,7 @@ def gluon_mxfp_dispatch_swiglu(
     block_n: int | None = None,
     block_k: int | None = None,
     num_warps: int | None = None,
+    num_buffers: int = _DEFAULT_NUM_BUFFERS,
     scale_load_mode: str = "transpose",
     w_transpose: bool = False,
 ) -> torch.Tensor:
@@ -1790,14 +1785,16 @@ def gluon_mxfp_dispatch_swiglu(
     N = w.shape[-1]
     div_a = 2 if a_format == "e2m1" else 1
     K = x.shape[-1] * div_a
-    bm, bn, bk, nw = _autotune_block(M, N, K, do_swiglu=True, scaled_mfma=True)
+    bm, bn, bk, nw = _autotune_block(
+        M, N, K, do_swiglu=True, scaled_mfma=True, a_format=a_format,
+    )
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
     out_block_n = block_n // 2
     y = torch.empty((M, N // 2), device=x.device, dtype=out_dtype)
-    _launch_pipelined_scaled(
+    _launch_kernel(
         x,
         w,
         y=y,
@@ -1819,6 +1816,7 @@ def gluon_mxfp_dispatch_swiglu(
         a_global_scale=a_global_scale,
         scale_load_mode=scale_load_mode,
         w_transpose=w_transpose,
+        num_buffers=num_buffers,
     )
     return y
 
@@ -1842,6 +1840,7 @@ def gluon_mxfp_combine(
     block_n: int | None = None,
     block_k: int | None = None,
     num_warps: int | None = None,
+    num_buffers: int = _DEFAULT_NUM_BUFFERS,
     scale_load_mode: str = "transpose",
     w_transpose: bool = False,
 ) -> torch.Tensor:
@@ -1855,14 +1854,17 @@ def gluon_mxfp_combine(
     div_a = 2 if a_format == "e2m1" else 1
     K = x.shape[-1] * div_a
     bm, bn, bk, nw = _autotune_block(
-        M, N, K, ragged=a_ragged_metadata is not None, scaled_mfma=True
+        M, N, K,
+        ragged=a_ragged_metadata is not None,
+        scaled_mfma=True,
+        a_format=a_format,
     )
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
     y = torch.zeros((n_tokens, N), device=x.device, dtype=out_dtype)
-    _launch_pipelined_scaled(
+    _launch_kernel(
         x,
         w,
         y=y,
@@ -1884,6 +1886,7 @@ def gluon_mxfp_combine(
         a_global_scale=a_global_scale,
         scale_load_mode=scale_load_mode,
         w_transpose=w_transpose,
+        num_buffers=num_buffers,
     )
     if n_expts_act is not None and n_expts_act > 1:
         y = y.view(n_tokens, n_expts_act, N).sum(dim=1)
@@ -1959,7 +1962,7 @@ def _gluon_bf16_ragged_matmul(
         y = torch.zeros((n_tokens or M, N), device=x.device, dtype=out_dtype)
     else:
         y = torch.empty((M, N), device=x.device, dtype=out_dtype)
-    _launch_pipelined(
+    _launch_kernel(
         x,
         w,
         y=y,
