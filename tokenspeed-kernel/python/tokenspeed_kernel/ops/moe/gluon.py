@@ -206,16 +206,7 @@ def get_mfma_layout(num_warps: int, use_mfma_scaled: bool,
     )
 
 
-# Scale loading modes:
-# - "bypass": scales go G->VGPR via gl.load (kernel direct loads).
-# - "transpose": same as bypass on CDNA4 (kept for API compat).
-# - "swizzle": scales are AITer-preshuffled host-side to [..., M/PF, K_S*PF];
-#   kernel async-copies them to LDS via buffer_load_to_shared and uses a
-#   5-D view (reshape+permute) on the LDS slot to undo the swizzle before
-#   local_load. After swizzle the contig K dim grows from K_S (=BK/32)
-#   to K_S*PF (=BK), which is large enough for canCoalesceWriteIntoSharedMemory
-#   to succeed with vec=4 (32-bit). Requires BLOCK_K >= 256 to fully utilise
-#   vec=4 without 2-lane NONK splitting; smaller BK uses lanes_nonk>1.
+
 _SCALE_LOAD_MODES = ("bypass", "transpose", "swizzle")
 _SCALE_PRESHUFFLE_FACTOR = 32
 _SCALE_KWIDTH = 4
@@ -225,14 +216,18 @@ _SCALE_ASYNC_VEC = 4  # 32-bit, smallest direct-to-LDS unit on CDNA4.
 def _effective_scale_load_mode(
     mode: str, block_m: int, block_n: int, block_k: int,
     scale_block: int, has_x_scale: bool, has_w_scale: bool,
+    k: int | None = None,
 ) -> str:
     # swizzle -> bypass fallback when the post-swizzle tile is too narrow
-    # along NONK for canCoalesceWriteIntoSharedMemory to succeed:
-    # tile [NONK_PS, K_S_PS], coalesced = vec*64. If K_S_PS < vec*64,
-    # lanes spill into NONK (lanes_nonk > 1); shape must have NONK_PS >=
-    # lanes_nonk otherwise the lane basis wraps to 0 and divideLeft fails.
+    # along NONK for canCoalesceWriteIntoSharedMemory to succeed, or when
+    # K_S = K/scale_block is not a multiple of SCALE_KWIDTH (host swizzle
+    # reshape requires K_S % KWIDTH == 0).
     if mode != "swizzle":
         return mode
+    if k is not None:
+        k_s = k // scale_block
+        if k_s % _SCALE_KWIDTH != 0:
+            return "bypass"
     PF = _SCALE_PRESHUFFLE_FACTOR
     bk_s_ps = (block_k // scale_block) * PF
     lanes_nonk = max(1, _SCALE_ASYNC_VEC * 64 // bk_s_ps)
@@ -525,30 +520,27 @@ class AsyncCopyDescriptor:
 
     @gluon.jit
     def issue_async_load(self, idx, buffer, pred=1):
-        # NOTE: issuing buffer_load_to_shared inside `if pred:` triggers an
-        # LLVM AMDGPU SIInsertWaitcnts::mergeAsyncMarks() assertion
-        # (Sequence.h: Begin <= End) at CFG joins where one predecessor
-        # has async marks and the other does not. Workaround: always
-        # emit the load and fold `pred` into its mask so both CFG paths
-        # carry an async mark of the same shape.
-        # Upstream fix: https://github.com/llvm/llvm-project/pull/193499
+        # Fold the per-iteration K step into ``offsets`` and keep the base ptr
+        # equal to ``self.ptr``. A runtime ``tt.addptr`` on the base trips
+        # ``unrealized_conversion_cast`` in BufferLoadToLocalOpConversion for
+        # certain tile shapes (e.g. mxfp4 X with BLOCK_K_X=128).
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
         EVEN_K: gl.constexpr = self.cfg.EVEN_K
-        base = self.ptr + idx * self.BLOCK_K * self.stride_k
+        off_k_step = idx * self.BLOCK_K
+        offsets = self.offsets + off_k_step * self.stride_k
         pred_b = pred != 0
         if EVEN_K:
             mask = (
-                gl.full(self.offsets.shape, True, gl.int1, layout=self.offsets.type.layout)
+                gl.full(offsets.shape, True, gl.int1, layout=offsets.type.layout)
                 & pred_b
             )
         else:
-            off_k_step = idx * self.BLOCK_K
             mask_k = gl.expand_dims(off_k_step + self.off_k, self.op_idx) < self.k_limit
             mask = mask_k & self.masks_nonk & pred_b
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             buffer.index(idx % NUM_BUFFERS),
-            base,
-            self.offsets,
+            self.ptr,
+            offsets,
             mask=mask,
             other=0,
         )
@@ -585,11 +577,19 @@ class AsyncCopyDescriptor:
 
 @gluon.jit
 def _load_scale_tile_via_gl_load(desc, mfma_idx, scale_layout: gl.constexpr):
-    # Always load scales G->VGPR via gl.load. Direct-to-LDS for scales is
-    # structurally impossible on CDNA4 for many tile shapes (canCoalesce
-    # check fails) so we bypass LDS for scales unconditionally.
-    base = desc.ptr + mfma_idx * desc.BLOCK_K * desc.stride_k
-    return gl.load(base + desc.offsets, mask=desc.masks_nonk, other=0)
+    # G->VGPR scale load via gl.load. Direct-to-LDS for scales is structurally
+    # impossible on CDNA4 for many tile shapes. K-mask the load so the OOB
+    # scale slots become 0; otherwise junk reads (e.g. 0xFF e8m0 == NaN)
+    # poison the mfma_scaled accumulator on the partial last K tile.
+    EVEN_K: gl.constexpr = desc.cfg.EVEN_K
+    off_k_step = mfma_idx * desc.BLOCK_K
+    base = desc.ptr + off_k_step * desc.stride_k
+    if EVEN_K:
+        mask = desc.masks_nonk
+    else:
+        mask_k = gl.expand_dims(off_k_step + desc.off_k, desc.op_idx) < desc.k_limit
+        mask = mask_k & desc.masks_nonk
+    return gl.load(base + desc.offsets, mask=mask, other=0)
 
 
 @composition
@@ -907,18 +907,26 @@ def _pipelined_moe_kernel_scaled(
     mask_m = rows_m < M
     mask_n = (off_n + offs_wn) < N
 
+    # Hint divisibility on K_phys: the launcher requires K % 32 == 0, so
+    # K_phys = K / DIV_FACTOR has div(K_phys) >= 32 // DIV_FACTOR (>= 16 for
+    # mxfp4 packed). Without this hint the K-mask alignment for non-even-K
+    # caps the direct-to-LDS vec at 64b on mxfp4, which CDNA4 rejects.
+    # ``multiple_of`` on a func arg is a silent no-op; apply it on the
+    # ``K // DIV_FACTOR`` SSA which has an arith.divsi defining op.
+    k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
+    k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
     x_desc = AsyncCopyDescriptor.initialize(
         cfg, 0, BLOCK_K_X, x_ptr,
         rows_m, offs_xk,
         stride_xm, stride_xk,
-        mask_m[:, None], K // cfg.DIV_FACTOR_X,
+        mask_m[:, None], k_limit_x,
     )
     if W_TRANSPOSE:
         w_desc = AsyncCopyDescriptor.initialize(
             cfg, 0, BLOCK_K_W, w_ptr,
             off_n + offs_wn, offs_wk,
             stride_wn, stride_wk,
-            mask_n[:, None], K // cfg.DIV_FACTOR_W,
+            mask_n[:, None], k_limit_w,
             base_offset=w_base_offset,
         )
     else:
@@ -926,7 +934,7 @@ def _pipelined_moe_kernel_scaled(
             cfg, 1, BLOCK_K_W, w_ptr,
             off_n + offs_wn, offs_wk,
             stride_wn, stride_wk,
-            mask_n[None, :], K // cfg.DIV_FACTOR_W,
+            mask_n[None, :], k_limit_w,
             base_offset=w_base_offset,
         )
     # Scale offsets: SCALE_VIA_LDS (swizzle) uses the post-swizzle HBM shape
@@ -1309,24 +1317,25 @@ def _launch_pipelined_scaled(
     if has_w_block_scale:
         assert w_scale is not None, "mxfp4 W requires a block-scale tensor"
 
-    scale_load_mode = _effective_scale_load_mode(
-        scale_load_mode, block_m, block_n, block_k,
-        scale_block=32,
-        has_x_scale=has_a_block_scale, has_w_scale=has_w_block_scale,
-    )
-
     M = x.shape[-2]
     K_phys = x.shape[-1]
     div_a = 2 if a_format == "e2m1" else 1
     div_b = 2 if b_format == "e2m1" else 1
     K = K_phys * div_a
 
+    scale_load_mode = _effective_scale_load_mode(
+        scale_load_mode, block_m, block_n, block_k,
+        scale_block=32,
+        has_x_scale=has_a_block_scale, has_w_scale=has_w_block_scale,
+        k=K,
+    )
+
     if w.ndim == 3:
         E, K_w_phys, N = w.shape
     else:
         K_w_phys, N = w.shape
         E = 1
-    K_w = K_w_phys * 2
+    K_w = K_w_phys * div_b
     assert K == K_w, f"K mismatch: A logical K={K} vs W logical K={K_w}"
 
     if is_scaled:
@@ -1392,7 +1401,7 @@ def _launch_pipelined_scaled(
 
     num_buffers = 2
     NUM_SUBTILES = (1, 1, 1)
-    EVEN_K = True
+    EVEN_K = (K % block_k == 0)
 
     _pipelined_moe_kernel_scaled[grid](
         x,

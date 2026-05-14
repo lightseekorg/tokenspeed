@@ -579,7 +579,10 @@ def _fp8_pair(M: int, K: int, fmt: str, *, device="cuda"):
 
 
 @pytest.mark.parametrize("scale_mode", ["bypass", "transpose", "swizzle"])
-@pytest.mark.parametrize("M,N,K", [(32, 32, 256), (64, 128, 256), (128, 64, 256)])
+@pytest.mark.parametrize("M,N,K", [
+    (32, 32, 256), (64, 128, 256), (128, 64, 256),
+    (64, 128, 2880),
+])
 def test_mxfp4_x_mxfp4_gating(M, N, K, scale_mode):
     """``e2m1`` x ``e2m1`` dense GEMM via scaled MFMA."""
     from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
