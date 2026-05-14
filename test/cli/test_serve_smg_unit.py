@@ -38,6 +38,7 @@ from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_port,
+    _gateway_args_with_default_prometheus_port,
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
@@ -103,6 +104,8 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--disable-retries",
         "--log-level",
         "warn",
+        "--prometheus-port",
+        "8413",
     ]
 
 
@@ -116,6 +119,20 @@ def test_gateway_args_preserve_user_log_level():
     gateway_args = _gateway_args_with_default_log_level(["--log-level", "debug"])
 
     assert gateway_args == ["--log-level", "debug"]
+
+
+def test_gateway_args_default_prometheus_port_is_8413():
+    gateway_args = _gateway_args_with_default_prometheus_port(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--prometheus-port", "8413"]
+
+
+def test_gateway_args_preserve_user_prometheus_port():
+    gateway_args = _gateway_args_with_default_prometheus_port(
+        ["--prometheus-port", "29000"]
+    )
+
+    assert gateway_args == ["--prometheus-port", "29000"]
 
 
 def test_smg_disable_flags_appended_when_absent():
