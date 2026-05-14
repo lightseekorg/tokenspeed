@@ -5,7 +5,8 @@
 DP=4 + expert parallel + mega_moe + FP8 KV cache (B200, 4× SM100):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
+CUDA_VISIBLE_DEVICES=0,1,2,3 exec ts serve \
+    --model deepseek-ai/DeepSeek-V4-Flash \
     --host localhost --port 30100 \
     --dist-init-addr 127.0.0.1:4013 \
     --trust-remote-code \
@@ -49,6 +50,20 @@ also be bumped to 256.)
   workspace (`0` lets the kernel pick).
 - `--deepseek-v4-indexer-prefill-max-logits-mb N`: caps the FP4 indexer
   prefill logits buffer in MB (default 512).
+
+## MTP speculative decoding
+
+DeepSeek V4 can use the checkpoint's NextN/MTP draft layers through the standard
+speculative flags. For `num_steps > 1`, keep the main V4 launch flags and add:
+
+```bash
+--speculative-algorithm MTP \
+--speculative-num-steps 3
+```
+
+When `--speculative-draft-model-path` is omitted for MTP, TokenSpeed uses the
+same V4 checkpoint as the draft source and loads the `DeepseekV4ForCausalLMNextN`
+architecture.
 
 ## Hardware / dependency requirements
 

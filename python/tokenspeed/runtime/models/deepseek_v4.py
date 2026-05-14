@@ -77,6 +77,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     DEEPSEEK_V4_INDEXER_DIM,
     DeepseekV4AttentionOpUnavailable,
@@ -142,6 +143,37 @@ def is_sm90_supported(device: object | None = None) -> bool:
 
 
 logger = get_colorful_logger(__name__)
+
+
+def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
+    return (
+        metadata is not None
+        and getattr(metadata, "token_to_req_indices", None) is not None
+        and metadata.token_to_req_indices.numel() == num_tokens
+    )
+
+
+def _deepseek_v4_forward_metadata(ctx: ForwardContext):
+    metadata = getattr(ctx.attn_backend, "forward_metadata", None)
+    if ctx.forward_mode == ForwardMode.EXTEND:
+        return getattr(ctx.attn_backend, "forward_prefill_metadata", None) or metadata
+    if ctx.forward_mode is not None and ctx.forward_mode.is_draft_extend():
+        prefill_metadata = getattr(ctx.attn_backend, "forward_prefill_metadata", None)
+        if _deepseek_v4_metadata_matches_tokens(
+            prefill_metadata,
+            ctx.input_num_tokens,
+        ):
+            return prefill_metadata
+        return prefill_metadata or metadata
+    if ctx.forward_mode is not None and ctx.forward_mode.is_decode_or_idle():
+        decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
+        if _deepseek_v4_metadata_matches_tokens(
+            decode_metadata,
+            ctx.input_num_tokens,
+        ):
+            return decode_metadata
+        return decode_metadata or metadata
+    return metadata
 
 
 def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tensor:
@@ -3779,7 +3811,7 @@ class DeepseekV4Compressor(nn.Module):
         write_compressed_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
-        metadata = ctx.attn_backend.forward_metadata
+        metadata = _deepseek_v4_forward_metadata(ctx)
         if metadata is None:
             raise RuntimeError("DeepSeek V4 compressor requires forward metadata")
         profile_prefix = (
@@ -4194,7 +4226,7 @@ class DeepseekV4Indexer(nn.Module):
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
         pool = ctx.token_to_kv_pool
-        metadata = ctx.attn_backend.forward_metadata
+        metadata = _deepseek_v4_forward_metadata(ctx)
         if metadata is None:
             raise RuntimeError("DeepSeek V4 indexer requires forward metadata")
         indexer_state = pool.get_indexer_state_buffer(layer_index)
@@ -4812,9 +4844,15 @@ class DeepseekV4Attention(nn.Module):
         prefix: str,
         aux_stream: torch.cuda.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
+        cache_layer_index: int | None = None,
     ) -> None:
         super().__init__()
+        # `layer_index` addresses checkpoint/config metadata; `cache_layer_index`
+        # addresses this model's compact KV cache slot.
         self.layer_index = layer_index
+        self.cache_layer_index = (
+            layer_index if cache_layer_index is None else cache_layer_index
+        )
         self.aux_stream = aux_stream
         if self.aux_stream is not None:
             self.ln_events: list[torch.cuda.Event | None] = [
@@ -5120,7 +5158,7 @@ class DeepseekV4Attention(nn.Module):
                 "`tokenspeed-kernel/python` with FlashMLA before serving V4."
             ) from exc
 
-        metadata = ctx.attn_backend.forward_metadata
+        metadata = _deepseek_v4_forward_metadata(ctx)
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
         pool = ctx.token_to_kv_pool
@@ -5134,7 +5172,7 @@ class DeepseekV4Attention(nn.Module):
 
         per_token_slots: list[tuple[torch.Tensor, torch.Tensor]] = []
         max_candidates = 0
-        compressed_block_size = pool.get_compressed_block_size(self.layer_index)
+        compressed_block_size = pool.get_compressed_block_size(self.cache_layer_index)
         for token_idx in range(positions.numel()):
             position = int(positions[token_idx].item())
             compressed = self._compressed_slots_for_token(
@@ -5160,11 +5198,11 @@ class DeepseekV4Attention(nn.Module):
         rows = []
         cursor = 0
         compressed_cache = (
-            pool.get_compressed_kv_buffer_2d(self.layer_index)
+            pool.get_compressed_kv_buffer_2d(self.cache_layer_index)
             if self.compress_ratio > 1
             else None
         )
-        swa_cache = pool.get_swa_kv_buffer(self.layer_index)
+        swa_cache = pool.get_swa_kv_buffer(self.cache_layer_index)
         for token_idx, (compressed, swa) in enumerate(per_token_slots):
             token_rows = []
             if compressed.numel() > 0:
@@ -5390,7 +5428,7 @@ class DeepseekV4Attention(nn.Module):
                 self._insert_swa_cache(
                     q=q,
                     kv=kv,
-                    swa_kv_cache=pool.get_swa_kv_buffer(self.layer_index),
+                    swa_kv_cache=pool.get_swa_kv_buffer(self.cache_layer_index),
                     slot_mapping=swa_slot_mapping,
                     positions=positions,
                     block_size=pool.swa_block_size,
@@ -5405,7 +5443,7 @@ class DeepseekV4Attention(nn.Module):
                     positions=positions,
                     ctx=ctx,
                     out_cache_loc=out_cache_loc,
-                    layer_index=self.layer_index,
+                    layer_index=self.cache_layer_index,
                     cos_sin_cache=self._cos_sin_cache(),
                 )
 
@@ -5418,7 +5456,9 @@ class DeepseekV4Attention(nn.Module):
                 self.indexer.prepare_decode_metadata(
                     positions=positions,
                     metadata=metadata,
-                    indexer_block_size=pool.get_indexer_block_size(self.layer_index),
+                    indexer_block_size=pool.get_indexer_block_size(
+                        self.cache_layer_index
+                    ),
                 )
 
             def run_indexer() -> torch.Tensor:
@@ -5429,7 +5469,7 @@ class DeepseekV4Attention(nn.Module):
                         positions=positions,
                         ctx=ctx,
                         out_cache_loc=out_cache_loc,
-                        layer_index=self.layer_index,
+                        layer_index=self.cache_layer_index,
                         cos_sin_cache=self._cos_sin_cache(),
                     )
 
@@ -5479,7 +5519,7 @@ class DeepseekV4Attention(nn.Module):
                     q=q,
                     positions=positions,
                     token_to_kv_pool=pool,
-                    layer_id=self.layer_index,
+                    layer_id=self.cache_layer_index,
                     kind=self.attention_kind,
                     compress_ratio=self.compress_ratio,
                     num_local_heads=self.num_local_heads,
@@ -5493,14 +5533,18 @@ class DeepseekV4Attention(nn.Module):
         elif (
             backend_decode is not None
             and ctx.forward_mode is not None
-            and ctx.forward_mode.is_decode()
+            and (
+                ctx.forward_mode.is_decode()
+                or ctx.forward_mode.is_target_verify()
+                or ctx.forward_mode.is_draft_extend()
+            )
         ):
             with deepseek_v4_profile_scope(f"{profile_prefix}_decode_backend"):
                 attn_output = backend_decode(
                     q=q,
                     positions=positions,
                     token_to_kv_pool=pool,
-                    layer_id=self.layer_index,
+                    layer_id=self.cache_layer_index,
                     kind=self.attention_kind,
                     compress_ratio=self.compress_ratio,
                     num_local_heads=self.num_local_heads,
@@ -5521,7 +5565,7 @@ class DeepseekV4Attention(nn.Module):
                     q=q,
                     positions=positions,
                     token_to_kv_pool=pool,
-                    layer_id=self.layer_index,
+                    layer_id=self.cache_layer_index,
                     kind=self.attention_kind,
                     compress_ratio=self.compress_ratio,
                     num_local_heads=self.num_local_heads,
@@ -5551,6 +5595,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str,
         aux_stream: torch.cuda.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
+        cache_layer_index: int | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -5570,6 +5615,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             add_prefix("attn", prefix),
             aux_stream=aux_stream,
             topk_buffer=topk_buffer,
+            cache_layer_index=cache_layer_index,
         )
         self.ffn = DeepseekV4MoE(
             config, mapping, quant_config, layer_id, add_prefix("ffn", prefix)
@@ -5766,7 +5812,7 @@ class DeepseekV4Model(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         hidden_states = input_embeds
         if hidden_states is None:
             with deepseek_v4_profile_scope("embed_tokens"):
@@ -5777,6 +5823,13 @@ class DeepseekV4Model(nn.Module):
             hidden_states = layer(
                 positions, hidden_states, ctx, out_cache_loc, input_ids
             )
+        aux_hidden_states = None
+        if (
+            ctx.capture_hidden_mode is not None
+            and ctx.capture_hidden_mode.need_capture()
+        ):
+            # V4 MTP consumes the pre-hc_head hypercompressed residual.
+            aux_hidden_states = [hidden_states.flatten(1)]
         with deepseek_v4_profile_scope("hc_head"):
             hidden_states = hc_head(
                 hidden_states,
@@ -5788,7 +5841,7 @@ class DeepseekV4Model(nn.Module):
             )
         with deepseek_v4_profile_scope("final_norm"):
             hidden_states = self.norm(hidden_states)
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
 
 class DeepseekV4ForCausalLM(BaseCausalLM):

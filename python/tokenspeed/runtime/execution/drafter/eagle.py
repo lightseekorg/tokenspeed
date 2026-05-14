@@ -285,6 +285,7 @@ class Eagle(BaseDrafter):
             )
 
             out_cache_loc = cache_locs[:, i - 1].contiguous()
+            ctx.attn_backend.advance_draft_forward_metadata()
 
             with nvtx_range("draft_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(

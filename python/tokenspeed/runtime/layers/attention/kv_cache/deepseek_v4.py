@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import torch
@@ -444,9 +444,21 @@ def deepseek_v4_cache_layout_from_config(
     hf_config,
     page_size: int,
     use_fp4_indexer_cache: bool,
+    layer_indices: Optional[Iterable[int]] = None,
 ) -> DeepseekV4CacheLayout:
+    compress_ratios = tuple(hf_config.compress_ratios)
+    if layer_indices is None:
+        layer_ratios = compress_ratios
+    else:
+        layer_indices = tuple(layer_indices)
+        if any(idx < 0 or idx >= len(compress_ratios) for idx in layer_indices):
+            raise ValueError(
+                "DeepSeek V4 cache layout layer index out of range: "
+                f"indices={layer_indices}, ratios={len(compress_ratios)}"
+            )
+        layer_ratios = [compress_ratios[idx] for idx in layer_indices]
     return DeepseekV4CacheLayout(
-        layer_ratio=tuple(max(1, int(x)) for x in hf_config.compress_ratios),
+        layer_ratio=tuple(max(1, int(x)) for x in layer_ratios),
         head_dim=int(hf_config.head_dim),
         page_size=page_size,
         use_fp4_indexer_cache=use_fp4_indexer_cache,
@@ -481,6 +493,11 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     ) -> None:
         if size <= 0:
             raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")
+        if layer_num != len(layout.layer_ratio):
+            raise ValueError(
+                "DeepSeek V4 KV pool layer_num must match cache layout ratios: "
+                f"layer_num={layer_num}, ratios={len(layout.layer_ratio)}"
+            )
         super().__init__(
             size=size,
             dtype=torch.uint8,

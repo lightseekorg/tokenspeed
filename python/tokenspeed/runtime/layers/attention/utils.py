@@ -137,6 +137,7 @@ def profile_max_num_pages(
     draft_attn_config: BaseAttnConfig | None = None,
     draft_num_attention_layers: int | None = None,
     cache_cell_size: int | None = None,
+    draft_cache_cell_size: int | None = None,
 ):
     cpu_group = (
         pg_manager.get_process_group("gloo", world_group)
@@ -156,7 +157,12 @@ def profile_max_num_pages(
     else:
         cell_size = cache_cell_size
     if draft_attn_config is not None:
-        cell_size += draft_attn_config.cache_cell_size() * draft_num_attention_layers
+        if draft_cache_cell_size is None:
+            cell_size += (
+                draft_attn_config.cache_cell_size() * draft_num_attention_layers
+            )
+        else:
+            cell_size += draft_cache_cell_size
     if cell_size <= 0:
         raise ValueError(f"KV cache cell size must be positive, got {cell_size}")
     max_num_token = int(rest_memory * (1 << 30) // cell_size)
