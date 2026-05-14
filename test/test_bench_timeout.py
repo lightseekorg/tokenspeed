@@ -52,9 +52,9 @@ def test_aiohttp_timeout_has_sock_subtimeouts():
         f"sock_read {timeout.sock_read} must be smaller than total "
         f"{timeout.total} so it actually fires before the umbrella"
     )
-    assert timeout.sock_connect is not None, (
-        "AIOHTTP_TIMEOUT must also set sock_connect"
-    )
+    assert (
+        timeout.sock_connect is not None
+    ), "AIOHTTP_TIMEOUT must also set sock_connect"
     assert 0 < timeout.sock_connect <= timeout.sock_read
 
 
@@ -74,9 +74,7 @@ async def test_await_with_per_request_timeout_returns_failed_output_on_hang(
         return bench.RequestFuncOutput()  # pragma: no cover
 
     start = time.perf_counter()
-    output = await bench.await_with_per_request_timeout(
-        stuck_request(), prompt_len=42
-    )
+    output = await bench.await_with_per_request_timeout(stuck_request(), prompt_len=42)
     elapsed = time.perf_counter() - start
 
     assert elapsed < 1.0, f"expected sub-second timeout, took {elapsed:.2f}s"
@@ -97,9 +95,7 @@ async def test_await_with_per_request_timeout_passes_through_success(monkeypatch
         output.generated_text = "hello"
         return output
 
-    result = await bench.await_with_per_request_timeout(
-        fast_request(), prompt_len=13
-    )
+    result = await bench.await_with_per_request_timeout(fast_request(), prompt_len=13)
 
     assert result.success is True
     assert result.generated_text == "hello"
