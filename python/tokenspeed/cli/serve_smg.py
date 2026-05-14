@@ -64,20 +64,19 @@ def _check_serve_extra_installed() -> None:
 
     missing: list[str] = []
     if importlib.util.find_spec("smg") is None:
-        missing.append("smg")
+        missing.append("tokenspeed-smg")
     if importlib.util.find_spec("smg_grpc_servicer.tokenspeed.server") is None:
-        missing.append("smg-grpc-servicer")
+        missing.append("tokenspeed-smg-grpc-servicer")
     if missing:
         sys.stderr.write(
-            "ts serve requires SMG packages:\n\n"
+            "ts serve requires the bundled gateway packages, normally installed\n"
+            "as part of `tokenspeed`. Reinstall tokenspeed to restore them:\n\n"
+            "    pip install --force-reinstall --no-deps tokenspeed\n\n"
+            "or install them explicitly:\n\n"
             "    pip install \\\n"
-            "        'smg==1.4.1.post20260512' \\\n"
-            "        'smg-grpc-servicer==0.5.2.post20260512' \\\n"
-            "        'smg-grpc-proto==0.4.7.post20260512' \\\n"
-            "        --extra-index-url https://lightseek.org/whl/cu130/\n\n"
-            "Swap the index for other variants:\n"
-            "    https://lightseek.org/whl/cu129/      (CUDA 12.9)\n"
-            "    https://lightseek.org/whl/rocm7.2/    (ROCm 7.2)\n\n"
+            "        tokenspeed-smg \\\n"
+            "        tokenspeed-smg-grpc-servicer \\\n"
+            "        tokenspeed-smg-grpc-proto\n\n"
             f"Missing: {', '.join(missing)}\n"
         )
         sys.exit(1)
