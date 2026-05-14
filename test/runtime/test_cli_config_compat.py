@@ -193,7 +193,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model"])
         self.assertEqual(args.max_prefill_tokens, 8192)
         self.assertIsNone(args.chunked_prefill_size)
-        self.assertFalse(args.enable_mixed_chunk)
+        self.assertFalse(args.enable_mixed_batch)
 
         sa = self._from_cli_args_no_init(args)
         sa.mapping = SimpleNamespace(world_size=1)
@@ -206,11 +206,11 @@ class TestCLIConfigCompat(unittest.TestCase):
 
         self.assertEqual(sa.max_prefill_tokens, 8192)
         self.assertEqual(sa.chunked_prefill_size, 8192)
-        self.assertFalse(sa.enable_mixed_chunk)
+        self.assertFalse(sa.enable_mixed_batch)
 
-    def test_mixed_chunk_can_be_enabled(self):
-        args = self._parse_args(["--model", "test/model", "--enable-mixed-chunk"])
-        self.assertTrue(args.enable_mixed_chunk)
+    def test_mixed_batch_can_be_enabled(self):
+        args = self._parse_args(["--model", "test/model", "--enable-mixed-batch"])
+        self.assertTrue(args.enable_mixed_batch)
 
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(

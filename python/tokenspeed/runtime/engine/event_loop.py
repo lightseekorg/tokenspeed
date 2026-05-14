@@ -273,7 +273,7 @@ class EventLoop:
             )
 
         enable_mixed_prefill_decode = (
-            server_args.enable_mixed_chunk and server_args.speculative_algorithm is None
+            server_args.enable_mixed_batch and server_args.speculative_algorithm is None
         )
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
