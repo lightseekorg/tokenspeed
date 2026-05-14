@@ -126,7 +126,7 @@ class Eagle(BaseDrafter):
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`, sliced and passed
         # via ForwardContext for the padded-static-len last-token selection in
         # LogitsProcessor.
-        self._last_index_offsets_buf = (
+        self.last_index_offsets_buf = (
             torch.arange(
                 self.input_buffers.max_bs, dtype=torch.int64, device=self.device
             )
@@ -207,7 +207,7 @@ class Eagle(BaseDrafter):
             capture_hidden_mode=CaptureHiddenMode.LAST,
             padded_static_len=self.spec_num_tokens if is_decode_like else -1,
             last_index_offsets=(
-                self._last_index_offsets_buf[:bs] if is_decode_like else None
+                self.last_index_offsets_buf[:bs] if is_decode_like else None
             ),
             keep_full_logits=False,
             global_num_tokens=draft_input.global_num_tokens,
@@ -354,7 +354,7 @@ class Eagle(BaseDrafter):
         if draft_input.forward_mode == ForwardMode.EXTEND:
             next_tokens[:, 0] = draft_input.base_model_output[:bs]
         else:
-            indices = self._last_index_offsets_buf[:bs] + draft_input.accept_lengths
+            indices = self.last_index_offsets_buf[:bs] + draft_input.accept_lengths
             torch.index_select(
                 draft_input.base_model_output, 0, indices, out=next_tokens[:, 0]
             )
