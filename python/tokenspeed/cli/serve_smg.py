@@ -29,7 +29,10 @@ import logging
 import signal
 import sys
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
+from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
     spawn_engine,
@@ -46,6 +49,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "none"
+DEFAULT_SMG_LOG_LEVEL = "warn"
+# smg reliability knobs we always want disabled when launched under
+# ts serve. These are tokenspeed-internal defaults: not surfaced via
+# the ts CLI, not routed through split_argv.
+_DEFAULT_SMG_DISABLE_FLAGS = (
+    "--disable-circuit-breaker",
+    "--disable-retries",
+)
 
 
 def _check_serve_extra_installed() -> None:
@@ -53,20 +64,19 @@ def _check_serve_extra_installed() -> None:
 
     missing: list[str] = []
     if importlib.util.find_spec("smg") is None:
-        missing.append("smg")
+        missing.append("tokenspeed-smg")
     if importlib.util.find_spec("smg_grpc_servicer.tokenspeed.server") is None:
-        missing.append("smg-grpc-servicer")
+        missing.append("tokenspeed-smg-grpc-servicer")
     if missing:
         sys.stderr.write(
-            "ts serve requires SMG packages:\n\n"
+            "ts serve requires the bundled gateway packages, normally installed\n"
+            "as part of `tokenspeed`. Reinstall tokenspeed to restore them:\n\n"
+            "    pip install --force-reinstall --no-deps tokenspeed\n\n"
+            "or install them explicitly:\n\n"
             "    pip install \\\n"
-            "        'smg==1.4.1.post20260512' \\\n"
-            "        'smg-grpc-servicer==0.5.2.post20260512' \\\n"
-            "        'smg-grpc-proto==0.4.7.post20260512' \\\n"
-            "        --extra-index-url https://lightseek.org/whl/cu130/\n\n"
-            "Swap the index for other variants:\n"
-            "    https://lightseek.org/whl/cu129/      (CUDA 12.9)\n"
-            "    https://lightseek.org/whl/rocm7.2/    (ROCm 7.2)\n\n"
+            "        tokenspeed-smg \\\n"
+            "        tokenspeed-smg-grpc-servicer \\\n"
+            "        tokenspeed-smg-grpc-proto\n\n"
             f"Missing: {', '.join(missing)}\n"
         )
         sys.exit(1)
@@ -102,9 +112,49 @@ def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
 
+def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
+    """Append the smg reliability-disable switches if they are not already there."""
+    result = list(gateway_args)
+    for flag in _DEFAULT_SMG_DISABLE_FLAGS:
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
+def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
+    if "--log-level" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
+
+
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
-    return _gateway_args_with_default_reasoning_parser(gateway_args)
+    gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
+    gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
+    return _gateway_args_with_default_log_level(gateway_args)
+
+
+def _overwrite_sampling_backend(engine_args: list[str]) -> list[str]:
+    if current_platform().is_nvidia:
+        return engine_args
+
+    # TODO: Remove this workaround after smg-grpc-servicer stops injecting
+    # ``--sampling-backend flashinfer`` on non-NVIDIA platforms.
+    # The currently pinned SMG TokenSpeed entrypoint forces flashinfer when the
+    # flag is absent, but flashinfer sampling kernels are NVIDIA-only.
+    result: list[str] = []
+    skip_next = False
+    for arg in engine_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--sampling-backend":
+            skip_next = True
+            continue
+        if arg.startswith("--sampling-backend="):
+            continue
+        result.append(arg)
+    return [*result, "--sampling-backend", "greedy"]
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -208,7 +258,7 @@ async def run_smg(
 
         await _probe_or_stop(
             wait_http_ready(
-                f"http://{user_host}:{user_port}/health",
+                f"http://{user_host}:{user_port}/readiness",
                 timeout=float(opts.gateway_startup_timeout),
             ),
             stop,
@@ -284,13 +334,16 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     except ImportError:
         pass
 
+    print_logo()
+
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
+    engine_args = _overwrite_sampling_backend(split.engine)
     gateway_args = _gateway_args_with_defaults(split.gateway)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
     rc = asyncio.run(
         run_smg(
-            engine_args=split.engine,
+            engine_args=engine_args,
             gateway_args=gateway_args,
             opts=split.opts,
             user_host=user_host,

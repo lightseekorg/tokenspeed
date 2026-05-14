@@ -20,14 +20,20 @@
 
 """Argv splitter for ``ts serve``.
 
+A leading positional argument is treated as the model (vllm-style
+``ts serve <model> [flags...]``) and rewritten to ``--model <model>``
+before routing.
+
 Routing precedence is top-down. The first matching rule wins:
 
 1. Orchestrator-only flags (consumed, never forwarded)
-2. ``--model`` (alias ``--model-path``) — fanned out to both
+2. ``--model`` / ``--reasoning-parser`` — fanned out to both.
+   ``--reasoning-parser`` goes to the gateway (post-gen parsing) and
+   the engine (defers JSON grammars past the reasoning channel).
 3. ``--host`` / ``--port`` — gateway only (user-facing)
-4. ``--chat-template`` / ``--tool-call-parser`` / ``--reasoning-parser`` —
-   gateway only **(override)**: ``prepare_server_args`` accepts these too,
-   but in smg mode the gateway owns OpenAI-compat HTTP and parsing.
+4. ``--chat-template`` / ``--tool-call-parser`` — gateway only
+   **(override)**: ``prepare_server_args`` accepts these too, but in smg
+   mode the gateway owns OpenAI-compat HTTP and parsing.
 5. ``--tp`` / ``--tensor-parallel-size`` — engine only (alias normalized)
 6. Anything else ``prepare_server_args`` accepts — engine only
 7. Anything else — gateway (fall-through to ``smg launch`` clap)
@@ -46,7 +52,7 @@ _ORCH_FLAGS = {
     "--drain-timeout",
 }
 
-_FANOUT_FLAGS = {"--model"}
+_FANOUT_FLAGS = {"--model", "--reasoning-parser"}
 
 _ALIASES = {
     "--model-path": "--model",
@@ -58,15 +64,26 @@ _GATEWAY_USER_FACING = {"--host", "--port"}
 _GATEWAY_OVERRIDE = {
     "--chat-template",
     "--tool-call-parser",
-    "--reasoning-parser",
 }
 
 _ENGINE_EXPLICIT = {"--tensor-parallel-size"}
 
+_MODEL_FLAG_TOKENS = ("--model", "--model-path")
+
+
+def _has_model_flag(tokens: Iterable[str]) -> bool:
+    for token in tokens:
+        if token in _MODEL_FLAG_TOKENS:
+            return True
+        for flag in _MODEL_FLAG_TOKENS:
+            if token.startswith(flag + "="):
+                return True
+    return False
+
 
 @dataclass
 class OrchestratorOpts:
-    engine_startup_timeout: int = 600
+    engine_startup_timeout: int = 1800
     gateway_startup_timeout: int = 60
     drain_timeout: int = 30
 
@@ -128,11 +145,28 @@ def _engine_recognized_flags() -> set[str]:
 def split_argv(argv: list[str]) -> SplitResult:
     """Split ts-serve argv into engine_args, gateway_args, orchestrator_opts.
 
+    A leading positional argument is rewritten to ``--model <value>`` so
+    ``ts serve <model> [flags...]`` and ``ts serve --model <model> [flags...]``
+    both work.
+
     Raises:
         ValueError: if a flag that requires a value is provided without one
             (e.g. ``--model`` with no path), if a timeout flag is
-            non-positive, or if a positional arg appears.
+            non-positive, if the model is given both positionally and via
+            ``--model``/``--model-path``, or if a positional arg appears
+            after the leading model.
     """
+
+    argv = list(argv)
+    if argv and not argv[0].startswith("--"):
+        model = argv[0]
+        rest = argv[1:]
+        if _has_model_flag(rest):
+            raise ValueError(
+                "model specified both as positional argument and via "
+                "--model/--model-path"
+            )
+        argv = ["--model", model, *rest]
 
     items = _normalize(argv)
     result = SplitResult()

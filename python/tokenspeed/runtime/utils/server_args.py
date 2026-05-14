@@ -194,6 +194,9 @@ class ServerArgs:
 
     # Grammar backend
     grammar_backend: str = "none"
+    # Used by ``input_processor`` to defer json_schema grammars past the
+    # model's reasoning channel.
+    reasoning_parser: str | None = None
     grammar_compile_timeout_secs: float = 30.0
     grammar_compile_max_retries: int = 2
     disable_any_whitespace: bool = False
@@ -1295,6 +1298,16 @@ class ServerArgs:
             choices=["xgrammar", "none"],
             default=ServerArgs.grammar_backend,
             help="Grammar backend. 'none' disables grammar-guided decoding entirely ",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            default=ServerArgs.reasoning_parser,
+            help=(
+                "Reasoning parser name (e.g. 'minimax', 'gpt-oss'). "
+                "Used to defer json_schema grammars past the model's "
+                "reasoning channel."
+            ),
         )
         parser.add_argument(
             "--grammar-compile-timeout-secs",

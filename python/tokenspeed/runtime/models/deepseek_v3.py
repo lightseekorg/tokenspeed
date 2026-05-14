@@ -804,10 +804,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
         use_fused_fp8_decode = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and (
-                ctx.forward_mode.is_decode_or_idle()
-                or ctx.forward_mode.is_target_verify()
-            )
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
             and self.rotary_emb is not None
             and k_scale == 1.0
@@ -1768,6 +1764,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=False,
             prev_is_moe=False,
+            post_attn_layernorm=self.post_attention_layernorm,
         )
 
     def forward(
@@ -1805,16 +1802,13 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
 
-            hidden_states, residual = self.comm_manager.post_attn_comm(
+            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
-            )
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
             )
 
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_comm(
+        hidden_states, residual = self.comm_manager.post_mlp_fused(
             hidden_states, residual, ctx
         )
 
@@ -1904,9 +1898,26 @@ class Eagle3MlaModel(nn.Module):
             residual,
         )
 
-        hidden_states_to_logits, hidden_states_to_aux = self.norm(
-            hidden_states, residual
-        )
+        comm_manager = self.midlayer.comm_manager
+        if comm_manager.should_fuse(hidden_states.shape[0]):
+            hidden_states_to_logits, hidden_states_to_aux, *_ = (
+                self.norm.forward_with_allreduce_fusion(
+                    self.mapping.dense.tp_rank,
+                    self.mapping.dense.tp_group,
+                    hidden_states,
+                    residual,
+                )
+            )
+        else:
+            hidden_states_to_logits, hidden_states_to_aux = self.norm(
+                hidden_states, residual
+            )
+            hidden_states_to_logits, _ = comm_manager.post_final_norm_comm(
+                hidden_states_to_logits, None, ctx
+            )
+            hidden_states_to_aux, _ = comm_manager.post_final_norm_comm(
+                hidden_states_to_aux, None, ctx
+            )
         return hidden_states_to_logits, [hidden_states_to_aux]
 
 

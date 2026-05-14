@@ -92,7 +92,7 @@ def test_orchestrator_runs_against_fake_engine():
 
     try:
         ok = _wait_http_200(
-            f"http://127.0.0.1:{user_port}/health", time.monotonic() + 60
+            f"http://127.0.0.1:{user_port}/readiness", time.monotonic() + 60
         )
         if not ok:
             stdout, stderr = proc.communicate(timeout=5)

@@ -35,9 +35,12 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 
 from tokenspeed.cli._argsplit import OrchestratorOpts
 from tokenspeed.cli.serve_smg import (
+    _DEFAULT_SMG_DISABLE_FLAGS,
+    _gateway_args_with_default_log_level,
     _gateway_args_with_default_port,
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
+    _gateway_args_with_smg_disable_defaults,
     _user_host_port_from_gateway_args,
     run_smg,
 )
@@ -94,7 +97,53 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "8000",
         "--reasoning-parser",
         "none",
+        "--disable-circuit-breaker",
+        "--disable-retries",
+        "--log-level",
+        "warn",
     ]
+
+
+def test_gateway_args_default_log_level_is_warn():
+    gateway_args = _gateway_args_with_default_log_level(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--log-level", "warn"]
+
+
+def test_gateway_args_preserve_user_log_level():
+    gateway_args = _gateway_args_with_default_log_level(["--log-level", "debug"])
+
+    assert gateway_args == ["--log-level", "debug"]
+
+
+def test_smg_disable_flags_appended_when_absent():
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--model", "/tmp/x"])
+
+    assert gateway_args == [
+        "--model",
+        "/tmp/x",
+        "--disable-circuit-breaker",
+        "--disable-retries",
+    ]
+
+
+def test_smg_disable_flags_not_duplicated():
+    """Idempotent: passing the flag explicitly must not double it up for smg's argparse."""
+    gateway_args = _gateway_args_with_smg_disable_defaults(
+        ["--disable-circuit-breaker"]
+    )
+
+    assert gateway_args == [
+        "--disable-circuit-breaker",
+        "--disable-retries",
+    ]
+
+
+def test_smg_disable_flag_set_covers_both():
+    assert _DEFAULT_SMG_DISABLE_FLAGS == (
+        "--disable-circuit-breaker",
+        "--disable-retries",
+    )
 
 
 @pytest.mark.asyncio

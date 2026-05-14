@@ -46,7 +46,7 @@ from tokenspeed.runtime.layers.attention.utils import (
     token_indices_from_pages,
     update_page_table_inplace,
 )
-from tokenspeed.runtime.spec_decode.eagle import EagleDraftInput, EagleVerifyInput
+from tokenspeed.runtime.spec_decode.eagle import EagleDraftInput
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
@@ -1262,7 +1262,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -1353,7 +1353,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -1394,7 +1394,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
-                        self.max_context_len,
+                        max_num_pages,
                         dtype=torch.int32,
                         device=self.device,
                     ),
@@ -1407,7 +1407,7 @@ class FlashAttentionBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        spec_info: EagleDraftInput | EagleVerifyInput | None = None,
+        spec_info: EagleDraftInput | None = None,
     ):
         """Initialize forward metadata for capturing CUDA graph."""
         metadata = FlashAttentionMetadata()
@@ -1607,7 +1607,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
-        spec_info: EagleDraftInput | EagleVerifyInput | None = None,
+        spec_info: EagleDraftInput | None = None,
         out_cache_loc: torch.Tensor | None = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""

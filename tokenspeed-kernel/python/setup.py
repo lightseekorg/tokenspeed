@@ -396,6 +396,14 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "lm_head_gemm",
+        [
+            CUDA_CSRC_DIR / "lm_head_gemm.cu",
+            CUDA_CSRC_DIR / "lm_head_gemm_binding.cu",
+        ],
+        [],
+    ),
+    (
         "trtllm_comm",
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
