@@ -65,10 +65,6 @@ _BACKEND_SPECS = {
         "tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer",
         "Mxfp4FlashinferMxfp4Backend",
     ),
-    ("mxfp4", "triton_kernel_fp8"): (
-        "tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel_fp8",
-        "Mxfp4Fp8TritonKernelBackend",
-    ),
     ("mxfp4", "triton_kernel"): (
         "tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel",
         "Mxfp4TritonKernelBackend",

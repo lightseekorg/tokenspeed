@@ -24,12 +24,8 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
 from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
     Mxfp4TritonKernelBackend,
 )
-from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel_fp8 import (
-    Mxfp4Fp8TritonKernelBackend,
-)
 
 __all__ = [
     "Mxfp4FlashinferMxfp4Backend",
     "Mxfp4TritonKernelBackend",
-    "Mxfp4Fp8TritonKernelBackend",
 ]
