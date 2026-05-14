@@ -78,9 +78,11 @@ def test_tool_call_parser_overrides_to_gateway_only():
     assert r.gateway == ["--tool-call-parser", "hermes"]
 
 
-def test_reasoning_parser_overrides_to_gateway_only():
+def test_reasoning_parser_fans_out_to_both():
+    # Gateway uses it for post-gen reasoning parsing; engine uses it to
+    # defer JSON grammars past the reasoning channel.
     r = _split(["--reasoning-parser", "qwen3"])
-    assert r.engine == []
+    assert r.engine == ["--reasoning-parser", "qwen3"]
     assert r.gateway == ["--reasoning-parser", "qwen3"]
 
 
@@ -128,12 +130,15 @@ def test_combined_real_invocation():
         "cache_aware",
     ]
     r = _split(argv)
-    # Engine: --model, --tp (normalized), --sampling-backend.
+    # Engine: --model (fan-out), --tp (normalized), --reasoning-parser
+    # (fan-out), --sampling-backend. Argv order is preserved.
     assert r.engine == [
         "--model",
         "Qwen/Qwen3-30B-A3B",
         "--tensor-parallel-size",
         "2",
+        "--reasoning-parser",
+        "qwen3",
         "--sampling-backend",
         "flashinfer",
     ]
