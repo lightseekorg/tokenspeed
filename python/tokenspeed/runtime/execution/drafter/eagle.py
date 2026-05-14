@@ -229,7 +229,7 @@ class Eagle(BaseDrafter):
         self,
         bs: int,
         draft_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
+        next_tokens: torch.Tensor,
         logits_output: LogitsProcessorOutput,
         draft_input: EagleDraftInput,
     ) -> None:
@@ -308,23 +308,11 @@ class Eagle(BaseDrafter):
 
             with nvtx_range("draft_sample", color="yellow"):
                 draft_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
-                draft_tokens[:, i] = self._map_hot(draft_ids)
+                # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
+                next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
                     positions.add_(1)
                     draft_seq_lens.add_(1)
-
-    def _get_last_verified_ids(
-        self, bs: int, forward_mode: ForwardMode, draft_input: EagleDraftInput
-    ) -> torch.Tensor:
-
-        if forward_mode == ForwardMode.EXTEND:
-            # Last verified id is simply the base output for each request
-            return draft_input.base_model_output[:bs]
-        else:
-            # Pick the last accepted token per request from the flattened base output
-            req_offsets = torch.arange(bs, device=self.device) * self.spec_num_tokens
-            indices = req_offsets + draft_input.accept_lengths - 1
-            return draft_input.base_model_output[indices]
 
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)
@@ -354,11 +342,22 @@ class Eagle(BaseDrafter):
 
         bs = draft_input.accept_lengths.shape[0]
 
-        draft_tokens = torch.empty(
-            (bs, self.spec_num_steps),
+        # Layout: column 0 holds the last verified id (the base model's accepted token);
+        # columns 1..spec_num_steps hold the drafter's speculative tokens.
+        next_tokens = torch.empty(
+            (bs, self.spec_num_steps + 1),
             dtype=torch.int32,
             device=self.device,
         )
+
+        # Last verified id per request → next_tokens[:, 0].
+        if draft_input.forward_mode == ForwardMode.EXTEND:
+            next_tokens[:, 0] = draft_input.base_model_output[:bs]
+        else:
+            indices = self._last_index_offsets_buf[:bs] + draft_input.accept_lengths
+            torch.index_select(
+                draft_input.base_model_output, 0, indices, out=next_tokens[:, 0]
+            )
 
         # Seed the draft attn backend's aliased seq_lens for the first step.
         self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
@@ -369,7 +368,7 @@ class Eagle(BaseDrafter):
         logits_output = self._run_first_step(bs, draft_input)
 
         draft_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
-        draft_tokens[:, 0] = self._map_hot(draft_ids)
+        next_tokens[:, 1] = self._map_hot(draft_ids)
 
         # Draft step 2+ (multi-step decode).
         if self.spec_num_steps > 1:
@@ -383,10 +382,10 @@ class Eagle(BaseDrafter):
             skip = self.dp_size == 1 and self.input_buffers.all_extends_mid_chunk
             if not skip:
                 self._run_multi_step_decode(
-                    bs, draft_ids, draft_tokens, logits_output, draft_input
+                    bs, draft_ids, next_tokens, logits_output, draft_input
                 )
 
-        return draft_tokens
+        return next_tokens
 
     @override
     @nvtx_range("drafter", color="purple")
@@ -409,10 +408,5 @@ class Eagle(BaseDrafter):
             all_decode_or_idle=base_ctx.all_decode_or_idle,
         )
 
-        draft_tokens = self.draft(draft_input)
-
-        last_verified_ids = self._get_last_verified_ids(
-            base_ctx.bs, base_ctx.forward_mode, draft_input
-        )
-
-        return torch.cat([last_verified_ids.unsqueeze(1), draft_tokens], dim=1)
+        # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.
+        return self.draft(draft_input)
