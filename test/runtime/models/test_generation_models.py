@@ -111,6 +111,7 @@ CI_MODELS = [
 
 # All other models that do not run on the CI
 ALL_OTHER_MODELS = [
+    ModelCase("Qwen/Qwen2-1.5B-Instruct"),
     ModelCase("Qwen/Qwen3.5-27B"),
     ModelCase("Qwen/Qwen3.5-35B-A3B"),
     ModelCase("Qwen/Qwen3.5-122B-A10B"),

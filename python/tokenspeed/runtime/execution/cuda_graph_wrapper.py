@@ -246,13 +246,13 @@ class CudaGraphWrapper:
             try:
                 draft_attn_backend.init_cuda_graph_state(
                     self.max_bs,
-                    self.drafter.draft_seq_lens,
+                    self.drafter.draft_seq_lens_buf,
                     paged_cache_group_specs=draft_paged_cache_group_specs,
                     max_tokens_per_req=self.max_tokens_per_req,
                 )
             except TypeError:
                 draft_attn_backend.init_cuda_graph_state(
-                    self.max_bs, self.drafter.draft_seq_lens
+                    self.max_bs, self.drafter.draft_seq_lens_buf
                 )
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}

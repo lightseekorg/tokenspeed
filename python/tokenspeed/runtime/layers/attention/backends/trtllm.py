@@ -615,7 +615,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             torch.index_select(
                 req_to_page[:, : self.max_num_pages],
                 0,
-                req_pool_indices[:bs].long(),
+                req_pool_indices[:bs],
                 out=self.cuda_graph_page_table[:bs, : self.max_num_pages],
             )
 
