@@ -306,7 +306,7 @@ def update_block_table(forward_op, device, req_to_page):
         forward_op.new_occupied_pages, dtype=torch.int32
     )
     request_pool_indices = flatten_and_to_device(
-        forward_op.request_pool_indices, dtype=torch.int32
+        forward_op.request_pool_indices, dtype=torch.int64
     )
     update_req_to_page(
         req_to_page=req_to_page,

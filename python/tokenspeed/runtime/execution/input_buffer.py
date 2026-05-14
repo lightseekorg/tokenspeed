@@ -67,7 +67,7 @@ class InputBuffers:
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             self.positions_buf = torch.arange(0, max_num_tokens, dtype=torch.int64)
-            self.req_pool_indices_buf = torch.zeros((max_bs,), dtype=torch.int32)
+            self.req_pool_indices_buf = torch.zeros((max_bs,), dtype=torch.int64)
             self.seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
             # Initialise to dummy_kv_slot so that padding positions (never
             # written by compute_out_cache_loc) always point to the reserved
@@ -165,9 +165,9 @@ class InputBuffers:
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
 
-        valid_cache_lengths = runtime_states.valid_cache_lengths[
-            req_pool_indices_device
-        ]
+        valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
+            0, req_pool_indices_device
+        )
 
         # Compute out_cache_loc using Triton kernel
         compute_out_cache_loc(

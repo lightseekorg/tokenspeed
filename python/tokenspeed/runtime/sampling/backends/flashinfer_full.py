@@ -197,7 +197,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         align with flat logits.
         """
 
-        pool_idx = sampling_info.req_pool_indices.long()
+        pool_idx = sampling_info.req_pool_indices
 
         if num_tokens_per_req > 1:
 
@@ -246,7 +246,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         weights is int32; 0 masks invalid rows, 1 accumulates."""
 
         self._counts.index_put_(
-            (pool_idx.long(), tokens.long()),
+            (pool_idx, tokens.long()),
             weights.to(torch.int32),
             accumulate=True,
         )
@@ -440,8 +440,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         accepted_tokens = predict.long().gather(0, safe_positions.view(-1))
 
         pool_idx_expanded = (
-            sampling_info.req_pool_indices.long()
-            .unsqueeze(-1)
+            sampling_info.req_pool_indices.unsqueeze(-1)
             .expand(-1, num_tokens_per_req)
             .reshape(-1)
         )

@@ -219,7 +219,9 @@ class Eagle(BaseDrafter):
         # vc+input_lengths (= seq_lens_buf).
         if draft_input.forward_mode.is_target_verify():
             cache_start = (
-                self.runtime_states.valid_cache_lengths[req_pool_indices]
+                self.runtime_states.valid_cache_lengths.index_select(
+                    0, req_pool_indices
+                )
                 + draft_input.accept_lengths
             )
         else:
