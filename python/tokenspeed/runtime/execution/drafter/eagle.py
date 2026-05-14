@@ -107,11 +107,18 @@ class Eagle(BaseDrafter):
 
         # Drafter-owned alias source for the draft attn backend; advanced in
         # place during multi-step decode.
-        self.draft_seq_lens = torch.zeros_like(self.input_buffers.seq_lens_buf)
+        self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
 
         # Persistent output buffer for the draft step's compute_out_cache_loc.
         self.draft_out_cache_loc_buf = torch.empty(
             (self.input_buffers.max_bs * (spec_num_steps - 1),),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        # Per-request input length is always 1 in multi-step decode (one token per request).
+        self.draft_input_lengths_buf = torch.ones(
+            (self.input_buffers.max_bs,),
             dtype=torch.int32,
             device=self.device,
         )
@@ -240,10 +247,10 @@ class Eagle(BaseDrafter):
         cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
 
         # +1 is the kernel's read-inclusive convention; advanced per iter.
-        draft_seq_lens = self.draft_seq_lens[:bs]
+        draft_seq_lens = self.draft_seq_lens_buf[:bs]
         draft_seq_lens.copy_(cache_start + 1)
 
-        input_lengths = torch.ones((bs,), device=self.device, dtype=torch.int32)
+        input_lengths = self.draft_input_lengths_buf[:bs]
         positions = cache_start.clone()
 
         for i in range(1, self.spec_num_steps):
@@ -341,7 +348,7 @@ class Eagle(BaseDrafter):
         )
 
         # Seed the draft attn backend's aliased seq_lens for the first step.
-        self.draft_seq_lens[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
+        self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
 
         # First draft step.
         logits_output = self._run_first_step(bs, draft_input)
