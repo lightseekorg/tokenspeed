@@ -53,6 +53,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
     cache_steps,
+    output_state_indices,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
@@ -77,6 +78,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    HAS_OUTPUT_STATE_INDICES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
 ):
     """
@@ -185,7 +187,18 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # Cache intermediate states if enabled
-        if CACHE_INTERMEDIATE_STATES:
+        if HAS_OUTPUT_STATE_INDICES:
+            out_idx = tl.load(output_state_indices + i_n * T + step_idx).to(tl.int64)
+            if out_idx >= 0:
+                output_ptr = (
+                    h0_source
+                    + out_idx * HV * K * V
+                    + i_hv * K * V
+                    + o_k[:, None] * V
+                    + o_v[None, :]
+                )
+                tl.store(output_ptr, b_h.to(output_ptr.dtype.element_ty), mask=mask_h)
+        elif CACHE_INTERMEDIATE_STATES:
             if cache_idx >= 0:
                 step_offset = step_idx * HV * K * V
                 cache_ptr = (
@@ -242,6 +255,7 @@ def fused_sigmoid_gating_delta_rule_update(
     disable_state_update: bool = False,
     intermediate_states_buffer: torch.Tensor | None = None,
     cache_steps: int | None = None,
+    output_state_indices: torch.Tensor | None = None,
     retrieve_parent_token: torch.Tensor | None = None,
 ):
     """
@@ -302,6 +316,7 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         cache_steps=0 if cache_steps is None else cache_steps,
+        output_state_indices=output_state_indices,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
@@ -324,6 +339,7 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_VARLEN=cu_seqlens is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,

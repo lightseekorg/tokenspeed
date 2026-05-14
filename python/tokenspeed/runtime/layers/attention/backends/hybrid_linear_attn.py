@@ -41,9 +41,6 @@ from tokenspeed.runtime.layers.attention.linear.fused_sigmoid_gating_recurrent i
     fused_sigmoid_gating_delta_rule_update,
 )
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
-from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
-    fused_mamba_state_scatter_with_mask,
-)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -55,6 +52,8 @@ if TYPE_CHECKING:
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
     mamba_cache_indices: torch.Tensor
+    mamba_output_indices: Optional[torch.Tensor] = None
+    mamba_req_pool_indices: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     # Pre-computed src/dst indices for extracting Mamba prefix-cache snapshots.
     track_ssm_h_src: Optional[torch.Tensor] = None
@@ -128,6 +127,7 @@ class SimpleMambaPool:
         device: str,
         page_size: int = 1,
         speculative_num_draft_tokens: int = 0,
+        max_req_pool_size: int = 0,
     ):
         self.size = size
         self.device = device
@@ -135,54 +135,142 @@ class SimpleMambaPool:
         self.page_size = page_size
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
         self.is_kda_cache = False
+        self.max_req_pool_size = max_req_pool_size
 
-        # Allocate conv state: (num_mamba_layers, size+1, conv_dim, state_len)
+        # Base slots (working + checkpoint) are allocated by C++ scheduler.
+        # Python-only draft rows live after the scheduler-owned range and are
+        # addressed by normal row indices in the same tensors.
+        self.base_size = size
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.current_input_size = (
+            max_req_pool_size + 1 if max_req_pool_size > 0 else size
+        )
+        self.draft_slots_per_req = max(0, speculative_num_draft_tokens - 1)
+        self.draft_base = size
+        self.draft_total_slots = self.current_input_size * self.draft_slots_per_req
+        total_size = size + self.draft_total_slots
+        self.total_size = total_size
+
+        # Allocate conv state: (num_mamba_layers, total_size, conv_dim, state_len)
         self.conv_state = torch.zeros(
             num_mamba_layers,
-            size + 1,
+            total_size,
             *conv_state_shape,
             dtype=conv_dtype,
             device=device,
         )
-        # Allocate temporal/SSM state: (num_mamba_layers, size+1, heads, key_dim, val_dim)
+        # Allocate temporal/SSM state: (num_mamba_layers, total_size, heads, key_dim, val_dim)
         self.ssm_state = torch.zeros(
             num_mamba_layers,
-            size + 1,
+            total_size,
             *temporal_state_shape,
             dtype=ssm_dtype,
             device=device,
         )
 
-        # Speculative decoding intermediate caches
-        if speculative_num_draft_tokens > 0:
-            self.intermediate_ssm_state_cache = torch.empty(
-                num_mamba_layers,
-                size + 1,
-                speculative_num_draft_tokens,
-                *temporal_state_shape,
-                dtype=ssm_dtype,
-                device=device,
-            )
-            self.intermediate_conv_window_cache = torch.zeros(
-                num_mamba_layers,
-                size + 1,
-                speculative_num_draft_tokens,
-                *conv_state_shape,
-                dtype=conv_dtype,
-                device=device,
-            )
-            self.mamba_cache = (
-                self.conv_state,
-                self.ssm_state,
-                self.intermediate_ssm_state_cache,
-                self.intermediate_conv_window_cache,
-            )
-        else:
-            self.mamba_cache = (self.conv_state, self.ssm_state)
+        self.mamba_cache = (self.conv_state, self.ssm_state)
+
+        self.current_input_indices = torch.full(
+            (self.current_input_size,), -1, dtype=torch.int32, device=device
+        )
 
     def get_mamba_indices(self, mamba_pool_indices: torch.Tensor) -> torch.Tensor:
         """Return mamba cache indices directly (allocated by C++ scheduler)."""
         return mamba_pool_indices.to(torch.int32)
+
+    def get_mtp_output_indices(
+        self,
+        req_pool_indices: torch.Tensor,
+        working_indices: torch.Tensor,
+        draft_token_num: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build per-request target-verify outputs: [working, draft0, ...]."""
+        bs = working_indices.shape[0]
+        if out is not None:
+            output_indices = out
+            output_indices.fill_(-1)
+        else:
+            output_indices = torch.full(
+                (bs, draft_token_num),
+                -1,
+                dtype=torch.int32,
+                device=working_indices.device,
+            )
+        if draft_token_num <= 0:
+            return output_indices
+
+        working = working_indices.to(torch.int32)
+        valid = working >= 0
+        output_indices[:, 0] = torch.where(valid, working, -1)
+
+        if draft_token_num > 1 and self.draft_slots_per_req > 0:
+            req = req_pool_indices[:bs].to(torch.int32)
+            steps = torch.arange(
+                draft_token_num - 1, dtype=torch.int32, device=working.device
+            )
+            draft = (
+                self.draft_base
+                + req[:, None] * self.draft_slots_per_req
+                + steps[None, :]
+            )
+            output_indices[:, 1:] = torch.where(
+                valid[:, None] & (req >= 0)[:, None],
+                draft,
+                -1,
+            )
+        return output_indices
+
+    def get_current_input_indices(
+        self,
+        req_pool_indices: torch.Tensor,
+        working_indices: torch.Tensor,
+        cow_src_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the row each request should read at the start of target verify."""
+        req_pool_indices = req_pool_indices[: working_indices.shape[0]].to(torch.int32)
+        working_indices = working_indices.to(torch.int32)
+        # Only keep >= 0 checks; upper bounds are guaranteed by the scheduler.
+        valid = (working_indices >= 0) & (req_pool_indices >= 0)
+        safe_req_indices = req_pool_indices.clamp(0, self.current_input_size - 1).long()
+        stored = self.current_input_indices[safe_req_indices]
+        current = torch.where(valid & (stored >= 0), stored, working_indices)
+        current = torch.where(valid, current, torch.full_like(current, -1))
+        if cow_src_indices is not None:
+            cow_src_indices = cow_src_indices[: working_indices.shape[0]].to(
+                torch.int32
+            )
+            current = torch.where(
+                (cow_src_indices >= 0) & valid & (current == working_indices),
+                cow_src_indices,
+                current,
+            )
+        return current
+
+    def reset_current_inputs(
+        self, req_pool_indices: torch.Tensor, working_indices: torch.Tensor
+    ) -> None:
+        """Mark freshly allocated/reused scheduler slots as canonical."""
+        req_pool_indices = req_pool_indices[: working_indices.shape[0]].to(torch.int32)
+        working_indices = working_indices.to(torch.int32)
+        self.current_input_indices[req_pool_indices.long()] = working_indices
+
+    def update_current_inputs_after_verify(
+        self,
+        req_pool_indices: torch.Tensor,
+        output_indices: torch.Tensor,
+        accepted_lengths: torch.Tensor,
+    ) -> None:
+        if output_indices is None or output_indices.numel() == 0:
+            return
+        n = accepted_lengths.shape[0]
+        req_pool_indices = req_pool_indices[:n].to(torch.int32)
+        accepted_lengths = accepted_lengths.clamp(
+            min=1, max=output_indices.shape[1]
+        ).to(torch.int32)
+        rows = torch.arange(n, device=accepted_lengths.device, dtype=torch.long)
+        selected = output_indices[rows, (accepted_lengths - 1).long()].to(torch.int32)
+        self.current_input_indices[req_pool_indices.long()] = selected
 
     def get_mamba_params(self, layer_id: int):
         """Return per-layer cache slices."""
@@ -222,6 +310,7 @@ class MambaAttnBackend(AttentionBackend):
         self.query_start_loc_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.output_indices_list = []
         self.speculative_num_draft_tokens = getattr(
             config, "speculative_num_draft_tokens", 0
         )
@@ -229,6 +318,12 @@ class MambaAttnBackend(AttentionBackend):
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
+
+    def reset_current_inputs(
+        self, req_pool_indices: torch.Tensor, working_indices: torch.Tensor
+    ):
+        if self.pool is not None:
+            self.pool.reset_current_inputs(req_pool_indices, working_indices)
 
     def init_forward_metadata(
         self,
@@ -244,6 +339,22 @@ class MambaAttnBackend(AttentionBackend):
             mamba_cache_indices = self.pool.get_mamba_indices(mamba_pool_indices[:bs])
         else:
             mamba_cache_indices = self.pool.get_mamba_indices(req_pool_indices[:bs])
+
+        mamba_output_indices = None
+        if forward_mode.is_target_verify():
+            draft_token_num = int(
+                kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
+            )
+            cow_src_indices = kwargs.get("mamba_cow_src_indices")
+            mamba_input_indices = self.pool.get_current_input_indices(
+                req_pool_indices[:bs], mamba_cache_indices, cow_src_indices
+            )
+            mamba_output_indices = self.pool.get_mtp_output_indices(
+                req_pool_indices[:bs],
+                mamba_cache_indices,
+                draft_token_num,
+            )
+            mamba_cache_indices = mamba_input_indices
 
         if forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -356,6 +467,8 @@ class MambaAttnBackend(AttentionBackend):
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            mamba_output_indices=mamba_output_indices,
+            mamba_req_pool_indices=req_pool_indices[:bs],
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
@@ -425,6 +538,15 @@ class MambaAttnBackend(AttentionBackend):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
+            if self.speculative_num_draft_tokens > 0:
+                self.output_indices_list.append(
+                    torch.full(
+                        (i + 1, self.speculative_num_draft_tokens),
+                        self.pad_slot_id,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_num_tokens + 1, dtype=torch.int32, device=self.device
         )
@@ -466,12 +588,28 @@ class MambaAttnBackend(AttentionBackend):
             mamba_indices = self.pool.get_mamba_indices(mamba_pool_indices[:bs])
         else:
             mamba_indices = self.pool.get_mamba_indices(req_pool_indices[:bs])
+        mamba_output_indices = None
+        if forward_mode.is_target_verify():
+            cow_src_indices = kwargs.get("mamba_cow_src_indices")
+            mamba_input_indices = self.pool.get_current_input_indices(
+                req_pool_indices[:bs], mamba_indices, cow_src_indices
+            )
+            mamba_output_indices = self.output_indices_list[bs - 1]
+            self.pool.get_mtp_output_indices(
+                req_pool_indices[:bs],
+                mamba_indices,
+                self.speculative_num_draft_tokens,
+                out=mamba_output_indices,
+            )
+            mamba_indices = mamba_input_indices
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         self._qsl_dirty[bs - 1] = False
         self._qsl_last_mode[bs - 1] = forward_mode
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
+            mamba_output_indices=mamba_output_indices,
+            mamba_req_pool_indices=req_pool_indices[:bs],
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -493,9 +631,24 @@ class MambaAttnBackend(AttentionBackend):
         else:
             mamba_indices = self.pool.get_mamba_indices(req_pool_indices[:real_bs])
 
+        mamba_output_indices = None
+        if forward_mode.is_target_verify():
+            cow_src_indices = kwargs.get("mamba_cow_src_indices")
+            mamba_input_indices = self.pool.get_current_input_indices(
+                req_pool_indices, mamba_indices, cow_src_indices
+            )
+            mamba_output_indices = self.output_indices_list[bs - 1]
+            self.pool.get_mtp_output_indices(
+                req_pool_indices,
+                mamba_indices,
+                self.speculative_num_draft_tokens,
+                out=mamba_output_indices,
+            )
+            mamba_indices = mamba_input_indices
+
         self.state_indices_list[bs - 1][:real_bs].copy_(mamba_indices)
         if num_padding > 0:
-            self.state_indices_list[bs - 1][real_bs:].fill_(self.pad_slot_id)
+            self.state_indices_list[bs - 1][real_bs:].fill_(-1)
 
         if num_padding == 0:
             need_copy = (
@@ -533,6 +686,8 @@ class MambaAttnBackend(AttentionBackend):
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
+            mamba_output_indices=mamba_output_indices,
+            mamba_req_pool_indices=req_pool_indices,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -648,12 +803,8 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num = kwargs.get(
                 "draft_token_num", self.speculative_num_draft_tokens
             )
-            (
-                conv_states,
-                ssm_states,
-                intermediate_state_cache,
-                intermediate_conv_window_cache,
-            ) = self.pool.get_mamba_params(layer_id)
+            conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
+            output_indices = self.forward_metadata.mamba_output_indices
 
             batch_size = seq_len // draft_token_num
             mixed_qkv_reshaped = (
@@ -668,13 +819,13 @@ class MambaAttnBackend(AttentionBackend):
                 bias,
                 activation,
                 conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
+                output_state_indices=output_indices[:batch_size],
             )
             mixed_qkv = (
                 mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
             )
         else:
-            conv_states, ssm_states, *rest = self.pool.get_mamba_params(layer_id)
+            conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
             if extend_prefix_lens is None:
                 extend_prefix_lens = self.forward_metadata.extend_prefix_lens
@@ -746,8 +897,7 @@ class MambaAttnBackend(AttentionBackend):
                 softplus_threshold=20.0,
                 # target_verify specific parameters
                 disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                cache_steps=draft_token_num,
+                output_state_indices=self.forward_metadata.mamba_output_indices,
             )
         else:
             beta = b.sigmoid()
@@ -979,30 +1129,27 @@ class HybridLinearAttnBackend(AttentionBackend):
             q, k, v, layer, out_cache_loc, token_to_kv_pool, **kwargs
         )
 
-    def update_mamba_state_after_mtp_verify(self, accepted_length, model):
-        request_number = accepted_length.shape[0]
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
-        mamba_caches = self.linear_attn_backend.pool.get_mamba_params_all_layers()
-        (
-            conv_states,
-            ssm_states,
-            intermediate_state_cache,
-            intermediate_conv_window_cache,
-        ) = mamba_caches
+    def reset_current_inputs(self, *args, **kwargs):
+        if self.linear_attn_backend is None:
+            return
+        if hasattr(self.linear_attn_backend, "reset_current_inputs"):
+            self.linear_attn_backend.reset_current_inputs(*args, **kwargs)
 
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            accepted_length,
+    def update_mamba_state_after_mtp_verify(self, accepted_length, model):
+        # mamba_cache_indices are input rows during target-verify. The first
+        # output row is always the scheduler-owned working slot, so use the
+        # output index table to update the next-round input pointer.
+        output_indices = self.linear_attn_backend.forward_metadata.mamba_output_indices
+        if output_indices is None:
+            return
+        req_pool_indices = (
+            self.linear_attn_backend.forward_metadata.mamba_req_pool_indices
         )
-        fused_mamba_state_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
+        if req_pool_indices is None:
+            return
+        request_number = accepted_length.shape[0]
+        self.linear_attn_backend.pool.update_current_inputs_after_verify(
+            req_pool_indices[:request_number],
+            output_indices[:request_number],
             accepted_length,
         )
