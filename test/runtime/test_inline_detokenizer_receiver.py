@@ -252,7 +252,12 @@ class TestFlagOffRegression(unittest.TestCase):
         # Populate output_ids so the raw-token fallback path doesn't crash;
         # we only care that the inline branch is NOT taken.
         tokens = tok.encode("hello world")
-        recv = _batch_token_id_out(["r1"], decode_ids=[tokens], output_ids=[tokens])
+        recv = _batch_token_id_out(
+            ["r1"],
+            decode_ids=[tokens],
+            output_ids=[tokens],
+            batch_accept_draft_tokens=[1.5],
+        )
         mgr.output_processor.handle_batch_output(recv)
 
         out = state.collector.take()
@@ -264,6 +269,7 @@ class TestFlagOffRegression(unittest.TestCase):
         # conversion used to guarantee. The state machine that would have
         # populated ``state.text`` never ran, so the value is "".
         self.assertEqual(out["text"], "")
+        self.assertEqual(out["meta_info"]["accept_draft_tokens"], 1.5)
         self.assertIsNone(state.inline_detokenizer)
         self.assertEqual(state.text, "")
 

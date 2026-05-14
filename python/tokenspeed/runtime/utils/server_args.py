@@ -88,6 +88,7 @@ class ServerArgs:
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
+    enable_mixed_batch: bool = False
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -816,6 +817,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-mixed-batch",
+            action="store_true",
+            dest="enable_mixed_batch",
+            default=ServerArgs.enable_mixed_batch,
+            help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
         )
         parser.add_argument(
             "--block-size",

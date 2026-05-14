@@ -141,13 +141,13 @@ if platform.is_nvidia:
             topk: int,
             next_n: int = 1,
         ):
-            seq_lens = seq_lens.to(torch.int32).contiguous()
+            seq_lens = seq_lens.to(torch.int32).reshape(-1).contiguous()
             if next_n == 1:
                 torch.ops.trtllm.indexer_topk_decode(
                     values, seq_lens, indices, next_n, topk
                 )
             else:
-                row_ends = seq_lens.cumsum(0)
+                row_ends = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
                 row_starts = row_ends - seq_lens
                 torch.ops.trtllm.indexer_topk_prefill(
                     values, row_starts, row_ends, indices, topk
