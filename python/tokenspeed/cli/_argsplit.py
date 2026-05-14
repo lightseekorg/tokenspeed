@@ -20,6 +20,10 @@
 
 """Argv splitter for ``ts serve``.
 
+A leading positional argument is treated as the model (vllm-style
+``ts serve <model> [flags...]``) and rewritten to ``--model <model>``
+before routing.
+
 Routing precedence is top-down. The first matching rule wins:
 
 1. Orchestrator-only flags (consumed, never forwarded)
@@ -63,6 +67,18 @@ _GATEWAY_OVERRIDE = {
 }
 
 _ENGINE_EXPLICIT = {"--tensor-parallel-size"}
+
+_MODEL_FLAG_TOKENS = ("--model", "--model-path")
+
+
+def _has_model_flag(tokens: Iterable[str]) -> bool:
+    for token in tokens:
+        if token in _MODEL_FLAG_TOKENS:
+            return True
+        for flag in _MODEL_FLAG_TOKENS:
+            if token.startswith(flag + "="):
+                return True
+    return False
 
 
 @dataclass
@@ -129,11 +145,28 @@ def _engine_recognized_flags() -> set[str]:
 def split_argv(argv: list[str]) -> SplitResult:
     """Split ts-serve argv into engine_args, gateway_args, orchestrator_opts.
 
+    A leading positional argument is rewritten to ``--model <value>`` so
+    ``ts serve <model> [flags...]`` and ``ts serve --model <model> [flags...]``
+    both work.
+
     Raises:
         ValueError: if a flag that requires a value is provided without one
             (e.g. ``--model`` with no path), if a timeout flag is
-            non-positive, or if a positional arg appears.
+            non-positive, if the model is given both positionally and via
+            ``--model``/``--model-path``, or if a positional arg appears
+            after the leading model.
     """
+
+    argv = list(argv)
+    if argv and not argv[0].startswith("--"):
+        model = argv[0]
+        rest = argv[1:]
+        if _has_model_flag(rest):
+            raise ValueError(
+                "model specified both as positional argument and via "
+                "--model/--model-path"
+            )
+        argv = ["--model", model, *rest]
 
     items = _normalize(argv)
     result = SplitResult()

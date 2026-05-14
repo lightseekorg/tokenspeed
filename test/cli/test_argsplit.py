@@ -38,7 +38,7 @@ def test_orchestrator_only_flags_are_consumed():
 
 def test_orchestrator_default_timeouts():
     r = _split([])
-    assert r.opts.engine_startup_timeout == 600
+    assert r.opts.engine_startup_timeout == 1800
     assert r.opts.gateway_startup_timeout == 60
     assert r.opts.drain_timeout == 30
 
@@ -184,3 +184,50 @@ def test_timeout_with_empty_value_raises():
 def test_timeout_with_zero_raises():
     with pytest.raises(ValueError, match="must be positive"):
         _split(["--engine-startup-timeout", "0"])
+
+
+def test_leading_positional_is_treated_as_model():
+    r = _split(
+        [
+            "openai/gpt-oss-20b",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8000",
+            "--tensor-parallel-size",
+            "1",
+        ]
+    )
+    assert "--model" in r.engine and "openai/gpt-oss-20b" in r.engine
+    assert "--model" in r.gateway and "openai/gpt-oss-20b" in r.gateway
+    assert r.gateway[r.gateway.index("--host") + 1] == "0.0.0.0"
+    assert r.gateway[r.gateway.index("--port") + 1] == "8000"
+    assert r.engine[r.engine.index("--tensor-parallel-size") + 1] == "1"
+
+
+def test_positional_model_matches_explicit_model_flag():
+    """Both invocation styles must produce the same split."""
+    positional = _split(["openai/gpt-oss-20b", "--host", "0.0.0.0"])
+    explicit = _split(["--model", "openai/gpt-oss-20b", "--host", "0.0.0.0"])
+    assert positional == explicit
+
+
+def test_positional_and_model_flag_conflict_raises():
+    with pytest.raises(ValueError, match="positional argument and via"):
+        _split(["openai/gpt-oss-20b", "--model", "other/model"])
+
+
+def test_positional_and_model_path_alias_conflict_raises():
+    with pytest.raises(ValueError, match="positional argument and via"):
+        _split(["openai/gpt-oss-20b", "--model-path", "other/model"])
+
+
+def test_positional_and_model_equals_form_conflict_raises():
+    with pytest.raises(ValueError, match="positional argument and via"):
+        _split(["openai/gpt-oss-20b", "--model=other/model"])
+
+
+def test_trailing_positional_still_raises():
+    """Only the FIRST argument may be positional; later ones remain illegal."""
+    with pytest.raises(ValueError, match="unexpected positional arg"):
+        _split(["--host", "0.0.0.0", "stray-positional"])
