@@ -42,6 +42,12 @@ STALE_PROCESS_PATTERNS = [
     r"smg_grpc_servicer\.tokenspeed",
     r"run_ci_suite",
 ]
+# Bare-metal pools whose stale-process cleanup must be scoped to our
+# own pgid via ProcessGroupManager. Concurrent jobs on the same
+# physical host share the network namespace and process table, so
+# the cmdline-pattern fallback above would TERM/KILL peer jobs'
+# smg / engine / ts serve processes alongside our own.
+PGM_RUNNER_PREFIXES = ("b200-", "b300-", "gb200-", "gb300-")
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
     (("b200", "gb200"), "sm100"),
@@ -53,6 +59,10 @@ AMD_RUNNER_PREFIXES = ("linux-mi355",)
 
 def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
+
+
+def runner_uses_pgm(runner: str) -> bool:
+    return runner.startswith(PGM_RUNNER_PREFIXES)
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -341,7 +351,17 @@ def setup_runner(
         )
         return local_env, pgm
 
-    kill_stale_processes(local_env, cwd, dry_run)
+    if runner_uses_pgm(runner):
+        # b200 / b300 / gb300: scope stale-process cleanup to our own
+        # pgid. The broad cmdline-pattern fallback would kill any
+        # concurrently-running peer job's smg / engine / ts serve
+        # processes on the same physical host.
+        pgm = make_manager()
+        local_env["CI_RUNNER_ID"] = pgm.runner_id
+        print(f"[pgm] runner={runner} runner_id={pgm.runner_id}", flush=True)
+        pgm.cleanup_stale(dry_run=dry_run)
+    else:
+        kill_stale_processes(local_env, cwd, dry_run)
     shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
     shell_run(
         "sudo apt-get install -y ninja-build",

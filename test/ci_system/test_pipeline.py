@@ -2,11 +2,13 @@ import re
 
 import pytest
 from pipeline import (
+    PGM_RUNNER_PREFIXES,
     STALE_PROCESS_PATTERNS,
     build_step_summary_lines,
     check_perf_reference,
     extract_evalscope_score,
     extract_perf_summary_rows,
+    runner_uses_pgm,
 )
 
 
@@ -35,6 +37,36 @@ def test_stale_process_patterns_match_existing_targets():
         assert any(
             re.search(pat, cmdline) for pat in STALE_PROCESS_PATTERNS
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
+
+
+@pytest.mark.parametrize(
+    "runner,expected",
+    [
+        ("b200-1gpu", True),
+        ("b200-4gpu", True),
+        ("b300-4gpu", True),
+        ("gb200-1gpu", True),
+        ("gb300-4gpu", True),
+        ("h100-1gpu", False),
+        ("h200-1gpu", False),
+        ("linux-mi355-2gpu-lightseek", False),
+        ("ubuntu-latest", False),
+    ],
+)
+def test_runner_uses_pgm_covers_bare_metal_blackwell(runner, expected):
+    """Self-hosted Blackwell pools (b200/b300/gb200/gb300) share the
+    host's network namespace and process table — they need pgid-scoped
+    cleanup so concurrent jobs on the same physical runner don't pkill
+    each other's smg / engine / ts serve processes via the broad
+    cmdline-pattern fallback."""
+    assert runner_uses_pgm(runner) is expected
+
+
+def test_pgm_runner_prefixes_are_kebab_terminated():
+    """Trailing dash prevents `gb200` from accidentally matching a
+    future `gb2000-*` runner label, etc."""
+    for prefix in PGM_RUNNER_PREFIXES:
+        assert prefix.endswith("-"), prefix
 
 
 def test_extract_evalscope_score_from_pipe_table():
