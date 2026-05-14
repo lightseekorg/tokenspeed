@@ -268,6 +268,15 @@ class OutputProcessor:
                         if recv_obj.output_multi_ids is not None:
                             output_multi_ids = recv_obj.output_multi_ids[i]
 
+                    if len(recv_obj.batch_accept_draft_tokens) > 0:
+                        meta_info.update(
+                            {
+                                "accept_draft_tokens": recv_obj.batch_accept_draft_tokens[
+                                    i
+                                ]
+                            }
+                        )
+
                     out_dict = {
                         "text": state.text,
                         "output_ids": output_token_ids,
