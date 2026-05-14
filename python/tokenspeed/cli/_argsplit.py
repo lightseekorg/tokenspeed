@@ -23,11 +23,13 @@
 Routing precedence is top-down. The first matching rule wins:
 
 1. Orchestrator-only flags (consumed, never forwarded)
-2. ``--model`` (alias ``--model-path``) — fanned out to both
+2. ``--model`` / ``--reasoning-parser`` — fanned out to both.
+   ``--reasoning-parser`` goes to the gateway (post-gen parsing) and
+   the engine (defers JSON grammars past the reasoning channel).
 3. ``--host`` / ``--port`` — gateway only (user-facing)
-4. ``--chat-template`` / ``--tool-call-parser`` / ``--reasoning-parser`` —
-   gateway only **(override)**: ``prepare_server_args`` accepts these too,
-   but in smg mode the gateway owns OpenAI-compat HTTP and parsing.
+4. ``--chat-template`` / ``--tool-call-parser`` — gateway only
+   **(override)**: ``prepare_server_args`` accepts these too, but in smg
+   mode the gateway owns OpenAI-compat HTTP and parsing.
 5. ``--tp`` / ``--tensor-parallel-size`` — engine only (alias normalized)
 6. Anything else ``prepare_server_args`` accepts — engine only
 7. Anything else — gateway (fall-through to ``smg launch`` clap)
@@ -46,7 +48,7 @@ _ORCH_FLAGS = {
     "--drain-timeout",
 }
 
-_FANOUT_FLAGS = {"--model"}
+_FANOUT_FLAGS = {"--model", "--reasoning-parser"}
 
 _ALIASES = {
     "--model-path": "--model",
@@ -58,7 +60,6 @@ _GATEWAY_USER_FACING = {"--host", "--port"}
 _GATEWAY_OVERRIDE = {
     "--chat-template",
     "--tool-call-parser",
-    "--reasoning-parser",
 }
 
 _ENGINE_EXPLICIT = {"--tensor-parallel-size"}
