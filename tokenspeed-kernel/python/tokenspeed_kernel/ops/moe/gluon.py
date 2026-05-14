@@ -24,13 +24,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-# Trigger the ``triton`` -> ``tokenspeed_triton`` redirect that the upstream
-# ``triton_kernels`` package needs; this must happen before any
-# ``triton_kernels.*`` import below.
 import tokenspeed_kernel.thirdparty.triton_kernels  # noqa: F401  (side effect)
 import torch
 from tokenspeed_kernel._triton import tl, triton  # noqa: F401  (kept for parity)
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 
 import tokenspeed_triton  # noqa: F401
@@ -38,18 +35,13 @@ from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.experimental.gluon import language as gl
 from tokenspeed_triton.language.core import _aggregate as aggregate
 
-
-try:
-    from triton_kernels.matmul import FlexCtx as _UpstreamFlexCtx  # noqa: F401
-    from triton_kernels.matmul import (  # noqa: F401
-        FusedActivation as _UpstreamFusedActivation,
-    )
-    from triton_kernels.matmul import PrecisionConfig as _UpstreamPrecisionConfig
-    from triton_kernels.matmul import matmul as _upstream_matmul
-    from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
-except ImportError:
-    _upstream_matmul = None
-    _UpstreamPrecisionConfig = None
+from triton_kernels.matmul import FlexCtx as _UpstreamFlexCtx  # noqa: F401
+from triton_kernels.matmul import (  # noqa: F401
+    FusedActivation as _UpstreamFusedActivation,
+)
+from triton_kernels.matmul import PrecisionConfig as _UpstreamPrecisionConfig  # noqa: F401
+from triton_kernels.matmul import matmul as _upstream_matmul
+from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -62,14 +54,6 @@ _GLUON_ENABLED_ENV = os.environ.get("TOKENSPEED_MOE_GLUON", "").lower() in {
     "yes",
     "on",
 }
-
-
-def _is_cdna4() -> bool:
-    return current_platform().is_cdna4
-
-
-def _gluon_is_supported() -> bool:
-    return _is_cdna4()
 
 
 def composition(cls):
@@ -1557,7 +1541,6 @@ def gluon_bf16_gating_gemm(
     Block size defaults are picked by :func:`_autotune_block` based on
     the input shape; pass explicit overrides to bench-tune.
     """
-    assert _gluon_is_supported(), "Gluon MoE kernel requires CDNA4."
     assert x.dim() == 2 and w.dim() == 2
     M, K = x.shape
     K_W, N = w.shape
@@ -1608,7 +1591,6 @@ def gluon_bf16_dispatch_swiglu(
     The output dtype is ``x.dtype``; the output N is ``w.shape[-1] // 2``
     because SwiGLU consumes pairs of (gate, linear) along the N axis.
     """
-    assert _gluon_is_supported(), "Gluon MoE kernel requires CDNA4."
     assert w.ndim == 3 and w.shape[-1] % 2 == 0
     M = x.shape[-2]
     N = w.shape[-1]
@@ -1661,7 +1643,6 @@ def gluon_bf16_combine(
     (x_e @ w_e)`` via the kernel's optional scatter+gate_scal post-write.
     The combine across the top-k axis is a final ``view + sum`` on host.
     """
-    assert _gluon_is_supported(), "Gluon MoE kernel requires CDNA4."
     assert w.ndim == 3
     M = x.shape[-2]
     N = w.shape[-1]
@@ -1717,7 +1698,6 @@ def gluon_mxfp_gating_gemm(
 ) -> torch.Tensor:
     # Scaled-MFMA dense GEMM y = (a_scale * x) @ (w_scale * w).
     # See _launch_kernel for scale_load_mode and tensor layouts.
-    assert _gluon_is_supported(), "Gluon scaled MoE kernel requires CDNA4."
     assert x.dim() == 2 and w.dim() == 2
     M = x.shape[0]
     N = w.shape[-1]
@@ -1779,7 +1759,6 @@ def gluon_mxfp_dispatch_swiglu(
     w_transpose: bool = False,
 ) -> torch.Tensor:
     """Scaled-MFMA dispatch + 1st GEMM + fused SwiGLU."""
-    assert _gluon_is_supported(), "Gluon scaled MoE kernel requires CDNA4."
     assert w.ndim == 3 and w.shape[-1] % 2 == 0
     M = x.shape[-2]
     N = w.shape[-1]
@@ -1845,7 +1824,6 @@ def gluon_mxfp_combine(
     w_transpose: bool = False,
 ) -> torch.Tensor:
     """Scaled-MFMA 2nd GEMM + scatter combine for MoE."""
-    assert _gluon_is_supported(), "Gluon scaled MoE kernel requires CDNA4."
     assert w.ndim == 3
     M = x.shape[-2]
     N = w.shape[-1]
@@ -1923,10 +1901,7 @@ def _gluon_bf16_ragged_matmul(
     Falls back to ``triton_kernels.matmul`` for unsupported precisions
     so we never break the gpt-oss-120b path while we land features.
     """
-    if (
-        not _supports_pure_bf16(precision_config, fused_activation)
-        or not _gluon_is_supported()
-    ):
+    if not _supports_pure_bf16(precision_config, fused_activation):
         return _upstream_matmul(
             x,
             w,
@@ -1998,37 +1973,41 @@ def _kernel_priority() -> int:
     return Priority.PORTABLE + 1  # 5
 
 
-if _gluon_is_supported() and _upstream_matmul is not None:
-    _common = dict(
-        solution="triton",
-        dtypes={torch.bfloat16, torch.float16, torch.uint8},
-        priority=_kernel_priority(),
-        tags={"portability", "gluon"},
-    )
+_common = dict(
+    solution="triton",
+    dtypes={torch.bfloat16, torch.float16, torch.uint8},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    priority=_kernel_priority(),
+    tags={"portability", "gluon"},
+)
 
-    register_kernel(
-        "moe",
-        "experts",
-        name="triton_kernels_gluon_dispatch_gemm",
-        features={"ragged_metadata", "dispatch_gemm"},
-        **_common,
-    )(_gluon_bf16_ragged_matmul)
+register_kernel(
+    "moe",
+    "experts",
+    name="triton_kernels_gluon_dispatch_gemm",
+    features={"ragged_metadata", "dispatch_gemm"},
+    **_common,
+)(_gluon_bf16_ragged_matmul)
 
-    register_kernel(
-        "moe",
-        "experts",
-        name="triton_kernels_gluon_gemm_combine",
-        features={"ragged_metadata", "gemm_combine"},
-        **_common,
-    )(_gluon_bf16_ragged_matmul)
+register_kernel(
+    "moe",
+    "experts",
+    name="triton_kernels_gluon_gemm_combine",
+    features={"ragged_metadata", "gemm_combine"},
+    **_common,
+)(_gluon_bf16_ragged_matmul)
 
-    register_kernel(
-        "moe",
-        "experts",
-        name="triton_kernels_gluon_matmul_ogs",
-        features={"ragged_metadata"},
-        **_common,
-    )(_gluon_bf16_ragged_matmul)
+register_kernel(
+    "moe",
+    "experts",
+    name="triton_kernels_gluon_matmul_ogs",
+    features={"ragged_metadata"},
+    **_common,
+)(_gluon_bf16_ragged_matmul)
 
 
 __all__ = [
