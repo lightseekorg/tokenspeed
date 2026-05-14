@@ -142,6 +142,11 @@ POEM_MESSAGES = [
 ]
 XGRAMMAR_MAX_TOKENS = 4096  # reasoning + JSON both fit; 1024 occasionally
 # runs out before the JSON channel opens, leaving ``content=''``.
+# Floor that guards "model actually reasoned before the JSON". Measured
+# ~2000 tok on MiniMax-M2.5; 300 gives plenty of margin while still
+# catching a regression that drops the structural-tag wrap (in which
+# case xgrammar locks onto `{` at token 0 and we'd see ~30-150 tok).
+MIN_XGRAMMAR_GEN_TOKENS = 300
 
 # Base args. Notes:
 #  - sampling-backend flashinfer: exercises the flashinfer sampling path on
@@ -563,6 +568,13 @@ class TestMiniMaxM25Perf(unittest.TestCase):
                 f"decode={decode_elapsed:.3f}s decode_tps={tps:.1f}"
             )
             print(f"[xgrammar poem content] {content[:200]!r}")
+            self.assertGreaterEqual(
+                tok,
+                MIN_XGRAMMAR_GEN_TOKENS,
+                f"xgrammar generation too short ({tok} tok) — structural-tag "
+                f"wrap likely dropped; expected reasoning + JSON ≥"
+                f"{MIN_XGRAMMAR_GEN_TOKENS} tok",
+            )
             self.assertGreaterEqual(
                 tps,
                 MIN_XGRAMMAR_TPS,
