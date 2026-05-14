@@ -62,11 +62,12 @@ if TYPE_CHECKING:
 # Opt-in env gate, read once at import time. spawn-launched TP workers inherit
 # os.environ via Python's cached dict (independent of setproctitle clobber on
 # /proc/<pid>/environ), so setting TOKENSPEED_SPEC_FAST_CHAIN_SAMPLING=1 before
-# launch propagates to all workers. When enabled, verify() switches to the same
-# top_k_top_p_sampling_from_logits(joint) kernel as plain decode plus a
-# token-equality verify (verify_chain_greedy), trading the sequential
-# top_k_renorm + top_p_renorm + chain_speculative_sampling_target_only chain
-# for one fused-sample + one constant-time verify. See verify() docstring.
+# launch propagates to all workers. When enabled, verify() replaces the
+# sequential top_k_renorm + top_p_renorm + chain_speculative_sampling_target_only
+# chain with top_k_top_p_sampling_from_logits(top_k_first) + a token-equality
+# verify (verify_chain_greedy). Matches stock TRTLLM 1.3.0rc14's verify
+# sampling and is bit-equivalent to the original filter semantics.
+# See verify() docstring.
 _FAST_CHAIN_ENABLED = os.environ.get("TOKENSPEED_SPEC_FAST_CHAIN_SAMPLING", "0") == "1"
 
 
@@ -329,13 +330,14 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         elif _FAST_CHAIN_ENABLED and sampling_info.vocab_mask is None:
 
-            # Fast chain-spec path: mirror plain decode's joint kernel + a
-            # token-equality verify instead of the sequential renorm chain.
+            # Fast chain-spec path: collapse the sequential renorm chain into
+            # one fused-sample kernel + a token-equality verify.
             #
             #   draft is already argmax-greedy on the caller side (chain-spec
             #   topk=1), so:
             #     1. sample one target token per chain position via flashinfer
-            #        top_k_top_p_sampling_from_logits(filter_apply_order="joint")
+            #        top_k_top_p_sampling_from_logits(
+            #            filter_apply_order="top_k_first")
             #     2. verify by token-equality vs draft candidates using the
             #        same verify_chain_greedy kernel the greedy path runs
             #     3. bonus token at the first mismatched position is the
@@ -346,14 +348,12 @@ class FlashInferSamplingBackend(SamplingBackend):
             # with a single fused sample kernel + a constant-time compare.
             #
             # Numerical semantics:
-            #   This path uses joint top-k / top-p filtering on the *original*
-            #   distribution (same as plain decode), while the sequential
-            #   path applies top-p in the *top-k-renormalized* distribution.
-            #   Both are unbiased rejection samplers on a chain-spec draft
-            #   point mass, just with slightly different filter boundaries
-            #   (~5% TV in typical top_k=50/top_p=0.95 configs). Enabling this
-            #   path brings verify in line with plain decode's filter
-            #   semantics.
+            #   filter_apply_order="top_k_first" applies top-k then top-p on
+            #   the top-k-renormalized distribution -- bit-equivalent to the
+            #   sequential top_k_renorm_prob -> top_p_renorm_prob chain it
+            #   replaces. This also matches stock TRTLLM 1.3.0rc14's verify
+            #   sampling
+            #   (tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py).
             #
             # vocab_mask fallback: grammar masks are per-draft-position, and
             # plain decode applies them via apply_vocab_mask to a [bs, V]
@@ -378,7 +378,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 scaled_logits,
                 top_ks,
                 top_ps,
-                filter_apply_order="joint",
+                filter_apply_order="top_k_first",
                 check_nan=check_nan,
                 deterministic=True,
             )
