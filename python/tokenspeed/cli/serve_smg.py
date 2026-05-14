@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "none"
+DEFAULT_SMG_LOG_LEVEL = "warn"
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -119,10 +120,17 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
     return result
 
 
+def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
+    if "--log-level" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
+
+
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
     gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
-    return _gateway_args_with_smg_disable_defaults(gateway_args)
+    gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
+    return _gateway_args_with_default_log_level(gateway_args)
 
 
 async def _stream_to(proc, tag: str) -> None:
