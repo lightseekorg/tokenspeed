@@ -320,7 +320,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         if raw_logprobs is not None:
 
             logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, sampled.long().unsqueeze(-1)
+                -1, sampled.unsqueeze(-1)
             ).squeeze(-1)
 
         # Accumulate sampled tokens into counts (greedy path accumulates too
@@ -454,7 +454,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         if raw_logprobs is not None:
 
             logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, predict.long().unsqueeze(-1)
+                -1, predict.unsqueeze(-1)
             ).squeeze(-1)
 
         return predict, accept_length
