@@ -62,7 +62,7 @@ class SamplingBatchInfo:
     # An event used for overlap schedule
     sampling_info_done: threading.Event | None = None
 
-    # int32[bs] — req_pool_idx per batch row. Sampling backends gather
+    # int64[bs] — req_pool_idx per batch row. Sampling backends gather
     # their pool-indexed scalar buffers (temperature / top_k / top_p /
     # seeds / penalties / logit_bias / counts) against this index.
     req_pool_indices: torch.Tensor | None = None

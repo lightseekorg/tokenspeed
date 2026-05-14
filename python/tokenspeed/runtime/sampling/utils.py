@@ -76,7 +76,7 @@ def write_output_logprobs(
     """Fill logits_output.next_token_logprobs; callers gate on the enable flag."""
     raw_logprobs = torch.log_softmax(logits, dim=-1)
     logits_output.next_token_logprobs = raw_logprobs.gather(
-        -1, tokens.long().unsqueeze(-1)
+        -1, tokens.unsqueeze(-1)
     ).squeeze(-1)
 
 
