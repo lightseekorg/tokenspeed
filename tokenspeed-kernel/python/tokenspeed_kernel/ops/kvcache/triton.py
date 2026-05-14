@@ -22,9 +22,13 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
+
+_PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -32,6 +36,34 @@ __all__ = [
     "transfer_kv_all_layer",
     "transfer_kv_per_layer",
 ]
+
+
+@triton.jit
+def _kv_transfer_per_layer_capped_kernel(
+    k_cache_dst_ptr,
+    v_cache_dst_ptr,
+    indices_dst_ptr,
+    k_cache_src_ptr,
+    v_cache_src_ptr,
+    indices_src_ptr,
+    kv_cache_src_stride,
+    kv_cache_dst_stride,
+    length,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Grid-capped variant: each program strides over multiple indices."""
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    for i in range(pid, length, nprog):
+        pos_src = tl.load(indices_src_ptr + i).to(tl.int64)
+        pos_dst = tl.load(indices_dst_ptr + i).to(tl.int64)
+        src_offset = pos_src * kv_cache_src_stride
+        dst_offset = pos_dst * kv_cache_dst_stride
+        k_src = tl.load(k_cache_src_ptr + src_offset + offs)
+        tl.store(k_cache_dst_ptr + dst_offset + offs, k_src)
+        v_src = tl.load(v_cache_src_ptr + src_offset + offs)
+        tl.store(v_cache_dst_ptr + dst_offset + offs, v_src)
 
 
 @triton.jit
@@ -297,6 +329,22 @@ def transfer_kv_per_layer(
 
     # BLOCK_SIZE is in elements, must be power of two and cover element_dim
     block_size = _next_power_of_two(element_dim)
+
+    cap = _PER_LAYER_GRID_CAP
+    if cap > 0 and length > cap:
+        _kv_transfer_per_layer_capped_kernel[(cap,)](
+            k_cache_dst_flat,
+            v_cache_dst_flat,
+            dst_indices,
+            k_cache_src_flat,
+            v_cache_src_flat,
+            src_indices,
+            kv_cache_src_stride,
+            kv_cache_dst_stride,
+            length,
+            BLOCK_SIZE=block_size,
+        )
+        return
 
     grid = (length,)
     _kv_transfer_per_layer_kernel[grid](
