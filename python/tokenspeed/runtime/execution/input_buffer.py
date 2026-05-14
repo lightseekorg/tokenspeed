@@ -270,7 +270,7 @@ class InputBuffers:
                 non_blocking=True,
             )
 
-        self.seq_lens_buf[:batch_size].copy_(input_lengths_device + cached_prefix_lens)
+        self.seq_lens_buf[:batch_size].copy_(input_lengths_device + valid_cache_lengths)
 
         # Reset positions beyond total_tokens to the dummy KV slot so that any
         # CUDA graph replay with a larger (padded) batch size writes padding
