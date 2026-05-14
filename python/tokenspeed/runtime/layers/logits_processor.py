@@ -35,7 +35,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -107,6 +106,7 @@ class LogitsMetadata:
 
     # for padding
     padded_static_len: int = -1
+    last_index_offsets: torch.Tensor | None = None
 
     @classmethod
     def from_forward_context(
@@ -119,6 +119,7 @@ class LogitsMetadata:
             capture_hidden_mode=ctx.capture_hidden_mode,
             extend_seq_lens=input_lengths,
             padded_static_len=ctx.padded_static_len,
+            last_index_offsets=ctx.last_index_offsets,
         )
 
 
@@ -231,14 +232,8 @@ class LogitsProcessor(nn.Module):
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
                 # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
                 last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
-                    - 1
+                    logits_metadata.last_index_offsets + logits_metadata.extend_seq_lens
                 )
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:

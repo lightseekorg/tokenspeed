@@ -123,6 +123,17 @@ class Eagle(BaseDrafter):
             device=self.device,
         )
 
+        # Precomputed `arange(max_bs) * spec_num_tokens - 1`, sliced and passed
+        # via ForwardContext for the padded-static-len last-token selection in
+        # LogitsProcessor.
+        self._last_index_offsets_buf = (
+            torch.arange(
+                self.input_buffers.max_bs, dtype=torch.int64, device=self.device
+            )
+            * spec_num_tokens
+            - 1
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -195,6 +206,9 @@ class Eagle(BaseDrafter):
             forward_mode=draft_first_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             padded_static_len=self.spec_num_tokens if is_decode_like else -1,
+            last_index_offsets=(
+                self._last_index_offsets_buf[:bs] if is_decode_like else None
+            ),
             keep_full_logits=False,
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
@@ -350,31 +364,10 @@ class Eagle(BaseDrafter):
         # Seed the draft attn backend's aliased seq_lens for the first step.
         self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
 
-        # First draft step.
+        # First draft step. LogitsProcessor prunes `[bs * spec_num_tokens, ...]`
+        # down to `[bs, ...]` via padded_static_len, so logits/hidden_states
+        # arrive here already aligned to one row per request.
         logits_output = self._run_first_step(bs, draft_input)
-
-        # In decode mode the draft model processes spec_num_tokens tokens
-        # per request (padded). The logits processor returns logits for ALL
-        # tokens. Select only the last valid token per request.
-        logits = logits_output.next_token_logits
-
-        if logits.shape[0] != bs and (
-            draft_input.forward_mode.is_decode_or_idle()
-            or draft_input.forward_mode.is_target_verify()
-            or draft_input.forward_mode.is_draft_extend()
-        ):
-            # logits shape: [bs * spec_num_tokens, vocab]
-            # Select last token per request using accept_lengths
-            last_indices = (
-                torch.arange(bs, device=logits.device) * self.spec_num_tokens
-                + draft_input.accept_lengths
-                - 1
-            )
-
-            logits_output.next_token_logits = logits[last_indices]
-
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states[last_indices]
 
         draft_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
         draft_tokens[:, 0] = self._map_hot(draft_ids)
