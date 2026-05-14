@@ -122,6 +122,51 @@ class LogitsMetadata:
         )
 
 
+_FUSED_LM_HEAD_GEMM = None
+
+
+def _get_fused_lm_head_gemm():
+    """Lazily import the fused lm_head GEMM kernel.
+
+    The kernel is only present when tokenspeed-kernel was built with a
+    compatible nvcc. Cache a sentinel when unavailable so we fall back
+    to ``torch.matmul`` silently on subsequent calls.
+    """
+    global _FUSED_LM_HEAD_GEMM
+    if _FUSED_LM_HEAD_GEMM is not None:
+        return _FUSED_LM_HEAD_GEMM
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
+            lm_head_gemm,
+            should_use_fused,
+        )
+
+        _FUSED_LM_HEAD_GEMM = (should_use_fused, lm_head_gemm)
+    except Exception:
+        _FUSED_LM_HEAD_GEMM = (None, None)
+    return _FUSED_LM_HEAD_GEMM
+
+
+def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute ``hidden_states @ weight.T``.
+
+    Routes to the fused ``lm_head_gemm`` when the shape matches a compiled
+    template and the bench-driven perf gate accepts (``should_use_fused``).
+    Otherwise falls back to ``torch.matmul``.
+
+    Only enabled for Kimi (``model_type == "kimi_k2"``) at the call site —
+    on DSv3 the fused kernel's PDL launch surface caused a downstream EAGLE3
+    spec decode AR regression that we have not characterised end-to-end; on
+    Kimi the perf win is the largest and the regression has not been
+    reproduced, so we gate the fused path to Kimi only.
+    """
+    cast_hidden = hidden_states.to(weight.dtype)
+    should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
+    if should_use_fused is not None and should_use_fused(cast_hidden, weight):
+        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+    return torch.matmul(cast_hidden, weight.T)
+
+
 class LogitsProcessor(nn.Module):
     def __init__(
         self,
@@ -153,6 +198,9 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
+
+        # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
+        self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
 
     def forward(
         self,
@@ -359,9 +407,12 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
+            if self._use_fused_lm_head:
+                logits = _lm_head_matmul(hidden_states, lm_head.weight)
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
             # GGUF models
             logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)

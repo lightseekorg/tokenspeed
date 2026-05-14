@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.sampling.backends.base import (
     DEFAULT_RANDOM_SEED,
     SamplingBackend,
@@ -33,7 +35,16 @@ if TYPE_CHECKING:
 
 
 _BACKEND_REGISTRY: dict[str, type[SamplingBackend]] = {}
-_DEFAULT_BACKEND = "flashinfer"
+
+
+def _get_default_backend_name() -> str:
+    if current_platform().is_nvidia:
+        return "flashinfer"
+    return "greedy"
+
+
+def _resolve_backend_name(server_args: ServerArgs) -> str:
+    return server_args.sampling_backend or _get_default_backend_name()
 
 
 def register_backend(name: str, cls: type[SamplingBackend]) -> None:
@@ -58,7 +69,7 @@ def create_sampling_backend(
     )
     from tokenspeed.runtime.sampling.backends import greedy as _g  # noqa: F401
 
-    name = server_args.sampling_backend or _DEFAULT_BACKEND
+    name = _resolve_backend_name(server_args)
     if name not in _BACKEND_REGISTRY:
         raise ValueError(
             f"Unknown sampling backend: {name!r}. "

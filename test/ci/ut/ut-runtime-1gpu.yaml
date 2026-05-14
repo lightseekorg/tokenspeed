@@ -20,5 +20,6 @@ install:
 ut:
   commands:
     - python3 test/runtime/run_ci_suite.py --device cuda --suite runtime-1gpu --timeout-per-file ${CI_TIMEOUT_PER_FILE:-1800}
+    - python3 -m pytest test/cli -v
 report:
   github_step_summary: true
