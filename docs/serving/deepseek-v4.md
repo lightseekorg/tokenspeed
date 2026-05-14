@@ -68,7 +68,7 @@ GSM8K 5-shot, 50 samples is the standard quick-validation harness for V4:
 ```bash
 HF_DATASETS_TRUST_REMOTE_CODE=1 lm_eval run \
     --model local-completions \
-    --model_args "model=deepseek-ai/DeepSeek-V4-Flash,base_url=http://127.0.0.1:30100/v1/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=4,max_retries=1,timeout=600,max_gen_toks=256" \
+    --model_args "model=deepseek-ai/DeepSeek-V4-Flash,base_url=http://127.0.0.1:8000/v1/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=4,max_retries=1,timeout=600,max_gen_toks=256" \
     --tasks gsm8k --num_fewshot 5 --limit 50 --batch_size 1 \
     --gen_kwargs temperature=0
 ```
