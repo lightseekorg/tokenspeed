@@ -640,6 +640,16 @@ class EventLoop:
         if host_exec is not None:
             self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
 
+    def _flush_mamba_retract_states(self, forward_op) -> None:
+        """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
+        if forward_op is not None:
+            return
+        if self.model_executor.drafter is None:
+            return
+        if self.model_executor.runtime_states.mamba_pool is None:
+            return
+        self.model_executor.flush_mamba_draft_to_working_on_retract()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -930,6 +940,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_mamba_retract_states(forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1044,6 +1055,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_mamba_retract_states(forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1112,12 +1124,6 @@ class EventLoop:
 
             curr_results = None
             if forward_op is not None:
-                if forward_op.num_extends() <= 0:
-                    # Overlap dispatch may schedule one extra decode before
-                    # the previous result is committed. Snapshot the completed
-                    # working state before this decode mutates the same slot;
-                    # the snapshot helper only copies block-aligned states.
-                    self.model_executor.snapshot_mamba_checkpoints_for_op(forward_op)
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,

@@ -132,11 +132,12 @@ def _mamba_state_snapshot_kernel(
     In-place copy kernel: pool[:, dst[i], :] = pool[:, src[i], :]
     Skips copy if page_size > 0 and cache_lengths[i] % page_size != 0.
 
-    Grid: (num_valid, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
+    Grid: (num_valid, num_layers) — loops over elem_per_entry internally.
+    Invalid entries early-return wasting only 1 block instead of
+    ceil(elem_per_entry / BLOCK_SIZE) blocks.
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1).to(tl.int64)
-    pid_block = tl.program_id(2).to(tl.int64)
 
     src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
     dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
@@ -160,12 +161,11 @@ def _mamba_state_snapshot_kernel(
     src_offset = pid_layer * layer_stride + src_idx * req_stride
     dst_offset = pid_layer * layer_stride + dst_idx * req_stride
 
-    start = pid_block * BLOCK_SIZE
-    offsets = start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < elem_per_entry
-
-    data = tl.load(pool_ptr + src_offset + offsets, mask=mask)
-    tl.store(pool_ptr + dst_offset + offsets, data, mask=mask)
+    for start in tl.static_range(0, elem_per_entry, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < elem_per_entry
+        data = tl.load(pool_ptr + src_offset + offsets, mask=mask)
+        tl.store(pool_ptr + dst_offset + offsets, data, mask=mask)
 
 
 def fused_mamba_state_snapshot(
@@ -224,8 +224,8 @@ def fused_mamba_state_snapshot(
         cache_lengths = src_indices  # unused; kernel skips when page_size==0
         page_size = 0
 
-    BLOCK_SIZE = 1024
-    grid = (num_valid, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    BLOCK_SIZE = 8192
+    grid = (num_valid, num_layers)
 
     _mamba_state_snapshot_kernel[grid](
         pool,
@@ -238,6 +238,7 @@ def fused_mamba_state_snapshot(
         req_stride,
         pool_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
     )
 
 
