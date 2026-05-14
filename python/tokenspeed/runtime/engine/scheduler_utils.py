@@ -20,6 +20,7 @@
 
 """Helper functions for constructing scheduler specs and events."""
 
+import os
 from collections.abc import Sequence
 from typing import Any, Mapping
 
@@ -38,6 +39,7 @@ _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
 }
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
