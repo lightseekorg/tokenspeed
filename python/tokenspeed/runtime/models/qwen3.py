@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
@@ -187,13 +188,13 @@ class Qwen3Attention(nn.Module):
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        return q, k
+        return qk_rmsnorm(
+            q,
+            k,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.q_norm.variance_epsilon,
+        )
 
     def _rotate_half(self, x):
         x1 = x[..., : x.shape[-1] // 2]

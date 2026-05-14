@@ -376,6 +376,7 @@ elif platform.is_nvidia and platform.is_hopper:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
+        scheduler_metadata: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -390,6 +391,7 @@ elif platform.is_nvidia and platform.is_hopper:
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
+            scheduler_metadata=scheduler_metadata,
         )
         return out.view_as(q)
 
