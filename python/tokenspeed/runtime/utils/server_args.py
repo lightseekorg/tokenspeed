@@ -580,13 +580,6 @@ class ServerArgs:
             )
             self.enable_kvstore = False
             self.disable_kvstore = True
-        if self.chunked_prefill_size != -1:
-            logger.warning(
-                "--speculative-algorithm NGRAM disables chunked prefill in this "
-                "release."
-            )
-            self.chunked_prefill_size = -1
-
         # NGRAM's drafter runs on CPU and is not part of the captured
         # graph in this first cut. Force eager so users don't silently
         # hit graph-capture failures during warmup.

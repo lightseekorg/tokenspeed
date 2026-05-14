@@ -514,7 +514,6 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertIsNone(sa.drafter_attention_backend)
         self.assertTrue(sa.enforce_eager)
         self.assertFalse(sa.enable_prefix_caching)
-        self.assertEqual(sa.chunked_prefill_size, -1)
 
     def test_ngram_via_speculative_config(self):
         sa = self._from_cli_args_for_ngram(

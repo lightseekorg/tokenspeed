@@ -141,9 +141,9 @@ The first release is intentionally narrow:
 - Single-rank only; running under PD disaggregation is rejected at startup.
 - The drafter runs outside the captured CUDA graph, so `--enforce-eager` is
   auto-enabled with a warning.
-- `enable_prefix_caching`, `enable_kvstore`, and chunked prefill are
-  auto-disabled because the proposer keeps its own per-request token history
-  and prefix-cache hits would skip the prefill path it relies on.
+- `enable_prefix_caching` and `enable_kvstore` are auto-disabled because the
+  proposer keeps its own per-request token history and prefix-cache hits would
+  skip the prefill path it relies on.
 - `--speculative-eagle-topk` must be `1` (chain only), and
   `--speculative-num-draft-tokens` must equal `--speculative-num-steps + 1`.
 
