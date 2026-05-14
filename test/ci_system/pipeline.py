@@ -47,7 +47,7 @@ STALE_PROCESS_PATTERNS = [
 # physical host share the network namespace and process table, so
 # the cmdline-pattern fallback above would TERM/KILL peer jobs'
 # smg / engine / ts serve processes alongside our own.
-PGM_RUNNER_PREFIXES = ("b200-", "b300-", "gb200-", "gb300-")
+PGM_RUNNER_PREFIXES = ("b200-", "b300-", "gb200-")
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
     (("b200", "gb200"), "sm100"),
@@ -352,8 +352,8 @@ def setup_runner(
         return local_env, pgm
 
     if runner_uses_pgm(runner):
-        # b200 / b300 / gb300: scope stale-process cleanup to our own
-        # pgid. The broad cmdline-pattern fallback would kill any
+        # b200 / b300: scope stale-process cleanup to our own pgid.
+        # The broad cmdline-pattern fallback would kill any
         # concurrently-running peer job's smg / engine / ts serve
         # processes on the same physical host.
         pgm = make_manager()

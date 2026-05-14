@@ -46,7 +46,6 @@ def test_stale_process_patterns_match_existing_targets():
         ("b200-4gpu", True),
         ("b300-4gpu", True),
         ("gb200-1gpu", True),
-        ("gb300-4gpu", True),
         ("h100-1gpu", False),
         ("h200-1gpu", False),
         ("linux-mi355-2gpu-lightseek", False),
@@ -54,8 +53,8 @@ def test_stale_process_patterns_match_existing_targets():
     ],
 )
 def test_runner_uses_pgm_covers_bare_metal_blackwell(runner, expected):
-    """Self-hosted Blackwell pools (b200/b300/gb200/gb300) share the
-    host's network namespace and process table — they need pgid-scoped
+    """Self-hosted Blackwell pools (b200/b300/gb200) share the host's
+    network namespace and process table — they need pgid-scoped
     cleanup so concurrent jobs on the same physical runner don't pkill
     each other's smg / engine / ts serve processes via the broad
     cmdline-pattern fallback."""
