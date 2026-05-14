@@ -46,6 +46,9 @@ _AUTO_IMPL_PREFERENCE = {
         "flashinfer_cutlass",
     ),
     "mxfp4": (
+        # FP8 x MXFP4 takes precedence on AMD when the checkpoint carries
+        # per-tensor static FP8 activation scales (Quark ``w_mxfp4_a_fp8``).
+        "triton_kernel_fp8",
         "flashinfer_mxfp4",
         "triton_kernel",
     ),
