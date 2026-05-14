@@ -210,6 +210,9 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    # NGRAM-only: bounds for the KMP suffix-ngram lookup.
+    speculative_ngram_min: int = 1
+    speculative_ngram_max: int = 3
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -486,6 +489,10 @@ class ServerArgs:
         self.validate_cache_options()
 
     def resolve_speculative_decoding(self):
+        if self.speculative_algorithm == "NGRAM":
+            self._resolve_ngram_speculative_decoding()
+            return
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -512,6 +519,88 @@ class ServerArgs:
             self.eagle3_layers_to_capture = [
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
+
+    def _resolve_ngram_speculative_decoding(self):
+        """NGRAM is a prompt-lookup proposer with no draft model.
+
+        It reuses the chain verify path, so ``speculative_num_steps`` and
+        ``speculative_num_draft_tokens`` keep the chain contract
+        (``draft_tokens == steps + 1``). Reject configurations that don't
+        make sense for a CPU-side lookup-only drafter to surface mistakes
+        at startup instead of mid-run.
+        """
+        if self.speculative_draft_model_path is not None:
+            raise ValueError(
+                "--speculative-algorithm NGRAM does not use a draft model; "
+                "remove --speculative-draft-model-path."
+            )
+        if self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--speculative-algorithm NGRAM only supports topk=1 (chain), "
+                f"got --speculative-eagle-topk={self.speculative_eagle_topk}."
+            )
+        expected_draft_tokens = self.speculative_num_steps + 1
+        if self.speculative_num_draft_tokens != expected_draft_tokens:
+            raise ValueError(
+                "--speculative-algorithm NGRAM requires "
+                "--speculative-num-draft-tokens == --speculative-num-steps + 1, "
+                f"got {self.speculative_num_draft_tokens} != "
+                f"{expected_draft_tokens}."
+            )
+        if self.speculative_ngram_min < 1:
+            raise ValueError(
+                "--speculative-ngram-min must be >= 1, got "
+                f"{self.speculative_ngram_min}."
+            )
+        if self.speculative_ngram_max < self.speculative_ngram_min:
+            raise ValueError(
+                "--speculative-ngram-max must be >= --speculative-ngram-min, got "
+                f"{self.speculative_ngram_max} < {self.speculative_ngram_min}."
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--speculative-algorithm NGRAM is not yet supported under "
+                "prefill/decode disaggregation."
+            )
+
+        # The first NGRAM implementation keeps its own per-request CPU token
+        # history. Disable features that can make that history diverge from
+        # the committed request stream until the runtime exposes a reset /
+        # commit signal for those paths.
+        if self.enable_prefix_caching:
+            logger.warning(
+                "--speculative-algorithm NGRAM disables prefix caching in this "
+                "release."
+            )
+            self.enable_prefix_caching = False
+        if not self.enable_prefix_caching and self.enable_kvstore:
+            logger.warning(
+                "--speculative-algorithm NGRAM disables KVStore because prefix "
+                "caching is disabled in this release."
+            )
+            self.enable_kvstore = False
+            self.disable_kvstore = True
+        if self.chunked_prefill_size != -1:
+            logger.warning(
+                "--speculative-algorithm NGRAM disables chunked prefill in this "
+                "release."
+            )
+            self.chunked_prefill_size = -1
+
+        # NGRAM's drafter runs on CPU and is not part of the captured
+        # graph in this first cut. Force eager so users don't silently
+        # hit graph-capture failures during warmup.
+        if not self.enforce_eager:
+            logger.warning(
+                "--speculative-algorithm NGRAM forces --enforce-eager in this "
+                "release; CUDA-graph capture will be enabled in a follow-up PR."
+            )
+            self.enforce_eager = True
+
+        # NGRAM has no drafter attention path.
+        self.drafter_attention_backend = None
+        self.speculative_draft_model_quantization = None
+        self.draft_model_path_use_base = False
 
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
@@ -1338,7 +1427,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP"],
+            choices=["EAGLE3", "MTP", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1370,6 +1459,18 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-ngram-min",
+            type=int,
+            default=ServerArgs.speculative_ngram_min,
+            help="Minimum n-gram length (NGRAM algorithm only).",
+        )
+        parser.add_argument(
+            "--speculative-ngram-max",
+            type=int,
+            default=ServerArgs.speculative_ngram_max,
+            help="Maximum n-gram length (NGRAM algorithm only).",
         )
         parser.add_argument(
             "--enable-output-logprobs",

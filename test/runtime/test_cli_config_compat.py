@@ -475,6 +475,146 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_num_steps, 1)
         self.assertEqual(sa.speculative_num_draft_tokens, 2)
 
+    # N-gram (prompt-lookup) speculative decoding
+
+    def _from_cli_args_for_ngram(self, argv: list[str]) -> ServerArgs:
+        """Parse argv and apply the basic + speculative resolvers used at
+        startup so NGRAM-specific validation runs.
+
+        We deliberately avoid the full ``__post_init__`` so the test
+        does not pull in GPU/parallelism resolution.
+        """
+        args = self._parse_args(argv)
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        sa.resolve_speculative_decoding()
+        return sa
+
+    def test_ngram_via_speculative_algorithm(self):
+        sa = self._from_cli_args_for_ngram(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "NGRAM",
+                "--speculative-num-steps",
+                "5",
+                "--speculative-ngram-min",
+                "2",
+                "--speculative-ngram-max",
+                "4",
+            ]
+        )
+        self.assertEqual(sa.speculative_algorithm, "NGRAM")
+        self.assertEqual(sa.speculative_num_steps, 5)
+        self.assertEqual(sa.speculative_num_draft_tokens, 6)
+        self.assertEqual(sa.speculative_ngram_min, 2)
+        self.assertEqual(sa.speculative_ngram_max, 4)
+        self.assertIsNone(sa.speculative_draft_model_path)
+        self.assertIsNone(sa.drafter_attention_backend)
+        self.assertTrue(sa.enforce_eager)
+        self.assertFalse(sa.enable_prefix_caching)
+        self.assertEqual(sa.chunked_prefill_size, -1)
+
+    def test_ngram_via_speculative_config(self):
+        sa = self._from_cli_args_for_ngram(
+            [
+                "--model",
+                "test/model",
+                "--speculative-config",
+                '{"method":"ngram","num_speculative_tokens":2}',
+            ]
+        )
+        self.assertEqual(sa.speculative_algorithm, "NGRAM")
+        self.assertEqual(sa.speculative_num_steps, 2)
+        self.assertEqual(sa.speculative_num_draft_tokens, 3)
+
+    def test_ngram_rejects_draft_model_path(self):
+        with self.assertRaisesRegex(ValueError, "NGRAM does not use a draft model"):
+            self._from_cli_args_for_ngram(
+                [
+                    "--model",
+                    "test/model",
+                    "--speculative-algorithm",
+                    "NGRAM",
+                    "--speculative-draft-model-path",
+                    "some/draft",
+                ]
+            )
+
+    def test_ngram_rejects_topk_other_than_one(self):
+        with self.assertRaisesRegex(ValueError, "NGRAM only supports topk=1"):
+            self._from_cli_args_for_ngram(
+                [
+                    "--model",
+                    "test/model",
+                    "--speculative-algorithm",
+                    "NGRAM",
+                    "--speculative-eagle-topk",
+                    "2",
+                ]
+            )
+
+    def test_ngram_rejects_mismatched_draft_token_width(self):
+        with self.assertRaisesRegex(
+            ValueError, "NGRAM requires .*num-draft-tokens"
+        ):
+            self._from_cli_args_for_ngram(
+                [
+                    "--model",
+                    "test/model",
+                    "--speculative-algorithm",
+                    "NGRAM",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-num-draft-tokens",
+                    "3",
+                ]
+            )
+
+    def test_ngram_rejects_invalid_ngram_bounds(self):
+        with self.assertRaisesRegex(ValueError, "--speculative-ngram-min must be >= 1"):
+            self._from_cli_args_for_ngram(
+                [
+                    "--model",
+                    "test/model",
+                    "--speculative-algorithm",
+                    "NGRAM",
+                    "--speculative-ngram-min",
+                    "0",
+                ]
+            )
+        with self.assertRaisesRegex(
+            ValueError, "--speculative-ngram-max must be >= --speculative-ngram-min"
+        ):
+            self._from_cli_args_for_ngram(
+                [
+                    "--model",
+                    "test/model",
+                    "--speculative-algorithm",
+                    "NGRAM",
+                    "--speculative-ngram-min",
+                    "4",
+                    "--speculative-ngram-max",
+                    "2",
+                ]
+            )
+
+    def test_ngram_rejects_disaggregation_mode(self):
+        with self.assertRaisesRegex(
+            ValueError, "NGRAM is not yet supported under .* disaggregation"
+        ):
+            self._from_cli_args_for_ngram(
+                [
+                    "--model",
+                    "test/model",
+                    "--speculative-algorithm",
+                    "NGRAM",
+                    "--disaggregation-mode",
+                    "prefill",
+                ]
+            )
+
     # ---- Full server command example ----
 
     def test_full_server_command(self):

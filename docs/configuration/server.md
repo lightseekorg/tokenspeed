@@ -116,16 +116,38 @@ Common parser values include `kimi_k2` and `gpt-oss`.
 | Parameter | Purpose |
 | --- | --- |
 | `--speculative-config` | JSON speculative decoding configuration. |
-| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3` or `MTP`. |
+| `--speculative-algorithm` | Speculative algorithm: `EAGLE3`, `MTP`, or `NGRAM`. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
+| `--speculative-ngram-min` | Minimum n-gram length (NGRAM only). Defaults to `1`. |
+| `--speculative-ngram-max` | Maximum n-gram length (NGRAM only). Defaults to `3`. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+### N-gram (prompt-lookup) Speculative Decoding
+
+`--speculative-algorithm NGRAM` runs a draft-model-free proposer that matches
+the longest suffix-ngram in each request's running token history (capped by
+`--speculative-ngram-max`) and speculates the tokens that follow the rightmost
+match. It reuses the chain verify path, so no extra verify kernel is needed.
+
+The first release is intentionally narrow:
+
+- Single-rank only; running under PD disaggregation is rejected at startup.
+- The drafter runs outside the captured CUDA graph, so `--enforce-eager` is
+  auto-enabled with a warning.
+- `enable_prefix_caching`, `enable_kvstore`, and chunked prefill are
+  auto-disabled because the proposer keeps its own per-request token history
+  and prefix-cache hits would skip the prefill path it relies on.
+- `--speculative-eagle-topk` must be `1` (chain only), and
+  `--speculative-num-draft-tokens` must equal `--speculative-num-steps + 1`.
+
+JSON form: `--speculative-config '{"method":"ngram","num_speculative_tokens":3}'`.
 
 ## Observability
 

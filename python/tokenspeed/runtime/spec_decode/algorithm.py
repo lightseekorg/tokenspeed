@@ -25,11 +25,13 @@ class SpeculativeAlgorithm(IntEnum):
     NONE = auto()
     EAGLE3 = auto()
     MTP = auto()
+    NGRAM = auto()
 
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
     def needs_draft_decode_prealloc(self) -> bool:
+        # NGRAM has no draft model and therefore no draft KV slots to reserve.
         return self in (SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.MTP)
 
     @staticmethod
@@ -37,6 +39,7 @@ class SpeculativeAlgorithm(IntEnum):
         name_map = {
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "MTP": SpeculativeAlgorithm.MTP,
+            "NGRAM": SpeculativeAlgorithm.NGRAM,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:

@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
+from tokenspeed.runtime.execution.drafter.ngram import NgramDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -59,7 +60,7 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "NGRAM": NgramDrafter}
 
 
 @dataclass
@@ -75,7 +76,7 @@ class ModelExecutorConfig:
     enforce_eager: bool
     block_size: int
     max_num_seqs: int
-    chunked_prefill_size: int
+    max_num_input_tokens: int
     vocab_size: int
     context_len: int
     device: str
@@ -97,6 +98,9 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    # NGRAM-only: bounds for KMP suffix-ngram lookup.
+    spec_ngram_min: int = 1
+    spec_ngram_max: int = 3
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -121,13 +125,18 @@ class ModelExecutorConfig:
             if server_args.speculative_algorithm
             else 1
         )
+        max_num_input_tokens = (
+            server_args.chunked_prefill_size
+            if server_args.chunked_prefill_size > 0
+            else server_args.max_prefill_tokens + server_args.max_model_len
+        )
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
             block_size=server_args.block_size,
             max_num_seqs=server_args.max_num_seqs,
-            chunked_prefill_size=server_args.chunked_prefill_size,
+            max_num_input_tokens=max_num_input_tokens,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
             device=server_args.device,
@@ -144,6 +153,8 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            spec_ngram_min=server_args.speculative_ngram_min,
+            spec_ngram_max=server_args.speculative_ngram_max,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -193,7 +204,7 @@ class ModelExecutor:
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
             max_bs=config.max_num_seqs // max(config.data_parallel_size, 1),
-            max_num_tokens=config.chunked_prefill_size,
+            max_num_tokens=config.max_num_input_tokens,
             page_size=config.block_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
@@ -211,24 +222,39 @@ class ModelExecutor:
         )
         if self.config.spec_algo is not None:
             DrafterImpl = _DRAFTER_MAPPING[config.spec_algo]
-            self.drafter = DrafterImpl(
-                spec_num_tokens=config.spec_num_tokens,
-                spec_num_steps=config.spec_num_steps,
-                draft_model_runner=draft_model_runner,
-                page_size=config.block_size,
-                runtime_states=self.runtime_states,
-                input_buffers=self.input_buffers,
-                req_to_page=self.req_to_page,
-                attn_backend=draft_attn_backend,
-                token_to_kv_pool=draft_token_to_kv_pool,
-                vocab_size=config.vocab_size,
-            )
-            embed, head = self.model_runner.model.get_embed_and_head()
-            draft_model_runner.model.set_embed_and_head(embed, head)
-            if config.spec_algo in ("EAGLE3",) and hasattr(
-                self.model_runner.model, "set_eagle3_layers_to_capture"
-            ):
-                self.model_runner.model.set_eagle3_layers_to_capture()
+            if config.spec_algo == "NGRAM":
+                # NGRAM is a prompt-lookup proposer with no draft model,
+                # no draft attention backend, and no draft KV pool. The
+                # executor must not have been wired with any of those.
+                self.drafter = DrafterImpl(
+                    spec_num_tokens=config.spec_num_tokens,
+                    spec_num_steps=config.spec_num_steps,
+                    runtime_states=self.runtime_states,
+                    input_buffers=self.input_buffers,
+                    max_context_len=config.context_len,
+                    vocab_size=config.vocab_size,
+                    min_ngram=config.spec_ngram_min,
+                    max_ngram=config.spec_ngram_max,
+                )
+            else:
+                self.drafter = DrafterImpl(
+                    spec_num_tokens=config.spec_num_tokens,
+                    spec_num_steps=config.spec_num_steps,
+                    draft_model_runner=draft_model_runner,
+                    page_size=config.block_size,
+                    runtime_states=self.runtime_states,
+                    input_buffers=self.input_buffers,
+                    req_to_page=self.req_to_page,
+                    attn_backend=draft_attn_backend,
+                    token_to_kv_pool=draft_token_to_kv_pool,
+                    vocab_size=config.vocab_size,
+                )
+                embed, head = self.model_runner.model.get_embed_and_head()
+                draft_model_runner.model.set_embed_and_head(embed, head)
+                if config.spec_algo in ("EAGLE3",) and hasattr(
+                    self.model_runner.model, "set_eagle3_layers_to_capture"
+                ):
+                    self.model_runner.model.set_eagle3_layers_to_capture()
         else:
             self.drafter = None
 
@@ -694,10 +720,12 @@ class ModelExecutor:
             input_lengths=empty,
         )
 
-        # If a drafter is active, its model also has MoE layers that issue
-        # NCCL collectives. Idle ranks must match those collectives:
-        # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
-        if self.drafter is not None:
+        # If a drafter with a draft model is active, that model has MoE
+        # layers that issue NCCL collectives. Idle ranks must match those
+        # collectives: 1 first-step forward + (spec_num_steps - 1) multi-step
+        # decode forwards. NGRAM has no draft model and therefore nothing
+        # extra to match here.
+        if self.drafter is not None and self.drafter.draft_model_runner is not None:
             draft_ctx = ForwardContext(
                 attn_backend=self.drafter.attn_backend,
                 token_to_kv_pool=self.drafter.token_to_kv_pool,
@@ -872,7 +900,10 @@ class ModelExecutor:
                     forward_mode=forward_mode,
                     capture_hidden_mode=(
                         CaptureHiddenMode.FULL
-                        if self.drafter is not None
+                        if (
+                            self.drafter is not None
+                            and self.config.spec_algo != "NGRAM"
+                        )
                         else CaptureHiddenMode.NULL
                     ),
                     padded_static_len=-1,
