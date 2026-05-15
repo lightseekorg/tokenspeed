@@ -227,6 +227,8 @@ def test_no_register_spill():
     """
     from tokenspeed_kernel.ops.moe.gluon import (
         _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
+    )
+    from tokenspeed_kernel.ops.moe.gluon import (
         assert_no_spills,
         gluon_bf16_combine,
         gluon_bf16_dispatch_swiglu,
@@ -381,6 +383,8 @@ def test_gpt_oss_no_spill(B):
     (sparse, ``B=1``) and prefill (dense, ``B=64``) at gpt-oss-120b sizes."""
     from tokenspeed_kernel.ops.moe.gluon import (
         _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
+    )
+    from tokenspeed_kernel.ops.moe.gluon import (
         assert_no_spills,
         gluon_bf16_combine,
         gluon_bf16_dispatch_swiglu,
@@ -578,11 +582,18 @@ def _fp8_pair(M: int, K: int, fmt: str, *, device="cuda"):
     return u, u.view(view).to(torch.float32)
 
 
-@pytest.mark.parametrize("scale_mode", ["bypass", "transpose", "swizzle"])
-@pytest.mark.parametrize("M,N,K", [
-    (32, 32, 256), (64, 128, 256), (128, 64, 256),
-    (64, 128, 2880),
-])
+@pytest.mark.parametrize(
+    "scale_mode", ["bypass", "transpose", "swizzle", "cdna4_upstream"]
+)
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (32, 32, 256),
+        (64, 128, 256),
+        (128, 64, 256),
+        (64, 128, 2880),
+    ],
+)
 def test_mxfp4_x_mxfp4_gating(M, N, K, scale_mode):
     """``e2m1`` x ``e2m1`` dense GEMM via scaled MFMA."""
     from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
@@ -608,12 +619,20 @@ def test_mxfp4_x_mxfp4_gating(M, N, K, scale_mode):
     assert rel < 5e-2, f"rel_max={rel} too large"
 
 
-@pytest.mark.parametrize("scale_mode", ["bypass", "transpose", "swizzle"])
+@pytest.mark.parametrize(
+    "scale_mode", ["bypass", "transpose", "swizzle", "cdna4_upstream"]
+)
 @pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("M,N,K", [(32, 32, 128), (64, 128, 256)])
 def test_fp8_x_mxfp4_gating(fmt, M, N, K, scale_mode):
     """``e4m3``/``e5m2`` (A) x ``e2m1`` (W) GEMM with global A scale."""
     from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
+
+    if scale_mode == "cdna4_upstream" and K < 256:
+        pytest.skip(
+            "cdna4_upstream needs BLOCK_K >= 256 (-> K >= 256 for the "
+            "single-tile case)."
+        )
 
     torch.manual_seed(0)
     a_u8, a_fp32 = _fp8_pair(M, K, fmt)
@@ -622,6 +641,11 @@ def test_fp8_x_mxfp4_gating(fmt, M, N, K, scale_mode):
     w_scale_kn = w_scale_nk.T.contiguous()
     a_global = 0.137
 
+    # cdna4_upstream requires block_k >= 256 (so MX_SCALE_BLOCK_K >= 8 for
+    # the inner-8 reshape in `unswizzle_mx_scale_cdna4`); the other modes
+    # can use the smaller block_k=128 which exercises the partial-K-tile
+    # masking path. Let autotune pick block_k for cdna4_upstream.
+    block_k_arg = None if scale_mode == "cdna4_upstream" else 128
     y = gluon_mxfp_gating_gemm(
         a_u8,
         w_packed,
@@ -630,7 +654,7 @@ def test_fp8_x_mxfp4_gating(fmt, M, N, K, scale_mode):
         a_format=fmt,
         a_global_scale=a_global,
         out_dtype=torch.float32,
-        block_k=128,
+        block_k=block_k_arg,
         scale_load_mode=scale_mode,
     )
     y_ref = a_global * (a_fp32 @ (w_fp32 * w_scale_kn))
