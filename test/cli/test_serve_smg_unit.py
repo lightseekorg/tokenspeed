@@ -102,6 +102,8 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "none",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--tokenizer-cache-enable-l0",
+        "--tokenizer-cache-enable-l1",
         "--log-level",
         "warn",
         "--prometheus-port",
