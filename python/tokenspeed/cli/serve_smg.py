@@ -123,6 +123,38 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
     return result
 
 
+_TOKENIZER_CACHE_FLAGS = (
+    "--tokenizer-cache-enable-l0",
+    "--tokenizer-cache-enable-l1",
+)
+
+
+def _gateway_args_with_default_tokenizer_cache(gateway_args: list[str]) -> list[str]:
+    """Default smg tokenizer caches (L0 + L1) ON for gateway-fronted launches.
+
+    For agentic / chat-completions traffic with a shared system prompt + history,
+    L1 prefix-caching at special-token boundaries cuts TTFT by ~30% (verified
+    end-to-end on mm25). smg's own clap defaults leave both layers OFF.
+
+    Opt-out: operators can pass ``--no-tokenizer-cache-enable-l0`` and/or
+    ``--no-tokenizer-cache-enable-l1`` to ``ts serve``. The ``--no-`` form is
+    intercepted here (smg's clap doesn't accept it natively) and prevents the
+    positive injection for that layer.
+    """
+    result = list(gateway_args)
+    for flag in _TOKENIZER_CACHE_FLAGS:
+        no_flag = "--no-" + flag[2:]
+        if no_flag in result:
+            # Operator opted out: strip the --no- marker (smg rejects it)
+            # and skip the positive injection for this layer.
+            while no_flag in result:
+                result.remove(no_flag)
+            continue
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
 def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     if "--log-level" in gateway_args:
         return gateway_args
@@ -190,6 +222,7 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
     gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
+    gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
     gateway_args = _gateway_args_with_default_log_level(gateway_args)
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
