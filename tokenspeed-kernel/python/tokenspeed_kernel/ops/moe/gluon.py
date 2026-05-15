@@ -1657,206 +1657,61 @@ def _pipelined_moe_kernel_scaled(
     USE_BLOCK_SCHEDULE: gl.constexpr = False,
     N_EXPTS_TOT: gl.constexpr = 0,
 ):
-    """Top-level MoE GEMM kernel.
+    """Top-level MoE GEMM kernel. Iteration mode is constexpr-selected:
 
-    Three scheduling modes, picked by the launcher to match the host
-    invocation context (CUDA-graph capture vs eager) and the workload.
+    - ``USE_BLOCK_SCHEDULE``: 1-D grid driven by the device-side ragged
+      schedule (graph-capturable). ``block_schedule[pid_m]`` packs
+      ``(block_in_expert << 16) | expert_id``; entries past
+      ``block_offs[N_EXPTS_TOT]`` are padding and cheap-skipped.
+    - ``PERSISTENT``: 1-D grid; each CTA strides through ``NUM_TILES``.
+    - Otherwise: legacy 2-D grid ``(block_pid, compact_idx)``.
 
-    1. ``USE_BLOCK_SCHEDULE=False, PERSISTENT=False`` (legacy):
-       2-D grid ``(blocks_per_expert * grid_n, num_active)``; each CTA
-       computes one tile ``(compact_idx, block_in_expert, pid_n)``.
-       Requires host-side ``_expert_layout`` which does a ``.tolist()``
-       on ``slice_sizes`` -- NOT graph-capturable.
-
-    2. ``USE_BLOCK_SCHEDULE=False, PERSISTENT=True`` (legacy persistent):
-       1-D grid sized to occupy the GPU; each CTA strides through tiles
-       ``0..NUM_TILES-1`` where ``NUM_TILES = num_active *
-       blocks_per_expert * grid_n``. Same host-side blocker as (1).
-
-    3. ``USE_BLOCK_SCHEDULE=True`` (graph-capturable, this CL):
-       Borrows triton_kernels' device-side ragged schedule. Host picks
-       ``grid_m`` = ``RaggedTensorMetadata.n_blocks(E, M, BLOCK_M)`` (a
-       pure-integer upper bound; no D2H sync), and ``block_schedule_ptr``
-       points at the device-side schedule table where entry ``pid_m``
-       packs ``(block_in_expert << 16) | expert_id``. ``block_offs_ptr +
-       N_EXPTS_TOT`` holds the exact number of valid blocks so each CTA
-       early-returns on padded entries -- the cost of a padded tile is
-       a single ``gl.load`` plus a branch, ~zero compared to the prologue
-       of a real tile.
-
-       Combined with ``a_global_scale_ptr`` (the per-tensor flex scale
-       read via ``gl.load`` rather than ``.item()``-ed on the host),
-       this is the path that lets Gluon participate in the production
-       gpt-oss-120b decode CUDA / HIP graph instead of being silently
-       fall-back'd to upstream triton_kernels.
+    All three paths funnel into a single ``_pipelined_moe_tile_compute``.
     """
     grid_n = (N + BLOCK_N - 1) // BLOCK_N
     tiles_per_expert = BLOCKS_PER_EXPERT * grid_n
+
+    # Pick loop bounds: persistent + schedule walk NUM_TILES with stride
+    # num_pids; legacy 2-D grid is one tile per CTA (encoded as a 1-iter
+    # range so the body is shared).
+    if PERSISTENT or USE_BLOCK_SCHEDULE:
+        loop_start = gl.program_id(0)
+        loop_stop = NUM_TILES
+        loop_step = gl.num_programs(0)
+    else:
+        loop_start = gl.program_id(1) * tiles_per_expert + gl.program_id(0)
+        loop_stop = loop_start + 1
+        loop_step = 1
+
+    # Schedule mode: load the unpadded-tile count once for early-skip.
     if USE_BLOCK_SCHEDULE:
-        # Schedule-driven path: grid is 1-D, tiles are dispatched via the
-        # pre-built schedule table. Schedule entry ``pid_m`` is a packed
-        # ``(block_in_expert << 16) | expert_id`` int32; padding entries
-        # past ``actual_unpadded_m`` are ``0xFFFFFFFF`` and we cheap-skip
-        # them by checking ``pid_m < actual_unpadded_m`` before any
-        # ``_pipelined_moe_tile_compute`` work.
-        actual_unpadded_m = gl.load(block_offs_ptr + N_EXPTS_TOT).to(gl.int32)
-        actual_total = actual_unpadded_m * grid_n
-        if PERSISTENT:
-            pid = gl.program_id(0)
-            num_pids = gl.num_programs(0)
-            for tile_idx in range(pid, NUM_TILES, num_pids):
-                if tile_idx < actual_total:
-                    pid_m = tile_idx // grid_n
-                    pid_n = tile_idx % grid_n
-                    schedule_raw = gl.load(block_schedule_ptr + pid_m).to(
-                        gl.uint32, bitcast=True
-                    )
-                    expert_id = (schedule_raw & 0x0000FFFF).to(gl.int32)
-                    block_in_expert = (schedule_raw >> 16).to(gl.int32)
-                    _pipelined_moe_tile_compute(
-                        x_ptr,
-                        w_ptr,
-                        x_scale_ptr,
-                        w_scale_ptr,
-                        bias_ptr,
-                        y_ptr,
-                        gather_idx_ptr,
-                        scatter_idx_ptr,
-                        gate_scal_ptr,
-                        expert_remap_ptr,
-                        slice_offs_ptr,
-                        slice_sizes_ptr,
-                        stride_xm,
-                        stride_xk,
-                        stride_we,
-                        stride_wn,
-                        stride_wk,
-                        stride_xsm,
-                        stride_xsk,
-                        stride_wse,
-                        stride_wsn,
-                        stride_wsk,
-                        stride_yn,
-                        stride_ym,
-                        stride_be,
-                        stride_bn,
-                        M,
-                        M_X,
-                        N,
-                        K,
-                        x_global_scale_ptr,
-                        expert_id,
-                        block_in_expert,
-                        pid_n,
-                        BLOCK_M=BLOCK_M,
-                        BLOCK_N=BLOCK_N,
-                        BLOCK_K=BLOCK_K,
-                        BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
-                        X_FORMAT=X_FORMAT,
-                        W_FORMAT=W_FORMAT,
-                        UPCAST_INDICES=UPCAST_INDICES,
-                        HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
-                        HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
-                        HAS_BIAS=HAS_BIAS,
-                        HAS_GATHER=HAS_GATHER,
-                        HAS_SCATTER=HAS_SCATTER,
-                        DO_SWIGLU=DO_SWIGLU,
-                        SWIGLU_ALPHA=SWIGLU_ALPHA,
-                        SWIGLU_LIMIT=SWIGLU_LIMIT,
-                        OUT_BLOCK_N=OUT_BLOCK_N,
-                        APPLY_GATE_SCAL=APPLY_GATE_SCAL,
-                        HAS_EXPERT_REMAP=False,
-                        HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
-                        NUM_WARPS=NUM_WARPS,
-                        NUM_BUFFERS=NUM_BUFFERS,
-                        SCALE_LOAD_MODE=SCALE_LOAD_MODE,
-                        W_TRANSPOSE=W_TRANSPOSE,
-                        NUM_SUBTILES=NUM_SUBTILES,
-                        EVEN_K=EVEN_K,
-                        APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
-                        USE_WARP_PIPELINE=USE_WARP_PIPELINE,
-                    )
+        actual_total = gl.load(block_offs_ptr + N_EXPTS_TOT).to(gl.int32) * grid_n
+
+    # Schedule entries already encode the real expert_id, so the tile
+    # compute must skip the expert_remap[] lookup in that mode.
+    TILE_HAS_EXPERT_REMAP: gl.constexpr = HAS_EXPERT_REMAP and not USE_BLOCK_SCHEDULE
+
+    for tile_idx in range(loop_start, loop_stop, loop_step):
+        if USE_BLOCK_SCHEDULE:
+            do_tile = tile_idx < actual_total
         else:
-            pid = gl.program_id(0)
-            if pid < actual_total:
-                pid_m = pid // grid_n
-                pid_n = pid % grid_n
+            do_tile = True
+
+        if do_tile:
+            if USE_BLOCK_SCHEDULE:
+                pid_m = tile_idx // grid_n
+                pid_n = tile_idx % grid_n
                 schedule_raw = gl.load(block_schedule_ptr + pid_m).to(
                     gl.uint32, bitcast=True
                 )
-                expert_id = (schedule_raw & 0x0000FFFF).to(gl.int32)
+                compact_idx = (schedule_raw & 0x0000FFFF).to(gl.int32)
                 block_in_expert = (schedule_raw >> 16).to(gl.int32)
-                _pipelined_moe_tile_compute(
-                    x_ptr,
-                    w_ptr,
-                    x_scale_ptr,
-                    w_scale_ptr,
-                    bias_ptr,
-                    y_ptr,
-                    gather_idx_ptr,
-                    scatter_idx_ptr,
-                    gate_scal_ptr,
-                    expert_remap_ptr,
-                    slice_offs_ptr,
-                    slice_sizes_ptr,
-                    stride_xm,
-                    stride_xk,
-                    stride_we,
-                    stride_wn,
-                    stride_wk,
-                    stride_xsm,
-                    stride_xsk,
-                    stride_wse,
-                    stride_wsn,
-                    stride_wsk,
-                    stride_yn,
-                    stride_ym,
-                    stride_be,
-                    stride_bn,
-                    M,
-                    M_X,
-                    N,
-                    K,
-                    x_global_scale_ptr,
-                    expert_id,
-                    block_in_expert,
-                    pid_n,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    BLOCK_K=BLOCK_K,
-                    BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
-                    X_FORMAT=X_FORMAT,
-                    W_FORMAT=W_FORMAT,
-                    UPCAST_INDICES=UPCAST_INDICES,
-                    HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
-                    HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
-                    HAS_BIAS=HAS_BIAS,
-                    HAS_GATHER=HAS_GATHER,
-                    HAS_SCATTER=HAS_SCATTER,
-                    DO_SWIGLU=DO_SWIGLU,
-                    SWIGLU_ALPHA=SWIGLU_ALPHA,
-                    SWIGLU_LIMIT=SWIGLU_LIMIT,
-                    OUT_BLOCK_N=OUT_BLOCK_N,
-                    APPLY_GATE_SCAL=APPLY_GATE_SCAL,
-                    HAS_EXPERT_REMAP=False,
-                    HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
-                    NUM_WARPS=NUM_WARPS,
-                    NUM_BUFFERS=NUM_BUFFERS,
-                    SCALE_LOAD_MODE=SCALE_LOAD_MODE,
-                    W_TRANSPOSE=W_TRANSPOSE,
-                    NUM_SUBTILES=NUM_SUBTILES,
-                    EVEN_K=EVEN_K,
-                    APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
-                    USE_WARP_PIPELINE=USE_WARP_PIPELINE,
-                )
-    elif PERSISTENT:
-        pid = gl.program_id(0)
-        num_pids = gl.num_programs(0)
-        for tile_idx in range(pid, NUM_TILES, num_pids):
-            compact_idx = tile_idx // tiles_per_expert
-            local = tile_idx % tiles_per_expert
-            block_in_expert = local // grid_n
-            pid_n = local % grid_n
+            else:
+                compact_idx = tile_idx // tiles_per_expert
+                local = tile_idx % tiles_per_expert
+                block_in_expert = local // grid_n
+                pid_n = local % grid_n
+
             _pipelined_moe_tile_compute(
                 x_ptr,
                 w_ptr,
@@ -1909,7 +1764,7 @@ def _pipelined_moe_kernel_scaled(
                 SWIGLU_LIMIT=SWIGLU_LIMIT,
                 OUT_BLOCK_N=OUT_BLOCK_N,
                 APPLY_GATE_SCAL=APPLY_GATE_SCAL,
-                HAS_EXPERT_REMAP=HAS_EXPERT_REMAP,
+                HAS_EXPERT_REMAP=TILE_HAS_EXPERT_REMAP,
                 HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
                 NUM_WARPS=NUM_WARPS,
                 NUM_BUFFERS=NUM_BUFFERS,
@@ -1920,74 +1775,6 @@ def _pipelined_moe_kernel_scaled(
                 APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
                 USE_WARP_PIPELINE=USE_WARP_PIPELINE,
             )
-    else:
-        compact_idx = gl.program_id(1)
-        block_pid = gl.program_id(0)
-        block_in_expert = block_pid // grid_n
-        pid_n = block_pid % grid_n
-        _pipelined_moe_tile_compute(
-            x_ptr,
-            w_ptr,
-            x_scale_ptr,
-            w_scale_ptr,
-            bias_ptr,
-            y_ptr,
-            gather_idx_ptr,
-            scatter_idx_ptr,
-            gate_scal_ptr,
-            expert_remap_ptr,
-            slice_offs_ptr,
-            slice_sizes_ptr,
-            stride_xm,
-            stride_xk,
-            stride_we,
-            stride_wn,
-            stride_wk,
-            stride_xsm,
-            stride_xsk,
-            stride_wse,
-            stride_wsn,
-            stride_wsk,
-            stride_yn,
-            stride_ym,
-            stride_be,
-            stride_bn,
-            M,
-            M_X,
-            N,
-            K,
-            x_global_scale_ptr,
-            compact_idx,
-            block_in_expert,
-            pid_n,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
-            X_FORMAT=X_FORMAT,
-            W_FORMAT=W_FORMAT,
-            UPCAST_INDICES=UPCAST_INDICES,
-            HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
-            HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
-            HAS_BIAS=HAS_BIAS,
-            HAS_GATHER=HAS_GATHER,
-            HAS_SCATTER=HAS_SCATTER,
-            DO_SWIGLU=DO_SWIGLU,
-            SWIGLU_ALPHA=SWIGLU_ALPHA,
-            SWIGLU_LIMIT=SWIGLU_LIMIT,
-            OUT_BLOCK_N=OUT_BLOCK_N,
-            APPLY_GATE_SCAL=APPLY_GATE_SCAL,
-            HAS_EXPERT_REMAP=HAS_EXPERT_REMAP,
-            HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
-            NUM_WARPS=NUM_WARPS,
-            NUM_BUFFERS=NUM_BUFFERS,
-            SCALE_LOAD_MODE=SCALE_LOAD_MODE,
-            W_TRANSPOSE=W_TRANSPOSE,
-            NUM_SUBTILES=NUM_SUBTILES,
-            EVEN_K=EVEN_K,
-            APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
-            USE_WARP_PIPELINE=USE_WARP_PIPELINE,
-        )
 
 
 # ---------------------------------------------------------------------------
