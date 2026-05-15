@@ -6,7 +6,7 @@ DP=4 + expert parallel + mega_moe + FP8 KV cache (B200, 4× SM100):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
-    --host localhost --port 30100 \
+    --host localhost --port 8000 \
     --dist-init-addr 127.0.0.1:4013 \
     --trust-remote-code \
     --data-parallel-size 4 \
@@ -68,7 +68,7 @@ GSM8K 5-shot, 50 samples is the standard quick-validation harness for V4:
 ```bash
 HF_DATASETS_TRUST_REMOTE_CODE=1 lm_eval run \
     --model local-completions \
-    --model_args "model=deepseek-ai/DeepSeek-V4-Flash,base_url=http://127.0.0.1:30100/v1/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=4,max_retries=1,timeout=600,max_gen_toks=256" \
+    --model_args "model=deepseek-ai/DeepSeek-V4-Flash,base_url=http://127.0.0.1:8000/v1/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=4,max_retries=1,timeout=600,max_gen_toks=256" \
     --tasks gsm8k --num_fewshot 5 --limit 50 --batch_size 1 \
     --gen_kwargs temperature=0
 ```

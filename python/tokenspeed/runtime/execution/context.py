@@ -59,3 +59,4 @@ class ForwardContext:
 
     # --- logits processor ---
     keep_full_logits: bool = False
+    last_index_offsets: torch.Tensor | None = None

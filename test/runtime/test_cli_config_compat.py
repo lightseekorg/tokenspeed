@@ -481,6 +481,29 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_num_steps, 1)
         self.assertEqual(sa.speculative_num_draft_tokens, 2)
 
+    def test_speculative_eagle_topk_cli_rejects_non_1(self):
+        # Only chain spec (topk=1) is wired end-to-end; the CLI choices
+        # set is the gate, so non-1 values must fail at parse time.
+        with self.assertRaises(SystemExit):
+            self._parse_args(["--model", "test/model", "--speculative-eagle-topk", "4"])
+
+    def test_speculative_eagle_topk_runtime_rejects_non_1_when_spec_on(self):
+        # ServerArgs can be built programmatically (e.g. by smg_grpc_servicer),
+        # bypassing argparse — keep the resolve-time defensive check covered.
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "EAGLE3",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.speculative_eagle_topk = 4
+        sa.resolve_basic_defaults()
+        with self.assertRaisesRegex(ValueError, "speculative_eagle_topk"):
+            sa.resolve_speculative_decoding()
+
     # ---- Full server command example ----
 
     def test_full_server_command(self):

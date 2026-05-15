@@ -214,7 +214,6 @@ class DefaultModelLoader(BaseModelLoader):
         if envs.TOKENSPEED_USE_MODELSCOPE.is_set():
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
-            # pylint: disable=C.
             from modelscope.hub.snapshot_download import snapshot_download
 
             if not os.path.exists(model):

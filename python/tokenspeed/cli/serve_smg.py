@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -50,6 +51,7 @@ DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "none"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -121,17 +123,108 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
     return result
 
 
+_TOKENIZER_CACHE_FLAGS = (
+    "--tokenizer-cache-enable-l0",
+    "--tokenizer-cache-enable-l1",
+)
+
+
+def _gateway_args_with_default_tokenizer_cache(gateway_args: list[str]) -> list[str]:
+    """Default smg tokenizer caches (L0 + L1) ON for gateway-fronted launches.
+
+    For agentic / chat-completions traffic with a shared system prompt + history,
+    L1 prefix-caching at special-token boundaries cuts TTFT by ~30% (verified
+    end-to-end on mm25). smg's own clap defaults leave both layers OFF.
+
+    Opt-out: operators can pass ``--no-tokenizer-cache-enable-l0`` and/or
+    ``--no-tokenizer-cache-enable-l1`` to ``ts serve``. The ``--no-`` form is
+    intercepted here (smg's clap doesn't accept it natively) and prevents the
+    positive injection for that layer.
+    """
+    result = list(gateway_args)
+    for flag in _TOKENIZER_CACHE_FLAGS:
+        no_flag = "--no-" + flag[2:]
+        if no_flag in result:
+            # Operator opted out: strip the --no- marker (smg rejects it)
+            # and skip the positive injection for this layer.
+            while no_flag in result:
+                result.remove(no_flag)
+            continue
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
 def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     if "--log-level" in gateway_args:
         return gateway_args
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
 
 
+def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
+    """Pin the smg Prometheus exporter to ``DEFAULT_SMG_PROMETHEUS_PORT``.
+
+    smg's own default (``29000``) collides easily when multiple ``ts serve``
+    instances share a host or when a previous run hasn't released the
+    port yet — the gateway then exits early and the tokenizer
+    registration job never runs, surfacing later as
+    ``tokenizer_not_found`` on the first request. Pinning a tokenspeed-
+    specific default keeps the port stable for our deployments while
+    still allowing an explicit override.
+    """
+    if "--prometheus-port" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
+
+
+def _user_model_id(gateway_args: list[str]) -> str | None:
+    """Return the value of ``--model`` from a split gateway argv, or ``None``."""
+    try:
+        idx = gateway_args.index("--model")
+    except ValueError:
+        return None
+    if idx + 1 >= len(gateway_args):
+        return None
+    return gateway_args[idx + 1]
+
+
+def _prewarm_hf_tokenizer(model_id: str) -> None:
+    """Download tokenizer artifacts to the HF cache before the gateway boots.
+
+    smg fires its ``AddTokenizer`` job asynchronously after the engine
+    reports SERVING. On fast runners (e.g. b300) the first eval request
+    can race that fetch and fail with ``tokenizer_not_found``. Pulling
+    tokenizer files into the HF cache up front keeps the registration
+    fast regardless of engine startup speed.
+    """
+    if not model_id or os.path.isdir(model_id):
+        return
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            allow_patterns=[
+                "tokenizer*",
+                "special_tokens_map*",
+                "vocab*",
+                "merges*",
+                "*.json",
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HF tokenizer prewarm failed for %s: %s", model_id, exc)
+
+
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
     gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
-    return _gateway_args_with_default_log_level(gateway_args)
+    gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
+    gateway_args = _gateway_args_with_default_log_level(gateway_args)
+    return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
 def _overwrite_sampling_backend(engine_args: list[str]) -> list[str]:
@@ -341,6 +434,10 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     engine_args = _overwrite_sampling_backend(split.engine)
     gateway_args = _gateway_args_with_defaults(split.gateway)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
+
+    model_id = _user_model_id(gateway_args)
+    if model_id is not None:
+        _prewarm_hf_tokenizer(model_id)
     rc = asyncio.run(
         run_smg(
             engine_args=engine_args,

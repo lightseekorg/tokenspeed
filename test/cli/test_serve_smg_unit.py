@@ -38,10 +38,13 @@ from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_port,
+    _gateway_args_with_default_prometheus_port,
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
+    _prewarm_hf_tokenizer,
     _user_host_port_from_gateway_args,
+    _user_model_id,
     run_smg,
 )
 
@@ -99,8 +102,12 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "none",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--tokenizer-cache-enable-l0",
+        "--tokenizer-cache-enable-l1",
         "--log-level",
         "warn",
+        "--prometheus-port",
+        "8413",
     ]
 
 
@@ -114,6 +121,20 @@ def test_gateway_args_preserve_user_log_level():
     gateway_args = _gateway_args_with_default_log_level(["--log-level", "debug"])
 
     assert gateway_args == ["--log-level", "debug"]
+
+
+def test_gateway_args_default_prometheus_port_is_8413():
+    gateway_args = _gateway_args_with_default_prometheus_port(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--prometheus-port", "8413"]
+
+
+def test_gateway_args_preserve_user_prometheus_port():
+    gateway_args = _gateway_args_with_default_prometheus_port(
+        ["--prometheus-port", "29000"]
+    )
+
+    assert gateway_args == ["--prometheus-port", "29000"]
 
 
 def test_smg_disable_flags_appended_when_absent():
@@ -144,6 +165,56 @@ def test_smg_disable_flag_set_covers_both():
         "--disable-circuit-breaker",
         "--disable-retries",
     )
+
+
+def test_user_model_id_extracts_value():
+    assert (
+        _user_model_id(["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"])
+        == "nvidia/Qwen3.5-397B-A17B-NVFP4"
+    )
+
+
+def test_user_model_id_returns_none_when_absent():
+    assert _user_model_id(["--port", "8000"]) is None
+
+
+def test_user_model_id_returns_none_when_model_lacks_value():
+    assert _user_model_id(["--model"]) is None
+
+
+def test_prewarm_skips_local_path(tmp_path):
+    with patch(
+        "huggingface_hub.snapshot_download", side_effect=AssertionError("must not call")
+    ) as sd:
+        _prewarm_hf_tokenizer(str(tmp_path))
+    sd.assert_not_called()
+
+
+def test_prewarm_skips_empty():
+    with patch("huggingface_hub.snapshot_download") as sd:
+        _prewarm_hf_tokenizer("")
+    sd.assert_not_called()
+
+
+def test_prewarm_fetches_tokenizer_artifacts_for_hf_id():
+    with patch("huggingface_hub.snapshot_download") as sd:
+        _prewarm_hf_tokenizer("nvidia/Qwen3.5-397B-A17B-NVFP4")
+    sd.assert_called_once()
+    _, kwargs = sd.call_args
+    assert kwargs["repo_id"] == "nvidia/Qwen3.5-397B-A17B-NVFP4"
+    # Patterns must include tokenizer.json and the surrounding JSON configs;
+    # avoid pulling weight files (no `*.safetensors` etc.).
+    patterns = set(kwargs["allow_patterns"])
+    assert "tokenizer*" in patterns
+    assert "*.json" in patterns
+
+
+def test_prewarm_swallows_download_errors():
+    with patch(
+        "huggingface_hub.snapshot_download", side_effect=RuntimeError("HF down")
+    ):
+        # Must not raise — smg's own retry path is the fallback.
+        _prewarm_hf_tokenizer("nvidia/Qwen3.5-397B-A17B-NVFP4")
 
 
 @pytest.mark.asyncio
