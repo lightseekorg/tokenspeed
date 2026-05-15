@@ -18,13 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# NOTE: ``tokenspeed_kernel`` (which loads ``tokenspeed_triton``'s C
-# extension) must be imported *before* ``torch`` to avoid a torch / triton
-# ABI mismatch that segfaults ``libtriton.so`` initialisation when torch's
-# allocator is loaded first. Importing it here protects every entry point
-# that begins with ``import tokenspeed``.
-import tokenspeed_kernel as _tokenspeed_kernel  # noqa: F401
-
 from tokenspeed._logging import suppress_noisy_third_party_logs
 
 _suppress_noisy_third_party_logs = suppress_noisy_third_party_logs

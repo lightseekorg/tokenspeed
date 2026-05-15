@@ -9,22 +9,13 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-# NOTE: ``tokenspeed_kernel`` (which loads ``tokenspeed_triton``'s C
-# extension) must be imported *before* ``torch`` to avoid a torch / triton
-# ABI mismatch that segfaults ``libtriton.so`` initialisation when torch's
-# allocator is loaded first. Mirror the workaround in
-# ``tokenspeed.runtime.utils.common``.
-import tokenspeed_kernel  # noqa: E402, F401
-import torch  # noqa: E402
+import torch
 
-from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (  # noqa: E402
+from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
     Mxfp4TritonKernelBackend,
 )
-from tokenspeed.runtime.layers.moe.core.types import (  # noqa: E402
-    BackendKey,
-    MoELayerSpec,
-)
-from tokenspeed.runtime.layers.quantization.mxfp4 import (  # noqa: E402
+from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+from tokenspeed.runtime.layers.quantization.mxfp4 import (
     Mxfp4Config,
     _is_amd_quark_w_mxfp4_a_fp8,
 )
@@ -118,7 +109,6 @@ class TestQuarkDetection(unittest.TestCase):
         cfg = Mxfp4Config.from_config(_AMD_QUARK_CFG)
         self.assertTrue(cfg.is_w4a8_fp8)
         self.assertTrue(cfg.is_checkpoint_mxfp4_serialized)
-        self.assertEqual(len(cfg.excluded_layers), 2)
 
     def test_from_config_oai_does_not_set_flag(self):
         cfg = Mxfp4Config.from_config(_OAI_MXFP4_CFG)

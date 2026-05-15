@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import asyncio
-import builtins
 import dataclasses
 import functools
 import io
@@ -55,12 +54,6 @@ from typing import (
     TypeVar,
 )
 
-# NOTE: ``tokenspeed_kernel`` (which pulls in ``tokenspeed_triton``'s C
-# extension) must be imported *before* ``torch`` to avoid a ROCm/Triton ABI
-# mismatch that segfaults ``libtriton.so`` initialisation when torch's
-# allocator is loaded first.
-from tokenspeed_kernel.platform import current_platform  # isort: skip  # noqa: E402
-
 import numpy as np  # noqa: E402
 import psutil  # noqa: E402
 import pybase64  # noqa: E402
@@ -74,6 +67,7 @@ from fastapi.responses import ORJSONResponse  # noqa: E402
 from PIL import Image  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 from starlette.routing import Mount  # noqa: E402
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.func_timer import enable_func_timer
 

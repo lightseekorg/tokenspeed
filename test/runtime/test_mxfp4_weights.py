@@ -10,17 +10,10 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-# NOTE: ``tokenspeed_kernel`` (which loads ``tokenspeed_triton``'s C
-# extension) must be imported *before* ``torch`` to avoid a torch / triton
-# ABI mismatch that segfaults ``libtriton.so`` initialisation when torch's
-# allocator is loaded first.
-import tokenspeed_kernel  # noqa: E402, F401
-import torch  # noqa: E402
-from torch import nn  # noqa: E402
+import torch
+from torch import nn
 
-from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (  # noqa: E402
-    create_mxfp4_weights,
-)
+from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import create_mxfp4_weights
 
 
 class _Backend:
