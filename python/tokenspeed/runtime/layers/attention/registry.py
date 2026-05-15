@@ -284,6 +284,12 @@ def _create_hybrid_linear_attn(
             if server_args.speculative_algorithm is not None
             else 0
         ),
+        max_req_pool_size=(
+            server_args.max_num_seqs
+            // max(
+                server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
+            )
+        ),
     )
     linear_attn_backend.set_pool(mamba_pool)
 

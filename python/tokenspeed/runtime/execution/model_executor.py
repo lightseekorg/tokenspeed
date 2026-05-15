@@ -848,9 +848,21 @@ class ModelExecutor:
                     self.runtime_states.zero_mamba_states(
                         mamba_pool_indices,
                         mamba_cow_src,
-                        self.input_buffers.extend_prefix_lens_buf[:bs],
-                        bs,
+                        self.input_buffers.extend_prefix_lens_buf[:num_extends],
+                        num_extends,
                     )
+                    if hasattr(self.attn_backend, "reset_current_inputs"):
+                        self.attn_backend.reset_current_inputs(
+                            self.input_buffers.req_pool_indices_buf[:num_extends],
+                            mamba_pool_indices[:num_extends],
+                        )
+                elif has_retract:
+                    if hasattr(self.attn_backend, "reset_current_inputs"):
+                        retract_mask = mamba_cow_src[:bs] >= 0
+                        self.attn_backend.reset_current_inputs(
+                            self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
+                            mamba_pool_indices[:bs][retract_mask],
+                        )
 
             grammar_completion = None
 
