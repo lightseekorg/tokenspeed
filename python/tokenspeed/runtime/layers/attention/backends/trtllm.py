@@ -214,17 +214,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward_decode(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        save_kv_cache: bool = True,
-        **kwargs,
-    ) -> torch.Tensor:
+    def _save_kv_and_prepare_q(
+        self, q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
+    ):
         if self._should_use_fused_fp8_path(save_kv_cache, k):
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
@@ -247,8 +239,23 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         else:
             q = q.contiguous()
 
-        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        return q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        q = self._save_kv_and_prepare_q(
+            q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
+        )
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
@@ -256,7 +263,15 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         if attention_sink is not None:
             attention_sink = attention_sink.float()
 
-        metadata = self.forward_decode_metadata
+        # Multi-token decode (q_len > 1) reads the prefill slot's
+        # uniform-stride metadata; plain decode reads the single-token slot.
+        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        metadata = (
+            self.forward_prefill_metadata
+            if spec_num_tokens > 1
+            else self.forward_decode_metadata
+        )
+
         o = trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=(k_cache, v_cache),
@@ -269,6 +284,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
+            q_len_per_req=metadata.max_seq_len_q,
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -280,34 +296,13 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        forward_mode: ForwardMode,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        if self._should_use_fused_fp8_path(save_kv_cache, k):
-            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v=v.view(-1, layer.tp_k_head_num, layer.head_dim),
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=out_cache_loc,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.page_size,
-            )
-        elif save_kv_cache and k is not None:
-            token_to_kv_pool.set_kv_buffer(
-                layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
-
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
-            q = fp8_cast_contiguous(q)
-        else:
-            q = q.contiguous()
-
-        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-
+        q = self._save_kv_and_prepare_q(
+            q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
+        )
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
@@ -315,52 +310,24 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         if attention_sink is not None:
             attention_sink = attention_sink.float()
 
-        # target_verify and draft_extend both produce uniform spec-length
-        # query batches (init_forward_metadata calls _init_target_verify_metadata
-        # for both), so route both through the latency-tagged decode kernel.
-        use_decode_kernel = (
-            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
-        )
-
         metadata = self.forward_prefill_metadata
-
-        if use_decode_kernel:
-
-            o = trtllm_batch_decode_with_kv_cache(
-                query=q,
-                kv_cache=(k_cache, v_cache),
-                workspace_buffer=self.workspace_buffer,
-                block_tables=metadata.page_table,
-                seq_lens=metadata.cache_seqlens_int32,
-                max_seq_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                window_left=layer.sliding_window_size,
-                sinks=attention_sink,
-                out_dtype=self.dtype,
-                q_len_per_req=metadata.max_seq_len_q,
-            )
-
-        else:
-
-            o = trtllm_batch_context_with_kv_cache(
-                query=q,
-                kv_cache=(k_cache, v_cache),
-                workspace_buffer=self.workspace_buffer,
-                block_tables=metadata.page_table,
-                seq_lens=metadata.cache_seqlens_int32,
-                max_q_len=metadata.max_seq_len_q,
-                max_kv_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                batch_size=metadata.cu_seqlens_q.shape[0] - 1,
-                cum_seq_lens_q=metadata.cu_seqlens_q,
-                cum_seq_lens_kv=metadata.cu_seqlens_k,
-                window_left=layer.sliding_window_size,
-                sinks=attention_sink,
-                out_dtype=self.dtype,
-            )
-
+        o = trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self.workspace_buffer,
+            block_tables=metadata.page_table,
+            seq_lens=metadata.cache_seqlens_int32,
+            max_q_len=metadata.max_seq_len_q,
+            max_kv_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=metadata.cu_seqlens_q.shape[0] - 1,
+            cum_seq_lens_q=metadata.cu_seqlens_q,
+            cum_seq_lens_kv=metadata.cu_seqlens_k,
+            window_left=layer.sliding_window_size,
+            sinks=attention_sink,
+            out_dtype=self.dtype,
+        )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     # ------------------------------------------------------------------
@@ -383,23 +350,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         use_cuda_graph: bool = False,
         **kwargs,
     ):
-        if forward_mode.is_decode():
-            self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
-        elif forward_mode.is_target_verify():
-            spec_num_tokens = num_tokens // bs if bs > 0 else 1
-            self._init_target_verify_metadata(
-                bs, spec_num_tokens, req_pool_indices, seq_lens, req_to_page
-            )
-        elif forward_mode.is_draft_extend():
-            # Compound: draft's step 0 uses prefill kernel (multi-token),
-            # steps 1..N-1 use decode kernel (single-token). Populate both
-            # slots in one call.
-            spec_num_tokens = num_tokens // bs if bs > 0 else 1
-            self._init_target_verify_metadata(
-                bs, spec_num_tokens, req_pool_indices, seq_lens, req_to_page
-            )
-            self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
-        elif forward_mode.is_extend():
+        if forward_mode.is_extend_or_mixed():
             self._init_extend_metadata(
                 bs,
                 req_pool_indices,
@@ -410,8 +361,18 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
             )
+            return
+
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
+            self._init_multi_token_metadata(
+                bs, spec_num_tokens, req_pool_indices, seq_lens, req_to_page
+            )
+            if self.is_draft:
+                # Drafter's N-1 single-token steps after the first.
+                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
         else:
-            raise NotImplementedError(f"Unsupported forward mode: {forward_mode}")
+            self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
 
     def _init_decode_metadata(
         self,
@@ -436,7 +397,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             ),
         )
 
-    def _init_target_verify_metadata(
+    def _init_multi_token_metadata(
         self,
         bs: int,
         spec_num_tokens: int,
@@ -444,8 +405,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
     ):
-        """Prefill slot for TARGET_VERIFY / DRAFT_EXTEND. Routes through the
-        decode kernel (q_len_per_req), which doesn't read cu_seqlens_k."""
+        """Prefill-slot metadata for multi-token decode (uniform q_len per
+        request). Routes through the decode kernel via q_len_per_req; the
+        kernel doesn't read cu_seqlens_k."""
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
@@ -554,20 +516,18 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        if forward_mode.is_decode():
-            self._init_decode_metadata_capture(bs, seq_lens)
-        elif forward_mode.is_target_verify():
-            spec_num_tokens = num_tokens // bs if bs > 0 else 1
-            self._init_target_verify_metadata_capture(bs, spec_num_tokens, seq_lens)
-        elif forward_mode.is_draft_extend():
-            # Compound: capture both prefill (step 0) and decode (steps 1..N-1).
-            spec_num_tokens = num_tokens // bs if bs > 0 else 1
-            self._init_target_verify_metadata_capture(bs, spec_num_tokens, seq_lens)
-            self._init_decode_metadata_capture(bs, seq_lens)
-        else:
+        if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"trtllm CUDA graph capture not supported for {forward_mode}"
             )
+
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
+            self._init_multi_token_metadata_capture(bs, spec_num_tokens, seq_lens)
+            if self.is_draft:
+                self._init_decode_metadata_capture(bs, seq_lens)
+        else:
+            self._init_decode_metadata_capture(bs, seq_lens)
 
     def _init_decode_metadata_capture(self, bs: int, seq_lens: torch.Tensor):
         # cache_seqlens aliases seq_lens_buf (set in init_cuda_graph_state).
@@ -581,7 +541,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
-    def _init_target_verify_metadata_capture(
+    def _init_multi_token_metadata_capture(
         self, bs: int, spec_num_tokens: int, seq_lens: torch.Tensor
     ):
         # cache_seqlens aliases seq_lens_buf; routes through the decode kernel.
@@ -610,6 +570,11 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
+        if forward_mode.is_extend_or_mixed():
+            raise NotImplementedError(
+                f"trtllm CUDA graph replay not supported for {forward_mode}"
+            )
+
         # cache_seqlens aliases seq_lens_buf; only page_table needs refresh.
         if req_to_page is not None:
             torch.index_select(
@@ -619,23 +584,10 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 out=self.cuda_graph_page_table[:bs, : self.max_num_pages],
             )
 
-        if forward_mode.is_decode():
-            self._init_decode_metadata_replay(bs)
-        elif forward_mode.is_target_verify():
-            self._init_target_verify_metadata_replay(bs)
-        elif forward_mode.is_draft_extend():
-            self._init_target_verify_metadata_replay(bs)
-            self._init_decode_metadata_replay(bs)
-        else:
-            raise NotImplementedError(
-                f"trtllm CUDA graph replay not supported for {forward_mode}"
-            )
-
-    def _init_decode_metadata_replay(self, bs: int):
-        self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
-
-    def _init_target_verify_metadata_replay(self, bs: int):
-        self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
+        if bs in self.cuda_graph_prefill_metadata:
+            self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
+        if bs in self.cuda_graph_decode_metadata:
+            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
 
 
 register_backend("trtllm", {AttentionArch.MHA}, TRTLLMMHAAttnBackend)
