@@ -622,6 +622,29 @@ class CudaGraphWrapper:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
+            # The drafter's decode kernel reads ``seq_lens`` from the metadata
+            # via aliasing:
+            #   - Writer: ``Eagle._run_multi_step_decode`` mutates
+            #     ``draft_seq_lens_buf`` in place between draft steps
+            #     (eagle.py: ``torch.add(cache_start, 1, out=draft_seq_lens)``
+            #     and ``draft_seq_lens.add_(1)`` inside the per-step loop).
+            #   - Reader: each backend's ``forward_decode`` passes
+            #     ``metadata.<seq_lens field>`` to its decode kernel; that
+            #     field is a slice view of ``draft_seq_lens_buf`` written
+            #     here (``cache_seqlens_int32=seq_lens[:bs]`` /
+            #     ``seq_lens_k=seq_lens[:bs]``).
+            # So the kernel sees the value the drafter just wrote, without
+            # rebuilding metadata per step.
+            # The EXTEND-mode prefill init still uses the controller's
+            # ``seq_lens`` because that path computes ``cu_seqlens_k`` from it
+            # eagerly (cumsum at init time), not via aliasing.
+            #
+            # TODO: relying on aliasing for correctness is fragile — a stray
+            # copy or a misrouted buffer silently produces wrong outputs.
+            # Move to an explicit per-call ``seq_lens`` contract
+            # so each kernel invocation carries its own value rather than
+            # reading through a tensor registered at init.
+            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             if forward_mode.is_extend_or_mixed():
                 # Step 0 uses the caller's prefix kwargs; subsequent decode
                 # steps use one-token-per-request metadata. Populate each
@@ -639,7 +662,7 @@ class CudaGraphWrapper:
                     padded_bs,
                     padded_bs,
                     req_pool_indices,
-                    seq_lens,
+                    draft_seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=ForwardMode.DECODE,
                 )
@@ -648,7 +671,7 @@ class CudaGraphWrapper:
                     padded_bs,
                     padded_bs * self.max_tokens_per_req,
                     req_pool_indices,
-                    seq_lens,
+                    draft_seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=ForwardMode.DECODE,
                 )
