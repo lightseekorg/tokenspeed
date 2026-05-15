@@ -31,8 +31,8 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
   --max-num-seqs 256 \
   --attention-backend trtllm_mla \
   --moe-backend flashinfer_trtllm \
-  --reasoning-parser kimi_k2 \
-  --tool-call-parser kimi_k2
+  --reasoning-parser kimi_k25 \
+  --tool-call-parser kimik2
 ```
 
 ## Launch Checklist
