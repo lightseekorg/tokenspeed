@@ -42,6 +42,7 @@ class AttentionBackend(ABC):
         self.num_kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
         self.dtype = config.dtype
         self.head_dim = config.head_dim
+        self.is_draft = config.is_draft
 
     @property
     def support_kv_cache_prewrite(self) -> bool:

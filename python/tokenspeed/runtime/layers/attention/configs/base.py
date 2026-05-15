@@ -57,6 +57,7 @@ class BaseAttnConfig:
     kv_cache_quant_method: str
     speculative_num_steps: int = 0
     speculative_num_draft_tokens: int = 0
+    is_draft: bool = False
 
     @classmethod
     def generate(
