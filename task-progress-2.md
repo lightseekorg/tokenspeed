@@ -869,9 +869,38 @@ medium，HF Quark `amd/gpt-oss-120b-w-mxfp4-a-fp8` 上）；本次 patch 没
 > evalscope 需要先 `huggingface-cli download`，整个流程 ~2 小时。
 > 单元测试已经覆盖 selector / adapter / passthrough 的回归路径。
 
-### 8. Commits
+### 8. Bit-exact production no-regression check
+
+```
+=== Gluon DISABLED (TOKENSPEED_MOE_GLUON=0 -> selector picks triton_kernels) ===
+  kernel=triton_kernels_dispatch_gemm
+  shape=(64, 256), abs mean=1248.000000
+=== Gluon ENABLED (selector picks gluon -> adapter falls back to triton_kernels.matmul) ===
+  kernel=triton_kernels_gluon_dispatch_gemm
+  shape=(64, 256), abs mean=1248.000000
+
+max abs diff = 0.0
+mean abs diff = 0.0
+bit-exact match: True
+```
+
+复现脚本（`HIP_VISIBLE_DEVICES=5 python3 << 'EOF' ... EOF`）：构造一份
+`(H=I=256, E=4, top_k=2, n_tokens=64)` 的 fp8×mxfp4 combine
+forward，然后切换 `TOKENSPEED_MOE_GLUON=0/1` 重新加载模块，验证两次
+forward 返回**一模一样**的 tensor。证明：
+
+* selector 在 ON 状态下确实把 combine 派到 `triton_kernels_gluon_gemm_combine`
+  （日志 ``select_kernel chose 'triton_kernels_gluon_gemm_combine' but
+  expected 'triton_kernels_gemm_combine'``，pri=14 vs 10）；
+* adapter 的 fallback 链路（包括 `gammas` 透传 + `n_expts_act` top-k
+  reduction，见下面 `a5d80bb` 修的 bug）和上游路径**数值完全等价**；
+* gpt-oss-120b 上线 Gluon 默认开启**不会引入精度回归**。
+
+### 9. Commits
 
 ```
 86d22e4  Merge branch 'origin/kylewng/fp8_mxfp4_moe' into kylewng/gluon_moe
 f25dd60  moe(gluon): default-on with throughput/latency tags above triton_kernels
+18215d4  docs(task2): record Update 6 — merge fp8_mxfp4_moe + Gluon priority
+a5d80bb  moe(gluon): mirror n_expts_act top-k reduction in upstream fallback
 ```
