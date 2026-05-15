@@ -36,6 +36,9 @@ pip3 install cmake ninja
 pip3 install tokenspeed-scheduler/
 
 echo "=== Step 5: Install TokenSpeed ==="
+# tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
+# python/pyproject.toml; pip resolves them from PyPI as part of the
+# editable install below.
 pip3 install -e ./python --no-build-isolation \
     --extra-index-url "${ROCM_INDEX}"
 

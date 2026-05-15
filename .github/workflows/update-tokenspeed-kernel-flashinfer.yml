@@ -52,7 +52,6 @@ jobs:
           replacements = [
               (r"flashinfer-python==[^\n]+", f"flashinfer-python=={version}"),
               (r"flashinfer-cubin==[^\n]+", f"flashinfer-cubin=={version}"),
-              (r"flashinfer-jit-cache==[^ ;\n]+", f"flashinfer-jit-cache=={version}+cu130"),
           ]
           for pattern, replacement in replacements:
               text = re.sub(pattern, replacement, text)

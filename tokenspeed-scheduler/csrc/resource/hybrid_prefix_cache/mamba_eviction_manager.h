@@ -39,8 +39,8 @@ public:
     void UntrackNode(TreeNode* node);
     void UpdateLeaf(TreeNode* node);
 
-    std::int32_t Evict(std::int32_t num_slots);
-    bool EnsureCapacity(std::int32_t required_slots);
+    std::int32_t Evict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
+    bool EnsureCapacity(std::int32_t required_slots, TreeNode* protected_node = nullptr);
 
     std::int32_t EvictableSlots() const;
 

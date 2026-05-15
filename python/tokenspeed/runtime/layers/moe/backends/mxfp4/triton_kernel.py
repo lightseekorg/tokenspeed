@@ -29,6 +29,7 @@ from torch.nn.parameter import Parameter
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_BLOCK,
+    create_mxfp4_fp8_input_scales,
     create_mxfp4_weights,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
@@ -39,6 +40,14 @@ _is_nvidia = current_platform().is_nvidia
 _is_blackwell = current_platform().is_blackwell
 _is_hopper = current_platform().is_hopper
 _is_amd = current_platform().is_amd
+
+
+def _quantize_to_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    fp8 = current_platform().fp8e4m3fn
+    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
+    return (
+        (x.to(torch.float32) * inv_scale).clamp_(min=fp8.min, max=fp8.max).to(fp8.dtype)
+    )
 
 
 def swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -102,11 +111,20 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         self.quant_config = quant_config
         self._activation: str | None = None
         self._swiglu_arg = None
+        self._is_w4a8_fp8 = (
+            isinstance(quant_config, Mxfp4Config)
+            and quant_config.is_w4a8_fp8
+            and current_platform().is_amd
+        )
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
         if not isinstance(quant_config, Mxfp4Config):
             return False
+        if quant_config.is_w4a8_fp8:
+            if not current_platform().is_amd:
+                # Quark quantization has only been tested on AMD platform
+                return False
         return spec.ep_size <= 1 and spec.activation in {
             "silu",
             "swiglu",
@@ -138,6 +156,8 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             ispp_padded,
             with_bias=with_bias,
         )
+        if self._is_w4a8_fp8:
+            create_mxfp4_fp8_input_scales(layer, self.spec.num_local_experts)
 
         self._activation = layer.activation
         self._swiglu_arg = getattr(layer, "swiglu_arg", None)
@@ -145,6 +165,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         from tokenspeed_kernel.ops.moe.triton_kernels import (
             FlexCtx,
+            InFlexData,
             PrecisionConfig,
         )
 
@@ -163,15 +184,52 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             layer.w2_weight, layer.w2_weight_scale, num_warps
         )
 
+        if self._is_w4a8_fp8:
+            # Collapse per-expert input scales to a single per-tensor scale
+            # per GEMM. Quark exports a constant value across experts for
+            # static ``per_tensor`` quantisation; ``max`` is a safe reduction
+            # in case individual experts reach slightly different values.
+            w13_in_scale = (
+                layer.w13_input_scale.data.to(torch.float32)
+                .max()
+                .reshape(1)
+                .to(layer.w13_input_scale.device)
+                .contiguous()
+            )
+            w2_in_scale = (
+                layer.w2_input_scale.data.to(torch.float32)
+                .max()
+                .reshape(1)
+                .to(layer.w2_input_scale.device)
+                .contiguous()
+            )
+            layer.w13_act_scale = w13_in_scale
+            layer.w2_act_scale = w2_in_scale
+
+            fp8_dtype = current_platform().fp8e4m3fn.dtype
+            w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
+            w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
+            # Force bf16 output so the swiglu / down-proj results stay in a
+            # standard floating dtype; without this, ``triton_kernels.matmul``
+            # defaults ``out_dtype`` to the input dtype (fp8) which would
+            # make the subsequent reductions / re-quantisation blow up.
+            out_dtype = torch.bfloat16
+        else:
+            w13_lhs = InFlexData()
+            w2_lhs = InFlexData()
+            out_dtype = None
+
         layer.w13_precision_config = PrecisionConfig(
-            flex_ctx=FlexCtx(rhs_data=w13_flex),
+            flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
             b_mx_scale=w13_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
+            out_dtype=out_dtype,
         )
         layer.w2_precision_config = PrecisionConfig(
-            flex_ctx=FlexCtx(rhs_data=w2_flex),
+            flex_ctx=FlexCtx(lhs_data=w2_lhs, rhs_data=w2_flex),
             b_mx_scale=w2_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
+            out_dtype=out_dtype,
         )
 
         layer.w13_weight_triton_tensor = w13_weight
@@ -226,9 +284,14 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             (gemm1_alpha, gemm1_clamp),
         )
 
+        if self._is_w4a8_fp8:
+            gemm1_input = _quantize_to_fp8(hidden_states, layer.w13_act_scale)
+        else:
+            gemm1_input = hidden_states
+
         # First GEMM: gate_up projection with fused activation
         intermediate_cache = tokenspeed_kernel.moe_experts(
-            hidden_states,
+            gemm1_input,
             w13_weight,
             w13_bias,
             a_ragged_metadata=ragged_metadata,
@@ -241,10 +304,15 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
 
+        if self._is_w4a8_fp8:
+            gemm2_input = _quantize_to_fp8(intermediate_cache, layer.w2_act_scale)
+        else:
+            gemm2_input = intermediate_cache
+
         # Second GEMM: down projection with scatter (combine)
         # gammas applies the routing weights (expert contribution weights)
         return tokenspeed_kernel.moe_experts(
-            intermediate_cache,
+            gemm2_input,
             w2_weight,
             w2_bias,
             a_ragged_metadata=ragged_metadata,

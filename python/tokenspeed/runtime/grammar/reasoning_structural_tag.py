@@ -47,21 +47,19 @@ from __future__ import annotations
 
 from typing import Any
 
-# tokenspeed reasoning_parser → xgrammar builtin model template.
-# Parsers not listed here fall back to the unwrapped constraint, which
-# is likely to corrupt the reasoning preamble. Add new mappings as the
-# reasoning_parser registry grows.
+# smg reasoning_parser name → xgrammar builtin model template. Keys
+# must match ``smg::get_available_reasoning_parsers()`` exactly. Unmapped
+# parsers fall through to the unwrapped json_schema constraint.
+# gpt-oss / harmony is intentionally absent: smg's Harmony Responses path
+# wraps the schema in a structural tag itself, so the engine never sees
+# json_schema for that family.
 _REASONING_PARSER_TO_XGRAMMAR_MODEL: dict[str, str] = {
-    "gpt-oss": "harmony",
-    "deepseek-r1": "deepseek_r1",
-    "deepseekv31": "deepseek_r1",
-    "deepseek-v3": "deepseek_r1",
+    "deepseek_r1": "deepseek_r1",
     "kimi": "kimi",
-    "kimi_k2": "kimi",
+    "kimi_k25": "kimi",
     "minimax": "minimax",
-    "minimax-append-think": "minimax",
     "qwen3": "qwen",
-    "qwen3-thinking": "qwen",
+    "qwen3_thinking": "qwen",
 }
 
 

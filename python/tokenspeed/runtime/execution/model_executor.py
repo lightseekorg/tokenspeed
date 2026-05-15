@@ -28,6 +28,10 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.engine.scheduler_utils import (
+    paged_cache_block_table_base_offsets_from_forward_op,
+    paged_cache_block_tables_from_forward_op,
+)
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
@@ -38,7 +42,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
-from tokenspeed.runtime.execution.runtime_stats import RuntimeStates
+from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
@@ -474,29 +478,41 @@ class ModelExecutor:
             return
         if not getattr(forward_op, "mamba_pool_indices", None):
             return
-        bs = len(forward_op.request_ids)
-        mamba_pool_indices = torch.tensor(
-            forward_op.mamba_pool_indices,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        mamba_checkpoint_indices = torch.tensor(
-            forward_op.mamba_track_pool_indices,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        req_pool_indices = torch.tensor(
-            forward_op.request_pool_indices,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        cache_lengths = self.runtime_states.valid_cache_lengths[req_pool_indices]
+
+        # CPU-side pre-filter
+        src_list = []
+        dst_list = []
+        req_list = []
+        for i in range(len(forward_op.request_ids)):
+            pool_idx = forward_op.mamba_pool_indices[i]
+            ckpt_idx = forward_op.mamba_track_pool_indices[i]
+            if pool_idx != -1 and ckpt_idx != -1:
+                src_list.append(pool_idx)
+                dst_list.append(ckpt_idx)
+                req_list.append(forward_op.request_pool_indices[i])
+
+        num_valid = len(src_list)
+        if num_valid == 0:
+            return
+
+        t_src = torch.tensor(src_list, dtype=torch.int64, device="cpu", pin_memory=True)
+        t_dst = torch.tensor(dst_list, dtype=torch.int64, device="cpu", pin_memory=True)
+        t_req = torch.tensor(req_list, dtype=torch.int64, device="cpu", pin_memory=True)
+
+        src_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
+        dst_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
+        req_buf = torch.empty(num_valid, dtype=torch.int64, device=self.device)
+        src_buf.copy_(t_src, non_blocking=True)
+        dst_buf.copy_(t_dst, non_blocking=True)
+        req_buf.copy_(t_req, non_blocking=True)
+
+        cache_lengths = self.runtime_states.valid_cache_lengths[req_buf]
         self.runtime_states.snapshot_mamba_checkpoints(
-            mamba_pool_indices,
-            mamba_checkpoint_indices,
+            src_buf,
+            dst_buf,
             cache_lengths,
             self.config.block_size,
-            bs,
+            num_valid,
         )
 
     def execute_forward_op_with_log(
@@ -796,6 +812,9 @@ class ModelExecutor:
         with nvtx_range("pre_fill_setup", color="orange"):
             num_extends = forward_op.num_extends()
             total_tokens = sum(forward_op.input_lengths)
+            has_retract = num_extends <= 0 and any(
+                x != -1 for x in getattr(forward_op, "hist_token_lens", [])
+            )
 
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
@@ -810,27 +829,28 @@ class ModelExecutor:
                 total_tokens=total_tokens,
             )
 
-            if num_extends > 0:
-                forward_mode = ForwardMode.EXTEND
-            elif self.drafter is not None:
-                forward_mode = ForwardMode.TARGET_VERIFY
-            else:
-                forward_mode = ForwardMode.DECODE
-
             bs = len(forward_op.request_ids)
+            forward_mode = ForwardMode.from_num_extends(
+                num_extends,
+                bs,
+                has_drafter=self.drafter is not None,
+            )
 
-            if self.runtime_states.mamba_pool is not None and num_extends > 0:
+            if self.runtime_states.mamba_pool is not None and (
+                num_extends > 0 or has_retract
+            ):
                 mamba_pool_indices = self.input_buffers.mamba_pool_indices_buf[:bs]
                 mamba_cow_src = self.input_buffers.mamba_cow_src_indices_buf[:bs]
                 self.runtime_states.copy_mamba_states(
                     mamba_pool_indices, mamba_cow_src, bs
                 )
-                self.runtime_states.zero_mamba_states(
-                    mamba_pool_indices,
-                    mamba_cow_src,
-                    self.input_buffers.extend_prefix_lens_buf[:bs],
-                    bs,
-                )
+                if num_extends > 0:
+                    self.runtime_states.zero_mamba_states(
+                        mamba_pool_indices,
+                        mamba_cow_src,
+                        self.input_buffers.extend_prefix_lens_buf[:bs],
+                        bs,
+                    )
 
             grammar_completion = None
 
@@ -916,6 +936,19 @@ class ModelExecutor:
                         if self.input_buffers.has_mamba
                         else {}
                     )
+                    paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        num_reqs=bs,
+                    )
+                    (
+                        paged_cache_block_table_base_offsets,
+                        _paged_cache_block_table_base_offset_max,
+                    ) = paged_cache_block_table_base_offsets_from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        num_reqs=bs,
+                    )
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -934,6 +967,10 @@ class ModelExecutor:
                         extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
                             :num_extends
                         ],
+                        paged_cache_block_tables=paged_cache_block_tables,
+                        paged_cache_block_table_base_offsets=(
+                            paged_cache_block_table_base_offsets
+                        ),
                         **mamba_kwargs,
                     )
 

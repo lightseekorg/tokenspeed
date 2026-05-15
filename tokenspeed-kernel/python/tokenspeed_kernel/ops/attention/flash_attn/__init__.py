@@ -56,9 +56,11 @@ if (
     except ImportError:
         pass
 
-    # FA4 on Blackwell supports head_dim in [8, 128] divisible by 8
-    # (and (192, 128) for DeepSeek MLA, not applicable here).
-    _FA4_BLACKWELL_HEAD_DIMS = frozenset(range(8, 129, 8))
+    # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8
+    # (and (192, 128) for DeepSeek MLA, not applicable here). Cached paths pass
+    # seqused_k and remain limited to <=128 by upstream FA4.
+    _FA4_BLACKWELL_PREFILL_HEAD_DIMS = frozenset(range(8, 257, 8))
+    _FA4_BLACKWELL_DECODE_HEAD_DIMS = frozenset(range(8, 129, 8))
 
     @register_kernel(
         "attention",
@@ -72,7 +74,7 @@ if (
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 3,
         traits={
-            "head_dim": _FA4_BLACKWELL_HEAD_DIMS,
+            "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -85,7 +87,6 @@ if (
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
@@ -95,19 +96,74 @@ if (
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         out, _ = flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_kv,
+            cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            softmax_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            softmax_scale=softmax_scale,
+            causal=is_causal,
+        )
+        return out
+
+    @register_kernel(
+        "attention",
+        "mha_prefill_with_kvcache",
+        name="fa4_mha_prefill_with_kvcache_cached",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        dtypes={torch.float16, torch.bfloat16},
+        priority=Priority.SPECIALIZED + 3,
+        traits={
+            "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
+            "prewritten_kv": frozenset({True}),
+            "sliding_window": frozenset({False}),
+            "support_sinks": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "support_logit_cap": frozenset({False}),
+        },
+        tags={"throughput"},
+    )
+    def fa4_mha_prefill_with_kvcache(
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        cu_seqlens_q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: float | None = None,
+        is_causal: bool = True,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ) -> torch.Tensor:
+        if k is not None or v is not None:
+            raise ValueError("FA4 cached prefill requires prewritten KV cache")
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        out, _ = flash_attn_varlen_func(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
             causal=is_causal,
         )
         return out
@@ -124,7 +180,7 @@ if (
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 3,
         traits={
-            "head_dim": _FA4_BLACKWELL_HEAD_DIMS,
+            "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "query_len": frozenset({1}),
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
@@ -149,6 +205,8 @@ if (
     ) -> torch.Tensor:
         batch_size = cache_seqlens.shape[0]
         q_reshaped = q.view(batch_size, 1, q.shape[1], q.shape[2])
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         out, _ = flash_attn_varlen_func(
             q=q_reshaped,
             k=k_cache,
@@ -157,11 +215,7 @@ if (
             page_table=page_table,
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
-            softmax_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            softmax_scale=softmax_scale,
             causal=is_causal,
         )
         return out.view_as(q)
@@ -201,7 +255,6 @@ elif platform.is_nvidia and platform.is_hopper:
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
@@ -211,19 +264,17 @@ elif platform.is_nvidia and platform.is_hopper:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         return flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_kv,
+            cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            softmax_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            softmax_scale=softmax_scale,
             causal=is_causal,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
@@ -245,6 +296,7 @@ elif platform.is_nvidia and platform.is_hopper:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
+            "prewritten_kv": frozenset({True}),
             "return_lse": frozenset({False}),
         },
         tags={"throughput"},
@@ -267,10 +319,14 @@ elif platform.is_nvidia and platform.is_hopper:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        if k is not None or v is not None:
+            raise ValueError("FA3 cached prefill requires prewritten KV cache")
         cu_seqlens_k_new = torch.nn.functional.pad(
             torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
             (1, 0),
         )
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         return flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -280,11 +336,7 @@ elif platform.is_nvidia and platform.is_hopper:
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k_new=cu_seqlens_k_new,
             max_seqlen_q=max_seqlen_q,
-            softmax_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            softmax_scale=softmax_scale,
             causal=is_causal,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
@@ -325,17 +377,15 @@ elif platform.is_nvidia and platform.is_hopper:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         out = flash_attn_with_kvcache(
             q=q.unsqueeze(1),
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            softmax_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            softmax_scale=softmax_scale,
             causal=is_causal,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,

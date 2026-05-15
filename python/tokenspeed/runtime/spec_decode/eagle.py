@@ -21,40 +21,18 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-from tokenspeed_kernel.ops.sampling.cuda import (
-    chain_speculative_sampling_target_only,
-    verify_chain_greedy,
-)
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
-from tokenspeed.runtime.grammar.base_grammar_backend import BaseGrammarObject
 from tokenspeed.runtime.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
-)
-from tokenspeed.runtime.sampling.backends.base import (
-    SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-    SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
-
-if current_platform().is_nvidia:
-    from tokenspeed_kernel.ops.sampling.flashinfer import (
-        top_k_renorm_prob,
-        top_p_renorm_probs,
-    )
-
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
 @dataclasses.dataclass
@@ -173,144 +151,6 @@ class EagleDraftOutput:
         self.token_list = torch.cat([self.token_list, spec_info.token_list], dim=0)
 
 
-@dataclasses.dataclass
-class EagleVerifyInput:
-    draft_token: torch.Tensor
-    positions: torch.Tensor
-    draft_token_num: int
-    spec_steps: int
-    capture_hidden_mode: CaptureHiddenMode
-    is_all_greedy: bool
-    grammar: BaseGrammarObject = None
-
-    @classmethod
-    def create(
-        cls,
-        verified_id: torch.Tensor,
-        token_list: torch.Tensor,
-        seq_lens: torch.Tensor,
-        spec_steps: int,
-        num_verify_tokens: int,
-        is_all_greedy: bool,
-        is_idle: bool,
-    ) -> EagleVerifyInput:
-        if is_idle:
-            return cls(
-                torch.empty(0, dtype=torch.int32, device="cuda"),
-                torch.empty(0, dtype=torch.int32, device="cuda"),
-                0,
-                spec_steps,
-                CaptureHiddenMode.LAST,
-                True,
-            )
-        else:
-            draft_tokens = torch.cat(
-                (verified_id.unsqueeze(1), token_list), dim=1
-            ).flatten()
-            positions = (
-                seq_lens.unsqueeze(1)
-                + torch.arange(num_verify_tokens, device=draft_tokens.device)
-            ).flatten()
-            return cls(
-                draft_tokens,
-                positions,
-                num_verify_tokens,
-                spec_steps,
-                CaptureHiddenMode.FULL,
-                is_all_greedy,
-            )
-
-    def verify(
-        self,
-        batch_size: int,
-        sampling_info,
-        logits_output: LogitsProcessorOutput,
-        vocab_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        bs = batch_size
-        candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-        predict = torch.zeros(predict_shape, dtype=torch.int32, device="cuda")
-        accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
-        )
-        accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
-
-        # Apply grammar mask
-        if vocab_mask is not None:
-            assert sampling_info.apply_vocab_mask is not None
-            sampling_info.apply_vocab_mask(
-                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
-            )
-
-        if self.is_all_greedy:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
-            verify_chain_greedy(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates.to(torch.int32),
-                target_predict=target_predict,
-                batch_size=bs,
-                num_draft_tokens=self.draft_token_num,
-            )
-        else:
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
-            )  # (bs * draft_token_num, 1)
-
-            target_probs = F.softmax(
-                logits_output.next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_p_renorm_probs(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
-            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-
-            # Draft probs placeholder: the _target_only kernel ignores this
-            # but the TVM FFI binding requires a non-None DLTensor argument.
-            draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device="cuda"
-            )
-
-            coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device="cuda"
-            )
-            chain_speculative_sampling_target_only(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=True,
-            )
-        rearranged_accept_index = torch.zeros_like(predict)
-        rearrange_accept_index[(bs,)](
-            accept_index_ptr=accept_index,
-            accept_length_ptr=accept_length,
-            output_ptr=rearranged_accept_index,
-            num_tokens_per_req_upper=triton.next_power_of_2(self.draft_token_num),
-            accept_index_stride=accept_index.shape[1],
-        )
-        return predict, logits_output, accept_length, rearranged_accept_index
-
-
 @triton.jit
 def create_extend_spec_info(
     verified_id,  # padded verified id
@@ -323,31 +163,6 @@ def create_extend_spec_info(
     last_verified_id = tl.load(verified_id + pid * spec_num_tokens + accept_len)
     tl.store(accept_length_ptr + pid, accept_len + 1)
     tl.store(new_verified_id + pid, last_verified_id)
-
-
-@triton.jit
-def rearrange_accept_index(
-    accept_index_ptr,
-    accept_length_ptr,
-    output_ptr,
-    num_tokens_per_req_upper: tl.constexpr,
-    accept_index_stride: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    accept_len = tl.load(accept_length_ptr + pid) + 1
-    cum_accept_len = 0
-    for i in range(pid):
-        cum_accept_len += tl.load(accept_length_ptr + i) + 1
-    store_offset = tl.arange(0, num_tokens_per_req_upper)
-    accept_index_load_offset = (
-        tl.arange(0, num_tokens_per_req_upper) + pid * accept_index_stride
-    )
-    accept_index = tl.load(accept_index_ptr + accept_index_load_offset)
-    tl.store(
-        output_ptr + store_offset + cum_accept_len,
-        accept_index,
-        mask=store_offset < accept_len,
-    )
 
 
 @triton.jit

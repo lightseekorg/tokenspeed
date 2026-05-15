@@ -57,16 +57,16 @@ def _next_server_port() -> int:
 # ── Server lifecycle ─────────────────────────────────────────────────
 
 
-def _api_server(port: int, extra_args=()) -> subprocess.Popen:
-    # Use ``python -m tokenspeed.api_server`` instead of the
-    # ``tokenspeed-serve`` console script — the CI runner doesn't always
-    # have the entrypoint on PATH (e.g. when tests are executed against a
-    # source tree rather than a wheel install), and the module form works
-    # unconditionally.
+def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
+    # Use ``python -m tokenspeed.cli serve`` instead of the ``ts`` console
+    # script — the CI runner doesn't always have the entrypoint on PATH
+    # (e.g. when tests are executed against a source tree rather than a
+    # wheel install), and the module form works unconditionally.
     cmd = [
         sys.executable,
         "-m",
-        "tokenspeed.api_server",
+        "tokenspeed.cli",
+        "serve",
         "--model",
         MODEL,
         "--host",
@@ -86,7 +86,7 @@ def _api_server(port: int, extra_args=()) -> subprocess.Popen:
 
 
 def _wait_for_server(port: int, timeout: int = TIMEOUT) -> bool:
-    url = f"http://127.0.0.1:{port}/health"
+    url = f"http://127.0.0.1:{port}/readiness"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -184,7 +184,7 @@ class TestLlamaDense(unittest.TestCase):
 
     def _run_quality_checks(self, extra_args=()):
         port = _next_server_port()
-        proc = _api_server(port, extra_args)
+        proc = _serve_server(port, extra_args)
         try:
             if not _wait_for_server(port):
                 self.fail(f"Server did not start within {TIMEOUT}s")

@@ -945,6 +945,193 @@ class TestChainSpeculativeSamplingTargetOnly:
         # ndt-1 draft tokens accepted (last position generates new prediction)
         assert (accept_token_num == ndt - 1).all()
 
+    # ------------------------------------------------------------------
+    # draft_probs=None path: kernel skips the GMEM round-trip and tracks
+    # the rejected token's id in a register instead. Output triple must
+    # match the legacy draft_probs=zeros path bit-exactly.
+    # ------------------------------------------------------------------
+
+    def test_none_draft_probs_deterministic(self):
+        """draft_probs=None matches the deterministic baseline outputs."""
+        from tokenspeed_kernel.thirdparty.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        bs, ndt = 4, 4
+        (
+            candidates,
+            target_probs,
+            uniform_samples,
+            uniform_samples_final,
+            predicts,
+            accept_index,
+            accept_token_num,
+            _draft_probs,
+        ) = self._make_deterministic_inputs(bs, ndt)
+
+        chain_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            uniform_samples,
+            uniform_samples_final,
+            target_probs,
+            None,
+            0.9,
+            1.0,
+        )
+        assert (accept_token_num == 1).all()
+        pred_reshaped = predicts.reshape(bs, ndt)
+        for i in range(bs):
+            assert pred_reshaped[i, 0].item() == 11  # accepted
+            assert pred_reshaped[i, 1].item() == 5  # resampled
+
+    @pytest.mark.parametrize("bs", [1, 8, 32, 64, 127])
+    def test_none_draft_probs_matches_zeros_buffer(self, bs):
+        """draft_probs=None produces bit-identical (predicts, accept_index,
+        accept_token_num) to passing torch.zeros_like(target_probs)."""
+        from tokenspeed_kernel.thirdparty.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        ndt, vocab = 4, 16
+
+        # First call: legacy path with explicit zeros buffer.
+        (
+            candidates_a,
+            target_probs_a,
+            uniform_samples_a,
+            uniform_samples_final_a,
+            predicts_a,
+            accept_index_a,
+            accept_token_num_a,
+            draft_probs_a,
+        ) = self._make_deterministic_inputs(bs, ndt, vocab)
+        chain_speculative_sampling_target_only(
+            predicts_a,
+            accept_index_a,
+            accept_token_num_a,
+            candidates_a,
+            uniform_samples_a,
+            uniform_samples_final_a,
+            target_probs_a,
+            draft_probs_a,
+            0.9,
+            1.0,
+        )
+
+        # Second call: new path with draft_probs=None.
+        (
+            candidates_b,
+            target_probs_b,
+            uniform_samples_b,
+            uniform_samples_final_b,
+            predicts_b,
+            accept_index_b,
+            accept_token_num_b,
+            _,
+        ) = self._make_deterministic_inputs(bs, ndt, vocab)
+        chain_speculative_sampling_target_only(
+            predicts_b,
+            accept_index_b,
+            accept_token_num_b,
+            candidates_b,
+            uniform_samples_b,
+            uniform_samples_final_b,
+            target_probs_b,
+            None,
+            0.9,
+            1.0,
+        )
+
+        torch.testing.assert_close(predicts_a, predicts_b, rtol=0, atol=0)
+        torch.testing.assert_close(accept_index_a, accept_index_b, rtol=0, atol=0)
+        torch.testing.assert_close(
+            accept_token_num_a, accept_token_num_b, rtol=0, atol=0
+        )
+
+    def test_none_draft_probs_all_accepted(self):
+        """All-accepted path also works with draft_probs=None."""
+        from tokenspeed_kernel.thirdparty.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        bs, ndt, vocab = 2, 4, 16
+        candidates = torch.tensor(
+            [[5, 6, 7, 8] for _ in range(bs)],
+            dtype=torch.int32,
+            device=self.DEVICE,
+        )
+        target_probs = torch.zeros((bs, ndt, vocab), device=self.DEVICE)
+        for t in range(ndt):
+            target_probs[:, t, candidates[0, t].item()] = 1.0
+        uniform_samples = torch.full(
+            (bs, ndt), 0.01, dtype=torch.float32, device=self.DEVICE
+        )
+        uniform_samples_final = torch.full(
+            (bs,), 0.01, dtype=torch.float32, device=self.DEVICE
+        )
+        predicts = torch.zeros(bs * ndt, dtype=torch.int32, device=self.DEVICE)
+        accept_index = torch.zeros((bs, ndt), dtype=torch.int32, device=self.DEVICE)
+        accept_token_num = torch.zeros(bs, dtype=torch.int32, device=self.DEVICE)
+
+        chain_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            uniform_samples,
+            uniform_samples_final,
+            target_probs,
+            None,
+            0.0,
+            1.0,
+        )
+        assert (accept_token_num == ndt - 1).all()
+
+    def test_draft_probs_writeback_preserved(self):
+        """When draft_probs IS provided, the kernel must still write back the
+        rejected position once at kernel exit (legacy observable behavior)."""
+        from tokenspeed_kernel.thirdparty.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        bs, ndt = 4, 4
+        (
+            candidates,
+            target_probs,
+            uniform_samples,
+            uniform_samples_final,
+            predicts,
+            accept_index,
+            accept_token_num,
+            draft_probs,
+        ) = self._make_deterministic_inputs(bs, ndt)
+
+        # Sentinel: fill draft_probs with -1 so unmodified positions are
+        # easily distinguished from kernel writes.
+        draft_probs.fill_(-1.0)
+
+        chain_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            uniform_samples,
+            uniform_samples_final,
+            target_probs,
+            draft_probs,
+            0.9,
+            1.0,
+        )
+        # Expected: at rejection, kernel writes
+        # draft_probs[batch, rejected_pos, draft_id] = target_probs[same].
+        # For this fixture: rejection happens at pos 1, draft_id = 12.
+        # target_probs[:, 1, 12] = 0.1.
+        for i in range(bs):
+            assert draft_probs[i, 1, 12].item() == target_probs[i, 1, 12].item()
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # rmsnorm_fused_parallel

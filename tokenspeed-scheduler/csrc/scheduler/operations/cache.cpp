@@ -40,7 +40,7 @@ namespace tokenspeed {
 
 std::optional<fsm::SchedulePrefetchEvent> Scheduler::schedulePrefetch(Request* request, const MatchResult& match) {
     const auto& storage = request->GetStorageInfo();
-    if (!config_.enable_l3_storage || !request->Is<fsm::Submitted>() ||
+    if (config_.disable_prefix_cache || !config_.enable_l3_storage || !request->Is<fsm::Submitted>() ||
         storage.hit_pages <= config_.prefetch_threshold) {
         return {};
     }

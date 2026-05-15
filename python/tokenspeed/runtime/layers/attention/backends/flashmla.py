@@ -47,7 +47,6 @@ from tokenspeed.runtime.layers.attention.utils import (
 )
 from tokenspeed.runtime.spec_decode.eagle import (
     EagleDraftInput,
-    EagleVerifyInput,
     generate_attn_arg_prefill,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -649,7 +648,7 @@ class _PrefillIndicesUpdater:
         req_to_page: torch.Tensor = None,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper = None,
         use_ragged: bool = False,
-        spec_info: EagleDraftInput | EagleVerifyInput | None = None,
+        spec_info: EagleDraftInput | None = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -686,7 +685,7 @@ class _PrefillIndicesUpdater:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         req_to_page: torch.Tensor = None,
-        spec_info: EagleDraftInput | EagleVerifyInput | None = None,
+        spec_info: EagleDraftInput | None = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling

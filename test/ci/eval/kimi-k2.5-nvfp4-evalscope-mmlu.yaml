@@ -13,10 +13,9 @@ install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
-    python3 -m tokenspeed.api_server
+    ts serve
     --model nvidia/Kimi-K2.5-NVFP4
-    --attn-tp-size 4
-    --moe-tp-size 4
+    --tp 4
     --max-model-len 80000
     --trust-remote-code
     --attention-backend tokenspeed_mla
@@ -30,8 +29,9 @@ server:
     --drafter-attention-backend trtllm
     --enable-cache-report
     --host 127.0.0.1
+    --port 8000
   ready:
-    url: http://127.0.0.1:8000/health
+    url: http://127.0.0.1:8000/readiness
     timeout: 1800
     interval: 10
 eval:

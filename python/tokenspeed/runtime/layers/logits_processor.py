@@ -35,7 +35,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -107,6 +106,7 @@ class LogitsMetadata:
 
     # for padding
     padded_static_len: int = -1
+    last_index_offsets: torch.Tensor | None = None
 
     @classmethod
     def from_forward_context(
@@ -119,7 +119,53 @@ class LogitsMetadata:
             capture_hidden_mode=ctx.capture_hidden_mode,
             extend_seq_lens=input_lengths,
             padded_static_len=ctx.padded_static_len,
+            last_index_offsets=ctx.last_index_offsets,
         )
+
+
+_FUSED_LM_HEAD_GEMM = None
+
+
+def _get_fused_lm_head_gemm():
+    """Lazily import the fused lm_head GEMM kernel.
+
+    The kernel is only present when tokenspeed-kernel was built with a
+    compatible nvcc. Cache a sentinel when unavailable so we fall back
+    to ``torch.matmul`` silently on subsequent calls.
+    """
+    global _FUSED_LM_HEAD_GEMM
+    if _FUSED_LM_HEAD_GEMM is not None:
+        return _FUSED_LM_HEAD_GEMM
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
+            lm_head_gemm,
+            should_use_fused,
+        )
+
+        _FUSED_LM_HEAD_GEMM = (should_use_fused, lm_head_gemm)
+    except Exception:
+        _FUSED_LM_HEAD_GEMM = (None, None)
+    return _FUSED_LM_HEAD_GEMM
+
+
+def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute ``hidden_states @ weight.T``.
+
+    Routes to the fused ``lm_head_gemm`` when the shape matches a compiled
+    template and the bench-driven perf gate accepts (``should_use_fused``).
+    Otherwise falls back to ``torch.matmul``.
+
+    Only enabled for Kimi (``model_type == "kimi_k2"``) at the call site —
+    on DSv3 the fused kernel's PDL launch surface caused a downstream EAGLE3
+    spec decode AR regression that we have not characterised end-to-end; on
+    Kimi the perf win is the largest and the regression has not been
+    reproduced, so we gate the fused path to Kimi only.
+    """
+    cast_hidden = hidden_states.to(weight.dtype)
+    should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
+    if should_use_fused is not None and should_use_fused(cast_hidden, weight):
+        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+    return torch.matmul(cast_hidden, weight.T)
 
 
 class LogitsProcessor(nn.Module):
@@ -154,6 +200,9 @@ class LogitsProcessor(nn.Module):
         ):
             self.final_logit_softcapping = None
 
+        # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
+        self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
     def forward(
         self,
         input_ids,
@@ -183,14 +232,8 @@ class LogitsProcessor(nn.Module):
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
                 # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
                 last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
-                    - 1
+                    logits_metadata.last_index_offsets + logits_metadata.extend_seq_lens
                 )
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
@@ -252,7 +295,11 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+                    aux_hidden_states = (
+                        aux_hidden_states[0]
+                        if len(aux_hidden_states) == 1
+                        else torch.cat(aux_hidden_states, dim=-1)
+                    )
                     hidden_states_to_store = aux_hidden_states
                 else:
                     hidden_states_to_store = hidden_states
@@ -260,7 +307,11 @@ class LogitsProcessor(nn.Module):
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
-                    aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
+                    aux_pruned_states = (
+                        aux_pruned_states[0]
+                        if len(aux_pruned_states) == 1
+                        else torch.cat(aux_pruned_states, dim=-1)
+                    )
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None
@@ -351,9 +402,12 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
+            if self._use_fused_lm_head:
+                logits = _lm_head_matmul(hidden_states, lm_head.weight)
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
             # GGUF models
             logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)

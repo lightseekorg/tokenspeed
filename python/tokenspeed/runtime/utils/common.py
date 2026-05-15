@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import asyncio
-import builtins
 import dataclasses
 import functools
 import io

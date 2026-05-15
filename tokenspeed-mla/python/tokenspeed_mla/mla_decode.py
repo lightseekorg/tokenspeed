@@ -39,6 +39,7 @@ from tokenspeed_mla.mla_decode_fp8 import (
 from tokenspeed_mla.mla_decode_fp16 import (
     BlackwellMultiHeadLatentAttentionForwardFP16,
 )
+from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
 from tokenspeed_mla.utils import (
     get_max_active_clusters,
     get_num_sm,
@@ -100,7 +101,7 @@ def _check_can_implement(
         cutlass.Float32,
         mma_qk_tiler_mn,
         mma_pv_tiler_mn,
-        1,  # split_kv (runtime, use 1 to pass the H<128 check)
+        1,  # split_kv placeholder; actual value is selected at runtime
         is_persistent,
         is_var_seq,
         is_var_split_kv,
@@ -124,7 +125,7 @@ def _get_compiled_mla_kernel(
     is_var_split_kv: bool,
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
-    fold_sq: bool = False,
+    fold_sq_factor: int = 1,
     causal_mask: bool = True,
     num_heads: int = 128,
     seq_len_q: int = 1,
@@ -167,13 +168,12 @@ def _get_compiled_mla_kernel(
         is_persistent=is_persistent,
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
+        fold_sq_factor=fold_sq_factor,
     )
     if is_fp8:
         kernel_kwargs["is_causal"] = causal_mask
         kernel_kwargs["num_heads"] = num_heads
         kernel_kwargs["seq_len_q"] = seq_len_q
-        if fold_sq:
-            kernel_kwargs["fold_sq"] = True
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -321,8 +321,8 @@ def tokenspeed_mla_decode(
 
         - Formula: ``B * H * q_len * split_kv * (kv_lora_rank + 1) * 4`` bytes
           (0 when split_kv == 1, which happens when B >= num_SMs / 2)
-        - Typical max: ~18 MB on a 148-SM GPU (e.g. B=4..8, H=128, D=512)
-        - Safe default: 128 MB covers all realistic configurations
+        - The TokenSpeed runtime backend grows this buffer from the actual
+          q_len before each decode launch.
     kv_lora_rank : int
         Latent dimension (e.g. 512).
     qk_rope_head_dim : int
@@ -390,19 +390,15 @@ def tokenspeed_mla_decode(
     # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
-    # H=128: standard config; H<128: fold seq_len_q into heads
-    # H*q_len can be < M tile (padding with zeros via TMA OOB)
+    # H=128: standard config. When H is smaller than M tile, fold only by a
+    # factor that exactly divides q_len; otherwise leave q_len on the scheduler
+    # dimension.
     mma_m_tile = 128
-    fold_sq = H < mma_m_tile and H * q_len <= mma_m_tile
-    if H < mma_m_tile and not fold_sq:
-        raise ValueError(
-            f"tokenspeed_mla_decode requires num_heads >= {mma_m_tile} or "
-            f"num_heads * q_len <= {mma_m_tile}, got num_heads={H}, q_len={q_len}"
-        )
+    fold_sq_factor = get_mla_decode_fold_sq_factor(H, q_len, mma_m_tile)
 
-    # When folding, the effective dimensions change for split_kv/workspace
-    H_eff = H * q_len if fold_sq else H
-    q_len_eff = 1 if fold_sq else q_len
+    # Effective dimensions used by split_kv/workspace accounting.
+    H_eff = H * fold_sq_factor
+    q_len_eff = q_len // fold_sq_factor
 
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
@@ -470,7 +466,7 @@ def tokenspeed_mla_decode(
         is_var_split_kv=is_var_split_kv,
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
-        fold_sq=fold_sq,
+        fold_sq_factor=fold_sq_factor,
         causal_mask=causal_mask,
         num_heads=H,
         seq_len_q=q_len,

@@ -786,22 +786,6 @@ class ExpertDistributionReqOutput:
     pass
 
 
-@dataclass
-class ProfileReqInput:
-    # The output directory
-    output_dir: str | None = None
-    # If set, it profile as many as this number of steps.
-    # If it is set, profiling is automatically stopped after this step, and
-    # the caller doesn't need to run stop_profile.
-    start_step: int | None = None
-    num_steps: int | None = None
-    activities: list[str] | None = None
-    profile_by_stage: bool = False
-    with_stack: bool | None = None
-    record_shapes: bool | None = None
-    profile_id: str | None = None
-
-
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
@@ -857,36 +841,6 @@ class HealthCheckOutput:
 
 
 @dataclass
-class Function:
-    description: str | None = None
-    name: str | None = None
-    parameters: object | None = None
-
-
-@dataclass
-class Tool:
-    function: Function
-    type: str | None = "function"
-
-
-@dataclass
-class ParseFunctionCallReq:
-    text: str  # The text to parse.
-    tools: list[Tool] = field(
-        default_factory=list
-    )  # A list of available function tools (name, parameters, etc.).
-    tool_call_parser: str | None = (
-        None  # Specify the parser type, e.g. 'deepseekv31', 'gpt-oss', or 'qwen3'.
-    )
-
-
-@dataclass
-class VertexGenerateReqInput:
-    instances: list[dict]
-    parameters: dict | None = None
-
-
-@dataclass
 class RpcReqInput:
     method: str
     parameters: dict | None = None
@@ -896,12 +850,6 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
-
-
-@dataclass
-class SeparateReasoningReqInput:
-    text: str  # The text to parse.
-    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
 
 
 @dataclass

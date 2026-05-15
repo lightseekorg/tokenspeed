@@ -1,2 +1,2 @@
-triton_kernels @ git+https://github.com/triton-lang/triton.git@4790c35390e62830fed7210d69f5988accf8aeda#subdirectory=python/triton_kernels
-iris @ git+https://github.com/ROCm/iris.git@9459a5e95d01ac50bd072b9c6c498a5c8f96af16
+tokenspeed-triton-kernels==1.0.0.post20260510
+tokenspeed-iris==0.0.0.post20260511

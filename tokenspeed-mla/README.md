@@ -19,13 +19,15 @@ serving workloads, especially coding agent style use cases with high request
 concurrency, short decode steps, and strict time-to-first-token/next-token
 requirements. For MLA prefill kernel, we supported two version, one is the open
 source version, and another is the binary version with some Nvidia internal knobs
-for better performance. For MLA decode kernel, we group seqlen_q and num_heads
-into one CTA for better performance.
+for better performance. For MLA decode kernel, small `q_len * num_heads`
+configurations can fold a query-token group (`fold_sq_factor`) into heads for
+better tile utilization; remaining query groups are scheduled across the query
+sequence dimension.
 
 ## Performance Numbers
 
 ### Prefill Performance
-![Prefill Latency Comparison](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-mla/assets/latency_comp_prefill.png)
+![Prefill Latency Comparison](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comp_prefill.png)
 
 Where:
 ```
@@ -53,8 +55,8 @@ python ./tokenspeed-mla/python/tokenspeed_mla/fmha.py \
 ```
 
 ### Decode Performance
-![Decode Latency Comparison for num_heads=16](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-mla/assets/latency_comparison_numHead16.png)
-![Decode Latency Comparison for num_heads=32](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-mla/assets/latency_comparison_numHead32.png)
+![Decode Latency Comparison for num_heads=16](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead16.png)
+![Decode Latency Comparison for num_heads=32](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead32.png)
 
 In the above test cases, `q_seqlen = 4` and `kv_seqlen = 80K`.
 
@@ -62,13 +64,24 @@ TensorRT-LLM uses a single kernel for MLA decode, which appears to adopt a swap-
 
 Key Optimization of TokenSpeed MLA decode kernel: Group `q_seqlen` and `num_heads` into BMM1 `M`
 
-In `mla_decode_fp16.py` and `mla_decode_fp8.py`, when `num_heads < 128` and
-`num_heads * q_seqlen <= 128`, `fold_sq` is enabled: the original query-sequence axis is folded into the head axis to better fill the BMM1 `M` tile (`128`).
-This improves `M`-dimension utilization and reduces tile waste in small num_heads
-decode scenarios, which is especially useful for coding agent inference traffic
-that tends to favor short-step, token-by-token decoding. Note that for  num_heads=16 , we still waste half the computation since BMM1’s M dimension is only 64. Optimizations for these cases are underway.
+In `mla_decode.py`, `mla_decode_fp16.py`, and `mla_decode_fp8.py`, decode uses
+`fold_sq_factor` to partially fold query tokens into the head axis when
+`num_heads < 128`. `q_seqlen` can be any positive length; the runtime chooses
+the largest factor `F` such that: `q_seqlen % F == 0` and
+`num_heads * F <= 128`. If no factor greater than one divides `q_seqlen`, the
+kernel does not fold and schedules the full query sequence dimension directly.
 
-Oter Optimizations includes:
+The folded execution shape becomes:
+- `H_eff = num_heads * F`
+- `q_seqlen_eff = q_seqlen / F`
+
+This improves BMM1 `M`-dimension utilization and reduces tile waste in small-head
+decode scenarios, especially token-by-token agent traffic. Example:
+`num_heads=64, q_seqlen=4` chooses `F=2`, so two query tokens are folded into
+`M` (`H_eff=128`) and the remaining two query groups are scheduled on the
+scheduler second dimension (`q_seqlen_eff=2`).
+
+Other optimizations include:
 
 - Using 2CTA UTCMMA instruction to reduce shared memory usage.
 - Try to use as less mbarrier as possible.
@@ -140,6 +153,8 @@ What it supports:
   - 4D accepted and normalized internally
 - Auto `split_kv` + workspace sizing and caching
 - Supports FP16/BF16/FP8; FP8 path writes BF16 output.
+- Supports `H <= 128` and `1 <= q_len <= 4`; for example,
+  `H=64, q_len=4` is supported.
 - `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.
 - `is_var_seq`, `is_persistent`, and `enable_pdl` affect scheduling/compile variants.
 - `causal_mask` is currently effective on the FP8 decode kernel path.

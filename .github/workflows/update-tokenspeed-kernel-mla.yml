@@ -1,0 +1,106 @@
+name: Update tokenspeed-kernel MLA
+
+on:
+  workflow_dispatch:
+    inputs:
+      mla_version:
+        description: "tokenspeed-mla version to use, for example 0.1.2 or v0.1.2."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.mla_version }}
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure git author
+        run: |
+          git config user.name "lightseek-bot"
+          git config user.email "243258330+lightseek-bot@users.noreply.github.com"
+
+      - name: Update tokenspeed-mla dependency
+        id: update
+        run: |
+          raw_version="${{ inputs.mla_version }}"
+          version="${raw_version#v}"
+
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?(\+[A-Za-z0-9.]+)?$ ]]; then
+            echo "Invalid tokenspeed-mla version: $raw_version" >&2
+            exit 1
+          fi
+
+          python - "$version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          path = Path("tokenspeed-kernel/python/requirements/cuda-thirdparty.txt")
+          text = path.read_text()
+          text, count = re.subn(
+              r"(?m)^tokenspeed-mla==[^\n]+$",
+              f"tokenspeed-mla=={version}",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("tokenspeed-mla dependency not found")
+          path.write_text(text)
+          PY
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required because this repository does not allow GITHUB_TOKEN to create pull requests." >&2
+            exit 1
+          fi
+
+          if git diff --quiet; then
+            echo "tokenspeed-kernel already uses tokenspeed-mla $VERSION."
+            exit 0
+          fi
+
+          branch="bot/update-tokenspeed-kernel-mla-${VERSION//+/-}"
+          git checkout -b "$branch"
+          git add tokenspeed-kernel/python/requirements/cuda-thirdparty.txt
+          git commit -s -m "Update tokenspeed-kernel MLA to ${VERSION}"
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          cat > pr-body.md <<EOF
+          ## Summary
+          - update tokenspeed-kernel tokenspeed-mla dependency to ${VERSION}
+
+          ## Tests
+          - Not run (dependency-only workflow update)
+          EOF
+
+          if gh pr view "$branch" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit "$branch" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Update tokenspeed-kernel MLA to ${VERSION}" \
+              --body-file pr-body.md
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "Update tokenspeed-kernel MLA to ${VERSION}" \
+              --body-file pr-body.md
+          fi

@@ -23,11 +23,13 @@
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.kimi_k2_config import KimiK2Config
 from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
+from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5Config, Qwen3_5MoeConfig
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 
 __all__ = [
     "DeepseekV4Config",
+    "Qwen2Config",
     "Qwen3Config",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",

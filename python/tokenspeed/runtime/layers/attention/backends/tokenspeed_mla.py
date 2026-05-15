@@ -68,19 +68,20 @@ logger = logging.getLogger(__name__)
 # Buffer is per-device and does NOT need zero-init.
 _cutedsl_workspace_buffer: dict[torch.device, torch.Tensor] = {}
 
-# Max q_len we expect to see through tokenspeed_mla_decode. 1 is pure decode;
-# spec-decoding verify / draft-extend can go up to num_draft_tokens. 8 covers
-# all shipping EAGLE3 configurations; larger q_len will cleanly error out in
-# the kernel's workspace_buffer.numel() check.
-_CUTEDSL_MAX_Q_LEN = 8
+# Initial q_len capacity for the per-device decode workspace. The buffer grows
+# on demand before each launch, so larger verify/draft batches are supported.
+_CUTEDSL_INITIAL_Q_LEN_CAPACITY = 8
 
 
 def get_cutedsl_workspace_buffer(
-    device: torch.device, num_heads_per_tp: int, kv_lora_rank: int
+    device: torch.device,
+    num_heads_per_tp: int,
+    kv_lora_rank: int,
+    q_len_capacity: int = _CUTEDSL_INITIAL_Q_LEN_CAPACITY,
 ) -> torch.Tensor:
     """Get or grow the per-device CuteDSL workspace buffer."""
     num_sms = get_num_sm(device)
-    required = num_sms * num_heads_per_tp * _CUTEDSL_MAX_Q_LEN * (kv_lora_rank + 1) * 4
+    required = num_sms * num_heads_per_tp * q_len_capacity * (kv_lora_rank + 1) * 4
 
     existing = _cutedsl_workspace_buffer.get(device)
     if existing is None or existing.numel() < required:
@@ -461,6 +462,10 @@ class CuteDSLMLABackend(AttentionBackend):
             )
             CuteDSLMLABackend._logged_decode = True
 
+        self.cutedsl_workspace = get_cutedsl_workspace_buffer(
+            query.device, layer.tp_q_head_num, self.kv_lora_rank, query.shape[1]
+        )
+
         raw_out = tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -627,6 +632,10 @@ class CuteDSLMLABackend(AttentionBackend):
 
         metadata = self.forward_decode_metadata
         max_seq_len = metadata.max_seq_len_k
+
+        self.cutedsl_workspace = get_cutedsl_workspace_buffer(
+            query.device, layer.tp_q_head_num, self.kv_lora_rank, query.shape[1]
+        )
 
         raw_out = tokenspeed_mla_decode(
             query=query,

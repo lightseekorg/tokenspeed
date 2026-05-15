@@ -938,9 +938,9 @@ class GptOssForCausalLM(BaseCausalLM):
             if kind == "input_scale":
                 # Per-tensor static FP8 activation scale; broadcast scalar
                 # into the per-expert slot.
-                param.data[local_expert_id] = weight.detach().to(
-                    torch.float32
-                ).reshape(())
+                param.data[local_expert_id] = (
+                    weight.detach().to(torch.float32).reshape(())
+                )
                 loaded_params.add(target)
                 continue
 
@@ -969,9 +969,7 @@ class GptOssForCausalLM(BaseCausalLM):
                     else:
                         narrow = weight
                 elif kind == "weight":
-                    narrow = weight[
-                        :, moe_tp_rank_start // 2 : moe_tp_rank_end // 2
-                    ]
+                    narrow = weight[:, moe_tp_rank_start // 2 : moe_tp_rank_end // 2]
                 else:  # weight_scale
                     narrow = weight[
                         :,
