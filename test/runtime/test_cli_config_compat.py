@@ -481,6 +481,32 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_num_steps, 1)
         self.assertEqual(sa.speculative_num_draft_tokens, 2)
 
+    def test_speculative_eagle_topk_gt_1_rejected(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "EAGLE3",
+                "--speculative-eagle-topk",
+                "4",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        with self.assertRaisesRegex(ValueError, "speculative_eagle_topk"):
+            sa.resolve_speculative_decoding()
+
+    def test_speculative_eagle_topk_gt_1_allowed_when_spec_off(self):
+        # topk is only consumed by the spec path, so don't reject when SD is off.
+        args = self._parse_args(
+            ["--model", "test/model", "--speculative-eagle-topk", "4"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        sa.resolve_speculative_decoding()
+        self.assertIsNone(sa.speculative_algorithm)
+
     # ---- Full server command example ----
 
     def test_full_server_command(self):
