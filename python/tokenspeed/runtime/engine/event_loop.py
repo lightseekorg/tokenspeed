@@ -792,7 +792,6 @@ class EventLoop:
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),
             len(forward_op.request_ids),
-            has_drafter=self.server_args.speculative_algorithm is not None,
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -869,7 +868,6 @@ class EventLoop:
             forward_mode = ForwardMode.from_num_extends(
                 forward_op.num_extends(),
                 batch_size,
-                has_drafter=self.server_args.speculative_algorithm is not None,
             )
 
         self._dp_local_info[0, 0] = num_tokens
@@ -886,13 +884,7 @@ class EventLoop:
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
-            mode
-            in (
-                int(ForwardMode.DECODE),
-                int(ForwardMode.IDLE),
-                int(ForwardMode.TARGET_VERIFY),
-            )
-            for mode in global_forward_mode
+            ForwardMode(mode).is_decode_or_idle() for mode in global_forward_mode
         )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,

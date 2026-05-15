@@ -613,25 +613,17 @@ class DeepseekV3AttentionMLA(nn.Module):
 
     def no_absorb(self, ctx: ForwardContext) -> bool:
         if self.attention_backend in self._MLA_KERNEL_BACKENDS:
-            # MLA kernel backends: Do not absorb when enabling ragged prefill
-            # Target verify and draft extend have few tokens, go through absorb.
+            # MLA kernel backends: do not absorb when ragged prefill is enabled.
             return (
                 not global_server_args_dict["mla_disable_ragged"]
-                and ctx.forward_mode.is_extend()
-                and not ctx.forward_mode.is_target_verify()
-                and not ctx.forward_mode.is_draft_extend()
+                and ctx.forward_mode.is_extend_or_mixed()
                 and ctx.padded_static_len == -1
             )
         else:
-            # Triton: Use normal computation for pure prefill and use weight absorption otherwise.
-            # Note: extend_prefix_lens_cpu not available in ForwardContext, so we skip the
-            # "no prefix cache" check. This is conservative — always absorb for Triton.
-            return (
-                ctx.forward_mode.is_extend()
-                and not ctx.forward_mode.is_target_verify()
-                and not ctx.forward_mode.is_draft_extend()
-                and ctx.padded_static_len == -1
-            )
+            # Triton: skip absorption on pure prefill, absorb otherwise.
+            # `extend_prefix_lens_cpu` is not on ForwardContext, so the
+            # "no prefix cache" guard is conservative — always absorb.
+            return ctx.forward_mode.is_extend_or_mixed() and ctx.padded_static_len == -1
 
     def forward(
         self,

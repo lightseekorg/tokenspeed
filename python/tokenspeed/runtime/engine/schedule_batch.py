@@ -225,7 +225,9 @@ class ScheduleBatch(DisaggregationDecodeScheduler):
                 logger.debug("[evict] out_cache_loc=%r after evict", out_cache_loc)
 
             if out_cache_loc is None:
-                phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+                phase_str = (
+                    "Prefill" if self.forward_mode.is_extend_or_mixed() else "Decode"
+                )
                 logger.error(
                     "%s out of memory. Try to lower your batch size.\nTry to allocate %s tokens.\nAvailable tokens: %s\n",
                     phase_str,

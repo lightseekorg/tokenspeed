@@ -296,18 +296,13 @@ class CudaGraphWrapper:
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
 
-        capture_forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if self.drafter is not None
-            else ForwardMode.DECODE
-        )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=0,
             input_num_tokens=bs * self.max_tokens_per_req,
-            forward_mode=capture_forward_mode,
+            forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.drafter is not None
@@ -463,7 +458,7 @@ class CudaGraphWrapper:
             bs * self.max_tokens_per_req,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
-            ForwardMode.DECODE if self.drafter is None else ForwardMode.TARGET_VERIFY,
+            ForwardMode.DECODE,
             **capture_kwargs,
         )
         if self.draft_attn_backend is not None:
@@ -487,7 +482,7 @@ class CudaGraphWrapper:
                 bs * self.max_tokens_per_req,
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
-                ForwardMode.DRAFT_EXTEND,
+                ForwardMode.DECODE,
                 **draft_kwargs,
             )
 
@@ -597,13 +592,12 @@ class CudaGraphWrapper:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            # DRAFT_EXTEND covers step 0 + N-1 decode steps (drafter syncs per step).
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,
-                forward_mode=ForwardMode.DRAFT_EXTEND,
+                forward_mode=ForwardMode.DECODE,
                 **kwargs,
             )
 
@@ -628,14 +622,10 @@ class CudaGraphWrapper:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            if forward_mode.is_extend():
-                # Initial prefill: draft step 0 uses EXTEND (regular prefill)
-                # kernel with the caller's prefix kwargs. Step 0 and the
-                # subsequent decode steps have structurally different
-                # metadata, so populate each slot with its own init call.
-                #
-                # Note: drops the pre-refactor subtraction of
-                # `extend_prefix_lens` from `seq_lens` for the draft init.
+            if forward_mode.is_extend_or_mixed():
+                # Step 0 uses the caller's prefix kwargs; subsequent decode
+                # steps use one-token-per-request metadata. Populate each
+                # slot with its own init call.
                 self.draft_attn_backend.init_forward_metadata(
                     padded_bs,
                     padded_bs * self.max_tokens_per_req,
@@ -654,18 +644,13 @@ class CudaGraphWrapper:
                     forward_mode=ForwardMode.DECODE,
                 )
             else:
-                # TARGET_VERIFY / DECODE caller: DRAFT_EXTEND is the "prepare
-                # full drafter pass" signal. The backend populates whichever
-                # slots it needs for step 0 + N-1 decode steps — a single
-                # slot (trtllm_mla) or both prefill and decode slots
-                # (trtllm_mha compound init).
                 self.draft_attn_backend.init_forward_metadata(
                     padded_bs,
                     padded_bs * self.max_tokens_per_req,
                     req_pool_indices,
                     seq_lens,
                     req_to_page=self.drafter.req_to_page,
-                    forward_mode=ForwardMode.DRAFT_EXTEND,
+                    forward_mode=ForwardMode.DECODE,
                 )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
@@ -677,7 +662,7 @@ class CudaGraphWrapper:
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
-        if not (ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()):
+        if not ctx.forward_mode.is_decode():
             return False
         if self.dp_size > 1:
             if not ctx.all_decode_or_idle:
@@ -861,7 +846,7 @@ class CudaGraphWrapper:
         # Update mamba/GDN state after speculative verify
         if (
             self.drafter is not None
-            and ctx.forward_mode.is_target_verify()
+            and ctx.forward_mode.is_decode()
             and hasattr(self.attn_backend, "update_mamba_state_after_mtp_verify")
         ):
             accept_lengths = result[1]
