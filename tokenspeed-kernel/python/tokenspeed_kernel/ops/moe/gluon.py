@@ -42,6 +42,11 @@ from triton_kernels.matmul import (  # noqa: F401
 )
 from triton_kernels.matmul import matmul as _upstream_matmul
 from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
+from triton_kernels.tensor import Tensor as _UpstreamWrappedTensor  # noqa: F401
+from triton_kernels.tensor import convert_layout as _upstream_convert_layout
+from triton_kernels.tensor_details.layout_details.strided import (  # noqa: F401
+    StridedLayout as _UpstreamStridedLayout,
+)
 
 # ---------------------------------------------------------------------------
 # Env knob
@@ -2323,6 +2328,283 @@ _TUNING_KW = frozenset(
 )
 
 
+def _extract_gluon_raw_w(w):
+    """Return the raw ``(E, K_packed, N) uint8`` weight tensor that the
+    Gluon scaled MoE launcher expects, given a possibly upstream-wrapped
+    ``triton_kernels.tensor.Tensor``.
+
+    On AMD CDNA4 the value layout used by ``swizzle_mxfp4`` is
+    ``StridedLayout(major_dim=-2)``: the production runtime calls
+    ``wrap_torch_tensor`` on a *non-contiguous* ``transpose(-2, -1)`` of
+    the loaded weight, so ``wrap_torch_tensor`` already infers the
+    target layout and ``convert_layout`` is a no-op -- the underlying
+    ``storage.data`` is the original transposed view of shape
+    ``(E, K_packed, N)`` with K contiguous (``stride == (..., 1,
+    K_packed)``). The Gluon kernel only consults ``.stride()`` for its
+    address math, so we can pass this through zero-copy.
+
+    For tensors that are not upstream-wrapped (``torch.Tensor`` already
+    in the right shape), pass through unchanged.
+    """
+    if isinstance(w, torch.Tensor):
+        return w
+    if not isinstance(w, _UpstreamWrappedTensor):
+        return w
+    return w.storage.data
+
+
+def _extract_gluon_raw_s(s):
+    """Return the raw uint8 scale tensor that Gluon's ``cdna4_upstream``
+    mode consumes. ``CDNA4MXScaleLayout.swizzle_data`` and our host
+    ``_swizzle_scales_cdna4_upstream`` are bit-equivalent (verified by
+    ``benchmarks/check_cdna4_upstream_scale.py``), so an upstream-
+    wrapped scale's underlying bytes can be passed straight through.
+    """
+    if isinstance(s, torch.Tensor):
+        return s
+    if not isinstance(s, _UpstreamWrappedTensor):
+        return s
+    return s.storage.data
+
+
+def _maybe_extract_swiglu_args(fused_activation):
+    """Pull ``(alpha, limit)`` from an upstream ``FusedActivation`` object
+    representing SwiGLU. Returns ``None`` for any other activation."""
+    if fused_activation is None:
+        return None
+    specs = getattr(fused_activation, "specs", None)
+    fn_name = getattr(specs, "name", None) if specs is not None else None
+    if fn_name != "swiglu":
+        return None
+    args = getattr(fused_activation, "fn_args", None)
+    if args is None:
+        args = getattr(fused_activation, "args", None)
+    if args is None or len(args) < 2:
+        return None
+    return float(args[0]), float(args[1])
+
+
+def _global_scale_value(scale) -> float:
+    """Collapse a per-tensor flex scale to a Python float for the Gluon
+    launcher, which takes ``a_global_scale: float`` not ``Tensor``."""
+    if scale is None:
+        return 1.0
+    if isinstance(scale, torch.Tensor):
+        return float(scale.detach().reshape(-1)[0].item())
+    return float(scale)
+
+
+def _try_dispatch_mxfp(
+    x: torch.Tensor,
+    w,
+    bias: torch.Tensor | None,
+    *,
+    a_ragged_metadata,
+    gather_indx,
+    scatter_indx,
+    precision_config,
+    fused_activation,
+    n_tokens,
+    n_expts_act,
+    passthrough,
+) -> tuple[torch.Tensor | None, bool]:
+    """Try to route an upstream-shaped ``moe_experts`` call to the
+    Gluon scaled-MFMA path (mxfp4 weight + fp8 / mxfp4 activation).
+
+    Returns ``(out, True)`` on success, ``(None, False)`` if anything in
+    the call shape is outside what we currently support, in which case
+    the caller falls back to ``triton_kernels.matmul``.
+    """
+    if precision_config is None:
+        return None, False
+    b_mx_scale = getattr(precision_config, "b_mx_scale", None)
+    if b_mx_scale is None:
+        return None, False
+
+    # During CUDA graph capture (replay-mode kernel launch), no
+    # device-host sync (.item()) and no host-side branching on tensor
+    # values is allowed. The Gluon launcher takes ``a_global_scale`` as
+    # a Python float, which forces an .item() on the fp8 flex scale --
+    # not graph-capturable. Fall back to upstream while capturing; once
+    # the graph is captured, replay paths bypass ``moe_experts`` entirely
+    # (they call into the captured stream), so this only suppresses
+    # gluon during the capture warm-up step.
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return None, False
+    except (AttributeError, RuntimeError):
+        pass
+
+    # KILL-SWITCH: until production-shape gluon swiglu compile lands and
+    # the W_TRANSPOSE+scatter NaN is fixed, allow disabling the gluon
+    # dispatcher entirely via env knob so we can isolate baseline /
+    # upstream-only behaviour.
+    import os as _os
+
+    if _os.environ.get("TOKENSPEED_MOE_GLUON_DISABLE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None, False
+
+    flex = getattr(precision_config, "flex_ctx", None)
+    lhs = getattr(flex, "lhs_data", None) if flex is not None else None
+    fp8_dtype = getattr(lhs, "dtype", None) if lhs is not None else None
+    fp8_scale = getattr(lhs, "scale", None) if lhs is not None else None
+
+    a_mx_scale = getattr(precision_config, "a_mx_scale", None)
+    if fp8_dtype is not None and a_mx_scale is not None:
+        return None, False
+
+    if fp8_dtype is not None:
+        a_format = "e4m3"
+        a_global_scale = _global_scale_value(fp8_scale)
+        x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
+        x_scale = None
+    elif a_mx_scale is not None:
+        a_format = "e2m1"
+        a_global_scale = 1.0
+        x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
+        x_scale = _extract_gluon_raw_s(a_mx_scale)
+        if not isinstance(x_scale, torch.Tensor):
+            return None, False
+    else:
+        return None, False
+
+    if precision_config.out_dtype is not None:
+        out_dtype = precision_config.out_dtype
+    elif x.dtype.is_floating_point:
+        out_dtype = x.dtype
+    else:
+        out_dtype = torch.bfloat16
+
+    w_raw = _extract_gluon_raw_w(w)
+    s_raw = _extract_gluon_raw_s(b_mx_scale)
+
+    if not isinstance(w_raw, torch.Tensor) or not isinstance(s_raw, torch.Tensor):
+        return None, False
+    if w_raw.ndim != 3:
+        return None, False
+
+    # Gluon's launcher consults ``gather_indx.src_indx`` / ``scatter_indx.dst_indx``
+    # whereas the upstream-routed callers (production + tests) often pass a
+    # plain ``torch.Tensor``. Accept both by lazily wrapping bare tensors.
+    def _adapt_indx(obj, attr):
+        if obj is None:
+            return None
+        if hasattr(obj, attr):
+            return obj
+        if isinstance(obj, torch.Tensor):
+            return type("IndxAdapter", (), {attr: obj})()
+        return obj
+
+    gather_indx = _adapt_indx(gather_indx, "src_indx")
+    scatter_indx = _adapt_indx(scatter_indx, "dst_indx")
+
+    swiglu_args = _maybe_extract_swiglu_args(fused_activation)
+    has_gather = gather_indx is not None
+    has_scatter = scatter_indx is not None
+
+    if fused_activation is not None and swiglu_args is None:
+        return None, False
+
+    gammas = passthrough.get("gammas")
+    betas = passthrough.get("betas")
+    out_alpha = passthrough.get("out_alpha")
+    if betas is not None or out_alpha is not None:
+        return None, False
+    epilogue = passthrough.get("epilogue")
+    if epilogue is not None:
+        return None, False
+    fused_comm = passthrough.get("fused_comm")
+    if fused_comm is not None:
+        return None, False
+    c_in = passthrough.get("c") or passthrough.get("c_acc_in")
+    if c_in is not None:
+        return None, False
+
+    try:
+        if has_scatter and not has_gather:
+            # NOTE(scatter+W_TRANSPOSE): gluon_mxfp_combine on
+            # ``W_TRANSPOSE=True`` (the only zero-copy path for
+            # production's K-contig weights) currently writes NaNs in
+            # the scatter epilogue (see check_gluon_mxfp_fp8_wiring.py).
+            # The dispatch+swiglu path with the same W_TRANSPOSE=True
+            # weight is already bit-identical to upstream, so the bug
+            # is localised to the scatter writeback. Until that's
+            # fixed, fall back to upstream's combine kernel; we still
+            # win on dispatch+swiglu, which dominates the MoE GEMM
+            # FLOPs for both prefill and decode.
+            return None, False
+
+        if not has_scatter and swiglu_args is not None:
+            # Covers both gather_indx-driven dispatch+swiglu (production
+            # path from triton_kernel_fp8.py) AND the pre-permuted
+            # bench-style call where ``gather_indx=None``.
+            swiglu_alpha, swiglu_limit = swiglu_args
+            out = gluon_mxfp_dispatch_swiglu(
+                x_view,
+                w_raw,
+                s_raw,
+                x_scale=x_scale,
+                a_format=a_format,
+                a_global_scale=a_global_scale,
+                bias=bias,
+                a_ragged_metadata=a_ragged_metadata,
+                gather_indx=gather_indx,
+                out_dtype=out_dtype,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_limit=swiglu_limit,
+                scale_load_mode="cdna4_upstream",
+                w_transpose=True,
+            )
+            return out, True
+
+        if not has_gather and not has_scatter and swiglu_args is None:
+            if x.ndim != 2 or w_raw.shape[0] != 1:
+                return None, False
+            out = gluon_mxfp_gating_gemm(
+                x_view,
+                w_raw.squeeze(0),
+                s_raw if s_raw.ndim == 2 else s_raw.squeeze(0),
+                x_scale=x_scale,
+                a_format=a_format,
+                a_global_scale=a_global_scale,
+                bias=bias,
+                out_dtype=out_dtype,
+                scale_load_mode="cdna4_upstream",
+                w_transpose=True,
+            )
+            return out, True
+    except Exception as exc:  # noqa: BLE001
+        # Defensive: if anything in the gluon launcher trips, fall back
+        # to upstream rather than aborting the whole MoE forward. The
+        # ``TOKENSPEED_MOE_GLUON_DEBUG`` env knob promotes the silent
+        # warning into a stack-trace re-raise so wiring regressions can
+        # be diagnosed quickly during development.
+        import logging
+        import os as _os
+
+        logging.getLogger("tokenspeed_kernel.ops.moe.gluon").warning(
+            "_try_dispatch_mxfp falling back to upstream: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        if _os.environ.get("TOKENSPEED_MOE_GLUON_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "debug",
+        }:
+            raise
+        return None, False
+
+    return None, False
+
+
 def _gluon_bf16_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -2357,6 +2639,26 @@ def _gluon_bf16_ragged_matmul(
     back.
     """
     if not _supports_pure_bf16(precision_config, fused_activation):
+        # Fast path: route mxfp4 weight (+ fp8 / mxfp4 activation) calls
+        # to our scaled-MFMA Gluon launchers. The launchers already do
+        # the top-k combine reduction internally, so we return as-is on
+        # success.
+        out, ok = _try_dispatch_mxfp(
+            x,
+            w,
+            bias,
+            a_ragged_metadata=a_ragged_metadata,
+            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+            precision_config=precision_config,
+            fused_activation=fused_activation,
+            n_tokens=n_tokens,
+            n_expts_act=n_expts_act,
+            passthrough=passthrough,
+        )
+        if ok:
+            return out
+
         out = _upstream_matmul(
             x,
             w,
