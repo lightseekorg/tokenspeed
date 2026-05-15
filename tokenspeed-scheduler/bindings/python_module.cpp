@@ -257,6 +257,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::module_ pd = m.def_submodule("PD");
     nb::module_ cache = m.def_submodule("Cache");
 
+    cache.attr("TRANSFER_KIND_KV") =
+        nb::int_(static_cast<std::int32_t>(tokenspeed::CacheTransferKind::KV));
+    cache.attr("TRANSFER_KIND_MAMBA") =
+        nb::int_(static_cast<std::int32_t>(tokenspeed::CacheTransferKind::Mamba));
+
     nb::class_<tokenspeed::cache::PrefetchDone>(cache, "PrefetchDoneEvent")
         .def(nb::init<>())
         .def_rw("success", &tokenspeed::cache::PrefetchDone::success)
