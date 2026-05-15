@@ -1413,8 +1413,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> dict[str, torch.Tensor]:
         """Refresh persistent base-offset buffers from per-step input.
 
-        Sliding groups whose key is missing fall back to 0 (legacy
-        absolute scheduler binding). Returns the [:bs] views keyed by gid.
+        Sliding groups whose key is missing fall back to 0. Returns the [:bs]
+        views keyed by gid.
         """
         out: dict[str, torch.Tensor] = {}
         for gid, buf in self._cuda_graph_paged_cache_base_offsets.items():

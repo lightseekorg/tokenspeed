@@ -22,6 +22,7 @@ from typing import Dict, Literal, Optional, Sequence
 from tokenspeed.runtime.utils.common import ceil_div
 
 Retention = Literal["full_history", "sliding_window"]
+Family = Literal["history", "state"]
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,8 @@ class PagedCacheGroupSpec:
     rows_per_page: int
     entry_stride_tokens: int
     sliding_window_tokens: Optional[int]
+    # History groups form a chain; State groups only need the trailing window.
+    family: Family = "history"
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1

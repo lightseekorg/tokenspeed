@@ -89,6 +89,43 @@ TreeNode* RadixTree::PruneEmptyByNode(TreeNode* node) {
     return current;
 }
 
+TreeNode* RadixTree::SplitAt(TreeNode* descendant, std::int32_t depth_in_tokens) {
+    if (descendant == nullptr) {
+        return nullptr;
+    }
+    if (depth_in_tokens <= 0 || depth_in_tokens % page_size_ != 0) {
+        return nullptr;
+    }
+    if (depth_in_tokens > static_cast<std::int32_t>(descendant->DepthInTokens())) {
+        return nullptr;
+    }
+
+    // Find the ancestor range covering depth_in_tokens.
+    // Exact match returns the node; an interior split returns the prefix.
+    TreeNode* current = descendant;
+    while (current != nullptr && !current->IsRoot()) {
+        const std::int32_t this_depth = static_cast<std::int32_t>(current->DepthInTokens());
+        const std::int32_t parent_depth = this_depth - static_cast<std::int32_t>(current->Tokens().size());
+        if (depth_in_tokens == this_depth) {
+            return current;
+        }
+        if (depth_in_tokens > parent_depth && depth_in_tokens < this_depth) {
+            // Refuse to split a snapshot-bearing node (would dangle borrowed ids).
+            if (current->HasPagedCacheSnapshot()) {
+                return nullptr;
+            }
+            TreeNode* parent = current->Parent();
+            const token_vec_t child_key = getFirstPage(current->Tokens(), page_size_);
+            const std::size_t prefix_pages =
+                static_cast<std::size_t>((depth_in_tokens - parent_depth) / page_size_);
+            SplitResult sr = splitChild(parent, child_key, prefix_pages);
+            return sr.prefix;
+        }
+        current = current->Parent();
+    }
+    return nullptr;
+}
+
 WalkResult RadixTree::WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode::timestamp_t access_time,
                                            TreeNode* start_node) {
     TreeNode* current = (start_node != nullptr) ? start_node : root_.get();
@@ -131,6 +168,10 @@ WalkResult RadixTree::WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode:
             break;
         }
         if (matched_num_pages != static_cast<std::int32_t>(child->Tokens().size() / page_size_)) {
+            // Refuse to split a snapshot-bearing node; borrowed ids rely on it.
+            if (child->HasPagedCacheSnapshot()) {
+                break;
+            }
             SplitResult split = splitChild(current, walk_key_cache, matched_num_pages);
             child = split.prefix;
         }

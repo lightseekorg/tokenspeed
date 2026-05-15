@@ -78,17 +78,20 @@ def build_v4_cache_specs(
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
 
     specs: List[PagedCacheGroupSpec] = [
+        # SWA kv: trailing window only -> State family.
         PagedCacheGroupSpec(
             group_id=V4_SWA_KV_GROUP_ID,
             retention="sliding_window",
             rows_per_page=V4_KERNEL_BLOCK_ROWS,
             entry_stride_tokens=1,
             sliding_window_tokens=swa_window,
+            family="state",
         ),
     ]
     for ratio in unique_compress_ratios:
         if ratio not in _COMPRESSOR_STATE_WINDOW_TOKENS:
             raise ValueError(f"unsupported DeepSeek V4 compress_ratio={ratio}")
+        # Compressor state: tail buffer -> State family.
         specs.append(
             PagedCacheGroupSpec(
                 group_id=v4_compressor_state_group_id(ratio),
@@ -96,8 +99,10 @@ def build_v4_cache_specs(
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
                 entry_stride_tokens=1,
                 sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
+                family="state",
             )
         )
+        # Compressed kv: full-history chain (indexer K shares this group).
         specs.append(
             PagedCacheGroupSpec(
                 group_id=v4_compressed_kv_group_id(ratio),
@@ -105,9 +110,11 @@ def build_v4_cache_specs(
                 rows_per_page=_compressed_kernel_block_size(ratio),
                 entry_stride_tokens=ratio,
                 sliding_window_tokens=None,
+                family="history",
             )
         )
     if 4 in unique_compress_ratios:
+        # Indexer compressor state: tail buffer -> State family.
         specs.append(
             PagedCacheGroupSpec(
                 group_id=V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
@@ -115,6 +122,7 @@ def build_v4_cache_specs(
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
                 entry_stride_tokens=1,
                 sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[4],
+                family="state",
             )
         )
     return specs

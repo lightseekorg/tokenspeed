@@ -106,6 +106,11 @@ class BaseTokenToKVPool:
     ) -> None:
         raise NotImplementedError()
 
+    @property
+    def prefix_cache_required_group_ids(self) -> tuple[str, ...] | None:
+        """None means adjunct disabled; subclasses return required group ids."""
+        return None
+
     # Buffer metadata used by prefill/decode disaggregation.
     def get_contiguous_buf_infos(self):
         raise NotImplementedError()

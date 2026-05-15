@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "resource/radix_tree/mamba_slot.h"
+#include "resource/radix_tree/paged_cache_snapshot.h"
 #include "resource/radix_tree/tree_resource.h"
 #include "resource/types.h"
 
@@ -106,6 +107,11 @@ public:
     void AttachMamba(std::unique_ptr<MambaSlot> slot) { mamba_slot_ = std::move(slot); }
     std::unique_ptr<MambaSlot> DetachMamba() { return std::move(mamba_slot_); }
 
+    // Paged-cache snapshot adjunct. Completeness is now per-family on the
+    // snapshot itself (see `PagedCacheSnapshot::IsCompleteFor`).
+    bool HasPagedCacheSnapshot() const { return paged_cache_snapshot_ != nullptr; }
+    const PagedCacheSnapshot* GetPagedCacheSnapshot() const { return paged_cache_snapshot_.get(); }
+
     std::optional<cache_op_id> CacheOpId() const;
 
     void SetPersisted(bool persisted = true);
@@ -116,6 +122,14 @@ public:
     std::unique_ptr<TreeNode> RemoveChild(const token_vec_t& key);
 
     void SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::int32_t page_size);
+
+private:
+    // Private so all attach/detach routes through HybridPrefixCache and keeps
+    // its `paged_cache_snapshot_nodes_` membership set in sync.
+    friend class HybridPrefixCache;
+    void AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot);
+    std::unique_ptr<PagedCacheSnapshot> DetachPagedCacheSnapshot();
+    PagedCacheSnapshot* GetPagedCacheSnapshotMut() { return paged_cache_snapshot_.get(); }
 
 private:
     TreeNode* parent_{};
@@ -129,6 +143,7 @@ private:
     std::unique_ptr<DeviceResource> device_resource_{};
     std::unique_ptr<HostResource> host_resource_{};
     std::unique_ptr<MambaSlot> mamba_slot_{};
+    std::unique_ptr<PagedCacheSnapshot> paged_cache_snapshot_{};
 };
 
 template <ResourceType RType>
