@@ -584,25 +584,31 @@ class MambaAttnBackend(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
         mamba_pool_indices = kwargs.get("mamba_pool_indices")
+        # Reuse the pre-allocated [bs]-length buffer as mamba_indices so the
+        # capture path matches the replay path: zero allocation, single write.
+        padded_mamba_indices = self.state_indices_list[bs - 1]
         if mamba_pool_indices is not None:
-            mamba_indices = self.pool.get_mamba_indices(mamba_pool_indices[:bs])
+            padded_mamba_indices[:bs].copy_(
+                self.pool.get_mamba_indices(mamba_pool_indices[:bs])
+            )
         else:
-            mamba_indices = self.pool.get_mamba_indices(req_pool_indices[:bs])
+            padded_mamba_indices[:bs].copy_(
+                self.pool.get_mamba_indices(req_pool_indices[:bs])
+            )
         mamba_output_indices = None
         if forward_mode.is_target_verify():
             cow_src_indices = kwargs.get("mamba_cow_src_indices")
             mamba_input_indices = self.pool.get_current_input_indices(
-                req_pool_indices[:bs], mamba_indices, cow_src_indices
+                req_pool_indices[:bs], padded_mamba_indices, cow_src_indices
             )
             mamba_output_indices = self.output_indices_list[bs - 1]
             self.pool.get_mtp_output_indices(
                 req_pool_indices[:bs],
-                mamba_indices,
+                padded_mamba_indices,
                 self.speculative_num_draft_tokens,
                 out=mamba_output_indices,
             )
-            mamba_indices = mamba_input_indices
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+            padded_mamba_indices.copy_(mamba_input_indices)
         self._qsl_dirty[bs - 1] = False
         self._qsl_last_mode[bs - 1] = forward_mode
         self.forward_metadata = MambaForwardMetadata(
@@ -626,29 +632,38 @@ class MambaAttnBackend(AttentionBackend):
 
         real_bs = bs - num_padding
         req_pool_indices = req_pool_indices[:bs]
+
+        # Reuse the pre-allocated [bs]-length buffer as the padded mamba_indices
+        # so downstream ops (get_mtp_output_indices, get_current_input_indices)
+        # see the full-batch shape with padding rows already set to -1.
+        # Zero extra allocations on this hot path.
+        padded_mamba_indices = self.state_indices_list[bs - 1]
         if mamba_pool_indices is not None:
-            mamba_indices = self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
+            padded_mamba_indices[:real_bs].copy_(
+                self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
+            )
         else:
-            mamba_indices = self.pool.get_mamba_indices(req_pool_indices[:real_bs])
+            padded_mamba_indices[:real_bs].copy_(
+                self.pool.get_mamba_indices(req_pool_indices[:real_bs])
+            )
+        if num_padding > 0:
+            padded_mamba_indices[real_bs:].fill_(-1)
 
         mamba_output_indices = None
         if forward_mode.is_target_verify():
             cow_src_indices = kwargs.get("mamba_cow_src_indices")
             mamba_input_indices = self.pool.get_current_input_indices(
-                req_pool_indices, mamba_indices, cow_src_indices
+                req_pool_indices, padded_mamba_indices, cow_src_indices
             )
             mamba_output_indices = self.output_indices_list[bs - 1]
             self.pool.get_mtp_output_indices(
                 req_pool_indices,
-                mamba_indices,
+                padded_mamba_indices,
                 self.speculative_num_draft_tokens,
                 out=mamba_output_indices,
             )
-            mamba_indices = mamba_input_indices
-
-        self.state_indices_list[bs - 1][:real_bs].copy_(mamba_indices)
-        if num_padding > 0:
-            self.state_indices_list[bs - 1][real_bs:].fill_(-1)
+            # mamba_input_indices already encodes padding via padded_mamba_indices.
+            padded_mamba_indices.copy_(mamba_input_indices)
 
         if num_padding == 0:
             need_copy = (
