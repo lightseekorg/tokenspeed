@@ -30,6 +30,7 @@ import ctypes
 import importlib
 import os
 import shutil
+import site
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -238,6 +239,22 @@ def _pip_verbose_args(verbose) -> list[str]:
     return ["-" + ("v" * min(level, 3))] if level > 0 else []
 
 
+def _refresh_python_install_paths() -> None:
+    """Expose packages installed by subprocess pip to this build process."""
+    candidates = []
+    for paths in (site.getsitepackages(), site.getusersitepackages()):
+        if isinstance(paths, str):
+            candidates.append(paths)
+        else:
+            candidates.extend(paths)
+
+    for path in candidates:
+        if path and Path(path).exists():
+            site.addsitedir(str(path))
+
+    importlib.invalidate_caches()
+
+
 def _install_backend_build_requirements(verbose=False) -> None:
     backend = _selected_backend()
     print(f"Installing {backend} build requirements before native build")
@@ -255,8 +272,9 @@ def _install_backend_build_requirements(verbose=False) -> None:
     )
 
     # The same setup.py process imports build deps immediately after pip adds
-    # them to site-packages, so refresh importlib's directory caches first.
-    importlib.invalidate_caches()
+    # them. If pip created user site-packages during this run, that path was not
+    # present when Python started, so add site paths before resolving headers.
+    _refresh_python_install_paths()
 
 
 def _ensure_cuda_compiler() -> None:
@@ -283,6 +301,7 @@ KERNEL_GROUPS = [
         "deepseek_v4_attention",
         [
             CUDA_CSRC_DIR / "deepseek_v4_attention.cu",
+            CUDA_CSRC_DIR / "deepseek_v4_topk.cu",
             CUDA_CSRC_DIR / "deepseek_v4_attention_binding.cu",
         ],
         [],
@@ -377,6 +396,14 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "lm_head_gemm",
+        [
+            CUDA_CSRC_DIR / "lm_head_gemm.cu",
+            CUDA_CSRC_DIR / "lm_head_gemm_binding.cu",
+        ],
+        [],
+    ),
+    (
         "trtllm_comm",
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
@@ -430,15 +457,70 @@ class CudaKernelBuilder:
             archs.add("100a")
         return archs
 
+    def _site_paths(self):
+        paths = []
+        try:
+            paths.extend(site.getsitepackages())
+        except Exception:
+            pass
+        paths.extend(sys.path)
+
+        seen = set()
+        for raw_path in paths:
+            if not raw_path:
+                continue
+            path = Path(raw_path).expanduser()
+            path_str = str(path)
+            if path.exists() and path_str not in seen:
+                seen.add(path_str)
+                yield path
+
+    def _cuda_toolkit_roots(self):
+        roots = [Path(CUDA_HOME)]
+
+        seen = set()
+        for root in roots:
+            root_str = str(root)
+            if root.exists() and root_str not in seen:
+                seen.add(root_str)
+                yield root
+
     def _resolve_include_dirs(self):
         dirs = [str(CUDA_CSRC_DIR / "include"), str(CUDA_CSRC_DIR)]
+        seen = set(dirs)
+
+        def _add_dir(path: Path) -> None:
+            path_str = str(path)
+            if path.exists() and path_str not in seen:
+                dirs.append(path_str)
+                seen.add(path_str)
+
+        for cuda_root in self._cuda_toolkit_roots():
+            cuda_include = cuda_root / "include"
+            if (cuda_include / "cuda_runtime.h").exists():
+                _add_dir(cuda_include)
+            if (cuda_include / "cccl").exists():
+                _add_dir(cuda_include / "cccl")
+
+        for base_path in self._site_paths():
+            for candidate in sorted(base_path.glob("nvidia/cu*/include"), reverse=True):
+                if (candidate / "cuda_runtime.h").exists():
+                    _add_dir(candidate)
+                if (candidate / "cccl").exists():
+                    _add_dir(candidate / "cccl")
+            for rel in (
+                "tokenspeed_triton/backends/nvidia/include",
+                "triton/backends/nvidia/include",
+            ):
+                candidate = base_path / rel
+                if (candidate / "cuda_runtime.h").exists():
+                    _add_dir(candidate)
 
         try:
             tvm_ffi = importlib.import_module("tvm_ffi")
-        except ImportError as exc:
-            raise RuntimeError("tvm_ffi is required to build CUDA kernels") from exc
-        else:
-            dirs.append(str(Path(tvm_ffi.__file__).parent / "include"))
+            _add_dir(Path(tvm_ffi.__file__).parent / "include")
+        except ImportError:
+            pass
 
         # flashinfer bundles TRT-LLM internal FP4 helpers
         # (tensorrt_llm/kernels/quantization_utils.cuh: cvt_warp_fp16_to_fp4,
@@ -446,26 +528,103 @@ class CudaKernelBuilder:
         # our own fused silu+mul+nvfp4 kernel can reuse them.
         try:
             flashinfer = importlib.import_module("flashinfer")
-        except ImportError as exc:
-            raise RuntimeError("flashinfer is required to build CUDA kernels") from exc
-
-        fi_root = Path(flashinfer.__file__).parent / "data"
-        for sub in (
-            fi_root / "csrc" / "nv_internal",
-            fi_root / "csrc" / "nv_internal" / "include",
-            fi_root / "include",
-            fi_root / "cutlass" / "include",
-        ):
-            if sub.exists():
-                dirs.append(str(sub))
-        spdlog = fi_root / "spdlog" / "include"
-        if spdlog.exists():
-            dirs.append(str(spdlog))
-            return dirs
+            fi_root = Path(flashinfer.__file__).parent / "data"
+            for sub in (
+                fi_root / "csrc" / "nv_internal",
+                fi_root / "csrc" / "nv_internal" / "include",
+                fi_root / "include",
+                fi_root / "cutlass" / "include",
+            ):
+                _add_dir(sub)
+            spdlog = fi_root / "spdlog" / "include"
+            if (spdlog / "spdlog" / "spdlog.h").exists():
+                _add_dir(spdlog)
+                return dirs
+        except ImportError:
+            pass
         if (Path("/usr/include") / "spdlog" / "spdlog.h").exists():
-            dirs.append("/usr/include")
+            _add_dir(Path("/usr/include"))
 
         return dirs
+
+    def _resolve_cuda_lib_flags(self):
+        cuda_home = Path(CUDA_HOME)
+        lib_candidates = []
+        for cuda_root in self._cuda_toolkit_roots():
+            lib_candidates.extend([cuda_root / "lib64", cuda_root / "lib"])
+        for base in self._site_paths():
+            lib_candidates.extend(
+                sorted(Path(base).glob("nvidia/cu*/lib"), reverse=True)
+            )
+
+        seen_lib_dirs = set()
+        unique_lib_candidates = []
+        for candidate in lib_candidates:
+            candidate_str = str(candidate)
+            if candidate.exists() and candidate_str not in seen_lib_dirs:
+                unique_lib_candidates.append(candidate)
+                seen_lib_dirs.add(candidate_str)
+        lib_candidates = unique_lib_candidates
+        self._cuda_library_dirs = lib_candidates
+
+        cuda_lib_dir = lib_candidates[0] if lib_candidates else cuda_home / "lib64"
+        for candidate in lib_candidates:
+            if (candidate / "libcudart.so").exists() or list(
+                candidate.glob("libcudart.so.*")
+            ):
+                cuda_lib_dir = candidate
+                break
+
+        flags = [f"-L{lib_dir}" for lib_dir in lib_candidates] or [f"-L{cuda_lib_dir}"]
+        cuda_stubs_dir = cuda_lib_dir / "stubs"
+        if cuda_stubs_dir.exists():
+            flags.append(f"-L{cuda_stubs_dir}")
+
+        cudart_so = cuda_lib_dir / "libcudart.so"
+        cudart_versioned = sorted(cuda_lib_dir.glob("libcudart.so.*"))
+        if cudart_so.exists():
+            flags.append("-lcudart")
+        elif cudart_versioned:
+            flags.append(f"-l:{cudart_versioned[-1].name}")
+        else:
+            flags.append("-lcudart")
+
+        flags.append("-lcuda")
+        return flags
+
+    def _resolve_library_ldflag(self, ldflag):
+        if not ldflag.startswith("-l") or ldflag.startswith("-l:"):
+            return ldflag
+
+        lib_name = ldflag[2:]
+        for lib_dir in getattr(self, "_cuda_library_dirs", []):
+            if (lib_dir / f"lib{lib_name}.so").exists():
+                return ldflag
+            versioned = sorted(lib_dir.glob(f"lib{lib_name}.so.*"))
+            if versioned:
+                return f"-l:{versioned[-1].name}"
+        return ldflag
+
+    def _prepare_cuda_toolchain_env(self):
+        path = os.environ.get("PATH", "")
+        path_entries = [entry for entry in path.split(os.pathsep) if entry]
+        candidates = [Path(NVCC).resolve().parent]
+
+        for cuda_root in self._cuda_toolkit_roots():
+            candidates.append(cuda_root / "bin")
+            candidates.append(cuda_root / "nvvm" / "bin")
+
+        for base in self._site_paths():
+            for cuda_root in sorted(Path(base).glob("nvidia/cu*"), reverse=True):
+                candidates.append(cuda_root / "bin")
+                candidates.append(cuda_root / "nvvm" / "bin")
+
+        for candidate in reversed(candidates):
+            candidate_str = str(candidate)
+            if candidate.exists() and candidate_str not in path_entries:
+                path_entries.insert(0, candidate_str)
+        if path_entries:
+            os.environ["PATH"] = os.pathsep.join(path_entries)
 
     def _compile_one(self, src, obj, nvcc_flags, include_dirs, extra_cflags=()):
         include_flags = [f"-I{d}" for d in include_dirs]
@@ -480,6 +639,7 @@ class CudaKernelBuilder:
         return obj
 
     def run(self):
+        self._prepare_cuda_toolchain_env()
         max_jobs = int(os.environ.get("MAX_JOBS", min(os.cpu_count() or 1, 16)))
         total_sources = sum(len(entry[1]) for entry in self.kernel_groups)
 
@@ -498,13 +658,7 @@ class CudaKernelBuilder:
             "-DENABLE_FP8",
         ] + gencode_flags
         include_dirs = self._resolve_include_dirs()
-        ldflags = [
-            "-shared",
-            f"-L{CUDA_HOME}/lib64",
-            f"-L{CUDA_HOME}/lib64/stubs",
-            "-lcudart",
-            "-lcuda",
-        ]
+        ldflags = ["-shared"] + self._resolve_cuda_lib_flags()
 
         # Ensure output directory exists
         CUDA_OBJS_DIR.mkdir(parents=True, exist_ok=True)
@@ -560,11 +714,14 @@ class CudaKernelBuilder:
                 future.result()
 
         for name, objects, extra_ldflags, so_path in group_meta:
+            extra_ldflags = [
+                self._resolve_library_ldflag(ldflag) for ldflag in (extra_ldflags or [])
+            ]
             link_cmd = (
                 [CXX]
                 + [str(o) for o in objects]
                 + ldflags
-                + (extra_ldflags or [])
+                + extra_ldflags
                 + ["-o", str(so_path)]
             )
             subprocess.check_call(link_cmd)

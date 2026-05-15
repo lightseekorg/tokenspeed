@@ -28,6 +28,7 @@
 #include <memory>
 
 #include "fsm/forward_events.h"
+#include "resource/allocator/paged_cache_group.h"
 #include "resource/types.h"
 #include "scheduler/operations/inc.h"
 
@@ -73,17 +74,20 @@ struct SchedulerConfig {
         std::int32_t total_pages{};
     } device_allocator;
 
+    std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::int32_t prefetch_threshold{4};  // num pages
+    bool enable_kv_cache_events{false};
+    bool enable_mixed_prefill_decode{false};
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};
 
-    std::int32_t num_mamba_slots{0};
     bool disable_prefix_cache{false};
     bool enable_mamba{false};
     std::int32_t mamba_cache_chunk_size{64};

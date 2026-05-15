@@ -14,7 +14,6 @@ leaves a finished request's scalars live for its slot's next tenant.
 Tests below cover:
   * greedy backend opts out of pool state (prepare_step is a no-op).
   * flashinfer backend scatters temperature/top_k/top_p/seed on flip.
-  * gather via ``_gather_scalars`` returns per-slot values in batch order.
   * steady-state: same rid+slot across steps → no redundant _reset_slot.
   * slot recycle: slot reassigned to a new rid → _reset_slot fires.
   * flashinfer_full additionally scatters penalty scalars, counts (zero),
@@ -28,8 +27,6 @@ the test doesn't invoke any flashinfer kernels.
 import os
 import sys
 import unittest
-
-import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -173,27 +170,6 @@ class TestFlashInferFlipDetection(unittest.TestCase):
         self.assertAlmostEqual(self.backend._temperature_pool[2].item(), 0.3, places=3)
         self.assertEqual(self.backend._seed_pool[2].item(), 99)
         self.assertIsNot(self.backend._generator_per_slot[2], gen_a)
-
-    def test_gather_scalars_returns_batch_order(self):
-        """_gather_scalars(req_pool_indices) must return batch-aligned
-        views, not pool-order. Batch row i ↔ pool slot req_pool_indices[i]."""
-        sp_a = _sp("a", temperature=0.5, top_k=10, top_p=0.5, seed=1)
-        sp_b = _sp("b", temperature=1.5, top_k=30, top_p=0.95, seed=2)
-        self.backend.prepare_step(
-            request_ids=["a", "b"],
-            request_pool_indices=[4, 2],  # deliberate non-sorted order
-            sampling_params_list=[sp_a, sp_b],
-        )
-        idx = torch.tensor([4, 2], dtype=torch.int32, device="cuda")
-        t, k, p, s = self.backend._gather_scalars(idx)
-        self.assertAlmostEqual(t[0].item(), 0.5, places=3)
-        self.assertAlmostEqual(t[1].item(), 1.5, places=3)
-        self.assertEqual(k[0].item(), 10)
-        self.assertEqual(k[1].item(), 30)
-        self.assertAlmostEqual(p[0].item(), 0.5, places=3)
-        self.assertAlmostEqual(p[1].item(), 0.95, places=3)
-        self.assertEqual(s[0].item(), 1)
-        self.assertEqual(s[1].item(), 2)
 
 
 class TestFlashInferFullFlipExtended(unittest.TestCase):

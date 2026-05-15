@@ -612,8 +612,11 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
     ):
         # cache_seqlens aliases seq_lens_buf; only page_table needs refresh.
         if req_to_page is not None:
-            self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
-                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            torch.index_select(
+                req_to_page[:, : self.max_num_pages],
+                0,
+                req_pool_indices[:bs],
+                out=self.cuda_graph_page_table[:bs, : self.max_num_pages],
             )
 
         if forward_mode.is_decode():

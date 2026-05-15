@@ -280,6 +280,26 @@ class TestPrefillFirst:
         assert plan.forward[0].num_extends() > 0
         assert plan.forward[0].request_ids == ["r1"]
 
+    def test_mixed_prefill_decode_can_schedule_decode_with_new_prefill(self):
+        cfg = make_config(max_scheduled_tokens=512, max_batch_size=8)
+        cfg.enable_mixed_prefill_decode = True
+        s = Scheduler(cfg)
+
+        submit(s, "r0", list(range(8)))
+        s.next_execution_plan()  # r0 → PrefillDone
+        s.next_execution_plan()  # r0 → Decoding
+        advance_forward(s, "r0", tokens=[99])
+
+        submit(s, "r1", list(range(8)))
+        plan = s.next_execution_plan()
+        op = plan.forward[0]
+
+        assert op.request_ids == ["r1", "r0"]
+        assert op.num_extends() == 1
+        assert len(op.input_ids) == sum(op.input_lengths[: op.num_extends()])
+        assert len(op.input_ids) + len(op.decode_input_ids) == sum(op.input_lengths)
+        assert op.sizes == [1, 0]
+
     def test_max_batch_size_limits_scheduled_requests(self):
         """max_batch_size caps the number of requests per plan."""
         s = Scheduler(make_config(max_scheduled_tokens=512, max_batch_size=2))
@@ -728,9 +748,9 @@ class TestDecodeInputIds:
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""
-        s = Scheduler(
-            make_config(page_size=16, num_device_pages=1024, max_batch_size=8)
-        )
+        cfg = make_config(page_size=16, num_device_pages=1024, max_batch_size=8)
+        cfg.enable_mixed_prefill_decode = True
+        s = Scheduler(cfg)
         # Bring r0 to Decoding.
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # r0 → PrefillDone

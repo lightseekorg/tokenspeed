@@ -20,11 +20,15 @@
 
 """Python API for the TokenSpeed scheduler."""
 
-from tokenspeed_scheduler import tokenspeed_scheduler_ext as _ext
+import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
     DisaggregationMode,
     ExecutionEvent,
     ExecutionPlan,
+    PagedCacheGroupAllocator,
+    PagedCacheGroupConfig,
+    PagedCacheGroupTable,
+    PagedCacheRetention,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -35,6 +39,7 @@ PD = _ext.PD
 Cache = _ext.Cache
 Forward = _ext.Forward
 ForwardEvent = _ext.ForwardEvent
+KVEvent = _ext.KVEvent
 
 
 def _flat_forward_op_repr(self):
@@ -63,11 +68,16 @@ __all__ = [
     "SchedulerStats",
     "DisaggregationMode",
     "RequestSpec",
+    "PagedCacheRetention",
+    "PagedCacheGroupConfig",
+    "PagedCacheGroupAllocator",
+    "PagedCacheGroupTable",
     # Execution plan & operations
     "ExecutionPlan",
     "Forward",
     "PD",
     "Cache",
+    "KVEvent",
     # Events
     "ExecutionEvent",
     "ForwardEvent",

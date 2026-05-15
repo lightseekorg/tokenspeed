@@ -1,3 +1,9 @@
+# Adapted from meituan-longcat/SGLang-FluentLLM.
+# This file has been modified for this repository.
+# This file may incorporate material from ModelTC/lightllm,
+# vllm-project/vllm, and sgl-project/sglang, as identified in
+# python/THIRDPARTYNOTICES.
+
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -112,7 +118,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     else:
         # cache_idx
         conv_state_batch_coord = idx_seq
-    if USE_PAD_SLOT:  # noqa
+    if USE_PAD_SLOT:
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
             return
@@ -710,7 +716,7 @@ def _causal_conv1d_update_kernel(
         ).to(tl.int64)
     else:
         conv_state_batch_coord = idx_seq
-    if USE_PAD_SLOT:  # noqa
+    if USE_PAD_SLOT:
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
             return

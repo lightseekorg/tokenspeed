@@ -67,7 +67,6 @@ def test_mha_prefill(
         k=k,
         v=v,
         cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_k=max_seqlen,
         softmax_scale=1.0 / math.sqrt(head_dim),

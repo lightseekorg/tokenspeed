@@ -60,10 +60,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.spec_decode.algorithm import SpeculativeAlgorithm
-    from tokenspeed.runtime.spec_decode.eagle import (
-        EagleDraftInput,
-        EagleVerifyInput,
-    )
+    from tokenspeed.runtime.spec_decode.eagle import EagleDraftInput
 
 
 logger = get_colorful_logger(__name__)
@@ -140,7 +137,7 @@ class ScheduleBatch(DisaggregationDecodeScheduler):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+    spec_info: EagleDraftInput | None = None
     draft_token_num: int | None = 0
     spec_num_steps: int | None = 0
     # Reserve multiple positions for speculative decoding
@@ -272,10 +269,12 @@ class ScheduleBatch(DisaggregationDecodeScheduler):
             return
         out_cache_loc = torch.concat(out_cache_loc_list)
         out_cache_loc = out_cache_loc.to(self.device, non_blocking=True)
-        req_indices = torch.tensor(req_indices, dtype=torch.int32).to(
+        req_indices = torch.tensor(req_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        start_offsets = self.req_to_token_pool.alloced_lens[req_indices]
+        start_offsets = torch.index_select(
+            self.req_to_token_pool.alloced_lens, 0, req_indices
+        )
         end_offsets = start_offsets + num_tokens_pre_alloc
         assign_req_to_token_pool[(bs,)](
             req_indices,

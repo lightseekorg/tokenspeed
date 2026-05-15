@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,9 @@ from tokenspeed.runtime.engine.io_struct import (
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+)
+from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    structural_tag_for_reasoning_json_schema,
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -49,6 +53,32 @@ class InputProcessor:
 
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
+
+    def _maybe_wrap_json_schema_for_reasoning(self, sampling: dict) -> None:
+        # Without this, xgrammar locks onto ``{`` at token 0 and the
+        # model can't emit ``<think>…</think>`` before the JSON.
+        if "json_schema" not in sampling:
+            return
+        reasoning_parser = getattr(self.engine.server_args, "reasoning_parser", None)
+        if not reasoning_parser:
+            return
+        try:
+            schema = sampling["json_schema"]
+            if isinstance(schema, str):
+                schema = json.loads(schema)
+            wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
+        except Exception as e:
+            self.engine.logger.warning(
+                "reasoning-parser=%s: failed to wrap json_schema (%s); "
+                "falling back.",
+                reasoning_parser,
+                e,
+            )
+            return
+        if wrapped is None:
+            return
+        sampling.pop("json_schema", None)
+        sampling["structural_tag"] = wrapped
 
     def validate_request(self, obj: GenerateReqInput | EmbeddingReqInput) -> None:
         """Reject cross-type requests before any other processing.
@@ -130,6 +160,8 @@ class InputProcessor:
                 adjusted_max_new_tokens,
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
+
+        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params)
 
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.resolve_seed(obj.rid)

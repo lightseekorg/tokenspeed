@@ -104,7 +104,6 @@ if platform.is_nvidia and platform.is_blackwell:
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
@@ -143,7 +142,7 @@ if platform.is_nvidia and platform.is_blackwell:
             batch_size=seq_lens.shape[0],
             window_left=window_left,
             cum_seq_lens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cu_seqlens_kv,
+            cum_seq_lens_kv=cu_seqlens_q,
             enable_pdl=False,
             is_causal=is_causal,
             return_lse=return_lse,
@@ -168,6 +167,7 @@ if platform.is_nvidia and platform.is_blackwell:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
+            "prewritten_kv": frozenset({True}),
             "return_lse": frozenset({False}),
         },
         tags={"throughput"},
@@ -190,6 +190,8 @@ if platform.is_nvidia and platform.is_blackwell:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        if k is not None or v is not None:
+            raise ValueError("FlashInfer cached prefill requires prewritten KV cache")
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(

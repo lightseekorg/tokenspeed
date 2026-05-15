@@ -628,6 +628,91 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             )
         self.assertEqual(int(flat_cache[64:128].sum()), 0)
 
+    def test_indexer_mxfp4_paged_gather_matches_paged_layout(self):
+        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+            has_indexer_mxfp4_paged_gather,
+            indexer_mxfp4_paged_gather,
+        )
+
+        if not has_indexer_mxfp4_paged_gather():
+            self.skipTest("DeepSeek V4 paged MXFP4 gather op is not available")
+
+        device = torch.device("cuda")
+        block_size = 4
+        value_bytes = 64
+        scale_bytes = 4
+        num_blocks = 3
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size * (value_bytes + scale_bytes),
+            device=device,
+            dtype=torch.uint8,
+        )
+
+        value_rows = {}
+        scale_rows = {}
+        for block_idx in range(num_blocks):
+            for row_idx in range(block_size):
+                values = (
+                    (
+                        torch.arange(value_bytes, device=device, dtype=torch.int16)
+                        + block_idx * 37
+                        + row_idx * 11
+                    )
+                    .remainder(251)
+                    .to(torch.uint8)
+                )
+                scales = torch.tensor(
+                    [block_idx, row_idx, block_idx * 17 + row_idx, 200 + block_idx],
+                    device=device,
+                    dtype=torch.uint8,
+                )
+                value_base = row_idx * value_bytes
+                scale_base = block_size * value_bytes + row_idx * scale_bytes
+                kv_cache[block_idx, value_base : value_base + value_bytes].copy_(values)
+                kv_cache[block_idx, scale_base : scale_base + scale_bytes].copy_(scales)
+                value_rows[(block_idx, row_idx)] = values
+                scale_rows[(block_idx, row_idx)] = scales
+
+        block_table = torch.tensor([[2, 0], [1, 0]], device=device, dtype=torch.int32)
+        cu_seq_lens = torch.tensor([0, 5, 7], device=device, dtype=torch.int32)
+        values_out = torch.full(
+            (8, value_bytes), 0xCC, device=device, dtype=torch.uint8
+        )
+        scales_out = torch.full(
+            (8, scale_bytes), 0xDD, device=device, dtype=torch.uint8
+        )
+
+        indexer_mxfp4_paged_gather(
+            kv_cache,
+            values_out,
+            scales_out,
+            block_table,
+            cu_seq_lens,
+            block_size,
+        )
+        torch.cuda.synchronize()
+
+        expected_plan = [
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+            (0, 0),
+            (1, 0),
+            (1, 1),
+        ]
+        expected_values = torch.stack([value_rows[item] for item in expected_plan])
+        expected_scales = torch.stack([scale_rows[item] for item in expected_plan])
+        self.assertTrue(torch.equal(values_out[:7].cpu(), expected_values.cpu()))
+        self.assertTrue(torch.equal(scales_out[:7].cpu(), expected_scales.cpu()))
+        self.assertTrue(
+            torch.equal(values_out[7].cpu(), torch.full((64,), 0xCC, dtype=torch.uint8))
+        )
+        self.assertTrue(
+            torch.equal(scales_out[7].cpu(), torch.full((4,), 0xDD, dtype=torch.uint8))
+        )
+
     def test_csa_indexer_cache_insert_matches_reference(self):
         torch.manual_seed(8901)
         device = torch.device("cuda")
@@ -1064,6 +1149,63 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual_lens.cpu(), torch.tensor([4, 3], dtype=torch.int32))
         )
+        compact_actual, compact_lens = deepseek_v4_decode_swa_indices_and_lens(
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            token_to_req_indices=token_to_req_indices,
+            block_table=torch.tensor([[11], [20]], device=device, dtype=torch.int32),
+            block_table_base_offsets=torch.tensor(
+                [1, 0], device=device, dtype=torch.int32
+            ),
+            window_size=4,
+            block_size=64,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(compact_actual.cpu(), actual.cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            compact_lens.cpu(), actual_lens.cpu(), atol=0, rtol=0
+        )
+
+    def test_decode_swa_indices_and_lens_masks_invalid_tokens(self):
+        device = torch.device("cuda")
+        query_start_loc = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([70, 3], device=device, dtype=torch.int32)
+        token_to_req_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        is_valid_token = torch.tensor([True, False], device=device)
+        block_table = torch.tensor(
+            [[10, 11], [20, 21]],
+            device=device,
+            dtype=torch.int32,
+        )
+        out_indices = torch.full((2, 4), -123, device=device, dtype=torch.int32)
+        out_lens = torch.empty((2,), device=device, dtype=torch.int32)
+
+        actual, actual_lens = deepseek_v4_decode_swa_indices_and_lens(
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            token_to_req_indices=token_to_req_indices,
+            block_table=block_table,
+            window_size=4,
+            block_size=64,
+            is_valid_token=is_valid_token,
+            out_indices=out_indices,
+            out_lens=out_lens,
+        )
+        torch.cuda.synchronize()
+
+        self.assertTrue(
+            torch.equal(actual_lens.cpu(), torch.tensor([4, 0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                actual[0].cpu(),
+                torch.tensor([706, 707, 708, 709], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(actual[1].cpu(), torch.full((4,), -123, dtype=torch.int32))
+        )
 
     def test_compute_global_topk_indices_and_lens_matches_reference(self):
         device = torch.device("cuda")
@@ -1115,6 +1257,46 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
         torch.testing.assert_close(
             actual_lens.cpu(), expected_lens.cpu(), atol=0, rtol=0
+        )
+
+    def test_compute_global_topk_indices_and_lens_masks_invalid_tokens(self):
+        device = torch.device("cuda")
+        topk_indices = torch.tensor(
+            [
+                [0, 1, -1, 5],
+                [3, -1, -1, -1],
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+        token_to_req_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        is_valid_token = torch.tensor([True, False], device=device)
+        block_table = torch.tensor(
+            [
+                [10, 11],
+                [20, 21],
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+
+        actual, actual_lens = deepseek_v4_compute_global_topk_indices_and_lens(
+            topk_indices=topk_indices,
+            token_to_req_indices=token_to_req_indices,
+            block_table=block_table,
+            block_size=4,
+            is_valid_token=is_valid_token,
+        )
+        torch.cuda.synchronize()
+
+        self.assertTrue(
+            torch.equal(actual_lens.cpu(), torch.tensor([3, 0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                actual[0].cpu(),
+                torch.tensor([40, 41, -1, 45], dtype=torch.int32),
+            )
         )
 
     def test_compressed_slot_mapping_matches_page_reference(self):
@@ -1186,9 +1368,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 token_base + NOPE_DIM : token_base + DEEPSEEK_V4_SWA_TOKEN_STRIDE
             ].copy_(rows[slot, NOPE_DIM:].to(torch.bfloat16).view(torch.uint8))
 
-        seq_lens = torch.tensor([5, 4], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([9, 8], device=device, dtype=torch.int32)
         gather_lens = torch.tensor([3, 2], device=device, dtype=torch.int32)
         block_table = torch.tensor([[0, 1], [2, 0]], device=device, dtype=torch.int32)
+        block_table_base_offsets = torch.tensor(
+            [1, 1], device=device, dtype=torch.int32
+        )
         out = torch.zeros(2, 5, HEAD_DIM, device=device, dtype=torch.bfloat16)
         deepseek_v4_dequantize_and_gather_k_cache(
             out=out,
@@ -1196,6 +1381,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             seq_lens=seq_lens,
             gather_lens=gather_lens,
             block_table=block_table,
+            block_table_base_offsets=block_table_base_offsets,
             block_size=block_size,
             offset=1,
         )
@@ -1206,11 +1392,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             request_slots = []
             start = int(seq_lens[req_idx].item() - gather_lens[req_idx].item())
             end = int(seq_lens[req_idx].item())
+            base = int(block_table_base_offsets[req_idx].item())
             for pos in range(start, end):
                 page = pos // block_size
                 offset = pos % block_size
                 request_slots.append(
-                    int(block_table[req_idx, page].item()) * block_size + offset
+                    int(block_table[req_idx, page - base].item()) * block_size + offset
                 )
             expected_slots.append(
                 torch.tensor(request_slots, device=device, dtype=torch.int64)

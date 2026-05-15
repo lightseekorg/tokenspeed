@@ -58,11 +58,15 @@ dependencies = [
     "pybind11",
     "pydantic",
     "py-spy",
+    "pytest-asyncio",
     "python-multipart",
     "pyzmq",
     "requests",
     "setproctitle",
     "tiktoken",
+    "tokenspeed-smg==1.4.1.post20260514",
+    "tokenspeed-smg-grpc-proto==0.4.7.post20260514",
+    "tokenspeed-smg-grpc-servicer==0.5.2.post20260514",
     "torch==2.11.0",
     "torchvision",
     "tqdm",
@@ -77,8 +81,6 @@ dependencies = [
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
-tokenspeed-serve = "tokenspeed.api_server:main"
-ts-serve = "tokenspeed.api_server:main"
 
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"

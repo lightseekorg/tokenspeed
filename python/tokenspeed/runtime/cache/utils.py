@@ -147,6 +147,7 @@ def set_mla_kv_buffer_triton(
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
 
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     if n_loc >= 512:
         if n_loc >= 16384:
             block_loc, num_warps, num_stages = 4, 1, 2
@@ -170,7 +171,7 @@ def set_mla_kv_buffer_triton(
             ENABLE_PDL=enable_pdl,
             num_warps=num_warps,
             num_stages=num_stages,
-            launch_pdl=enable_pdl,
+            **extra_kwargs,
         )
     else:
         BLOCK = 256
@@ -190,7 +191,7 @@ def set_mla_kv_buffer_triton(
             rope_dim,
             BLOCK=BLOCK,
             ENABLE_PDL=enable_pdl,
-            launch_pdl=enable_pdl,
+            **extra_kwargs,
         )
 
 
@@ -316,6 +317,7 @@ def get_mla_kv_buffer_triton(
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
 
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     if n_loc >= 512:
         if n_loc >= 16384:
             block_loc, num_warps, num_stages = 8, 1, 2
@@ -339,7 +341,7 @@ def get_mla_kv_buffer_triton(
             ENABLE_PDL=enable_pdl,
             num_warps=num_warps,
             num_stages=num_stages,
-            launch_pdl=enable_pdl,
+            **extra_kwargs,
         )
     else:
         BLOCK = 256
@@ -359,5 +361,5 @@ def get_mla_kv_buffer_triton(
             rope_dim,
             BLOCK=BLOCK,
             ENABLE_PDL=enable_pdl,
-            launch_pdl=enable_pdl,
+            **extra_kwargs,
         )

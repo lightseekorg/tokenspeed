@@ -24,7 +24,13 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling.cuda import chain_speculative_sampling_target_only
-from tokenspeed_kernel.ops.sampling.flashinfer import min_p_sampling_from_probs, softmax
+from tokenspeed_kernel.ops.sampling.flashinfer import (
+    min_p_sampling_from_probs,
+    softmax,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+)
+from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -34,11 +40,9 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import (
-    nan_guard_logits,
-    top_k_top_p_renorm_torch,
-)
+from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -193,7 +197,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         align with flat logits.
         """
 
-        pool_idx = sampling_info.req_pool_indices.long()
+        pool_idx = sampling_info.req_pool_indices
 
         if num_tokens_per_req > 1:
 
@@ -242,7 +246,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         weights is int32; 0 masks invalid rows, 1 accumulates."""
 
         self._counts.index_put_(
-            (pool_idx.long(), tokens.long()),
+            (pool_idx, tokens.long()),
             weights.to(torch.int32),
             accumulate=True,
         )
@@ -281,20 +285,31 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         logits = self._apply_penalties_and_bias(logits, sampling_info)
 
-        temperatures, top_ks, top_ps, seeds = self._gather_scalars(
-            sampling_info.req_pool_indices
+        temperatures, top_ks, top_ps, min_ps, seeds, offsets = (
+            gather_and_expand_scalars(
+                sampling_info.req_pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                min_p=self._min_p_pool,
+                seed=self._seed_pool,
+                offsets=sampling_info.valid_cache_lengths,
+                enable_pdl=pdl_enabled(),
+            )
         )
-        offsets = self._gather_offsets(sampling_info)
-        min_ps = self._min_p_pool.index_select(0, sampling_info.req_pool_indices.long())
 
-        probs = softmax(logits, temperature=temperatures.view(-1, 1))
-        probs = top_k_top_p_renorm_torch(probs, top_ks, top_ps)
+        probs = softmax(
+            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
+        )
+        probs = top_k_renorm_prob(probs, top_ks)
+        probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
 
         batch_next_token_ids = min_p_sampling_from_probs(
             probs,
             min_ps,
             seed=seeds,
             offset=offsets,
+            deterministic=True,
         )
 
         sampled = batch_next_token_ids.to(torch.int32)
@@ -305,7 +320,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         if raw_logprobs is not None:
 
             logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, sampled.long().unsqueeze(-1)
+                -1, sampled.unsqueeze(-1)
             ).squeeze(-1)
 
         # Accumulate sampled tokens into counts (greedy path accumulates too
@@ -363,34 +378,29 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        temperatures, top_ks, top_ps, _seeds = self._gather_scalars(
-            sampling_info.req_pool_indices
+        temperatures, top_ks, top_ps, min_ps, _, _ = gather_and_expand_scalars(
+            sampling_info.req_pool_indices,
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
+            min_p=self._min_p_pool,
+            n=num_tokens_per_req,
+            enable_pdl=pdl_enabled(),
         )
-        min_ps = self._min_p_pool.index_select(0, sampling_info.req_pool_indices.long())
 
-        expanded_temperature = torch.repeat_interleave(
-            temperatures.view(-1, 1), num_tokens_per_req, dim=0
+        target_probs = softmax(
+            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
         )
-
-        target_probs = softmax(logits, temperature=expanded_temperature)
-
-        target_probs = top_k_top_p_renorm_torch(
-            target_probs,
-            torch.repeat_interleave(top_ks, num_tokens_per_req, dim=0),
-            torch.repeat_interleave(top_ps, num_tokens_per_req, dim=0),
-        )
+        target_probs = top_k_renorm_prob(target_probs, top_ks)
+        target_probs = top_p_renorm_prob(target_probs, top_ps, is_deterministic=True)
 
         # min_p renorm open-coded: zero probs below `min_p * max_prob` per
         # row, then renormalize. The chain-speculative-sampling kernel has no
         # min_p knob, and flashinfer exposes no `min_p_renorm_prob`.
-        expanded_min_ps = torch.repeat_interleave(
-            min_ps, num_tokens_per_req, dim=0
-        ).view(-1, 1)
-
         max_probs = target_probs.max(dim=-1, keepdim=True).values
 
         target_probs = torch.where(
-            target_probs >= expanded_min_ps * max_probs,
+            target_probs >= min_ps.view(-1, 1) * max_probs,
             target_probs,
             torch.zeros_like(target_probs),
         )
@@ -398,10 +408,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         target_probs.div_(target_probs.sum(dim=-1, keepdim=True))
 
         target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
-
-        draft_probs = torch.zeros(
-            target_probs.shape, dtype=torch.float32, device=target_probs.device
-        )
 
         coins = self._coins_buf[:bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[:bs]
@@ -414,9 +420,11 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=draft_probs,
+            draft_probs=None,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+            deterministic=True,
+            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1
@@ -432,8 +440,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         accepted_tokens = predict.long().gather(0, safe_positions.view(-1))
 
         pool_idx_expanded = (
-            sampling_info.req_pool_indices.long()
-            .unsqueeze(-1)
+            sampling_info.req_pool_indices.unsqueeze(-1)
             .expand(-1, num_tokens_per_req)
             .reshape(-1)
         )
@@ -447,7 +454,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         if raw_logprobs is not None:
 
             logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, predict.long().unsqueeze(-1)
+                -1, predict.unsqueeze(-1)
             ).squeeze(-1)
 
         return predict, accept_length

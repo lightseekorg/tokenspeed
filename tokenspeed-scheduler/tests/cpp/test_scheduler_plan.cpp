@@ -111,4 +111,39 @@ TEST_F(SchedulerTestSuite, NoCacheOps_PlainRequestNoCacheHit) {
     EXPECT_TRUE(cache_ops.empty());
 }
 
+class DisablePrefixCacheTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.disable_prefix_cache = true;
+        return cfg;
+    }
+};
+
+TEST_F(DisablePrefixCacheTestSuite, SamePromptDoesNotReuseDevicePrefix) {
+    Submit(MakeRequestSpec("r_seed", 2));
+    PlanOnce();
+    SendForwardDone("r_seed", {100});
+    PlanOnce();
+    SendFinish("r_seed");
+    PlanOnce();
+
+    Submit(MakeRequestSpec("r1", 2));
+    auto plan = PlanOnce();
+    const auto& op = plan.Operations()[0];
+    auto* fwd = std::get_if<FlatForwardOperation>(&op);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 1u);
+    EXPECT_EQ(fwd->request_ids[0], "r1");
+    EXPECT_EQ(fwd->extend_prefix_lens[0], 0);
+    EXPECT_EQ(fwd->input_lengths[0], 4);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan).empty());
+}
+
+TEST_F(DisablePrefixCacheTestSuite, PrefetchNotGeneratedForStorageHit) {
+    Submit(MakePrefetchableSpec("r1", 8, 6));
+    auto plan = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<PrefetchOperation>(plan).empty());
+}
+
 }  // namespace tokenspeed::test

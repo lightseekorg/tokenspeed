@@ -1,10 +1,40 @@
+import re
+
 import pytest
 from pipeline import (
+    STALE_PROCESS_PATTERNS,
     build_step_summary_lines,
     check_perf_reference,
     extract_evalscope_score,
     extract_perf_summary_rows,
 )
+
+
+def test_stale_process_patterns_match_smg_router_proctitle():
+    """`smg launch` rewrites its cmdline to `smg::router` via setproctitle;
+    the cleanup list must still match after that, otherwise stale routers
+    survive between runs and the next run hits port-bind conflicts."""
+    sample_cmdlines = [
+        "smg::router",
+        "smg::router --worker-urls grpc://127.0.0.1:1234",
+    ]
+    for cmdline in sample_cmdlines:
+        assert any(
+            re.search(pat, cmdline) for pat in STALE_PROCESS_PATTERNS
+        ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
+
+
+def test_stale_process_patterns_match_existing_targets():
+    cmdlines = [
+        "/usr/bin/python /usr/local/bin/ts serve --model foo",
+        "/usr/bin/python -m smg launch --worker-urls grpc://127.0.0.1:1234",
+        "/usr/bin/python -m smg_grpc_servicer.tokenspeed --host 127.0.0.1",
+        "/usr/bin/python /repo/test/runtime/run_ci_suite.py --device cuda",
+    ]
+    for cmdline in cmdlines:
+        assert any(
+            re.search(pat, cmdline) for pat in STALE_PROCESS_PATTERNS
+        ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
 
 
 def test_extract_evalscope_score_from_pipe_table():
