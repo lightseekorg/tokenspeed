@@ -12,9 +12,11 @@ runner:
     b200-2gpu:
       GPT_OSS_EVAL_ATTENTION_BACKEND: trtllm
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_mxfp4
+      GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     linux-mi355-2gpu-lightseek:
       # speed up host-side mem alloc in ci
       GPT_OSS_EVAL_KVSTORE_RATIO: "0.25"
+      GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
 install:
@@ -22,7 +24,7 @@ install:
 server:
   command: >-
     ts serve
-    --model openai/gpt-oss-120b
+    --model ${GPT_OSS_EVAL_MODEL}
     --attn-tp-size 2
     --moe-tp-size 2
     --max-model-len 80000
@@ -44,7 +46,7 @@ eval:
   # Expected GPQA-Diamond AveragePass@1 bar: 0.74 +- 0.03 (gpt-oss-120b reasoning).
   command: >-
     /tmp/evalscope-perf/bin/evalscope eval
-    --model openai/gpt-oss-120b
+    --model ${GPT_OSS_EVAL_MODEL}
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
