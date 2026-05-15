@@ -40,7 +40,10 @@ except (ImportError, AttributeError):
 
 from tokenspeed_scheduler import Cache
 
-from tokenspeed.runtime.cache.executor.host_executor import HostExecutor
+from tokenspeed.runtime.cache.executor.host_executor import (
+    CacheTransferBatch,
+    HostExecutor,
+)
 from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
 from tokenspeed.runtime.cache.kv_cache_host import (
     MHATokenToKVPoolHost,
@@ -211,79 +214,54 @@ class MemoryExecutor:
             self.submit(op)
         self.host_exec.flush()
 
+    def _transfer_batches(self, op):
+        has_units = bool(getattr(op, "transfer_kinds", None))
+        retract_flags = getattr(op, "is_retract", [False] * len(op.op_ids))
+        for i, op_id in enumerate(op.op_ids):
+            is_retract = bool(retract_flags[i])
+            if has_units:
+                yield CacheTransferBatch.from_scheduler(
+                    op_id,
+                    op.transfer_kinds[i],
+                    op.src_indices[i],
+                    op.dst_indices[i],
+                    is_retract=is_retract,
+                )
+            else:
+                yield CacheTransferBatch.from_pages(
+                    op_id,
+                    op.src_pages[i],
+                    op.dst_pages[i],
+                    is_retract=is_retract,
+                )
+
+    def _submit_host_transfer(self, op, *, is_writeback: bool) -> None:
+        name = "writeback" if is_writeback else "loadback"
+        logger.debug(
+            "[cache_op] %s op_id=%s rows=%s",
+            name,
+            op.op_ids,
+            len(op.op_ids),
+        )
+        for batch in self._transfer_batches(op):
+            mamba_pairs = batch.mamba_pairs()
+            if mamba_pairs:
+                logger.info(
+                    "[cache_op] mamba %s op_id=%s slots=%s",
+                    name,
+                    batch.op_id,
+                    mamba_pairs,
+                )
+            if is_writeback:
+                self.host_exec.enqueue_writeback(batch)
+            else:
+                self.host_exec.enqueue_loadback(batch)
+
     def submit(self, op) -> None:
         if isinstance(op, Cache.WriteBackOp):
-            logger.debug(
-                "[cache_op] writeback op_id=%s src_pages=%s dst_pages=%s",
-                op.op_ids,
-                len(op.src_pages),
-                len(op.dst_pages),
-            )
-            for i in range(len(op.op_ids)):
-                op_id = op.op_ids[i]
-                is_retract = bool(getattr(op, "is_retract", [False])[i])
-                if getattr(op, "transfer_kinds", None):
-                    kinds = op.transfer_kinds[i]
-                    src_indices = op.src_indices[i]
-                    dst_indices = op.dst_indices[i]
-                    mamba_pairs = [
-                        (src, dst)
-                        for kind, src, dst in zip(kinds, src_indices, dst_indices)
-                        if int(kind) == 1
-                    ]
-                    if mamba_pairs:
-                        logger.info(
-                            "[cache_op] mamba writeback op_id=%s slots=%s",
-                            op_id,
-                            mamba_pairs,
-                        )
-                    self.host_exec.enqueue_writeback_units(
-                        op_id,
-                        kinds,
-                        src_indices,
-                        dst_indices,
-                        is_retract=is_retract,
-                    )
-                else:
-                    src_pages = op.src_pages[i]
-                    dst_pages = op.dst_pages[i]
-                    self.host_exec.enqueue_writeback(
-                        op_id, src_pages, dst_pages, is_retract=is_retract
-                    )
+            self._submit_host_transfer(op, is_writeback=True)
         elif isinstance(op, Cache.LoadBackOp):
-            logger.debug(
-                "[cache_op] loadback op_id=%s src_pages=%s dst_pages=%s",
-                op.op_ids,
-                len(op.src_pages),
-                len(op.dst_pages),
-            )
-            for i in range(len(op.op_ids)):
-                op_id = op.op_ids[i]
-                if getattr(op, "transfer_kinds", None):
-                    kinds = op.transfer_kinds[i]
-                    src_indices = op.src_indices[i]
-                    dst_indices = op.dst_indices[i]
-                    mamba_pairs = [
-                        (src, dst)
-                        for kind, src, dst in zip(kinds, src_indices, dst_indices)
-                        if int(kind) == 1
-                    ]
-                    if mamba_pairs:
-                        logger.info(
-                            "[cache_op] mamba loadback op_id=%s slots=%s",
-                            op_id,
-                            mamba_pairs,
-                        )
-                    self.host_exec.enqueue_loadback_units(
-                        op_id,
-                        kinds,
-                        src_indices,
-                        dst_indices,
-                    )
-                else:
-                    src_pages = op.src_pages[i]
-                    dst_pages = op.dst_pages[i]
-                    self.host_exec.enqueue_loadback(op_id, src_pages, dst_pages)
+            self._submit_host_transfer(op, is_writeback=False)
         elif isinstance(op, Cache.PrefetchOp):
             logger.debug(
                 "[cache_op] prefetch op_id=%s dst_pages=%s", op.op_id, len(op.dst_pages)

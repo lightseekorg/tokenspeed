@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
+from enum import IntEnum
 from typing import Iterable, NamedTuple
 
 import torch
@@ -33,6 +35,60 @@ from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 CONCURRENT_WRITEBACK_BLOCK_QUOTA = 2
+
+
+class CacheTransferKind(IntEnum):
+    KV = 0
+    MAMBA = 1
+
+
+@dataclass(frozen=True, slots=True)
+class CacheTransferUnit:
+    kind: CacheTransferKind
+    src: int
+    dst: int
+
+    @classmethod
+    def from_raw(cls, kind, src, dst) -> "CacheTransferUnit":
+        return cls(CacheTransferKind(int(kind)), int(src), int(dst))
+
+
+@dataclass(frozen=True, slots=True)
+class CacheTransferBatch:
+    op_id: int
+    units: tuple[CacheTransferUnit, ...]
+    is_retract: bool = False
+
+    @classmethod
+    def from_pages(
+        cls,
+        op_id: int,
+        src_pages: Iterable[int],
+        dst_pages: Iterable[int],
+        *,
+        is_retract: bool = False,
+    ) -> "CacheTransferBatch":
+        units = tuple(
+            CacheTransferUnit(CacheTransferKind.KV, int(src), int(dst))
+            for src, dst in zip(src_pages, dst_pages)
+        )
+        return cls(int(op_id), units, is_retract)
+
+    @classmethod
+    def from_scheduler(
+        cls, op_id: int, kinds, src_indices, dst_indices, *, is_retract: bool = False
+    ) -> "CacheTransferBatch":
+        units = tuple(
+            CacheTransferUnit.from_raw(kind, src, dst)
+            for kind, src, dst in zip(kinds, src_indices, dst_indices)
+        )
+        return cls(int(op_id), units, is_retract)
+
+    def of_kind(self, kind: CacheTransferKind) -> tuple[CacheTransferUnit, ...]:
+        return tuple(unit for unit in self.units if unit.kind == kind)
+
+    def mamba_pairs(self) -> list[tuple[int, int]]:
+        return [(unit.src, unit.dst) for unit in self.of_kind(CacheTransferKind.MAMBA)]
 
 
 def _cache_stream_priorities() -> tuple[int | None, int | None]:
@@ -207,10 +263,12 @@ class HostExecutor:
         self.load_stream = _new_cache_stream(load_priority)
         self._writeback_block_quota: int | None = None
 
-        self.write_queue: list[_TransferOp] = []
-        self.load_queue: list[_TransferOp] = []
-        self.mamba_write_queue: list[_TransferOp] = []
-        self.mamba_load_queue: list[_TransferOp] = []
+        self.write_queues: dict[CacheTransferKind, list[_TransferOp]] = {
+            kind: [] for kind in CacheTransferKind
+        }
+        self.load_queues: dict[CacheTransferKind, list[_TransferOp]] = {
+            kind: [] for kind in CacheTransferKind
+        }
 
         self.ack_write_queue: list[_Ack] = []
         self.ack_load_queue: list[_Ack] = []
@@ -222,95 +280,122 @@ class HostExecutor:
         self._producer_map: OrderedDict[int, int] = OrderedDict()
         self._producer_map_limit = 1024
 
-    def enqueue_writeback(
-        self, op_id, src_pages, dst_pages, is_retract: bool = False
-    ) -> None:
-        src_pages, dst_pages = _dedupe_page_pairs(src_pages, dst_pages)
-        if not src_pages:
-            completed_writebacks = getattr(self, "completed_writebacks", None)
-            if completed_writebacks is None:
-                completed_writebacks = []
-                self.completed_writebacks = completed_writebacks
-            completed_writebacks.append(op_id)
-            return
-        device_indices = page_ids_to_token_indices(
-            src_pages, self.page_size, str(self.device)
-        )
-        host_indices = page_ids_to_token_indices(dst_pages, self.page_size, "cpu")
-        self.write_queue.append(
-            _TransferOp(host_indices, device_indices, op_id, is_retract)
-        )
+    def enqueue_writeback(self, batch: CacheTransferBatch) -> None:
+        self._enqueue_batch(batch, is_writeback=True)
 
-    def enqueue_loadback(self, op_id, src_pages, dst_pages) -> None:
-        src_pages, dst_pages = _dedupe_page_pairs(src_pages, dst_pages)
-        if not src_pages:
-            return
-        host_indices = page_ids_to_token_indices(src_pages, self.page_size, "cpu")
-        device_indices = page_ids_to_token_indices(
-            dst_pages, self.page_size, str(self.device)
-        )
-        self.load_queue.append(_TransferOp(host_indices, device_indices, op_id))
+    def enqueue_loadback(self, batch: CacheTransferBatch) -> None:
+        self._enqueue_batch(batch, is_writeback=False)
 
-    def enqueue_writeback_units(
-        self, op_id, kinds, src_indices, dst_indices, is_retract: bool = False
+    def _enqueue_batch(
+        self,
+        batch: CacheTransferBatch,
+        *,
+        is_writeback: bool,
     ) -> None:
-        kv_src, kv_dst, mamba_src, mamba_dst = self._split_transfer_units(
-            kinds, src_indices, dst_indices
-        )
+        queues = self.write_queues if is_writeback else self.load_queues
         queued = False
-        if kv_src:
-            self.enqueue_writeback(op_id, kv_src, kv_dst, is_retract=is_retract)
+        for kind in CacheTransferKind:
+            op = self._make_transfer_op(batch, kind, is_writeback=is_writeback)
+            if op is None:
+                continue
+            queues[kind].append(op)
             queued = True
-        if mamba_src:
-            self._require_mamba_pools()
-            self.mamba_write_queue.append(
-                _TransferOp(
-                    torch.tensor(mamba_dst, dtype=torch.int64),
-                    torch.tensor(mamba_src, dtype=torch.int64),
-                    op_id,
-                    is_retract,
-                )
-            )
-            queued = True
-        if not queued:
-            self.completed_writebacks.append(op_id)
+        if is_writeback and not queued:
+            self.completed_writebacks.append(batch.op_id)
 
-    def enqueue_loadback_units(self, op_id, kinds, src_indices, dst_indices) -> None:
-        kv_src, kv_dst, mamba_src, mamba_dst = self._split_transfer_units(
-            kinds, src_indices, dst_indices
+    def _make_transfer_op(
+        self,
+        batch: CacheTransferBatch,
+        kind: CacheTransferKind,
+        *,
+        is_writeback: bool,
+    ) -> _TransferOp | None:
+        units = batch.of_kind(kind)
+        if not units:
+            return None
+        src = [unit.src for unit in units]
+        dst = [unit.dst for unit in units]
+        if kind == CacheTransferKind.KV:
+            return self._make_kv_transfer_op(
+                batch.op_id,
+                src,
+                dst,
+                batch.is_retract,
+                is_writeback=is_writeback,
+            )
+        if kind == CacheTransferKind.MAMBA:
+            return self._make_mamba_transfer_op(
+                batch.op_id,
+                src,
+                dst,
+                batch.is_retract,
+                is_writeback=is_writeback,
+            )
+        raise ValueError(f"unsupported cache transfer kind={kind}")
+
+    def _make_kv_transfer_op(
+        self,
+        op_id: int,
+        src: list[int],
+        dst: list[int],
+        is_retract: bool,
+        *,
+        is_writeback: bool,
+    ) -> _TransferOp | None:
+        if is_writeback:
+            device_pages, host_pages = _dedupe_page_pairs(src, dst)
+        else:
+            host_pages, device_pages = _dedupe_page_pairs(src, dst)
+        if not host_pages:
+            return None
+        host_indices = page_ids_to_token_indices(host_pages, self.page_size, "cpu")
+        device_indices = page_ids_to_token_indices(
+            device_pages, self.page_size, str(self.device)
         )
-        if kv_src:
-            self.enqueue_loadback(op_id, kv_src, kv_dst)
-        if mamba_src:
-            self._require_mamba_pools()
-            self.mamba_load_queue.append(
-                _TransferOp(
-                    torch.tensor(mamba_src, dtype=torch.int64),
-                    torch.tensor(mamba_dst, dtype=torch.int64),
-                    op_id,
-                )
-            )
+        return _TransferOp(host_indices, device_indices, op_id, is_retract)
 
-    def _split_transfer_units(self, kinds, src_indices, dst_indices):
-        kv_src, kv_dst, mamba_src, mamba_dst = [], [], [], []
-        for kind, src, dst in zip(kinds, src_indices, dst_indices):
-            if int(kind) == 0:
-                kv_src.append(int(src))
-                kv_dst.append(int(dst))
-            elif int(kind) == 1:
-                mamba_src.append(int(src))
-                mamba_dst.append(int(dst))
-            else:
-                raise ValueError(f"unsupported cache transfer kind={kind}")
-        return kv_src, kv_dst, mamba_src, mamba_dst
+    def _make_mamba_transfer_op(
+        self,
+        op_id: int,
+        src: list[int],
+        dst: list[int],
+        is_retract: bool,
+        *,
+        is_writeback: bool,
+    ) -> _TransferOp | None:
+        self._require_mamba_pools()
+        if is_writeback:
+            device_slots, host_slots = src, dst
+        else:
+            host_slots, device_slots = src, dst
+        if not host_slots:
+            return None
+        host_indices = torch.tensor(host_slots, dtype=torch.int64)
+        device_indices = torch.tensor(device_slots, dtype=torch.int64)
+        return _TransferOp(host_indices, device_indices, op_id, is_retract)
 
     def _require_mamba_pools(self) -> None:
         if self.mamba_pool is None or self.mamba_host_pool is None:
             raise RuntimeError("mamba cache transfer requested without mamba pools")
 
+    @staticmethod
+    def _has_queued(queues: dict[CacheTransferKind, list[_TransferOp]]) -> bool:
+        return any(queues.values())
+
+    @staticmethod
+    def _merge_queue(queue: list[_TransferOp]) -> _TransferOp | None:
+        return _TransferOp.merge(queue) if queue else None
+
+    @staticmethod
+    def _clear_queues(queues: dict[CacheTransferKind, list[_TransferOp]]) -> None:
+        for queue in queues.values():
+            queue.clear()
+
     def flush(self) -> None:
-        has_loadback = bool(self.load_queue or self.mamba_load_queue)
-        write_queues = [*self.write_queue, *self.mamba_write_queue]
+        has_loadback = self._has_queued(self.load_queues)
+        write_queues = [
+            op for queue in self.write_queues.values() for op in queue
+        ]
         throttle_writeback = has_loadback and not any(
             getattr(op, "is_retract", False) for op in write_queues
         )
@@ -326,15 +411,11 @@ class HostExecutor:
             self._writeback_block_quota = previous_writeback_block_quota
 
     def _start_writing(self) -> None:
-        if not self.write_queue and not self.mamba_write_queue:
+        if not self._has_queued(self.write_queues):
             return
 
-        op = _TransferOp.merge(self.write_queue) if self.write_queue else None
-        mamba_op = (
-            _TransferOp.merge(self.mamba_write_queue)
-            if self.mamba_write_queue
-            else None
-        )
+        op = self._merge_queue(self.write_queues[CacheTransferKind.KV])
+        mamba_op = self._merge_queue(self.write_queues[CacheTransferKind.MAMBA])
         if op is not None:
             host_indices, device_indices = self._move_indices(op, self.host_pool)
             # Prepare draft indices outside the stream context so non_blocking H2D
@@ -348,8 +429,7 @@ class HostExecutor:
         else:
             host_indices = device_indices = None
             draft_host_indices = draft_device_indices = None
-        self.write_queue.clear()
-        self.mamba_write_queue.clear()
+        self._clear_queues(self.write_queues)
         node_ids = []
         if op is not None:
             node_ids.extend(op.node_ids)
@@ -399,20 +479,17 @@ class HostExecutor:
         self.ack_write_queue.append(_Ack(finish_event, node_ids))
 
     def _start_loading(self) -> None:
-        if not self.load_queue and not self.mamba_load_queue:
+        if not self._has_queued(self.load_queues):
             return
 
         producer_id = self.layer_done_counter.update_producer()
-        op = _TransferOp.merge(self.load_queue) if self.load_queue else None
-        mamba_op = (
-            _TransferOp.merge(self.mamba_load_queue) if self.mamba_load_queue else None
-        )
+        op = self._merge_queue(self.load_queues[CacheTransferKind.KV])
+        mamba_op = self._merge_queue(self.load_queues[CacheTransferKind.MAMBA])
         if op is not None:
             host_indices, device_indices = self._move_indices(op, self.host_pool)
         else:
             host_indices = device_indices = None
-        self.load_queue.clear()
-        self.mamba_load_queue.clear()
+        self._clear_queues(self.load_queues)
         node_ids = []
         if op is not None:
             node_ids.extend(op.node_ids)
@@ -549,10 +626,8 @@ class HostExecutor:
     def reset(self) -> None:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
-        self.write_queue.clear()
-        self.load_queue.clear()
-        self.mamba_write_queue.clear()
-        self.mamba_load_queue.clear()
+        self._clear_queues(self.write_queues)
+        self._clear_queues(self.load_queues)
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         self._producer_map.clear()
