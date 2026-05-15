@@ -155,6 +155,33 @@ def _load_layout(
 # ---------------------------------------------------------------------------
 
 
+@gluon.constexpr_function
+def _swiglu_split_layout(
+    block_m: int, block_n_full: int, num_warps: int
+) -> gl.constexpr:
+    """Build a ``BlockedLayout`` whose last-axis registers come in pairs,
+    so that ``reshape([..., 2]) -> split`` lowers to a free lane swap.
+
+    ``block_n_full = 2 * OUT_BLOCK_N`` is the GEMM accumulator N width
+    BEFORE the swiglu halve. We use ``size_per_thread = [1, 4]`` so each
+    thread holds two ``(gate, linear)`` pairs in adjacent registers; the
+    new innermost axis after reshape lives entirely in registers and the
+    split can lower to a zero-cost SliceLayout pick.
+
+    The fixed natural per-CTA tile is ``[2 * num_warps, 128]`` (i.e.
+    8 warps -> [16, 128]); both BLOCK_M and BLOCK_N replicate over this
+    tile when bigger, which is fine for split (each replica holds an
+    independent fragment with its own (gate, linear) pairs).
+    """
+    THREADS_PER_WARP = 64  # CDNA4 wavefront size.
+    return gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[2, THREADS_PER_WARP // 2],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+    )
+
+
 @gluon.jit
 def _swiglu_reduce(
     acc,
@@ -169,10 +196,24 @@ def _swiglu_reduce(
     adjacent N-columns are interpreted as ``(gate, linear)``. We split
     them along the last axis and apply the canonical
     ``s = gate / (1 + exp(-alpha * gate))`` mixing rule.
+
+    The MFMA-scaled accumulator layout on CDNA4 places adjacent N
+    elements in DIFFERENT lanes, so a naive
+    ``reshape -> split`` fails to infer a SliceLayout for the new
+    innermost axis (``gl.split`` requires the split axis to live in
+    registers). We pre-convert the accumulator to a ``BlockedLayout``
+    with ``size_per_thread = [1, 4]`` along N so adjacent N-elements
+    sit in the same thread's registers; the reshape then folds the
+    inner ``2`` axis into registers and ``gl.split`` becomes a free
+    lane pick.
     """
-    # Reshape [BM, 2*OUT_BLOCK_N] -> [BM, OUT_BLOCK_N, 2]; the last
-    # axis is the (gate, linear) pair.
-    reshaped = acc.reshape((acc.shape[0], OUT_BLOCK_N, 2))
+    BLOCK_M: gl.constexpr = acc.shape[0]
+    BLOCK_N_FULL: gl.constexpr = acc.shape[1]
+    SPLIT_LAYOUT: gl.constexpr = _swiglu_split_layout(
+        BLOCK_M, BLOCK_N_FULL, gl.num_warps()
+    )
+    acc = gl.convert_layout(acc, SPLIT_LAYOUT)
+    reshaped = acc.reshape((BLOCK_M, OUT_BLOCK_N, 2))
     gate, linear = gl.split(reshaped)
     if limit > 0.0:
         gate = gl.minimum(gate, limit)
@@ -1018,6 +1059,8 @@ def _pipelined_moe_kernel_scaled(
     scatter_idx_ptr,
     gate_scal_ptr,
     expert_remap_ptr,
+    slice_offs_ptr,
+    slice_sizes_ptr,
     stride_xm,
     stride_xk,
     stride_we,
@@ -1033,6 +1076,7 @@ def _pipelined_moe_kernel_scaled(
     stride_be,
     stride_bn,
     M,
+    M_X,
     N,
     K,
     x_global_scale,
@@ -1054,6 +1098,7 @@ def _pipelined_moe_kernel_scaled(
     OUT_BLOCK_N: gl.constexpr,
     APPLY_GATE_SCAL: gl.constexpr,
     HAS_EXPERT_REMAP: gl.constexpr,
+    HAS_RAGGED_OFFS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     SCALE_LOAD_MODE: gl.constexpr,
@@ -1079,7 +1124,20 @@ def _pipelined_moe_kernel_scaled(
     BLOCK_SCALE_FACTOR: gl.constexpr = 32
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // BLOCK_SCALE_FACTOR
 
-    off_m = compact_idx * BLOCKS_PER_EXPERT * BLOCK_M + block_in_expert * BLOCK_M
+    if HAS_RAGGED_OFFS:
+        # Honour the actual ragged packing of x: experts live back-to-back
+        # in HBM at ``slice_offs[expert_id]``; per-expert block boundary
+        # is ``slice_sizes[expert_id]`` (NOT padded up to BLOCK_M).
+        # This is required when per-expert size < BLOCK_M (otherwise the
+        # naive ``compact_idx * BLOCKS_PER_EXPERT * BLOCK_M`` reads rows
+        # belonging to the next expert and corrupts the GEMM).
+        m_base = gl.load(slice_offs_ptr + expert_id).to(gl.int32)
+        m_size = gl.load(slice_sizes_ptr + expert_id).to(gl.int32)
+        off_m = m_base + block_in_expert * BLOCK_M
+        m_limit = m_base + m_size
+    else:
+        off_m = compact_idx * BLOCKS_PER_EXPERT * BLOCK_M + block_in_expert * BLOCK_M
+        m_limit = M
     off_n = pid_n * BLOCK_N
     w_base_offset = expert_id * stride_we
     ws_base_offset = expert_id * stride_wse
@@ -1136,13 +1194,26 @@ def _pipelined_moe_kernel_scaled(
         offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
 
     rows_m = off_m + offs_xm
+    # ``m_limit`` is the per-expert tail when HAS_RAGGED_OFFS=True
+    # (= slice_offs[expert_id] + slice_sizes[expert_id]); otherwise it
+    # is the global ``M``. The pre-gather position lives in the
+    # ragged-dispatched order so we use ``m_limit`` to bound it.
+    pre_gather_mask = rows_m < m_limit
     if HAS_GATHER:
-        rows_m_safe = gl.where(rows_m < M, rows_m, gl.zeros_like(rows_m))
+        rows_m_safe = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
         rows_m = gl.load(
-            gather_idx_ptr + rows_m_safe, mask=rows_m_safe < M, other=0
+            gather_idx_ptr + rows_m_safe, mask=pre_gather_mask, other=0
         ).to(gl.int32)
-
-    mask_m = rows_m < M
+        # Post-gather ``rows_m`` lives in the *global* token-id space
+        # of x_orig (size = ``M_X`` = x.shape[-2] = n_tokens), so the
+        # x-load mask must use the pre-gather mask combined with the
+        # global ``rows_m < M_X`` bound (the latter guards a junk
+        # gather_idx value). NOTE: ``M`` is the dispatched / output
+        # tile count (= gather_indx.numel() in production) which can be
+        # > M_X for top-k>1 dispatches; do NOT mix the two.
+        mask_m = pre_gather_mask & (rows_m < M_X)
+    else:
+        mask_m = pre_gather_mask
     mask_n = (off_n + offs_wn) < N
 
     # Hint divisibility on K_phys: the launcher requires K % 32 == 0, so
@@ -1207,7 +1278,12 @@ def _pipelined_moe_kernel_scaled(
             offs_xs_k = gl.arange(0, BLOCK_K_S_PS, layout=gl.SliceLayout(0, LX_S))
             row_base_x_s = off_m // cfg.PRESHUFFLE_FACTOR
             rows_m_scale = row_base_x_s + offs_xs_m
-            row_limit_x_s = (M + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
+            # x_scale's row bound follows x's physical row count (M_X),
+            # not the dispatched tile count M. With HAS_GATHER, off_m
+            # is in dispatched space but the x_scale read is gated by
+            # mask_m (post-gather) below; this row_limit only exists to
+            # guard the SCALE_VIA_LDS bulk load.
+            row_limit_x_s = (M_X + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
             # cdna4_upstream: the in-tile K-axis is packed with the N-axis,
             # so a K-mask on the packed column would scramble both. We rely
             # on the host-side padding (e8m0=0 for OOB microblocks)
@@ -1256,7 +1332,7 @@ def _pipelined_moe_kernel_scaled(
                 offs_xs_k,
                 stride_xsm,
                 stride_xsk,
-                rows_m_scale[:, None] < M,
+                rows_m_scale[:, None] < M_X,
                 K // cfg.SCALE_BLOCK,
             )
     else:
@@ -1353,18 +1429,18 @@ def _pipelined_moe_kernel_scaled(
     if APPLY_GATE_SCAL:
         scal = gl.load(
             gate_scal_ptr + offs_y_m,
-            mask=offs_y_m < M,
+            mask=offs_y_m < m_limit,
             other=1.0,
         )
         out = out * scal[:, None].to(out.dtype)
 
     actual_n = (N // 2) if DO_SWIGLU else N
     if HAS_SCATTER:
-        rows_y = gl.load(scatter_idx_ptr + offs_y_m, mask=offs_y_m < M, other=M)
+        rows_y = gl.load(scatter_idx_ptr + offs_y_m, mask=offs_y_m < m_limit, other=M)
         mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
         y_offs = rows_y[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
     else:
-        mask_y = (offs_y_m[:, None] < M) & (offs_y_n[None, :] < actual_n)
+        mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < actual_n)
         y_offs = offs_y_m[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
 
     gl.store(y_ptr + y_offs, out, mask=mask_y)
@@ -1665,7 +1741,19 @@ def _launch_kernel(
     if has_w_block_scale:
         assert w_scale is not None, "mxfp4 W requires a block-scale tensor"
 
-    M = x.shape[-2]
+    # ``M`` is the dispatched / output tile count consumed by the kernel
+    # for ragged & writeback bookkeeping. With a non-None ``gather_indx``
+    # production passes ``x`` *un-permuted* (shape ``(n_tokens, H)``) and
+    # the kernel walks ``gather_indx[i]`` for ``i in [0, gather_indx.numel())``
+    # -- so M must reflect the dispatched count, not ``n_tokens``.
+    # ``M_X`` stays bound to ``x.shape[-2]`` so the post-gather safety
+    # check (``rows_m < M_X``) keeps catching out-of-range gather idx.
+    M_X = x.shape[-2]
+    if gather_indx is not None:
+        gather_buf_for_m = gather_indx.src_indx
+        M = int(gather_buf_for_m.shape[0])
+    else:
+        M = M_X
     K_phys = x.shape[-1]
     div_a = 2 if a_format == "e2m1" else 1
     div_b = 2 if b_format == "e2m1" else 1
@@ -1725,6 +1813,27 @@ def _launch_kernel(
         expert_remap if expert_remap is not None else _make_dummy(x.device, torch.int32)
     )
 
+    # Per-expert ragged offsets (slice_offs) + sizes (slice_sizes).
+    # Required when per-expert size < BLOCK_M -- otherwise the kernel's
+    # naive ``compact_idx * BLOCKS_PER_EXPERT * BLOCK_M`` row offset
+    # would step PAST the per-expert tail and load rows belonging to
+    # the NEXT expert (corrupting the GEMM, see check_gluon_mxfp_fp8
+    # n_active=8 per_expert=32 case).
+    # DEBUG knob: ``TOKENSPEED_MOE_GLUON_RAGGED_OFFS=0`` disables the
+    # per-expert slice_offs / slice_sizes mask path even when ragged
+    # metadata is provided. Used to bisect whether a regression comes
+    # from the new ragged-offs code or from elsewhere.
+    _ragged_offs_disabled = os.environ.get(
+        "TOKENSPEED_MOE_GLUON_RAGGED_OFFS", ""
+    ).strip().lower() in {"0", "false", "no", "off"}
+    has_ragged_offs = a_ragged_metadata is not None and not _ragged_offs_disabled
+    if has_ragged_offs:
+        slice_offs_buf = a_ragged_metadata.slice_offs.to(torch.int32)
+        slice_sizes_buf = a_ragged_metadata.slice_sizes.to(torch.int32)
+    else:
+        slice_offs_buf = _make_dummy(x.device, torch.int32)
+        slice_sizes_buf = _make_dummy(x.device, torch.int32)
+
     swiglu_alpha = swiglu[0] if swiglu is not None else 0.0
     swiglu_limit = swiglu[1] if swiglu is not None else 0.0
 
@@ -1772,6 +1881,8 @@ def _launch_kernel(
         scatter_buf,
         gate_scal_buf,
         expert_remap_buf,
+        slice_offs_buf,
+        slice_sizes_buf,
         x.stride(-2),
         x.stride(-1),
         w3.stride(0),
@@ -1787,6 +1898,7 @@ def _launch_kernel(
         bias.stride(0) if bias is not None else 0,
         bias.stride(-1) if bias is not None else 0,
         M,
+        M_X,
         N,
         K,
         float(a_global_scale),
@@ -1808,6 +1920,7 @@ def _launch_kernel(
         OUT_BLOCK_N=out_block_n,
         APPLY_GATE_SCAL=gate_scal is not None,
         HAS_EXPERT_REMAP=expert_remap is not None,
+        HAS_RAGGED_OFFS=has_ragged_offs,
         NUM_WARPS=num_warps,
         NUM_BUFFERS=num_buffers,
         SCALE_LOAD_MODE=scale_load_mode,
@@ -2197,7 +2310,16 @@ def gluon_mxfp_dispatch_swiglu(
 ) -> torch.Tensor:
     """Scaled-MFMA dispatch + 1st GEMM + fused SwiGLU."""
     assert w.ndim == 3 and w.shape[-1] % 2 == 0
-    M = x.shape[-2]
+    # Output rows: dispatched tile count (= ``gather_indx.numel()`` when
+    # ``x`` is the un-permuted (n_tokens, H) input from production), or
+    # ``x.shape[-2]`` for pre-permuted bench-style calls.
+    if gather_indx is not None:
+        gather_t = (
+            gather_indx.src_indx if hasattr(gather_indx, "src_indx") else gather_indx
+        )
+        M = int(gather_t.shape[0])
+    else:
+        M = x.shape[-2]
     N = w.shape[-1]
     div_a = 2 if a_format == "e2m1" else 1
     K = x.shape[-1] * div_a
@@ -2270,8 +2392,6 @@ def gluon_mxfp_combine(
     assert w.ndim == 3
     M = x.shape[-2]
     N = w.shape[-1]
-    if n_tokens is None:
-        n_tokens = M
     div_a = 2 if a_format == "e2m1" else 1
     K = x.shape[-1] * div_a
     bm, bn, bk, nw = _autotune_block(
@@ -2287,7 +2407,21 @@ def gluon_mxfp_combine(
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
-    y = torch.zeros((n_tokens, N), device=x.device, dtype=out_dtype)
+    # Scatter writeback produces a *flat* ``(n_tokens * n_expts_act, N)``
+    # buffer (matching upstream ``triton_kernels.matmul`` semantics). The
+    # caller-supplied ``n_tokens`` is the post-combine token count; with
+    # ``n_expts_act > 1`` we still need ``n_tokens * n_expts_act`` rows
+    # in the kernel's HBM output so each expert's slot is independently
+    # writable, then we reduce over the top-k axis below. With
+    # ``n_tokens=None`` (bench callers) we default to ``M`` rows.
+    n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
+    if n_tokens is None:
+        n_rows = M
+        n_tokens_eff = M
+    else:
+        n_tokens_eff = int(n_tokens)
+        n_rows = n_tokens_eff * n_act_eff
+    y = torch.zeros((n_rows, N), device=x.device, dtype=out_dtype)
     _launch_kernel(
         x,
         w,
@@ -2312,8 +2446,8 @@ def gluon_mxfp_combine(
         w_transpose=w_transpose,
         num_buffers=num_buffers,
     )
-    if n_expts_act is not None and n_expts_act > 1:
-        y = y.view(n_tokens, n_expts_act, N).sum(dim=1)
+    if n_act_eff > 1:
+        y = y.view(n_tokens_eff, n_act_eff, N).sum(dim=1)
     return y
 
 
@@ -2526,20 +2660,57 @@ def _try_dispatch_mxfp(
         return None, False
 
     try:
+        # Per-path kill-switches (debug aid for bisecting end-to-end
+        # crashes). Set ``TOKENSPEED_MOE_GLUON_DISPATCH=0`` /
+        # ``TOKENSPEED_MOE_GLUON_COMBINE=0`` to fall back to upstream
+        # for one specific kernel without disabling gluon entirely.
+        _disable_dispatch = _os.environ.get(
+            "TOKENSPEED_MOE_GLUON_DISPATCH", ""
+        ).strip().lower() in {"0", "false", "no", "off"}
+        _disable_combine = _os.environ.get(
+            "TOKENSPEED_MOE_GLUON_COMBINE", ""
+        ).strip().lower() in {"0", "false", "no", "off"}
+
         if has_scatter and not has_gather:
-            # NOTE(scatter+W_TRANSPOSE): gluon_mxfp_combine on
-            # ``W_TRANSPOSE=True`` (the only zero-copy path for
-            # production's K-contig weights) currently writes NaNs in
-            # the scatter epilogue (see check_gluon_mxfp_fp8_wiring.py).
-            # The dispatch+swiglu path with the same W_TRANSPOSE=True
-            # weight is already bit-identical to upstream, so the bug
-            # is localised to the scatter writeback. Until that's
-            # fixed, fall back to upstream's combine kernel; we still
-            # win on dispatch+swiglu, which dominates the MoE GEMM
-            # FLOPs for both prefill and decode.
-            return None, False
+            if _disable_combine:
+                return None, False
+            # gemm + scatter combine path. The pre-ragged-offs bug
+            # (off_m past per-expert tail loaded NEXT expert's rows)
+            # used to taint this path's writeback with NaNs whenever
+            # per-expert size < BLOCK_M; the HAS_RAGGED_OFFS fix
+            # bounds writes to the actual per-expert tail and now
+            # produces bit-identical output vs upstream.
+            out = gluon_mxfp_combine(
+                x_view,
+                w_raw,
+                s_raw,
+                x_scale=x_scale,
+                a_format=a_format,
+                a_global_scale=a_global_scale,
+                bias=bias,
+                a_ragged_metadata=a_ragged_metadata,
+                scatter_indx=scatter_indx,
+                gate_scal=gammas,
+                # ``n_tokens`` / ``n_expts_act`` arrive as direct
+                # parameters on ``_try_dispatch_mxfp`` (see
+                # ``_gluon_bf16_ragged_matmul``), NOT in ``passthrough``;
+                # falling back to the latter silently dropped them and
+                # left the kernel allocating a ``(M, N)`` slab without
+                # the post-kernel top-k reduction, producing a
+                # ``(top_k * n_tokens, N)`` output that crashed the
+                # downstream layernorm with a shape mismatch on decode
+                # batches.
+                n_tokens=n_tokens,
+                n_expts_act=n_expts_act,
+                out_dtype=out_dtype,
+                scale_load_mode="cdna4_upstream",
+                w_transpose=True,
+            )
+            return out, True
 
         if not has_scatter and swiglu_args is not None:
+            if _disable_dispatch:
+                return None, False
             # Covers both gather_indx-driven dispatch+swiglu (production
             # path from triton_kernel_fp8.py) AND the pre-permuted
             # bench-style call where ``gather_indx=None``.
