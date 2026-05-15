@@ -53,6 +53,4 @@ eval:
     --eval-batch-size 16
 report:
   github_step_summary: true
-score_threshold:
-  b200-2gpu: 0.7
-  linux-mi355-2gpu-lightseek: 0.69 # TODO: Verify the performance with weights author
+score_threshold: 0.7

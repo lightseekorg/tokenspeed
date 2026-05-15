@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 from tokenspeed.runtime.layers.quantization import Mxfp4Config
+from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
 _is_nvidia = current_platform().is_nvidia
 _is_blackwell = current_platform().is_blackwell
@@ -120,6 +121,11 @@ class Mxfp4TritonKernelBackend(MoEBackend):
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
         if not isinstance(quant_config, Mxfp4Config):
+            return False
+        if should_ignore_quant_layer(
+            prefix=spec.prefix,
+            ignored_layers=getattr(quant_config, "ignored_layers", []) or [],
+        ):
             return False
         if quant_config.is_w4a8_fp8:
             if not current_platform().is_amd:
