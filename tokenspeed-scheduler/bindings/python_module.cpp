@@ -222,7 +222,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("enable_mamba", &tokenspeed::SchedulerConfig::enable_mamba)
         .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)
-        .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks);
+        .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks)
+        .def_rw("mamba_host_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_host_pool_total_chunks);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
@@ -343,12 +344,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::FlatLoadBackOperation>(cache, "LoadBackOp")
         .def_ro("op_ids", &tokenspeed::FlatLoadBackOperation::op_ids)
         .def_ro("src_pages", &tokenspeed::FlatLoadBackOperation::src_pages)
-        .def_ro("dst_pages", &tokenspeed::FlatLoadBackOperation::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::FlatLoadBackOperation::dst_pages)
+        .def_ro("transfer_kinds", &tokenspeed::FlatLoadBackOperation::transfer_kinds)
+        .def_ro("src_indices", &tokenspeed::FlatLoadBackOperation::src_indices)
+        .def_ro("dst_indices", &tokenspeed::FlatLoadBackOperation::dst_indices);
 
     nb::class_<tokenspeed::FlatWriteBackOperation>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::FlatWriteBackOperation::op_ids)
         .def_ro("src_pages", &tokenspeed::FlatWriteBackOperation::src_pages)
         .def_ro("dst_pages", &tokenspeed::FlatWriteBackOperation::dst_pages)
+        .def_ro("transfer_kinds", &tokenspeed::FlatWriteBackOperation::transfer_kinds)
+        .def_ro("src_indices", &tokenspeed::FlatWriteBackOperation::src_indices)
+        .def_ro("dst_indices", &tokenspeed::FlatWriteBackOperation::dst_indices)
         .def_ro("is_retract", &tokenspeed::FlatWriteBackOperation::is_retract);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {

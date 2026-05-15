@@ -41,19 +41,17 @@
 
 namespace {
 
-// Build a flat list of (device_page, host_page) pairs from the given write_diff nodes.
-// Both Draining::PagePair and Retracting::PagePair are std::tuple<int32_t, int32_t>.
-std::vector<std::tuple<std::int32_t, std::int32_t>> BuildWriteBackPairs(
+std::vector<tokenspeed::CacheTransferUnit> BuildWriteBackPairs(
     const std::vector<tokenspeed::TreeNode*>& write_diff) {
-    std::vector<std::tuple<std::int32_t, std::int32_t>> pages_to_transfer;
+    std::vector<tokenspeed::CacheTransferUnit> transfers;
     for (tokenspeed::TreeNode* n : write_diff) {
         const auto& dev_pages = n->Device().Pages();
         const auto& host_pages = n->Host().Pages();
         for (std::size_t i = 0; i < dev_pages.size(); ++i) {
-            pages_to_transfer.emplace_back(dev_pages[i], host_pages[i]);
+            transfers.push_back({tokenspeed::CacheTransferKind::KV, dev_pages[i], host_pages[i]});
         }
     }
-    return pages_to_transfer;
+    return transfers;
 }
 
 }  // namespace
@@ -313,8 +311,23 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
     // local_mamba_allocator dropped here — destructor frees remaining slots
 
     MatchResult match = kv_prefix_cache_->Match(full_paged_tokens);
-    if (!disable_l2_cache_ && (match.device.DepthInPage() > match.host.DepthInPage())) {
-        std::vector<TreeNode*> write_diff = match.NodesWithout<ResourceType::Host>();
+    if (disable_l2_cache_) {
+        return Finished{};
+    }
+
+    const bool need_kv_writeback = match.device.DepthInPage() > match.host.DepthInPage();
+    TreeNode* mamba_node =
+        hybrid_prefix_cache_ != nullptr ? hybrid_prefix_cache_->FindLastMambaNode(match.device.last_node,
+                                                                                  ResourceType::Device)
+                                        : nullptr;
+    const bool need_mamba_writeback = mamba_node != nullptr && !mamba_node->HasMambaHost();
+    if (!need_kv_writeback && !need_mamba_writeback) {
+        return Finished{};
+    }
+
+    std::vector<TreeNode*> write_diff;
+    if (need_kv_writeback) {
+        write_diff = match.NodesWithout<ResourceType::Host>();
         std::int32_t host_pages_num = 0;
         for (TreeNode* node : write_diff) {
             host_pages_num += node->Device().NumPages();
@@ -323,13 +336,30 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
         if (!kv_prefix_cache_->EnsureCapacityByEvict<ResourceType::Host>(host_pages_num)) {
             return Finished{};
         }
-        kv_prefix_cache_->AllocateResourceOfType<ResourceType::Host>(write_diff);
-        std::unique_ptr<DeviceNodeRef> device_node_ref = std::make_unique<DeviceNodeRef>(match.device.last_node);
-        std::unique_ptr<HostNodeRef> host_node_ref = std::make_unique<HostNodeRef>(match.device.last_node);
-
-        return Draining{BuildWriteBackPairs(write_diff), std::move(device_node_ref), std::move(host_node_ref)};
     }
-    return Finished{};
+    if (need_mamba_writeback && !hybrid_prefix_cache_->EnsureMambaHostCapacityByEvict(1, mamba_node)) {
+        return Finished{};
+    }
+
+    std::vector<CacheTransferUnit> transfers;
+    std::unique_ptr<DeviceNodeRef> device_node_ref;
+    std::unique_ptr<HostNodeRef> host_node_ref;
+    if (need_kv_writeback) {
+        kv_prefix_cache_->AllocateResourceOfType<ResourceType::Host>(write_diff);
+        transfers = BuildWriteBackPairs(write_diff);
+        device_node_ref = std::make_unique<DeviceNodeRef>(match.device.last_node);
+        host_node_ref = std::make_unique<HostNodeRef>(match.device.last_node);
+    } else {
+        device_node_ref = std::make_unique<DeviceNodeRef>(mamba_node);
+    }
+
+    if (need_mamba_writeback) {
+        auto host_slot = hybrid_prefix_cache_->AllocateHostMamba();
+        if (host_slot == nullptr) return Finished{};
+        hybrid_prefix_cache_->AttachHostMamba(mamba_node, std::move(host_slot));
+        transfers.push_back({CacheTransferKind::Mamba, mamba_node->MambaSlotIndex(), mamba_node->MambaHostSlotIndex()});
+    }
+    return Draining{std::move(transfers), std::move(device_node_ref), std::move(host_node_ref)};
 }
 
 std::variant<Draining, Finished> FinishEvent::operator()(Decoding&& state) {
@@ -439,17 +469,37 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     auto local_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
 
-    // Mamba: save the latest checkpoint/working state into the prefix cache
-    // before the request is retracted, so it can be recovered on loadback.
+    // Mamba retraction recovery needs the live working state, not merely the
+    // page-aligned prefix checkpoint. Prefix reuse ignores non-exact-depth
+    // states; recovery explicitly opts into them.
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr &&
         (local_mamba_allocator->HasCheckpoint() || local_mamba_allocator->HasWorking())) {
         TreeNode* terminal = match_result_.device.last_node;
-        if (terminal != nullptr && !terminal->HasMamba()) {
-            if (local_mamba_allocator->HasCheckpoint()) {
-                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachCheckpoint());
+        const std::size_t recovery_depth =
+            token_container->Size() > 0 ? static_cast<std::size_t>(token_container->Size() - 1) : 0;
+        if (terminal != nullptr &&
+            (!terminal->HasMambaDevice() || terminal->MambaDeviceDepthTokens() != recovery_depth)) {
+            if (local_mamba_allocator->HasWorking()) {
+                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking(), recovery_depth);
             } else {
-                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
+                hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachCheckpoint());
             }
+        }
+        if (terminal != nullptr && terminal->HasMambaHost() && terminal->HasMambaDevice() &&
+            terminal->MambaHostDepthTokens() != terminal->MambaDeviceDepthTokens()) {
+            terminal->DetachMambaHost();
+        }
+        if (terminal != nullptr && terminal->HasMambaDevice() && !terminal->HasMambaHost()) {
+            if (!hybrid_prefix_cache_->EnsureMambaHostCapacityByEvict(1, terminal)) {
+                throw std::logic_error("ScheduleRetractEvent: failed to allocate host slot for mamba writeback");
+            }
+            auto host_slot = hybrid_prefix_cache_->AllocateHostMamba();
+            if (host_slot == nullptr) {
+                throw std::logic_error("ScheduleRetractEvent: failed to allocate host mamba slot");
+            }
+            hybrid_prefix_cache_->AttachHostMamba(terminal, std::move(host_slot), terminal->MambaDeviceDepthTokens());
+            pages_to_transfer.push_back(
+                {CacheTransferKind::Mamba, terminal->MambaSlotIndex(), terminal->MambaHostSlotIndex()});
         }
         // Once retracted, the recoverable Mamba state is tree-owned and
         // therefore evictable by HybridPrefixCache. Do not keep request-local

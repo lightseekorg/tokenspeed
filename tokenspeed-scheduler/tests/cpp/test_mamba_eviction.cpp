@@ -36,7 +36,7 @@ protected:
     void SetUp() override {
         mamba_alloc_ = std::make_unique<MambaChunkAllocator>(8);
         page_alloc_ = std::make_unique<PageAllocator>(2, 32);
-        eviction_ = std::make_unique<MambaEvictionManager>(mamba_alloc_.get());
+        eviction_ = std::make_unique<MambaEvictionManager>(mamba_alloc_.get(), ResourceType::Device);
     }
 
     TreeNode* MakeNodeWithMamba(TreeNode* parent, const token_vec_t& tokens) {

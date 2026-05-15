@@ -185,6 +185,8 @@ class HostExecutor:
         draft_device_pool=None,
         draft_host_pool=None,
         draft_layer_num: int = 0,
+        mamba_pool=None,
+        mamba_host_pool=None,
     ):
         self.page_size = page_size
         self.device_pool = device_pool
@@ -197,6 +199,8 @@ class HostExecutor:
         self.draft_device_pool = draft_device_pool
         self.draft_host_pool = draft_host_pool
         self.draft_layer_num = draft_layer_num
+        self.mamba_pool = mamba_pool
+        self.mamba_host_pool = mamba_host_pool
 
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
@@ -205,6 +209,8 @@ class HostExecutor:
 
         self.write_queue: list[_TransferOp] = []
         self.load_queue: list[_TransferOp] = []
+        self.mamba_write_queue: list[_TransferOp] = []
+        self.mamba_load_queue: list[_TransferOp] = []
 
         self.ack_write_queue: list[_Ack] = []
         self.ack_load_queue: list[_Ack] = []
@@ -245,9 +251,68 @@ class HostExecutor:
         )
         self.load_queue.append(_TransferOp(host_indices, device_indices, op_id))
 
+    def enqueue_writeback_units(
+        self, op_id, kinds, src_indices, dst_indices, is_retract: bool = False
+    ) -> None:
+        kv_src, kv_dst, mamba_src, mamba_dst = self._split_transfer_units(
+            kinds, src_indices, dst_indices
+        )
+        queued = False
+        if kv_src:
+            self.enqueue_writeback(op_id, kv_src, kv_dst, is_retract=is_retract)
+            queued = True
+        if mamba_src:
+            self._require_mamba_pools()
+            self.mamba_write_queue.append(
+                _TransferOp(
+                    torch.tensor(mamba_dst, dtype=torch.int64),
+                    torch.tensor(mamba_src, dtype=torch.int64),
+                    op_id,
+                    is_retract,
+                )
+            )
+            queued = True
+        if not queued:
+            self.completed_writebacks.append(op_id)
+
+    def enqueue_loadback_units(self, op_id, kinds, src_indices, dst_indices) -> None:
+        kv_src, kv_dst, mamba_src, mamba_dst = self._split_transfer_units(
+            kinds, src_indices, dst_indices
+        )
+        if kv_src:
+            self.enqueue_loadback(op_id, kv_src, kv_dst)
+        if mamba_src:
+            self._require_mamba_pools()
+            self.mamba_load_queue.append(
+                _TransferOp(
+                    torch.tensor(mamba_src, dtype=torch.int64),
+                    torch.tensor(mamba_dst, dtype=torch.int64),
+                    op_id,
+                )
+            )
+
+    def _split_transfer_units(self, kinds, src_indices, dst_indices):
+        kv_src, kv_dst, mamba_src, mamba_dst = [], [], [], []
+        for kind, src, dst in zip(kinds, src_indices, dst_indices):
+            if int(kind) == 0:
+                kv_src.append(int(src))
+                kv_dst.append(int(dst))
+            elif int(kind) == 1:
+                mamba_src.append(int(src))
+                mamba_dst.append(int(dst))
+            else:
+                raise ValueError(f"unsupported cache transfer kind={kind}")
+        return kv_src, kv_dst, mamba_src, mamba_dst
+
+    def _require_mamba_pools(self) -> None:
+        if self.mamba_pool is None or self.mamba_host_pool is None:
+            raise RuntimeError("mamba cache transfer requested without mamba pools")
+
     def flush(self) -> None:
-        throttle_writeback = self.load_queue and not any(
-            getattr(op, "is_retract", False) for op in self.write_queue
+        has_loadback = bool(self.load_queue or self.mamba_load_queue)
+        write_queues = [*self.write_queue, *self.mamba_write_queue]
+        throttle_writeback = has_loadback and not any(
+            getattr(op, "is_retract", False) for op in write_queues
         )
         writeback_block_quota = (
             CONCURRENT_WRITEBACK_BLOCK_QUOTA if throttle_writeback else None
@@ -261,20 +326,35 @@ class HostExecutor:
             self._writeback_block_quota = previous_writeback_block_quota
 
     def _start_writing(self) -> None:
-        if not self.write_queue:
+        if not self.write_queue and not self.mamba_write_queue:
             return
 
-        op = _TransferOp.merge(self.write_queue)
-        host_indices, device_indices = self._move_indices(op, self.host_pool)
-        # Prepare draft indices outside the stream context so non_blocking H2D
-        # copies are issued on the default stream and then consumed by write_stream.
-        if self.draft_host_pool is not None:
-            draft_host_indices, draft_device_indices = self._move_indices(
-                op, self.draft_host_pool
-            )
+        op = _TransferOp.merge(self.write_queue) if self.write_queue else None
+        mamba_op = (
+            _TransferOp.merge(self.mamba_write_queue)
+            if self.mamba_write_queue
+            else None
+        )
+        if op is not None:
+            host_indices, device_indices = self._move_indices(op, self.host_pool)
+            # Prepare draft indices outside the stream context so non_blocking H2D
+            # copies are issued on the default stream and then consumed by write_stream.
+            if self.draft_host_pool is not None:
+                draft_host_indices, draft_device_indices = self._move_indices(
+                    op, self.draft_host_pool
+                )
+            else:
+                draft_host_indices = draft_device_indices = None
         else:
+            host_indices = device_indices = None
             draft_host_indices = draft_device_indices = None
         self.write_queue.clear()
+        self.mamba_write_queue.clear()
+        node_ids = []
+        if op is not None:
+            node_ids.extend(op.node_ids)
+        if mamba_op is not None:
+            node_ids.extend(mamba_op.node_ids)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -282,48 +362,68 @@ class HostExecutor:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.host_pool.backup_from_device_all_layer(
-                self.device_pool,
-                host_indices.to(torch.int64),
-                device_indices.to(torch.int64),
-                self.io_backend,
-                block_quota=self._writeback_block_quota,
-            )
-            # Draft model shares the same page mapping; backup its KV cache too.
-            if self.draft_host_pool is not None:
-                self.draft_host_pool.backup_from_device_all_layer(
-                    self.draft_device_pool,
-                    draft_host_indices.to(torch.int64),
-                    draft_device_indices.to(torch.int64),
+            if op is not None:
+                self.host_pool.backup_from_device_all_layer(
+                    self.device_pool,
+                    host_indices.to(torch.int64),
+                    device_indices.to(torch.int64),
                     self.io_backend,
                     block_quota=self._writeback_block_quota,
                 )
-                if draft_host_indices.is_cuda:
-                    draft_host_indices.record_stream(self.write_stream)
-                if draft_device_indices.is_cuda:
-                    draft_device_indices.record_stream(self.write_stream)
+                # Draft model shares the same page mapping; backup its KV cache too.
+                if self.draft_host_pool is not None:
+                    self.draft_host_pool.backup_from_device_all_layer(
+                        self.draft_device_pool,
+                        draft_host_indices.to(torch.int64),
+                        draft_device_indices.to(torch.int64),
+                        self.io_backend,
+                        block_quota=self._writeback_block_quota,
+                    )
+                    if draft_host_indices.is_cuda:
+                        draft_host_indices.record_stream(self.write_stream)
+                    if draft_device_indices.is_cuda:
+                        draft_device_indices.record_stream(self.write_stream)
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.write_stream)
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.write_stream)
+            if mamba_op is not None:
+                self._copy_mamba_slots(
+                    self.mamba_pool,
+                    self.mamba_host_pool,
+                    mamba_op.device_indices,
+                    mamba_op.host_indices,
+                )
             finish_event.record()
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(_Ack(finish_event, op.node_ids))
+        self.ack_write_queue.append(_Ack(finish_event, node_ids))
 
     def _start_loading(self) -> None:
-        if not self.load_queue:
+        if not self.load_queue and not self.mamba_load_queue:
             return
 
         producer_id = self.layer_done_counter.update_producer()
-        op = _TransferOp.merge(self.load_queue)
-        host_indices, device_indices = self._move_indices(op, self.host_pool)
+        op = _TransferOp.merge(self.load_queue) if self.load_queue else None
+        mamba_op = (
+            _TransferOp.merge(self.mamba_load_queue) if self.mamba_load_queue else None
+        )
+        if op is not None:
+            host_indices, device_indices = self._move_indices(op, self.host_pool)
+        else:
+            host_indices = device_indices = None
         self.load_queue.clear()
+        self.mamba_load_queue.clear()
+        node_ids = []
+        if op is not None:
+            node_ids.extend(op.node_ids)
+        if mamba_op is not None:
+            node_ids.extend(mamba_op.node_ids)
 
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
         # Prepare draft indices once if draft pool is present.
-        if self.draft_host_pool is not None:
+        if op is not None and self.draft_host_pool is not None:
             draft_host_indices, draft_device_indices = self._move_indices(
                 op, self.draft_host_pool
             )
@@ -332,17 +432,28 @@ class HostExecutor:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for layer_index in range(self.layer_num):
-                self.host_pool.load_to_device_per_layer(
-                    self.device_pool,
-                    host_indices.to(torch.int64),
-                    device_indices.to(torch.int64),
-                    layer_index,
-                    self.io_backend,
+            if mamba_op is not None:
+                self._copy_mamba_slots(
+                    self.mamba_host_pool,
+                    self.mamba_pool,
+                    mamba_op.host_indices,
+                    mamba_op.device_indices,
                 )
-                producer_event.complete(layer_index)
+            if op is not None:
+                for layer_index in range(self.layer_num):
+                    self.host_pool.load_to_device_per_layer(
+                        self.device_pool,
+                        host_indices.to(torch.int64),
+                        device_indices.to(torch.int64),
+                        layer_index,
+                        self.io_backend,
+                    )
+                    producer_event.complete(layer_index)
+            else:
+                for layer_index in range(self.layer_num):
+                    producer_event.complete(layer_index)
             # Draft layers follow base layers in the same load stream.
-            if self.draft_host_pool is not None:
+            if op is not None and self.draft_host_pool is not None:
                 for layer_index in range(self.draft_layer_num):
                     self.draft_host_pool.load_to_device_per_layer(
                         self.draft_device_pool,
@@ -355,16 +466,24 @@ class HostExecutor:
                     draft_host_indices.record_stream(self.load_stream)
                 if draft_device_indices.is_cuda:
                     draft_device_indices.record_stream(self.load_stream)
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            if op is not None:
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.load_stream)
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.load_stream)
 
-        self.ack_load_queue.append(_Ack(producer_event.finish_event, op.node_ids))
-        for op_id in op.node_ids:
+        self.ack_load_queue.append(_Ack(producer_event.finish_event, node_ids))
+        for op_id in node_ids:
             self._producer_map[op_id] = producer_id
         while len(self._producer_map) > self._producer_map_limit:
             self._producer_map.popitem(last=False)
+
+    def _copy_mamba_slots(self, src_pool, dst_pool, src_indices, dst_indices) -> None:
+        for src_idx, dst_idx in zip(src_indices.tolist(), dst_indices.tolist()):
+            for src_cache, dst_cache in zip(src_pool.mamba_cache, dst_pool.mamba_cache):
+                dst_cache[:, int(dst_idx)].copy_(
+                    src_cache[:, int(src_idx)], non_blocking=True
+                )
 
     def _move_indices(self, op: _TransferOp, host_pool):
         host_indices = op.host_indices
@@ -432,6 +551,8 @@ class HostExecutor:
         self.load_stream.synchronize()
         self.write_queue.clear()
         self.load_queue.clear()
+        self.mamba_write_queue.clear()
+        self.mamba_load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         self._producer_map.clear()

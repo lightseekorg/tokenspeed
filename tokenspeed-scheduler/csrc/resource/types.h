@@ -45,6 +45,17 @@ enum class MatchIntent {
     StateRecovery,
 };
 
+enum class CacheTransferKind {
+    KV = 0,
+    Mamba = 1,
+};
+
+struct CacheTransferUnit {
+    CacheTransferKind kind{CacheTransferKind::KV};
+    std::int32_t src{-1};
+    std::int32_t dst{-1};
+};
+
 template <ResourceType RType>
 class NodeRef;
 using DeviceNodeRef = NodeRef<ResourceType::Device>;

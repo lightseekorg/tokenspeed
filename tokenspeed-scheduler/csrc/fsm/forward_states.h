@@ -284,7 +284,7 @@ struct Draining {
     // can redistribute pages across new prefix/suffix nodes).
     // Storing concrete (device_page, host_page) pairs here makes newWriteBackOperation
     // split-safe: it never needs to re-walk the radix tree.
-    using PagePair = std::tuple<std::int32_t, std::int32_t>;
+    using PagePair = CacheTransferUnit;
     Draining(std::vector<PagePair> pages_to_transfer, std::unique_ptr<DeviceNodeRef>&& device_node_ref,
              std::unique_ptr<HostNodeRef>&& host_node_ref)
         : pages_to_transfer_(std::move(pages_to_transfer)),
@@ -323,7 +323,7 @@ private:
 
 // Need to hold local_kv_allocator(has tail page info), and token container for recovery
 struct Retracting : public WritingBack {
-    using PagePair = std::tuple<std::int32_t, std::int32_t>;
+    using PagePair = CacheTransferUnit;
 
     Retracting(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,

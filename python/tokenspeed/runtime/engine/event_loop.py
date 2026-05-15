@@ -252,6 +252,7 @@ class EventLoop:
                 is_dp_attention_enabled=self.has_dp,
                 tp_group=self.attn_tp_cpu_group,
                 draft_device_pool=draft_token_to_kv_pool,
+                mamba_pool=mamba_pool,
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
@@ -295,6 +296,9 @@ class EventLoop:
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            mamba_host_pool_total_chunks=(
+                max(mamba_pool_total_chunks * 4, 1) if has_mamba else 0
+            ),
             paged_cache_groups=pool_to_paged_cache_groups(token_to_kv_pool),
             enable_mixed_prefill_decode=enable_mixed_prefill_decode,
         )

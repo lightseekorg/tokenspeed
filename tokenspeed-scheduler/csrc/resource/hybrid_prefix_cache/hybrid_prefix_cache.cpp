@@ -27,14 +27,15 @@
 namespace tokenspeed {
 
 HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
-                                     std::int32_t mamba_cache_chunk_size)
+                                     MambaChunkAllocator* host_mamba_allocator, std::int32_t mamba_cache_chunk_size)
     : kv_prefix_cache_{kv_prefix_cache},
       mamba_allocator_{mamba_allocator},
-      mamba_eviction_manager_{mamba_allocator},
+      host_mamba_allocator_{host_mamba_allocator},
+      mamba_eviction_manager_{mamba_allocator, ResourceType::Device},
+      host_mamba_eviction_manager_{host_mamba_allocator, ResourceType::Host,
+                                   [this](TreeNode* node) { detachHostMamba(node); }},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
-// The HybridPrefixCache::Match is a wrapper of the KVPrefixCache::Match.
-// And it's not used in fact, because the HybridPrefixCache is always used with the KVPrefixCache now.
 MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
     auto match = kv_prefix_cache_.Match(token_ids, intent);
     augmentMatch(match);
@@ -49,17 +50,21 @@ MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int3
 }
 
 void HybridPrefixCache::augmentMatch(MatchResult& match) const {
-    TreeNode* kv_terminal = match.device.last_node;
-    if (kv_terminal == nullptr || kv_terminal->IsRoot()) return;
+    TreeNode* device_terminal = match.device.last_node;
+    TreeNode* host_terminal = match.host.last_node;
+    if (device_terminal == nullptr || device_terminal->IsRoot()) return;
 
-    TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
-    if (mamba_node == nullptr) {
+    TreeNode* device_mamba = FindLastMambaNode(device_terminal, ResourceType::Device);
+    TreeNode* host_mamba = FindLastMambaNode(host_terminal, ResourceType::Host);
+    TreeNode* usable = device_mamba != nullptr ? device_mamba : host_mamba;
+
+    if (usable == nullptr) {
         const std::int32_t kv_depth = match.device.DepthInPage();
         const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * match.device.page_size);
         if (aligned_seqlen > 0) {
             match.mamba_branching_seqlen = aligned_seqlen;
         }
-        TreeNode* root = kv_terminal;
+        TreeNode* root = device_terminal;
         while (!root->IsRoot()) root = root->Parent();
         match.device.last_node = root;
         match.host.last_node = root;
@@ -68,9 +73,11 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
 
     std::int32_t page_size = match.device.page_size;
     std::int32_t kv_depth = match.device.DepthInPage();
-    std::int32_t mamba_depth = mamba_node->DepthInPage(page_size);
+    std::int32_t mamba_depth = usable->DepthInPage(page_size);
 
-    match.mamba_cow_src_index = mamba_node->MambaSlotIndex();
+    if (usable->HasMambaDevice()) {
+        match.mamba_cow_src_index = usable->MambaSlotIndex();
+    }
 
     if (kv_depth > mamba_depth) {
         const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * page_size);
@@ -79,8 +86,9 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         }
     }
 
-    match.device.last_node = mamba_node;
-    match.host.last_node = mamba_node;
+    match.device.last_node = device_mamba != nullptr ? device_mamba : usable->Parent();
+    if (match.device.last_node == nullptr) match.device.last_node = usable;
+    match.host.last_node = usable;
 }
 
 std::int32_t HybridPrefixCache::AlignMambaCacheSeqlen(std::int32_t seqlen) const {
@@ -88,9 +96,14 @@ std::int32_t HybridPrefixCache::AlignMambaCacheSeqlen(std::int32_t seqlen) const
     return (seqlen / mamba_cache_chunk_size_) * mamba_cache_chunk_size_;
 }
 
-TreeNode* HybridPrefixCache::FindLastMambaNode(TreeNode* from) const {
+TreeNode* HybridPrefixCache::FindLastMambaNode(TreeNode* from, ResourceType residency,
+                                                 bool require_exact_depth) const {
     for (TreeNode* cur = from; cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
-        if (cur->HasMamba()) return cur;
+        const bool has_mamba = residency == ResourceType::Device ? cur->HasMambaDevice() : cur->HasMambaHost();
+        if (!has_mamba) continue;
+        if (!require_exact_depth) return cur;
+        const bool exact = residency == ResourceType::Device ? cur->HasAlignedMambaDevice() : cur->HasAlignedMambaHost();
+        if (exact) return cur;
     }
     return nullptr;
 }
@@ -99,20 +112,63 @@ bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeN
     return mamba_eviction_manager_.EnsureCapacity(num_slots, protected_node);
 }
 
+bool HybridPrefixCache::EnsureMambaHostCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node) {
+    return host_mamba_eviction_manager_.EnsureCapacity(num_slots, protected_node);
+}
+
+std::unique_ptr<MambaSlot> HybridPrefixCache::AllocateDeviceMamba() {
+    auto slot = mamba_allocator_->Allocate();
+    if (!slot.has_value()) return nullptr;
+    return std::make_unique<MambaSlot>(std::move(*slot));
+}
+
+std::unique_ptr<MambaSlot> HybridPrefixCache::AllocateHostMamba() {
+    auto slot = host_mamba_allocator_->Allocate();
+    if (!slot.has_value()) return nullptr;
+    return std::make_unique<MambaSlot>(std::move(*slot));
+}
+
 void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {
+    if (terminal_node == nullptr) return;
+    InsertMamba(terminal_node, std::move(slot), terminal_node->DepthInTokens());
+}
+
+void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot,
+                                    std::size_t depth_tokens) {
     if (terminal_node == nullptr || slot == nullptr) return;
     const std::int32_t page_size = kv_prefix_cache_.PageSize();
     if (page_size <= 0 || terminal_node->DepthInTokens() % static_cast<std::size_t>(page_size) != 0) {
         throw std::logic_error("HybridPrefixCache::InsertMamba: terminal node is not block-aligned");
     }
-    terminal_node->AttachMamba(std::move(slot));
+    terminal_node->AttachMambaDevice(std::move(slot), depth_tokens);
     mamba_eviction_manager_.TrackNode(terminal_node);
 }
 
+void HybridPrefixCache::LoadBackMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {
+    if (terminal_node == nullptr || !terminal_node->HasMambaHost()) return;
+    InsertMamba(terminal_node, std::move(slot), terminal_node->MambaHostDepthTokens());
+}
+
+void HybridPrefixCache::AttachHostMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {
+    if (terminal_node == nullptr) return;
+    AttachHostMamba(terminal_node, std::move(slot), terminal_node->DepthInTokens());
+}
+
+void HybridPrefixCache::AttachHostMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot,
+                                        std::size_t depth_tokens) {
+    if (terminal_node == nullptr || slot == nullptr) return;
+    terminal_node->AttachMambaHost(std::move(slot), depth_tokens);
+    host_mamba_eviction_manager_.TrackNode(terminal_node);
+}
+
+void HybridPrefixCache::detachHostMamba(TreeNode* node) {
+    node->DetachMambaHost();
+}
+
 void HybridPrefixCache::OnKVEvict(TreeNode* node) {
-    if (node == nullptr || !node->HasMamba()) return;
+    if (node == nullptr || !node->HasMambaDevice()) return;
     mamba_eviction_manager_.UntrackNode(node);
-    node->DetachMamba();
+    node->DetachMambaDevice();
     if (node->Parent() != nullptr) {
         mamba_eviction_manager_.UpdateLeaf(node->Parent());
     }
@@ -120,6 +176,10 @@ void HybridPrefixCache::OnKVEvict(TreeNode* node) {
 
 std::int32_t HybridPrefixCache::AvailableSlots() const {
     return mamba_allocator_->AvailableSlots();
+}
+
+std::int32_t HybridPrefixCache::AvailableHostSlots() const {
+    return host_mamba_allocator_->AvailableSlots();
 }
 
 }  // namespace tokenspeed
