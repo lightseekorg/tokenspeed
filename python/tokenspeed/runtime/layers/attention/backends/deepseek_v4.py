@@ -389,7 +389,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         if forward_mode is not None and forward_mode.is_mixed():
             num_prefill_reqs = max(0, min(num_extends, bs))
-        elif forward_mode is not None and forward_mode.is_extend():
+        elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             num_prefill_reqs = bs
         else:
             num_prefill_reqs = 0
@@ -1093,8 +1093,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         }
         req_count = max(0, req_end - req_start)
         token_count = max(0, token_end - token_start)
-        num_prefill_reqs = req_count if forward_mode.is_extend() else 0
-        num_prefill_tokens = token_count if forward_mode.is_extend() else 0
+        num_prefill_reqs = req_count if forward_mode.is_extend_or_mixed() else 0
+        num_prefill_tokens = token_count if forward_mode.is_extend_or_mixed() else 0
         return DeepseekV4ForwardMetadata(
             page_size=metadata.page_size,
             req_pool_indices=metadata.req_pool_indices[req_start:req_end],
@@ -1167,7 +1167,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if metadata.forward_mode is None or not metadata.forward_mode.is_extend():
+        if (
+            metadata.forward_mode is None
+            or not metadata.forward_mode.is_extend_or_mixed()
+        ):
             raise RuntimeError(
                 "forward_deepseek_v4_prefill only supports extend/prefill modes"
             )
@@ -1232,7 +1235,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if metadata.forward_mode is None or not metadata.forward_mode.is_extend():
+        if (
+            metadata.forward_mode is None
+            or not metadata.forward_mode.is_extend_or_mixed()
+        ):
             raise RuntimeError(
                 "forward_deepseek_v4_prefill only supports extend/prefill modes"
             )
