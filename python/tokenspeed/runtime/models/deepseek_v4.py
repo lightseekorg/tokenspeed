@@ -34,7 +34,7 @@ import re
 import site
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -126,6 +126,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     set_weight_attrs,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
 from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
 
@@ -1943,10 +1944,9 @@ def _deepseek_v4_indexer_decode_metadata(
     # refreshed_keys. The metadata builder also clears refreshed_keys at the
     # start of each refresh so a stale entry from a previous step cannot
     # cause an early-return with capture-time data. By returning the cached plan
-    # here, the per-layer
-    # `run_indexer` call dispatched into `_deepseek_v4_maybe_execute_in_parallel`
-    # becomes a pure read, eliminating the cross-stream allocator race
-    # against `insert_and_compress` on aux_stream.
+    # here, the per-layer `run_indexer` call dispatched on the `StreamFork`
+    # main branch becomes a pure read, eliminating the cross-stream allocator
+    # race against `insert_and_compress` on the aux stream.
     if cached is not None and refreshed_keys is not None and key in refreshed_keys:
         return cached
 
@@ -2766,26 +2766,6 @@ _DEEPSEEK_V4_PREFILL_TOPK_OP_CHECKED = False
 _DEEPSEEK_V4_PREFILL_TOPK_OP_AVAILABLE = False
 _DEEPSEEK_V4_PAGED_GATHER_CHECKED = False
 _DEEPSEEK_V4_PAGED_GATHER_AVAILABLE = False
-
-
-def _deepseek_v4_maybe_execute_in_parallel(
-    fn0: Callable[[], Any],
-    fn1: Callable[[], Any],
-    event0: torch.cuda.Event | None,
-    event1: torch.cuda.Event | None,
-    aux_stream: torch.cuda.Stream | None,
-) -> tuple[Any, Any]:
-    if aux_stream is None or event0 is None or event1 is None:
-        return fn0(), fn1()
-
-    event0.record()
-    result0 = fn0()
-    with torch.cuda.stream(aux_stream):
-        event0.wait()
-        result1 = fn1()
-        event1.record()
-    event1.wait()
-    return result0, result1
 
 
 _DEEPSEEK_V4_MEGA_DEEP_GEMM = None
@@ -4815,14 +4795,7 @@ class DeepseekV4Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_index = layer_index
-        self.aux_stream = aux_stream
-        if self.aux_stream is not None:
-            self.ln_events: list[torch.cuda.Event | None] = [
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-            ]
-        else:
-            self.ln_events = [None, None]
+        self.stream_fork = StreamFork(aux_stream)
         use_fp4_indexer_cache = _attention_use_fp4_indexer_cache(config)
         self.layout = deepseek_v4_attention_layout(
             config,
@@ -5437,21 +5410,19 @@ class DeepseekV4Attention(nn.Module):
                 insert_swa_cache()
                 run_compressor()
 
-            topk_indices, _ = _deepseek_v4_maybe_execute_in_parallel(
-                run_indexer,
-                insert_and_compress,
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            with self.stream_fork.scope(
+                enable=self.stream_fork.aux_stream is not None
+            ) as fork:
+                topk_indices = run_indexer()
+                with fork.branch():
+                    insert_and_compress()
         elif self.compressor is not None:
-            _deepseek_v4_maybe_execute_in_parallel(
-                run_compressor,
-                insert_swa_cache,
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            with self.stream_fork.scope(
+                enable=self.stream_fork.aux_stream is not None
+            ) as fork:
+                run_compressor()
+                with fork.branch():
+                    insert_swa_cache()
         else:
             insert_swa_cache()
         backend_decode = getattr(
