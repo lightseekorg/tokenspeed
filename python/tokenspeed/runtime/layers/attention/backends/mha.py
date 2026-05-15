@@ -102,55 +102,56 @@ class MHAAttnBackend(AttentionBackend):
             self.max_context_len,
         )
 
-        if forward_mode.is_decode_or_idle():
-            self.forward_decode_metadata = MHAMetadata(
+        if forward_mode.is_extend_or_mixed():
+            if extend_prefix_lens is None:
+                extend_seq_lens = seq_lens
+            else:
+                assert (
+                    extend_prefix_lens.dtype == torch.int32
+                ), f"extend_prefix_lens must be int32, got {extend_prefix_lens.dtype}"
+                extend_seq_lens = seq_lens - extend_prefix_lens[:bs]
+
+            extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+            assert (
+                extend_seq_lens_cpu is not None
+            ), "mha extend requires extend_seq_lens_cpu"
+            max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
+
+            self.forward_prefill_metadata = MHAMetadata(
                 cache_seqlens_int32=seq_lens,
+                cu_seqlens_q=self._make_cu_seqlens(extend_seq_lens),
                 page_table=page_table,
+                max_seq_len_q=max_seq_len_q,
                 max_seq_len_k=self.max_context_len,
             )
             return
 
-        if forward_mode.is_target_verify() or forward_mode.is_draft_extend():
-            tokens_per_req = num_tokens // bs if bs > 0 else 1
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
             self.forward_prefill_metadata = MHAMetadata(
                 cache_seqlens_int32=seq_lens,
                 cu_seqlens_q=self._make_uniform_cu_seqlens(
                     bs,
-                    tokens_per_req,
+                    spec_num_tokens,
                     seq_lens.device,
                 ),
                 page_table=page_table,
-                max_seq_len_q=tokens_per_req,
+                max_seq_len_q=spec_num_tokens,
                 max_seq_len_k=self.max_context_len,
             )
+            if self.is_draft:
+                # Drafter follow-up single-token steps after the first.
+                self.forward_decode_metadata = MHAMetadata(
+                    cache_seqlens_int32=seq_lens.clone(),
+                    page_table=page_table,
+                    max_seq_len_k=self.max_context_len,
+                )
+        else:
             self.forward_decode_metadata = MHAMetadata(
-                cache_seqlens_int32=seq_lens.clone(),
+                cache_seqlens_int32=seq_lens,
                 page_table=page_table,
                 max_seq_len_k=self.max_context_len,
             )
-            return
-
-        if extend_prefix_lens is None:
-            extend_seq_lens = seq_lens
-        else:
-            assert (
-                extend_prefix_lens.dtype == torch.int32
-            ), f"extend_prefix_lens must be int32, got {extend_prefix_lens.dtype}"
-            extend_seq_lens = seq_lens - extend_prefix_lens[:bs]
-
-        extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
-        assert (
-            extend_seq_lens_cpu is not None
-        ), "mha extend requires extend_seq_lens_cpu"
-        max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
-
-        self.forward_prefill_metadata = MHAMetadata(
-            cache_seqlens_int32=seq_lens,
-            cu_seqlens_q=self._make_cu_seqlens(extend_seq_lens),
-            page_table=page_table,
-            max_seq_len_q=max_seq_len_q,
-            max_seq_len_k=self.max_context_len,
-        )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         assert (
@@ -177,59 +178,43 @@ class MHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        if forward_mode.is_decode():
-            cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
-            metadata = MHAMetadata(
-                cache_seqlens_int32=cache_seqlens,
-                page_table=self.cuda_graph_page_table[:bs, :],
-                max_seq_len_k=self.max_context_len,
-            )
-            self.cuda_graph_decode_metadata[bs] = metadata
-            self.forward_decode_metadata = metadata
-        elif forward_mode.is_target_verify():
-            spec_num_tokens = num_tokens // bs if bs > 0 else 1
-            cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
-            metadata = MHAMetadata(
-                cache_seqlens_int32=cache_seqlens,
-                cu_seqlens_q=self._make_uniform_cu_seqlens(
-                    bs,
-                    spec_num_tokens,
-                    self.device,
-                ),
-                page_table=self.cuda_graph_page_table[:bs, :],
-                max_seq_len_q=spec_num_tokens,
-                max_seq_len_k=self.max_context_len,
-            )
-            self.cuda_graph_prefill_metadata[bs] = metadata
-            self.forward_prefill_metadata = metadata
-        elif forward_mode.is_draft_extend():
-            spec_num_tokens = num_tokens // bs if bs > 0 else 1
-            cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
-            metadata = MHAMetadata(
-                cache_seqlens_int32=cache_seqlens,
-                cu_seqlens_q=self._make_uniform_cu_seqlens(
-                    bs,
-                    spec_num_tokens,
-                    self.device,
-                ),
-                page_table=self.cuda_graph_page_table[:bs, :],
-                max_seq_len_q=spec_num_tokens,
-                max_seq_len_k=self.max_context_len,
-            )
-            self.cuda_graph_prefill_metadata[bs] = metadata
-            self.forward_prefill_metadata = metadata
-
-            metadata = MHAMetadata(
-                cache_seqlens_int32=cache_seqlens,
-                page_table=self.cuda_graph_page_table[:bs, :],
-                max_seq_len_k=self.max_context_len,
-            )
-            self.cuda_graph_decode_metadata[bs] = metadata
-            self.forward_decode_metadata = metadata
-        else:
+        if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"mha CUDA graph capture not supported for {forward_mode}"
             )
+
+        cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
+            metadata = MHAMetadata(
+                cache_seqlens_int32=cache_seqlens,
+                cu_seqlens_q=self._make_uniform_cu_seqlens(
+                    bs,
+                    spec_num_tokens,
+                    self.device,
+                ),
+                page_table=self.cuda_graph_page_table[:bs, :],
+                max_seq_len_q=spec_num_tokens,
+                max_seq_len_k=self.max_context_len,
+            )
+            self.cuda_graph_prefill_metadata[bs] = metadata
+            self.forward_prefill_metadata = metadata
+            if self.is_draft:
+                metadata = MHAMetadata(
+                    cache_seqlens_int32=cache_seqlens,
+                    page_table=self.cuda_graph_page_table[:bs, :],
+                    max_seq_len_k=self.max_context_len,
+                )
+                self.cuda_graph_decode_metadata[bs] = metadata
+                self.forward_decode_metadata = metadata
+        else:
+            metadata = MHAMetadata(
+                cache_seqlens_int32=cache_seqlens,
+                page_table=self.cuda_graph_page_table[:bs, :],
+                max_seq_len_k=self.max_context_len,
+            )
+            self.cuda_graph_decode_metadata[bs] = metadata
+            self.forward_decode_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -246,17 +231,15 @@ class MHAAttnBackend(AttentionBackend):
                 req_to_page[req_pool_indices[:bs], : self.max_num_pages]
             )
 
-        if forward_mode.is_decode():
-            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
-        elif forward_mode.is_target_verify():
-            self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
-        elif forward_mode.is_draft_extend():
-            self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
-            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
-        else:
+        if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"mha CUDA graph replay not supported for {forward_mode}"
             )
+
+        if bs in self.cuda_graph_prefill_metadata:
+            self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
+        if bs in self.cuda_graph_decode_metadata:
+            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
 
     def forward_decode(
         self,
@@ -266,11 +249,28 @@ class MHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         if layer.qk_head_dim != layer.v_head_dim:
             raise NotImplementedError("mha backend requires qk_head_dim == v_head_dim")
+
+        # Multi-token decode (q_len > 1) reuses the prefill kernel via the
+        # uniform-stride prefill slot; plain decode uses the single-token slot.
+        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
 
         if save_kv_cache and k is not None:
             token_to_kv_pool.set_kv_buffer(
@@ -312,7 +312,7 @@ class MHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        forward_mode: ForwardMode,
+        bs: int,
         save_kv_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
