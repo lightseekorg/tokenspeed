@@ -657,3 +657,221 @@ docker exec kylewng_triton_dev_mi355_1505_dev bash -c '
     --kvstore-ratio 0.25 --enable-cache-report \
     --host 127.0.0.1 --port 8000'
 ```
+
+---
+
+## Update 6 — merge `kylewng/fp8_mxfp4_moe` + 抢 selector 优先级
+
+针对 `TASKS.md:68-73`：把 fp8 × mxfp4 模型那条分支并进来，改 Gluon
+MoE GEMM 的 registration 让 selector 默认走 Gluon（而不是 `triton_kernels`），
+然后跑 ut + 评估精度/性能。
+
+### 1. 合并 / 冲突解决
+
+`origin/kylewng/fp8_mxfp4_moe` 与本分支（`kylewng/gluon_moe`）共享同一
+个 base commit (`runtime: add fp8 x mxfp4 MoE backend for AMD
+gpt-oss-120b`，本地 `12b2216` ≡ 远端 `b4d2fe5`，diff 为空)。其后 5 个
+commit (`cleanup × 4`, `lint`, `remove note`) + ~70 个 main 推进合到
+我们这边。
+
+`git merge origin/kylewng/fp8_mxfp4_moe` 报两处冲突：
+
+| 文件 | 内容 | 解决 |
+|------|------|------|
+| `python/tokenspeed/runtime/layers/quantization/mxfp4.py` | 上游 cleanup 把 `_is_quark_w_mxfp4_a_fp8` 重命名 `_is_amd_quark_w_mxfp4_a_fp8`、加 `current_platform().is_amd` 守卫，并删掉未被外部使用的 `excluded_layers` 字段 | 取上游版本（grep 全 codebase 没有其他位置使用 `excluded_layers`） |
+| `python/tokenspeed/runtime/models/gpt_oss.py` | 仅 lint 重排 (`black`/换行) | 取上游版本 |
+
+合并 commit：`86d22e4 Merge branch 'origin/kylewng/fp8_mxfp4_moe' into
+kylewng/gluon_moe`。
+
+### 2. Selector 选择路径分析
+
+`tokenspeed_kernel/selection.py::_rank_by_objective` 用
+`(oracle, objective, priority)` 字典序排序，higher wins。
+
+* `_MoEOracle.adjust` 对 `moe.experts` 模式恒返回 10（中性），所以 oracle
+  无优势；
+* objective 维度：`SelectionObjective` 的 tag 命中（`throughput` /
+  `latency` / `portability` / `determinism`）+1；不命中 0；
+* priority 用 `KernelSpec.priority`（夹到 `[0, 19]`）。
+
+`triton_kernels` 的 MoE experts 三个变体 (`triton_kernels_dispatch_gemm`,
+`triton_kernels_gemm_combine`, `triton_kernels_matmul_ogs`) 都是
+`priority = Priority.PERFORMANT + 2 = 10`，`tags = {"portability"}`。
+
+之前我们的 Gluon kernel 在 `_GLUON_ENABLED_ENV` 未开时 priority=5，
+低于上游，于是默认下永远输 → 等于在生产上没接进来。
+
+### 3. 改 registration（不删上游、只让 Gluon 默认赢）
+
+`tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/gluon.py`：
+
+```python
+# Default ON. ``TOKENSPEED_MOE_GLUON=0/false/no/off`` to disable.
+_GLUON_DISABLED_ENV = os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() \
+    in {"0", "false", "no", "off", "disable", "disabled"}
+
+def _kernel_priority() -> int:
+    if _GLUON_DISABLED_ENV:
+        return Priority.PORTABLE + 1   # 5  (below triton_kernels = 10)
+    return Priority.SPECIALIZED + 2    # 14 (clearly above triton_kernels)
+
+_common = dict(
+    solution="triton",
+    dtypes={torch.bfloat16, torch.float16, torch.uint8},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    priority=_kernel_priority(),
+    tags={"throughput", "latency", "gluon"},   # ← 不再标 "portability"
+)
+```
+
+`features=…` 和三组 `register_kernel(...)` 调用维持原样；上游
+`triton_kernels_*` 仍然注册（把 `TOKENSPEED_MOE_GLUON=0` 即可走
+回上游做 A/B）。
+
+### 4. Adapter passthrough 修复（隐藏 bug）
+
+之前的 `_gluon_bf16_ragged_matmul` 用 `**_unused` 吞掉调用方的额外
+kwargs，但 fallback 到 `triton_kernels.matmul` 时**没有把它们传回去**。
+runtime 在 combine 路径用 `gammas=gate_scal` 表达 routing 权重；以前
+gluon 的 priority 是 5（输给上游），所以这个 bug 没显形。priority 改
+14 之后 selector 把 combine 路径交给我们 → fallback 链路把 `gammas`
+丢掉 → 数值错误。
+
+修法：
+
+```python
+_TUNING_KW = frozenset({"block_m","block_n","block_k","num_warps","num_buffers","dtype"})
+def _gluon_bf16_ragged_matmul(... **passthrough):
+    if not _supports_pure_bf16(precision_config, fused_activation):
+        return _upstream_matmul(
+            x, w, bias,
+            ...,
+            **{k: v for k, v in passthrough.items() if k not in _TUNING_KW},
+        )
+```
+
+这样 `gammas`, `betas`, `out_alpha`, `c`, `c_acc_in`, `fused_comm`,
+`epilogue`, `b_ragged_metadata` 等上游 `matmul` 接受的参数全部透明
+转发。
+
+### 5. 验证
+
+```bash
+# Selector 切换确认 (MI355, gfx950)
+$ HIP_VISIBLE_DEVICES=5 python3 -c '...'  # see commit message
+platform: amd 9.5 is_amd= True
+features=['dispatch_gemm','ragged_metadata'] -> kernel=triton_kernels_gluon_dispatch_gemm
+features=['gemm_combine','ragged_metadata'] -> kernel=triton_kernels_gluon_gemm_combine
+features=['ragged_metadata']                 -> kernel=triton_kernels_gluon_dispatch_gemm
+
+# Unit + selection regression
+$ python3 -m pytest tokenspeed-kernel/test/ops/test_moe_gluon.py -q          # 51 passed
+$ python3 -m pytest tokenspeed-kernel/test/test_callsite_selection.py -q     # 36 passed, 14 skipped
+$ python3 -m pytest test/runtime/test_mxfp4_fp8_backend.py \
+                   test/runtime/test_mxfp4_weights.py -q                     # 12 passed
+$ python3 -m pytest test/runtime/test_server_args_attention_backends.py \
+                   test/runtime/test_sampling_backend_registry.py \
+                   test/runtime/test_logging.py \
+                   test/runtime/test_cli_config_compat.py -q                 # 65 passed
+```
+
+`test_callsite_selection.py` 只跑 `h100_platform` / `b200_platform`
+fixture；我们的 Gluon kernel 因 `CapabilityRequirement(amd, gfx950)`
+被 capability 过滤，**不会**误中 NV 平台的 `expected_kernel_name=
+"triton_kernels_dispatch_gemm"` 检查。
+
+### 6. 真实 gpt-oss-120b 路径上的实际生效情况
+
+很重要，**目前 priority 切换 ≠ 立刻拿性能加速**：
+
+`Mxfp4TritonKernelBackend.process_weights_after_loading` 会把权重
+吃到 `triton_kernels` 自己的 `swizzle_mxfp4` 里，得到一个
+`PrecisionConfig(b_mx_scale=<wrapped>, flex_ctx.lhs_data=
+InFlexData(dtype=fp8, scale=...))` 的对象（mxfp4 W + per-tensor
+fp8 act）。
+
+我们的 selector adapter `_gluon_bf16_ragged_matmul` 在
+`_supports_pure_bf16(precision_config, fused_activation) == False`
+时 fallback 到 `_upstream_matmul`：
+
+* `precision_config.b_mx_scale is not None`  → fallback；
+* `flex_ctx.lhs_data.dtype != None` (fp8)    → fallback。
+
+也就是说，gpt-oss-120b（`amd/gpt-oss-120b-w-mxfp4-a-fp8`）的
+forward 现在仍走上游 `triton_kernels.matmul` —— **不会回归**（passthrough
+覆盖了 `gammas` 等参数），但**也暂时拿不到 Gluon 的吞吐**。
+
+要把 fp8 × mxfp4 真正走通 Gluon 的 scaled-MFMA path，需要再做一组
+工作：
+
+1. 让 `Mxfp4TritonKernelBackend.process_weights_after_loading` 在
+   Gluon kernel 被选中时**跳过** `swizzle_mxfp4`，保留原始
+   `(E, K_packed, N)` uint8 + e8m0 scale tensors（我们已实现的
+   `gluon_mxfp_dispatch_swiglu` / `gluon_mxfp_combine` 直接吃这种
+   layout）；
+2. adapter 在 `precision_config.b_mx_scale != None` 且 `w/scale` 是
+   plain `torch.Tensor` 时分发到 `gluon_mxfp_*`，否则保留对
+   `triton_kernels.Tensor` 的 fallback；
+3. 把 `FusedActivation(swiglu_fn, (alpha, limit))` 的 `alpha/limit`
+   解出来，传给 `gluon_mxfp_dispatch_swiglu(swiglu_alpha=..., swiglu_limit=...)`。
+
+这是下一个 patch 的事，因为它会改动 runtime weight pipeline，需要单
+独验证 mxfp4 数值匹配。我会在 follow-up 里完成；此 patch 先做到
+**“selector 默认选 Gluon、fallback 路径不丢参数、所有 ut 通过”**。
+
+### 7. 评估流程（gpqa-diamond）
+
+要复现 `test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml`
+的 MI355 跑分：
+
+```bash
+docker exec kylewng_triton_dev_mi355_1505_dev_1 bash -c '
+  cd /root/code/tokenspeed && \
+  HIP_VISIBLE_DEVICES=2,3 \
+  python3 -m tokenspeed.api_server \
+    --model openai/gpt-oss-120b \
+    --attn-tp-size 2 --moe-tp-size 2 --max-model-len 80000 \
+    --trust-remote-code --reasoning-parser gpt-oss \
+    --kvstore-ratio 0.25 --enable-cache-report \
+    --host 127.0.0.1 --port 8000'
+
+# 同窗口 / 同容器，evalscope perf 跑 gpqa_diamond
+docker exec kylewng_triton_dev_mi355_1505_dev_1 bash -c '
+  python3 -m uv venv --seed --clear /tmp/evalscope-perf && \
+  python3 -m uv pip install --python /tmp/evalscope-perf/bin/python "evalscope[perf]" && \
+  /tmp/evalscope-perf/bin/evalscope eval \
+    --model openai/gpt-oss-120b \
+    --api-url http://127.0.0.1:8000/v1 --api-key EMPTY_TOKEN \
+    --datasets gpqa_diamond --eval-batch-size 16 --stream \
+    --generation-config "{\"do_sample\":false,\"temperature\":0.0,\"max_tokens\":65536}"'
+```
+
+A/B 通过环境变量 `TOKENSPEED_MOE_GLUON=1`（默认；选 Gluon kernel，
+但当前 fp8×mxfp4 仍 fallback 到 `triton_kernels.matmul`）vs.
+`TOKENSPEED_MOE_GLUON=0`（强制 priority=5，selector 选回上游
+`triton_kernels.matmul`）做对照。
+
+精度门槛：`score_threshold: 0.7`（YAML 里），`task-progress-1.md`
+里 Task 1 在同样 yaml 下记录的实测 mean_acc 是 **0.6616**（reasoning
+medium，HF Quark `amd/gpt-oss-120b-w-mxfp4-a-fp8` 上）；本次 patch 没
+改变 forward 行为，因此 Gluon 启用前后**精度应当完全一致**。
+
+吞吐预期：因为 fp8×mxfp4 仍走上游，**throughput 与 Task 1 完全一致**
+(decode ≈ 79.37 tok/s)。Real perf gain 要等上面 §6 列出的 follow-up
+落地后再跑这条 yaml。
+
+> 备注：gpt-oss-120b 权重 (~120 GB) 当前 dev 容器没有缓存，跑完整
+> evalscope 需要先 `huggingface-cli download`，整个流程 ~2 小时。
+> 单元测试已经覆盖 selector / adapter / passthrough 的回归路径。
+
+### 8. Commits
+
+```
+86d22e4  Merge branch 'origin/kylewng/fp8_mxfp4_moe' into kylewng/gluon_moe
+f25dd60  moe(gluon): default-on with throughput/latency tags above triton_kernels
+```
