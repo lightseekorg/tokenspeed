@@ -1921,7 +1921,7 @@ def _gluon_bf16_ragged_matmul(
     back.
     """
     if not _supports_pure_bf16(precision_config, fused_activation):
-        return _upstream_matmul(
+        out = _upstream_matmul(
             x,
             w,
             bias,
@@ -1932,6 +1932,24 @@ def _gluon_bf16_ragged_matmul(
             fused_activation=fused_activation,
             **{k: v for k, v in passthrough.items() if k not in _TUNING_KW},
         )
+        # Mirror the post-processing applied by the registered
+        # ``triton_kernels`` wrapper (see ``ops.moe.triton_kernels._matmul``):
+        # when the caller passes ``scatter_indx`` together with
+        # ``n_expts_act > 1``, the upstream matmul writes a flat
+        # ``(n_tokens * n_expts_act, N)`` slab that has to be folded back
+        # into ``(n_tokens, N)`` via top-k expert summation. The previous
+        # adapter skipped this step, which surfaced the moment we won
+        # selection over ``triton_kernels_gemm_combine``.
+        if (
+            scatter_indx is not None
+            and n_expts_act is not None
+            and n_expts_act > 1
+        ):
+            assert (
+                n_tokens is not None
+            ), "n_tokens required when n_expts_act > 1 for top-k reduction"
+            out = out.view(n_tokens, n_expts_act, out.shape[-1]).sum(dim=1)
+        return out
 
     # bf16 / fp16 path
     M = x.shape[-2]
