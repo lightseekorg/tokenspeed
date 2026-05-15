@@ -101,7 +101,7 @@ class Bf16FlashinferCutlassBackend(MoEBackend):
             ep_rank=self.spec.ep_rank,
             tp_size=self._tp_size,
             tp_rank=self._tp_rank,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            tune_max_num_tokens=max(8192, next_power_of_2(x.shape[0])),
             activation_type=ActivationType.Swiglu,
             dtype=x.dtype,
             features={"pre_routed"},
