@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
+from tokenspeed_kernel.ops.sampling.triton import (
+    gather_and_expand_scalars,
+    min_p_renorm_prob,
+)
 
 
 def _make_pools(pool_rows: int, device: str):
@@ -39,6 +42,16 @@ def _reference(index, pool, n: int):
     """index_select + repeat_interleave reference."""
     idx = index.long()
     return pool.index_select(0, idx).repeat_interleave(n, dim=0)
+
+
+def _min_p_reference(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    out = torch.where(
+        probs >= min_p.to(probs.dtype).view(-1, 1) * max_probs,
+        probs,
+        torch.zeros_like(probs),
+    )
+    return out / out.sum(dim=-1, keepdim=True)
 
 
 @pytest.mark.parametrize("bs", [1, 4, 7])
@@ -163,3 +176,40 @@ def test_gather_empty_batch(device: str) -> None:
     assert min_ps.numel() == 0
     assert seeds.numel() == 0
     assert offsets.numel() == 0
+
+
+@pytest.mark.parametrize("rows", [1, 3, 5])
+@pytest.mark.parametrize("vocab_size", [17, 257, 1025])
+def test_min_p_renorm_prob(rows: int, vocab_size: int, device: str) -> None:
+    torch.manual_seed(rows * 1000 + vocab_size)
+    probs = torch.rand((rows, vocab_size), device=device, dtype=torch.float32)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    min_p = torch.linspace(0.0, 0.2, rows, device=device, dtype=torch.float32)
+
+    out = min_p_renorm_prob(probs, min_p)
+    ref = _min_p_reference(probs, min_p)
+
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out.sum(dim=-1), torch.ones(rows, device=device))
+
+
+def test_min_p_renorm_prob_bf16_min_p(device: str) -> None:
+    torch.manual_seed(0)
+    probs = torch.rand((4, 513), device=device, dtype=torch.float32)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    min_p = torch.tensor([0.0, 0.01, 0.05, 0.2], device=device, dtype=torch.bfloat16)
+
+    out = min_p_renorm_prob(probs, min_p)
+    ref = _min_p_reference(probs, min_p)
+
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
+
+
+def test_min_p_renorm_prob_empty_batch(device: str) -> None:
+    probs = torch.empty((0, 32), device=device, dtype=torch.float32)
+    min_p = torch.empty((0,), device=device, dtype=torch.float32)
+
+    out = min_p_renorm_prob(probs, min_p)
+
+    assert out.shape == probs.shape
+    assert out.dtype == probs.dtype
