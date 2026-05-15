@@ -48,12 +48,17 @@ from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
 # Env knob
 # ---------------------------------------------------------------------------
 
-_GLUON_ENABLED_ENV = os.environ.get("TOKENSPEED_MOE_GLUON", "").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+# The Gluon MoE kernels target throughput/latency on AMD MI355 (CDNA4 / gfx950)
+# and outperform the upstream ``triton_kernels`` MoE GEMM there. They are
+# therefore enabled by default on that platform; set
+# ``TOKENSPEED_MOE_GLUON=0`` (or false/no/off) to fall back to the upstream
+# triton_kernels path -- useful for A/B comparisons and for working around a
+# regression without rebuilding.
+_GLUON_DISABLE_VALUES = {"0", "false", "no", "off", "disable", "disabled"}
+_GLUON_DISABLED_ENV = (
+    os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower()
+    in _GLUON_DISABLE_VALUES
+)
 
 
 def composition(cls):
@@ -1877,6 +1882,11 @@ def gluon_mxfp_combine(
 # ---------------------------------------------------------------------------
 
 
+_TUNING_KW = frozenset(
+    {"block_m", "block_n", "block_k", "num_warps", "num_buffers", "dtype"}
+)
+
+
 def _gluon_bf16_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -1894,12 +1904,21 @@ def _gluon_bf16_ragged_matmul(
     block_k: int = _DEFAULT_BLOCK_K,
     num_warps: int = _DEFAULT_NUM_WARPS,
     num_buffers: int = _DEFAULT_NUM_BUFFERS,
-    **_unused,
+    **passthrough,
 ) -> torch.Tensor:
     """Selector-facing entry: matches the upstream ``matmul`` signature.
 
     Falls back to ``triton_kernels.matmul`` for unsupported precisions
-    so we never break the gpt-oss-120b path while we land features.
+    (mxfp4 weight scales / fp8 activation flex data) so we never break
+    the gpt-oss-120b path while we land scaled-MFMA features.
+
+    Extra keyword arguments (``gammas``, ``betas``, ``out_alpha``,
+    ``c``/``c_acc_in``, ``fused_comm``, ``epilogue``,
+    ``b_ragged_metadata``, ...) the runtime backends pass to
+    ``tokenspeed_kernel.moe_experts`` are forwarded transparently to the
+    upstream ``triton_kernels.matmul`` so combine-side scaling
+    (``gammas``) and other epilogue knobs are preserved when we fall
+    back.
     """
     if not _supports_pure_bf16(precision_config, fused_activation):
         return _upstream_matmul(
@@ -1911,6 +1930,7 @@ def _gluon_bf16_ragged_matmul(
             scatter_indx=scatter_indx,
             precision_config=precision_config,
             fused_activation=fused_activation,
+            **{k: v for k, v in passthrough.items() if k not in _TUNING_KW},
         )
 
     # bf16 / fp16 path
@@ -1965,14 +1985,21 @@ def _gluon_bf16_ragged_matmul(
 
 
 def _kernel_priority() -> int:
-    if _GLUON_ENABLED_ENV:
-        # Above triton_kernels (which sits at PERFORMANT + 2 = 10) so we
-        # actually win selection.
-        return Priority.SPECIALIZED + 1  # 13
-    # Default: stay below triton_kernels so existing users see no change.
-    return Priority.PORTABLE + 1  # 5
+    # The Gluon MoE GEMM is a throughput/latency-optimized kernel for MI355
+    # (gfx950). When enabled (default), sit clearly above the upstream
+    # ``triton_kernels`` MoE GEMM (PERFORMANT + 2 = 10) so that the selector
+    # picks us on MI355 without requiring an explicit override.
+    if _GLUON_DISABLED_ENV:
+        # Drop below triton_kernels so the upstream path wins. Kept as a
+        # candidate so that an explicit ``TOKENSPEED_KERNEL_OVERRIDE_MOE_EXPERTS``
+        # can still target the Gluon kernel by name.
+        return Priority.PORTABLE + 1  # 5
+    return Priority.SPECIALIZED + 2  # 14
 
 
+# Tag the kernels with the SelectionObjective categories they actually serve
+# (``throughput`` / ``latency``). They are intentionally **not** tagged as
+# ``portability`` -- portability falls back to ``triton_kernels``.
 _common = dict(
     solution="triton",
     dtypes={torch.bfloat16, torch.float16, torch.uint8},
@@ -1982,7 +2009,7 @@ _common = dict(
         max_arch_version=ArchVersion(9, 5),
     ),
     priority=_kernel_priority(),
-    tags={"portability", "gluon"},
+    tags={"throughput", "latency", "gluon"},
 )
 
 register_kernel(
