@@ -187,6 +187,27 @@ class AttentionConfig:
         self.v_smem_layout = gl.constexpr(v_smem_layout)
 
 
+@gluon.aggregate
+class AttentionInput:
+    ptr: gl.tensor
+    stride_t: gl.constexpr
+    stride_h: gl.constexpr
+    stride_d: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, ptr, stride_t, stride_h, stride_d):
+        self.ptr = ptr
+        self.stride_t = gl.constexpr(stride_t)
+        self.stride_h = gl.constexpr(stride_h)
+        self.stride_d = gl.constexpr(stride_d)
+
+    @gluon.jit
+    def offsets(self, token, head, dim):
+        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
+            gl.int32
+        )
+
+
 # ===-----------------------------------------------------------------------===#
 # Kernel Program
 # ===-----------------------------------------------------------------------===#
@@ -195,9 +216,9 @@ class AttentionConfig:
 @gluon.aggregate
 class AttentionProgram:
     cfg: AttentionConfig
-    q_ptr: gl.tensor
-    k_ptr: gl.tensor
-    v_ptr: gl.tensor
+    q: AttentionInput
+    k: AttentionInput
+    v: AttentionInput
     output_ptr: gl.tensor
     sink_ptr: gl.tensor
     lse_ptr: gl.tensor
@@ -211,9 +232,9 @@ class AttentionProgram:
     def __init__(
         self,
         cfg,
-        q_ptr,
-        k_ptr,
-        v_ptr,
+        q,
+        k,
+        v,
         output_ptr,
         sink_ptr,
         lse_ptr,
@@ -224,9 +245,9 @@ class AttentionProgram:
         kv_head,
     ):
         self.cfg = cfg
-        self.q_ptr = q_ptr
-        self.k_ptr = k_ptr
-        self.v_ptr = v_ptr
+        self.q = q
+        self.k = k
+        self.v = v
         self.output_ptr = output_ptr
         self.sink_ptr = sink_ptr
         self.lse_ptr = lse_ptr
@@ -239,9 +260,9 @@ class AttentionProgram:
     @gluon.jit
     def initialize_from_state(
         cfg,
-        q_ptr,
-        k_ptr,
-        v_ptr,
+        q,
+        k,
+        v,
         output_ptr,
         sink_ptr,
         lse_ptr,
@@ -254,9 +275,9 @@ class AttentionProgram:
         q_start = query_block * cfg.BLOCK_M
         return AttentionProgram(
             cfg,
-            q_ptr,
-            k_ptr,
-            v_ptr,
+            q,
+            k,
+            v,
             output_ptr,
             sink_ptr,
             lse_ptr,
@@ -274,53 +295,66 @@ class AttentionProgram:
             0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
-        offsets = (
-            ((self.seq_base + offs_m[:, None]) * cfg.N_HEADS + self.q_head)
-            * cfg.HEAD_DIM
-            + offs_d[None, :]
-        ).to(gl.int32)
+        offsets = self.q.offsets(
+            self.seq_base + offs_m[:, None], self.q_head, offs_d[None, :]
+        )
         mask = offs_m[:, None] < self.seq_len
         if other is None:
-            return buffer_load(self.q_ptr, offsets, mask=mask)
-        return buffer_load(self.q_ptr, offsets, mask=mask, other=other)
+            return buffer_load(self.q.ptr, offsets, mask=mask)
+        return buffer_load(self.q.ptr, offsets, mask=mask, other=other)
 
     @gluon.jit
-    def make_kv_offsets(self, kv_start):
+    def make_k_offsets(self, kv_start):
         cfg = self.cfg
         offs_n = kv_start + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        offsets = (
-            ((self.seq_base + offs_n[:, None]) * cfg.N_KV_HEADS + self.kv_head)
-            * cfg.HEAD_DIM
-            + offs_d[None, :]
-        ).to(gl.int32)
+        offsets = self.k.offsets(
+            self.seq_base + offs_n[:, None], self.kv_head, offs_d[None, :]
+        )
         return offsets, offs_n
 
     @gluon.jit
-    def update_kv_offsets(self, offsets):
+    def make_v_offsets(self, kv_start):
         cfg = self.cfg
-        return offsets + cfg.BLOCK_N * cfg.N_KV_HEADS * cfg.HEAD_DIM
+        offs_n = kv_start + gl.arange(
+            0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout)
+        )
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
+        offsets = self.v.offsets(
+            self.seq_base + offs_n[:, None], self.kv_head, offs_d[None, :]
+        )
+        return offsets
+
+    @gluon.jit
+    def update_k_offsets(self, offsets):
+        cfg = self.cfg
+        return offsets + cfg.BLOCK_N * self.k.stride_t
+
+    @gluon.jit
+    def update_v_offsets(self, offsets):
+        cfg = self.cfg
+        return offsets + cfg.BLOCK_N * self.v.stride_t
 
     @gluon.jit
     def issue_buffer_load_k(self, offsets, k_smem, mask=None, other=None):
         if mask is None:
-            buffer_load_to_shared(k_smem, self.k_ptr, offsets)
+            buffer_load_to_shared(k_smem, self.k.ptr, offsets)
         elif other is None:
-            buffer_load_to_shared(k_smem, self.k_ptr, offsets, mask=mask)
+            buffer_load_to_shared(k_smem, self.k.ptr, offsets, mask=mask)
         else:
-            buffer_load_to_shared(k_smem, self.k_ptr, offsets, mask=mask, other=other)
+            buffer_load_to_shared(k_smem, self.k.ptr, offsets, mask=mask, other=other)
         commit_group()
 
     @gluon.jit
     def issue_buffer_load_v(self, offsets, v_smem, mask=None, other=None):
         if mask is None:
-            buffer_load_to_shared(v_smem, self.v_ptr, offsets)
+            buffer_load_to_shared(v_smem, self.v.ptr, offsets)
         elif other is None:
-            buffer_load_to_shared(v_smem, self.v_ptr, offsets, mask=mask)
+            buffer_load_to_shared(v_smem, self.v.ptr, offsets, mask=mask)
         else:
-            buffer_load_to_shared(v_smem, self.v_ptr, offsets, mask=mask, other=other)
+            buffer_load_to_shared(v_smem, self.v.ptr, offsets, mask=mask, other=other)
         commit_group()
 
     @gluon.jit
@@ -404,7 +438,7 @@ class AttentionProgram:
         l_ij = gl.sum(p, axis=1)
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
-        p = p.to(self.q_ptr.dtype.element_ty)
+        p = p.to(self.q.ptr.dtype.element_ty)
         p = gl.convert_layout(p, cfg.p_layout)
         return p, m_new, l_i, acc
 
@@ -534,9 +568,9 @@ class ProgramScheduler:
     def get_program(
         self,
         q_round,
-        q_ptr,
-        k_ptr,
-        v_ptr,
+        q,
+        k,
+        v,
         output_ptr,
         sink_ptr,
         lse_ptr,
@@ -571,9 +605,9 @@ class ProgramScheduler:
         seq_len = seq_end - seq_base
         program = AttentionProgram.initialize_from_state(
             cfg,
-            q_ptr,
-            k_ptr,
-            v_ptr,
+            q,
+            k,
+            v,
             output_ptr,
             sink_ptr,
             lse_ptr,
@@ -596,23 +630,19 @@ def process_small_attention_tile(
 
     k_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(1, cfg.k_layout))
     k_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.k_layout))
-    k_offsets = (
-        ((program.seq_base + k_offs_n[None, :]) * cfg.N_KV_HEADS + program.kv_head)
-        * cfg.HEAD_DIM
-        + k_offs_d[:, None]
-    ).to(gl.int32)
+    k_offsets = program.k.offsets(
+        program.seq_base + k_offs_n[None, :], program.kv_head, k_offs_d[:, None]
+    )
     k_mask = k_offs_n[None, :] < program.seq_len
-    k = buffer_load(program.k_ptr, k_offsets, mask=k_mask, other=0.0)
+    k = buffer_load(program.k.ptr, k_offsets, mask=k_mask, other=0.0)
 
     v_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout))
     v_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
-    v_offsets = (
-        ((program.seq_base + v_offs_n[:, None]) * cfg.N_KV_HEADS + program.kv_head)
-        * cfg.HEAD_DIM
-        + v_offs_d[None, :]
-    ).to(gl.int32)
+    v_offsets = program.v.offsets(
+        program.seq_base + v_offs_n[:, None], program.kv_head, v_offs_d[None, :]
+    )
     v_mask = v_offs_n[:, None] < program.seq_len
-    v = buffer_load(program.v_ptr, v_offsets, mask=v_mask, other=0.0)
+    v = buffer_load(program.v.ptr, v_offsets, mask=v_mask, other=0.0)
 
     qk = program.compute_qk(q, k)
 
@@ -636,7 +666,7 @@ def process_small_attention_tile(
         l_i += gl.exp2(sink_log2 - m_i)
 
     acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
-    p = p.to(program.q_ptr.dtype.element_ty)
+    p = p.to(program.q.ptr.dtype.element_ty)
     p = gl.convert_layout(p, cfg.p_layout)
     acc = program.compute_pv(p, v, acc)
 
@@ -660,14 +690,16 @@ def process_attention_tile(
     m_i, l_i, acc = program.init_attention_state()
 
     main_end = program.q_start // cfg.BLOCK_N
-    base_offsets, base_offs_n = program.make_kv_offsets(0)
+    base_k_offsets, base_offs_n = program.make_k_offsets(0)
+    base_v_offsets = program.make_v_offsets(0)
 
-    kv_offsets = base_offsets
+    k_offsets = base_k_offsets
+    v_offsets = base_v_offsets
     offs_n = base_offs_n
 
     for _ in range(0, main_end):
-        program.issue_buffer_load_k(kv_offsets, k_smem)
-        program.issue_buffer_load_v(kv_offsets, v_smem)
+        program.issue_buffer_load_k(k_offsets, k_smem)
+        program.issue_buffer_load_v(v_offsets, v_smem)
 
         wait_group(1)
         k = program.shared_load_k(k_smem)
@@ -678,18 +710,17 @@ def process_attention_tile(
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
 
-        kv_offsets = program.update_kv_offsets(kv_offsets)
+        k_offsets = program.update_k_offsets(k_offsets)
+        v_offsets = program.update_v_offsets(v_offsets)
         offs_n = offs_n + cfg.BLOCK_N
 
     # The main loop handles prefix tiles; the two boundary tiles are causal.
-    boundary_offset = main_end * cfg.BLOCK_N * cfg.N_KV_HEADS * cfg.HEAD_DIM
-    boundary_offs_n = main_end * cfg.BLOCK_N
-
-    kv_offsets = base_offsets + boundary_offset
-    offs_n = base_offs_n + boundary_offs_n
+    boundary_start = main_end * cfg.BLOCK_N
+    k_offsets, offs_n = program.make_k_offsets(boundary_start)
+    v_offsets = program.make_v_offsets(boundary_start)
     mask = offs_n[:, None] < program.seq_len
-    program.issue_buffer_load_k(kv_offsets, k_smem, mask=mask)
-    program.issue_buffer_load_v(kv_offsets, v_smem, mask=mask, other=0.0)
+    program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
+    program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
     wait_group(1)
     k = program.shared_load_k(k_smem)
@@ -701,12 +732,12 @@ def process_attention_tile(
     v = program.shared_load_v(v_smem)
     acc = program.compute_pv(p, v, acc)
 
-    boundary_step = cfg.BLOCK_N * cfg.N_KV_HEADS * cfg.HEAD_DIM
-    kv_offsets = base_offsets + boundary_offset + boundary_step
-    offs_n = base_offs_n + boundary_offs_n + cfg.BLOCK_N
+    boundary_start = boundary_start + cfg.BLOCK_N
+    k_offsets, offs_n = program.make_k_offsets(boundary_start)
+    v_offsets = program.make_v_offsets(boundary_start)
     mask = offs_n[:, None] < program.seq_len
-    program.issue_buffer_load_k(kv_offsets, k_smem, mask=mask)
-    program.issue_buffer_load_v(kv_offsets, v_smem, mask=mask, other=0.0)
+    program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
+    program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
     wait_group(1)
     k = program.shared_load_k(k_smem)
@@ -740,10 +771,11 @@ def process_sliding_attention_tile(
     kv_start = program.q_start - cfg.WINDOW_LEFT
     kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
     for _ in range(0, cfg.NUM_KV_TILES):
-        offsets, offs_n = program.make_kv_offsets(kv_start)
+        k_offsets, offs_n = program.make_k_offsets(kv_start)
+        v_offsets = program.make_v_offsets(kv_start)
         mask = offs_n[:, None] < program.seq_len
-        program.issue_buffer_load_k(offsets, k_smem, mask=mask)
-        program.issue_buffer_load_v(offsets, v_smem, mask=mask, other=0.0)
+        program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
+        program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
         wait_group(1)
         k = program.shared_load_k(k_smem)
@@ -773,6 +805,15 @@ def attention_kernel(
     output_ptr,
     sink_ptr,
     lse_ptr,
+    Q_STRIDE_T: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    K_STRIDE_T: gl.constexpr,
+    K_STRIDE_H: gl.constexpr,
+    K_STRIDE_D: gl.constexpr,
+    V_STRIDE_T: gl.constexpr,
+    V_STRIDE_H: gl.constexpr,
+    V_STRIDE_D: gl.constexpr,
     N_HEADS: gl.constexpr,
     N_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -812,6 +853,9 @@ def attention_kernel(
         NUM_XCDS,
         NUM_BLOCKS,
     )
+    q = AttentionInput(q_ptr, Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D)
+    k = AttentionInput(k_ptr, K_STRIDE_T, K_STRIDE_H, K_STRIDE_D)
+    v = AttentionInput(v_ptr, V_STRIDE_T, V_STRIDE_H, V_STRIDE_D)
     k_smem = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty,
         [cfg.BLOCK_N, cfg.HEAD_DIM],
@@ -827,9 +871,9 @@ def attention_kernel(
     if cfg.IS_SLIDING:
         program, valid = scheduler.get_program(
             0,
-            q_ptr,
-            k_ptr,
-            v_ptr,
+            q,
+            k,
+            v,
             output_ptr,
             sink_ptr,
             lse_ptr,
@@ -850,9 +894,9 @@ def attention_kernel(
         for q_round in range(0, scheduler.num_q_rounds):
             program, valid = scheduler.get_program(
                 q_round,
-                q_ptr,
-                k_ptr,
-                v_ptr,
+                q,
+                k,
+                v,
                 output_ptr,
                 sink_ptr,
                 lse_ptr,
@@ -927,9 +971,6 @@ def gluon_mha_prefill_fp16_gfx950(
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     total_tokens, n_heads, head_dim = q.shape
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
 
     block_m = 128
     block_n = 64
@@ -951,7 +992,7 @@ def gluon_mha_prefill_fp16_gfx950(
         num_xcds=num_xcds,
         is_sliding=is_sliding,
     )
-    output = torch.empty_like(q)
+    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     lse = (
         torch.empty((total_tokens, n_heads), device=q.device, dtype=torch.float32)
         if return_lse
@@ -971,6 +1012,15 @@ def gluon_mha_prefill_fp16_gfx950(
         output,
         sink_arg,
         lse_arg,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
         n_heads,
         k.shape[1],
         head_dim,
