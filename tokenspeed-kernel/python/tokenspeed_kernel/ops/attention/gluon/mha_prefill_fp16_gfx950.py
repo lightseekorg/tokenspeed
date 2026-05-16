@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 
+import tokenspeed_triton as triton
 import tokenspeed_triton.experimental.gluon.language as gl
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_triton import language as tl
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.experimental.gluon.language.amd.cdna4 import (
     buffer_load,
@@ -20,6 +22,9 @@ from tokenspeed_triton.experimental.gluon.language.amd.cdna4.async_copy import (
     wait_group,
 )
 from tokenspeed_triton.language.core import PropagateNan
+
+_INV_LN2_VALUE = 1.4426950408889634
+_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 
 # ===-----------------------------------------------------------------------===#
 # Kernel Utilities
@@ -52,6 +57,13 @@ class AttentionConfig:
     NUM_WARPS: gl.constexpr
     BATCH_SIZE: gl.constexpr
     MAX_SEQLEN: gl.constexpr
+    HAS_SINK: gl.constexpr
+    HAS_LSE: gl.constexpr
+    IS_SLIDING: gl.constexpr
+    WINDOW_LEFT: gl.constexpr
+    NUM_Q_BLOCKS: gl.constexpr
+    NUM_TILES: gl.constexpr
+    NUM_KV_TILES: gl.constexpr
     NUM_SMS: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
@@ -78,6 +90,12 @@ class AttentionConfig:
         NUM_WARPS,
         BATCH_SIZE,
         MAX_SEQLEN,
+        HAS_SINK,
+        HAS_LSE,
+        IS_SLIDING,
+        WINDOW_LEFT,
+        NUM_Q_BLOCKS,
+        NUM_TILES,
         NUM_SMS,
         NUM_XCDS,
         NUM_BLOCKS,
@@ -87,6 +105,10 @@ class AttentionConfig:
         assert NUM_SMS % NUM_XCDS == 0
         assert NUM_BLOCKS % NUM_XCDS == 0
         assert NUM_BLOCKS >= N_HEADS
+        if IS_SLIDING:
+            assert WINDOW_LEFT >= 0
+        else:
+            assert WINDOW_LEFT == -1
 
         qk_layout = gl.amd.AMDMFMALayout(
             version=4,
@@ -110,6 +132,10 @@ class AttentionConfig:
         v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
             [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
+        if IS_SLIDING:
+            num_kv_tiles = (BLOCK_M + WINDOW_LEFT + BLOCK_N - 1) // BLOCK_N
+        else:
+            num_kv_tiles = 0
         self.N_HEADS = gl.constexpr(N_HEADS)
         self.N_KV_HEADS = gl.constexpr(N_KV_HEADS)
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
@@ -119,6 +145,13 @@ class AttentionConfig:
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.MAX_SEQLEN = gl.constexpr(MAX_SEQLEN)
+        self.HAS_SINK = gl.constexpr(HAS_SINK)
+        self.HAS_LSE = gl.constexpr(HAS_LSE)
+        self.IS_SLIDING = gl.constexpr(IS_SLIDING)
+        self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.NUM_Q_BLOCKS = gl.constexpr(NUM_Q_BLOCKS)
+        self.NUM_TILES = gl.constexpr(NUM_TILES)
+        self.NUM_KV_TILES = gl.constexpr(num_kv_tiles)
         self.NUM_SMS = gl.constexpr(NUM_SMS)
         self.NUM_XCDS = gl.constexpr(NUM_XCDS)
         self.NUM_BLOCKS = gl.constexpr(NUM_BLOCKS)
@@ -146,6 +179,8 @@ class AttentionProgram:
     k_ptr: gl.tensor
     v_ptr: gl.tensor
     output_ptr: gl.tensor
+    sink_ptr: gl.tensor
+    lse_ptr: gl.tensor
     seq_base: gl.tensor
     seq_len: gl.tensor
     q_start: gl.tensor
@@ -160,6 +195,8 @@ class AttentionProgram:
         k_ptr,
         v_ptr,
         output_ptr,
+        sink_ptr,
+        lse_ptr,
         seq_base,
         seq_len,
         q_start,
@@ -171,6 +208,8 @@ class AttentionProgram:
         self.k_ptr = k_ptr
         self.v_ptr = v_ptr
         self.output_ptr = output_ptr
+        self.sink_ptr = sink_ptr
+        self.lse_ptr = lse_ptr
         self.seq_base = seq_base
         self.seq_len = seq_len
         self.q_start = q_start
@@ -184,6 +223,8 @@ class AttentionProgram:
         k_ptr,
         v_ptr,
         output_ptr,
+        sink_ptr,
+        lse_ptr,
         seq_base,
         seq_len,
         query_block,
@@ -197,6 +238,8 @@ class AttentionProgram:
             k_ptr,
             v_ptr,
             output_ptr,
+            sink_ptr,
+            lse_ptr,
             seq_base,
             seq_len,
             q_start,
@@ -234,6 +277,20 @@ class AttentionProgram:
     def make_v_offset_tile(self):
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
+        offsets = (
+            ((self.seq_base + offs_n[:, None]) * cfg.N_KV_HEADS + self.kv_head)
+            * cfg.HEAD_DIM
+            + offs_d[None, :]
+        ).to(gl.int32)
+        return offsets, offs_n
+
+    @gluon.jit
+    def make_sliding_kv_offsets(self, kv_start):
+        cfg = self.cfg
+        offs_n = kv_start + gl.arange(
+            0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout)
+        )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
         offsets = (
             ((self.seq_base + offs_n[:, None]) * cfg.N_KV_HEADS + self.kv_head)
@@ -296,6 +353,20 @@ class AttentionProgram:
         return mfma(p, v, acc)
 
     @gluon.jit
+    def apply_sliding_mask(self, qk, offs_n):
+        cfg = self.cfg
+        offs_m = self.q_start + gl.arange(
+            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+        )
+        kv = gl.convert_layout(offs_n, gl.SliceLayout(0, cfg.qk_layout))
+        valid = offs_m[:, None] < self.seq_len
+        valid &= kv[None, :] < self.seq_len
+        valid &= kv[None, :] <= offs_m[:, None]
+        valid &= offs_m[:, None] <= kv[None, :] + cfg.WINDOW_LEFT
+        qk = gl.where(valid, qk, -float("inf"))
+        return qk, valid
+
+    @gluon.jit
     def softmax(self, qk, m_i, l_i, acc):
         cfg = self.cfg
         row_max = reduce_max_prop_nan(qk, 1)
@@ -313,6 +384,34 @@ class AttentionProgram:
         return p, m_new, l_i, acc
 
     @gluon.jit
+    def sliding_softmax(self, qk, valid, m_i, l_i, acc):
+        cfg = self.cfg
+        valid_count = gl.sum(valid.to(gl.int32), axis=1)
+        row_has_valid = valid_count > 0
+        row_max = reduce_max_prop_nan(qk, 1)
+        m_candidate = elementwise_max_prop_nan(m_i, row_max)
+        m_new = gl.where(row_has_valid, m_candidate, m_i)
+        m_new_scaled = m_new * cfg.SM_SCALE
+        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+        p = gl.where(valid, gl.exp2(qk_shifted), 0.0)
+        m_diff = m_i * cfg.SM_SCALE - m_new_scaled
+        alpha = gl.where(row_has_valid, gl.exp2(m_diff), 1.0)
+        l_ij = gl.sum(p, axis=1)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+        p = p.to(self.q_ptr.dtype.element_ty)
+        p = gl.convert_layout(p, cfg.p_layout)
+        return p, m_new, l_i, acc
+
+    @gluon.jit
+    def apply_sinks(self, l_i, m_i):
+        cfg = self.cfg
+        if cfg.HAS_SINK:
+            sink = gl.load(self.sink_ptr + self.q_head).to(gl.float32)
+            l_i += gl.exp2(sink * _INV_LN2 - m_i * cfg.SM_SCALE)
+        return l_i
+
+    @gluon.jit
     def store_output(self, output):
         cfg = self.cfg
         offs_m = self.q_start + gl.arange(
@@ -328,16 +427,30 @@ class AttentionProgram:
         output = output.to(self.output_ptr.dtype.element_ty)
         buffer_store(output, self.output_ptr, offsets, mask=mask)
 
+    @gluon.jit
+    def store_lse(self, l_i, m_i):
+        cfg = self.cfg
+        if cfg.HAS_LSE:
+            offs_m = self.q_start + gl.arange(
+                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
+            )
+            offsets = ((self.seq_base + offs_m) * cfg.N_HEADS + self.q_head).to(
+                gl.int32
+            )
+            mask = offs_m < self.seq_len
+            lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
+            lse = m_i * cfg.SM_SCALE + gl.log2(lse_l_i)
+            buffer_store(lse, self.lse_ptr, offsets, mask=mask)
+
 
 @gluon.aggregate
 class ProgramScheduler:
     cfg: AttentionConfig
-    logical_pid: gl.tensor
     lane_valid: gl.tensor
-    batch_slot: gl.tensor
+    batch: gl.tensor
     q_head: gl.tensor
     q_lane: gl.tensor
-    num_q_blocks: gl.constexpr
+    query_block: gl.tensor
     batch_slots: gl.constexpr
     q_lanes: gl.constexpr
     q_rounds_per_wave: gl.constexpr
@@ -351,42 +464,61 @@ class ProgramScheduler:
         # assigning batch/head/Q-block work while keeping adjacent heads grouped
         # per XCD.
         start_pid = gl.program_id(axis=0)
-        pids_per_xcd: gl.constexpr = cfg.NUM_BLOCKS // cfg.NUM_XCDS
-        xcd = start_pid % cfg.NUM_XCDS
-        local_pid = start_pid // cfg.NUM_XCDS
-        logical_pid = xcd * pids_per_xcd + local_pid
-
-        num_q_blocks: gl.constexpr = (cfg.MAX_SEQLEN + cfg.BLOCK_M - 1) // cfg.BLOCK_M
-
-        max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
-        if cfg.BATCH_SIZE < max_batch_slots:
-            batch_slots: gl.constexpr = cfg.BATCH_SIZE
+        if cfg.IS_SLIDING:
+            pids_per_xcd: gl.constexpr = (
+                cfg.NUM_TILES + cfg.NUM_XCDS - 1
+            ) // cfg.NUM_XCDS
+            xcd = start_pid % cfg.NUM_XCDS
+            local_pid = start_pid // cfg.NUM_XCDS
+            logical_pid = xcd * pids_per_xcd + local_pid
+            lane_valid = logical_pid < cfg.NUM_TILES
+            safe_pid = gl.where(lane_valid, logical_pid, 0)
+            query_block = safe_pid % cfg.NUM_Q_BLOCKS
+            head_batch = safe_pid // cfg.NUM_Q_BLOCKS
+            q_head = head_batch % cfg.N_HEADS
+            batch = head_batch // cfg.N_HEADS
+            q_lane = safe_pid - safe_pid
+            batch_slots: gl.constexpr = 1
+            q_lanes: gl.constexpr = 1
+            q_rounds_per_wave: gl.constexpr = 1
+            num_q_rounds: gl.constexpr = 1
         else:
-            batch_slots: gl.constexpr = max_batch_slots
+            pids_per_xcd: gl.constexpr = cfg.NUM_BLOCKS // cfg.NUM_XCDS
+            xcd = start_pid % cfg.NUM_XCDS
+            local_pid = start_pid // cfg.NUM_XCDS
+            logical_pid = xcd * pids_per_xcd + local_pid
 
-        q_lanes: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
-        q_rounds_per_wave: gl.constexpr = (num_q_blocks + q_lanes - 1) // q_lanes
-        num_batch_waves: gl.constexpr = (
-            cfg.BATCH_SIZE + batch_slots - 1
-        ) // batch_slots
-        num_q_rounds: gl.constexpr = num_batch_waves * q_rounds_per_wave
+            max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
+            if cfg.BATCH_SIZE < max_batch_slots:
+                batch_slots: gl.constexpr = cfg.BATCH_SIZE
+            else:
+                batch_slots: gl.constexpr = max_batch_slots
 
-        active_lanes: gl.constexpr = batch_slots * cfg.N_HEADS * q_lanes
-        lane_valid = logical_pid < active_lanes
-        safe_pid = gl.where(lane_valid, logical_pid, 0)
-        q_lane = safe_pid % q_lanes
-        head_batch_slot = safe_pid // q_lanes
-        q_head = head_batch_slot % cfg.N_HEADS
-        batch_slot = head_batch_slot // cfg.N_HEADS
+            q_lanes: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
+            q_rounds_per_wave: gl.constexpr = (
+                cfg.NUM_Q_BLOCKS + q_lanes - 1
+            ) // q_lanes
+            num_batch_waves: gl.constexpr = (
+                cfg.BATCH_SIZE + batch_slots - 1
+            ) // batch_slots
+            num_q_rounds: gl.constexpr = num_batch_waves * q_rounds_per_wave
+
+            active_lanes: gl.constexpr = batch_slots * cfg.N_HEADS * q_lanes
+            lane_valid = logical_pid < active_lanes
+            safe_pid = gl.where(lane_valid, logical_pid, 0)
+            q_lane = safe_pid % q_lanes
+            head_batch_slot = safe_pid // q_lanes
+            q_head = head_batch_slot % cfg.N_HEADS
+            batch = head_batch_slot // cfg.N_HEADS
+            query_block = safe_pid - safe_pid
 
         return ProgramScheduler(
             cfg,
-            logical_pid,
             lane_valid,
-            batch_slot,
+            batch,
             q_head,
             q_lane,
-            num_q_blocks,
+            query_block,
             batch_slots,
             q_lanes,
             q_rounds_per_wave,
@@ -401,21 +533,32 @@ class ProgramScheduler:
         k_ptr,
         v_ptr,
         output_ptr,
+        sink_ptr,
+        lse_ptr,
         cu_seqlens_ptr,
     ):
         cfg = self.cfg
 
-        batch_wave = q_round // self.q_rounds_per_wave
-        wave_round = q_round - batch_wave * self.q_rounds_per_wave
-        query_block_inc = wave_round * self.q_lanes + self.q_lane
-        query_block_dec = wave_round * self.q_lanes + (self.q_lanes - 1 - self.q_lane)
-        query_block = gl.where(wave_round % 2 == 0, query_block_inc, query_block_dec)
-        batch = batch_wave * self.batch_slots + self.batch_slot
-        valid = (
-            self.lane_valid
-            & (batch < cfg.BATCH_SIZE)
-            & (query_block < self.num_q_blocks)
-        )
+        if cfg.IS_SLIDING:
+            query_block = self.query_block
+            batch = self.batch
+            valid = self.lane_valid
+        else:
+            batch_wave = q_round // self.q_rounds_per_wave
+            wave_round = q_round - batch_wave * self.q_rounds_per_wave
+            query_block_inc = wave_round * self.q_lanes + self.q_lane
+            query_block_dec = wave_round * self.q_lanes + (
+                self.q_lanes - 1 - self.q_lane
+            )
+            query_block = gl.where(
+                wave_round % 2 == 0, query_block_inc, query_block_dec
+            )
+            batch = batch_wave * self.batch_slots + self.batch
+            valid = (
+                self.lane_valid
+                & (batch < cfg.BATCH_SIZE)
+                & (query_block < cfg.NUM_Q_BLOCKS)
+            )
 
         safe_batch = gl.where(valid, batch, 0)
         seq_base = gl.load(cu_seqlens_ptr + safe_batch)
@@ -427,6 +570,8 @@ class ProgramScheduler:
             k_ptr,
             v_ptr,
             output_ptr,
+            sink_ptr,
+            lse_ptr,
             seq_base,
             seq_len,
             query_block,
@@ -523,9 +668,60 @@ def process_attention_tile(
     v = program.shared_load_v(v_smem)
     acc = program.compute_pv(p, v, acc)
 
+    l_i = program.apply_sinks(l_i, m_i)
+    program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     recip_denom = 1.0 / denom
     output = acc * recip_denom[:, None]
+    output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
+def process_sliding_attention_tile(
+    program: AttentionProgram,
+    k_smem: gl.shared_memory_descriptor,
+    v_smem: gl.shared_memory_descriptor,
+):
+    cfg = program.cfg
+    q = program.load_q()
+    m_i = gl.full(
+        [cfg.BLOCK_M],
+        value=-float("inf"),
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, cfg.pv_layout),
+    )
+    l_i = gl.full(
+        [cfg.BLOCK_M],
+        value=0,
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, cfg.pv_layout),
+    )
+    acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
+
+    kv_start = program.q_start - cfg.WINDOW_LEFT
+    kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
+    for _ in range(0, cfg.NUM_KV_TILES):
+        offsets, offs_n = program.make_sliding_kv_offsets(kv_start)
+        mask = offs_n[:, None] < program.seq_len
+        program.issue_buffer_load_k(offsets, k_smem, mask=mask)
+        program.issue_buffer_load_v(offsets, v_smem, mask=mask, other=0.0)
+
+        wait_group(1)
+        k = program.shared_load_k(k_smem)
+        qk = program.compute_qk(q, k)
+        qk, valid = program.apply_sliding_mask(qk, offs_n)
+        p, m_i, l_i, acc = program.sliding_softmax(qk, valid, m_i, l_i, acc)
+
+        wait_group(0)
+        v = program.shared_load_v(v_smem)
+        acc = program.compute_pv(p, v, acc)
+        kv_start = kv_start + cfg.BLOCK_N
+
+    l_i = program.apply_sinks(l_i, m_i)
+    program.store_lse(l_i, m_i)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    output = acc * (1.0 / denom)[:, None]
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
 
@@ -537,6 +733,8 @@ def _mha_prefill_kernel(
     v_ptr,
     cu_seqlens_ptr,
     output_ptr,
+    sink_ptr,
+    lse_ptr,
     N_HEADS: gl.constexpr,
     N_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -546,6 +744,12 @@ def _mha_prefill_kernel(
     NUM_WARPS: gl.constexpr,
     BATCH_SIZE: gl.constexpr,
     MAX_SEQLEN: gl.constexpr,
+    HAS_SINK: gl.constexpr,
+    HAS_LSE: gl.constexpr,
+    IS_SLIDING: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+    NUM_Q_BLOCKS: gl.constexpr,
+    NUM_TILES: gl.constexpr,
     NUM_SMS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     NUM_BLOCKS: gl.constexpr,
@@ -560,6 +764,12 @@ def _mha_prefill_kernel(
         NUM_WARPS,
         BATCH_SIZE,
         MAX_SEQLEN,
+        HAS_SINK,
+        HAS_LSE,
+        IS_SLIDING,
+        WINDOW_LEFT,
+        NUM_Q_BLOCKS,
+        NUM_TILES,
         NUM_SMS,
         NUM_XCDS,
         NUM_BLOCKS,
@@ -575,25 +785,63 @@ def _mha_prefill_kernel(
         cfg.v_smem_layout,
     )
 
-    mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-    mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
-    boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
-    boundary_mask1 = (mask_offs_n[None, :] + cfg.BLOCK_N) <= mask_offs_m[:, None]
-
     scheduler = ProgramScheduler.create(cfg)
-    for q_round in range(0, scheduler.num_q_rounds):
+    if cfg.IS_SLIDING:
         program, valid = scheduler.get_program(
-            q_round, q_ptr, k_ptr, v_ptr, output_ptr, cu_seqlens_ptr
+            0,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            output_ptr,
+            sink_ptr,
+            lse_ptr,
+            cu_seqlens_ptr,
         )
         if valid:
-            process_attention_tile(
-                program, k_smem, v_smem, boundary_mask0, boundary_mask1
+            process_sliding_attention_tile(program, k_smem, v_smem)
+    else:
+        mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
+        mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
+        boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
+        boundary_mask1 = (mask_offs_n[None, :] + cfg.BLOCK_N) <= mask_offs_m[:, None]
+
+        for q_round in range(0, scheduler.num_q_rounds):
+            program, valid = scheduler.get_program(
+                q_round,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                output_ptr,
+                sink_ptr,
+                lse_ptr,
+                cu_seqlens_ptr,
             )
+            if valid:
+                process_attention_tile(
+                    program, k_smem, v_smem, boundary_mask0, boundary_mask1
+                )
 
 
 # ===-----------------------------------------------------------------------===#
 # Entry Point
 # ===-----------------------------------------------------------------------===#
+
+
+def schedule_grid(
+    *,
+    batch_size: int,
+    n_heads: int,
+    max_seqlen: int,
+    block_m: int,
+    num_blocks: int,
+    num_xcds: int,
+    is_sliding: bool,
+) -> tuple[int, ...]:
+    num_q_blocks = triton.cdiv(max_seqlen, block_m)
+    if is_sliding:
+        num_tiles = num_q_blocks * n_heads * batch_size
+        return (max(1, triton.cdiv(num_tiles, num_xcds) * num_xcds),)
+    return (num_blocks,)
 
 
 @register_kernel(
@@ -611,12 +859,11 @@ def _mha_prefill_kernel(
     traits={
         "head_dim": frozenset({64}),
         "is_causal": frozenset({True}),
-        "sliding_window": frozenset({False}),
-        "support_sinks": frozenset({False}),
+        "sliding_window": frozenset({False, True}),
+        "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False}),
-        "return_lse": frozenset({False}),
+        "return_lse": frozenset({False, True}),
     },
-    tags={"throughput"},
 )
 def gluon_mha_prefill_fp16_gfx950(
     q: torch.Tensor,
@@ -631,56 +878,8 @@ def gluon_mha_prefill_fp16_gfx950(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
-) -> torch.Tensor:
-    if not is_causal:
-        raise NotImplementedError(
-            "gluon_mha_prefill_fp16_gfx950 requires causal prefill"
-        )
-    if window_left >= 0:
-        raise NotImplementedError("sliding-window prefill is not implemented yet")
-    if logit_cap != 0.0:
-        raise NotImplementedError("logit_cap is not supported")
-    if sinks is not None:
-        raise NotImplementedError("attention sinks are not implemented yet")
-    if return_lse:
-        raise NotImplementedError("return_lse is not implemented yet")
-    if max_seqlen_q != max_seqlen_k:
-        raise ValueError("max_seqlen_q and max_seqlen_k must match")
-
-    qkv = (q, k, v)
-    if any(t.ndim != 3 for t in qkv):
-        raise ValueError("q, k, and v must be 3D tensors")
-    if any(not t.is_cuda for t in qkv):
-        raise ValueError("q, k, and v must be CUDA tensors")
-    if any(t.device != q.device for t in qkv):
-        raise ValueError("q, k, and v must be on the same device")
-    if any(t.dtype != q.dtype for t in qkv) or q.dtype not in (
-        torch.float16,
-        torch.bfloat16,
-    ):
-        raise ValueError("q, k, and v must have the same fp16 or bf16 dtype")
-    if any(not t.is_contiguous() for t in qkv):
-        raise ValueError("q, k, and v must be contiguous")
-
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     total_tokens, n_heads, head_dim = q.shape
-    if k.shape[0] != total_tokens or v.shape[0] != total_tokens:
-        raise ValueError("q, k, and v must have the same flattened token count")
-    if k.shape[1] != v.shape[1] or k.shape[2] != head_dim or v.shape[2] != head_dim:
-        raise ValueError("q, k, and v must have compatible head shapes")
-    if n_heads == 0 or k.shape[1] == 0 or head_dim == 0:
-        raise ValueError("q, k, and v must have non-empty head dimensions")
-    if n_heads % k.shape[1] != 0:
-        raise ValueError("number of Q heads must be divisible by number of K/V heads")
-    if head_dim != 64:
-        raise ValueError("head_dim must be 64")
-    if cu_seqlens_q.ndim != 1 or cu_seqlens_q.numel() < 2:
-        raise ValueError("cu_seqlens_q must be a 1D tensor with at least two elements")
-    if max_seqlen_q < 0:
-        raise ValueError("max_seqlen_q must be non-negative")
-
-    cu_seqlens_q = cu_seqlens_q.to(
-        device=q.device, dtype=torch.int32, non_blocking=True
-    ).contiguous()
 
     block_m = 128
     block_n = 64
@@ -689,9 +888,30 @@ def gluon_mha_prefill_fp16_gfx950(
     num_sms = 256
     num_xcds = 8
     num_blocks = num_sms * 2
-    grid = (num_blocks,)
+    is_sliding = window_left >= 0
+    kernel_window_left = window_left if is_sliding else -1
+    num_q_blocks = triton.cdiv(max_seqlen_q, block_m)
+    num_tiles = num_q_blocks * n_heads * batch_size
+    grid = schedule_grid(
+        batch_size=batch_size,
+        n_heads=n_heads,
+        max_seqlen=max_seqlen_q,
+        block_m=block_m,
+        num_blocks=num_blocks,
+        num_xcds=num_xcds,
+        is_sliding=is_sliding,
+    )
     output = torch.empty_like(q)
-    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+    lse = (
+        torch.empty((total_tokens, n_heads), device=q.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
+    scale = 1.0 / math.sqrt(head_dim)
+    has_sink = sinks is not None
+    has_lse = return_lse
+    sink_arg = sinks if sinks is not None else q
+    lse_arg = lse if lse is not None else q
 
     _mha_prefill_kernel[grid](
         q,
@@ -699,18 +919,28 @@ def gluon_mha_prefill_fp16_gfx950(
         v,
         cu_seqlens_q,
         output,
+        sink_arg,
+        lse_arg,
         n_heads,
         k.shape[1],
         head_dim,
-        scale * 1.4426950408889634,
+        scale * _INV_LN2_VALUE,
         block_m,
         block_n,
         num_warps,
         batch_size,
         max_seqlen_q,
+        has_sink,
+        has_lse,
+        is_sliding,
+        kernel_window_left,
+        num_q_blocks,
+        num_tiles,
         num_sms,
         num_xcds,
         num_blocks,
         num_warps=num_warps,
     )
+    if return_lse:
+        return output, lse
     return output
