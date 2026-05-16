@@ -707,7 +707,7 @@ def process_sliding_attention_tile(
 
 
 @gluon.jit
-def _mha_prefill_kernel(
+def attention_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -893,7 +893,7 @@ def gluon_mha_prefill_fp16_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    _mha_prefill_kernel[grid](
+    attention_kernel[grid](
         q,
         k,
         v,
