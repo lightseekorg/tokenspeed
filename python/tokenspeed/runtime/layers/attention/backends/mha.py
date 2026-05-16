@@ -57,6 +57,7 @@ class MHAMetadata:
     cu_seqlens_q: torch.Tensor | None = None
     max_seq_len_q: int | None = None
     max_seq_len_k: int | None = None
+    use_direct_prefill: bool = False
 
 
 class MHAAttnBackend(AttentionBackend):
@@ -143,6 +144,13 @@ class MHAAttnBackend(AttentionBackend):
             extend_seq_lens_cpu is not None
         ), "mha extend requires extend_seq_lens_cpu"
         max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
+        extend_prefix_lens_cpu = kwargs.get("extend_prefix_lens_cpu")
+        if extend_prefix_lens is None:
+            use_direct_prefill = True
+        elif extend_prefix_lens_cpu is not None:
+            use_direct_prefill = not bool(extend_prefix_lens_cpu[:bs].any().item())
+        else:
+            use_direct_prefill = False
 
         self.forward_prefill_metadata = MHAMetadata(
             cache_seqlens_int32=seq_lens,
@@ -150,6 +158,7 @@ class MHAAttnBackend(AttentionBackend):
             page_table=page_table,
             max_seq_len_q=max_seq_len_q,
             max_seq_len_k=self.max_context_len,
+            use_direct_prefill=use_direct_prefill,
         )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
@@ -326,14 +335,7 @@ class MHAAttnBackend(AttentionBackend):
         k = None if k is None else k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = None if v is None else v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-        use_direct_prefill = False
-        if k is not None and v is not None:
-            query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-            use_direct_prefill = bool(
-                torch.equal(metadata.cache_seqlens_int32, query_lens)
-            )
-
-        if use_direct_prefill:
+        if k is not None and v is not None and metadata.use_direct_prefill:
             return self._forward_extend_direct(
                 q,
                 k,
