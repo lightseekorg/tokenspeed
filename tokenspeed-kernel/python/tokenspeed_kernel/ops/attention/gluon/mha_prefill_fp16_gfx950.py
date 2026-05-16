@@ -327,12 +327,23 @@ class AttentionProgram:
     @gluon.jit
     def init_attention_state(self):
         cfg = self.cfg
-        m_i = gl.full(
-            [cfg.BLOCK_M],
-            value=-float("inf"),
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, cfg.pv_layout),
-        )
+        if cfg.HAS_SINK:
+            sink = gl.load(self.sink_ptr + self.q_head).to(gl.float32)
+            sink_unscaled = sink * _INV_LN2 / cfg.SM_SCALE
+            m_i = gl.full(
+                [cfg.BLOCK_M],
+                value=0,
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.pv_layout),
+            )
+            m_i += sink_unscaled
+        else:
+            m_i = gl.full(
+                [cfg.BLOCK_M],
+                value=-float("inf"),
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.pv_layout),
+            )
         l_i = gl.full(
             [cfg.BLOCK_M],
             value=0,
