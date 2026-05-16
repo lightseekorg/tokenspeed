@@ -367,7 +367,7 @@ class AttentionProgram:
         valid &= kv[None, :] <= offs_m[:, None]
         valid &= offs_m[:, None] <= kv[None, :] + cfg.WINDOW_LEFT
         qk = gl.where(valid, qk, -float("inf"))
-        return qk, valid
+        return qk
 
     @gluon.jit
     def softmax(self, qk, m_i, l_i, acc):
@@ -664,7 +664,7 @@ def process_sliding_attention_tile(
         wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        qk, _ = program.apply_sliding_mask(qk, offs_n)
+        qk = program.apply_sliding_mask(qk, offs_n)
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         wait_group(0)
