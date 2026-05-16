@@ -420,6 +420,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             out_cache_loc=None,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
+            bs=ctx.bs,
             **kwargs,
         )
 
