@@ -5485,7 +5485,7 @@ class DeepseekV4Attention(nn.Module):
         elif (
             backend_prefill is not None
             and ctx.forward_mode is not None
-            and ctx.forward_mode.is_extend()
+            and ctx.forward_mode.is_extend_or_mixed()
         ):
             with deepseek_v4_profile_scope(f"{profile_prefix}_prefill_backend"):
                 attn_output = backend_prefill(

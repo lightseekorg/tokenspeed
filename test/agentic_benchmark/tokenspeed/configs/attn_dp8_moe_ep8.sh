@@ -25,6 +25,6 @@ exec ts serve \
     --speculative-draft-model-quantization unquant \
     --drafter-attention-backend trtllm_mla \
     --enable-cache-report \
-    --host localhost \
+    --host 127.0.0.1 \
     --port 8000 \
-    --dist-init-addr localhost:4000
+    --dist-init-addr 127.0.0.1:4000

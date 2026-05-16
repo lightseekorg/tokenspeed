@@ -418,7 +418,7 @@ class RequestHandler:
                 Not needed for step-count-based profiling.
         """
         if self.profile_by_stage and forward_mode is not None:
-            if forward_mode.is_extend():
+            if forward_mode.is_extend_or_mixed():
                 if self.profiler_prefill_ct == 0:
                     self.start_profile(forward_mode)
                 self.profiler_prefill_ct += 1
