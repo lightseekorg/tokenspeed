@@ -32,13 +32,13 @@ _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 
 
 @gluon.jit
-def elementwise_max_prop_nan(a, b, propagate_nan: gl.constexpr = PropagateNan.ALL):
+def maximum(a, b, propagate_nan: gl.constexpr = PropagateNan.ALL):
     return gl.maximum(a, b, propagate_nan=propagate_nan)
 
 
 @gluon.jit
-def reduce_max_prop_nan(input, axis=None, keep_dims=False):
-    return gl.reduce(input, axis, elementwise_max_prop_nan, keep_dims=keep_dims)
+def max(input, axis=None, keep_dims=False):
+    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -325,6 +325,26 @@ class AttentionProgram:
         return mfma(p, v, acc)
 
     @gluon.jit
+    def init_attention_state(self):
+        cfg = self.cfg
+        m_i = gl.full(
+            [cfg.BLOCK_M],
+            value=-float("inf"),
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
+        l_i = gl.full(
+            [cfg.BLOCK_M],
+            value=0,
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
+        acc = gl.zeros(
+            [cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout
+        )
+        return m_i, l_i, acc
+
+    @gluon.jit
     def apply_sliding_mask(self, qk, offs_n):
         cfg = self.cfg
         offs_m = self.q_start + gl.arange(
@@ -341,8 +361,8 @@ class AttentionProgram:
     @gluon.jit
     def softmax(self, qk, m_i, l_i, acc):
         cfg = self.cfg
-        row_max = reduce_max_prop_nan(qk, 1)
-        m_new = elementwise_max_prop_nan(m_i, row_max)
+        row_max = max(qk, 1)
+        m_new = maximum(m_i, row_max)
         m_new_scaled = m_new * cfg.SM_SCALE
         qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
         p = gl.exp2(qk_shifted)
@@ -542,19 +562,7 @@ def process_attention_tile(
 ):
     cfg = program.cfg
     q = program.load_q()
-    m_i = gl.full(
-        [cfg.BLOCK_M],
-        value=-float("inf"),
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
-    l_i = gl.full(
-        [cfg.BLOCK_M],
-        value=0,
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
-    acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
+    m_i, l_i, acc = program.init_attention_state()
 
     main_end = program.q_start // cfg.BLOCK_N
     base_offsets, base_offs_n = program.make_kv_offsets(0)
@@ -632,19 +640,7 @@ def process_sliding_attention_tile(
 ):
     cfg = program.cfg
     q = program.load_q()
-    m_i = gl.full(
-        [cfg.BLOCK_M],
-        value=-float("inf"),
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
-    l_i = gl.full(
-        [cfg.BLOCK_M],
-        value=0,
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
-    acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
+    m_i, l_i, acc = program.init_attention_state()
 
     kv_start = program.q_start - cfg.WINDOW_LEFT
     kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
