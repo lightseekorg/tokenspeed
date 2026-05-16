@@ -384,26 +384,6 @@ class AttentionProgram:
         return p, m_new, l_i, acc
 
     @gluon.jit
-    def sliding_softmax(self, qk, valid, m_i, l_i, acc):
-        cfg = self.cfg
-        valid_count = gl.sum(valid.to(gl.int32), axis=1)
-        row_has_valid = valid_count > 0
-        row_max = reduce_max_prop_nan(qk, 1)
-        m_candidate = elementwise_max_prop_nan(m_i, row_max)
-        m_new = gl.where(row_has_valid, m_candidate, m_i)
-        m_new_scaled = m_new * cfg.SM_SCALE
-        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
-        p = gl.where(valid, gl.exp2(qk_shifted), 0.0)
-        m_diff = m_i * cfg.SM_SCALE - m_new_scaled
-        alpha = gl.where(row_has_valid, gl.exp2(m_diff), 1.0)
-        l_ij = gl.sum(p, axis=1)
-        l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None]
-        p = p.to(self.q_ptr.dtype.element_ty)
-        p = gl.convert_layout(p, cfg.p_layout)
-        return p, m_new, l_i, acc
-
-    @gluon.jit
     def apply_sinks(self, l_i, m_i):
         cfg = self.cfg
         if cfg.HAS_SINK:
@@ -711,7 +691,7 @@ def process_sliding_attention_tile(
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
         qk, valid = program.apply_sliding_mask(qk, offs_n)
-        p, m_i, l_i, acc = program.sliding_softmax(qk, valid, m_i, l_i, acc)
+        p, m_i, l_i, acc = program.softmax(qk, valid, m_i, l_i, acc)
 
         wait_group(0)
         v = program.shared_load_v(v_smem)
