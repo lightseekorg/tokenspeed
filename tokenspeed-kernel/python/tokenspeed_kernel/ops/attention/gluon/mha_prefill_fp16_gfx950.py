@@ -690,8 +690,8 @@ def process_sliding_attention_tile(
         wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        qk, valid = program.apply_sliding_mask(qk, offs_n)
-        p, m_i, l_i, acc = program.softmax(qk, valid, m_i, l_i, acc)
+        qk, _ = program.apply_sliding_mask(qk, offs_n)
+        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         wait_group(0)
         v = program.shared_load_v(v_smem)
