@@ -102,7 +102,6 @@ class AttentionConfig:
     WINDOW_LEFT: gl.constexpr
     NUM_Q_BLOCKS: gl.constexpr
     NUM_TILES: gl.constexpr
-    NUM_KV_TILES: gl.constexpr
     NUM_SMS: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
@@ -177,10 +176,6 @@ class AttentionConfig:
         v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
             [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
-        if IS_SLIDING:
-            num_kv_tiles = (BLOCK_M + WINDOW_LEFT + BLOCK_N - 1) // BLOCK_N
-        else:
-            num_kv_tiles = 0
         self.N_HEADS = gl.constexpr(N_HEADS)
         self.N_KV_HEADS = gl.constexpr(N_KV_HEADS)
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
@@ -196,7 +191,6 @@ class AttentionConfig:
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.NUM_Q_BLOCKS = gl.constexpr(NUM_Q_BLOCKS)
         self.NUM_TILES = gl.constexpr(NUM_TILES)
-        self.NUM_KV_TILES = gl.constexpr(num_kv_tiles)
         self.NUM_SMS = gl.constexpr(NUM_SMS)
         self.NUM_XCDS = gl.constexpr(NUM_XCDS)
         self.NUM_BLOCKS = gl.constexpr(NUM_BLOCKS)
@@ -679,7 +673,8 @@ def process_small_attention_tile(
 
     program.store_lse(l_i, m_i / cfg.SM_SCALE)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
-    output = acc * (1.0 / denom)[:, None]
+    recip_denom = 1.0 / denom
+    output = acc * recip_denom[:, None]
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
 
@@ -777,7 +772,10 @@ def process_sliding_attention_tile(
 
     kv_start = program.q_start - cfg.WINDOW_LEFT
     kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
-    for _ in range(0, cfg.NUM_KV_TILES):
+    num_kv_tiles: gl.constexpr = (
+        cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
+    ) // cfg.BLOCK_N
+    for _ in range(0, num_kv_tiles):
         k_offsets, offs_n = program.make_k_offsets(kv_start)
         v_offsets = program.make_v_offsets(kv_start)
         mask = offs_n[:, None] < program.seq_len
@@ -798,7 +796,8 @@ def process_sliding_attention_tile(
     l_i = program.apply_sinks(l_i, m_i)
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
-    output = acc * (1.0 / denom)[:, None]
+    recip_denom = 1.0 / denom
+    output = acc * recip_denom[:, None]
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
 
