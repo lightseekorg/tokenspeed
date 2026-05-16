@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import tokenspeed_triton as triton
 import tokenspeed_triton.experimental.gluon.language as gl
@@ -811,8 +812,57 @@ def attention_kernel(
     output_ptr,
     sink_ptr,
     lse_ptr,
-    cfg: gl.constexpr,
+    Q_STRIDE_T: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    K_STRIDE_T: gl.constexpr,
+    K_STRIDE_H: gl.constexpr,
+    K_STRIDE_D: gl.constexpr,
+    V_STRIDE_T: gl.constexpr,
+    V_STRIDE_H: gl.constexpr,
+    V_STRIDE_D: gl.constexpr,
+    N_HEADS: gl.constexpr,
+    N_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    BATCH_SIZE: gl.constexpr,
+    MAX_SEQLEN: gl.constexpr,
+    HAS_SINK: gl.constexpr,
+    HAS_LSE: gl.constexpr,
+    IS_SLIDING: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+    NUM_Q_BLOCKS: gl.constexpr,
+    NUM_TILES: gl.constexpr,
+    NUM_SMS: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    NUM_BLOCKS: gl.constexpr,
 ):
+    cfg = AttentionConfig(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        SM_SCALE,
+        BLOCK_M,
+        BLOCK_N,
+        NUM_WARPS,
+        BATCH_SIZE,
+        MAX_SEQLEN,
+        HAS_SINK,
+        HAS_LSE,
+        IS_SLIDING,
+        WINDOW_LEFT,
+        NUM_Q_BLOCKS,
+        NUM_TILES,
+        NUM_SMS,
+        NUM_XCDS,
+        NUM_BLOCKS,
+        InputLayout(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
+        InputLayout(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
+        InputLayout(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
+    )
     k_smem = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty,
         [cfg.BLOCK_N, cfg.HEAD_DIM],
@@ -874,18 +924,36 @@ def attention_kernel(
 # ===-----------------------------------------------------------------------===#
 
 
+class LaunchConfig(NamedTuple):
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    sm_scale: float
+    block_m: int
+    block_n: int
+    num_warps: int
+    batch_size: int
+    max_seqlen: int
+    is_sliding: bool
+    window_left: int
+    num_q_blocks: int
+    num_tiles: int
+    num_sms: int
+    num_xcds: int
+    num_blocks: int
+    grid: tuple[int, ...]
+
+
 def get_config(
     *,
     q: torch.Tensor,
     k: torch.Tensor,
-    v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
     window_left: int,
-    has_sink: bool,
-    has_lse: bool,
-) -> tuple[AttentionConfig, tuple[int, ...]]:
+) -> LaunchConfig:
     n_heads = q.shape[1]
+    n_kv_heads = k.shape[1]
     head_dim = q.shape[2]
     block_m = 128
     block_n = 64
@@ -898,34 +966,31 @@ def get_config(
     window_left = window_left if is_sliding else -1
     num_q_blocks = triton.cdiv(max_seqlen_q, block_m)
     num_tiles = num_q_blocks * n_heads * batch_size
-    scale = 1.0 / math.sqrt(head_dim)
-    cfg = AttentionConfig(
-        n_heads,
-        k.shape[1],
-        head_dim,
-        scale * _INV_LN2_VALUE,
-        block_m,
-        block_n,
-        num_warps,
-        batch_size,
-        max_seqlen_q,
-        has_sink,
-        has_lse,
-        is_sliding,
-        window_left,
-        num_q_blocks,
-        num_tiles,
-        num_sms,
-        num_xcds,
-        num_blocks,
-        InputLayout(q.stride(0), q.stride(1), q.stride(2)),
-        InputLayout(k.stride(0), k.stride(1), k.stride(2)),
-        InputLayout(v.stride(0), v.stride(1), v.stride(2)),
-    )
+    sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
     if is_sliding:
         grid_tiles = triton.cdiv(num_tiles, num_xcds) * num_xcds
-        return cfg, (grid_tiles if grid_tiles > 1 else 1,)
-    return cfg, (num_blocks,)
+        grid = (grid_tiles if grid_tiles > 1 else 1,)
+    else:
+        grid = (num_blocks,)
+    return LaunchConfig(
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        sm_scale=sm_scale,
+        block_m=block_m,
+        block_n=block_n,
+        num_warps=num_warps,
+        batch_size=batch_size,
+        max_seqlen=max_seqlen_q,
+        is_sliding=is_sliding,
+        window_left=window_left,
+        num_q_blocks=num_q_blocks,
+        num_tiles=num_tiles,
+        num_sms=num_sms,
+        num_xcds=num_xcds,
+        num_blocks=num_blocks,
+        grid=grid,
+    )
 
 
 @register_kernel(
@@ -964,6 +1029,13 @@ def gluon_mha_prefill_fp16_gfx950(
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     total_tokens, n_heads, _ = q.shape
+    config = get_config(
+        q=q,
+        k=k,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        window_left=window_left,
+    )
     output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     lse = (
         torch.empty((total_tokens, n_heads), device=q.device, dtype=torch.float32)
@@ -974,18 +1046,8 @@ def gluon_mha_prefill_fp16_gfx950(
     has_lse = return_lse
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
-    cfg, grid = get_config(
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
-        window_left=window_left,
-        has_sink=has_sink,
-        has_lse=has_lse,
-    )
 
-    attention_kernel[grid](
+    attention_kernel[config.grid](
         q,
         k,
         v,
@@ -993,8 +1055,34 @@ def gluon_mha_prefill_fp16_gfx950(
         output,
         sink_arg,
         lse_arg,
-        cfg,
-        num_warps=cfg.NUM_WARPS,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        config.sm_scale,
+        config.block_m,
+        config.block_n,
+        config.num_warps,
+        config.batch_size,
+        config.max_seqlen,
+        has_sink,
+        has_lse,
+        config.is_sliding,
+        config.window_left,
+        config.num_q_blocks,
+        config.num_tiles,
+        config.num_sms,
+        config.num_xcds,
+        config.num_blocks,
+        num_warps=config.num_warps,
     )
     if return_lse:
         return output, lse
