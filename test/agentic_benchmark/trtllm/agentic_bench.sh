@@ -45,7 +45,7 @@ launch_server() {
         --enable_chunked_prefill \
         --trust_remote_code \
         --config "${SCRIPT_DIR}/configs/${config}.yaml" \
-        --host localhost \
+        --host 127.0.0.1 \
         --port 8001 \
         > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
@@ -54,7 +54,7 @@ launch_server() {
 wait_for_ready() {
     local TIMEOUT=600
     local START=$SECONDS
-    until curl -sf -o /dev/null http://localhost:8001/health; do
+    until curl -sf -o /dev/null http://127.0.0.1:8001/health; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "Server died early. Last log lines:" >&2
             tail -100 "$SERVER_LOG" >&2
@@ -91,7 +91,7 @@ wait_for_port_free() {
     local port=${1:-8001}
     local timeout=${2:-90}
     local start=$SECONDS
-    while ! python3 -c "import socket; s=socket.socket(); s.bind(('localhost', $port)); s.close()" 2>/dev/null; do
+    while ! python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1', $port)); s.close()" 2>/dev/null; do
         if (( SECONDS - start > timeout )); then
             echo "Port ${port} still in use after ${timeout}s" >&2
             return 1
@@ -121,7 +121,7 @@ for CONFIG in "${CONFIGS[@]}"; do
     echo "Warmup..."
     evalscope perf \
         --model nvidia/Kimi-K2.5-NVFP4 \
-        --url http://localhost:8001/v1/chat/completions \
+        --url http://127.0.0.1:8001/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
         --dataset-path agentic_dataset.json \
@@ -136,7 +136,7 @@ for CONFIG in "${CONFIGS[@]}"; do
     echo "Benchmark..."
     evalscope perf \
         --model nvidia/Kimi-K2.5-NVFP4 \
-        --url http://localhost:8001/v1/chat/completions \
+        --url http://127.0.0.1:8001/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
         --dataset-path agentic_dataset.json \
