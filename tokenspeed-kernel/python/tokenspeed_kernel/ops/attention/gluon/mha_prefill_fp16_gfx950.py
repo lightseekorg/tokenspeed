@@ -869,7 +869,7 @@ def gluon_mha_prefill_fp16_gfx950(
     num_xcds = 8
     num_blocks = num_sms * 2
     is_sliding = window_left >= 0
-    kernel_window_left = window_left if is_sliding else -1
+    window_left = window_left if is_sliding else -1
     num_q_blocks = triton.cdiv(max_seqlen_q, block_m)
     num_tiles = num_q_blocks * n_heads * batch_size
     grid = schedule_grid(
@@ -913,7 +913,7 @@ def gluon_mha_prefill_fp16_gfx950(
         has_sink,
         has_lse,
         is_sliding,
-        kernel_window_left,
+        window_left,
         num_q_blocks,
         num_tiles,
         num_sms,
