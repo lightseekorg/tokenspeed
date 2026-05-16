@@ -617,6 +617,7 @@ class EventLoop:
 
     def _setup_layerwise_loadback(self, execution_plan) -> None:
         consumer_indices = []
+        draft_consumer_indices = []
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
                 for op_id in cache_op.op_ids:
@@ -626,16 +627,22 @@ class EventLoop:
                         and producer_idx not in consumer_indices
                     ):
                         consumer_indices.append(producer_idx)
+                    draft_idx = self.memory_executor.get_draft_producer_index(op_id)
+                    if (
+                        draft_idx is not None
+                        and draft_idx not in draft_consumer_indices
+                    ):
+                        draft_consumer_indices.append(draft_idx)
         self.memory_executor.set_consumer(consumer_indices if consumer_indices else -1)
+        self.memory_executor.set_draft_consumer(
+            draft_consumer_indices if draft_consumer_indices else -1
+        )
         # Fence WriteBack against this iter's ``set_kv_buffer``: the
         # scheduler can re-allocate a freed-but-not-yet-written-back slot
         # to a new prefill / decode within the same iter. ``set_kv_buffer``
         # runs before any ``wait_until`` in attention, so nothing else
         # orders writeback's reads against the new writes. Cheap when
         # write_stream is idle.
-        # LoadBack does not need fencing here: it only fires on admission
-        # iters (eager prefill), whose per-layer ``wait_until`` drains
-        # ``load_stream`` before the iter ends.
         host_exec = getattr(self.memory_executor, "host_exec", None)
         if host_exec is not None:
             self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
