@@ -209,7 +209,8 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     std::vector<TreeNode*> mamba_loadback_diff;
     TreeNode* mamba_recovery_node = nullptr;
     if (hybrid_prefix_cache_ && mamba_allocator_) {
-        mamba_recovery_node = hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node, ResourceType::Host, false);
+        mamba_recovery_node =
+            hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node, ResourceType::Host, false);
         if (mamba_recovery_node == nullptr) {
             spdlog::warn("[Scheduler] Retracted request {} lost tree-owned Mamba state, aborting request",
                          request->Id());
@@ -293,14 +294,10 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::ScheduleDecodeFromRetractedEvent{
-        config_.decode_input_tokens,
-        &device_allocator_,
-        &req_pool_allocator_,
-        &kv_prefix_cache_,
-        std::move(match_result),
-        loadback_diff,
-        mamba_loadback_diff,
-        mamba_allocator_ ? &*mamba_allocator_ : nullptr,
+        config_.decode_input_tokens, &device_allocator_,
+        &req_pool_allocator_,        &kv_prefix_cache_,
+        std::move(match_result),     loadback_diff,
+        mamba_loadback_diff,         mamba_allocator_ ? &*mamba_allocator_ : nullptr,
     };
 }
 
@@ -339,8 +336,8 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
-LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff,
-                                     const std::vector<TreeNode*>& mamba_diff, cache_op_id op_id) {
+LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff, const std::vector<TreeNode*>& mamba_diff,
+                                     cache_op_id op_id) {
     std::vector<CacheTransferUnit> transfers;
 
     for (TreeNode* node : diff) {
@@ -376,8 +373,7 @@ std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* re
     CacheOpSpec spec;
     spec.request_id = request->Id();
     cache_op_tracker_[op_id] = std::move(spec);
-    return WriteBackOperation{op_id,
-                              std::vector<CacheTransferUnit>(pages_to_transfer.begin(), pages_to_transfer.end()),
+    return WriteBackOperation{op_id, std::vector<CacheTransferUnit>(pages_to_transfer.begin(), pages_to_transfer.end()),
                               true};
 }
 

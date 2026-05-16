@@ -196,7 +196,6 @@ TEST_F(DisablePrefixCacheMambaRetractTest, RetractedRequestRecoversFromTreeOwned
     EXPECT_GE(fwd->mamba_checkpoint_dst_indices[0], 0);
 }
 
-
 class MambaL2TransferTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

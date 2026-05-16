@@ -45,8 +45,8 @@ protected:
         prefix_cache_ = std::make_unique<KVPrefixCache>(device_alloc_.get(), host_alloc_.get());
         mamba_alloc_ = std::make_unique<MambaChunkAllocator>(kMambaSlots);
         host_mamba_alloc_ = std::make_unique<MambaChunkAllocator>(kMambaHostSlots);
-        hybrid_prefix_cache_ = std::make_unique<HybridPrefixCache>(
-            *prefix_cache_, mamba_alloc_.get(), host_mamba_alloc_.get(), kMambaCacheChunkSize);
+        hybrid_prefix_cache_ = std::make_unique<HybridPrefixCache>(*prefix_cache_, mamba_alloc_.get(),
+                                                                   host_mamba_alloc_.get(), kMambaCacheChunkSize);
     }
 
     std::vector<std::int32_t> CollectPrefixPages(TreeNode* matched_node) {

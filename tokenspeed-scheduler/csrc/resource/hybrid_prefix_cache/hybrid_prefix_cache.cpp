@@ -96,13 +96,13 @@ std::int32_t HybridPrefixCache::AlignMambaCacheSeqlen(std::int32_t seqlen) const
     return (seqlen / mamba_cache_chunk_size_) * mamba_cache_chunk_size_;
 }
 
-TreeNode* HybridPrefixCache::FindLastMambaNode(TreeNode* from, ResourceType residency,
-                                                 bool require_exact_depth) const {
+TreeNode* HybridPrefixCache::FindLastMambaNode(TreeNode* from, ResourceType residency, bool require_exact_depth) const {
     for (TreeNode* cur = from; cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
         const bool has_mamba = residency == ResourceType::Device ? cur->HasMambaDevice() : cur->HasMambaHost();
         if (!has_mamba) continue;
         if (!require_exact_depth) return cur;
-        const bool exact = residency == ResourceType::Device ? cur->HasAlignedMambaDevice() : cur->HasAlignedMambaHost();
+        const bool exact =
+            residency == ResourceType::Device ? cur->HasAlignedMambaDevice() : cur->HasAlignedMambaHost();
         if (exact) return cur;
     }
     return nullptr;

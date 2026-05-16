@@ -41,8 +41,7 @@
 
 namespace {
 
-std::vector<tokenspeed::CacheTransferUnit> BuildWriteBackPairs(
-    const std::vector<tokenspeed::TreeNode*>& write_diff) {
+std::vector<tokenspeed::CacheTransferUnit> BuildWriteBackPairs(const std::vector<tokenspeed::TreeNode*>& write_diff) {
     std::vector<tokenspeed::CacheTransferUnit> transfers;
     for (tokenspeed::TreeNode* n : write_diff) {
         const auto& dev_pages = n->Device().Pages();
@@ -316,10 +315,9 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
     }
 
     const bool need_kv_writeback = match.device.DepthInPage() > match.host.DepthInPage();
-    TreeNode* mamba_node =
-        hybrid_prefix_cache_ != nullptr ? hybrid_prefix_cache_->FindLastMambaNode(match.device.last_node,
-                                                                                  ResourceType::Device)
-                                        : nullptr;
+    TreeNode* mamba_node = hybrid_prefix_cache_ != nullptr
+                               ? hybrid_prefix_cache_->FindLastMambaNode(match.device.last_node, ResourceType::Device)
+                               : nullptr;
     const bool need_mamba_writeback = mamba_node != nullptr && !mamba_node->HasMambaHost();
     if (!need_kv_writeback && !need_mamba_writeback) {
         return Finished{};
