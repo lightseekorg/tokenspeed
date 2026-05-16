@@ -67,6 +67,7 @@ class MLAConfig(BaseAttnConfig):
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             speculative_num_steps=server_args.speculative_num_steps,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            is_draft=is_draft,
             kv_lora_rank=model_config.kv_lora_rank,
             qk_nope_head_dim=model_config.qk_nope_head_dim,
             qk_rope_head_dim=model_config.qk_rope_head_dim,

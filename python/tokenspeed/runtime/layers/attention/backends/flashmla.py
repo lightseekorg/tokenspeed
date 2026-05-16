@@ -104,8 +104,8 @@ _global_workspace_buffer = None
 class FlashMLABackend(AttentionBackend):
     """FlashMLA attention backend for TokenSpeed scheduling.
 
-    Uses the FlashMLA kernel for DECODE, TARGET_VERIFY, and DRAFT_EXTEND;
-    uses FlashInfer's MLA prefill wrappers for the EXTEND path.
+    Uses the FlashMLA kernel for decode (any q_len); uses FlashInfer's MLA
+    prefill wrappers for the EXTEND path.
     """
 
     def __init__(self, config: MLAConfig):
@@ -197,7 +197,17 @@ class FlashMLABackend(AttentionBackend):
         else:
             block_table = None
 
-        if forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
@@ -208,7 +218,7 @@ class FlashMLABackend(AttentionBackend):
                 num_splits,
                 block_table,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif is_target_verify or is_draft_extend:
             seq_lens = seq_lens + self.draft_token_num
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
@@ -287,7 +297,7 @@ class FlashMLABackend(AttentionBackend):
             )
 
     # ------------------------------------------------------------------
-    # CUDA graph (DECODE / TARGET_VERIFY / DRAFT_EXTEND only)
+    # CUDA graph (decode only, any q_len)
     # ------------------------------------------------------------------
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
@@ -334,7 +344,17 @@ class FlashMLABackend(AttentionBackend):
         forward_mode: ForwardMode,
     ):
         block_table = self.cuda_graph_kv_indices[:bs]
-        if forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
@@ -348,7 +368,7 @@ class FlashMLABackend(AttentionBackend):
                 self.cuda_graph_num_splits[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :],
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif is_target_verify or is_draft_extend:
             seq_lens = seq_lens + self.draft_token_num
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
@@ -369,12 +389,16 @@ class FlashMLABackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
+        if forward_mode is None or not forward_mode.is_decode_or_idle():
+            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
+
         req_pool_indices = req_pool_indices[:bs]
         if req_to_page is not None:
             block_table = req_to_page[req_pool_indices]
@@ -382,35 +406,32 @@ class FlashMLABackend(AttentionBackend):
             block_table = self.cuda_graph_kv_indices[:bs]
         seq_lens = seq_lens[:bs]
 
-        if forward_mode is not None and forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = not self.is_draft and spec_num_tokens > 1
+        is_draft_extend = self.is_draft and spec_num_tokens > 1
+
+        if spec_num_tokens == 1:
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.cuda_graph_kv_indices[:bs].copy_(block_table)
-            self.forward_metadata.flashmla_metadata = self.cuda_graph_mla_metadata
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
-            self.forward_metadata.block_table = self.cuda_graph_kv_indices[:bs]
-        elif forward_mode is not None and (
-            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
-        ):
+        elif is_target_verify or is_draft_extend:
             seq_lens = seq_lens + self.draft_token_num
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.draft_token_num * self.num_q_heads,
                 1,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.cuda_graph_kv_indices[:bs].copy_(block_table)
-            self.forward_metadata.flashmla_metadata = self.cuda_graph_mla_metadata
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
-            self.forward_metadata.block_table = self.cuda_graph_kv_indices[:bs]
         else:
             raise RuntimeError(f"Not supported forward mode: {forward_mode}")
+
+        self.cuda_graph_mla_metadata.copy_(mla_metadata)
+        self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+        self.cuda_graph_kv_indices[:bs].copy_(block_table)
+        self.forward_metadata.flashmla_metadata = self.cuda_graph_mla_metadata
+        self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+        self.forward_metadata.block_table = self.cuda_graph_kv_indices[:bs]
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -427,12 +448,27 @@ class FlashMLABackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = True,
         seq_lens: torch.Tensor | None = None,
         forward_mode: ForwardMode | None = None,
         **kwargs,
     ):
-        if forward_mode is None or forward_mode == ForwardMode.EXTEND:
+        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode is not None
+            and forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode is not None
+            and forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and spec_num_tokens > 1
+        )
+
+        if forward_mode is None or forward_mode.is_extend():
             # Prefill: dispatch to ragged (MHA-style) or absorbed (MQA) path.
             if self.forward_metadata.use_ragged:
                 return self._forward_normal_extend(q, k, v, layer, save_kv_cache)
@@ -447,7 +483,7 @@ class FlashMLABackend(AttentionBackend):
                     save_kv_cache,
                 )
 
-        assert forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+        assert is_target_verify or is_draft_extend
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -455,7 +491,7 @@ class FlashMLABackend(AttentionBackend):
 
         bs = (
             q.shape[0]
-            if forward_mode.is_draft_extend()
+            if is_draft_extend
             else self.forward_metadata.block_table.shape[0]
         )
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -522,10 +558,29 @@ class FlashMLABackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = True,
         seq_lens: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Multi-token decode (target verify or drafter compound) reuses
+        # the multi-token kernel path in forward_extend.
+        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                seq_lens=seq_lens,
+                forward_mode=ForwardMode.DECODE,
+                **kwargs,
+            )
+
         if k is not None:
             assert v is not None
             if save_kv_cache:

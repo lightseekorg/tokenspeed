@@ -94,12 +94,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(ForwardMode.MIXED.is_mixed())
         self.assertFalse(ForwardMode.EXTEND.is_mixed())
         self.assertFalse(ForwardMode.DECODE.is_mixed())
+        self.assertTrue(ForwardMode.EXTEND.is_extend_or_mixed())
+        self.assertTrue(ForwardMode.MIXED.is_extend_or_mixed())
+        self.assertFalse(ForwardMode.DECODE.is_extend_or_mixed())
+        self.assertTrue(ForwardMode.DECODE.is_decode_or_idle())
+        self.assertTrue(ForwardMode.IDLE.is_decode_or_idle())
+        self.assertFalse(ForwardMode.EXTEND.is_decode_or_idle())
         self.assertEqual(ForwardMode.from_num_extends(0, 0), ForwardMode.IDLE)
         self.assertEqual(ForwardMode.from_num_extends(0, 2), ForwardMode.DECODE)
-        self.assertEqual(
-            ForwardMode.from_num_extends(0, 2, has_drafter=True),
-            ForwardMode.TARGET_VERIFY,
-        )
         self.assertEqual(ForwardMode.from_num_extends(2, 2), ForwardMode.EXTEND)
         self.assertEqual(ForwardMode.from_num_extends(1, 2), ForwardMode.MIXED)
 
@@ -127,6 +129,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper = object.__new__(CudaGraphWrapper)
         wrapper.attn_backend = FakeBackend()
         wrapper.draft_attn_backend = None
+        wrapper.max_tokens_per_req = 1
 
         wrapper._init_replay_metadata(
             padded_bs=4,
@@ -140,6 +143,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             },
         )
 
+        # num_tokens = padded_bs * max_tokens_per_req is passed as 2nd positional.
+        self.assertEqual(captured["args"][1], 4)
         self.assertEqual(captured["kwargs"]["actual_bs"], 0)
         self.assertEqual(
             captured["kwargs"]["paged_cache_block_tables"]["v4.swa"].shape,
@@ -751,6 +756,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=4096,
             )
@@ -784,6 +790,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=4096,
             )
@@ -823,6 +830,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=4096,
             )
@@ -863,6 +871,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=4096,
             )
@@ -928,6 +937,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1127,6 +1137,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=576,
                 context_len=256,
             )
@@ -1212,6 +1223,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=576,
                 context_len=256,
             )
@@ -1256,6 +1268,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=576,
                 context_len=256,
             )
@@ -1349,6 +1362,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
             )
@@ -1434,6 +1448,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
             )
@@ -1494,6 +1509,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=1024,
             )
@@ -1617,6 +1633,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
             )
@@ -1680,6 +1697,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
             )
@@ -1695,6 +1713,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=4,
+            num_tokens=4,
             actual_bs=2,
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),

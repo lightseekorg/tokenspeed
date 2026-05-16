@@ -1312,7 +1312,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.reasoning_parser,
             help=(
-                "Reasoning parser name (e.g. 'minimax', 'gpt-oss'). "
+                "Reasoning parser name (e.g. 'minimax', 'kimi_k25'). "
                 "Used to defer json_schema grammars past the model's "
                 "reasoning channel."
             ),

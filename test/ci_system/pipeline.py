@@ -643,8 +643,15 @@ def parse_eval_score_threshold(threshold: Any) -> tuple[float, float | None]:
     if isinstance(threshold, list) and len(threshold) == 2:
         return float(threshold[0]), float(threshold[1])
     raise ValueError(
-        "eval.score_threshold must be a number or a two-item [min, max] range"
+        "eval.score_threshold must be a number, a two-item [min, max] range, "
+        "or a mapping of runner label to one of those values"
     )
+
+
+def resolve_score_threshold_for_runner(threshold: Any, runner: str) -> Any:
+    if isinstance(threshold, dict):
+        return threshold.get(runner)
+    return threshold
 
 
 def format_eval_score_threshold(min_score: float, max_score: float | None) -> str:
@@ -657,12 +664,20 @@ def check_eval_score_threshold(
     task: Dict[str, Any],
     command_results: List[Dict[str, Any]],
     stages_run: List[str],
+    runner: str,
 ) -> Dict[str, Any] | None:
     threshold = task.get("score_threshold")
     if threshold is None:
         threshold = task.get("eval", {}).get("score_threshold")
     if threshold is None:
         print("[eval-score] no score_threshold configured", flush=True)
+        return None
+    threshold = resolve_score_threshold_for_runner(threshold, runner)
+    if threshold is None:
+        print(
+            "[eval-score] no score_threshold configured for runner " f"{runner!r}",
+            flush=True,
+        )
         return None
     if "eval" not in stages_run:
         print(
@@ -1196,7 +1211,9 @@ def execute_task(
         eval_accept_rate = summarize_eval_accept_rate(
             task, command_results, stages_run, server_log_path
         )
-        eval_score_check = check_eval_score_threshold(task, command_results, stages_run)
+        eval_score_check = check_eval_score_threshold(
+            task, command_results, stages_run, runner
+        )
         if eval_score_check is not None and not eval_score_check["passed"]:
             raise RuntimeError(
                 f"eval score {eval_score_check['score']:g} does not satisfy "

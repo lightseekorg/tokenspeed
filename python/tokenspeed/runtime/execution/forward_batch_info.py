@@ -30,27 +30,18 @@ import triton.language as tl
 
 
 class ForwardMode(IntEnum):
-    # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
+    # Extend a sequence. The KV cache of the beginning part of the sequence
+    # is already computed (e.g., system prompt).
     EXTEND = auto()
-    # Decode one token.
+    # Decode one or more tokens per request.
     DECODE = auto()
-    # Contains both EXTEND and DECODE when doing chunked prefill.
+    # Contains both EXTEND and DECODE tokens in one batch.
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
+    # No sequence to forward; used for data parallel attention idle ranks.
     IDLE = auto()
 
-    # Used in speculative decoding: verify a batch in the target model.
-    TARGET_VERIFY = auto()
-    # Used in speculative decoding: extend a batch in the draft model.
-    DRAFT_EXTEND = auto()
-
     def is_extend(self):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or self == ForwardMode.DRAFT_EXTEND
-            or self == self.TARGET_VERIFY
-        )
+        return self == ForwardMode.EXTEND
 
     def is_decode(self):
         return self == ForwardMode.DECODE
@@ -61,27 +52,20 @@ class ForwardMode(IntEnum):
     def is_idle(self):
         return self == ForwardMode.IDLE
 
-    def is_target_verify(self):
-        return self == ForwardMode.TARGET_VERIFY
-
-    def is_draft_extend(self):
-        return self == ForwardMode.DRAFT_EXTEND
+    def is_extend_or_mixed(self):
+        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
 
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     @staticmethod
-    def from_num_extends(
-        num_extends: int,
-        batch_size: int,
-        *,
-        has_drafter: bool = False,
-    ) -> "ForwardMode":
+    def from_num_extends(num_extends: int, batch_size: int) -> "ForwardMode":
         if batch_size <= 0:
             return ForwardMode.IDLE
-        if num_extends > 0:
+        elif num_extends > 0:
             return ForwardMode.MIXED if num_extends < batch_size else ForwardMode.EXTEND
-        return ForwardMode.TARGET_VERIFY if has_drafter else ForwardMode.DECODE
+        else:
+            return ForwardMode.DECODE
 
 
 class CaptureHiddenMode(IntEnum):

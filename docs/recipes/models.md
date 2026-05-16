@@ -24,8 +24,8 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
   --max-num-seqs 256 \
   --attention-backend trtllm_mla \
   --moe-backend flashinfer_trtllm \
-  --reasoning-parser kimi_k2 \
-  --tool-call-parser kimi_k2 \
+  --reasoning-parser kimi_k25 \
+  --tool-call-parser kimik2 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -44,8 +44,7 @@ tokenspeed serve openai/gpt-oss-20b \
   --tensor-parallel-size 1 \
   --max-model-len 131072 \
   --chunked-prefill-size 8192 \
-  --reasoning-parser gpt-oss \
-  --tool-call-parser gpt-oss \
+  --reasoning-parser base \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -58,8 +57,7 @@ tokenspeed serve openai/gpt-oss-120b \
   --kv-cache-dtype fp8 \
   --chunked-prefill-size 8192 \
   --max-num-seqs 256 \
-  --reasoning-parser gpt-oss \
-  --tool-call-parser gpt-oss \
+  --reasoning-parser base \
   --host 0.0.0.0 \
   --port 8000
 ```

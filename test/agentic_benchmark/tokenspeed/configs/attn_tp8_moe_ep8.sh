@@ -25,5 +25,5 @@ exec ts serve \
     --speculative-draft-model-quantization unquant \
     --drafter-attention-backend tokenspeed_mla \
     --enable-cache-report \
-    --host localhost \
+    --host 127.0.0.1 \
     --port 8000
