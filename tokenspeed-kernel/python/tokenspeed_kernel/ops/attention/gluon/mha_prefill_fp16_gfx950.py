@@ -814,7 +814,8 @@ def schedule_grid(
     num_q_blocks = triton.cdiv(max_seqlen, block_m)
     if is_sliding:
         num_tiles = num_q_blocks * n_heads * batch_size
-        return (max(1, triton.cdiv(num_tiles, num_xcds) * num_xcds),)
+        grid_tiles = triton.cdiv(num_tiles, num_xcds) * num_xcds
+        return (grid_tiles if grid_tiles > 1 else 1,)
     return (num_blocks,)
 
 
