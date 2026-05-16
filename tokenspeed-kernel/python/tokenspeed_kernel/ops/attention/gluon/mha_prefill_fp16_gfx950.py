@@ -62,6 +62,11 @@ def max(input, axis=None, keep_dims=False):
     return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
 
 
+# ===-----------------------------------------------------------------------===#
+# Kernel Config
+# ===-----------------------------------------------------------------------===#
+
+
 @gluon.aggregate
 class InputLayout:
     stride_t: gl.constexpr
@@ -79,11 +84,6 @@ class InputLayout:
         return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
             gl.int32
         )
-
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Config
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.aggregate
