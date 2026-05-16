@@ -123,8 +123,13 @@ std::optional<cache_op_id> TreeNode::CacheOpId() const {
 }
 
 std::int32_t TreeNode::MambaSlotIndex() const {
-    _assert(mamba_slot_ != nullptr, "MambaSlotIndex called on node without mamba");
-    return mamba_slot_->Index();
+    _assert(device_mamba_slot_ != nullptr, "MambaSlotIndex called on node without device mamba");
+    return device_mamba_slot_->Index();
+}
+
+std::int32_t TreeNode::MambaHostSlotIndex() const {
+    _assert(host_mamba_slot_ != nullptr, "MambaHostSlotIndex called on node without host mamba");
+    return host_mamba_slot_->Index();
 }
 
 }  // namespace tokenspeed

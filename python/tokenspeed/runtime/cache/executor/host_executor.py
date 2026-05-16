@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Iterable, NamedTuple
 
 import torch
@@ -33,6 +34,54 @@ from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 CONCURRENT_WRITEBACK_BLOCK_QUOTA = 2
+
+
+KV_TRANSFER_KIND = int(Cache.TRANSFER_KIND_KV)
+MAMBA_TRANSFER_KIND = int(Cache.TRANSFER_KIND_MAMBA)
+TransferPairs = tuple[tuple[int, int], ...]
+TransferGroups = tuple[tuple[int, TransferPairs], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CacheTransferBatch:
+    op_id: int
+    units_by_kind: TransferGroups
+    is_retract: bool = False
+
+    @classmethod
+    def from_pages(
+        cls,
+        op_id: int,
+        src_pages: Iterable[int],
+        dst_pages: Iterable[int],
+        *,
+        is_retract: bool = False,
+    ) -> "CacheTransferBatch":
+        pairs = tuple((int(src), int(dst)) for src, dst in zip(src_pages, dst_pages))
+        groups = ((KV_TRANSFER_KIND, pairs),) if pairs else ()
+        return cls(int(op_id), groups, is_retract)
+
+    @classmethod
+    def from_scheduler(
+        cls, op_id: int, kinds, src_indices, dst_indices, *, is_retract: bool = False
+    ) -> "CacheTransferBatch":
+        grouped: dict[int, list[tuple[int, int]]] = {}
+        for kind, src, dst in zip(kinds, src_indices, dst_indices):
+            grouped.setdefault(int(kind), []).append((int(src), int(dst)))
+        return cls(int(op_id), cls._freeze(grouped), is_retract)
+
+    @staticmethod
+    def _freeze(groups: dict[int, list[tuple[int, int]]]) -> TransferGroups:
+        return tuple((kind, tuple(pairs)) for kind, pairs in groups.items() if pairs)
+
+    def pairs(self, kind: int) -> TransferPairs:
+        for group_kind, pairs in self.units_by_kind:
+            if group_kind == int(kind):
+                return pairs
+        return ()
+
+    def mamba_pairs(self) -> TransferPairs:
+        return self.pairs(MAMBA_TRANSFER_KIND)
 
 
 def _cache_stream_priorities() -> tuple[int | None, int | None]:
@@ -173,6 +222,188 @@ class _Ack(NamedTuple):
     node_ids: list[int]
 
 
+class _CacheTransferBackend:
+    kind: int
+    write_order = 0
+    load_order = 0
+
+    def make_op(
+        self,
+        executor,
+        op_id: int,
+        pairs: TransferPairs,
+        is_retract: bool,
+        *,
+        is_writeback: bool,
+    ) -> _TransferOp | None:
+        raise NotImplementedError
+
+    def prepare_write(self, executor, op: _TransferOp):
+        return None
+
+    def write(self, executor, op: _TransferOp, prepared) -> None:
+        raise NotImplementedError
+
+    def prepare_load(self, executor, op: _TransferOp):
+        return None
+
+    def load(
+        self, executor, op: _TransferOp, prepared, producer_event: LayerLoadingEvent
+    ) -> bool:
+        raise NotImplementedError
+
+
+class _KVTransferBackend(_CacheTransferBackend):
+    kind = KV_TRANSFER_KIND
+    write_order = 0
+    load_order = 10
+
+    def make_op(
+        self,
+        executor,
+        op_id: int,
+        pairs: TransferPairs,
+        is_retract: bool,
+        *,
+        is_writeback: bool,
+    ) -> _TransferOp | None:
+        src = [src for src, _ in pairs]
+        dst = [dst for _, dst in pairs]
+        if is_writeback:
+            device_pages, host_pages = _dedupe_page_pairs(src, dst)
+        else:
+            host_pages, device_pages = _dedupe_page_pairs(src, dst)
+        if not host_pages:
+            return None
+        host_indices = page_ids_to_token_indices(host_pages, executor.page_size, "cpu")
+        device_indices = page_ids_to_token_indices(
+            device_pages, executor.page_size, str(executor.device)
+        )
+        return _TransferOp(host_indices, device_indices, op_id, is_retract)
+
+    def prepare_write(self, executor, op: _TransferOp):
+        return self._prepare_indices(executor, op)
+
+    def write(self, executor, op: _TransferOp, prepared) -> None:
+        host_indices, device_indices, draft_host_indices, draft_device_indices = (
+            prepared
+        )
+        executor.host_pool.backup_from_device_all_layer(
+            executor.device_pool,
+            host_indices.to(torch.int64),
+            device_indices.to(torch.int64),
+            executor.io_backend,
+            block_quota=executor._writeback_block_quota,
+        )
+        if executor.draft_host_pool is not None:
+            executor.draft_host_pool.backup_from_device_all_layer(
+                executor.draft_device_pool,
+                draft_host_indices.to(torch.int64),
+                draft_device_indices.to(torch.int64),
+                executor.io_backend,
+                block_quota=executor._writeback_block_quota,
+            )
+            self._record_stream(draft_host_indices, executor.write_stream)
+            self._record_stream(draft_device_indices, executor.write_stream)
+        self._record_stream(host_indices, executor.write_stream)
+        self._record_stream(device_indices, executor.write_stream)
+
+    def prepare_load(self, executor, op: _TransferOp):
+        return self._prepare_indices(executor, op)
+
+    def load(
+        self, executor, op: _TransferOp, prepared, producer_event: LayerLoadingEvent
+    ) -> bool:
+        host_indices, device_indices, draft_host_indices, draft_device_indices = (
+            prepared
+        )
+        for layer_index in range(executor.layer_num):
+            executor.host_pool.load_to_device_per_layer(
+                executor.device_pool,
+                host_indices.to(torch.int64),
+                device_indices.to(torch.int64),
+                layer_index,
+                executor.io_backend,
+            )
+            producer_event.complete(layer_index)
+        if executor.draft_host_pool is not None:
+            for layer_index in range(executor.draft_layer_num):
+                executor.draft_host_pool.load_to_device_per_layer(
+                    executor.draft_device_pool,
+                    draft_host_indices.to(torch.int64),
+                    draft_device_indices.to(torch.int64),
+                    layer_index,
+                    executor.io_backend,
+                )
+            self._record_stream(draft_host_indices, executor.load_stream)
+            self._record_stream(draft_device_indices, executor.load_stream)
+        self._record_stream(host_indices, executor.load_stream)
+        self._record_stream(device_indices, executor.load_stream)
+        return True
+
+    @staticmethod
+    def _prepare_indices(executor, op: _TransferOp):
+        host_indices, device_indices = executor._move_indices(op, executor.host_pool)
+        if executor.draft_host_pool is None:
+            return host_indices, device_indices, None, None
+        draft_host_indices, draft_device_indices = executor._move_indices(
+            op, executor.draft_host_pool
+        )
+        return host_indices, device_indices, draft_host_indices, draft_device_indices
+
+    @staticmethod
+    def _record_stream(tensor, stream) -> None:
+        if tensor is not None and tensor.is_cuda:
+            tensor.record_stream(stream)
+
+
+class _MambaTransferBackend(_CacheTransferBackend):
+    kind = MAMBA_TRANSFER_KIND
+    write_order = 10
+    load_order = 0
+
+    def make_op(
+        self,
+        executor,
+        op_id: int,
+        pairs: TransferPairs,
+        is_retract: bool,
+        *,
+        is_writeback: bool,
+    ) -> _TransferOp | None:
+        executor._require_mamba_pools()
+        src = [src for src, _ in pairs]
+        dst = [dst for _, dst in pairs]
+        if is_writeback:
+            device_slots, host_slots = src, dst
+        else:
+            host_slots, device_slots = src, dst
+        if not host_slots:
+            return None
+        host_indices = torch.tensor(host_slots, dtype=torch.int64)
+        device_indices = torch.tensor(device_slots, dtype=torch.int64)
+        return _TransferOp(host_indices, device_indices, op_id, is_retract)
+
+    def write(self, executor, op: _TransferOp, prepared) -> None:
+        executor._copy_mamba_slots(
+            executor.mamba_pool,
+            executor.mamba_host_pool,
+            op.device_indices,
+            op.host_indices,
+        )
+
+    def load(
+        self, executor, op: _TransferOp, prepared, producer_event: LayerLoadingEvent
+    ) -> bool:
+        executor._copy_mamba_slots(
+            executor.mamba_host_pool,
+            executor.mamba_pool,
+            op.host_indices,
+            op.device_indices,
+        )
+        return False
+
+
 class HostExecutor:
 
     def __init__(
@@ -185,6 +416,8 @@ class HostExecutor:
         draft_device_pool=None,
         draft_host_pool=None,
         draft_layer_num: int = 0,
+        mamba_pool=None,
+        mamba_host_pool=None,
     ):
         self.page_size = page_size
         self.device_pool = device_pool
@@ -197,14 +430,21 @@ class HostExecutor:
         self.draft_device_pool = draft_device_pool
         self.draft_host_pool = draft_host_pool
         self.draft_layer_num = draft_layer_num
+        self.mamba_pool = mamba_pool
+        self.mamba_host_pool = mamba_host_pool
 
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
         self.load_stream = _new_cache_stream(load_priority)
         self._writeback_block_quota: int | None = None
 
-        self.write_queue: list[_TransferOp] = []
-        self.load_queue: list[_TransferOp] = []
+        self.transfer_backends = self._build_transfer_backends()
+        self.write_queues: dict[int, list[_TransferOp]] = {
+            kind: [] for kind in self.transfer_backends
+        }
+        self.load_queues: dict[int, list[_TransferOp]] = {
+            kind: [] for kind in self.transfer_backends
+        }
 
         self.ack_write_queue: list[_Ack] = []
         self.ack_load_queue: list[_Ack] = []
@@ -216,38 +456,65 @@ class HostExecutor:
         self._producer_map: OrderedDict[int, int] = OrderedDict()
         self._producer_map_limit = 1024
 
-    def enqueue_writeback(
-        self, op_id, src_pages, dst_pages, is_retract: bool = False
-    ) -> None:
-        src_pages, dst_pages = _dedupe_page_pairs(src_pages, dst_pages)
-        if not src_pages:
-            completed_writebacks = getattr(self, "completed_writebacks", None)
-            if completed_writebacks is None:
-                completed_writebacks = []
-                self.completed_writebacks = completed_writebacks
-            completed_writebacks.append(op_id)
-            return
-        device_indices = page_ids_to_token_indices(
-            src_pages, self.page_size, str(self.device)
-        )
-        host_indices = page_ids_to_token_indices(dst_pages, self.page_size, "cpu")
-        self.write_queue.append(
-            _TransferOp(host_indices, device_indices, op_id, is_retract)
-        )
+    @staticmethod
+    def _build_transfer_backends() -> dict[int, _CacheTransferBackend]:
+        backends = (_KVTransferBackend(), _MambaTransferBackend())
+        return {backend.kind: backend for backend in backends}
 
-    def enqueue_loadback(self, op_id, src_pages, dst_pages) -> None:
-        src_pages, dst_pages = _dedupe_page_pairs(src_pages, dst_pages)
-        if not src_pages:
-            return
-        host_indices = page_ids_to_token_indices(src_pages, self.page_size, "cpu")
-        device_indices = page_ids_to_token_indices(
-            dst_pages, self.page_size, str(self.device)
-        )
-        self.load_queue.append(_TransferOp(host_indices, device_indices, op_id))
+    def enqueue_writeback(self, batch: CacheTransferBatch) -> None:
+        self._enqueue_batch(batch, is_writeback=True)
+
+    def enqueue_loadback(self, batch: CacheTransferBatch) -> None:
+        self._enqueue_batch(batch, is_writeback=False)
+
+    def _enqueue_batch(
+        self,
+        batch: CacheTransferBatch,
+        *,
+        is_writeback: bool,
+    ) -> None:
+        queues = self.write_queues if is_writeback else self.load_queues
+        queued = False
+        for kind, pairs in batch.units_by_kind:
+            backend = self.transfer_backends.get(kind)
+            if backend is None:
+                raise ValueError(f"unsupported cache transfer kind={kind}")
+            op = backend.make_op(
+                self,
+                batch.op_id,
+                pairs,
+                batch.is_retract,
+                is_writeback=is_writeback,
+            )
+            if op is None:
+                continue
+            queues[kind].append(op)
+            queued = True
+        if is_writeback and not queued:
+            self.completed_writebacks.append(batch.op_id)
+
+    def _require_mamba_pools(self) -> None:
+        if self.mamba_pool is None or self.mamba_host_pool is None:
+            raise RuntimeError("mamba cache transfer requested without mamba pools")
+
+    @staticmethod
+    def _has_queued(queues: dict[int, list[_TransferOp]]) -> bool:
+        return any(queues.values())
+
+    @staticmethod
+    def _merge_queue(queue: list[_TransferOp]) -> _TransferOp | None:
+        return _TransferOp.merge(queue) if queue else None
+
+    @staticmethod
+    def _clear_queues(queues: dict[int, list[_TransferOp]]) -> None:
+        for queue in queues.values():
+            queue.clear()
 
     def flush(self) -> None:
-        throttle_writeback = self.load_queue and not any(
-            getattr(op, "is_retract", False) for op in self.write_queue
+        has_loadback = self._has_queued(self.load_queues)
+        write_queues = [op for queue in self.write_queues.values() for op in queue]
+        throttle_writeback = has_loadback and not any(
+            getattr(op, "is_retract", False) for op in write_queues
         )
         writeback_block_quota = (
             CONCURRENT_WRITEBACK_BLOCK_QUOTA if throttle_writeback else None
@@ -260,21 +527,41 @@ class HostExecutor:
         finally:
             self._writeback_block_quota = previous_writeback_block_quota
 
+    def _queued_transfers(
+        self,
+        queues: dict[int, list[_TransferOp]],
+        *,
+        order_attr: str,
+    ) -> list[tuple[int, _CacheTransferBackend, _TransferOp]]:
+        transfers = []
+        for kind, queue in queues.items():
+            op = self._merge_queue(queue)
+            if op is None:
+                continue
+            backend = self.transfer_backends[kind]
+            transfers.append((getattr(backend, order_attr), kind, backend, op))
+        transfers.sort(key=lambda item: item[0])
+        return [(kind, backend, op) for _, kind, backend, op in transfers]
+
+    @staticmethod
+    def _node_ids(
+        transfers: list[tuple[int, _CacheTransferBackend, _TransferOp]],
+    ) -> list[int]:
+        node_ids = []
+        for _, _, op in transfers:
+            node_ids.extend(op.node_ids)
+        return node_ids
+
     def _start_writing(self) -> None:
-        if not self.write_queue:
+        transfers = self._queued_transfers(self.write_queues, order_attr="write_order")
+        if not transfers:
             return
 
-        op = _TransferOp.merge(self.write_queue)
-        host_indices, device_indices = self._move_indices(op, self.host_pool)
-        # Prepare draft indices outside the stream context so non_blocking H2D
-        # copies are issued on the default stream and then consumed by write_stream.
-        if self.draft_host_pool is not None:
-            draft_host_indices, draft_device_indices = self._move_indices(
-                op, self.draft_host_pool
-            )
-        else:
-            draft_host_indices = draft_device_indices = None
-        self.write_queue.clear()
+        prepared = {
+            kind: backend.prepare_write(self, op) for kind, backend, op in transfers
+        }
+        self._clear_queues(self.write_queues)
+        node_ids = self._node_ids(transfers)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -282,89 +569,51 @@ class HostExecutor:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.host_pool.backup_from_device_all_layer(
-                self.device_pool,
-                host_indices.to(torch.int64),
-                device_indices.to(torch.int64),
-                self.io_backend,
-                block_quota=self._writeback_block_quota,
-            )
-            # Draft model shares the same page mapping; backup its KV cache too.
-            if self.draft_host_pool is not None:
-                self.draft_host_pool.backup_from_device_all_layer(
-                    self.draft_device_pool,
-                    draft_host_indices.to(torch.int64),
-                    draft_device_indices.to(torch.int64),
-                    self.io_backend,
-                    block_quota=self._writeback_block_quota,
-                )
-                if draft_host_indices.is_cuda:
-                    draft_host_indices.record_stream(self.write_stream)
-                if draft_device_indices.is_cuda:
-                    draft_device_indices.record_stream(self.write_stream)
+            for kind, backend, op in transfers:
+                backend.write(self, op, prepared[kind])
             finish_event.record()
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(_Ack(finish_event, op.node_ids))
+        self.ack_write_queue.append(_Ack(finish_event, node_ids))
 
     def _start_loading(self) -> None:
-        if not self.load_queue:
+        transfers = self._queued_transfers(self.load_queues, order_attr="load_order")
+        if not transfers:
             return
 
         producer_id = self.layer_done_counter.update_producer()
-        op = _TransferOp.merge(self.load_queue)
-        host_indices, device_indices = self._move_indices(op, self.host_pool)
-        self.load_queue.clear()
+        prepared = {
+            kind: backend.prepare_load(self, op) for kind, backend, op in transfers
+        }
+        self._clear_queues(self.load_queues)
+        node_ids = self._node_ids(transfers)
 
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        # Prepare draft indices once if draft pool is present.
-        if self.draft_host_pool is not None:
-            draft_host_indices, draft_device_indices = self._move_indices(
-                op, self.draft_host_pool
-            )
-        else:
-            draft_host_indices = draft_device_indices = None
-
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for layer_index in range(self.layer_num):
-                self.host_pool.load_to_device_per_layer(
-                    self.device_pool,
-                    host_indices.to(torch.int64),
-                    device_indices.to(torch.int64),
-                    layer_index,
-                    self.io_backend,
+            completed_layers = False
+            for kind, backend, op in transfers:
+                completed_layers = (
+                    backend.load(self, op, prepared[kind], producer_event)
+                    or completed_layers
                 )
-                producer_event.complete(layer_index)
-            # Draft layers follow base layers in the same load stream.
-            if self.draft_host_pool is not None:
-                for layer_index in range(self.draft_layer_num):
-                    self.draft_host_pool.load_to_device_per_layer(
-                        self.draft_device_pool,
-                        draft_host_indices.to(torch.int64),
-                        draft_device_indices.to(torch.int64),
-                        layer_index,
-                        self.io_backend,
-                    )
-                if draft_host_indices.is_cuda:
-                    draft_host_indices.record_stream(self.load_stream)
-                if draft_device_indices.is_cuda:
-                    draft_device_indices.record_stream(self.load_stream)
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            if not completed_layers:
+                for layer_index in range(self.layer_num):
+                    producer_event.complete(layer_index)
 
-        self.ack_load_queue.append(_Ack(producer_event.finish_event, op.node_ids))
-        for op_id in op.node_ids:
+        self.ack_load_queue.append(_Ack(producer_event.finish_event, node_ids))
+        for op_id in node_ids:
             self._producer_map[op_id] = producer_id
         while len(self._producer_map) > self._producer_map_limit:
             self._producer_map.popitem(last=False)
+
+    def _copy_mamba_slots(self, src_pool, dst_pool, src_indices, dst_indices) -> None:
+        for src_idx, dst_idx in zip(src_indices.tolist(), dst_indices.tolist()):
+            for src_cache, dst_cache in zip(src_pool.mamba_cache, dst_pool.mamba_cache):
+                dst_cache[:, int(dst_idx)].copy_(
+                    src_cache[:, int(src_idx)], non_blocking=True
+                )
 
     def _move_indices(self, op: _TransferOp, host_pool):
         host_indices = op.host_indices
@@ -430,8 +679,8 @@ class HostExecutor:
     def reset(self) -> None:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
-        self.write_queue.clear()
-        self.load_queue.clear()
+        self._clear_queues(self.write_queues)
+        self._clear_queues(self.load_queues)
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         self._producer_map.clear()

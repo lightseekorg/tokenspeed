@@ -25,17 +25,39 @@
 
 namespace tokenspeed {
 
-MambaEvictionManager::MambaEvictionManager(MambaChunkAllocator* allocator) : allocator_{allocator} {}
+MambaEvictionManager::MambaEvictionManager(MambaChunkAllocator* allocator, ResourceType residency, DetachFn detach_fn)
+    : allocator_{allocator}, residency_{residency}, detach_fn_{std::move(detach_fn)} {}
+
+bool MambaEvictionManager::hasMamba(const TreeNode* node) const {
+    return residency_ == ResourceType::Device ? node->HasMambaDevice() : node->HasMambaHost();
+}
+
+bool MambaEvictionManager::isLocked(const TreeNode* node) const {
+    if (residency_ != ResourceType::Device) return false;
+    return node->OnDevice() && GetResource<ResourceType::Device>(node).RefCount() > 0;
+}
+
+void MambaEvictionManager::detach(TreeNode* node) const {
+    if (detach_fn_) {
+        detach_fn_(node);
+        return;
+    }
+    if (residency_ == ResourceType::Device) {
+        node->DetachMambaDevice();
+    } else {
+        node->DetachMambaHost();
+    }
+}
 
 bool MambaEvictionManager::hasChildWithMamba(const TreeNode* node) const {
     for (const auto& [_, child] : node->Children()) {
-        if (child != nullptr && child->HasMamba()) return true;
+        if (child != nullptr && hasMamba(child.get())) return true;
     }
     return false;
 }
 
 bool MambaEvictionManager::isMambaLeaf(const TreeNode* node) const {
-    return !node->IsRoot() && node->HasMamba() && !hasChildWithMamba(node);
+    return !node->IsRoot() && hasMamba(node) && !hasChildWithMamba(node);
 }
 
 void MambaEvictionManager::TrackNode(TreeNode* node) {
@@ -43,10 +65,8 @@ void MambaEvictionManager::TrackNode(TreeNode* node) {
     if (isMambaLeaf(node)) {
         mamba_leaves_.insert(node);
     }
-    if (node->Parent() != nullptr && !node->Parent()->IsRoot()) {
-        if (!isMambaLeaf(node->Parent())) {
-            mamba_leaves_.erase(node->Parent());
-        }
+    if (node->Parent() != nullptr && !node->Parent()->IsRoot() && !isMambaLeaf(node->Parent())) {
+        mamba_leaves_.erase(node->Parent());
     }
 }
 
@@ -68,12 +88,7 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* prote
     std::priority_queue<TreeNode*, std::vector<TreeNode*>, decltype(older)> candidates(older);
 
     for (TreeNode* n : mamba_leaves_) {
-        if (n == protected_node) {
-            continue;
-        }
-        if (n->OnDevice() && GetResource<ResourceType::Device>(n).RefCount() > 0) {
-            continue;
-        }
+        if (n == protected_node || isLocked(n)) continue;
         candidates.push(n);
     }
 
@@ -82,15 +97,14 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* prote
         TreeNode* leaf = candidates.top();
         candidates.pop();
 
-        leaf->DetachMamba();
+        detach(leaf);
         evicted++;
         mamba_leaves_.erase(leaf);
 
         TreeNode* parent = leaf->Parent();
         if (parent != nullptr && !parent->IsRoot() && isMambaLeaf(parent)) {
             mamba_leaves_.insert(parent);
-            bool parent_locked = parent->OnDevice() && GetResource<ResourceType::Device>(parent).RefCount() > 0;
-            if (!parent_locked && parent != protected_node) {
+            if (!isLocked(parent) && parent != protected_node) {
                 candidates.push(parent);
             }
         }
@@ -108,9 +122,7 @@ bool MambaEvictionManager::EnsureCapacity(std::int32_t required_slots, TreeNode*
 std::int32_t MambaEvictionManager::EvictableSlots() const {
     std::int32_t total = 0;
     for (const TreeNode* n : mamba_leaves_) {
-        if (n->OnDevice() && GetResource<ResourceType::Device>(n).RefCount() > 0) {
-            continue;
-        }
+        if (isLocked(n)) continue;
         total++;
     }
     return total;

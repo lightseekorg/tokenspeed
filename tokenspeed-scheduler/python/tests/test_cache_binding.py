@@ -23,6 +23,11 @@
 from tokenspeed_scheduler import Cache, ExecutionEvent
 
 
+def test_cache_transfer_kinds_are_bound():
+    assert Cache.TRANSFER_KIND_KV == 0
+    assert Cache.TRANSFER_KIND_MAMBA == 1
+
+
 def test_cache_event_fields_are_bound():
     write_back = Cache.WriteBackDoneEvent()
     write_back.success = True

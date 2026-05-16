@@ -36,6 +36,7 @@ protected:
     static constexpr std::int32_t kDevicePages = 32;
     static constexpr std::int32_t kHostPages = 0;
     static constexpr std::int32_t kMambaSlots = 8;
+    static constexpr std::int32_t kMambaHostSlots = 8;
     static constexpr std::int32_t kMambaCacheChunkSize = 4;
 
     void SetUp() override {
@@ -43,8 +44,9 @@ protected:
         host_alloc_ = std::make_unique<PageAllocator>(kPageSize, kHostPages);
         prefix_cache_ = std::make_unique<KVPrefixCache>(device_alloc_.get(), host_alloc_.get());
         mamba_alloc_ = std::make_unique<MambaChunkAllocator>(kMambaSlots);
-        hybrid_prefix_cache_ =
-            std::make_unique<HybridPrefixCache>(*prefix_cache_, mamba_alloc_.get(), kMambaCacheChunkSize);
+        host_mamba_alloc_ = std::make_unique<MambaChunkAllocator>(kMambaHostSlots);
+        hybrid_prefix_cache_ = std::make_unique<HybridPrefixCache>(*prefix_cache_, mamba_alloc_.get(),
+                                                                   host_mamba_alloc_.get(), kMambaCacheChunkSize);
     }
 
     std::vector<std::int32_t> CollectPrefixPages(TreeNode* matched_node) {
@@ -82,6 +84,7 @@ protected:
     std::unique_ptr<PageAllocator> device_alloc_;
     std::unique_ptr<PageAllocator> host_alloc_;
     std::unique_ptr<MambaChunkAllocator> mamba_alloc_;
+    std::unique_ptr<MambaChunkAllocator> host_mamba_alloc_;
     std::unique_ptr<KVPrefixCache> prefix_cache_;
     std::unique_ptr<HybridPrefixCache> hybrid_prefix_cache_;
 };
@@ -169,11 +172,52 @@ TEST_F(MambaCacheTest, FindLastMambaNodeWalksUp) {
 
     auto match = prefix_cache_->Match(tokens4);
     TreeNode* terminal = match.device.last_node;
-    TreeNode* mamba_node = hybrid_prefix_cache_->FindLastMambaNode(terminal);
+    TreeNode* mamba_node = hybrid_prefix_cache_->FindLastMambaNode(terminal, ResourceType::Device);
 
     ASSERT_NE(mamba_node, nullptr);
     EXPECT_TRUE(mamba_node->HasMamba());
     EXPECT_EQ(mamba_node->DepthInPage(kPageSize), 2);
+}
+
+TEST_F(MambaCacheTest, PrefixMatchIgnoresNonExactMambaState) {
+    auto tokens = MakeAlignedTokens(2, kPageSize);
+    InsertKVOnly(tokens);
+
+    auto match = prefix_cache_->Match(tokens);
+    TreeNode* terminal = match.device.last_node;
+    auto slot = mamba_alloc_->Allocate();
+    ASSERT_TRUE(slot.has_value());
+    hybrid_prefix_cache_->InsertMamba(terminal, std::make_unique<MambaSlot>(std::move(*slot)), tokens.size() + 1);
+
+    EXPECT_EQ(hybrid_prefix_cache_->FindLastMambaNode(terminal, ResourceType::Device), nullptr);
+    EXPECT_EQ(hybrid_prefix_cache_->FindLastMambaNode(terminal, ResourceType::Device, false), terminal);
+
+    auto prefix_match = hybrid_prefix_cache_->Match(tokens);
+    EXPECT_EQ(prefix_match.device.DepthInPage(), 0);
+    EXPECT_EQ(prefix_match.mamba_cow_src_index, -1);
+    EXPECT_EQ(prefix_match.mamba_branching_seqlen, static_cast<std::int32_t>(tokens.size()));
+}
+
+TEST_F(MambaCacheTest, LoadBackPreservesNonExactMambaStateDepth) {
+    auto tokens = MakeAlignedTokens(2, kPageSize);
+    InsertKVOnly(tokens);
+
+    auto match = prefix_cache_->Match(tokens);
+    TreeNode* terminal = match.device.last_node;
+    auto host_slot = host_mamba_alloc_->Allocate();
+    ASSERT_TRUE(host_slot.has_value());
+    hybrid_prefix_cache_->AttachHostMamba(terminal, std::make_unique<MambaSlot>(std::move(*host_slot)),
+                                          tokens.size() + 1);
+
+    auto device_slot = mamba_alloc_->Allocate();
+    ASSERT_TRUE(device_slot.has_value());
+    hybrid_prefix_cache_->LoadBackMamba(terminal, std::make_unique<MambaSlot>(std::move(*device_slot)));
+
+    EXPECT_EQ(terminal->MambaDeviceDepthTokens(), terminal->MambaHostDepthTokens());
+    EXPECT_FALSE(terminal->HasAlignedMambaHost());
+    EXPECT_FALSE(terminal->HasAlignedMambaDevice());
+    EXPECT_EQ(hybrid_prefix_cache_->FindLastMambaNode(terminal, ResourceType::Device), nullptr);
+    EXPECT_EQ(hybrid_prefix_cache_->FindLastMambaNode(terminal, ResourceType::Device, false), terminal);
 }
 
 TEST_F(MambaCacheTest, KVEvictionTriggersMambaEviction) {

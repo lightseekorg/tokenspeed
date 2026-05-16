@@ -63,6 +63,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    PageAllocator* device_allocator, ReqPoolAllocator* req_pool_allocator,
                                    MatchResult match_result, Role role, KVPrefixCache* kv_prefix_cache,
                                    bool disable_l2_cache, std::vector<TreeNode*> loadback_diff,
+                                   std::vector<TreeNode*> mamba_loadback_diff = {},
                                    HybridPrefixCache* hybrid_prefix_cache = nullptr,
                                    MambaChunkAllocator* mamba_allocator = nullptr)
         : tokens_this_round_(tokens_this_round),
@@ -73,6 +74,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           role_{role},
           disable_l2_cache_{disable_l2_cache},
           loadback_diff_(std::move(loadback_diff)),
+          mamba_loadback_diff_(std::move(mamba_loadback_diff)),
           kv_prefix_cache_(kv_prefix_cache),
           hybrid_prefix_cache_(hybrid_prefix_cache),
           mamba_allocator_(mamba_allocator) {}
@@ -83,6 +85,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
     const MatchResult GetMatchResult() const { return match_result_; }
 
     const std::vector<TreeNode*>& GetLoadbackDiff() const { return loadback_diff_; }
+    const std::vector<TreeNode*>& GetMambaLoadbackDiff() const { return mamba_loadback_diff_; }
 
 private:
     std::int32_t tokens_this_round_{};
@@ -93,6 +96,7 @@ private:
     const Role role_;
     bool disable_l2_cache_{};
     std::vector<TreeNode*> loadback_diff_;
+    std::vector<TreeNode*> mamba_loadback_diff_;
     KVPrefixCache* kv_prefix_cache_;
     HybridPrefixCache* hybrid_prefix_cache_{};
     MambaChunkAllocator* mamba_allocator_{};
@@ -136,6 +140,7 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
     ScheduleDecodeFromRetractedEvent(std::int32_t decode_input_tokens, PageAllocator* device_allocator,
                                      ReqPoolAllocator* req_pool_allocator, KVPrefixCache* kv_prefix_cache,
                                      MatchResult match_result, std::vector<TreeNode*> loadback_diff,
+                                     std::vector<TreeNode*> mamba_loadback_diff = {},
                                      MambaChunkAllocator* mamba_allocator = nullptr)
         : decode_input_tokens_(decode_input_tokens),
           device_allocator_(device_allocator),
@@ -143,6 +148,7 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
           kv_prefix_cache_(kv_prefix_cache),
           match_result_(std::move(match_result)),
           loadback_diff_(std::move(loadback_diff)),
+          mamba_loadback_diff_(std::move(mamba_loadback_diff)),
           mamba_allocator_(mamba_allocator) {}
 
     Decoding operator()(Retracted&& state);
@@ -150,6 +156,7 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
     const MatchResult& GetMatchResult() const { return match_result_; }
 
     const std::vector<TreeNode*>& GetLoadbackDiff() const { return loadback_diff_; }
+    const std::vector<TreeNode*>& GetMambaLoadbackDiff() const { return mamba_loadback_diff_; }
 
 private:
     std::int32_t decode_input_tokens_{};
@@ -158,6 +165,7 @@ private:
     KVPrefixCache* kv_prefix_cache_{};
     MatchResult match_result_{};
     std::vector<TreeNode*> loadback_diff_;
+    std::vector<TreeNode*> mamba_loadback_diff_;
     MambaChunkAllocator* mamba_allocator_{};
 };
 

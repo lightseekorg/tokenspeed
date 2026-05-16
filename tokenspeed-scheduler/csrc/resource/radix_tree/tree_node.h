@@ -101,10 +101,35 @@ public:
     HostResource& Host() { return *host_resource_; }
     const HostResource& Host() const { return *host_resource_; }
 
-    bool HasMamba() const { return mamba_slot_ != nullptr; }
+    bool HasMamba() const { return HasMambaDevice(); }
+    bool HasMambaDevice() const { return device_mamba_slot_ != nullptr; }
+    bool HasMambaHost() const { return host_mamba_slot_ != nullptr; }
+    bool HasAlignedMambaDevice() const { return HasMambaDevice() && device_mamba_depth_tokens_ == depth_in_tokens_; }
+    bool HasAlignedMambaHost() const { return HasMambaHost() && host_mamba_depth_tokens_ == depth_in_tokens_; }
     std::int32_t MambaSlotIndex() const;
-    void AttachMamba(std::unique_ptr<MambaSlot> slot) { mamba_slot_ = std::move(slot); }
-    std::unique_ptr<MambaSlot> DetachMamba() { return std::move(mamba_slot_); }
+    std::int32_t MambaHostSlotIndex() const;
+    std::size_t MambaDeviceDepthTokens() const { return device_mamba_depth_tokens_; }
+    std::size_t MambaHostDepthTokens() const { return host_mamba_depth_tokens_; }
+    void AttachMamba(std::unique_ptr<MambaSlot> slot) { AttachMambaDevice(std::move(slot)); }
+    void AttachMambaDevice(std::unique_ptr<MambaSlot> slot) { AttachMambaDevice(std::move(slot), depth_in_tokens_); }
+    void AttachMambaDevice(std::unique_ptr<MambaSlot> slot, std::size_t depth_tokens) {
+        device_mamba_slot_ = std::move(slot);
+        device_mamba_depth_tokens_ = depth_tokens;
+    }
+    void AttachMambaHost(std::unique_ptr<MambaSlot> slot) { AttachMambaHost(std::move(slot), depth_in_tokens_); }
+    void AttachMambaHost(std::unique_ptr<MambaSlot> slot, std::size_t depth_tokens) {
+        host_mamba_slot_ = std::move(slot);
+        host_mamba_depth_tokens_ = depth_tokens;
+    }
+    std::unique_ptr<MambaSlot> DetachMamba() { return DetachMambaDevice(); }
+    std::unique_ptr<MambaSlot> DetachMambaDevice() {
+        device_mamba_depth_tokens_ = 0;
+        return std::move(device_mamba_slot_);
+    }
+    std::unique_ptr<MambaSlot> DetachMambaHost() {
+        host_mamba_depth_tokens_ = 0;
+        return std::move(host_mamba_slot_);
+    }
 
     std::optional<cache_op_id> CacheOpId() const;
 
@@ -128,7 +153,10 @@ private:
     bool storage_persisted_{false};
     std::unique_ptr<DeviceResource> device_resource_{};
     std::unique_ptr<HostResource> host_resource_{};
-    std::unique_ptr<MambaSlot> mamba_slot_{};
+    std::unique_ptr<MambaSlot> device_mamba_slot_{};
+    std::unique_ptr<MambaSlot> host_mamba_slot_{};
+    std::size_t device_mamba_depth_tokens_{0};
+    std::size_t host_mamba_depth_tokens_{0};
 };
 
 template <ResourceType RType>

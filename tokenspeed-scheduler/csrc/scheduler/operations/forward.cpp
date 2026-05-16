@@ -73,6 +73,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
+    std::vector<TreeNode*> mamba_loadback_diff;
 
     const std::int32_t device_matched = match_result.device.DepthInPage();
     const std::int32_t host_matched = match_result.host.DepthInPage();
@@ -84,6 +85,13 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             loadback_tokens = config_.page_size * (host_matched - device_matched);
         }
         unscheduled = request->PrefillSize() - std::max(device_matched, host_matched) * config_.page_size;
+        if (hybrid_prefix_cache_) {
+            TreeNode* mamba_host_node =
+                hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node, ResourceType::Host);
+            if (mamba_host_node != nullptr && !mamba_host_node->HasMambaDevice()) {
+                mamba_loadback_diff.push_back(mamba_host_node);
+            }
+        }
     }
 
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
@@ -104,8 +112,18 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         return {};
     }
 
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2)) {
-        return {};
+    if (hybrid_prefix_cache_) {
+        TreeNode* protected_mamba = mamba_loadback_diff.empty() ? nullptr : mamba_loadback_diff.front();
+        std::int32_t mamba_slots_needed = 2 + static_cast<std::int32_t>(mamba_loadback_diff.size());
+        if (!hybrid_prefix_cache_->EnsureMambaCapacityByEvict(mamba_slots_needed, protected_mamba)) {
+            return {};
+        }
+        for (TreeNode* node : mamba_loadback_diff) {
+            auto slot = hybrid_prefix_cache_->AllocateDeviceMamba();
+            if (slot == nullptr) return {};
+            hybrid_prefix_cache_->LoadBackMamba(node, std::move(slot));
+            match_result.mamba_cow_src_index = node->MambaSlotIndex();
+        }
     }
 
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
@@ -126,6 +144,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         &kv_prefix_cache_,
         disable_l2_cache,
         std::move(loadback_diff),
+        std::move(mamba_loadback_diff),
         hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
         mamba_allocator_ ? &*mamba_allocator_ : nullptr,
     };
@@ -187,16 +206,22 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 
     MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
+    std::vector<TreeNode*> mamba_loadback_diff;
     TreeNode* mamba_recovery_node = nullptr;
     if (hybrid_prefix_cache_ && mamba_allocator_) {
-        mamba_recovery_node = hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node);
+        mamba_recovery_node =
+            hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node, ResourceType::Host, false);
         if (mamba_recovery_node == nullptr) {
             spdlog::warn("[Scheduler] Retracted request {} lost tree-owned Mamba state, aborting request",
                          request->Id());
             request->Apply(fsm::AbortEvent{});
             return {};
         }
-        match_result.mamba_cow_src_index = mamba_recovery_node->MambaSlotIndex();
+        if (!mamba_recovery_node->HasMambaDevice()) {
+            mamba_loadback_diff.push_back(mamba_recovery_node);
+        } else {
+            match_result.mamba_cow_src_index = mamba_recovery_node->MambaSlotIndex();
+        }
     }
 
     const std::int32_t device_matched2 = match_result.device.DepthInPage();
@@ -219,8 +244,15 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
         // working/checkpoint slots. Protect the source node only for this
         // allocation; retracted Mamba states are otherwise normal evictable
         // tree-owned cache entries.
-        if (!hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2, mamba_recovery_node)) {
+        std::int32_t mamba_slots_needed = 2 + static_cast<std::int32_t>(mamba_loadback_diff.size());
+        if (!hybrid_prefix_cache_->EnsureMambaCapacityByEvict(mamba_slots_needed, mamba_recovery_node)) {
             return {};
+        }
+        for (TreeNode* node : mamba_loadback_diff) {
+            auto slot = hybrid_prefix_cache_->AllocateDeviceMamba();
+            if (slot == nullptr) return {};
+            hybrid_prefix_cache_->LoadBackMamba(node, std::move(slot));
+            match_result.mamba_cow_src_index = node->MambaSlotIndex();
         }
     }
 
@@ -262,13 +294,10 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::ScheduleDecodeFromRetractedEvent{
-        config_.decode_input_tokens,
-        &device_allocator_,
-        &req_pool_allocator_,
-        &kv_prefix_cache_,
-        std::move(match_result),
-        loadback_diff,
-        mamba_allocator_ ? &*mamba_allocator_ : nullptr,
+        config_.decode_input_tokens, &device_allocator_,
+        &req_pool_allocator_,        &kv_prefix_cache_,
+        std::move(match_result),     loadback_diff,
+        mamba_loadback_diff,         mamba_allocator_ ? &*mamba_allocator_ : nullptr,
     };
 }
 
@@ -307,17 +336,21 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
-LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff, cache_op_id op_id) {
-    std::vector<std::tuple<std::int32_t, std::int32_t>> pages_to_transfer;
+LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff, const std::vector<TreeNode*>& mamba_diff,
+                                     cache_op_id op_id) {
+    std::vector<CacheTransferUnit> transfers;
 
     for (TreeNode* node : diff) {
         const auto& host_pages = node->Host().Pages();
         const auto& device_pages = node->Device().Pages();
         for (std::size_t i = 0; i < host_pages.size(); ++i) {
-            pages_to_transfer.emplace_back(host_pages[i], device_pages[i]);
+            transfers.push_back({CacheTransferKind::KV, host_pages[i], device_pages[i]});
         }
     }
-    return LoadBackOperation{op_id, std::move(pages_to_transfer)};
+    for (TreeNode* node : mamba_diff) {
+        transfers.push_back({CacheTransferKind::Mamba, node->MambaHostSlotIndex(), node->MambaSlotIndex()});
+    }
+    return LoadBackOperation{op_id, std::move(transfers)};
 }
 
 std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* request,
@@ -340,9 +373,8 @@ std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* re
     CacheOpSpec spec;
     spec.request_id = request->Id();
     cache_op_tracker_[op_id] = std::move(spec);
-    return WriteBackOperation{
-        op_id, std::vector<std::tuple<std::int32_t, std::int32_t>>(pages_to_transfer.begin(), pages_to_transfer.end()),
-        true};
+    return WriteBackOperation{op_id, std::vector<CacheTransferUnit>(pages_to_transfer.begin(), pages_to_transfer.end()),
+                              true};
 }
 
 std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retract_request) {
@@ -530,11 +562,12 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
                                                     config_.disable_l2_cache, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
+                std::vector<TreeNode*> mamba_loadback_diff = ev->GetMambaLoadbackDiff();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
                 // will be empty when disable_l2_cache
-                if (!loadback_diff.empty()) {
+                if (!loadback_diff.empty() || !mamba_loadback_diff.empty()) {
                     cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
-                    loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, op_id));
+                    loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_diff, op_id));
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
@@ -549,10 +582,11 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
+                std::vector<TreeNode*> mamba_loadback_diff = ev->GetMambaLoadbackDiff();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)));
-                if (!loadback_diff.empty()) {
+                if (!loadback_diff.empty() || !mamba_loadback_diff.empty()) {
                     cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
-                    loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, op_id));
+                    loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_diff, op_id));
                 }
             }
         }

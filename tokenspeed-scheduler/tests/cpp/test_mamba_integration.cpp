@@ -196,4 +196,115 @@ TEST_F(DisablePrefixCacheMambaRetractTest, RetractedRequestRecoversFromTreeOwned
     EXPECT_GE(fwd->mamba_checkpoint_dst_indices[0], 0);
 }
 
+class MambaL2TransferTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 4;
+        cfg.mamba_host_pool_total_chunks = 8;
+        cfg.decode_input_tokens = 0;
+        cfg.enable_l3_storage = false;
+        cfg.device_allocator.total_pages = 8;
+        cfg.host_allocator.total_pages = 32;
+        return cfg;
+    }
+
+    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cop = std::get_if<CacheOperation>(&op)) {
+                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) return wb;
+            }
+        }
+        return nullptr;
+    }
+
+    static const FlatLoadBackOperation* GetLoadBack(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cop = std::get_if<CacheOperation>(&op)) {
+                if (auto* lb = std::get_if<FlatLoadBackOperation>(cop)) return lb;
+            }
+        }
+        return nullptr;
+    }
+
+    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) return fwd;
+        }
+        return nullptr;
+    }
+
+    static bool HasKind(const std::vector<std::vector<std::int32_t>>& kinds, CacheTransferKind kind) {
+        const auto target = static_cast<std::int32_t>(kind);
+        for (const auto& row : kinds) {
+            for (std::int32_t value : row) {
+                if (value == target) return true;
+            }
+        }
+        return false;
+    }
+
+    ExecutionPlan PlanWriteBackOneFinishedRequest(const std::string& id, std::int32_t pages, token_t start) {
+        Submit(MakeRequestSpec(id, pages, start));
+        PlanOnce();
+        SendForwardDone(id, {1000 + start});
+        PlanOnce();
+        SendFinish(id);
+        return PlanOnce();
+    }
+
+    void FinishAndAckWriteBack(const std::string& id, token_t token) {
+        SendForwardDone(id, {1000 + token});
+        PlanOnce();
+        SendFinish(id);
+        auto plan = PlanOnce();
+        const auto* wb = GetWriteBack(plan);
+        if (wb == nullptr) return;
+        for (cache_op_id op_id : wb->op_ids) {
+            SendWriteBackDone(op_id);
+        }
+        PlanOnce();
+    }
+};
+
+TEST_F(MambaL2TransferTest, FinishWriteBackCarriesKvAndMambaTransfers) {
+    auto wb_plan = PlanWriteBackOneFinishedRequest("r1", 2, 1);
+    const auto* wb = GetWriteBack(wb_plan);
+    ASSERT_NE(wb, nullptr);
+    ASSERT_FALSE(wb->op_ids.empty());
+    EXPECT_TRUE(HasKind(wb->transfer_kinds, CacheTransferKind::KV));
+    EXPECT_TRUE(HasKind(wb->transfer_kinds, CacheTransferKind::Mamba));
+}
+
+TEST_F(MambaL2TransferTest, HostOnlyMambaPrefixGeneratesLoadBackTransfer) {
+    auto wb_plan = PlanWriteBackOneFinishedRequest("r1", 2, 1);
+    const auto* wb = GetWriteBack(wb_plan);
+    ASSERT_NE(wb, nullptr);
+    ASSERT_FALSE(wb->op_ids.empty());
+    SendWriteBackDone(wb->op_ids[0]);
+    PlanOnce();
+
+    Submit(MakeRequestSpec("fill_a", 1, 100));
+    ASSERT_NE(GetForward(PlanOnce()), nullptr);
+    Submit(MakeRequestSpec("fill_b", 1, 200));
+    ASSERT_NE(GetForward(PlanOnce()), nullptr);
+
+    FinishAndAckWriteBack("fill_a", 100);
+    FinishAndAckWriteBack("fill_b", 200);
+
+    // Use three pages so except_last still reaches r1's two-page Mamba checkpoint.
+    Submit(MakeRequestSpec("r2", 3, 1));
+    auto plan = PlanOnce();
+    const auto* lb = GetLoadBack(plan);
+    ASSERT_NE(lb, nullptr);
+    EXPECT_TRUE(HasKind(lb->transfer_kinds, CacheTransferKind::Mamba));
+
+    const auto* fwd = GetForward(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 1u);
+    EXPECT_EQ(fwd->request_ids[0], "r2");
+    EXPECT_GE(fwd->mamba_cow_src_indices[0], 0);
+}
+
 }  // namespace tokenspeed::test

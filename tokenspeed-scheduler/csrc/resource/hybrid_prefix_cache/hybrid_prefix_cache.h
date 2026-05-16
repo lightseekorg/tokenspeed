@@ -36,29 +36,41 @@ class MambaChunkAllocator;
 
 class HybridPrefixCache {
 public:
-    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size);
+    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* device_allocator,
+                      MambaChunkAllocator* host_allocator, std::int32_t mamba_cache_chunk_size);
 
     MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
                       MatchIntent intent = MatchIntent::PrefixReuse);
 
     bool EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
+    bool EnsureMambaHostCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
     void InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot);
+    void InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot, std::size_t depth_tokens);
+    void LoadBackMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot);
+    void AttachHostMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot);
+    void AttachHostMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot, std::size_t depth_tokens);
+    std::unique_ptr<MambaSlot> AllocateHostMamba();
+    std::unique_ptr<MambaSlot> AllocateDeviceMamba();
     std::int32_t AlignMambaCacheSeqlen(std::int32_t seqlen) const;
-    TreeNode* FindLastMambaNode(TreeNode* from) const;
+    TreeNode* FindLastMambaNode(TreeNode* from, ResourceType residency, bool require_exact_depth = true) const;
 
     // CallBack on KV Prefix Cache Eviction
     void OnKVEvict(TreeNode* node);
 
     std::int32_t AvailableSlots() const;
+    std::int32_t AvailableHostSlots() const;
     KVPrefixCache& GetKVPrefixCache() { return kv_prefix_cache_; }
 
 private:
     void augmentMatch(MatchResult& match) const;
+    void detachHostMamba(TreeNode* node);
 
     KVPrefixCache& kv_prefix_cache_;
     MambaChunkAllocator* mamba_allocator_;
+    MambaChunkAllocator* host_mamba_allocator_;
     MambaEvictionManager mamba_eviction_manager_;
+    MambaEvictionManager host_mamba_eviction_manager_;
     std::int32_t mamba_cache_chunk_size_;
 };
 

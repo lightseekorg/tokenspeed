@@ -131,6 +131,12 @@ class SimpleMambaPool:
     ):
         self.size = size
         self.device = device
+        self.num_mamba_layers = num_mamba_layers
+        self.conv_state_shape = tuple(conv_state_shape)
+        self.temporal_state_shape = tuple(temporal_state_shape)
+        self.conv_dtype = conv_dtype
+        self.ssm_dtype = ssm_dtype
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.mamba_layer_ids = list(mamba_layer_ids)
         self.page_size = page_size
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
@@ -179,6 +185,20 @@ class SimpleMambaPool:
             )
         else:
             self.mamba_cache = (self.conv_state, self.ssm_state)
+
+    def make_host_pool(self, size: int) -> "SimpleMambaPool":
+        return SimpleMambaPool(
+            size=size,
+            num_mamba_layers=self.num_mamba_layers,
+            conv_state_shape=self.conv_state_shape,
+            temporal_state_shape=self.temporal_state_shape,
+            conv_dtype=self.conv_dtype,
+            ssm_dtype=self.ssm_dtype,
+            mamba_layer_ids=self.mamba_layer_ids,
+            device="cpu",
+            page_size=self.page_size,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+        )
 
     def get_mamba_indices(self, mamba_pool_indices: torch.Tensor) -> torch.Tensor:
         """Return mamba cache indices directly (allocated by C++ scheduler)."""

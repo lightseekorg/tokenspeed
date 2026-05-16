@@ -50,7 +50,7 @@ struct BackUpOperation : public CacheOperationBase {
 };
 struct WriteBackOperation {
     cache_op_id op_id{0};
-    std::vector<std::tuple<std::int32_t, std::int32_t>> pages_to_transfer;  // (src_device, dst_host)
+    std::vector<CacheTransferUnit> transfers;
     bool is_retract{false};
 };
 
@@ -58,29 +58,48 @@ struct FlatWriteBackOperation {
     std::vector<cache_op_id> op_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    std::vector<std::vector<std::int32_t>> transfer_kinds;
+    std::vector<std::vector<std::int32_t>> src_indices;
+    std::vector<std::vector<std::int32_t>> dst_indices;
     std::vector<bool> is_retract;
 
     explicit FlatWriteBackOperation(const std::vector<WriteBackOperation>& ops) {
-        struct PairHash {
-            std::size_t operator()(const std::tuple<std::int32_t, std::int32_t>& t) const {
-                std::size_t h1 = std::hash<std::int32_t>{}(std::get<0>(t));
-                std::size_t h2 = std::hash<std::int32_t>{}(std::get<1>(t));
-                return h1 ^ (h2 << 32) ^ (h2 >> 32);
+        struct UnitHash {
+            std::size_t operator()(const CacheTransferUnit& unit) const {
+                std::size_t h0 = std::hash<std::int32_t>{}(static_cast<std::int32_t>(unit.kind));
+                std::size_t h1 = std::hash<std::int32_t>{}(unit.src);
+                std::size_t h2 = std::hash<std::int32_t>{}(unit.dst);
+                return h0 ^ (h1 << 16) ^ (h2 << 1);
             }
         };
-        std::unordered_set<std::tuple<std::int32_t, std::int32_t>, PairHash> seen;
+        struct UnitEq {
+            bool operator()(const CacheTransferUnit& lhs, const CacheTransferUnit& rhs) const {
+                return lhs.kind == rhs.kind && lhs.src == rhs.src && lhs.dst == rhs.dst;
+            }
+        };
+        std::unordered_set<CacheTransferUnit, UnitHash, UnitEq> seen;
         for (const auto& op : ops) {
             std::vector<std::int32_t> src_pages_this_op;
             std::vector<std::int32_t> dst_pages_this_op;
-            for (const auto& page : op.pages_to_transfer) {
-                if (seen.insert(page).second) {
-                    src_pages_this_op.push_back(std::get<0>(page));
-                    dst_pages_this_op.push_back(std::get<1>(page));
+            std::vector<std::int32_t> kinds_this_op;
+            std::vector<std::int32_t> src_this_op;
+            std::vector<std::int32_t> dst_this_op;
+            for (const auto& unit : op.transfers) {
+                if (!seen.insert(unit).second) continue;
+                kinds_this_op.push_back(static_cast<std::int32_t>(unit.kind));
+                src_this_op.push_back(unit.src);
+                dst_this_op.push_back(unit.dst);
+                if (unit.kind == CacheTransferKind::KV) {
+                    src_pages_this_op.push_back(unit.src);
+                    dst_pages_this_op.push_back(unit.dst);
                 }
             }
             op_ids.push_back(op.op_id);
             src_pages.push_back(std::move(src_pages_this_op));
             dst_pages.push_back(std::move(dst_pages_this_op));
+            transfer_kinds.push_back(std::move(kinds_this_op));
+            src_indices.push_back(std::move(src_this_op));
+            dst_indices.push_back(std::move(dst_this_op));
             is_retract.push_back(op.is_retract);
         }
     }
@@ -88,35 +107,54 @@ struct FlatWriteBackOperation {
 
 struct LoadBackOperation {
     cache_op_id op_id{0};
-    std::vector<std::tuple<std::int32_t, std::int32_t>> pages_to_transfer;
+    std::vector<CacheTransferUnit> transfers;
 };
 
 struct FlatLoadBackOperation {
     std::vector<cache_op_id> op_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    std::vector<std::vector<std::int32_t>> transfer_kinds;
+    std::vector<std::vector<std::int32_t>> src_indices;
+    std::vector<std::vector<std::int32_t>> dst_indices;
 
     explicit FlatLoadBackOperation(const std::vector<LoadBackOperation>& ops) {
-        struct PairHash {
-            std::size_t operator()(const std::tuple<std::int32_t, std::int32_t>& t) const {
-                std::size_t h1 = std::hash<std::int32_t>{}(std::get<0>(t));
-                std::size_t h2 = std::hash<std::int32_t>{}(std::get<1>(t));
-                return h1 ^ (h2 << 32) ^ (h2 >> 32);
+        struct UnitHash {
+            std::size_t operator()(const CacheTransferUnit& unit) const {
+                std::size_t h0 = std::hash<std::int32_t>{}(static_cast<std::int32_t>(unit.kind));
+                std::size_t h1 = std::hash<std::int32_t>{}(unit.src);
+                std::size_t h2 = std::hash<std::int32_t>{}(unit.dst);
+                return h0 ^ (h1 << 16) ^ (h2 << 1);
             }
         };
-        std::unordered_set<std::tuple<std::int32_t, std::int32_t>, PairHash> seen;
+        struct UnitEq {
+            bool operator()(const CacheTransferUnit& lhs, const CacheTransferUnit& rhs) const {
+                return lhs.kind == rhs.kind && lhs.src == rhs.src && lhs.dst == rhs.dst;
+            }
+        };
+        std::unordered_set<CacheTransferUnit, UnitHash, UnitEq> seen;
         for (const auto& op : ops) {
             std::vector<std::int32_t> src_pages_this_op;
             std::vector<std::int32_t> dst_pages_this_op;
-            for (const auto& page : op.pages_to_transfer) {
-                if (seen.insert(page).second) {
-                    src_pages_this_op.push_back(std::get<0>(page));
-                    dst_pages_this_op.push_back(std::get<1>(page));
+            std::vector<std::int32_t> kinds_this_op;
+            std::vector<std::int32_t> src_this_op;
+            std::vector<std::int32_t> dst_this_op;
+            for (const auto& unit : op.transfers) {
+                if (!seen.insert(unit).second) continue;
+                kinds_this_op.push_back(static_cast<std::int32_t>(unit.kind));
+                src_this_op.push_back(unit.src);
+                dst_this_op.push_back(unit.dst);
+                if (unit.kind == CacheTransferKind::KV) {
+                    src_pages_this_op.push_back(unit.src);
+                    dst_pages_this_op.push_back(unit.dst);
                 }
             }
             op_ids.push_back(op.op_id);
             src_pages.push_back(std::move(src_pages_this_op));
             dst_pages.push_back(std::move(dst_pages_this_op));
+            transfer_kinds.push_back(std::move(kinds_this_op));
+            src_indices.push_back(std::move(src_this_op));
+            dst_indices.push_back(std::move(dst_this_op));
         }
     }
 };

@@ -65,6 +65,7 @@ def make_config(
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
+    mamba_host_pool_total_chunks: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
 ) -> SchedulerConfig:
@@ -94,6 +95,7 @@ def make_config(
     cfg.mamba_cache_chunk_size = mamba_cache_chunk_size
     cfg.mamba_pool_total_chunks = mamba_pool_total_chunks
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
+    cfg.mamba_host_pool_total_chunks = mamba_host_pool_total_chunks
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg

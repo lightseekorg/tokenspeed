@@ -78,8 +78,13 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
     if (config_.enable_mamba && config_.mamba_pool_total_chunks > 0) {
         mamba_allocator_.emplace(config_.mamba_pool_total_chunks);
+        const std::int32_t host_chunks = config_.mamba_host_pool_total_chunks > 0
+                                             ? config_.mamba_host_pool_total_chunks
+                                             : std::max(config_.mamba_pool_total_chunks * 4, 1);
+        mamba_host_allocator_.emplace(host_chunks);
         if (config_.role != Role::kD) {
-            hybrid_prefix_cache_.emplace(kv_prefix_cache_, &*mamba_allocator_, config_.mamba_cache_chunk_size);
+            hybrid_prefix_cache_.emplace(kv_prefix_cache_, &*mamba_allocator_, &*mamba_host_allocator_,
+                                         config_.mamba_cache_chunk_size);
             kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
                 [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
         }
@@ -405,8 +410,8 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
             CacheOpSpec spec;
             spec.request_id = id;
             cache_op_tracker_[op_id] = std::move(spec);
-            ops.push_back(WriteBackOperation{op_id, std::vector<std::tuple<std::int32_t, std::int32_t>>(
-                                                        pages_to_transfer.begin(), pages_to_transfer.end())});
+            ops.push_back(WriteBackOperation{
+                op_id, std::vector<CacheTransferUnit>(pages_to_transfer.begin(), pages_to_transfer.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
             req->Apply(fsm::AbortEvent{});

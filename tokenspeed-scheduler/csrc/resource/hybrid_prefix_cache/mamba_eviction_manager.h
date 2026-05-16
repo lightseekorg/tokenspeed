@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <queue>
 #include <unordered_set>
 #include <vector>
@@ -33,7 +34,9 @@ class MambaChunkAllocator;
 
 class MambaEvictionManager {
 public:
-    explicit MambaEvictionManager(MambaChunkAllocator* allocator);
+    using DetachFn = std::function<void(TreeNode*)>;
+
+    MambaEvictionManager(MambaChunkAllocator* allocator, ResourceType residency, DetachFn detach_fn = {});
 
     void TrackNode(TreeNode* node);
     void UntrackNode(TreeNode* node);
@@ -48,7 +51,13 @@ private:
     bool isMambaLeaf(const TreeNode* node) const;
     bool hasChildWithMamba(const TreeNode* node) const;
 
+    bool hasMamba(const TreeNode* node) const;
+    bool isLocked(const TreeNode* node) const;
+    void detach(TreeNode* node) const;
+
     MambaChunkAllocator* allocator_;
+    ResourceType residency_;
+    DetachFn detach_fn_;
     std::unordered_set<TreeNode*> mamba_leaves_;
 };
 
