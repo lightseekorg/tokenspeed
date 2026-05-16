@@ -61,6 +61,27 @@ def max(input, axis=None, keep_dims=False):
     return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
 
 
+@gluon.aggregate
+class AttentionInput:
+    ptr: gl.tensor
+    stride_t: gl.constexpr
+    stride_h: gl.constexpr
+    stride_d: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, ptr, stride_t, stride_h, stride_d):
+        self.ptr = ptr
+        self.stride_t = gl.constexpr(stride_t)
+        self.stride_h = gl.constexpr(stride_h)
+        self.stride_d = gl.constexpr(stride_d)
+
+    @gluon.jit
+    def offsets(self, token, head, dim):
+        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
+            gl.int32
+        )
+
+
 # ===-----------------------------------------------------------------------===#
 # Kernel Config
 # ===-----------------------------------------------------------------------===#
@@ -185,27 +206,6 @@ class AttentionConfig:
         self.store_layout = gl.constexpr(store_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
         self.v_smem_layout = gl.constexpr(v_smem_layout)
-
-
-@gluon.aggregate
-class AttentionInput:
-    ptr: gl.tensor
-    stride_t: gl.constexpr
-    stride_h: gl.constexpr
-    stride_d: gl.constexpr
-
-    @gluon.constexpr_function
-    def __init__(self, ptr, stride_t, stride_h, stride_d):
-        self.ptr = ptr
-        self.stride_t = gl.constexpr(stride_t)
-        self.stride_h = gl.constexpr(stride_h)
-        self.stride_d = gl.constexpr(stride_d)
-
-    @gluon.jit
-    def offsets(self, token, head, dim):
-        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
-            gl.int32
-        )
 
 
 # ===-----------------------------------------------------------------------===#
