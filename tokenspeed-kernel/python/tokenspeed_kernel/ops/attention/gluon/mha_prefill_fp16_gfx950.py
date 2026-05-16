@@ -268,7 +268,7 @@ class AttentionProgram:
         )
 
     @gluon.jit
-    def load_q(self):
+    def load_q(self, other=None):
         cfg = self.cfg
         offs_m = self.q_start + gl.arange(
             0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout)
@@ -280,7 +280,9 @@ class AttentionProgram:
             + offs_d[None, :]
         ).to(gl.int32)
         mask = offs_m[:, None] < self.seq_len
-        return buffer_load(self.q_ptr, offsets, mask=mask)
+        if other is None:
+            return buffer_load(self.q_ptr, offsets, mask=mask)
+        return buffer_load(self.q_ptr, offsets, mask=mask, other=other)
 
     @gluon.jit
     def make_kv_offsets(self, kv_start):
@@ -584,6 +586,68 @@ class ProgramScheduler:
 
 
 @gluon.jit
+def process_small_attention_tile(
+    program: AttentionProgram,
+    k_smem: gl.shared_memory_descriptor,
+    v_smem: gl.shared_memory_descriptor,
+):
+    cfg = program.cfg
+    q = program.load_q(other=0.0)
+
+    k_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(1, cfg.k_layout))
+    k_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.k_layout))
+    k_offsets = (
+        ((program.seq_base + k_offs_n[None, :]) * cfg.N_KV_HEADS + program.kv_head)
+        * cfg.HEAD_DIM
+        + k_offs_d[:, None]
+    ).to(gl.int32)
+    k_mask = k_offs_n[None, :] < program.seq_len
+    k = buffer_load(program.k_ptr, k_offsets, mask=k_mask, other=0.0)
+
+    v_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout))
+    v_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
+    v_offsets = (
+        ((program.seq_base + v_offs_n[:, None]) * cfg.N_KV_HEADS + program.kv_head)
+        * cfg.HEAD_DIM
+        + v_offs_d[None, :]
+    ).to(gl.int32)
+    v_mask = v_offs_n[:, None] < program.seq_len
+    v = buffer_load(program.v_ptr, v_offsets, mask=v_mask, other=0.0)
+
+    qk = program.compute_qk(q, k)
+
+    mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
+    mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
+    valid = mask_offs_m[:, None] < program.seq_len
+    valid &= mask_offs_n[None, :] < program.seq_len
+    valid &= mask_offs_n[None, :] <= mask_offs_m[:, None]
+    if cfg.IS_SLIDING:
+        valid &= mask_offs_m[:, None] <= mask_offs_n[None, :] + cfg.WINDOW_LEFT
+
+    qk_scaled = qk * cfg.SM_SCALE
+    qk_scaled = gl.where(valid, qk_scaled, -1.0e20)
+    row_has_valid = gl.sum(valid.to(gl.int32), axis=1) > 0
+    row_max = max(qk_scaled, 1)
+    m_i = gl.where(row_has_valid, row_max, 0.0)
+    p = gl.where(valid, gl.exp2(qk_scaled - m_i[:, None]), 0.0)
+    l_i = gl.sum(p, axis=1)
+    if cfg.HAS_SINK:
+        sink_log2 = gl.load(program.sink_ptr + program.q_head).to(gl.float32) * _INV_LN2
+        l_i += gl.exp2(sink_log2 - m_i)
+
+    acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
+    p = p.to(program.q_ptr.dtype.element_ty)
+    p = gl.convert_layout(p, cfg.p_layout)
+    acc = program.compute_pv(p, v, acc)
+
+    program.store_lse(l_i, m_i / cfg.SM_SCALE)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    output = acc * (1.0 / denom)[:, None]
+    output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
 def process_attention_tile(
     program: AttentionProgram,
     k_smem: gl.shared_memory_descriptor,
@@ -772,7 +836,11 @@ def attention_kernel(
             cu_seqlens_ptr,
         )
         if valid:
-            process_sliding_attention_tile(program, k_smem, v_smem)
+            if program.seq_len < cfg.BLOCK_N:
+                if program.q_start == 0:
+                    process_small_attention_tile(program, k_smem, v_smem)
+            else:
+                process_sliding_attention_tile(program, k_smem, v_smem)
     else:
         mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
         mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
@@ -791,9 +859,13 @@ def attention_kernel(
                 cu_seqlens_ptr,
             )
             if valid:
-                process_attention_tile(
-                    program, k_smem, v_smem, boundary_mask0, boundary_mask1
-                )
+                if program.seq_len < cfg.BLOCK_N:
+                    if program.q_start == 0:
+                        process_small_attention_tile(program, k_smem, v_smem)
+                else:
+                    process_attention_tile(
+                        program, k_smem, v_smem, boundary_mask0, boundary_mask1
+                    )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -855,6 +927,9 @@ def gluon_mha_prefill_fp16_gfx950(
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     total_tokens, n_heads, head_dim = q.shape
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
 
     block_m = 128
     block_n = 64
