@@ -23,6 +23,7 @@ from __future__ import annotations
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -35,10 +36,6 @@ __all__ = [
     "mha_prefill_with_kvcache",
     "mha_decode_with_kvcache",
 ]
-
-
-def _requires_logit_cap(logit_cap: float) -> bool:
-    return logit_cap != 0.0
 
 
 def mha_prefill(
@@ -88,7 +85,7 @@ def mha_prefill(
         "head_dim": q.shape[-1],
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
@@ -204,7 +201,7 @@ def mha_prefill_with_kvcache(
         "prewritten_kv": prewritten_kv,
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
@@ -317,7 +314,7 @@ def mha_decode_with_kvcache(
         "page_size": k_cache.shape[1],
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
         "query_len": 1,

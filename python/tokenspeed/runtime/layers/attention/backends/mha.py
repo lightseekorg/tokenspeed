@@ -57,6 +57,7 @@ class MHAMetadata:
     cu_seqlens_q: torch.Tensor | None = None
     max_seq_len_q: int | None = None
     max_seq_len_k: int | None = None
+    use_direct_prefill: bool = False
 
 
 class MHAAttnBackend(AttentionBackend):
@@ -64,7 +65,7 @@ class MHAAttnBackend(AttentionBackend):
 
     @property
     def support_kv_cache_prewrite(self) -> bool:
-        return True
+        return False
 
     def __init__(self, config: MHAConfig):
         super().__init__(config)
@@ -116,6 +117,15 @@ class MHAAttnBackend(AttentionBackend):
                 extend_seq_lens_cpu is not None
             ), "mha extend requires extend_seq_lens_cpu"
             max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
+            extend_prefix_lens_cpu = kwargs.get("extend_prefix_lens_cpu")
+            if not forward_mode.is_extend():
+                use_direct_prefill = False
+            elif extend_prefix_lens is None:
+                use_direct_prefill = True
+            elif extend_prefix_lens_cpu is not None:
+                use_direct_prefill = not bool(extend_prefix_lens_cpu[:bs].any().item())
+            else:
+                use_direct_prefill = False
 
             self.forward_prefill_metadata = MHAMetadata(
                 cache_seqlens_int32=seq_lens,
@@ -123,6 +133,7 @@ class MHAAttnBackend(AttentionBackend):
                 page_table=page_table,
                 max_seq_len_q=max_seq_len_q,
                 max_seq_len_k=self.max_context_len,
+                use_direct_prefill=use_direct_prefill,
             )
             return
 
@@ -327,6 +338,87 @@ class MHAAttnBackend(AttentionBackend):
         k = None if k is None else k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = None if v is None else v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
+        if k is not None and v is not None and metadata.use_direct_prefill:
+            return self._forward_extend_direct(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                cu_seqlens_q,
+                save_kv_cache,
+                kwargs.get("sinks"),
+            )
+
+        return self._forward_extend_with_kvcache(
+            q,
+            k,
+            v,
+            layer,
+            out_cache_loc,
+            token_to_kv_pool,
+            metadata,
+            cu_seqlens_q,
+            save_kv_cache,
+            kwargs.get("sinks"),
+        )
+
+    def _forward_extend_direct(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        metadata: MHAMetadata,
+        cu_seqlens_q: torch.Tensor,
+        save_kv_cache: bool,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        result = mha_prefill(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=metadata.max_seq_len_q,
+            softmax_scale=layer.scaling,
+            is_causal=True,
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            sinks=sinks,
+            solution=self.kernel_solution,
+        )
+        output = self._unwrap_output(result).reshape(
+            -1, layer.tp_q_head_num * layer.v_head_dim
+        )
+        if save_kv_cache:
+            token_to_kv_pool.set_kv_buffer(
+                layer,
+                out_cache_loc,
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
+        return output
+
+    def _forward_extend_with_kvcache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        metadata: MHAMetadata,
+        cu_seqlens_q: torch.Tensor,
+        save_kv_cache: bool,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
         if save_kv_cache and k is not None:
             token_to_kv_pool.set_kv_buffer(
                 layer,
@@ -337,52 +429,28 @@ class MHAAttnBackend(AttentionBackend):
                 layer.v_scale,
             )
 
-        no_kv_cache = False
-        if k is not None and v is not None and not save_kv_cache:
-            query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-            no_kv_cache = bool(torch.equal(metadata.cache_seqlens_int32, query_lens))
-
-        if no_kv_cache:
-            result = mha_prefill(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=metadata.max_seq_len_q,
-                max_seqlen_k=metadata.max_seq_len_q,
-                softmax_scale=layer.scaling,
-                is_causal=True,
-                window_left=layer.sliding_window_size,
-                logit_cap=layer.logit_cap,
-                sinks=kwargs.get("sinks"),
-                solution=self.kernel_solution,
-            )
-            return self._unwrap_output(result).reshape(
-                -1, layer.tp_q_head_num * layer.v_head_dim
-            )
-        else:
-            k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-            result = mha_prefill_with_kvcache(
-                q=q,
-                k=None if save_kv_cache else k,
-                v=None if save_kv_cache else v,
-                cu_seqlens_q=cu_seqlens_q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                page_table=metadata.page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
-                softmax_scale=layer.scaling,
-                is_causal=True,
-                window_left=layer.sliding_window_size,
-                logit_cap=layer.logit_cap,
-                sinks=kwargs.get("sinks"),
-                max_seqlen_q=metadata.max_seq_len_q,
-                max_seqlen_k=metadata.max_seq_len_k,
-                solution=self.kernel_solution,
-            )
-            return self._unwrap_output(result).reshape(
-                -1, layer.tp_q_head_num * layer.v_head_dim
-            )
+        k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        result = mha_prefill_with_kvcache(
+            q=q,
+            k=None if save_kv_cache else k,
+            v=None if save_kv_cache else v,
+            cu_seqlens_q=cu_seqlens_q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            softmax_scale=layer.scaling,
+            is_causal=True,
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            sinks=sinks,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=metadata.max_seq_len_k,
+            solution=self.kernel_solution,
+        )
+        return self._unwrap_output(result).reshape(
+            -1, layer.tp_q_head_num * layer.v_head_dim
+        )
 
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(

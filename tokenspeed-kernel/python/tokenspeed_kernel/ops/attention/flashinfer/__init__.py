@@ -92,6 +92,7 @@ if platform.is_nvidia and platform.is_blackwell:
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 2,
         traits={
+            "head_dim": frozenset({128}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
