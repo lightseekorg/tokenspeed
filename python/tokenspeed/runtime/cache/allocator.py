@@ -125,7 +125,7 @@ class KVAllocator:
         page_ids_to_free = self.req_to_page[
             req_pool_index, full_page_num : full_page_num + page_num_to_free
         ]
-        self.need_to_free.append(page_ids_to_free.cpu())
+        self.need_to_free.append(page_ids_to_free)
 
     def free_req_cache(self, req_pool_index: int, alloced_len: int):
         """Release all pages of the request when prefix cache is not used."""
@@ -133,7 +133,7 @@ class KVAllocator:
         if alloced_page_num == 0:
             return
         page_ids_to_free = self.req_to_page[req_pool_index, :alloced_page_num]
-        self.need_to_free.append(page_ids_to_free.cpu())
+        self.need_to_free.append(page_ids_to_free)
 
     def free_with_diff(self, new_prefix_page_ids, old_page_ids):
         # New KV pages come from the prefix tree and are already cached, so only
@@ -146,7 +146,7 @@ class KVAllocator:
             logger.debug(
                 "[DebugTrace] free_with_diff free page=%s", old_page_ids[diff].tolist()
             )
-            self.need_to_free.append(old_page_ids[diff].cpu())
+            self.need_to_free.append(old_page_ids[diff])
         else:
             logger.debug(
                 "[DebugTrace] free_with_diff: no pages to free, all pages are cached"
@@ -154,7 +154,7 @@ class KVAllocator:
         return diff
 
     def append_to_later_free(self, page_ids: torch.Tensor) -> None:
-        self.need_to_free.append(page_ids.cpu())
+        self.need_to_free.append(page_ids)
 
     def free(self, req_pool_index: int, indices=None) -> None:
         if self.is_not_in_free_group:
@@ -184,15 +184,13 @@ class KVAllocator:
                 "[DebugTrace] free_group_end pages_need_to_free=%s",
                 pages_need_to_free.tolist(),
             )
-            token_level_offsets = torch.arange(self.page_size)
+            token_level_offsets = torch.arange(self.page_size, device=self.device)
             slots_to_free = (
-                (pages_need_to_free[:, None] * self.page_size + token_level_offsets)
-                .flatten()
-                .to(self.device)
-            )
+                pages_need_to_free[:, None] * self.page_size + token_level_offsets
+            ).flatten()
             writted_positions = slots_to_free[self.token_slot_refs[slots_to_free] >= 1]
             self.token_slot_refs[writted_positions] += -1
-            self.free_slots = torch.concat([self.free_slots] + self.need_to_free)
+            self.free_slots = torch.concat([self.free_slots, pages_need_to_free.cpu()])
             self.need_to_free = []
 
     def clear(self) -> None:
