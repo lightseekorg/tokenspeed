@@ -585,6 +585,7 @@ class CudaGraphWrapper:
             kwargs["actual_bs"] = actual_bs
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
+            padded_bs * self.max_tokens_per_req,
             req_pool_indices,
             seq_lens,
             req_to_page=req_to_page,
@@ -594,6 +595,7 @@ class CudaGraphWrapper:
         if self.draft_attn_backend is not None:
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
+                padded_bs * self.max_tokens_per_req,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,

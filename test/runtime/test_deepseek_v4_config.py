@@ -1695,6 +1695,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=4,
+            num_tokens=4,
             actual_bs=2,
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),

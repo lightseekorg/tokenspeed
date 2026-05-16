@@ -1643,6 +1643,7 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -1661,14 +1662,15 @@ class FlashAttentionBackend(AttentionBackend):
         assert req_to_page is not None, "req_to_page must be provided"
         max_context_len = self.max_context_len
 
-        # The wrapper always passes forward_mode=DECODE at replay (cuda
-        # graph only runs in decode), so dispatch by (self.is_draft, dict
-        # membership) instead. Captures populate disjoint dicts per phase.
-        is_target_verify = not self.is_draft and (
-            bs in self.target_verify_metadata
-            or bs in self.target_verify_metadata_topk_normal
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
         )
-        is_draft_extend = self.is_draft and bs in self.draft_extend_metadata
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
 
         if (
             forward_mode.is_decode_or_idle()
