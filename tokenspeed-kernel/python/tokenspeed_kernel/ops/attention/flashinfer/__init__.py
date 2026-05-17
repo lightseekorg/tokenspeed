@@ -40,7 +40,6 @@ trtllm_batch_context_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
 trtllm_ragged_attention_deepseek = error_fn
-flashinfer_mha_prefill_ragged = error_fn
 
 if platform.is_nvidia:
     try:
@@ -102,7 +101,7 @@ if platform.is_nvidia and platform.is_blackwell:
     @register_kernel(
         "attention",
         "mha_prefill",
-        name="flashinfer_mha_prefill_ragged",
+        name="flashinfer_mha_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
@@ -119,7 +118,7 @@ if platform.is_nvidia and platform.is_blackwell:
         },
         tags={"throughput"},
     )
-    def flashinfer_mha_prefill_ragged(
+    def flashinfer_mha_prefill(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -158,79 +157,6 @@ if platform.is_nvidia and platform.is_blackwell:
             o_data_type=q.dtype,
         )
         return wrapper.run(q, k, v, return_lse=return_lse)
-
-    @register_kernel(
-        "attention",
-        "mha_prefill",
-        name="flashinfer_mha_prefill",
-        solution="flashinfer",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
-        dtypes={torch.float16, torch.bfloat16},
-        priority=Priority.PORTABLE,
-        traits={
-            "head_dim": frozenset({128}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False}),
-            "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({True, False}),
-        },
-        tags={"throughput"},
-    )
-    def flashinfer_mha_prefill(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        softmax_scale: float | None = None,
-        is_causal: bool = True,
-        window_left: int = -1,
-        logit_cap: float = 0.0,
-        sinks: torch.Tensor | None = None,
-        return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        global _workspace_buffer
-        if _workspace_buffer is None:
-            _workspace_buffer = torch.zeros(
-                150 * 1024 * 1024,
-                dtype=torch.uint8,
-                device=q.device,
-            )
-        seq_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        # TRTLLM kernels require fp32 sinks
-        if sinks is not None and sinks.dtype != torch.float32:
-            sinks = sinks.to(torch.float32)
-        result = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=_workspace_buffer,
-            seq_lens=seq_lens,
-            max_q_len=max_seqlen_q,
-            max_kv_len=max_seqlen_k,
-            bmm1_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
-            bmm2_scale=1.0,
-            o_sf_scale=-1.0,
-            batch_size=seq_lens.shape[0],
-            window_left=window_left,
-            cum_seq_lens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cu_seqlens_q,
-            enable_pdl=False,
-            is_causal=is_causal,
-            return_lse=return_lse,
-            attention_sinks=sinks,
-        )
-        if return_lse:
-            return result
-        return result
 
     @register_kernel(
         "attention",
@@ -391,5 +317,4 @@ __all__ = [
     "trtllm_batch_decode_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",
     "trtllm_ragged_attention_deepseek",
-    "flashinfer_mha_prefill_ragged",
 ]
