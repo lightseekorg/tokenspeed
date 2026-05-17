@@ -40,6 +40,7 @@ trtllm_batch_context_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
 trtllm_ragged_attention_deepseek = error_fn
+flashinfer_mha_prefill_ragged = error_fn
 
 if platform.is_nvidia:
     try:
@@ -76,9 +77,87 @@ if platform.is_nvidia and platform.is_blackwell:
 # ------------------------------------------------------------------------------
 
 _workspace_buffer: torch.Tensor | None = None
+_ragged_prefill_workspaces: dict[torch.device, torch.Tensor] = {}
+_ragged_prefill_wrappers: dict[torch.device, BatchPrefillWithRaggedKVCacheWrapper] = {}
+
+
+def _get_ragged_prefill_wrapper(
+    device: torch.device,
+) -> BatchPrefillWithRaggedKVCacheWrapper:
+    wrapper = _ragged_prefill_wrappers.get(device)
+    if wrapper is None:
+        workspace = torch.empty(
+            128 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
+        _ragged_prefill_workspaces[device] = workspace
+        _ragged_prefill_wrappers[device] = wrapper
+    return wrapper
 
 
 if platform.is_nvidia and platform.is_blackwell:
+
+    @register_kernel(
+        "attention",
+        "mha_prefill",
+        name="flashinfer_mha_prefill_ragged",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        dtypes={torch.float16, torch.bfloat16},
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "head_dim": frozenset({64, 128}),
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False}),
+            "support_logit_cap": frozenset({False, True}),
+            "return_lse": frozenset({True, False}),
+        },
+        tags={"throughput"},
+    )
+    def flashinfer_mha_prefill_ragged(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: float | None = None,
+        is_causal: bool = True,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if sinks is not None:
+            raise NotImplementedError(
+                "FlashInfer ragged prefill does not support sinks"
+            )
+        wrapper = _get_ragged_prefill_wrapper(q.device)
+        wrapper.plan(
+            cu_seqlens_q,
+            cu_seqlens_q,
+            q.shape[1],
+            k.shape[1],
+            q.shape[-1],
+            head_dim_vo=v.shape[-1],
+            causal=is_causal,
+            window_left=window_left,
+            logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
+            sm_scale=(
+                softmax_scale
+                if softmax_scale is not None
+                else 1.0 / math.sqrt(q.shape[-1])
+            ),
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+            o_data_type=q.dtype,
+        )
+        return wrapper.run(q, k, v, return_lse=return_lse)
 
     @register_kernel(
         "attention",
@@ -90,11 +169,11 @@ if platform.is_nvidia and platform.is_blackwell:
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={torch.float16, torch.bfloat16},
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.PORTABLE,
         traits={
             "head_dim": frozenset({128}),
             "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
+            "support_sinks": frozenset({False}),
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({True, False}),
         },
@@ -312,4 +391,5 @@ __all__ = [
     "trtllm_batch_decode_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",
     "trtllm_ragged_attention_deepseek",
+    "flashinfer_mha_prefill_ragged",
 ]
