@@ -186,6 +186,9 @@ class PrefixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves: set[TreeNode] = set()
 
+        if self.enable_kv_cache_events and KV_EVENTS_AVAILABLE:
+            self.kv_event_queue.append(AllBlocksCleared())
+
     def match_prefix(self, key: list, **kwargs) -> MatchResult:
         """Find the matching prefix from the prefix tree.
         Args:
@@ -198,9 +201,6 @@ class PrefixCache(BasePrefixCache):
             than the last node's value.
         """
 
-        # Emit AllBlocksCleared event when cache is reset
-        if self.enable_kv_cache_events and KV_EVENTS_AVAILABLE:
-            self.kv_event_queue.append(AllBlocksCleared())
         if self.disable or len(key) == 0:
             return self._empty_match_result()
 
