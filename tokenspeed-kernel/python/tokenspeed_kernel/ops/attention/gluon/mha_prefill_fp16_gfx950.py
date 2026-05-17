@@ -63,12 +63,6 @@ class InputLayout:
     stride_h: gl.constexpr
     stride_d: gl.constexpr
 
-    @gluon.constexpr_function
-    def __init__(self, stride_t, stride_h, stride_d):
-        self.stride_t = gl.constexpr(stride_t)
-        self.stride_h = gl.constexpr(stride_h)
-        self.stride_d = gl.constexpr(stride_d)
-
     @gluon.jit
     def offsets(self, token, head, dim):
         return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
