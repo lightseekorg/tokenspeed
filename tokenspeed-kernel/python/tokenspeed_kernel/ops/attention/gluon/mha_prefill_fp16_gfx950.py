@@ -622,7 +622,7 @@ class ProgramScheduler:
 
 
 @gluon.jit
-def process_small_attention_tile(
+def process_single_attention_tile(
     program: AttentionProgram,
     k_smem: gl.shared_memory_descriptor,
     v_smem: gl.shared_memory_descriptor,
@@ -656,23 +656,23 @@ def process_small_attention_tile(
     if cfg.IS_SLIDING:
         valid &= mask_offs_m[:, None] <= mask_offs_n[None, :] + cfg.WINDOW_LEFT
 
-    qk_scaled = qk * cfg.SM_SCALE
-    qk_scaled = gl.where(valid, qk_scaled, -1.0e20)
+    qk = gl.where(valid, qk, -1.0e20)
     row_has_valid = gl.sum(valid.to(gl.int32), axis=1) > 0
-    row_max = max(qk_scaled, 1)
+    row_max = max(qk, 1)
     m_i = gl.where(row_has_valid, row_max, 0.0)
-    p = gl.where(valid, gl.exp2(qk_scaled - m_i[:, None]), 0.0)
+    m_i_scaled = m_i * cfg.SM_SCALE
+    p = gl.where(valid, gl.exp2(qk * cfg.SM_SCALE - m_i_scaled[:, None]), 0.0)
     l_i = gl.sum(p, axis=1)
     if cfg.HAS_SINK:
         sink_log2 = gl.load(program.sink_ptr + program.q_head).to(gl.float32) * _INV_LN2
-        l_i += gl.exp2(sink_log2 - m_i)
+        l_i += gl.exp2(sink_log2 - m_i_scaled)
 
     acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
     p = p.to(program.q_ptr.dtype.element_ty)
     p = gl.convert_layout(p, cfg.p_layout)
     acc = program.compute_pv(p, v, acc)
 
-    program.store_lse(l_i, m_i / cfg.SM_SCALE)
+    program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     recip_denom = 1.0 / denom
     output = acc * recip_denom[:, None]
@@ -685,100 +685,66 @@ def process_attention_tile(
     program: AttentionProgram,
     k_smem: gl.shared_memory_descriptor,
     v_smem: gl.shared_memory_descriptor,
-    boundary_mask0: gl.tensor,
-    boundary_mask1: gl.tensor,
+    boundary_mask0=None,
+    boundary_mask1=None,
 ):
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc = program.init_attention_state()
 
-    main_end = program.q_start // cfg.BLOCK_N
-    base_k_offsets, base_offs_n = program.make_k_offsets(0)
-    base_v_offsets = program.make_v_offsets(0)
+    if cfg.IS_SLIDING:
+        kv_start = program.q_start - cfg.WINDOW_LEFT
+        kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
+        num_kv_tiles: gl.constexpr = (
+            cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
+        ) // cfg.BLOCK_N
+        for _ in range(0, num_kv_tiles):
+            k_offsets, offs_n = program.make_k_offsets(kv_start)
+            v_offsets = program.make_v_offsets(kv_start)
+            mask = offs_n[:, None] < program.seq_len
+            program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
+            program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
-    k_offsets = base_k_offsets
-    v_offsets = base_v_offsets
-    offs_n = base_offs_n
+            wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            qk = program.apply_sliding_mask(qk, offs_n)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
-    for _ in range(0, main_end):
-        program.issue_buffer_load_k(k_offsets, k_smem)
-        program.issue_buffer_load_v(v_offsets, v_smem)
+            wait_group(0)
+            v = program.shared_load_v(v_smem)
+            acc = program.compute_pv(p, v, acc)
+            kv_start = kv_start + cfg.BLOCK_N
+    else:
+        main_end = program.q_start // cfg.BLOCK_N
+        base_k_offsets, base_offs_n = program.make_k_offsets(0)
+        base_v_offsets = program.make_v_offsets(0)
 
-        wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+        k_offsets = base_k_offsets
+        v_offsets = base_v_offsets
+        offs_n = base_offs_n
 
-        wait_group(0)
-        v = program.shared_load_v(v_smem)
-        acc = program.compute_pv(p, v, acc)
+        for _ in range(0, main_end):
+            program.issue_buffer_load_k(k_offsets, k_smem)
+            program.issue_buffer_load_v(v_offsets, v_smem)
 
-        k_offsets = program.update_k_offsets(k_offsets)
-        v_offsets = program.update_v_offsets(v_offsets)
-        offs_n = offs_n + cfg.BLOCK_N
+            wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
-    # The main loop handles prefix tiles; the two boundary tiles are causal.
-    boundary_start = main_end * cfg.BLOCK_N
-    k_offsets, offs_n = program.make_k_offsets(boundary_start)
-    v_offsets = program.make_v_offsets(boundary_start)
-    mask = offs_n[:, None] < program.seq_len
-    program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
-    program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+            wait_group(0)
+            v = program.shared_load_v(v_smem)
+            acc = program.compute_pv(p, v, acc)
 
-    wait_group(1)
-    k = program.shared_load_k(k_smem)
-    qk = program.compute_qk(q, k)
-    qk = gl.where(boundary_mask0, qk, -float("inf"))
-    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+            k_offsets = program.update_k_offsets(k_offsets)
+            v_offsets = program.update_v_offsets(v_offsets)
+            offs_n = offs_n + cfg.BLOCK_N
 
-    wait_group(0)
-    v = program.shared_load_v(v_smem)
-    acc = program.compute_pv(p, v, acc)
-
-    boundary_start = boundary_start + cfg.BLOCK_N
-    k_offsets, offs_n = program.make_k_offsets(boundary_start)
-    v_offsets = program.make_v_offsets(boundary_start)
-    mask = offs_n[:, None] < program.seq_len
-    program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
-    program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
-
-    wait_group(1)
-    k = program.shared_load_k(k_smem)
-    qk = program.compute_qk(q, k)
-    qk = gl.where(boundary_mask1, qk, -float("inf"))
-    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-    wait_group(0)
-    v = program.shared_load_v(v_smem)
-    acc = program.compute_pv(p, v, acc)
-
-    l_i = program.apply_sinks(l_i, m_i)
-    program.store_lse(l_i, m_i)
-    denom = gl.where(l_i > 0.0, l_i, 1.0)
-    recip_denom = 1.0 / denom
-    output = acc * recip_denom[:, None]
-    output = gl.convert_layout(output, cfg.store_layout)
-    program.store_output(output)
-
-
-@gluon.jit
-def process_sliding_attention_tile(
-    program: AttentionProgram,
-    k_smem: gl.shared_memory_descriptor,
-    v_smem: gl.shared_memory_descriptor,
-):
-    cfg = program.cfg
-    q = program.load_q()
-    m_i, l_i, acc = program.init_attention_state()
-
-    kv_start = program.q_start - cfg.WINDOW_LEFT
-    kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
-    num_kv_tiles: gl.constexpr = (
-        cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
-    ) // cfg.BLOCK_N
-    for _ in range(0, num_kv_tiles):
-        k_offsets, offs_n = program.make_k_offsets(kv_start)
-        v_offsets = program.make_v_offsets(kv_start)
+        # The main loop handles prefix tiles; the two boundary tiles are causal.
+        boundary_start = main_end * cfg.BLOCK_N
+        k_offsets, offs_n = program.make_k_offsets(boundary_start)
+        v_offsets = program.make_v_offsets(boundary_start)
         mask = offs_n[:, None] < program.seq_len
         program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
         program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
@@ -786,13 +752,29 @@ def process_sliding_attention_tile(
         wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        qk = program.apply_sliding_mask(qk, offs_n)
+        qk = gl.where(boundary_mask0, qk, -float("inf"))
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         wait_group(0)
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
-        kv_start = kv_start + cfg.BLOCK_N
+
+        boundary_start = boundary_start + cfg.BLOCK_N
+        k_offsets, offs_n = program.make_k_offsets(boundary_start)
+        v_offsets = program.make_v_offsets(boundary_start)
+        mask = offs_n[:, None] < program.seq_len
+        program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
+        program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+
+        wait_group(1)
+        k = program.shared_load_k(k_smem)
+        qk = program.compute_qk(q, k)
+        qk = gl.where(boundary_mask1, qk, -float("inf"))
+        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+        wait_group(0)
+        v = program.shared_load_v(v_smem)
+        acc = program.compute_pv(p, v, acc)
 
     l_i = program.apply_sinks(l_i, m_i)
     program.store_lse(l_i, m_i)
@@ -889,9 +871,9 @@ def attention_kernel(
         if valid:
             if program.seq_len < cfg.BLOCK_N:
                 if program.q_start == 0:
-                    process_small_attention_tile(program, k_smem, v_smem)
+                    process_single_attention_tile(program, k_smem, v_smem)
             else:
-                process_sliding_attention_tile(program, k_smem, v_smem)
+                process_attention_tile(program, k_smem, v_smem)
     else:
         mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
         mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
@@ -912,7 +894,7 @@ def attention_kernel(
             if valid:
                 if program.seq_len < cfg.BLOCK_N:
                     if program.q_start == 0:
-                        process_small_attention_tile(program, k_smem, v_smem)
+                        process_single_attention_tile(program, k_smem, v_smem)
                 else:
                     process_attention_tile(
                         program, k_smem, v_smem, boundary_mask0, boundary_mask1
