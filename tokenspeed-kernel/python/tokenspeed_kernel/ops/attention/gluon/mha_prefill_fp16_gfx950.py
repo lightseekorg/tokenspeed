@@ -25,24 +25,14 @@ from __future__ import annotations
 import math
 from typing import NamedTuple
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.experimental.gluon.language as gl
 import torch
+from tokenspeed_kernel._triton import gluon, tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_triton import language as tl
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.experimental.gluon.language.amd.cdna4 import (
-    buffer_load,
-    buffer_store,
-    mfma,
-)
-from tokenspeed_triton.experimental.gluon.language.amd.cdna4.async_copy import (
-    buffer_load_to_shared,
-    commit_group,
-    wait_group,
-)
-from tokenspeed_triton.language.core import PropagateNan
+
+gl = gluon.language
+cdna4 = gl.amd.cdna4
+async_copy = cdna4.async_copy
 
 _INV_LN2_VALUE = 1.4426950408889634
 _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
@@ -53,7 +43,7 @@ _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 
 
 @gluon.jit
-def maximum(a, b, propagate_nan: gl.constexpr = PropagateNan.ALL):
+def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
     return gl.maximum(a, b, propagate_nan=propagate_nan)
 
 
@@ -302,8 +292,8 @@ class AttentionProgram:
         )
         mask = offs_m[:, None] < self.seq_len
         if other is None:
-            return buffer_load(self.q_ptr, offsets, mask=mask)
-        return buffer_load(self.q_ptr, offsets, mask=mask, other=other)
+            return cdna4.buffer_load(self.q_ptr, offsets, mask=mask)
+        return cdna4.buffer_load(self.q_ptr, offsets, mask=mask, other=other)
 
     @gluon.jit
     def make_k_offsets(self, kv_start):
@@ -342,22 +332,26 @@ class AttentionProgram:
     @gluon.jit
     def issue_buffer_load_k(self, offsets, k_smem, mask=None, other=None):
         if mask is None:
-            buffer_load_to_shared(k_smem, self.k_ptr, offsets)
+            async_copy.buffer_load_to_shared(k_smem, self.k_ptr, offsets)
         elif other is None:
-            buffer_load_to_shared(k_smem, self.k_ptr, offsets, mask=mask)
+            async_copy.buffer_load_to_shared(k_smem, self.k_ptr, offsets, mask=mask)
         else:
-            buffer_load_to_shared(k_smem, self.k_ptr, offsets, mask=mask, other=other)
-        commit_group()
+            async_copy.buffer_load_to_shared(
+                k_smem, self.k_ptr, offsets, mask=mask, other=other
+            )
+        async_copy.commit_group()
 
     @gluon.jit
     def issue_buffer_load_v(self, offsets, v_smem, mask=None, other=None):
         if mask is None:
-            buffer_load_to_shared(v_smem, self.v_ptr, offsets)
+            async_copy.buffer_load_to_shared(v_smem, self.v_ptr, offsets)
         elif other is None:
-            buffer_load_to_shared(v_smem, self.v_ptr, offsets, mask=mask)
+            async_copy.buffer_load_to_shared(v_smem, self.v_ptr, offsets, mask=mask)
         else:
-            buffer_load_to_shared(v_smem, self.v_ptr, offsets, mask=mask, other=other)
-        commit_group()
+            async_copy.buffer_load_to_shared(
+                v_smem, self.v_ptr, offsets, mask=mask, other=other
+            )
+        async_copy.commit_group()
 
     @gluon.jit
     def shared_load_k(self, k_smem):
@@ -376,11 +370,11 @@ class AttentionProgram:
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
-        return mfma(q, k, qk)
+        return cdna4.mfma(q, k, qk)
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        return mfma(p, v, acc)
+        return cdna4.mfma(p, v, acc)
 
     @gluon.jit
     def init_attention_state(self):
@@ -466,7 +460,7 @@ class AttentionProgram:
         ).to(gl.int32)
         mask = offs_m[:, None] < self.seq_len
         output = output.to(self.output_ptr.dtype.element_ty)
-        buffer_store(output, self.output_ptr, offsets, mask=mask)
+        cdna4.buffer_store(output, self.output_ptr, offsets, mask=mask)
 
     @gluon.jit
     def store_lse(self, l_i, m_i):
@@ -481,7 +475,7 @@ class AttentionProgram:
             mask = offs_m < self.seq_len
             lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
             lse = m_i * cfg.SM_SCALE + gl.log2(lse_l_i)
-            buffer_store(lse, self.lse_ptr, offsets, mask=mask)
+            cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
 
 @gluon.aggregate
@@ -636,7 +630,7 @@ def process_single_attention_tile(
         program.seq_base + k_offs_n[None, :], program.kv_head, k_offs_d[:, None]
     )
     k_mask = k_offs_n[None, :] < program.seq_len
-    k = buffer_load(program.k_ptr, k_offsets, mask=k_mask, other=0.0)
+    k = cdna4.buffer_load(program.k_ptr, k_offsets, mask=k_mask, other=0.0)
 
     v_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout))
     v_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
@@ -644,7 +638,7 @@ def process_single_attention_tile(
         program.seq_base + v_offs_n[:, None], program.kv_head, v_offs_d[None, :]
     )
     v_mask = v_offs_n[:, None] < program.seq_len
-    v = buffer_load(program.v_ptr, v_offsets, mask=v_mask, other=0.0)
+    v = cdna4.buffer_load(program.v_ptr, v_offsets, mask=v_mask, other=0.0)
 
     qk = program.compute_qk(q, k)
 
@@ -705,13 +699,13 @@ def process_attention_tile(
             program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
             program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
-            wait_group(1)
+            async_copy.wait_group(1)
             k = program.shared_load_k(k_smem)
             qk = program.compute_qk(q, k)
             qk = program.apply_sliding_mask(qk, offs_n)
             p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
-            wait_group(0)
+            async_copy.wait_group(0)
             v = program.shared_load_v(v_smem)
             acc = program.compute_pv(p, v, acc)
             kv_start = kv_start + cfg.BLOCK_N
@@ -728,12 +722,12 @@ def process_attention_tile(
             program.issue_buffer_load_k(k_offsets, k_smem)
             program.issue_buffer_load_v(v_offsets, v_smem)
 
-            wait_group(1)
+            async_copy.wait_group(1)
             k = program.shared_load_k(k_smem)
             qk = program.compute_qk(q, k)
             p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
-            wait_group(0)
+            async_copy.wait_group(0)
             v = program.shared_load_v(v_smem)
             acc = program.compute_pv(p, v, acc)
 
@@ -749,13 +743,13 @@ def process_attention_tile(
         program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
         program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
-        wait_group(1)
+        async_copy.wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
         qk = gl.where(boundary_mask0, qk, -float("inf"))
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
-        wait_group(0)
+        async_copy.wait_group(0)
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
 
@@ -766,13 +760,13 @@ def process_attention_tile(
         program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
         program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
-        wait_group(1)
+        async_copy.wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
         qk = gl.where(boundary_mask1, qk, -float("inf"))
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
-        wait_group(0)
+        async_copy.wait_group(0)
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
 
