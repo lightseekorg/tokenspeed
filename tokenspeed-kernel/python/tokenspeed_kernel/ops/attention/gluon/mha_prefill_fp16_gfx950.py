@@ -26,7 +26,7 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, tl, triton
+from tokenspeed_kernel._triton import gl, gluon, tl
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 
@@ -78,15 +78,10 @@ class AttentionConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
-    BATCH_SIZE: gl.constexpr
-    MAX_SEQLEN: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
-    NUM_Q_BLOCKS: gl.constexpr
-    NUM_TILES: gl.constexpr
-    NUM_SMS: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
     q_input_layout: InputLayout
@@ -113,26 +108,16 @@ class AttentionConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
-        MAX_SEQLEN,
         HAS_SINK,
         HAS_LSE,
         IS_SLIDING,
         WINDOW_LEFT,
-        NUM_Q_BLOCKS,
-        NUM_TILES,
-        NUM_SMS,
-        NUM_XCDS,
-        NUM_BLOCKS,
         q_input_layout,
         k_input_layout,
         v_input_layout,
     ):
         assert HEAD_DIM == 64
         assert NUM_WARPS == 4
-        assert NUM_SMS % NUM_XCDS == 0
-        assert NUM_BLOCKS % NUM_XCDS == 0
-        assert NUM_BLOCKS >= N_HEADS
         if IS_SLIDING:
             assert WINDOW_LEFT >= 0
         else:
@@ -167,17 +152,12 @@ class AttentionConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
-        self.MAX_SEQLEN = gl.constexpr(MAX_SEQLEN)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
-        self.NUM_Q_BLOCKS = gl.constexpr(NUM_Q_BLOCKS)
-        self.NUM_TILES = gl.constexpr(NUM_TILES)
-        self.NUM_SMS = gl.constexpr(NUM_SMS)
-        self.NUM_XCDS = gl.constexpr(NUM_XCDS)
-        self.NUM_BLOCKS = gl.constexpr(NUM_BLOCKS)
+        self.NUM_XCDS = gl.constexpr(8)
+        self.NUM_BLOCKS = gl.constexpr(512)
         self.q_input_layout = q_input_layout
         self.k_input_layout = k_input_layout
         self.v_input_layout = v_input_layout
@@ -474,89 +454,50 @@ class AttentionProgram:
 @gluon.aggregate
 class ProgramScheduler:
     cfg: gl.constexpr
-    lane_valid: gl.tensor
-    batch: gl.tensor
-    q_head: gl.tensor
-    q_lane: gl.tensor
-    query_block: gl.tensor
-    batch_slots: gl.constexpr
-    q_lanes: gl.constexpr
-    q_rounds_per_wave: gl.constexpr
-    num_q_rounds: gl.constexpr
+    work: gl.tensor
+    total_work: gl.tensor
+    num_q_blocks: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(self, cfg, work, total_work, num_q_blocks):
+        self.cfg = gl.constexpr(cfg)
+        self.work = work
+        self.total_work = total_work
+        self.num_q_blocks = num_q_blocks
 
     @gluon.jit
-    def create(cfg):
+    def create(cfg, batch_size, max_seqlen_q):
+        num_q_blocks = (max_seqlen_q + cfg.BLOCK_M - 1) // cfg.BLOCK_M
+        total_work = batch_size * cfg.N_HEADS * num_q_blocks
+
         # Physical pids are interleaved across XCDs by launch order. The remap
         # below deinterleaves them into contiguous logical pid ranges: local_pid
-        # is the CTA's ordinal within one XCD, and logical_pid is the id used for
-        # assigning batch/head/Q-block work while keeping adjacent heads grouped
-        # per XCD.
+        # is the CTA's ordinal within one XCD, and work is the first logical tile
+        # assigned to this persistent CTA.
         start_pid = gl.program_id(axis=0)
-        if cfg.IS_SLIDING:
-            pids_per_xcd: gl.constexpr = (
-                cfg.NUM_TILES + cfg.NUM_XCDS - 1
-            ) // cfg.NUM_XCDS
-            xcd = start_pid % cfg.NUM_XCDS
-            local_pid = start_pid // cfg.NUM_XCDS
-            logical_pid = xcd * pids_per_xcd + local_pid
-            lane_valid = logical_pid < cfg.NUM_TILES
-            safe_pid = gl.where(lane_valid, logical_pid, 0)
-            query_block = safe_pid % cfg.NUM_Q_BLOCKS
-            head_batch = safe_pid // cfg.NUM_Q_BLOCKS
-            q_head = head_batch % cfg.N_HEADS
-            batch = head_batch // cfg.N_HEADS
-            q_lane = safe_pid - safe_pid
-            batch_slots: gl.constexpr = 1
-            q_lanes: gl.constexpr = 1
-            q_rounds_per_wave: gl.constexpr = 1
-            num_q_rounds: gl.constexpr = 1
-        else:
-            pids_per_xcd: gl.constexpr = cfg.NUM_BLOCKS // cfg.NUM_XCDS
-            xcd = start_pid % cfg.NUM_XCDS
-            local_pid = start_pid // cfg.NUM_XCDS
-            logical_pid = xcd * pids_per_xcd + local_pid
+        pids_per_xcd: gl.constexpr = cfg.NUM_BLOCKS // cfg.NUM_XCDS
+        xcd = start_pid % cfg.NUM_XCDS
+        local_pid = start_pid // cfg.NUM_XCDS
+        work = xcd * pids_per_xcd + local_pid
 
-            max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
-            if cfg.BATCH_SIZE < max_batch_slots:
-                batch_slots: gl.constexpr = cfg.BATCH_SIZE
-            else:
-                batch_slots: gl.constexpr = max_batch_slots
+        return ProgramScheduler(gl.constexpr(cfg), work, total_work, num_q_blocks)
 
-            q_lanes: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
-            q_rounds_per_wave: gl.constexpr = (
-                cfg.NUM_Q_BLOCKS + q_lanes - 1
-            ) // q_lanes
-            num_batch_waves: gl.constexpr = (
-                cfg.BATCH_SIZE + batch_slots - 1
-            ) // batch_slots
-            num_q_rounds: gl.constexpr = num_batch_waves * q_rounds_per_wave
+    @gluon.jit
+    def has_work(self):
+        return self.work < self.total_work
 
-            active_lanes: gl.constexpr = batch_slots * cfg.N_HEADS * q_lanes
-            lane_valid = logical_pid < active_lanes
-            safe_pid = gl.where(lane_valid, logical_pid, 0)
-            q_lane = safe_pid % q_lanes
-            head_batch_slot = safe_pid // q_lanes
-            q_head = head_batch_slot % cfg.N_HEADS
-            batch = head_batch_slot // cfg.N_HEADS
-            query_block = safe_pid - safe_pid
-
+    @gluon.jit
+    def advance(self):
         return ProgramScheduler(
-            gl.constexpr(cfg),
-            lane_valid,
-            batch,
-            q_head,
-            q_lane,
-            query_block,
-            batch_slots,
-            q_lanes,
-            q_rounds_per_wave,
-            num_q_rounds,
+            gl.constexpr(self.cfg),
+            self.work + self.cfg.NUM_BLOCKS,
+            self.total_work,
+            self.num_q_blocks,
         )
 
     @gluon.jit
     def get_program(
         self,
-        q_round,
         q_ptr,
         k_ptr,
         v_ptr,
@@ -566,31 +507,12 @@ class ProgramScheduler:
         cu_seqlens_ptr,
     ):
         cfg = self.cfg
-
-        if cfg.IS_SLIDING:
-            query_block = self.query_block
-            batch = self.batch
-            valid = self.lane_valid
-        else:
-            batch_wave = q_round // self.q_rounds_per_wave
-            wave_round = q_round - batch_wave * self.q_rounds_per_wave
-            query_block_inc = wave_round * self.q_lanes + self.q_lane
-            query_block_dec = wave_round * self.q_lanes + (
-                self.q_lanes - 1 - self.q_lane
-            )
-            query_block = gl.where(
-                wave_round % 2 == 0, query_block_inc, query_block_dec
-            )
-            batch = batch_wave * self.batch_slots + self.batch
-            valid = (
-                self.lane_valid
-                & (batch < cfg.BATCH_SIZE)
-                & (query_block < cfg.NUM_Q_BLOCKS)
-            )
-
-        safe_batch = gl.where(valid, batch, 0)
-        seq_base = gl.load(cu_seqlens_ptr + safe_batch)
-        seq_end = gl.load(cu_seqlens_ptr + safe_batch + 1)
+        query_block = self.work % self.num_q_blocks
+        head_batch = self.work // self.num_q_blocks
+        q_head = head_batch % cfg.N_HEADS
+        batch = head_batch // cfg.N_HEADS
+        seq_base = gl.load(cu_seqlens_ptr + batch)
+        seq_end = gl.load(cu_seqlens_ptr + batch + 1)
         seq_len = seq_end - seq_base
         program = AttentionProgram.initialize_from_state(
             cfg,
@@ -603,9 +525,9 @@ class ProgramScheduler:
             seq_base,
             seq_len,
             query_block,
-            self.q_head,
+            q_head,
         )
-        return program, valid
+        return program, program.q_start < program.seq_len
 
 
 @gluon.jit
@@ -797,17 +719,12 @@ def attention_kernel(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    BATCH_SIZE: gl.constexpr,
-    MAX_SEQLEN: gl.constexpr,
+    batch_size,
+    max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
-    NUM_Q_BLOCKS: gl.constexpr,
-    NUM_TILES: gl.constexpr,
-    NUM_SMS: gl.constexpr,
-    NUM_XCDS: gl.constexpr,
-    NUM_BLOCKS: gl.constexpr,
 ):
     cfg = AttentionConfig(
         N_HEADS,
@@ -817,17 +734,10 @@ def attention_kernel(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
-        MAX_SEQLEN,
         HAS_SINK,
         HAS_LSE,
         IS_SLIDING,
         WINDOW_LEFT,
-        NUM_Q_BLOCKS,
-        NUM_TILES,
-        NUM_SMS,
-        NUM_XCDS,
-        NUM_BLOCKS,
         InputLayout(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputLayout(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputLayout(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -843,33 +753,11 @@ def attention_kernel(
         cfg.v_smem_layout,
     )
 
-    scheduler = ProgramScheduler.create(cfg)
-    if cfg.IS_SLIDING:
-        program, valid = scheduler.get_program(
-            0,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            output_ptr,
-            sink_ptr,
-            lse_ptr,
-            cu_seqlens_ptr,
-        )
-        if valid:
-            if program.seq_len < cfg.BLOCK_N:
-                if program.q_start == 0:
-                    process_single_attention_tile(program, k_smem, v_smem)
-            else:
-                process_attention_tile(program, k_smem, v_smem)
-    else:
-        mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-        mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
-        boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
-        boundary_mask1 = (mask_offs_n[None, :] + cfg.BLOCK_N) <= mask_offs_m[:, None]
+    scheduler = ProgramScheduler.create(cfg, batch_size, max_seqlen_q)
 
-        for q_round in range(0, scheduler.num_q_rounds):
-            program, valid = scheduler.get_program(
-                q_round,
+    if cfg.IS_SLIDING:
+        while scheduler.has_work():
+            program, active = scheduler.get_program(
                 q_ptr,
                 k_ptr,
                 v_ptr,
@@ -878,7 +766,30 @@ def attention_kernel(
                 lse_ptr,
                 cu_seqlens_ptr,
             )
-            if valid:
+            if active:
+                if program.seq_len < cfg.BLOCK_N:
+                    if program.q_start == 0:
+                        process_single_attention_tile(program, k_smem, v_smem)
+                else:
+                    process_attention_tile(program, k_smem, v_smem)
+            scheduler = scheduler.advance()
+    else:
+        mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
+        mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
+        boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
+        boundary_mask1 = (mask_offs_n[None, :] + cfg.BLOCK_N) <= mask_offs_m[:, None]
+
+        while scheduler.has_work():
+            program, active = scheduler.get_program(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                output_ptr,
+                sink_ptr,
+                lse_ptr,
+                cu_seqlens_ptr,
+            )
+            if active:
                 if program.seq_len < cfg.BLOCK_N:
                     if program.q_start == 0:
                         process_single_attention_tile(program, k_smem, v_smem)
@@ -886,6 +797,7 @@ def attention_kernel(
                     process_attention_tile(
                         program, k_smem, v_smem, boundary_mask0, boundary_mask1
                     )
+            scheduler = scheduler.advance()
 
 
 # ===-----------------------------------------------------------------------===#
@@ -905,11 +817,6 @@ class LaunchConfig(NamedTuple):
     max_seqlen: int
     is_sliding: bool
     window_left: int
-    num_q_blocks: int
-    num_tiles: int
-    num_sms: int
-    num_xcds: int
-    num_blocks: int
     grid: tuple[int, ...]
 
 
@@ -928,19 +835,9 @@ def get_config(
     block_n = 64
     num_warps = 4
     batch_size = cu_seqlens_q.numel() - 1
-    num_sms = 256
-    num_xcds = 8
-    num_blocks = num_sms * 2
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
-    num_q_blocks = triton.cdiv(max_seqlen_q, block_m)
-    num_tiles = num_q_blocks * n_heads * batch_size
     sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
-    if is_sliding:
-        grid_tiles = triton.cdiv(num_tiles, num_xcds) * num_xcds
-        grid = (grid_tiles if grid_tiles > 1 else 1,)
-    else:
-        grid = (num_blocks,)
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -953,12 +850,7 @@ def get_config(
         max_seqlen=max_seqlen_q,
         is_sliding=is_sliding,
         window_left=window_left,
-        num_q_blocks=num_q_blocks,
-        num_tiles=num_tiles,
-        num_sms=num_sms,
-        num_xcds=num_xcds,
-        num_blocks=num_blocks,
-        grid=grid,
+        grid=(512,),
     )
 
 
@@ -1046,11 +938,6 @@ def gluon_mha_prefill_fp16_gfx950(
         has_lse,
         config.is_sliding,
         config.window_left,
-        config.num_q_blocks,
-        config.num_tiles,
-        config.num_sms,
-        config.num_xcds,
-        config.num_blocks,
         num_warps=config.num_warps,
     )
     if return_lse:
