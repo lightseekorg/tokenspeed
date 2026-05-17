@@ -87,7 +87,7 @@ def _get_ragged_prefill_wrapper(
     wrapper = _ragged_prefill_wrappers.get(device)
     if wrapper is None:
         workspace = torch.empty(
-            128 * 1024 * 1024,
+            256 * 1024 * 1024,
             dtype=torch.uint8,
             device=device,
         )
@@ -111,7 +111,7 @@ if platform.is_nvidia and platform.is_blackwell:
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "head_dim": frozenset({64, 128}),
+            "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False}),
             "support_logit_cap": frozenset({False, True}),
