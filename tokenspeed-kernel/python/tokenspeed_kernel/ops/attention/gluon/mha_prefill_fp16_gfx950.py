@@ -26,11 +26,10 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel._triton import gluon, tl, triton
+from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 
-gl = gluon.language
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
