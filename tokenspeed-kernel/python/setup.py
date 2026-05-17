@@ -453,6 +453,30 @@ class CudaKernelBuilder:
             archs.add(self._normalize_cuda_arch(direct))
             return archs
 
+        # Try detecting from the NVIDIA driver.
+        if not archs:
+            try:
+                caps = (
+                    subprocess.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=compute_cap",
+                            "--format=csv,noheader",
+                        ],
+                        text=True,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    .strip()
+                    .splitlines()
+                )
+                for cap in caps:
+                    cap = cap.strip()
+                    if cap:
+                        archs.add(self._normalize_cuda_arch(cap + "a"))
+            except (OSError, subprocess.CalledProcessError):
+                pass
+
+        # Fallback: Blackwell
         if not archs:
             archs.add("100a")
         return archs
