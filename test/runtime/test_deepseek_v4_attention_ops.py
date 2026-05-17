@@ -584,6 +584,112 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         expected = torch.topk(logits, k=2, dim=-1, sorted=False).indices.to(torch.int32)
         torch.testing.assert_close(topk.cpu(), expected.cpu(), atol=0, rtol=0)
 
+    def _assert_persistent_topk_matches_torch(
+        self,
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        output: torch.Tensor,
+        topk: int,
+    ) -> None:
+        for row_idx, raw_len in enumerate(lengths.cpu().tolist()):
+            row_output = output[row_idx].cpu()
+            if raw_len <= topk:
+                expected = torch.full((topk,), -1, dtype=torch.int32)
+                if raw_len > 0:
+                    expected[:raw_len] = torch.arange(raw_len, dtype=torch.int32)
+                self.assertTrue(torch.equal(row_output, expected))
+                continue
+
+            expected = (
+                torch.topk(
+                    logits[row_idx, :raw_len],
+                    k=topk,
+                    dim=-1,
+                    sorted=False,
+                )
+                .indices.to(torch.int32)
+                .sort()
+                .values.cpu()
+            )
+            self.assertTrue(torch.equal(row_output.sort().values, expected))
+
+    def test_persistent_topk_matches_torch_across_decode_medium_large_paths(self):
+        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+            has_persistent_topk,
+            persistent_topk,
+        )
+
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6790)
+        device = torch.device("cuda")
+        topk = 512
+        lengths = torch.tensor(
+            [0, 7, 513, 9000, 33000], device=device, dtype=torch.int32
+        )
+        stride = 33024
+        logits = torch.randn(
+            (lengths.numel(), stride), device=device, dtype=torch.float32
+        )
+        for row_idx, raw_len in enumerate(lengths.cpu().tolist()):
+            if raw_len < stride:
+                logits[row_idx, raw_len:] = 1.0e6
+        output = torch.full(
+            (lengths.numel(), topk), -77, device=device, dtype=torch.int32
+        )
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        persistent_topk(
+            logits,
+            lengths,
+            output,
+            workspace,
+            topk,
+            int(lengths.max().item()),
+        )
+        torch.cuda.synchronize()
+
+        self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
+
+    def test_persistent_topk_matches_torch_for_batch_gt_32(self):
+        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+            has_persistent_topk,
+            persistent_topk,
+        )
+
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6791)
+        device = torch.device("cuda")
+        topk = 512
+        num_rows = 36
+        stride = 544
+        lengths = torch.tensor(
+            [0, 17] + [520 + (idx % 24) for idx in range(num_rows - 2)],
+            device=device,
+            dtype=torch.int32,
+        )
+        logits = torch.randn((num_rows, stride), device=device, dtype=torch.float32)
+        for row_idx, raw_len in enumerate(lengths.cpu().tolist()):
+            if raw_len < stride:
+                logits[row_idx, raw_len:] = 1.0e6
+        output = torch.full((num_rows, topk), -77, device=device, dtype=torch.int32)
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        persistent_topk(
+            logits,
+            lengths,
+            output,
+            workspace,
+            topk,
+            int(lengths.max().item()),
+        )
+        torch.cuda.synchronize()
+
+        self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
+
     def test_indexer_mxfp4_cache_matches_reference(self):
         torch.manual_seed(7890)
         device = torch.device("cuda")
