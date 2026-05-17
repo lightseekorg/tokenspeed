@@ -102,6 +102,7 @@ PER_REQUEST_TIMEOUT_SEC = float(
 DEFAULT_NUM_PROMPTS = 1000
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+MTBENCH_URL = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
 OPENAI_COMPATIBLE_BACKENDS = frozenset({"openai", "tokenspeed"})
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,7 @@ class BenchmarkMetrics:
     percentiles_e2el_ms: list[tuple[float, float]]
     max_output_tokens_per_s: float
     max_concurrent_requests: int
+    mean_accept_length: float
 
 
 def set_ulimit(target_soft_limit: int = 65535) -> None:
@@ -1049,6 +1051,58 @@ def sample_sharegpt_requests(
     return samples
 
 
+def sample_mtbench_requests(
+    dataset_path: str | None,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: int | None = None,
+    max_model_len: int | None = None,
+    apply_chat_template: bool = False,
+    skip_min_tokens_check: bool = False,
+) -> list[SampleRequest]:
+    if not dataset_path:
+        dataset_path = download_and_cache_file(MTBENCH_URL)
+
+    questions: list[str] = []
+    with open(dataset_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            turns = entry.get("turns", [])
+            if turns:
+                questions.append(turns[0])
+    random.shuffle(questions)
+
+    samples: list[SampleRequest] = []
+    valid: list[SampleRequest] = []
+    for prompt in questions:
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
+        prompt_len = len(tokenizer.encode(prompt))
+        output_len = fixed_output_len if fixed_output_len is not None else 256
+        if not is_valid_sequence(
+            prompt_len, output_len, max_model_len, skip_min_tokens_check
+        ):
+            continue
+        valid.append(SampleRequest(prompt, prompt_len, output_len))
+    for i in range(num_requests):
+        if not valid:
+            break
+        samples.append(valid[i % len(valid)])
+
+    print(f"#Input tokens: {sum(x.prompt_len for x in samples)}")
+    print(f"#Output tokens: {sum(x.expected_output_len for x in samples)}")
+    return samples
+
+
 def sample_random_requests(
     input_len: int,
     output_len: int,
@@ -1087,6 +1141,16 @@ def get_samples(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
+            max_model_len=args.max_model_len,
+            apply_chat_template=args.apply_chat_template,
+            skip_min_tokens_check=args.skip_min_tokens_check,
+        )
+    if args.dataset_name == "mtbench":
+        return sample_mtbench_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.mtbench_output_len,
             max_model_len=args.max_model_len,
             apply_chat_template=args.apply_chat_template,
             skip_min_tokens_check=args.skip_min_tokens_check,
@@ -1253,6 +1317,8 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    total_output_tokens_for_accept = 0
+    total_chunks_for_accept = 0
 
     for output in outputs:
         if output.success:
@@ -1277,6 +1343,9 @@ def calculate_metrics(
             itls.extend(output.itl)
             ttfts.append(output.ttft)
             e2els.append(output.latency)
+            if output_len > 0 and output.itl:
+                total_output_tokens_for_accept += output_len
+                total_chunks_for_accept += len(output.itl)
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -1386,6 +1455,11 @@ def calculate_metrics(
         ],
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        mean_accept_length=(
+            total_output_tokens_for_accept / total_chunks_for_accept
+            if total_chunks_for_accept > 0
+            else 1.0
+        ),
     )
     return metrics, actual_output_lens
 
@@ -1619,6 +1693,9 @@ async def benchmark(
         metrics.total_token_throughput,
         precision=2,
     )
+    _print_metric_row(
+        "Mean accept length (tok/step):", metrics.mean_accept_length, precision=2
+    )
 
     result: dict[str, Any] = {
         "duration": benchmark_duration,
@@ -1630,6 +1707,7 @@ async def benchmark(
         "request_goodput": metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
+        "mean_accept_length": metrics.mean_accept_length,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -1749,7 +1827,7 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
         "--dataset-name",
         type=str,
         default="random",
-        choices=["sharegpt", "random"],
+        choices=["sharegpt", "random", "mtbench"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1761,6 +1839,7 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--skip-min-tokens-check", action="store_true")
     parser.add_argument("--sharegpt-output-len", type=int, default=None)
+    parser.add_argument("--mtbench-output-len", type=int, default=None)
     parser.add_argument("--random-input-len", type=int, default=1024)
     parser.add_argument("--random-output-len", type=int, default=128)
     parser.add_argument("--random-range-ratio", type=float, default=0.0)
@@ -1840,6 +1919,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     if args.output_len is not None:
         args.random_output_len = args.output_len
         args.sharegpt_output_len = args.output_len
+        args.mtbench_output_len = args.output_len
 
     if args.ramp_up_strategy is not None:
         if args.request_rate != float("inf"):

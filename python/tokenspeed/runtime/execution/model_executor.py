@@ -228,7 +228,15 @@ class ModelExecutor:
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
-                self.model_runner.model.set_eagle3_layers_to_capture()
+                draft_layer_ids = None
+                draft_model = getattr(draft_model_runner, "model", None)
+                if (
+                    draft_model is not None
+                    and hasattr(draft_model, "model")
+                    and hasattr(draft_model.model, "get_aux_hidden_state_layer_ids")
+                ):
+                    draft_layer_ids = draft_model.model.get_aux_hidden_state_layer_ids()
+                self.model_runner.model.set_eagle3_layers_to_capture(draft_layer_ids)
         else:
             self.drafter = None
 
