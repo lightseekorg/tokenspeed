@@ -471,15 +471,39 @@ class Eagle3LlamaModel(BaseTransformerModel):
         self.midlayer = self.layers[0]
         del self.layers
 
-        self.num_fc_input_dim = (
-            len(config.eagle_aux_hidden_state_layer_ids)
-            if hasattr(config, "eagle_aux_hidden_state_layer_ids")
-            else 3
-        )
+        # Target-model hidden width; falls back to draft hidden_size when the
+        # draft and target share dimensions.
+        self.hidden_size_in = getattr(config, "target_hidden_size", config.hidden_size)
+
+        self.num_fc_input_dim = getattr(config, "num_aux_hidden_states", None)
+        if self.num_fc_input_dim is None:
+            layer_ids = self.get_aux_hidden_state_layer_ids()
+            self.num_fc_input_dim = len(layer_ids) if layer_ids else 3
 
         self.fc = torch.nn.Linear(
-            config.hidden_size * self.num_fc_input_dim, config.hidden_size
+            self.hidden_size_in * self.num_fc_input_dim,
+            config.hidden_size,
+            bias=getattr(config, "bias", False),
         )
+
+        # Per-aux RMSNorm applied chunk-wise before `fc`.
+        if getattr(config, "fc_norm", None):
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+                    for _ in range(self.num_fc_input_dim)
+                ]
+            )
+        else:
+            self.fc_norm = None
+
+        # When True, drafter consumes its own hidden states after the final norm.
+        self.norm_output = getattr(config, "norm_output", False)
+
+    def get_aux_hidden_state_layer_ids(self):
+        eagle_config = getattr(self.config, "eagle_config", None) or {}
+        layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", None)
+        return layer_ids
 
     def forward(
         self,
@@ -509,6 +533,12 @@ class Eagle3LlamaModel(BaseTransformerModel):
         if hidden_states is None:
             raise ValueError("Eagle3 forward requires hidden_states")
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.fc_norm is not None:
+                chunks = hidden_states.chunk(self.num_fc_input_dim, dim=-1)
+                hidden_states = torch.cat(
+                    [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                    dim=-1,
+                )
             hidden_states = self.fc(hidden_states)
 
         residual = None
@@ -537,7 +567,8 @@ class Eagle3LlamaModel(BaseTransformerModel):
                 hidden_states_to_aux, None, ctx
             )
 
-        return hidden_states_to_logits, [hidden_states_to_aux]
+        aux = hidden_states_to_logits if self.norm_output else hidden_states_to_aux
+        return hidden_states_to_logits, [aux]
 
 
 class LlamaForCausalLMEagle3(BaseCausalLM):
@@ -592,11 +623,11 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         else:
             # During CUDA graph capture warmup, provide dummy hidden states.
             num_tokens = input_ids.shape[0]
-            hidden_size = self.config.hidden_size
+            hidden_size_in = self.model.hidden_size_in
             num_fc = self.model.num_fc_input_dim
             model_kwargs["hidden_states"] = torch.zeros(
                 num_tokens,
-                hidden_size * num_fc,
+                hidden_size_in * num_fc,
                 dtype=torch.bfloat16,
                 device=input_ids.device,
             )
@@ -613,7 +644,21 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        for name, loaded_weight in weights:
+        # Map incoming checkpoint names to current module attribute names.
+        legacy_name_map = {
+            "layers.0": "midlayer",
+        }
+
+        loaded_param_names: set[str] = set()
+        unmatched_checkpoint_keys: list[str] = []
+        self.hot_token_id = None
+
+        for original_name, loaded_weight in weights:
+            name = original_name
+            for legacy, new in legacy_name_map.items():
+                if legacy in name:
+                    name = name.replace(legacy, new)
+
             if "d2t" in name:
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
                 continue
@@ -621,26 +666,64 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             if "t2d" in name:
                 continue
 
+            matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param_name = f"model.{name}" if name not in params_dict else name
-                if param_name in params_dict:
-                    param = params_dict[param_name]
+                resolved = f"model.{name}" if name not in params_dict else name
+                if resolved in params_dict:
+                    param = params_dict[resolved]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, shard_id)
+                    loaded_param_names.add(resolved)
+                    matched = True
                 break
             else:
-                param_name = name if name in params_dict else f"model.{name}"
-                if param_name in params_dict:
-                    param = params_dict[param_name]
+                resolved = name if name in params_dict else f"model.{name}"
+                if resolved in params_dict:
+                    param = params_dict[resolved]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    loaded_param_names.add(resolved)
+                    matched = True
+
+            if not matched:
+                unmatched_checkpoint_keys.append(original_name)
+
+        # ``embed_tokens`` and ``lm_head`` are overwritten later by
+        # ``set_embed_and_head`` when draft/target hidden sizes match, so
+        # they're expected to be missing from the EAGLE checkpoint.
+        expected_missing = {"model.embed_tokens.weight", "lm_head.weight"}
+        missing_param_names = sorted(
+            set(params_dict) - loaded_param_names - expected_missing
+        )
+
+        if unmatched_checkpoint_keys:
+            logger.warning(
+                "EAGLE3 load_weights: %d checkpoint key(s) did not match any "
+                "module parameter and were dropped: %s",
+                len(unmatched_checkpoint_keys),
+                unmatched_checkpoint_keys,
+            )
+        if missing_param_names:
+            logger.warning(
+                "EAGLE3 load_weights: %d module parameter(s) were not "
+                "populated from the checkpoint and remain at initial values: "
+                "%s",
+                len(missing_param_names),
+                missing_param_names,
+            )
+        if self.hot_token_id is None:
+            logger.warning(
+                "EAGLE3 load_weights: no 'd2t' tensor found in the checkpoint; "
+                "draft-to-target vocab mapping will be missing and acceptance "
+                "will be incorrect."
+            )
 
     def get_hot_token_id(self):
         return self.hot_token_id
