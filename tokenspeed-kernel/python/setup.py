@@ -472,7 +472,7 @@ class CudaKernelBuilder:
                 for cap in caps:
                     cap = cap.strip()
                     if cap:
-                        archs.add(self._normalize_cuda_arch(cap + "a"))
+                        archs.add(self._normalize_cuda_arch(cap))
             except (OSError, subprocess.CalledProcessError):
                 pass
 
