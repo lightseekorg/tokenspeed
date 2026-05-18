@@ -655,7 +655,7 @@ def process_attention_tile(
         k_offsets, offs_n = program.make_k_offsets(boundary_start)
         v_offsets = program.make_v_offsets(boundary_start)
         mask = offs_n[:, None] < program.seq_len
-        program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
+        program.issue_buffer_load_k(k_offsets, k_smem, mask=mask, other=0.0)
         program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
         async_copy.wait_group(1)
@@ -672,7 +672,7 @@ def process_attention_tile(
         k_offsets, offs_n = program.make_k_offsets(boundary_start)
         v_offsets = program.make_v_offsets(boundary_start)
         mask = offs_n[:, None] < program.seq_len
-        program.issue_buffer_load_k(k_offsets, k_smem, mask=mask)
+        program.issue_buffer_load_k(k_offsets, k_smem, mask=mask, other=0.0)
         program.issue_buffer_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
         async_copy.wait_group(1)
