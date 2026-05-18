@@ -1,10 +1,21 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Portions of this file are adapted from vLLM csrc/topk.cu.
+ * Portions of this file are adapted from vLLM:
+ *   csrc/topk.cu
+ *   csrc/persistent_topk.cuh
+ *
+ * Original copyright:
+ *   Copyright contributors to the vLLM project
  *
  * Modifications copyright:
  *   Copyright (c) 2026 LightSeek Foundation
+ *
+ * TokenSpeed modifications:
+ *   - Ported the PyTorch custom op boundary to TokenSpeed's TVM FFI CUDA
+ *     extension style.
+ *   - Exposed only the DeepSeek V4 CSA top-k contracts needed by the model
+ *     runtime.
  */
 
 #include <algorithm>
@@ -17,6 +28,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "deepseek_v4_persistent_topk.cuh"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::TensorView;
@@ -435,4 +447,213 @@ void deepseek_v4_indexer_topk_prefill(TensorView logits, TensorView row_starts,
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "deepseek_v4_indexer_topk_prefill failed: "
       << cudaGetErrorString(err);
+}
+
+namespace {
+
+constexpr int64_t kRadixTopkWorkspaceSize = 1024 * 1024;
+
+template <int TopK>
+void launch_persistent_topk(const TensorView& logits,
+                            const TensorView& lengths,
+                            TensorView& output,
+                            TensorView& workspace,
+                            int64_t max_seq_len,
+                            cudaStream_t stream) {
+  namespace P = vllm::persistent;
+
+  const int64_t num_rows = logits.size(0);
+  const int64_t stride = logits.size(1);
+
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "cudaGetDevice failed: " << cudaGetErrorString(err);
+
+  int num_sms = 0;
+  int max_smem_per_block = 0;
+  err = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "cudaDevAttrMultiProcessorCount query failed: "
+      << cudaGetErrorString(err);
+  err = cudaDeviceGetAttribute(&max_smem_per_block,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               device);
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "cudaDevAttrMaxSharedMemoryPerBlockOptin query failed: "
+      << cudaGetErrorString(err);
+
+  if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
+    cudaError_t status =
+        vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
+            static_cast<float*>(logits.data_ptr()),
+            static_cast<int32_t*>(output.data_ptr()),
+            static_cast<int32_t*>(lengths.data_ptr()),
+            static_cast<uint32_t>(num_rows), static_cast<uint32_t>(TopK),
+            static_cast<uint32_t>(stride), stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "FilteredTopK failed: " << cudaGetErrorString(status);
+  } else {
+    TVM_FFI_ICHECK(workspace.size(0) >= kRadixTopkWorkspaceSize)
+        << "workspace too small for persistent topk";
+
+    int effective_max_smem;
+    if (num_rows <= 4) {
+      effective_max_smem =
+          std::min(max_smem_per_block, static_cast<int>(P::kSmemMedium));
+    } else if (num_rows <= 8) {
+      constexpr int kSmemCapMedium = 48 * 1024;
+      effective_max_smem = std::min(max_smem_per_block, kSmemCapMedium);
+    } else {
+      effective_max_smem = max_smem_per_block;
+    }
+
+    TVM_FFI_ICHECK(static_cast<size_t>(effective_max_smem) >
+                   P::kFixedSmemLarge)
+        << "insufficient shared memory for persistent topk";
+    size_t available_for_ordered =
+        static_cast<size_t>(effective_max_smem) - P::kFixedSmemLarge;
+    uint32_t max_chunk_elements =
+        static_cast<uint32_t>(available_for_ordered / sizeof(uint32_t));
+
+    uint32_t vec_size = 1;
+    if (stride % 4 == 0) {
+      vec_size = 4;
+    } else if (stride % 2 == 0) {
+      vec_size = 2;
+    }
+
+    max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
+    uint32_t min_chunk = vec_size * P::kThreadsPerBlock;
+    if (max_chunk_elements < min_chunk) {
+      max_chunk_elements = min_chunk;
+    }
+
+    uint32_t ctas_per_group =
+        (static_cast<uint32_t>(stride) + max_chunk_elements - 1) /
+        max_chunk_elements;
+    uint32_t chunk_size =
+        (static_cast<uint32_t>(stride) + ctas_per_group - 1) / ctas_per_group;
+    chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
+    if (chunk_size > max_chunk_elements) {
+      chunk_size = max_chunk_elements;
+    }
+
+    size_t smem_size = P::kFixedSmemLarge + chunk_size * sizeof(uint32_t);
+    if (smem_size < P::kSmemMedium) {
+      smem_size = P::kSmemMedium;
+    }
+
+    int occupancy = 1;
+    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occupancy, P::persistent_topk_kernel<TopK, 4>, P::kThreadsPerBlock,
+        smem_size);
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "persistent topk occupancy query failed: "
+        << cudaGetErrorString(err);
+    if (occupancy < 1) {
+      occupancy = 1;
+    }
+
+    uint32_t max_resident_ctas = static_cast<uint32_t>(num_sms) * occupancy;
+    uint32_t num_groups = std::min(max_resident_ctas / ctas_per_group,
+                                   static_cast<uint32_t>(num_rows));
+    if (num_groups == 0) {
+      num_groups = 1;
+    }
+    uint32_t total_ctas = num_groups * ctas_per_group;
+
+    size_t state_bytes = num_groups * sizeof(P::RadixRowState);
+    TVM_FFI_ICHECK(workspace.size(0) >= static_cast<int64_t>(state_bytes))
+        << "workspace too small, need " << state_bytes << " bytes";
+    err = cudaMemsetAsync(workspace.data_ptr(), 0, state_bytes, stream);
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "failed to clear persistent topk workspace: "
+        << cudaGetErrorString(err);
+
+    P::PersistentTopKParams params;
+    params.input = static_cast<float*>(logits.data_ptr());
+    params.output = static_cast<int32_t*>(output.data_ptr());
+    params.lengths = static_cast<int32_t*>(lengths.data_ptr());
+    params.num_rows = static_cast<uint32_t>(num_rows);
+    params.stride = static_cast<uint32_t>(stride);
+    params.top_k = static_cast<uint32_t>(TopK);
+    params.chunk_size = chunk_size;
+    params.row_states =
+        reinterpret_cast<P::RadixRowState*>(workspace.data_ptr());
+    params.ctas_per_group = ctas_per_group;
+    params.max_seq_len = static_cast<uint32_t>(max_seq_len);
+
+#define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                      \
+  do {                                                                       \
+    auto kernel = &P::persistent_topk_kernel<TOPK_VAL, VS>;                  \
+    cudaError_t err = cudaFuncSetAttribute(                                  \
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);     \
+    TVM_FFI_ICHECK(err == cudaSuccess)                                       \
+        << "Failed to set smem: " << cudaGetErrorString(err);               \
+    kernel<<<total_ctas, P::kThreadsPerBlock, smem_size, stream>>>(params);  \
+  } while (0)
+
+    if (vec_size == 4) {
+      LAUNCH_PERSISTENT(TopK, 4);
+    } else if (vec_size == 2) {
+      LAUNCH_PERSISTENT(TopK, 2);
+    } else {
+      LAUNCH_PERSISTENT(TopK, 1);
+    }
+#undef LAUNCH_PERSISTENT
+  }
+
+  err = cudaGetLastError();
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "deepseek_v4_persistent_topk failed: " << cudaGetErrorString(err);
+}
+
+}  // namespace
+
+void deepseek_v4_persistent_topk(TensorView logits,
+                                 TensorView lengths,
+                                 TensorView output,
+                                 TensorView workspace,
+                                 int64_t k,
+                                 int64_t max_seq_len) {
+  CHECK_CUDA(logits);
+  CHECK_CUDA(lengths);
+  CHECK_CUDA(output);
+  CHECK_CUDA(workspace);
+  CHECK_DIM(2, logits);
+  TVM_FFI_ICHECK(lengths.ndim() == 1 || lengths.ndim() == 2)
+      << "lengths must be 1D or 2D";
+  CHECK_DIM(2, output);
+  CHECK_DIM(1, workspace);
+  CHECK_CONTIGUOUS(logits);
+  CHECK_CONTIGUOUS(lengths);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(workspace);
+  TVM_FFI_ICHECK(logits.dtype() == dl_float32) << "logits must be float32";
+  TVM_FFI_ICHECK(lengths.dtype() == dl_int32) << "lengths must be int32";
+  TVM_FFI_ICHECK(output.dtype() == dl_int32) << "output must be int32";
+  TVM_FFI_ICHECK(workspace.dtype() == dl_uint8) << "workspace must be uint8";
+  TVM_FFI_ICHECK(lengths.numel() == logits.size(0))
+      << "lengths size mismatch";
+  TVM_FFI_ICHECK(output.size(0) == logits.size(0) && output.size(1) == k)
+      << "output size mismatch";
+  TVM_FFI_ICHECK(k == 512 || k == 1024 || k == 2048)
+      << "persistent topk supports k=512, k=1024, or k=2048, got " << k;
+  TVM_FFI_ICHECK(max_seq_len > 0) << "max_seq_len must be positive";
+
+  cudaError_t err = cudaSetDevice(logits.device().device_id);
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "cudaSetDevice failed: " << cudaGetErrorString(err);
+  cudaStream_t stream = get_stream(logits.device());
+  if (k == 512) {
+    launch_persistent_topk<512>(logits, lengths, output, workspace, max_seq_len,
+                                stream);
+  } else if (k == 1024) {
+    launch_persistent_topk<1024>(logits, lengths, output, workspace, max_seq_len,
+                                 stream);
+  } else {
+    launch_persistent_topk<2048>(logits, lengths, output, workspace, max_seq_len,
+                                 stream);
+  }
 }
