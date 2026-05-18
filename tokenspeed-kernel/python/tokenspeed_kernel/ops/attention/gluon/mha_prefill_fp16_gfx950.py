@@ -78,6 +78,7 @@ class AttentionConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
+    BATCH_SIZE: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     IS_SLIDING: gl.constexpr
@@ -108,6 +109,7 @@ class AttentionConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
+        BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
         IS_SLIDING,
@@ -152,6 +154,7 @@ class AttentionConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
@@ -530,6 +533,132 @@ class ProgramScheduler:
         return program, program.q_start < program.seq_len
 
 
+@gluon.aggregate
+class FullCausalProgramScheduler:
+    cfg: gl.constexpr
+    lane_valid: gl.tensor
+    batch_slot: gl.tensor
+    q_head: gl.tensor
+    q_lane: gl.tensor
+    num_q_blocks: gl.tensor
+    q_rounds_per_wave: gl.tensor
+    num_q_rounds: gl.tensor
+    batch_slots: gl.constexpr
+    q_lanes: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        cfg,
+        lane_valid,
+        batch_slot,
+        q_head,
+        q_lane,
+        num_q_blocks,
+        q_rounds_per_wave,
+        num_q_rounds,
+        batch_slots,
+        q_lanes,
+    ):
+        self.cfg = gl.constexpr(cfg)
+        self.lane_valid = lane_valid
+        self.batch_slot = batch_slot
+        self.q_head = q_head
+        self.q_lane = q_lane
+        self.num_q_blocks = num_q_blocks
+        self.q_rounds_per_wave = q_rounds_per_wave
+        self.num_q_rounds = num_q_rounds
+        self.batch_slots = gl.constexpr(batch_slots)
+        self.q_lanes = gl.constexpr(q_lanes)
+
+    @gluon.jit
+    def create(cfg, max_seqlen_q):
+        num_q_blocks = (max_seqlen_q + cfg.BLOCK_M - 1) // cfg.BLOCK_M
+        max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
+        if cfg.BATCH_SIZE < max_batch_slots:
+            batch_slots: gl.constexpr = cfg.BATCH_SIZE
+        else:
+            batch_slots: gl.constexpr = max_batch_slots
+        q_lanes: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
+
+        q_rounds_per_wave = (num_q_blocks + q_lanes - 1) // q_lanes
+        num_batch_waves: gl.constexpr = (
+            cfg.BATCH_SIZE + batch_slots - 1
+        ) // batch_slots
+        num_q_rounds = num_batch_waves * q_rounds_per_wave
+
+        start_pid = gl.program_id(axis=0)
+        pids_per_xcd: gl.constexpr = cfg.NUM_BLOCKS // cfg.NUM_XCDS
+        xcd = start_pid % cfg.NUM_XCDS
+        local_pid = start_pid // cfg.NUM_XCDS
+        logical_pid = xcd * pids_per_xcd + local_pid
+
+        active_lanes: gl.constexpr = batch_slots * cfg.N_HEADS * q_lanes
+        lane_valid = logical_pid < active_lanes
+        safe_pid = gl.where(lane_valid, logical_pid, 0)
+        q_lane = safe_pid % q_lanes
+        head_batch_slot = safe_pid // q_lanes
+        q_head = head_batch_slot % cfg.N_HEADS
+        batch_slot = head_batch_slot // cfg.N_HEADS
+
+        return FullCausalProgramScheduler(
+            gl.constexpr(cfg),
+            lane_valid,
+            batch_slot,
+            q_head,
+            q_lane,
+            num_q_blocks,
+            q_rounds_per_wave,
+            num_q_rounds,
+            batch_slots,
+            q_lanes,
+        )
+
+    @gluon.jit
+    def has_work(self, q_round):
+        return q_round < self.num_q_rounds
+
+    @gluon.jit
+    def get_program(
+        self,
+        q_round,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        output_ptr,
+        sink_ptr,
+        lse_ptr,
+        cu_seqlens_ptr,
+    ):
+        cfg = self.cfg
+        batch_wave = q_round // self.q_rounds_per_wave
+        wave_round = q_round - batch_wave * self.q_rounds_per_wave
+        query_block_inc = wave_round * self.q_lanes + self.q_lane
+        query_block_dec = wave_round * self.q_lanes + (self.q_lanes - 1 - self.q_lane)
+        query_block = gl.where(wave_round % 2 == 0, query_block_inc, query_block_dec)
+        batch = batch_wave * self.batch_slots + self.batch_slot
+        valid = self.lane_valid & (query_block < self.num_q_blocks)
+
+        safe_batch = gl.where(valid, batch, 0)
+        seq_base = gl.load(cu_seqlens_ptr + safe_batch)
+        seq_end = gl.load(cu_seqlens_ptr + safe_batch + 1)
+        seq_len = seq_end - seq_base
+        program = AttentionProgram.initialize_from_state(
+            cfg,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            output_ptr,
+            sink_ptr,
+            lse_ptr,
+            seq_base,
+            seq_len,
+            query_block,
+            self.q_head,
+        )
+        return program, valid & (program.q_start < program.seq_len)
+
+
 @gluon.jit
 def process_single_attention_tile(
     program: AttentionProgram,
@@ -719,7 +848,7 @@ def attention_kernel(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    batch_size,
+    BATCH_SIZE: gl.constexpr,
     max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
@@ -734,6 +863,7 @@ def attention_kernel(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
+        BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
         IS_SLIDING,
@@ -753,9 +883,8 @@ def attention_kernel(
         cfg.v_smem_layout,
     )
 
-    scheduler = ProgramScheduler.create(cfg, batch_size, max_seqlen_q)
-
     if cfg.IS_SLIDING:
+        scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q)
         while scheduler.has_work():
             program, active = scheduler.get_program(
                 q_ptr,
@@ -774,13 +903,16 @@ def attention_kernel(
                     process_attention_tile(program, k_smem, v_smem)
             scheduler = scheduler.advance()
     else:
+        scheduler = FullCausalProgramScheduler.create(cfg, max_seqlen_q)
         mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
         mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
         boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
         boundary_mask1 = (mask_offs_n[None, :] + cfg.BLOCK_N) <= mask_offs_m[:, None]
 
-        while scheduler.has_work():
+        q_round = 0
+        while scheduler.has_work(q_round):
             program, active = scheduler.get_program(
+                q_round,
                 q_ptr,
                 k_ptr,
                 v_ptr,
@@ -797,7 +929,7 @@ def attention_kernel(
                     process_attention_tile(
                         program, k_smem, v_smem, boundary_mask0, boundary_mask1
                     )
-            scheduler = scheduler.advance()
+            q_round += 1
 
 
 # ===-----------------------------------------------------------------------===#
