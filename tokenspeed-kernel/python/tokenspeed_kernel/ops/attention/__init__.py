@@ -26,11 +26,8 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.attention.flash_attn import (
-    get_scheduler_metadata as _fa3_get_scheduler_metadata,
-)
+from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import error_fn as _error_fn
 from tokenspeed_kernel.selection import select_kernel
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
@@ -382,38 +379,3 @@ def mha_decode_with_kvcache(
         if scheduler_metadata is not None:
             kernel_kwargs["scheduler_metadata"] = scheduler_metadata
         return kernel(**kernel_kwargs)
-
-
-def mha_decode_scheduler_metadata(
-    *,
-    batch_size: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    num_heads_q: int,
-    num_heads_kv: int,
-    headdim: int,
-    cache_seqlens: torch.Tensor,
-    qkv_dtype: torch.dtype,
-    page_size: int,
-    causal: bool = True,
-) -> torch.Tensor | None:
-    """Pre-compute decode scheduler metadata once per scheduler step.
-
-    Only the FA3 decode kernel consumes pre-computed scheduler metadata; on
-    every other backend the kernel computes it internally and this helper
-    returns ``None`` so callers can pass through unconditionally.
-    """
-    if _fa3_get_scheduler_metadata is _error_fn:
-        return None
-    return _fa3_get_scheduler_metadata(
-        batch_size=batch_size,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        num_heads_q=num_heads_q,
-        num_heads_kv=num_heads_kv,
-        headdim=headdim,
-        cache_seqlens=cache_seqlens,
-        qkv_dtype=qkv_dtype,
-        page_size=page_size,
-        causal=causal,
-    )
