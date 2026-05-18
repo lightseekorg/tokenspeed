@@ -687,7 +687,7 @@ class TestSelectKernel:
         )
         assert impl() == "aiter_decode"
 
-    def test_amd_mi355_platform_selects_aiter(self, sample_specs, mi355_platform):
+    def test_amd_mi350_platform_selects_aiter(self, sample_specs, mi350_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
@@ -695,7 +695,7 @@ class TestSelectKernel:
             "attention",
             "decode",
             torch.bfloat16,
-            platform=mi355_platform,
+            platform=mi350_platform,
         )
         assert impl() == "aiter_decode"
 
