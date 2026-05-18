@@ -148,9 +148,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
 
         # Separate slots for prefill-kernel vs decode-kernel forward paths.
         # forward_extend reads prefill; forward_decode reads decode.
-        # forward_mixed_metadata holds the full-batch metadata for MIXED mode;
-        # both _forward_mixed_split_kernel and _forward_mixed_context_kernel
-        # read from this slot.
+        # forward_mixed_metadata holds the full-batch metadata for MIXED mode,
+        # read by _forward_mixed_split_kernel.
         self.forward_prefill_metadata: TRTLLMMHAMetadata | None = None
         self.forward_decode_metadata: TRTLLMMHAMetadata | None = None
         self.forward_mixed_metadata: TRTLLMMHAMetadata | None = None
@@ -300,8 +299,14 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             # recurses with forward_mode=EXTEND for prefill rows (which falls
             # through to the regular extend body below).
             return self._forward_mixed_split_kernel(
-                q, k, v, layer, out_cache_loc, token_to_kv_pool,
-                save_kv_cache=save_kv_cache, **kwargs,
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
             )
 
         if self._should_use_fused_fp8_path(save_kv_cache, k):
@@ -422,89 +427,27 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         # falls through to the regular extend body and picks up the prefill
         # view from self.forward_prefill_metadata.
         o_ext = self.forward_extend(
-            q_ext, k_ext, v_ext, layer, loc_ext, token_to_kv_pool,
+            q_ext,
+            k_ext,
+            v_ext,
+            layer,
+            loc_ext,
+            token_to_kv_pool,
             forward_mode=ForwardMode.EXTEND,
-            save_kv_cache=save_kv_cache, **kwargs,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
         )
         o_dec = self.forward_decode(
-            q_dec, k_dec, v_dec, layer, loc_dec, token_to_kv_pool,
-            save_kv_cache=save_kv_cache, **kwargs,
+            q_dec,
+            k_dec,
+            v_dec,
+            layer,
+            loc_dec,
+            token_to_kv_pool,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
         )
         return torch.cat([o_ext, o_dec], dim=0)
-
-    def _forward_mixed_context_kernel(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        save_kv_cache: bool = True,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Alternative MIXED strategy: feed the whole batch (prefill rows +
-        decode rows as q_len=1) into a single trtllm_batch_context_with_kv_cache
-        call. Reserved for benchmark comparison against _forward_mixed_split_kernel.
-        Not dispatched by default; to benchmark, swap the call in forward_extend's
-        is_mixed() branch.
-        """
-        mixed_meta = self.forward_mixed_metadata
-        assert mixed_meta is not None, (
-            "forward_mixed_metadata must be set by _init_mixed_metadata before "
-            "_forward_mixed_context_kernel is called"
-        )
-
-        # KV cache write for the full batch (split-kernel path defers this to
-        # each sub-call's own write; here we have a single fused call).
-        if self._should_use_fused_fp8_path(save_kv_cache, k):
-            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v=v.view(-1, layer.tp_k_head_num, layer.head_dim),
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=out_cache_loc,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.page_size,
-            )
-        elif save_kv_cache and k is not None:
-            token_to_kv_pool.set_kv_buffer(
-                layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
-
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
-            q = fp8_cast_contiguous(q)
-        else:
-            q = q.contiguous()
-
-        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
-        bmm1_scale, bmm2_scale = self._compute_scales(layer)
-
-        attention_sink = kwargs.get("sinks", None)
-        if attention_sink is not None:
-            attention_sink = attention_sink.float()
-
-        o = trtllm_batch_context_with_kv_cache(
-            query=q,
-            kv_cache=(k_cache, v_cache),
-            workspace_buffer=self.workspace_buffer,
-            block_tables=mixed_meta.page_table,
-            seq_lens=mixed_meta.cache_seqlens_int32,
-            max_q_len=mixed_meta.max_seq_len_q,
-            max_kv_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            batch_size=mixed_meta.cu_seqlens_q.shape[0] - 1,
-            cum_seq_lens_q=mixed_meta.cu_seqlens_q,
-            cum_seq_lens_kv=mixed_meta.cu_seqlens_k,
-            window_left=layer.sliding_window_size,
-            sinks=attention_sink,
-            out_dtype=self.dtype,
-        )
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     # ------------------------------------------------------------------
     # Metadata initialisation
@@ -708,12 +651,12 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         Builds the page_table once for the full batch via _build_page_table;
         downstream _forward_mixed_* methods take row views.
         """
-        assert seq_lens.dtype == torch.int32, (
-            f"seq_lens must be int32, got {seq_lens.dtype}"
-        )
-        assert 0 < num_extends < bs, (
-            f"MIXED requires 0 < num_extends < bs, got num_extends={num_extends}, bs={bs}"
-        )
+        assert (
+            seq_lens.dtype == torch.int32
+        ), f"seq_lens must be int32, got {seq_lens.dtype}"
+        assert (
+            0 < num_extends < bs
+        ), f"MIXED requires 0 < num_extends < bs, got num_extends={num_extends}, bs={bs}"
         assert extend_seq_lens_cpu is not None and extend_seq_lens is not None, (
             "MIXED requires extend_seq_lens and extend_seq_lens_cpu (pinned mirror) "
             "to compute query_lens without GPU sync"
