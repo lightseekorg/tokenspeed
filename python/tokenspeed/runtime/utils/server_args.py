@@ -355,7 +355,7 @@ class ServerArgs:
             elif self.mapping.world_size >= 8:
                 self.gpu_memory_utilization = 0.81
             elif self.mapping.world_size >= 4:
-                self.gpu_memory_utilization = 0.85
+                self.gpu_memory_utilization = 0.95
             elif self.mapping.world_size >= 2:
                 self.gpu_memory_utilization = 0.87
             else:
