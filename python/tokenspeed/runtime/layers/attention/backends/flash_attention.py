@@ -211,8 +211,8 @@ class FlashAttentionBackend(AttentionBackend):
             - It will spawn num_steps FlashAttentionBackend for the draft worker
 
     Note about CUDA Graph:
-    - We only support CUDA Graph for Decode (Normal Decode and Draft Decode) and Target Verify.
-    - We don't support CUDA Graph for Extend and Draft Extend.
+    - We only support CUDA Graph for decode (any q_len; q_len > 1 uses the prefill slot).
+    - We don't support CUDA Graph for extend.
     - When server init, init_cuda_graph_state will be called first and then init_cuda_graph_capture will be called.
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
@@ -220,10 +220,9 @@ class FlashAttentionBackend(AttentionBackend):
     def __init__(self, config: MHAConfig):
         super().__init__(config)
 
-        # Pattern A: separate prefill/decode metadata slots so a compound
-        # DRAFT_EXTEND capture can populate both once (step 0 = prefill,
-        # steps 1..N-1 = decode) and the captured graph reads from fixed
-        # addresses.
+        # Separate prefill/decode metadata slots so the drafter can use
+        # the prefill slot for its first multi-token step after verify
+        # and the decode slot for the single-token follow-up steps.
         self.forward_prefill_metadata: FlashAttentionMetadata = None
         self.forward_decode_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
@@ -404,13 +403,23 @@ class FlashAttentionBackend(AttentionBackend):
 
         assert req_to_page is not None, "req_to_page must be provided"
 
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
+
         # Use max_context_len as worst-case max_seq_len_k — avoids GPU sync (.item()).
         # The actual per-request lengths are in cache_seqlens_int32.
         page_table = build_page_table(
             req_pool_indices, req_to_page, self.page_size, max_context_len
         )
 
-        if forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             # Draft Decode
             if spec_info is not None:
                 if self.topk <= 1:
@@ -472,7 +481,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens_int32=metadata.cache_seqlens_int32,
                 page_table=page_table,
             )
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             if self.topk <= 1:
                 # seq_lens = valid_cache_lengths + speculative_num_draft_tokens
                 # (the controller writes the post-write cache length); the
@@ -563,7 +572,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_mode.is_extend():
+        elif forward_mode.is_extend_or_mixed() or is_draft_extend:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = max_context_len
             metadata.page_table = page_table
@@ -583,10 +592,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
-            elif (
-                forward_mode == ForwardMode.DRAFT_EXTEND
-                and kwargs.get("extend_seq_lens") is not None
-            ):
+            elif is_draft_extend and kwargs.get("extend_seq_lens") is not None:
                 metadata.max_seq_len_q = num_tokens
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(kwargs["extend_seq_lens"], dim=0, dtype=torch.int32),
@@ -602,7 +608,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
             # Setup local attention if enabled
-            if forward_mode == ForwardMode.EXTEND:
+            if forward_mode.is_extend():
                 self._init_local_attn_metadata(
                     metadata,
                     device,
@@ -611,12 +617,11 @@ class FlashAttentionBackend(AttentionBackend):
                     page_table=page_table,
                 )
 
-        # Route to prefill/decode slot. DRAFT_EXTEND is compound: step 0
-        # uses the prefill slot (multi-token query), steps 1..N-1 use the
-        # decode slot (single-token query, advanced per step).
-        if forward_mode.is_decode_or_idle():
+        # Route to prefill/decode slot. Drafter's first multi-token step uses
+        # the prefill slot; follow-up single-token steps use the decode slot.
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             self.forward_decode_metadata = metadata
-        elif forward_mode == ForwardMode.DRAFT_EXTEND:
+        elif is_draft_extend:
             self.forward_prefill_metadata = metadata
             decode_metadata = FlashAttentionMetadata()
             decode_metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -641,6 +646,7 @@ class FlashAttentionBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = True,
         # For multi-head latent attention
         q_rope: torch.Tensor | None = None,
@@ -648,7 +654,6 @@ class FlashAttentionBackend(AttentionBackend):
         sinks: torch.Tensor | None = None,
         forward_mode: ForwardMode = None,
         spec_info=None,
-        batch_size: int = None,
         **kwargs,
     ):
         if k is not None:
@@ -671,6 +676,20 @@ class FlashAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_prefill_metadata
 
+        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode is not None
+            and forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode is not None
+            and forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and spec_num_tokens > 1
+        )
+
         # Calculate window size
         is_swa = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
@@ -683,8 +702,7 @@ class FlashAttentionBackend(AttentionBackend):
             and self.fa_impl_ver != 4
         ):
             if layer.k_scale is not None:
-                bs_for_descale = batch_size if batch_size is not None else q.shape[0]
-                descale_shape = (bs_for_descale, layer.tp_k_head_num)
+                descale_shape = (q.shape[0], layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
@@ -698,12 +716,7 @@ class FlashAttentionBackend(AttentionBackend):
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
 
-        use_cascade_attn = (
-            forward_mode is not None
-            and forward_mode.is_target_verify()
-            and self.topk > 1
-            and not is_swa
-        )
+        use_cascade_attn = is_target_verify and self.topk > 1 and not is_swa
 
         # Only pass ``ver`` when talking to a non-default FlashAttention
         # interface version.
@@ -807,9 +820,8 @@ class FlashAttentionBackend(AttentionBackend):
 
             if (
                 attn_attend_prefix_cache is not None
-                and forward_mode is not None
-                and not forward_mode.is_target_verify()
-                and not forward_mode.is_draft_extend()
+                and not is_target_verify
+                and not is_draft_extend
             ):
                 # Do multi-head attention with chunked prefix cache
                 if attn_attend_prefix_cache:
@@ -943,16 +955,36 @@ class FlashAttentionBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = True,
         # For multi-head latent attention
         q_rope: torch.Tensor | None = None,
         k_rope: torch.Tensor | None = None,
         sinks: torch.Tensor | None = None,
-        forward_mode: ForwardMode = None,
         spec_info=None,
-        batch_size: int = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Multi-token decode (target verify or drafter's first post-verify
+        # step) reuses the multi-token prefill path.
+        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=spec_info,
+                **kwargs,
+            )
+
         assert self.fa_impl_ver in [3], "Only FA3 support decoding"
         if k is not None:
             assert v is not None
@@ -1002,8 +1034,7 @@ class FlashAttentionBackend(AttentionBackend):
         k_descale, v_descale = None, None
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
-                bs_for_descale = batch_size if batch_size is not None else q.shape[0]
-                descale_shape = (bs_for_descale, layer.tp_k_head_num)
+                descale_shape = (q.shape[0], layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
@@ -1416,7 +1447,17 @@ class FlashAttentionBackend(AttentionBackend):
         metadata_expand = FlashAttentionMetadata()
 
         device = seq_lens.device
-        if forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             if spec_info is not None:
                 # Draft Decode
                 if self.topk <= 1:
@@ -1481,10 +1522,10 @@ class FlashAttentionBackend(AttentionBackend):
                 if self.attention_chunk_size is not None:
                     self._update_local_attn_metadata_for_capture(metadata, batch_size)
 
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             if self.topk <= 1:
                 # cache_seqlens aliases seq_lens_buf (= valid_cache_lengths
-                # + speculative_num_draft_tokens for TARGET_VERIFY); the
+                # + speculative_num_draft_tokens for the verify call); the
                 # controller has already written the right values.
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
@@ -1551,11 +1592,10 @@ class FlashAttentionBackend(AttentionBackend):
                     self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
-        elif forward_mode.is_draft_extend():
-            # Compound DRAFT_EXTEND: step 0 uses prefill slot (multi-token
-            # query over spec_num_tokens), steps 1..N-1 use decode slot
-            # (single-token query). Both slots' cache_seqlens alias
-            # seq_lens_buf — controller-written, no copy.
+        elif is_draft_extend:
+            # Drafter's first multi-token step uses the prefill slot;
+            # follow-up single-token steps use the decode slot. Both slots'
+            # cache_seqlens alias seq_lens_buf — controller-written, no copy.
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -1590,12 +1630,12 @@ class FlashAttentionBackend(AttentionBackend):
             ][:bs, :]
             self.decode_cuda_graph_metadata[bs] = decode_metadata
 
-        # Route to prefill/decode slots. DRAFT_EXTEND populates both.
-        if forward_mode.is_decode_or_idle():
+        # Route to prefill/decode slots. Drafter's compound case populates both.
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             self.forward_decode_metadata = metadata
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             self.forward_prefill_metadata = metadata
-        elif forward_mode.is_draft_extend():
+        elif is_draft_extend:
             self.forward_prefill_metadata = metadata
             self.forward_decode_metadata = decode_metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
@@ -1603,12 +1643,14 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
         spec_info: EagleDraftInput | None = None,
         out_cache_loc: torch.Tensor | None = None,
+        **kwargs,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         seq_lens = seq_lens[:bs]
@@ -1620,40 +1662,43 @@ class FlashAttentionBackend(AttentionBackend):
         assert req_to_page is not None, "req_to_page must be provided"
         max_context_len = self.max_context_len
 
-        if forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
 
-            if spec_info is not None:
-                # Draft Decode — cache_seqlens aliases seq_lens_buf.
-                if self.topk <= 1:
-                    metadata = self.decode_cuda_graph_metadata[bs]
-                    metadata.max_seq_len_k = max_context_len
-                    update_page_table_inplace(
-                        metadata.page_table,
-                        req_pool_indices,
-                        req_to_page,
-                        self.page_size,
-                        max_context_len,
-                    )
+        if (
+            forward_mode.is_decode_or_idle()
+            and not is_target_verify
+            and not is_draft_extend
+        ):
 
-                else:
-                    metadata = self.draft_decode_metadata_topk_normal[bs]
-                    metadata.max_seq_len_k = max_context_len
-                    update_page_table_inplace(
-                        metadata.page_table,
-                        req_pool_indices,
-                        req_to_page,
-                        self.page_size,
-                        max_context_len,
-                    )
+            if spec_info is not None and self.topk > 1:
+                # Draft Decode topk > 1 — cache_seqlens aliases seq_lens_buf.
+                metadata = self.draft_decode_metadata_topk_normal[bs]
+                metadata.max_seq_len_k = max_context_len
+                update_page_table_inplace(
+                    metadata.page_table,
+                    req_pool_indices,
+                    req_to_page,
+                    self.page_size,
+                    max_context_len,
+                )
 
-                    metadata_expand = self.draft_decode_metadata_topk_expand[bs]
-                    decode_length = self.speculative_step_id + 1
-                    cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
-                    metadata_expand.page_table[: cache_loc.shape[0]].copy_(
-                        cache_loc[:, :decode_length]
-                    )
+                metadata_expand = self.draft_decode_metadata_topk_expand[bs]
+                decode_length = self.speculative_step_id + 1
+                cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
+                metadata_expand.page_table[: cache_loc.shape[0]].copy_(
+                    cache_loc[:, :decode_length]
+                )
             else:
-                # Normal Decode — cache_seqlens aliases seq_lens_buf.
+                # Normal Decode (or drafter follow-up single-token decode,
+                # topk <= 1) — cache_seqlens aliases seq_lens_buf.
                 metadata = self.decode_cuda_graph_metadata[bs]
                 metadata.max_seq_len_k = max_context_len
                 update_page_table_inplace(
@@ -1669,7 +1714,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata,
                     bs,
                 )
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             if self.topk <= 1:
                 # cache_seqlens aliases seq_lens_buf; the controller already
                 # wrote vc + speculative_num_draft_tokens via fill_input_buffers.
@@ -1747,8 +1792,8 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand, metadata_swa
                     )
 
-        elif forward_mode.is_draft_extend():
-            # Compound DRAFT_EXTEND: refresh both prefill slot (step 0,
+        elif is_draft_extend:
+            # Drafter's compound case: refresh both prefill slot (step 0,
             # multi-token query) and decode slot (steps 1..N-1, single
             # token query). cache_seqlens aliases seq_lens_buf.
             metadata = self.draft_extend_metadata[bs]
@@ -1771,12 +1816,16 @@ class FlashAttentionBackend(AttentionBackend):
                 max_context_len,
             )
 
-        # Route to prefill/decode slots. DRAFT_EXTEND populates both.
-        if forward_mode.is_decode_or_idle():
+        # Route to prefill/decode slots. Drafter's compound case populates both.
+        if (
+            forward_mode.is_decode_or_idle()
+            and not is_target_verify
+            and not is_draft_extend
+        ):
             self.forward_decode_metadata = metadata
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             self.forward_prefill_metadata = metadata
-        elif forward_mode.is_draft_extend():
+        elif is_draft_extend:
             self.forward_prefill_metadata = metadata
             self.forward_decode_metadata = decode_metadata
         self.forward_metadata_spec_decode_expand = metadata_expand

@@ -84,6 +84,7 @@ class PagedAttention(nn.Module):
             out_cache_loc,
             ctx.token_to_kv_pool,
             ctx.forward_mode,
+            ctx.bs,
             save_kv_cache,
             **kwargs,
         )

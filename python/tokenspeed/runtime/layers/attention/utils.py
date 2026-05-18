@@ -116,13 +116,30 @@ def token_indices_from_pages(
 
 # --- Page-based memory profiling ---
 
-from typing import Optional, Tuple
 
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
-from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-from tokenspeed.runtime.utils import get_available_gpu_memory
+def profile_available_cache_memory_bytes(
+    attn_config: BaseAttnConfig,
+    gpu_id: int,
+    tp_size: int,
+    gpu_memory_utilization: float,
+    total_gpu_memory: int,
+    world_group=None,
+) -> int:
+    cpu_group = (
+        pg_manager.get_process_group("gloo", world_group)
+        if world_group is not None
+        else None
+    )
+    available_gpu_memory = get_available_gpu_memory(
+        attn_config.device,
+        gpu_id,
+        distributed=tp_size > 1,
+        cpu_group=cpu_group,
+    )
+    cache_memory = available_gpu_memory - total_gpu_memory * (
+        1 - gpu_memory_utilization
+    )
+    return int(cache_memory * (1 << 30))
 
 
 def profile_max_num_pages(
@@ -138,19 +155,14 @@ def profile_max_num_pages(
     draft_num_attention_layers: int | None = None,
     cache_cell_size: int | None = None,
 ):
-    cpu_group = (
-        pg_manager.get_process_group("gloo", world_group)
-        if world_group is not None
-        else None
-    )
-    available_gpu_memory = get_available_gpu_memory(
-        attn_config.device,
+    cache_memory = profile_available_cache_memory_bytes(
+        attn_config,
         gpu_id,
-        distributed=tp_size > 1,
-        cpu_group=cpu_group,
+        tp_size,
+        gpu_memory_utilization,
+        total_gpu_memory,
+        world_group,
     )
-
-    rest_memory = available_gpu_memory - total_gpu_memory * (1 - gpu_memory_utilization)
     if cache_cell_size is None:
         cell_size = attn_config.cache_cell_size() * num_attention_layers
     else:
@@ -159,7 +171,7 @@ def profile_max_num_pages(
         cell_size += draft_attn_config.cache_cell_size() * draft_num_attention_layers
     if cell_size <= 0:
         raise ValueError(f"KV cache cell size must be positive, got {cell_size}")
-    max_num_token = int(rest_memory * (1 << 30) // cell_size)
+    max_num_token = cache_memory // cell_size
     max_num_pages = (max_num_token + page_size - 1) // page_size
     return max_num_pages
 
@@ -175,32 +187,26 @@ def profile_cache_budget(
     mamba_memory_per_chunk: int,
     mamba_ratio: float,
     world_group=None,
-    draft_attn_config: Optional[BaseAttnConfig] = None,
-    draft_num_attention_layers: Optional[int] = None,
-) -> Tuple[int, int]:
+    draft_attn_config: BaseAttnConfig | None = None,
+    draft_num_attention_layers: int | None = None,
+) -> tuple[int, int]:
     """Profile GPU memory and split between KV pages and mamba chunks.
 
     Returns:
         (kv_max_num_pages, mamba_pool_total_chunks)
     """
-    cpu_group = (
-        pg_manager.get_process_group("gloo", world_group)
-        if world_group is not None
-        else None
-    )
-    available_gpu_memory = get_available_gpu_memory(
-        attn_config.device,
+    total_cache_memory = profile_available_cache_memory_bytes(
+        attn_config,
         gpu_id,
-        distributed=tp_size > 1,
-        cpu_group=cpu_group,
+        tp_size,
+        mem_fraction_static,
+        total_gpu_memory,
+        world_group,
     )
-
-    rest_memory = available_gpu_memory - total_gpu_memory * (1 - mem_fraction_static)
     cell_size = attn_config.cache_cell_size() * num_attention_layers
     if draft_attn_config is not None:
         cell_size += draft_attn_config.cache_cell_size() * draft_num_attention_layers
 
-    total_cache_memory = rest_memory * (1 << 30)
     kv_memory = int(total_cache_memory / (1 + mamba_ratio))
     mamba_memory = total_cache_memory - kv_memory
 

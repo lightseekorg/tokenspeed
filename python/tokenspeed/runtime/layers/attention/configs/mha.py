@@ -60,6 +60,7 @@ class MHAConfig(BaseAttnConfig):
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             speculative_num_steps=server_args.speculative_num_steps,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            is_draft=is_draft,
         )
 
     def cache_cell_size(self) -> int:

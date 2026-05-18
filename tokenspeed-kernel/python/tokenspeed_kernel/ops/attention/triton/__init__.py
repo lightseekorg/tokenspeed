@@ -36,7 +36,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     dtypes={torch.float16, torch.bfloat16},
-    priority=Priority.PERFORMANT,
+    priority=Priority.PORTABLE,
     traits={
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
@@ -95,7 +95,7 @@ def triton_mha_prefill(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     dtypes={torch.float16, torch.bfloat16},
-    priority=Priority.PERFORMANT,
+    priority=Priority.PORTABLE,
     traits={
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
@@ -174,7 +174,7 @@ def triton_mha_prefill_with_kvcache(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     dtypes={torch.float16, torch.bfloat16},
-    priority=Priority.PERFORMANT,
+    priority=Priority.PORTABLE,
     traits={
         "query_len": frozenset({1}),
         "sliding_window": frozenset({False, True}),

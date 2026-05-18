@@ -48,6 +48,14 @@ def has_indexer_mxfp4_paged_gather() -> bool:
     return hasattr(module, "deepseek_v4_gather_paged_indexer_mxfp4_cache")
 
 
+def has_persistent_topk() -> bool:
+    try:
+        module = _load_deepseek_v4_attention_module()
+    except Exception:
+        return False
+    return hasattr(module, "deepseek_v4_persistent_topk")
+
+
 def fused_qnorm_rope_kv_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -137,4 +145,34 @@ def indexer_mxfp4_paged_gather(
         block_table.contiguous(),
         cu_seq_lens.contiguous(),
         int(cache_block_size),
+    )
+
+
+def persistent_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    output: torch.Tensor,
+    workspace: torch.Tensor,
+    k: int,
+    max_seq_len: int,
+) -> None:
+    if logits.dtype != torch.float32:
+        raise TypeError(f"logits must be float32, got {logits.dtype}")
+    if lengths.dtype != torch.int32:
+        lengths = lengths.to(torch.int32)
+    if output.dtype != torch.int32:
+        raise TypeError(f"output must be int32, got {output.dtype}")
+    if workspace.dtype != torch.uint8:
+        raise TypeError(f"workspace must be uint8, got {workspace.dtype}")
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
+    if not lengths.is_contiguous():
+        lengths = lengths.contiguous()
+    _load_deepseek_v4_attention_module().deepseek_v4_persistent_topk(
+        logits,
+        lengths,
+        output,
+        workspace,
+        int(k),
+        int(max_seq_len),
     )

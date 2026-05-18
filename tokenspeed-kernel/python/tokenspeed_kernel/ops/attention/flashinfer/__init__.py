@@ -76,6 +76,24 @@ if platform.is_nvidia and platform.is_blackwell:
 # ------------------------------------------------------------------------------
 
 _workspace_buffer: torch.Tensor | None = None
+_ragged_prefill_workspaces: dict[torch.device, torch.Tensor] = {}
+_ragged_prefill_wrappers: dict[torch.device, BatchPrefillWithRaggedKVCacheWrapper] = {}
+
+
+def _get_ragged_prefill_wrapper(
+    device: torch.device,
+) -> BatchPrefillWithRaggedKVCacheWrapper:
+    wrapper = _ragged_prefill_wrappers.get(device)
+    if wrapper is None:
+        workspace = torch.empty(
+            256 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
+        _ragged_prefill_workspaces[device] = workspace
+        _ragged_prefill_wrappers[device] = wrapper
+    return wrapper
 
 
 if platform.is_nvidia and platform.is_blackwell:
@@ -90,11 +108,12 @@ if platform.is_nvidia and platform.is_blackwell:
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={torch.float16, torch.bfloat16},
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.SPECIALIZED + 1,
         traits={
+            "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "support_sinks": frozenset({False}),
+            "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({True, False}),
         },
         tags={"throughput"},
@@ -112,45 +131,32 @@ if platform.is_nvidia and platform.is_blackwell:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        global _workspace_buffer
-        if _workspace_buffer is None:
-            _workspace_buffer = torch.zeros(
-                150 * 1024 * 1024,
-                dtype=torch.uint8,
-                device=q.device,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if sinks is not None:
+            raise NotImplementedError(
+                "FlashInfer ragged prefill does not support sinks"
             )
-        seq_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        # TRTLLM kernels require fp32 sinks
-        if sinks is not None and sinks.dtype != torch.float32:
-            sinks = sinks.to(torch.float32)
-        result = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=_workspace_buffer,
-            seq_lens=seq_lens,
-            max_q_len=max_seqlen_q,
-            max_kv_len=max_seqlen_k,
-            bmm1_scale=(
+        wrapper = _get_ragged_prefill_wrapper(q.device)
+        wrapper.plan(
+            cu_seqlens_q,
+            cu_seqlens_q,
+            q.shape[1],
+            k.shape[1],
+            q.shape[-1],
+            head_dim_vo=v.shape[-1],
+            causal=is_causal,
+            window_left=window_left,
+            logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
+            sm_scale=(
                 softmax_scale
                 if softmax_scale is not None
                 else 1.0 / math.sqrt(q.shape[-1])
             ),
-            bmm2_scale=1.0,
-            o_sf_scale=-1.0,
-            batch_size=seq_lens.shape[0],
-            window_left=window_left,
-            cum_seq_lens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cu_seqlens_q,
-            enable_pdl=False,
-            is_causal=is_causal,
-            return_lse=return_lse,
-            attention_sinks=sinks,
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+            o_data_type=q.dtype,
         )
-        if return_lse:
-            return result
-        return result
+        return wrapper.run(q, k, v, return_lse=return_lse)
 
     @register_kernel(
         "attention",

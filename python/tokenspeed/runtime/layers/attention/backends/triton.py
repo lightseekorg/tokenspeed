@@ -200,7 +200,17 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
 
-        if forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             if spec_info is None:
                 torch.cumsum(seq_lens, dim=0, out=kv_indptr[1 : bs + 1])
                 kv_indptr = kv_indptr[: bs + 1]
@@ -259,7 +269,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             bs = len(req_pool_indices)
             qo_indptr = torch.arange(
                 0,
@@ -307,7 +317,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
 
-        elif forward_mode.is_draft_extend():
+        elif is_draft_extend:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
@@ -452,7 +462,17 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
 
-        if forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             if spec_info is None:
                 kv_indptr = self.kv_indptr
                 torch.cumsum(seq_lens, dim=0, out=kv_indptr[1 : bs + 1])
@@ -495,7 +515,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
                 0,
@@ -542,7 +562,7 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
-        elif forward_mode.is_draft_extend():
+        elif is_draft_extend:
             num_tokens_per_bs = self.speculative_num_steps + 1
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -593,15 +613,27 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
         spec_info: EagleDraftInput | None = None,
+        **kwargs,
     ):
         _req_to_token = self.req_to_page
 
-        if forward_mode.is_decode_or_idle():
+        spec_num_tokens = num_tokens // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             # Update kv_indptr, kv_indices
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
@@ -645,7 +677,7 @@ class TritonAttnBackend(AttentionBackend):
                 num_token = spec_info.kv_indptr.shape[0] - 1
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
 
-        elif forward_mode.is_target_verify():
+        elif is_target_verify:
             # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
             bs = len(req_pool_indices)
             qo_indptr = self.qo_indptr[: bs + 1]
@@ -686,7 +718,7 @@ class TritonAttnBackend(AttentionBackend):
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             torch.cumsum(seq_mask_len, dim=0, out=mask_indptr[1 : bs + 1])
-        elif forward_mode.is_draft_extend():
+        elif is_draft_extend:
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
@@ -719,6 +751,7 @@ class TritonAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -772,9 +805,26 @@ class TritonAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        # Multi-token decode (target verify or drafter compound) reuses
+        # the multi-token kernel path in forward_extend.
+        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        if spec_num_tokens > 1:
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)

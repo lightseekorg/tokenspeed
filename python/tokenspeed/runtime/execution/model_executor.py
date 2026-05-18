@@ -354,10 +354,7 @@ class ModelExecutor:
         ctx: ForwardContext,
         candidates,
     ):
-        if self.drafter is not None and (
-            ctx.forward_mode == ForwardMode.DECODE
-            or ctx.forward_mode == ForwardMode.TARGET_VERIFY
-        ):
+        if self.drafter is not None and ctx.forward_mode.is_decode():
             return self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
@@ -376,9 +373,7 @@ class ModelExecutor:
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
-            is_spec_verify = n > 1 and (
-                ctx.forward_mode.is_target_verify() or ctx.forward_mode.is_decode()
-            )
+            is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
@@ -634,11 +629,6 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
-        graph_forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if self.drafter is not None
-            else ForwardMode.DECODE
-        )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -646,7 +636,7 @@ class ModelExecutor:
             bs=0,
             num_extends=0,
             input_num_tokens=0,
-            forward_mode=graph_forward_mode,
+            forward_mode=ForwardMode.DECODE,
             global_num_tokens=global_num_tokens,
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
@@ -830,11 +820,7 @@ class ModelExecutor:
             )
 
             bs = len(forward_op.request_ids)
-            forward_mode = ForwardMode.from_num_extends(
-                num_extends,
-                bs,
-                has_drafter=self.drafter is not None,
-            )
+            forward_mode = ForwardMode.from_num_extends(num_extends, bs)
 
             if self.runtime_states.mamba_pool is not None and (
                 num_extends > 0 or has_retract
@@ -874,8 +860,7 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     padded_static_len=-1,
-                    keep_full_logits=forward_mode.is_decode_or_idle()
-                    or forward_mode.is_target_verify(),
+                    keep_full_logits=forward_mode.is_decode_or_idle(),
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:

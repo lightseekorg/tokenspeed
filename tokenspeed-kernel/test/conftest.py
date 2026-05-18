@@ -117,11 +117,11 @@ def mi300_platform() -> PlatformInfo:
 
 
 @pytest.fixture
-def mi355_platform() -> PlatformInfo:
+def mi350_platform() -> PlatformInfo:
     return PlatformInfo(
         vendor="amd",
         arch_version=ArchVersion(9, 5),
-        device_name="AMD Instinct MI355X",
+        device_name="AMD Instinct MI350X/MI355X",
         device_count=8,
         total_memory=288 * (1024**3),
         memory_bandwidth=8000.0,

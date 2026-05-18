@@ -150,10 +150,7 @@ class Eagle(BaseDrafter):
         input_num_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (input_ids, unpadded_input_lengths) for the first draft step."""
-        # Only pure EXTEND (prefill) uses shifted_prefill_ids. TARGET_VERIFY
-        # and DRAFT_EXTEND use base_model_output + accept_lengths.
-        if forward_mode == ForwardMode.EXTEND:
-
+        if forward_mode.is_extend():
             input_ids = self.input_buffers.shifted_prefill_ids_buf[
                 :input_num_tokens
             ].clone()
@@ -165,8 +162,8 @@ class Eagle(BaseDrafter):
             input_ids[req_boundaries] = torch.where(
                 needs_fill, draft_input.base_model_output[:bs], boundary_ids
             )
-        else:
 
+        else:
             input_ids = draft_input.base_model_output
             unpadded_input_lengths = draft_input.accept_lengths
 
@@ -185,15 +182,10 @@ class Eagle(BaseDrafter):
         input_ids, unpadded_input_lengths = self._get_first_step_input(
             forward_mode, draft_input, bs, draft_input.input_num_tokens
         )
-
-        # The drafter's first step uses DRAFT_EXTEND when base model did
-        # TARGET_VERIFY, or EXTEND when base model did EXTEND (prefill).
-        if forward_mode.is_target_verify():
-            draft_first_mode = ForwardMode.DRAFT_EXTEND
-        else:
-            draft_first_mode = forward_mode
-
-        is_decode_like = draft_first_mode.is_draft_extend()
+        padded_static_len, last_index_offsets = -1, None
+        if forward_mode.is_decode():
+            padded_static_len = self.spec_num_tokens
+            last_index_offsets = self.last_index_offsets_buf[:bs]
 
         # make a ctx every time model runner forward
         first_step_ctx = ForwardContext(
@@ -203,12 +195,10 @@ class Eagle(BaseDrafter):
             bs=bs,
             num_extends=0,
             input_num_tokens=draft_input.input_num_tokens,
-            forward_mode=draft_first_mode,
+            forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            padded_static_len=self.spec_num_tokens if is_decode_like else -1,
-            last_index_offsets=(
-                self.last_index_offsets_buf[:bs] if is_decode_like else None
-            ),
+            padded_static_len=padded_static_len,
+            last_index_offsets=last_index_offsets,
             keep_full_logits=False,
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
@@ -235,10 +225,9 @@ class Eagle(BaseDrafter):
     ) -> None:
 
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        # Step 1's new write position. TARGET_VERIFY uses vc+accept_length
-        # (vc+N would shift rotary past the rejected tail); EXTEND uses
-        # vc+input_lengths (= seq_lens_buf).
-        if draft_input.forward_mode.is_target_verify():
+        # Step 1's write position uses vc+accept_length under DECODE so the
+        # rotary advance doesn't shift past the rejected tail.
+        if draft_input.forward_mode.is_decode():
             cache_start = (
                 self.runtime_states.valid_cache_lengths.index_select(
                     0, req_pool_indices
@@ -324,10 +313,7 @@ class Eagle(BaseDrafter):
         base_ctx: ForwardContext,
     ) -> torch.Tensor | None:
 
-        if not (
-            base_ctx.forward_mode.is_decode()
-            or base_ctx.forward_mode.is_target_verify()
-        ):
+        if not base_ctx.forward_mode.is_decode():
             return None
 
         return self.input_buffers.input_ids_buf[: base_ctx.input_num_tokens].reshape(
@@ -351,7 +337,7 @@ class Eagle(BaseDrafter):
         )
 
         # Last verified id per request → next_tokens[:, 0].
-        if draft_input.forward_mode == ForwardMode.EXTEND:
+        if draft_input.forward_mode.is_extend():
             next_tokens[:, 0] = draft_input.base_model_output[:bs]
         else:
             indices = self.last_index_offsets_buf[:bs] + draft_input.accept_lengths
