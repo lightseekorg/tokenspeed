@@ -440,10 +440,6 @@ def _grouped_topk_biased_kernel(
     topk_ids_ptr,
     stride_gm,
     stride_ge,
-    stride_wm,
-    stride_wk,
-    stride_im,
-    stride_ik,
     num_experts: tl.constexpr,
     num_expert_group: tl.constexpr,
     topk_group: tl.constexpr,
@@ -532,18 +528,18 @@ def _grouped_topk_biased_kernel(
         else:
             weights_sum += best_weight
         tl.store(
-            topk_ids_ptr + token_id * stride_im + k * stride_ik,
+            topk_ids_ptr + token_id * TOPK + k,
             stored_expert.to(tl.int32),
         )
         if is_shared_slot:
             shared_weight = weights_sum / routed_scaling_factor
             tl.store(
-                topk_weights_ptr + token_id * stride_wm + k * stride_wk,
+                topk_weights_ptr + token_id * TOPK + k,
                 shared_weight,
             )
         else:
             tl.store(
-                topk_weights_ptr + token_id * stride_wm + k * stride_wk,
+                topk_weights_ptr + token_id * TOPK + k,
                 best_weight,
             )
         masked_choice = tl.where(offs_e == best_expert, -float("inf"), masked_choice)
@@ -551,11 +547,11 @@ def _grouped_topk_biased_kernel(
     if renormalize:
         denom = tl.where(weights_sum != 0.0, weights_sum, 1.0)
         for k in tl.static_range(0, TOPK):
-            weight = tl.load(topk_weights_ptr + token_id * stride_wm + k * stride_wk)
+            weight = tl.load(topk_weights_ptr + token_id * TOPK + k)
             weight = weight / denom
             if apply_routed_scaling_factor_on_output:
                 weight = weight * routed_scaling_factor
-            tl.store(topk_weights_ptr + token_id * stride_wm + k * stride_wk, weight)
+            tl.store(topk_weights_ptr + token_id * TOPK + k, weight)
 
 
 @register_kernel(
@@ -660,10 +656,6 @@ def triton_biased_grouped_topk(
         topk_ids,
         gating_output.stride(0),
         gating_output.stride(1),
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        topk_ids.stride(0),
-        topk_ids.stride(1),
         num_experts=num_experts,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
