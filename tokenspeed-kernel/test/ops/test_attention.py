@@ -27,6 +27,7 @@ import torch
 from tokenspeed_kernel import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_merge_state,
     mha_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -281,3 +282,42 @@ def test_mha_decode_with_kvcache(
     )
 
     assert out.shape == q.shape
+
+
+@pytest.mark.parametrize(
+    "dtype,head_dim,num_heads",
+    [(torch.bfloat16, 64, 8)],
+)
+def test_mha_merge_state(
+    device: str,
+    dtype: torch.dtype,
+    head_dim: int,
+    num_heads: int,
+) -> None:
+    total_q = 31
+    out_a = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    out_b = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    lse_a = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
+    lse_b = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
+
+    out, lse = mha_merge_state(
+        out_a,
+        lse_a,
+        out_b,
+        lse_b,
+        solution="triton",
+    )
+
+    lse_ref = torch.maximum(lse_a, lse_b)
+    weight_a = torch.exp(lse_a - lse_ref)
+    weight_b = torch.exp(lse_b - lse_ref)
+    denom = weight_a + weight_b
+    out_ref = (
+        out_a.float() * weight_a[..., None] + out_b.float() * weight_b[..., None]
+    ) / denom[..., None]
+    lse_ref = lse_ref + torch.log(denom)
+
+    assert out.shape == out_a.shape
+    assert lse.shape == lse_a.shape
+    torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)

@@ -25,6 +25,7 @@ bootstrap_profiling_from_env()
 from tokenspeed_kernel.ops.attention import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_merge_state,
     mha_prefill,
 )
 from tokenspeed_kernel.ops.gemm import mm
@@ -46,4 +47,5 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "mha_merge_state",
 ]

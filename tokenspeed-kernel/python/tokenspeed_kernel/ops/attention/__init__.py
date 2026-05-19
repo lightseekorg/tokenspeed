@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
+import math
+
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
@@ -35,7 +38,10 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "mha_merge_state",
 ]
+
+LSE_LN = math.log2(math.e)
 
 
 def mha_prefill(
@@ -348,4 +354,94 @@ def mha_decode_with_kvcache(
             sinks=sinks,
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
+        )
+
+
+def mha_merge_state(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    *,
+    lse_scale_log2: float = LSE_LN,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two MHA partial attention states.
+
+    Args:
+        out_a: First partial output with shape [total_q, num_heads, head_dim].
+        lse_a: First partial log-sum-exp with shape [total_q, num_heads].
+        out_b: Second partial output with shape [total_q, num_heads, head_dim].
+        lse_b: Second partial log-sum-exp with shape [total_q, num_heads].
+        lse_scale_log2: Multiplier that converts input LSE to log2 domain.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+    """
+    if out_a.shape != out_b.shape:
+        raise ValueError(f"out shapes must match, got {out_a.shape} and {out_b.shape}")
+    if lse_a.shape != lse_b.shape:
+        raise ValueError(f"lse shapes must match, got {lse_a.shape} and {lse_b.shape}")
+    if out_a.shape[:2] != lse_a.shape:
+        raise ValueError(
+            f"out and lse shapes are incompatible: {out_a.shape} and {lse_a.shape}"
+        )
+    if out_a.dtype != out_b.dtype:
+        raise ValueError(f"out dtypes must match, got {out_a.dtype} and {out_b.dtype}")
+    if out_a.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"mha_merge_state output dtype must be fp16/bf16, got {out_a.dtype}"
+        )
+    if lse_a.dtype != torch.float32 or lse_b.dtype != torch.float32:
+        raise ValueError(
+            f"mha_merge_state LSE dtype must be fp32, got {lse_a.dtype} and {lse_b.dtype}"
+        )
+    if not (out_a.device == out_b.device == lse_a.device == lse_b.device):
+        raise ValueError("all mha_merge_state inputs must be on the same device")
+    if not (
+        out_a.is_contiguous()
+        and out_b.is_contiguous()
+        and lse_a.is_contiguous()
+        and lse_b.is_contiguous()
+    ):
+        raise ValueError("mha_merge_state inputs must be contiguous")
+
+    traits = {
+        "head_dim": out_a.shape[-1],
+    }
+    kernel = select_kernel(
+        "attention",
+        "mha_merge_state",
+        out_a.dtype,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "total_q": out_a.shape[0],
+        "num_heads": out_a.shape[1],
+        "head_dim": out_a.shape[2],
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mha_merge_state",
+        kernel.name,
+        out_a.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mha_merge_state",
+        out_a.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            out_a=out_a,
+            lse_a=lse_a,
+            out_b=out_b,
+            lse_b=lse_b,
+            lse_scale_log2=lse_scale_log2,
         )

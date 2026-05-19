@@ -27,9 +27,9 @@ import torch
 from tokenspeed_kernel import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_merge_state,
     mha_prefill,
 )
-from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -494,7 +494,7 @@ class MHAAttnBackend(AttentionBackend):
         )
         prefix_out, prefix_lse = prefix_result
 
-        output = self._merge_states(
+        output, _ = mha_merge_state(
             chunk_out.contiguous(),
             chunk_lse.contiguous(),
             prefix_out.contiguous(),
@@ -584,24 +584,6 @@ class MHAAttnBackend(AttentionBackend):
             and layer.sliding_window_size < 0
             and layer.logit_cap == 0.0
         )
-
-    @staticmethod
-    def _merge_states(
-        out_a: torch.Tensor,
-        lse_a: torch.Tensor,
-        out_b: torch.Tensor,
-        lse_b: torch.Tensor,
-    ) -> torch.Tensor:
-        if torch.version.cuda is not None:
-            output, _ = merge_state(out_a, lse_a, out_b, lse_b)
-            return output
-        lse = torch.maximum(lse_a, lse_b)
-        weight_a = torch.exp(lse_a - lse)
-        weight_b = torch.exp(lse_b - lse)
-        denom = weight_a + weight_b
-        return (out_a * weight_a[..., None] + out_b * weight_b[..., None]) / denom[
-            ..., None
-        ]
 
     @staticmethod
     def _make_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
