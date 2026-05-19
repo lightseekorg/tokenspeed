@@ -114,7 +114,7 @@ if platform.is_nvidia and platform.is_blackwell:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False}),
             "support_logit_cap": frozenset({False, True}),
-            "return_lse": frozenset({True, False}),
+            "return_lse": frozenset({False}),
         },
         tags={"throughput"},
     )
