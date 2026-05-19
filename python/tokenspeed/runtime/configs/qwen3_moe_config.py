@@ -18,23 +18,39 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime configuration exports."""
+"""Qwen3 MoE model configuration definitions."""
 
-from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
-from tokenspeed.runtime.configs.kimi_k2_config import KimiK2Config
-from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
-from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
-from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5Config, Qwen3_5MoeConfig
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
-from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 
-__all__ = [
-    "DeepseekV4Config",
-    "Qwen2Config",
-    "Qwen3Config",
-    "Qwen3MoeConfig",
-    "Qwen3_5Config",
-    "Qwen3_5MoeConfig",
-    "MiniMaxM2Config",
-    "KimiK2Config",
-]
+
+class Qwen3MoeConfig(Qwen3Config):
+    """Configuration for Qwen3 MoE causal LMs such as Qwen3-30B-A3B."""
+
+    model_type = "qwen3_moe"
+
+    def __init__(
+        self,
+        decoder_sparse_step=1,
+        moe_intermediate_size=768,
+        shared_expert_intermediate_size=0,
+        num_experts_per_tok=8,
+        num_experts=128,
+        norm_topk_prob=True,
+        output_router_logits=False,
+        router_aux_loss_coef=0.001,
+        mlp_only_layers=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.decoder_sparse_step = decoder_sparse_step
+        self.moe_intermediate_size = moe_intermediate_size
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_experts = num_experts
+        self.norm_topk_prob = norm_topk_prob
+        self.output_router_logits = output_router_logits
+        self.router_aux_loss_coef = router_aux_loss_coef
+        self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
+
+
+__all__ = ["Qwen3MoeConfig"]
