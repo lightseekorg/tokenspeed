@@ -26,9 +26,9 @@ from collections import OrderedDict
 from typing import Iterable, NamedTuple
 
 import torch
-from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
 from tokenspeed_scheduler import Cache
 
+from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
