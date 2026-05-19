@@ -56,7 +56,7 @@ def mha_prefill(
     override: str | None = None,
     solution: str | None = None,
 ) -> AttentionResult:
-    """Ragged MHA prefill without KV cache.
+    """MHA prefill from uncached KV.
 
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
@@ -157,7 +157,7 @@ def mha_extend_with_kvcache(
     override: str | None = None,
     solution: str | None = None,
 ) -> AttentionResult:
-    """Ragged MHA extend over paged KV cache.
+    """MHA extend with paged KV cache.
 
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
@@ -263,7 +263,7 @@ def mha_decode_with_kvcache(
     override: str | None = None,
     solution: str | None = None,
 ) -> AttentionResult:
-    """Single-token MHA decode with paged KV cache.
+    """MHA decode with paged KV cache.
 
     Args:
         q: Query tensor with shape [batch, num_q_heads, head_dim].
