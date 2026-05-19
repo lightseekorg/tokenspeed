@@ -288,12 +288,21 @@ def test_mha_decode_with_kvcache(
     "dtype,head_dim,num_heads",
     [(torch.bfloat16, 64, 8)],
 )
+@pytest.mark.parametrize(
+    "solution",
+    [None, "triton", "cuda"],
+    ids=["auto", "triton", "cuda"],
+)
 def test_mha_merge_state(
     device: str,
+    solution: str | None,
     dtype: torch.dtype,
     head_dim: int,
     num_heads: int,
 ) -> None:
+    if solution == "cuda" and not platform.is_nvidia:
+        pytest.skip("CUDA merge-state kernel is NVIDIA-only")
+
     total_q = 31
     out_a = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
     out_b = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
@@ -305,7 +314,7 @@ def test_mha_merge_state(
         lse_a,
         out_b,
         lse_b,
-        solution="triton",
+        solution=solution,
     )
 
     lse_ref = torch.maximum(lse_a, lse_b)
