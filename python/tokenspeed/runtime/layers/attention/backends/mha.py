@@ -60,8 +60,7 @@ class MHAMetadata:
     max_seq_len_k: int | None = None
     prefix_seqlens_int32: torch.Tensor | None = None
     max_prefix_seq_len: int | None = None
-    use_split_extend: bool = False
-    use_direct_prefill: bool = False
+    use_split_prefill: bool = False
 
 
 class MHAAttnBackend(AttentionBackend):
@@ -123,18 +122,14 @@ class MHAAttnBackend(AttentionBackend):
             max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
             extend_prefix_lens_cpu = kwargs.get("extend_prefix_lens_cpu")
             if not forward_mode.is_extend():
-                use_direct_prefill = False
-                use_split_extend = False
+                use_split_prefill = False
             elif extend_prefix_lens is None:
-                use_direct_prefill = True
-                use_split_extend = False
+                use_split_prefill = False
             elif extend_prefix_lens_cpu is not None:
                 has_prefix = bool(extend_prefix_lens_cpu[:bs].any().item())
-                use_direct_prefill = not has_prefix
-                use_split_extend = has_prefix
+                use_split_prefill = has_prefix
             else:
-                use_direct_prefill = False
-                use_split_extend = False
+                use_split_prefill = False
 
             prefix_seqlens = None
             max_prefix_seq_len = None
@@ -151,8 +146,7 @@ class MHAAttnBackend(AttentionBackend):
                 max_seq_len_k=self.max_context_len,
                 prefix_seqlens_int32=prefix_seqlens,
                 max_prefix_seq_len=max_prefix_seq_len,
-                use_split_extend=use_split_extend,
-                use_direct_prefill=use_direct_prefill,
+                use_split_prefill=use_split_prefill,
             )
             return
 
@@ -303,7 +297,11 @@ class MHAAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
-        if save_kv_cache and k is not None:
+        has_kv = k is not None
+        if has_kv != (v is not None):
+            raise ValueError("mha decode requires k and v to both be present or absent")
+
+        if save_kv_cache and has_kv:
             token_to_kv_pool.set_kv_buffer(
                 layer,
                 out_cache_loc,
@@ -355,9 +353,39 @@ class MHAAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = None if k is None else k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = None if v is None else v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        has_kv = k is not None
+        if has_kv != (v is not None):
+            raise ValueError("mha extend requires k and v to both be present or absent")
 
-        if k is not None and v is not None and metadata.use_direct_prefill:
-            return self._forward_extend_direct(
+        if has_kv:
+            if metadata.use_split_prefill:
+                return self._forward_split_prefill(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    metadata,
+                    cu_seqlens_q,
+                    save_kv_cache,
+                    kwargs.get("sinks"),
+                )
+            else:
+                return self._forward_prefill(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    metadata,
+                    cu_seqlens_q,
+                    save_kv_cache,
+                    kwargs.get("sinks"),
+                )
+        else:
+            return self._forward_extend(
                 q,
                 k,
                 v,
@@ -370,38 +398,7 @@ class MHAAttnBackend(AttentionBackend):
                 kwargs.get("sinks"),
             )
 
-        if k is not None and v is not None and metadata.use_split_extend:
-            return self._forward_extend_split(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                metadata,
-                cu_seqlens_q,
-                save_kv_cache,
-                kwargs.get("sinks"),
-            )
-        if metadata.use_split_extend:
-            raise NotImplementedError(
-                "mha prefix extend requires KV tensors for split extend"
-            )
-
-        return self._forward_extend_with_kvcache(
-            q,
-            k,
-            v,
-            layer,
-            out_cache_loc,
-            token_to_kv_pool,
-            metadata,
-            cu_seqlens_q,
-            save_kv_cache,
-            kwargs.get("sinks"),
-        )
-
-    def _forward_extend_direct(
+    def _forward_prefill(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -441,7 +438,7 @@ class MHAAttnBackend(AttentionBackend):
             )
         return output
 
-    def _forward_extend_split(
+    def _forward_split_prefill(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -508,7 +505,7 @@ class MHAAttnBackend(AttentionBackend):
             )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def _forward_extend_with_kvcache(
+    def _forward_extend(
         self,
         q: torch.Tensor,
         k: torch.Tensor | None,
@@ -521,7 +518,8 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        if save_kv_cache and k is not None:
+        has_kv = k is not None
+        if save_kv_cache and has_kv:
             token_to_kv_pool.set_kv_buffer(
                 layer,
                 out_cache_loc,
@@ -530,7 +528,7 @@ class MHAAttnBackend(AttentionBackend):
                 layer.k_scale,
                 layer.v_scale,
             )
-        elif k is not None or v is not None:
+        elif has_kv:
             raise ValueError("mha_extend_with_kvcache requires KV to be prewritten")
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
