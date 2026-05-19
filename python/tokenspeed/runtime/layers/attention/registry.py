@@ -31,6 +31,7 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.utils import (
+    profile_available_cache_memory_bytes,
     profile_cache_budget,
     profile_max_num_pages,
 )
@@ -359,7 +360,6 @@ def create_attn_components(
                 server_args, model_config.hf_config
             ),
         )
-        profile_cache_cell_size = deepseek_v4_layout.cache_cell_size(num_layers)
 
     hf_config = getattr(model_config, "hf_config", None)
     text_config = getattr(hf_config, "text_config", hf_config) if hf_config else None
@@ -387,7 +387,48 @@ def create_attn_components(
         ),
     )
 
-    if has_mamba and server_args.max_mamba_cache_size is not None:
+    if is_deepseek_v4_model:
+        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+            profile_deepseek_v4_max_num_pages,
+        )
+
+        draft_cache_cell_size = 0
+        if draft_attn_config is not None:
+            draft_cache_cell_size = (
+                draft_attn_config.cache_cell_size()
+                * draft_model_config.num_attention_layers
+            )
+        max_total_num_pages = profile_deepseek_v4_max_num_pages(
+            layout=deepseek_v4_layout,
+            hf_config=model_config.hf_config,
+            layer_num=num_layers,
+            max_live_requests=config.max_bs,
+            max_scheduled_tokens=server_args.chunked_prefill_size,
+            max_context_len=config.context_len,
+            available_cache_memory_bytes=profile_available_cache_memory_bytes(
+                attn_config=config,
+                gpu_id=gpu_id,
+                tp_size=server_args.mapping.world_size,
+                gpu_memory_utilization=server_args.gpu_memory_utilization,
+                total_gpu_memory=gpu_memory,
+                world_group=server_args.mapping.world_group,
+            ),
+            draft_cache_cell_size=draft_cache_cell_size,
+        )
+        logger.info(
+            "DeepSeek V4 grouped KV profile: max_live_requests=%s "
+            "(attn config max_bs=%s, attn_dp_size=%s), max_total_num_pages=%s",
+            config.max_bs,
+            config.max_bs,
+            server_args.mapping.attn.dp_size,
+            max_total_num_pages,
+        )
+        max_num_tokens = _resolve_max_num_tokens(
+            max_total_num_pages,
+            server_args.block_size,
+            server_args.max_total_tokens,
+        )
+    elif has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
         max_total_num_pages = profile_max_num_pages(
             **_profile_kwargs,
