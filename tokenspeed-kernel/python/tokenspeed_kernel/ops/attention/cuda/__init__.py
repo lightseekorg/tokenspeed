@@ -8,7 +8,9 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 
-if current_platform().is_nvidia:
+platform = current_platform()
+
+if platform.is_nvidia and platform.is_hopper_plus:
     from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 
     @register_kernel(
@@ -17,7 +19,7 @@ if current_platform().is_nvidia:
         name="cuda_mha_merge_state",
         solution="cuda",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(8, 0),
+            min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={torch.float16, torch.bfloat16},

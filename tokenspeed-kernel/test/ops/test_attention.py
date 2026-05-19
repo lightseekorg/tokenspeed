@@ -300,8 +300,8 @@ def test_mha_merge_state(
     head_dim: int,
     num_heads: int,
 ) -> None:
-    if solution == "cuda" and not platform.is_nvidia:
-        pytest.skip("CUDA merge-state kernel is NVIDIA-only")
+    if solution == "cuda" and not (platform.is_nvidia and platform.is_hopper_plus):
+        pytest.skip("CUDA merge-state kernel is NVIDIA Hopper+-only")
 
     total_q = 31
     out_a = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
