@@ -77,7 +77,7 @@ if (
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
         tags={"throughput"},
@@ -94,10 +94,10 @@ if (
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        out, _ = flash_attn_varlen_func(
+        out, lse = flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -107,7 +107,10 @@ if (
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=True,
+            return_lse=return_lse,
         )
+        if return_lse:
+            return out, lse.transpose(0, 1).contiguous()
         return out
 
     @register_kernel(
@@ -125,7 +128,7 @@ if (
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
         tags={"throughput"},
@@ -144,10 +147,10 @@ if (
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        out, _ = flash_attn_varlen_func(
+        out, lse = flash_attn_varlen_func(
             q=q,
             k=k_cache,
             v=v_cache,
@@ -158,7 +161,10 @@ if (
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=False,
+            return_lse=return_lse,
         )
+        if return_lse:
+            return out, lse.transpose(0, 1).contiguous()
         return out
 
     @register_kernel(
