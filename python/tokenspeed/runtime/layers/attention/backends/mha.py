@@ -428,12 +428,12 @@ class MHAAttnBackend(AttentionBackend):
                 layer.k_scale,
                 layer.v_scale,
             )
+        elif k is not None or v is not None:
+            raise ValueError("mha_prefill_with_kvcache requires KV to be prewritten")
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         result = mha_prefill_with_kvcache(
             q=q,
-            k=None if save_kv_cache else k,
-            v=None if save_kv_cache else v,
             cu_seqlens_q=cu_seqlens_q,
             k_cache=k_cache,
             v_cache=v_cache,

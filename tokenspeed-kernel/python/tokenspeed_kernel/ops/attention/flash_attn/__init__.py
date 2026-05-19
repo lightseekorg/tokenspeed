@@ -124,7 +124,6 @@ if (
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "prewritten_kv": frozenset({True}),
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -134,8 +133,6 @@ if (
     )
     def fa4_mha_prefill_with_kvcache(
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -150,8 +147,6 @@ if (
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        if k is not None or v is not None:
-            raise ValueError("FA4 cached prefill requires prewritten KV cache")
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         out, _ = flash_attn_varlen_func(
@@ -296,15 +291,12 @@ elif platform.is_nvidia and platform.is_hopper:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
-            "prewritten_kv": frozenset({True}),
             "return_lse": frozenset({False}),
         },
         tags={"throughput"},
     )
     def fa3_mha_prefill_with_kvcache(
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -319,8 +311,6 @@ elif platform.is_nvidia and platform.is_hopper:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        if k is not None or v is not None:
-            raise ValueError("FA3 cached prefill requires prewritten KV cache")
         cu_seqlens_k_new = torch.nn.functional.pad(
             torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
             (1, 0),

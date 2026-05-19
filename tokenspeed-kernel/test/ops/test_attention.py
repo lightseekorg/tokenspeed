@@ -165,8 +165,6 @@ def test_mha_prefill_with_kvcache(
 
     out = mha_prefill_with_kvcache(
         q=q,
-        k=None,
-        v=None,
         cu_seqlens_q=cu_seqlens_q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -179,6 +177,24 @@ def test_mha_prefill_with_kvcache(
     )
 
     assert out.shape == q.shape
+
+    triton_out, triton_lse = mha_prefill_with_kvcache(
+        q=q,
+        cu_seqlens_q=cu_seqlens_q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=prefix_seqlens,
+        max_seqlen_q=max_query_seqlen,
+        max_seqlen_k=int(prefix_seqlens.max().item()),
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        is_causal=False,
+        return_lse=True,
+        solution="triton",
+    )
+
+    assert triton_out.shape == q.shape
+    assert triton_lse.shape == (q.shape[0], q.shape[1])
 
 
 @pytest.mark.parametrize(

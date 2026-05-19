@@ -173,15 +173,12 @@ if platform.is_nvidia and platform.is_blackwell:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
-            "prewritten_kv": frozenset({True}),
             "return_lse": frozenset({False}),
         },
         tags={"throughput"},
     )
     def flashinfer_mha_prefill_with_kvcache(
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -196,8 +193,6 @@ if platform.is_nvidia and platform.is_blackwell:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        if k is not None or v is not None:
-            raise ValueError("FlashInfer cached prefill requires prewritten KV cache")
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(

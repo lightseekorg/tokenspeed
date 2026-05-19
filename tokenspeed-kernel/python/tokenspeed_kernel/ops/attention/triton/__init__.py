@@ -100,15 +100,12 @@ def triton_mha_prefill(
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False, True}),
-        "prewritten_kv": frozenset({False, True}),
-        "return_lse": frozenset({False}),
+        "return_lse": frozenset({False, True}),
     },
     tags={"portability"},
 )
 def triton_mha_prefill_with_kvcache(
     q: torch.Tensor,
-    k: torch.Tensor | None,
-    v: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -122,23 +119,24 @@ def triton_mha_prefill_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
-) -> torch.Tensor:
-    extend_from_cache = k is None or v is None
-    if extend_from_cache:
-        if k is not None or v is not None:
-            raise ValueError("k and v must both be provided or both be None")
-        k = torch.empty(
-            (0, k_cache.shape[2], k_cache.shape[3]),
-            dtype=k_cache.dtype,
-            device=k_cache.device,
-        )
-        v = torch.empty(
-            (0, v_cache.shape[2], v_cache.shape[3]),
-            dtype=v_cache.dtype,
-            device=v_cache.device,
-        )
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    k = torch.empty(
+        (0, k_cache.shape[2], k_cache.shape[3]),
+        dtype=k_cache.dtype,
+        device=k_cache.device,
+    )
+    v = torch.empty(
+        (0, v_cache.shape[2], v_cache.shape[3]),
+        dtype=v_cache.dtype,
+        device=v_cache.device,
+    )
 
     out = torch.empty_like(q)
+    lse = (
+        torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
     sm_scale = (
         softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
     )
@@ -161,9 +159,11 @@ def triton_mha_prefill_with_kvcache(
         page_table=page_table,
         page_table_stride_b=page_table.stride(0),
         page_size=k_cache.shape[1],
-        extend_from_cache=extend_from_cache,
         has_kv_cache=True,
+        lse_extend=lse,
     )
+    if return_lse:
+        return out, lse
     return out
 
 

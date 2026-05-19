@@ -144,8 +144,6 @@ def mha_prefill(
 def mha_prefill_with_kvcache(
     # attention inputs
     q: torch.Tensor,
-    k: torch.Tensor | None,
-    v: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -164,19 +162,16 @@ def mha_prefill_with_kvcache(
     override: str | None = None,
     solution: str | None = None,
 ) -> AttentionResult:
-    """Ragged MHA extend-prefill with paged KV cache.
+    """Ragged MHA prefill over paged KV cache.
 
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
-        k: Optional new key tensor with shape [total_q, num_kv_heads, head_dim].
-            When None, the appended KV is assumed to already be present in k_cache.
-        v: Optional new value tensor with shape [total_q, num_kv_heads, head_dim].
-            When None, the appended KV is assumed to already be present in v_cache.
         cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
-        cache_seqlens: Total visible KV lengths after appending the new KV, shape [batch].
+        cache_seqlens: Visible KV lengths in the cache, shape [batch]. Query
+            lengths are independent and may be smaller than KV lengths.
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
         softmax_scale: Optional scale factor applied before softmax.
@@ -187,18 +182,18 @@ def mha_prefill_with_kvcache(
         return_lse: Whether to also return log-sum-exp values.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
-    """
-    if (k is None) != (v is None):
-        raise ValueError("k and v must both be provided or both be None")
-    prewritten_kv = k is None
 
+    In causal mode, each request's query tokens are interpreted as the suffix of
+    that request's visible KV sequence, so query position ``i`` maps to absolute
+    KV position ``cache_seqlen - q_len + i``. In non-causal mode, each query
+    token attends all visible cached KV tokens.
+    """
     # Select kernel
     traits = {
         "num_q_heads": q.shape[1],
-        "num_kv_heads": (k.shape[1] if k is not None else k_cache.shape[2]),
+        "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "prewritten_kv": prewritten_kv,
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
         "support_logit_cap": logit_cap != 0.0,
@@ -222,7 +217,7 @@ def mha_prefill_with_kvcache(
         "page_size": k_cache.shape[1],
         "max_pages_per_seq": page_table.shape[1],
         "num_q_heads": q.shape[1],
-        "num_kv_heads": k.shape[1] if k is not None else k_cache.shape[2],
+        "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "max_seqlen_q": max_seqlen_q,
         "max_seqlen_k": max_seqlen_k,
@@ -245,8 +240,6 @@ def mha_prefill_with_kvcache(
     ):
         return kernel(
             q=q,
-            k=k,
-            v=v,
             cu_seqlens_q=cu_seqlens_q,
             k_cache=k_cache,
             v_cache=v_cache,
