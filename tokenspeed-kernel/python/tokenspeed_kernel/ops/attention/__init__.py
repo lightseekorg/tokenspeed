@@ -76,7 +76,8 @@ def mha_prefill(
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
-        return_lse: Whether to also return log-sum-exp values.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -179,7 +180,8 @@ def mha_extend_with_kvcache(
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
-        return_lse: Whether to also return log-sum-exp values.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
