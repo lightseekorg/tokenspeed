@@ -1000,7 +1000,6 @@ def get_config(
     priority=Priority.SPECIALIZED,
     traits={
         "head_dim": frozenset({64}),
-        "is_causal": frozenset({True}),
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False}),
@@ -1015,7 +1014,6 @@ def gluon_mha_prefill_fp16_gfx950(
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
-    is_causal: bool = True,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,

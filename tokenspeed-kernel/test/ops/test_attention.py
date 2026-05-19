@@ -26,8 +26,8 @@ import pytest
 import torch
 from tokenspeed_kernel import (
     mha_decode_with_kvcache,
+    mha_extend_with_kvcache,
     mha_prefill,
-    mha_prefill_with_kvcache,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -70,7 +70,6 @@ def test_mha_prefill(
         max_seqlen_q=max_seqlen,
         max_seqlen_k=max_seqlen,
         softmax_scale=1.0 / math.sqrt(head_dim),
-        is_causal=True,
     )
 
     assert out.shape == q.shape
@@ -80,7 +79,7 @@ def test_mha_prefill(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [(torch.bfloat16, 128, 8, 2)],
 )
-def test_mha_prefill_with_kvcache(
+def test_mha_extend_with_kvcache(
     device: str,
     dtype: torch.dtype,
     head_dim: int,
@@ -163,7 +162,7 @@ def test_mha_prefill_with_kvcache(
                     dtype=dtype,
                 )
 
-    out = mha_prefill_with_kvcache(
+    out = mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
         k_cache=k_cache,
@@ -173,12 +172,11 @@ def test_mha_prefill_with_kvcache(
         max_seqlen_q=max_query_seqlen,
         max_seqlen_k=max_cache_seqlen_used,
         softmax_scale=1.0 / math.sqrt(head_dim),
-        is_causal=True,
     )
 
     assert out.shape == q.shape
 
-    triton_out, triton_lse = mha_prefill_with_kvcache(
+    triton_out, triton_lse = mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
         k_cache=k_cache,
@@ -188,7 +186,6 @@ def test_mha_prefill_with_kvcache(
         max_seqlen_q=max_query_seqlen,
         max_seqlen_k=int(prefix_seqlens.max().item()),
         softmax_scale=1.0 / math.sqrt(head_dim),
-        is_causal=False,
         return_lse=True,
         solution="triton",
     )
@@ -281,7 +278,6 @@ def test_mha_decode_with_kvcache(
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max_cache_seqlen,
         softmax_scale=1.0 / math.sqrt(head_dim),
-        is_causal=True,
     )
 
     assert out.shape == q.shape

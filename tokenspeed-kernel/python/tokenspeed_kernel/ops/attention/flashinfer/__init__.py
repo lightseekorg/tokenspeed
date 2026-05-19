@@ -126,7 +126,6 @@ if platform.is_nvidia and platform.is_blackwell:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -144,7 +143,7 @@ if platform.is_nvidia and platform.is_blackwell:
             k.shape[1],
             q.shape[-1],
             head_dim_vo=v.shape[-1],
-            causal=is_causal,
+            causal=True,
             window_left=window_left,
             logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
             sm_scale=(
@@ -160,8 +159,8 @@ if platform.is_nvidia and platform.is_blackwell:
 
     @register_kernel(
         "attention",
-        "mha_prefill_with_kvcache",
-        name="flashinfer_mha_prefill_with_kvcache_cached",
+        "mha_extend_with_kvcache",
+        name="flashinfer_mha_extend_with_kvcache_cached",
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
@@ -177,7 +176,7 @@ if platform.is_nvidia and platform.is_blackwell:
         },
         tags={"throughput"},
     )
-    def flashinfer_mha_prefill_with_kvcache(
+    def flashinfer_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -187,7 +186,6 @@ if platform.is_nvidia and platform.is_blackwell:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -260,7 +258,6 @@ if platform.is_nvidia and platform.is_blackwell:
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,

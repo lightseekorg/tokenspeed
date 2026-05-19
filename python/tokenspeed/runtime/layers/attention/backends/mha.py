@@ -26,8 +26,8 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel import (
     mha_decode_with_kvcache,
+    mha_extend_with_kvcache,
     mha_prefill,
-    mha_prefill_with_kvcache,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -305,7 +305,6 @@ class MHAAttnBackend(AttentionBackend):
             page_table=metadata.page_table,
             cache_seqlens=metadata.cache_seqlens_int32,
             softmax_scale=layer.scaling,
-            is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=kwargs.get("sinks"),
@@ -386,7 +385,6 @@ class MHAAttnBackend(AttentionBackend):
             max_seqlen_q=metadata.max_seq_len_q,
             max_seqlen_k=metadata.max_seq_len_q,
             softmax_scale=layer.scaling,
-            is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
@@ -429,10 +427,10 @@ class MHAAttnBackend(AttentionBackend):
                 layer.v_scale,
             )
         elif k is not None or v is not None:
-            raise ValueError("mha_prefill_with_kvcache requires KV to be prewritten")
+            raise ValueError("mha_extend_with_kvcache requires KV to be prewritten")
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        result = mha_prefill_with_kvcache(
+        result = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
             k_cache=k_cache,
@@ -440,7 +438,6 @@ class MHAAttnBackend(AttentionBackend):
             page_table=metadata.page_table,
             cache_seqlens=metadata.cache_seqlens_int32,
             softmax_scale=layer.scaling,
-            is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,

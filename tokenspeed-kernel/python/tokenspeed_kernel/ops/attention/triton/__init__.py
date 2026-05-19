@@ -53,7 +53,6 @@ def triton_mha_prefill(
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
-    is_causal: bool = True,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -77,7 +76,7 @@ def triton_mha_prefill(
         cu_seqlens_q,
         cache_seqlens,
         None,
-        is_causal,
+        True,
         max_seqlen_q,
         sm_scale=sm_scale,
         logit_cap=logit_cap,
@@ -90,8 +89,8 @@ def triton_mha_prefill(
 
 @register_kernel(
     "attention",
-    "mha_prefill_with_kvcache",
-    name="triton_mha_prefill_with_kvcache",
+    "mha_extend_with_kvcache",
+    name="triton_mha_extend_with_kvcache",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     dtypes={torch.float16, torch.bfloat16},
@@ -104,7 +103,7 @@ def triton_mha_prefill(
     },
     tags={"portability"},
 )
-def triton_mha_prefill_with_kvcache(
+def triton_mha_extend_with_kvcache(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -114,7 +113,6 @@ def triton_mha_prefill_with_kvcache(
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
-    is_causal: bool = True,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -150,7 +148,7 @@ def triton_mha_prefill_with_kvcache(
         cu_seqlens_q,
         cache_seqlens,
         None,
-        is_causal,
+        False,
         max_seqlen_q,
         sm_scale=sm_scale,
         logit_cap=logit_cap,
@@ -192,7 +190,6 @@ def triton_mha_decode_with_kvcache(
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
-    is_causal: bool = True,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,

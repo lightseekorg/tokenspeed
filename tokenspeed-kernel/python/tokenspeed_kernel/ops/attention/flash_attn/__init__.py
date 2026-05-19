@@ -90,7 +90,6 @@ if (
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -107,14 +106,14 @@ if (
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=True,
         )
         return out
 
     @register_kernel(
         "attention",
-        "mha_prefill_with_kvcache",
-        name="fa4_mha_prefill_with_kvcache_cached",
+        "mha_extend_with_kvcache",
+        name="fa4_mha_extend_with_kvcache_cached",
         solution="fa4",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
@@ -131,7 +130,7 @@ if (
         },
         tags={"throughput"},
     )
-    def fa4_mha_prefill_with_kvcache(
+    def fa4_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -141,7 +140,6 @@ if (
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -159,7 +157,7 @@ if (
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
         )
         return out
 
@@ -192,7 +190,6 @@ if (
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -211,7 +208,7 @@ if (
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
         )
         return out.view_as(q)
 
@@ -253,7 +250,6 @@ elif platform.is_nvidia and platform.is_hopper:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -270,7 +266,7 @@ elif platform.is_nvidia and platform.is_hopper:
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=True,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
@@ -278,8 +274,8 @@ elif platform.is_nvidia and platform.is_hopper:
 
     @register_kernel(
         "attention",
-        "mha_prefill_with_kvcache",
-        name="fa3_mha_prefill_with_kvcache_cached",
+        "mha_extend_with_kvcache",
+        name="fa3_mha_extend_with_kvcache_cached",
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -295,7 +291,7 @@ elif platform.is_nvidia and platform.is_hopper:
         },
         tags={"throughput"},
     )
-    def fa3_mha_prefill_with_kvcache(
+    def fa3_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -305,7 +301,6 @@ elif platform.is_nvidia and platform.is_hopper:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -327,7 +322,7 @@ elif platform.is_nvidia and platform.is_hopper:
             cu_seqlens_k_new=cu_seqlens_k_new,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
@@ -361,7 +356,6 @@ elif platform.is_nvidia and platform.is_hopper:
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -376,7 +370,7 @@ elif platform.is_nvidia and platform.is_hopper:
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
