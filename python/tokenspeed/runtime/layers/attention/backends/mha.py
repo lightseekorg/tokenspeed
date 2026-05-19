@@ -370,12 +370,7 @@ class MHAAttnBackend(AttentionBackend):
                 kwargs.get("sinks"),
             )
 
-        can_split_extend = self._can_use_split_extend(
-            metadata,
-            layer,
-            kwargs.get("sinks"),
-        )
-        if k is not None and v is not None and can_split_extend:
+        if k is not None and v is not None and metadata.use_split_extend:
             return self._forward_extend_split(
                 q,
                 k,
@@ -386,11 +381,11 @@ class MHAAttnBackend(AttentionBackend):
                 metadata,
                 cu_seqlens_q,
                 save_kv_cache,
+                kwargs.get("sinks"),
             )
         if metadata.use_split_extend:
             raise NotImplementedError(
-                "mha prefix extend requires Triton split extend without sinks, "
-                "sliding window, or logit cap"
+                "mha prefix extend requires KV tensors for split extend"
             )
 
         return self._forward_extend_with_kvcache(
@@ -457,6 +452,7 @@ class MHAAttnBackend(AttentionBackend):
         metadata: MHAMetadata,
         cu_seqlens_q: torch.Tensor,
         save_kv_cache: bool,
+        sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         assert metadata.prefix_seqlens_int32 is not None
         assert metadata.max_prefix_seq_len is not None
@@ -471,6 +467,7 @@ class MHAAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            sinks=sinks,
             return_lse=True,
             solution=self.kernel_solution,
         )
@@ -570,20 +567,6 @@ class MHAAttnBackend(AttentionBackend):
             layer.v_head_dim,
         )
         return k_cache, v_cache
-
-    def _can_use_split_extend(
-        self,
-        metadata: MHAMetadata,
-        layer: PagedAttention,
-        sinks: torch.Tensor | None,
-    ) -> bool:
-        return (
-            metadata.use_split_extend
-            and self.kernel_solution == "triton"
-            and sinks is None
-            and layer.sliding_window_size < 0
-            and layer.logit_cap == 0.0
-        )
 
     @staticmethod
     def _make_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
