@@ -29,6 +29,7 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 
@@ -39,6 +40,7 @@ __all__ = [
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
     "mha_merge_state",
+    "mha_decode_scheduler_metadata",
 ]
 
 LSE_LN = math.log2(math.e)
@@ -267,6 +269,7 @@ def mha_decode_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    scheduler_metadata: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -344,7 +347,7 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        kernel_kwargs = dict(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -357,6 +360,11 @@ def mha_decode_with_kvcache(
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
         )
+        # Only the FA3 path accepts pre-computed scheduler metadata; other
+        # backends would reject the unknown kwarg.
+        if scheduler_metadata is not None:
+            kernel_kwargs["scheduler_metadata"] = scheduler_metadata
+        return kernel(**kernel_kwargs)
 
 
 def mha_merge_state(

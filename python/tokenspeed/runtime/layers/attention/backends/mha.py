@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
+    mha_decode_scheduler_metadata,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_merge_state,
@@ -61,6 +62,11 @@ class MHAMetadata:
     prefix_seqlens_int32: torch.Tensor | None = None
     max_prefix_seq_len: int | None = None
     use_split_prefill: bool = False
+    use_direct_prefill: bool = False
+    # FA3 scheduler metadata pre-computed once per scheduler step. When set,
+    # the FA3 decode kernel skips its internal prepare_varlen_num_blocks
+    # launch.
+    scheduler_metadata: torch.Tensor | None = None
 
 
 class MHAAttnBackend(AttentionBackend):
@@ -83,6 +89,12 @@ class MHAAttnBackend(AttentionBackend):
         ) // self.page_size
         self.forward_decode_metadata: MHAMetadata | None = None
         self.forward_prefill_metadata: MHAMetadata | None = None
+
+        # Constants for the FA3 scheduler-metadata pre-compute.
+        self._tp_q_head_num = max(config.num_attention_heads // config.attn_tp_size, 1)
+        self._tp_k_head_num = max(config.num_kv_heads // config.attn_tp_size, 1)
+        self._head_dim = config.head_dim
+        self._qkv_dtype = config.dtype
 
     def init_forward_metadata(
         self,
@@ -130,6 +142,7 @@ class MHAAttnBackend(AttentionBackend):
                 use_split_prefill = has_prefix
             else:
                 use_split_prefill = False
+            use_direct_prefill = not use_split_prefill
 
             prefix_seqlens = None
             max_prefix_seq_len = None
@@ -147,6 +160,7 @@ class MHAAttnBackend(AttentionBackend):
                 prefix_seqlens_int32=prefix_seqlens,
                 max_prefix_seq_len=max_prefix_seq_len,
                 use_split_prefill=use_split_prefill,
+                use_direct_prefill=use_direct_prefill,
             )
             return
 
@@ -171,11 +185,37 @@ class MHAAttnBackend(AttentionBackend):
                     max_seq_len_k=self.max_context_len,
                 )
         else:
-            self.forward_decode_metadata = MHAMetadata(
+            metadata = MHAMetadata(
                 cache_seqlens_int32=seq_lens,
                 page_table=page_table,
                 max_seq_len_k=self.max_context_len,
             )
+            metadata.scheduler_metadata = self._maybe_compute_scheduler_metadata(
+                bs, seq_lens
+            )
+            self.forward_decode_metadata = metadata
+
+    def _maybe_compute_scheduler_metadata(
+        self, bs: int, cache_seqlens: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Pre-compute FA3 decode scheduler metadata once per step.
+
+        Returns ``None`` when the active backend does not consume pre-computed
+        scheduler metadata (only FA3 on Hopper does); the kernel then falls
+        back to its internal prepare_varlen_num_blocks launch.
+        """
+        return mha_decode_scheduler_metadata(
+            batch_size=bs,
+            max_seqlen_q=1,
+            max_seqlen_k=self.max_context_len,
+            num_heads_q=self._tp_q_head_num,
+            num_heads_kv=self._tp_k_head_num,
+            headdim=self._head_dim,
+            cache_seqlens=cache_seqlens,
+            qkv_dtype=self._qkv_dtype,
+            page_size=self.page_size,
+            causal=True,
+        )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         assert (
@@ -315,6 +355,17 @@ class MHAAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
 
+        # Precomputed scheduler metadata bakes in the canonical-decode
+        # attention pattern (causal, no sliding window, no softcap, no
+        # sinks). For layers that deviate, fall back to the FA3 kernel's
+        # internal prepare_varlen path so attention output stays correct.
+        sinks = kwargs.get("sinks")
+        scheduler_metadata = (
+            metadata.scheduler_metadata
+            if (layer.sliding_window_size < 0 and not layer.logit_cap and sinks is None)
+            else None
+        )
+
         result = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -324,8 +375,9 @@ class MHAAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
-            sinks=kwargs.get("sinks"),
+            sinks=sinks,
             max_seqlen_k=metadata.max_seq_len_k,
+            scheduler_metadata=scheduler_metadata,
             solution=self.kernel_solution,
         )
         return self._unwrap_output(result).reshape(
