@@ -78,13 +78,21 @@ def _to_cute(src: torch.Tensor, dtype):
     return ct
 
 
+def force_16b_aligned_int32_cuda(x):
+    y = torch.empty(x.numel(), dtype=torch.int32, device=x.device)
+    y.copy_(x.reshape(-1))
+    assert y.data_ptr() % 16 == 0
+    return y
+
+
 def _to_cute_1d(t: torch.Tensor):
     """Convert a 1D int32 tensor (cum_seqlen) to cute with TVM-FFI.
     Returns (cute_tensor, torch_tensor) to keep backing storage alive."""
     t = t.to(torch.int32) if t.dtype != torch.int32 else t
     if not t.is_cuda:
         t = t.cuda()
-    ct = from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True)
+    ct = force_16b_aligned_int32_cuda(t)
+    ct = from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True)
     ct.element_type = cutlass.Int32
     return ct, t
 
