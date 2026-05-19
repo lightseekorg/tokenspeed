@@ -29,6 +29,7 @@ from tokenspeed_kernel import (
     mha_extend_with_kvcache,
     mha_prefill,
 )
+from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -57,6 +58,9 @@ class MHAMetadata:
     cu_seqlens_q: torch.Tensor | None = None
     max_seq_len_q: int | None = None
     max_seq_len_k: int | None = None
+    prefix_seqlens_int32: torch.Tensor | None = None
+    max_prefix_seq_len: int | None = None
+    use_split_extend: bool = False
     use_direct_prefill: bool = False
 
 
@@ -120,12 +124,24 @@ class MHAAttnBackend(AttentionBackend):
             extend_prefix_lens_cpu = kwargs.get("extend_prefix_lens_cpu")
             if not forward_mode.is_extend():
                 use_direct_prefill = False
+                use_split_extend = False
             elif extend_prefix_lens is None:
                 use_direct_prefill = True
+                use_split_extend = False
             elif extend_prefix_lens_cpu is not None:
-                use_direct_prefill = not bool(extend_prefix_lens_cpu[:bs].any().item())
+                has_prefix = bool(extend_prefix_lens_cpu[:bs].any().item())
+                use_direct_prefill = not has_prefix
+                use_split_extend = has_prefix
             else:
                 use_direct_prefill = False
+                use_split_extend = False
+
+            prefix_seqlens = None
+            max_prefix_seq_len = None
+            if extend_prefix_lens is not None:
+                prefix_seqlens = extend_prefix_lens[:bs]
+                if extend_prefix_lens_cpu is not None:
+                    max_prefix_seq_len = int(extend_prefix_lens_cpu[:bs].max().item())
 
             self.forward_prefill_metadata = MHAMetadata(
                 cache_seqlens_int32=seq_lens,
@@ -133,6 +149,9 @@ class MHAAttnBackend(AttentionBackend):
                 page_table=page_table,
                 max_seq_len_q=max_seq_len_q,
                 max_seq_len_k=self.max_context_len,
+                prefix_seqlens_int32=prefix_seqlens,
+                max_prefix_seq_len=max_prefix_seq_len,
+                use_split_extend=use_split_extend,
                 use_direct_prefill=use_direct_prefill,
             )
             return
@@ -351,6 +370,29 @@ class MHAAttnBackend(AttentionBackend):
                 kwargs.get("sinks"),
             )
 
+        can_split_extend = self._can_use_split_extend(
+            metadata,
+            layer,
+            kwargs.get("sinks"),
+        )
+        if k is not None and v is not None and can_split_extend:
+            return self._forward_extend_split(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                cu_seqlens_q,
+                save_kv_cache,
+            )
+        if metadata.use_split_extend:
+            raise NotImplementedError(
+                "mha prefix extend requires Triton split extend without sinks, "
+                "sliding window, or logit cap"
+            )
+
         return self._forward_extend_with_kvcache(
             q,
             k,
@@ -403,6 +445,71 @@ class MHAAttnBackend(AttentionBackend):
                 layer.v_scale,
             )
         return output
+
+    def _forward_extend_split(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        metadata: MHAMetadata,
+        cu_seqlens_q: torch.Tensor,
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        assert metadata.prefix_seqlens_int32 is not None
+        assert metadata.max_prefix_seq_len is not None
+
+        chunk_result = mha_prefill(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=metadata.max_seq_len_q,
+            softmax_scale=layer.scaling,
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            return_lse=True,
+            solution=self.kernel_solution,
+        )
+        chunk_out, chunk_lse = chunk_result
+
+        k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        prefix_result = mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=cu_seqlens_q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.prefix_seqlens_int32,
+            softmax_scale=layer.scaling,
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            return_lse=True,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=metadata.max_prefix_seq_len,
+            solution=self.kernel_solution,
+        )
+        prefix_out, prefix_lse = prefix_result
+
+        output = self._merge_states(
+            chunk_out.contiguous(),
+            chunk_lse.contiguous(),
+            prefix_out.contiguous(),
+            prefix_lse.contiguous(),
+        )
+        if save_kv_cache:
+            token_to_kv_pool.set_kv_buffer(
+                layer,
+                out_cache_loc,
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_extend_with_kvcache(
         self,
@@ -463,6 +570,38 @@ class MHAAttnBackend(AttentionBackend):
             layer.v_head_dim,
         )
         return k_cache, v_cache
+
+    def _can_use_split_extend(
+        self,
+        metadata: MHAMetadata,
+        layer: PagedAttention,
+        sinks: torch.Tensor | None,
+    ) -> bool:
+        return (
+            metadata.use_split_extend
+            and self.kernel_solution == "triton"
+            and sinks is None
+            and layer.sliding_window_size < 0
+            and layer.logit_cap == 0.0
+        )
+
+    @staticmethod
+    def _merge_states(
+        out_a: torch.Tensor,
+        lse_a: torch.Tensor,
+        out_b: torch.Tensor,
+        lse_b: torch.Tensor,
+    ) -> torch.Tensor:
+        if torch.version.cuda is not None:
+            output, _ = merge_state(out_a, lse_a, out_b, lse_b)
+            return output
+        lse = torch.maximum(lse_a, lse_b)
+        weight_a = torch.exp(lse_a - lse)
+        weight_b = torch.exp(lse_b - lse)
+        denom = weight_a + weight_b
+        return (out_a * weight_a[..., None] + out_b * weight_b[..., None]) / denom[
+            ..., None
+        ]
 
     @staticmethod
     def _make_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
