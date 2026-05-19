@@ -378,34 +378,6 @@ def mha_merge_state(
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
-    if out_a.shape != out_b.shape:
-        raise ValueError(f"out shapes must match, got {out_a.shape} and {out_b.shape}")
-    if lse_a.shape != lse_b.shape:
-        raise ValueError(f"lse shapes must match, got {lse_a.shape} and {lse_b.shape}")
-    if out_a.shape[:2] != lse_a.shape:
-        raise ValueError(
-            f"out and lse shapes are incompatible: {out_a.shape} and {lse_a.shape}"
-        )
-    if out_a.dtype != out_b.dtype:
-        raise ValueError(f"out dtypes must match, got {out_a.dtype} and {out_b.dtype}")
-    if out_a.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(
-            f"mha_merge_state output dtype must be fp16/bf16, got {out_a.dtype}"
-        )
-    if lse_a.dtype != torch.float32 or lse_b.dtype != torch.float32:
-        raise ValueError(
-            f"mha_merge_state LSE dtype must be fp32, got {lse_a.dtype} and {lse_b.dtype}"
-        )
-    if not (out_a.device == out_b.device == lse_a.device == lse_b.device):
-        raise ValueError("all mha_merge_state inputs must be on the same device")
-    if not (
-        out_a.is_contiguous()
-        and out_b.is_contiguous()
-        and lse_a.is_contiguous()
-        and lse_b.is_contiguous()
-    ):
-        raise ValueError("mha_merge_state inputs must be contiguous")
-
     traits = {
         "head_dim": out_a.shape[-1],
     }
