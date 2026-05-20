@@ -57,6 +57,19 @@ def max(input, axis=None, keep_dims=False):
 
 
 @gluon.aggregate
+class InputLayout:
+    stride_t: gl.constexpr
+    stride_h: gl.constexpr
+    stride_d: gl.constexpr
+
+    @gluon.jit
+    def offsets(self, token, head, dim):
+        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
+            gl.int32
+        )
+
+
+@gluon.aggregate
 class AttentionConfig:
     SM_SCALE: gl.constexpr
     PAGE_TABLE_STRIDE: gl.constexpr
@@ -71,6 +84,7 @@ class AttentionConfig:
     WINDOW_LEFT: gl.constexpr
     GROUP_SIZE: gl.constexpr
     GROUP_BLOCKS: gl.constexpr
+    q_input_layout: InputLayout
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
     q_layout: gl.constexpr
@@ -97,6 +111,7 @@ class AttentionConfig:
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        q_input_layout,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
         assert HEAD_DIM == 64
@@ -126,6 +141,7 @@ class AttentionConfig:
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
         self.GROUP_BLOCKS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
+        self.q_input_layout = q_input_layout
         self.qk_layout = gl.constexpr(mfma_layout)
         self.pv_layout = gl.constexpr(mfma_layout)
         self.q_layout = gl.constexpr(gl.DotOperandLayout(0, mfma_layout, k_width=8))
@@ -269,10 +285,8 @@ class AttentionProgram:
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
         q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
         valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
-        offsets = (
-            self.batch * cfg.NUM_Q_HEADS * cfg.HEAD_DIM
-            + q_heads[:, None] * cfg.HEAD_DIM
-            + offs_d[None, :]
+        offsets = cfg.q_input_layout.offsets(
+            self.batch, q_heads[:, None], offs_d[None, :]
         )
         return cdna4.buffer_load(self.q_ptr, offsets, mask=valid[:, None], other=0.0)
 
@@ -418,6 +432,9 @@ def _mha_decode_fp16(
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_lse_ptr,
+    Q_STRIDE_B: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
@@ -442,6 +459,7 @@ def _mha_decode_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        InputLayout(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
         cfg,
@@ -512,6 +530,7 @@ def _mha_decode_reduce_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        InputLayout(1, 1, 1),
     )
     batch = gl.program_id(0)
     q_head = gl.program_id(1)
@@ -653,7 +672,7 @@ def gluon_mha_decode_fp16_gfx950(
     )
 
     batch = q.shape[0]
-    output = torch.empty_like(q)
+    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     mid_o = torch.empty(
         (batch, config.num_q_heads, config.num_kv_splits, config.head_dim),
         device=q.device,
@@ -665,9 +684,8 @@ def gluon_mha_decode_fp16_gfx950(
         dtype=torch.float32,
     )
 
-    _mha_decode_fp16[
-        (batch, config.num_kv_heads * config.group_blocks, config.num_kv_splits)
-    ](
+    grid = (batch, config.num_kv_heads * config.group_blocks, config.num_kv_splits)
+    _mha_decode_fp16[grid](
         q,
         k_cache,
         v_cache,
@@ -675,6 +693,9 @@ def gluon_mha_decode_fp16_gfx950(
         cache_seqlens,
         mid_o,
         mid_lse,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
         config.sm_scale,
         page_table.stride(0),
         config.page_size,
@@ -688,7 +709,9 @@ def gluon_mha_decode_fp16_gfx950(
         config.window_left,
         num_warps=1,
     )
-    _mha_decode_reduce_fp16[(batch, config.num_q_heads)](
+
+    grid = (batch, config.num_q_heads)
+    _mha_decode_reduce_fp16[grid](
         mid_o,
         mid_lse,
         output,
