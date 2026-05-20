@@ -26,47 +26,24 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, tl
+from tokenspeed_kernel._triton import gl, gluon
+from tokenspeed_kernel.ops.attention.gluon.utils import (
+    _INV_LN2,
+    _INV_LN2_VALUE,
+    InputStrides,
+    max,
+    maximum,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
-_INV_LN2_VALUE = 1.4426950408889634
-_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Utilities
-# ===-----------------------------------------------------------------------===#
-
-
-@gluon.jit
-def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
-    return gl.maximum(a, b, propagate_nan=propagate_nan)
-
-
-@gluon.jit
-def max(input, axis=None, keep_dims=False):
-    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
-
 
 # ===-----------------------------------------------------------------------===#
 # Kernel Config
 # ===-----------------------------------------------------------------------===#
-
-
-@gluon.aggregate
-class InputLayout:
-    stride_t: gl.constexpr
-    stride_h: gl.constexpr
-    stride_d: gl.constexpr
-
-    @gluon.jit
-    def offsets(self, token, head, dim):
-        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
-            gl.int32
-        )
 
 
 @gluon.aggregate
@@ -84,7 +61,7 @@ class AttentionConfig:
     WINDOW_LEFT: gl.constexpr
     GROUP_SIZE: gl.constexpr
     GROUP_BLOCKS: gl.constexpr
-    q_input_layout: InputLayout
+    q_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
     q_layout: gl.constexpr
@@ -111,7 +88,7 @@ class AttentionConfig:
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
-        q_input_layout,
+        q_strides,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
         assert HEAD_DIM == 64
@@ -127,6 +104,21 @@ class AttentionConfig:
             transposed=True,
             warps_per_cta=[1, 1],
         )
+        qk_layout = mfma_layout
+        pv_layout = mfma_layout
+        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=8)
+        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=8)
+        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=4)
+        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
+        load_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
+        store_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
+        reduce_layout = gl.BlockedLayout([1], [64], [1], [0])
+        k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
+            [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
+        )
+        v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
+            [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
+        )
 
         self.SM_SCALE = gl.constexpr(SM_SCALE)
         self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
@@ -141,30 +133,18 @@ class AttentionConfig:
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
         self.GROUP_BLOCKS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
-        self.q_input_layout = q_input_layout
-        self.qk_layout = gl.constexpr(mfma_layout)
-        self.pv_layout = gl.constexpr(mfma_layout)
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, mfma_layout, k_width=8))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, mfma_layout, k_width=8))
-        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, mfma_layout, k_width=4))
-        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, mfma_layout, k_width=4))
-        self.load_layout = gl.constexpr(
-            gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        )
-        self.store_layout = gl.constexpr(
-            gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        )
-        self.reduce_layout = gl.constexpr(gl.BlockedLayout([1], [64], [1], [0]))
-        self.k_smem_layout = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
-            )
-        )
-        self.v_smem_layout = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
-            )
-        )
+        self.q_strides = q_strides
+        self.qk_layout = gl.constexpr(qk_layout)
+        self.pv_layout = gl.constexpr(pv_layout)
+        self.q_layout = gl.constexpr(q_layout)
+        self.k_layout = gl.constexpr(k_layout)
+        self.p_layout = gl.constexpr(p_layout)
+        self.v_layout = gl.constexpr(v_layout)
+        self.load_layout = gl.constexpr(load_layout)
+        self.store_layout = gl.constexpr(store_layout)
+        self.reduce_layout = gl.constexpr(reduce_layout)
+        self.k_smem_layout = gl.constexpr(k_smem_layout)
+        self.v_smem_layout = gl.constexpr(v_smem_layout)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -285,9 +265,7 @@ class AttentionProgram:
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
         q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
         valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
-        offsets = cfg.q_input_layout.offsets(
-            self.batch, q_heads[:, None], offs_d[None, :]
-        )
+        offsets = cfg.q_strides.offsets(self.batch, q_heads[:, None], offs_d[None, :])
         return cdna4.buffer_load(self.q_ptr, offsets, mask=valid[:, None], other=0.0)
 
     @gluon.jit
@@ -459,7 +437,7 @@ def _mha_decode_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
-        InputLayout(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
+        InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
         cfg,
@@ -530,7 +508,7 @@ def _mha_decode_reduce_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
-        InputLayout(1, 1, 1),
+        InputStrides(1, 1, 1),
     )
     batch = gl.program_id(0)
     q_head = gl.program_id(1)
