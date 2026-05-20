@@ -47,14 +47,18 @@ from tokenspeed.runtime.configs import (
     DeepseekV4Config,
     KimiK2Config,
     MiniMaxM2Config,
+    Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3Config,
+    Qwen3MoeConfig,
 )
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
+    Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     DeepseekV4Config.model_type: DeepseekV4Config,
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,

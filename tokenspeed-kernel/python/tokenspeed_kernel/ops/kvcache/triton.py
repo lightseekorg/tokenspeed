@@ -22,16 +22,135 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
+_PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
+
 _is_nvidia = current_platform().is_nvidia
 
 __all__ = [
+    "store_kv_cache",
     "transfer_kv_all_layer",
     "transfer_kv_per_layer",
 ]
+
+
+@triton.jit
+def _store_kv_cache_kernel(
+    k_src_ptr,
+    v_src_ptr,
+    k_dst_ptr,
+    v_dst_ptr,
+    loc_ptr,
+    k_src_token_stride,
+    v_src_token_stride,
+    k_dst_row_stride,
+    v_dst_row_stride,
+    n_kv_per_token: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scatter rows of k_src/v_src into k_dst/v_dst at indices loc_ptr.
+
+    Stride-aware: leading axis of src/dst can have any stride; the only
+    requirement is ``stride(-1) == 1`` so we can use linear addressing on
+    the flattened head_dim×num_kv_heads axis.
+    """
+    is_v = tl.program_id(0)
+    row = tl.program_id(1)
+
+    dst_row = tl.load(loc_ptr + row)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n_kv_per_token
+
+    if is_v == 1:
+        src = tl.load(
+            v_src_ptr + row * v_src_token_stride + offsets, mask=mask, other=0
+        )
+        tl.store(v_dst_ptr + dst_row * v_dst_row_stride + offsets, src, mask=mask)
+    else:
+        src = tl.load(
+            k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
+        )
+        tl.store(k_dst_ptr + dst_row * k_dst_row_stride + offsets, src, mask=mask)
+
+
+def store_kv_cache(
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+    k_dst: torch.Tensor,
+    v_dst: torch.Tensor,
+    loc: torch.Tensor,
+) -> None:
+    """Fused per-token KV cache scatter for one layer.
+
+    Replaces ``k_dst[loc] = k_src; v_dst[loc] = v_src`` with a single triton
+    launch handling both k and v rows. The last dim of all four tensors must
+    be contiguous (stride == 1); the leading axis may have any stride — this
+    lets src tensors come from a qkv-split view directly (no contiguous copy
+    required).
+    """
+    n_tokens = k_src.shape[0]
+    if n_tokens == 0:
+        return
+    n_kv_k = k_src.numel() // n_tokens
+    n_kv_v = v_src.numel() // n_tokens
+    assert (
+        n_kv_k == n_kv_v
+    ), f"k/v must share per-token element count, got {n_kv_k} vs {n_kv_v}"
+    assert k_src.stride(-1) == 1 and v_src.stride(-1) == 1
+    assert k_dst.stride(-1) == 1 and v_dst.stride(-1) == 1
+
+    k_src_stride = k_src.stride(0) if k_src.dim() > 1 else k_src.shape[-1]
+    v_src_stride = v_src.stride(0) if v_src.dim() > 1 else v_src.shape[-1]
+    k_dst_stride = k_dst.stride(0) if k_dst.dim() > 1 else k_dst.shape[-1]
+    v_dst_stride = v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1]
+
+    block = triton.next_power_of_2(n_kv_k)
+    _store_kv_cache_kernel[(2, n_tokens)](
+        k_src,
+        v_src,
+        k_dst,
+        v_dst,
+        loc,
+        k_src_stride,
+        v_src_stride,
+        k_dst_stride,
+        v_dst_stride,
+        n_kv_k,
+        BLOCK=block,
+    )
+
+
+@triton.jit
+def _kv_transfer_per_layer_capped_kernel(
+    k_cache_dst_ptr,
+    v_cache_dst_ptr,
+    indices_dst_ptr,
+    k_cache_src_ptr,
+    v_cache_src_ptr,
+    indices_src_ptr,
+    kv_cache_src_stride,
+    kv_cache_dst_stride,
+    length,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Grid-capped variant: each program strides over multiple indices."""
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    for i in range(pid, length, nprog):
+        pos_src = tl.load(indices_src_ptr + i).to(tl.int64)
+        pos_dst = tl.load(indices_dst_ptr + i).to(tl.int64)
+        src_offset = pos_src * kv_cache_src_stride
+        dst_offset = pos_dst * kv_cache_dst_stride
+        k_src = tl.load(k_cache_src_ptr + src_offset + offs)
+        tl.store(k_cache_dst_ptr + dst_offset + offs, k_src)
+        v_src = tl.load(v_cache_src_ptr + src_offset + offs)
+        tl.store(v_cache_dst_ptr + dst_offset + offs, v_src)
 
 
 @triton.jit
@@ -297,6 +416,22 @@ def transfer_kv_per_layer(
 
     # BLOCK_SIZE is in elements, must be power of two and cover element_dim
     block_size = _next_power_of_two(element_dim)
+
+    cap = _PER_LAYER_GRID_CAP
+    if cap > 0 and length > cap:
+        _kv_transfer_per_layer_capped_kernel[(cap,)](
+            k_cache_dst_flat,
+            v_cache_dst_flat,
+            dst_indices,
+            k_cache_src_flat,
+            v_cache_src_flat,
+            src_indices,
+            kv_cache_src_stride,
+            kv_cache_dst_stride,
+            length,
+            BLOCK_SIZE=block_size,
+        )
+        return
 
     grid = (length,)
     _kv_transfer_per_layer_kernel[grid](

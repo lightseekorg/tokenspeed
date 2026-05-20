@@ -34,7 +34,7 @@ import re
 import site
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -126,6 +126,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     set_weight_attrs,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
 from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
 
@@ -634,6 +635,7 @@ def _deepseek_v4_indexer_topk_from_cache_batched(
     topk_tokens: int,
     preserve_topk_order: bool = False,
     out: torch.Tensor | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batch the decode indexer cache read while preserving per-token top-k."""
 
@@ -701,6 +703,15 @@ def _deepseek_v4_indexer_topk_from_cache_batched(
         return topk
 
     if logits.is_cuda and topk_tokens in (512, 1024, 2048):
+        if _deepseek_v4_try_persistent_topk(
+            logits,
+            compressed_lens,
+            topk,
+            topk_tokens,
+            max_len,
+            workspace=persistent_topk_workspace,
+        ):
+            return topk
         from tokenspeed_kernel.thirdparty.trtllm import fast_topk_v2
 
         fast_topk_v2(
@@ -1494,6 +1505,7 @@ def _deepseek_v4_indexer_topk_from_logits(
     row_starts: Optional[torch.Tensor] = None,
     row_ends: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    persistent_topk_workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     lengths_for_kernel = lengths.to(torch.int32).contiguous()
     length_rows = lengths_for_kernel.reshape(-1)
@@ -1546,6 +1558,15 @@ def _deepseek_v4_indexer_topk_from_logits(
             return prefill_topk
 
     if not preserve_topk_order and logits.is_cuda and topk_tokens in (512, 1024, 2048):
+        if _deepseek_v4_try_persistent_topk(
+            logits,
+            lengths_for_kernel,
+            topk,
+            topk_tokens,
+            max_len,
+            workspace=persistent_topk_workspace,
+        ):
+            return topk
         from tokenspeed_kernel.thirdparty.trtllm import fast_topk_v2
 
         fast_topk_v2(
@@ -1943,10 +1964,9 @@ def _deepseek_v4_indexer_decode_metadata(
     # refreshed_keys. The metadata builder also clears refreshed_keys at the
     # start of each refresh so a stale entry from a previous step cannot
     # cause an early-return with capture-time data. By returning the cached plan
-    # here, the per-layer
-    # `run_indexer` call dispatched into `_deepseek_v4_maybe_execute_in_parallel`
-    # becomes a pure read, eliminating the cross-stream allocator race
-    # against `insert_and_compress` on aux_stream.
+    # here, the per-layer `run_indexer` call dispatched on the `StreamFork`
+    # main branch becomes a pure read, eliminating the cross-stream allocator
+    # race against `insert_and_compress` on the aux stream.
     if cached is not None and refreshed_keys is not None and key in refreshed_keys:
         return cached
 
@@ -2056,6 +2076,7 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     decode_max_context_len: Optional[int] = None,
     is_valid_token: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    persistent_topk_workspace: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     q_values, q_scales = index_q
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
@@ -2142,6 +2163,7 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
             topk_tokens,
             next_n=1,
             out=out,
+            persistent_topk_workspace=persistent_topk_workspace,
         )
 
 
@@ -2223,6 +2245,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
     topk_indices_buffer: torch.Tensor,
     prefill_gather_values_workspace: torch.Tensor,
     prefill_gather_scales_workspace: torch.Tensor,
+    persistent_topk_workspace: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
     topk_tokens: int,
@@ -2449,6 +2472,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     decode_block_table=decode_block_table,
                     decode_max_context_len=decode_max_context_len,
                     out=decode_out,
+                    persistent_topk_workspace=persistent_topk_workspace,
                 )
         if topk is None and fallback_index_q.shape[0] >= decode_end:
             with deepseek_v4_profile_scope("indexer_topk_fallback_decode"):
@@ -2464,6 +2488,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     compress_ratio=compress_ratio,
                     topk_tokens=topk_tokens,
                     out=decode_out,
+                    persistent_topk_workspace=persistent_topk_workspace,
                 )
                 topk = decode_out
         if topk is None:
@@ -2503,6 +2528,7 @@ def _deepseek_v4_sparse_attn_indexer_op(
     topk_indices_buffer: torch.Tensor,
     prefill_gather_values_workspace: torch.Tensor,
     prefill_gather_scales_workspace: torch.Tensor,
+    persistent_topk_workspace: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
     topk_tokens: int,
@@ -2542,6 +2568,7 @@ def _deepseek_v4_sparse_attn_indexer_op(
         topk_indices_buffer=topk_indices_buffer,
         prefill_gather_values_workspace=prefill_gather_values_workspace,
         prefill_gather_scales_workspace=prefill_gather_scales_workspace,
+        persistent_topk_workspace=persistent_topk_workspace,
         cache_block_size=cache_block_size,
         compress_ratio=compress_ratio,
         topk_tokens=topk_tokens,
@@ -2578,6 +2605,7 @@ def _deepseek_v4_sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor,
     prefill_gather_values_workspace: torch.Tensor,
     prefill_gather_scales_workspace: torch.Tensor,
+    persistent_topk_workspace: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
     topk_tokens: int,
@@ -2612,6 +2640,7 @@ def _deepseek_v4_sparse_attn_indexer_fake(
         cache_block_size,
         prefill_gather_values_workspace,
         prefill_gather_scales_workspace,
+        persistent_topk_workspace,
         compress_ratio,
         topk_tokens,
         num_prefill_tokens,
@@ -2629,6 +2658,7 @@ direct_register_custom_op(
         "topk_indices_buffer",
         "prefill_gather_values_workspace",
         "prefill_gather_scales_workspace",
+        "persistent_topk_workspace",
     ],
     fake_impl=_deepseek_v4_sparse_attn_indexer_fake,
 )
@@ -2661,6 +2691,7 @@ def _deepseek_v4_sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor,
     prefill_gather_values_workspace: torch.Tensor,
     prefill_gather_scales_workspace: torch.Tensor,
+    persistent_topk_workspace: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
     topk_tokens: int,
@@ -2714,6 +2745,7 @@ def _deepseek_v4_sparse_attn_indexer(
             topk_indices_buffer,
             prefill_gather_values_workspace,
             prefill_gather_scales_workspace,
+            persistent_topk_workspace,
             cache_block_size,
             compress_ratio,
             topk_tokens,
@@ -2748,6 +2780,7 @@ def _deepseek_v4_sparse_attn_indexer(
         topk_indices_buffer=topk_indices_buffer,
         prefill_gather_values_workspace=prefill_gather_values_workspace,
         prefill_gather_scales_workspace=prefill_gather_scales_workspace,
+        persistent_topk_workspace=persistent_topk_workspace,
         cache_block_size=cache_block_size,
         compress_ratio=compress_ratio,
         topk_tokens=topk_tokens,
@@ -2768,24 +2801,49 @@ _DEEPSEEK_V4_PAGED_GATHER_CHECKED = False
 _DEEPSEEK_V4_PAGED_GATHER_AVAILABLE = False
 
 
-def _deepseek_v4_maybe_execute_in_parallel(
-    fn0: Callable[[], Any],
-    fn1: Callable[[], Any],
-    event0: torch.cuda.Event | None,
-    event1: torch.cuda.Event | None,
-    aux_stream: torch.cuda.Stream | None,
-) -> tuple[Any, Any]:
-    if aux_stream is None or event0 is None or event1 is None:
-        return fn0(), fn1()
+def _deepseek_v4_try_persistent_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: torch.Tensor,
+    topk_tokens: int,
+    max_seq_len: int,
+    workspace: Optional[torch.Tensor] = None,
+) -> bool:
+    if (
+        not logits.is_cuda
+        or logits.dtype != torch.float32
+        or topk_tokens not in (512, 1024, 2048)
+    ):
+        return False
+    if (
+        workspace is None
+        or not workspace.is_cuda
+        or workspace.device != logits.device
+        or workspace.numel() < 1024 * 1024
+        or workspace.dtype != torch.uint8
+    ):
+        return False
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+            has_persistent_topk,
+            persistent_topk,
+        )
 
-    event0.record()
-    result0 = fn0()
-    with torch.cuda.stream(aux_stream):
-        event0.wait()
-        result1 = fn1()
-        event1.record()
-    event1.wait()
-    return result0, result1
+        if not has_persistent_topk():
+            return False
+        persistent_topk(
+            logits.contiguous(),
+            lengths.to(device=logits.device, dtype=torch.int32)
+            .reshape(-1)
+            .contiguous(),
+            topk,
+            workspace,
+            topk_tokens,
+            max_seq_len,
+        )
+    except Exception:
+        return False
+    return True
 
 
 _DEEPSEEK_V4_MEGA_DEEP_GEMM = None
@@ -3923,6 +3981,12 @@ class DeepseekV4Indexer(nn.Module):
             torch.empty((0, scale_bytes), dtype=torch.uint8),
             persistent=False,
         )
+        workspace_rows = 1024 * 1024 if self.topk_tokens in (512, 1024, 2048) else 0
+        self.register_buffer(
+            "_persistent_topk_workspace",
+            torch.empty((workspace_rows,), dtype=torch.uint8),
+            persistent=False,
+        )
 
     def _prefill_gather_workspace(
         self,
@@ -4174,6 +4238,7 @@ class DeepseekV4Indexer(nn.Module):
             topk_indices_buffer=topk_out,
             prefill_gather_values_workspace=prefill_gather_values,
             prefill_gather_scales_workspace=prefill_gather_scales,
+            persistent_topk_workspace=self._persistent_topk_workspace,
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             topk_tokens=self.topk_tokens,
@@ -4536,6 +4601,7 @@ class DeepseekV4Indexer(nn.Module):
                             metadata=metadata,
                             is_valid_token=decode_valid_token,
                             out=decode_out,
+                            persistent_topk_workspace=self._persistent_topk_workspace,
                         )
                     if topk is not None:
                         return
@@ -4569,6 +4635,7 @@ class DeepseekV4Indexer(nn.Module):
                     compress_ratio=self.compress_ratio,
                     topk_tokens=self.topk_tokens,
                     out=decode_out,
+                    persistent_topk_workspace=self._persistent_topk_workspace,
                 )
 
             fill_prefill_topk()
@@ -4615,6 +4682,7 @@ class DeepseekV4Indexer(nn.Module):
                             else None
                         ),
                         out=topk_out,
+                        persistent_topk_workspace=self._persistent_topk_workspace,
                     )
                 if topk is not None:
                     return topk
@@ -4654,6 +4722,7 @@ class DeepseekV4Indexer(nn.Module):
                 compress_ratio=self.compress_ratio,
                 topk_tokens=self.topk_tokens,
                 out=topk_out,
+                persistent_topk_workspace=self._persistent_topk_workspace,
             )
 
         indexer_cache = pool.get_indexer_kv_buffer_2d(layer_index)
@@ -4815,14 +4884,7 @@ class DeepseekV4Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_index = layer_index
-        self.aux_stream = aux_stream
-        if self.aux_stream is not None:
-            self.ln_events: list[torch.cuda.Event | None] = [
-                torch.cuda.Event(),
-                torch.cuda.Event(),
-            ]
-        else:
-            self.ln_events = [None, None]
+        self.stream_fork = StreamFork(aux_stream)
         use_fp4_indexer_cache = _attention_use_fp4_indexer_cache(config)
         self.layout = deepseek_v4_attention_layout(
             config,
@@ -5437,21 +5499,19 @@ class DeepseekV4Attention(nn.Module):
                 insert_swa_cache()
                 run_compressor()
 
-            topk_indices, _ = _deepseek_v4_maybe_execute_in_parallel(
-                run_indexer,
-                insert_and_compress,
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            with self.stream_fork.scope(
+                enable=self.stream_fork.aux_stream is not None
+            ) as fork:
+                topk_indices = run_indexer()
+                with fork.branch():
+                    insert_and_compress()
         elif self.compressor is not None:
-            _deepseek_v4_maybe_execute_in_parallel(
-                run_compressor,
-                insert_swa_cache,
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            with self.stream_fork.scope(
+                enable=self.stream_fork.aux_stream is not None
+            ) as fork:
+                run_compressor()
+                with fork.branch():
+                    insert_swa_cache()
         else:
             insert_swa_cache()
         backend_decode = getattr(
@@ -5514,7 +5574,7 @@ class DeepseekV4Attention(nn.Module):
         elif (
             backend_prefill is not None
             and ctx.forward_mode is not None
-            and ctx.forward_mode.is_extend()
+            and ctx.forward_mode.is_extend_or_mixed()
         ):
             with deepseek_v4_profile_scope(f"{profile_prefix}_prefill_backend"):
                 attn_output = backend_prefill(

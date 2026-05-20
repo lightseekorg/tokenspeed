@@ -322,7 +322,11 @@ def _site_id(site: CallSite) -> str:
 )
 @pytest.mark.parametrize(
     "platform_name",
-    ["h100_platform", "b200_platform"],
+    [
+        "h100_platform",
+        "b200_platform",
+        "mi350_platform",
+    ],
 )
 def test_kernel_selection(site, platform_name, request):
     platform = request.getfixturevalue(platform_name)

@@ -50,9 +50,9 @@ from tokenspeed_mla.utils import torch_to_cutlass_dtype
 
 logger = logging.getLogger(__name__)
 
-# Backend selection via env var. Values: "cutedsl" (default) or "binary" (AOT SO).
+# Backend selection via env var. Values: "binary" (default, AOT SO) or "cutedsl".
 _PREFILL_BACKEND_ENV = os.environ.get(
-    "TOKENSPEED_MLA_PREFILL_BACKEND", "cutedsl"
+    "TOKENSPEED_MLA_PREFILL_BACKEND", "binary"
 ).lower()
 
 

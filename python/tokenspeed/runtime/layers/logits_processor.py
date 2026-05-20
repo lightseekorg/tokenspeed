@@ -212,32 +212,32 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
         # Get the last hidden states and last logits for the next token prediction
-        if (
-            logits_metadata.forward_mode.is_decode_or_idle()
-            or logits_metadata.forward_mode.is_target_verify()
-        ):
-            pruned_states = hidden_states
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden for hidden in aux_hidden_states]
-            sample_indices = None
-            input_logprob_indices = None
-        elif (
-            logits_metadata.forward_mode.is_extend()
-            and not logits_metadata.extend_return_logprob
-        ):
-            # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
+        if not logits_metadata.extend_return_logprob:
+            if logits_metadata.forward_mode.is_extend_or_mixed():
+                # Prefill: last token of each request via cumulative seq lens.
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-            else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
+                pruned_states = hidden_states[last_index]
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [
+                        hidden[last_index] for hidden in aux_hidden_states
+                    ]
+            elif logits_metadata.padded_static_len > 0:
+                # Padded per-request layout: pick the last valid token per
+                # request using the precomputed offsets.
                 last_index = (
                     logits_metadata.last_index_offsets + logits_metadata.extend_seq_lens
                 )
-            pruned_states = hidden_states[last_index]
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                pruned_states = hidden_states[last_index]
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [
+                        hidden[last_index] for hidden in aux_hidden_states
+                    ]
+            else:
+                # One row per request already — no indexing needed.
+                pruned_states = hidden_states
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [hidden for hidden in aux_hidden_states]
+
             sample_indices = None
             input_logprob_indices = None
         else:

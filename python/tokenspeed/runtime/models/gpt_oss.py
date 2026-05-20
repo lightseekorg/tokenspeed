@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -773,6 +774,26 @@ class GptOssForCausalLM(BaseCausalLM):
                 )
                 param.data[slices].copy_(narrow_weight[slices])
 
+        # Detect AMD-Quark per-expert checkpoints (e.g.
+        # ``amd/gpt-oss-120b-w-mxfp4-a-fp8``). These store one set of tensors
+        # per expert (``...experts.{e}.gate_up_proj.{weight,...}``) plus a
+        # scalar ``input_scale`` for static FP8 activation quantization.
+        if any(
+            re.search(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.", n)
+            for n, _ in weights
+        ):
+            return self._load_mxfp4_per_expert_weights(
+                weights,
+                params_dict=params_dict,
+                moe_tp_rank_start=moe_tp_rank_start,
+                moe_tp_rank_end=moe_tp_rank_end,
+                moe_ep_rank_start=moe_ep_rank_start,
+                moe_ep_rank_end=moe_ep_rank_end,
+                moe_tp_rank=moe_tp_rank,
+                copy_into_param=_copy_into_param,
+                mxfp4_block=mxfp4_block,
+            )
+
         for name, weight in weights:
             weight = _WeightCreator.maybe_materialize(weight)
 
@@ -838,6 +859,127 @@ class GptOssForCausalLM(BaseCausalLM):
                     narrow_weight = torch.zeros_like(narrow_weight)
                 _copy_into_param(params_dict[new_name], narrow_weight)
                 loaded_params.add(new_name)
+
+        return loaded_params
+
+    def _load_mxfp4_per_expert_weights(
+        self,
+        weights,
+        *,
+        params_dict,
+        moe_tp_rank_start: int,
+        moe_tp_rank_end: int,
+        moe_ep_rank_start: int,
+        moe_ep_rank_end: int,
+        moe_tp_rank: int,
+        copy_into_param,
+        mxfp4_block: int,
+    ):
+        """Load the AMD-Quark per-expert MXFP4 + FP8 input-scale checkpoint.
+
+        Tensor names look like
+        ``model.layers.{l}.mlp.experts.{e}.{gate_up_proj,down_proj}.{weight,
+        weight_scale,bias,input_scale}`` and shapes match the existing fused
+        ``w13_*`` / ``w2_*`` parameters once the per-expert tensors are
+        stacked along the expert dimension.
+        """
+        loaded_params: set = set()
+
+        per_expert_re = re.compile(
+            r"^(?P<base>.*\.experts\.)(?P<expert>\d+)\.(?P<proj>gate_up_proj|down_proj)\.(?P<kind>weight_scale|weight|bias|input_scale)$"
+        )
+
+        for name, weight in weights:
+            weight = _WeightCreator.maybe_materialize(weight)
+
+            match = per_expert_re.match(name)
+            if match is None:
+                # ``router`` and other non-expert weights are emitted to the
+                # generic loader by the caller; if we still hit one here it is
+                # an unexpected name.
+                continue
+
+            base = match.group("base")
+            expert_id = int(match.group("expert"))
+            proj = match.group("proj")
+            kind = match.group("kind")
+
+            if not (moe_ep_rank_start <= expert_id < moe_ep_rank_end):
+                continue
+            local_expert_id = expert_id - moe_ep_rank_start
+
+            if proj == "gate_up_proj":
+                if kind == "weight":
+                    target = base + "w13_weight"
+                elif kind == "weight_scale":
+                    target = base + "w13_weight_scale"
+                elif kind == "bias":
+                    target = base + "w13_weight_bias"
+                else:  # input_scale
+                    target = base + "w13_input_scale"
+            else:  # down_proj
+                if kind == "weight":
+                    target = base + "w2_weight"
+                elif kind == "weight_scale":
+                    target = base + "w2_weight_scale"
+                elif kind == "bias":
+                    target = base + "w2_weight_bias"
+                else:  # input_scale
+                    target = base + "w2_input_scale"
+
+            if target not in params_dict:
+                # The active backend (e.g. plain MXFP4 without FP8 act) may
+                # not allocate ``input_scale`` parameters; just skip.
+                if kind == "input_scale":
+                    continue
+                raise KeyError(f"missing target parameter {target!r} for {name!r}")
+            param = params_dict[target]
+
+            if kind == "input_scale":
+                # Per-tensor static FP8 activation scale; broadcast scalar
+                # into the per-expert slot.
+                param.data[local_expert_id] = (
+                    weight.detach().to(torch.float32).reshape(())
+                )
+                loaded_params.add(target)
+                continue
+
+            if proj == "gate_up_proj":
+                # Per-expert tensor shapes:
+                #   weight:        (2*intermediate, hidden//2) uint8
+                #   weight_scale:  (2*intermediate, hidden//mxfp4_block) uint8
+                #   bias:          (2*intermediate,) bf16
+                # The fused parameter slot is sharded along the (output)
+                # intermediate dimension.
+                if kind == "bias":
+                    narrow = weight[2 * moe_tp_rank_start : 2 * moe_tp_rank_end]
+                else:
+                    narrow = weight[2 * moe_tp_rank_start : 2 * moe_tp_rank_end, :]
+                copy_into_param(param.data[local_expert_id], narrow)
+            else:  # down_proj
+                # Per-expert tensor shapes:
+                #   weight:        (hidden, intermediate//2) uint8
+                #   weight_scale:  (hidden, intermediate//mxfp4_block) uint8
+                #   bias:          (hidden,) bf16
+                # Down_proj is sharded along the (input) intermediate
+                # dimension.
+                if kind == "bias":
+                    if moe_tp_rank != 0:
+                        narrow = torch.zeros_like(weight)
+                    else:
+                        narrow = weight
+                elif kind == "weight":
+                    narrow = weight[:, moe_tp_rank_start // 2 : moe_tp_rank_end // 2]
+                else:  # weight_scale
+                    narrow = weight[
+                        :,
+                        moe_tp_rank_start
+                        // mxfp4_block : moe_tp_rank_end
+                        // mxfp4_block,
+                    ]
+                copy_into_param(param.data[local_expert_id], narrow)
+
+            loaded_params.add(target)
 
         return loaded_params
 

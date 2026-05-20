@@ -109,7 +109,10 @@ about.
 | `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 | `--enable-custom-logit-processor` | Allow custom logit processors. Keep disabled unless the deployment needs it. |
 
-Common parser values include `kimi_k2` and `gpt-oss`.
+Common reasoning parser values include `kimi_k25`, `base`, `qwen3`, and
+`deepseek_r1`. Common tool-call parser values include `kimik2`, `qwen`, `json`,
+and `passthrough`. The parser names are validated by the SMG gateway, so use
+the values accepted by the bundled `tokenspeed-smg` package.
 
 ## Speculative Decoding
 

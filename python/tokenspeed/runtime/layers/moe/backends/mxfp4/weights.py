@@ -107,4 +107,41 @@ def create_mxfp4_weights(
         set_weight_attrs(w2_weight_bias, {"weight_loader": weight_loader})
 
 
-__all__ = ["MXFP4_BLOCK", "create_mxfp4_weights"]
+def _per_tensor_input_scale_loader(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    local_expert_id: int,
+) -> None:
+    value = loaded_weight.detach().to(torch.float32).reshape(())
+    if shard_id in ("w1", "w3"):
+        prev = param.data[local_expert_id]
+        param.data[local_expert_id] = torch.maximum(prev, value)
+    elif shard_id == "w2":
+        param.data[local_expert_id] = value
+    else:
+        raise ValueError(f"Unknown shard_id for input_scale: {shard_id!r}")
+
+
+def create_mxfp4_fp8_input_scales(layer: nn.Module, num_local_experts: int) -> None:
+    from tokenspeed.runtime.utils import set_weight_attrs
+
+    w13 = nn.Parameter(
+        torch.zeros(num_local_experts, dtype=torch.float32),
+        requires_grad=False,
+    )
+    w2 = nn.Parameter(
+        torch.zeros(num_local_experts, dtype=torch.float32),
+        requires_grad=False,
+    )
+    layer.register_parameter("w13_input_scale", w13)
+    layer.register_parameter("w2_input_scale", w2)
+    set_weight_attrs(w13, {"weight_loader": _per_tensor_input_scale_loader})
+    set_weight_attrs(w2, {"weight_loader": _per_tensor_input_scale_loader})
+
+
+__all__ = [
+    "MXFP4_BLOCK",
+    "create_mxfp4_weights",
+    "create_mxfp4_fp8_input_scales",
+]

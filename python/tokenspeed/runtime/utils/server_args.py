@@ -355,7 +355,7 @@ class ServerArgs:
             elif self.mapping.world_size >= 8:
                 self.gpu_memory_utilization = 0.81
             elif self.mapping.world_size >= 4:
-                self.gpu_memory_utilization = 0.85
+                self.gpu_memory_utilization = 0.95
             elif self.mapping.world_size >= 2:
                 self.gpu_memory_utilization = 0.87
             else:
@@ -516,6 +516,14 @@ class ServerArgs:
             self.eagle3_layers_to_capture = [
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
+
+        # Hoist the PD-decode runtime assert (topk == 1) to startup.
+        if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "speculative_eagle_topk > 1 (tree spec) is not currently "
+                f"supported: {self.speculative_eagle_topk=}. Only chain spec "
+                "(topk=1) is wired end-to-end."
+            )
 
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
@@ -1304,7 +1312,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.reasoning_parser,
             help=(
-                "Reasoning parser name (e.g. 'minimax', 'gpt-oss'). "
+                "Reasoning parser name (e.g. 'minimax', 'kimi_k25'). "
                 "Used to defer json_schema grammars past the model's "
                 "reasoning channel."
             ),
@@ -1383,7 +1391,7 @@ class ServerArgs:
             "--speculative-eagle-topk",
             type=int,
             help="The number of tokens sampled from the draft model in each speculative step.",
-            choices=[1, 2, 4, 8],
+            choices=[1],
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(

@@ -20,9 +20,7 @@
 
 from __future__ import annotations
 
-import functools
 import os
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -739,6 +737,39 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+def _normalize_fp8_group_scale_layout(
+    A: torch.Tensor,
+    A_scale: torch.Tensor,
+    expected_scale_k: int,
+) -> torch.Tensor:
+    """Return FP8 activation scales as [M, num_k_groups].
+
+    The NVIDIA fast path in ``per_token_group_quant_fp8`` can return TRT-LLM
+    scales as a flattened buffer with M padded to a multiple of 4. The MoE
+    Triton kernel consumes row-major scales with no padded rows.
+    """
+    if A_scale.shape[-1] == expected_scale_k:
+        return A_scale
+
+    if A_scale.ndim == 1:
+        m = A.shape[-2]
+        aligned_m = triton.cdiv(m, 4) * 4
+        valid_numel = expected_scale_k * aligned_m
+        if A_scale.numel() < valid_numel:
+            return A_scale
+        return (
+            A_scale[:valid_numel]
+            .view(expected_scale_k, aligned_m)[:, :m]
+            .T.contiguous()
+        )
+
+    # Some helpers return [num_k_groups, M]; convert to [M, num_k_groups].
+    if A_scale.shape[0] == expected_scale_k:
+        return A_scale.transpose(0, 1).contiguous()
+
+    return A_scale
+
+
 @register_kernel(
     "moe",
     "experts",
@@ -793,15 +824,8 @@ def invoke_fused_moe_kernel(
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             A, A_scale = per_token_group_quant_fp8(A, block_k)
-            # TRT-LLM's per-token group quantization helper returns scales in
-            # column-major layout [num_groups, num_tokens], while this MoE
-            # kernel consumes [num_tokens, num_groups].
             expected_scale_k = triton.cdiv(A.shape[-1], block_k)
-            if (
-                A_scale.shape[-1] != expected_scale_k
-                and A_scale.shape[0] == expected_scale_k
-            ):
-                A_scale = A_scale.transpose(0, 1).contiguous()
+            A_scale = _normalize_fp8_group_scale_layout(A, A_scale, expected_scale_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
@@ -812,10 +836,11 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+        )
 
     K = B.shape[2] - padded_size
     even_Ks = K % config["BLOCK_SIZE_K"] == 0

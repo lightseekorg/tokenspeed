@@ -42,6 +42,7 @@ class AttentionBackend(ABC):
         self.num_kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
         self.dtype = config.dtype
         self.head_dim = config.head_dim
+        self.is_draft = config.is_draft
 
     @property
     def support_kv_cache_prewrite(self) -> bool:
@@ -80,6 +81,7 @@ class AttentionBackend(ABC):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -119,6 +121,7 @@ class AttentionBackend(ABC):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: BaseTokenToKVPool,
         forward_mode: ForwardMode,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -131,6 +134,7 @@ class AttentionBackend(ABC):
                 layer,
                 out_cache_loc,
                 token_to_kv_pool,
+                bs,
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
@@ -149,6 +153,7 @@ class AttentionBackend(ABC):
                 layer,
                 out_cache_loc,
                 token_to_kv_pool,
+                bs,
                 save_kv_cache=save_kv_cache,
                 forward_mode=forward_mode,
                 **kwargs,
@@ -170,6 +175,7 @@ class AttentionBackend(ABC):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: BaseTokenToKVPool,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -184,6 +190,7 @@ class AttentionBackend(ABC):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: BaseTokenToKVPool,
+        bs: int,
         save_kv_cache: bool = True,
         **kwargs,
     ):

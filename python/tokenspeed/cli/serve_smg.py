@@ -30,8 +30,6 @@ import os
 import signal
 import sys
 
-from tokenspeed_kernel.platform import current_platform
-
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
@@ -51,6 +49,7 @@ DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "none"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -122,10 +121,58 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
     return result
 
 
+_TOKENIZER_CACHE_FLAGS = (
+    "--tokenizer-cache-enable-l0",
+    "--tokenizer-cache-enable-l1",
+)
+
+
+def _gateway_args_with_default_tokenizer_cache(gateway_args: list[str]) -> list[str]:
+    """Default smg tokenizer caches (L0 + L1) ON for gateway-fronted launches.
+
+    For agentic / chat-completions traffic with a shared system prompt + history,
+    L1 prefix-caching at special-token boundaries cuts TTFT by ~30% (verified
+    end-to-end on mm25). smg's own clap defaults leave both layers OFF.
+
+    Opt-out: operators can pass ``--no-tokenizer-cache-enable-l0`` and/or
+    ``--no-tokenizer-cache-enable-l1`` to ``ts serve``. The ``--no-`` form is
+    intercepted here (smg's clap doesn't accept it natively) and prevents the
+    positive injection for that layer.
+    """
+    result = list(gateway_args)
+    for flag in _TOKENIZER_CACHE_FLAGS:
+        no_flag = "--no-" + flag[2:]
+        if no_flag in result:
+            # Operator opted out: strip the --no- marker (smg rejects it)
+            # and skip the positive injection for this layer.
+            while no_flag in result:
+                result.remove(no_flag)
+            continue
+        if flag not in result:
+            result.append(flag)
+    return result
+
+
 def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     if "--log-level" in gateway_args:
         return gateway_args
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
+
+
+def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
+    """Pin the smg Prometheus exporter to ``DEFAULT_SMG_PROMETHEUS_PORT``.
+
+    smg's own default (``29000``) collides easily when multiple ``ts serve``
+    instances share a host or when a previous run hasn't released the
+    port yet — the gateway then exits early and the tokenizer
+    registration job never runs, surfacing later as
+    ``tokenizer_not_found`` on the first request. Pinning a tokenspeed-
+    specific default keeps the port stable for our deployments while
+    still allowing an explicit override.
+    """
+    if "--prometheus-port" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
 
 
 def _user_model_id(gateway_args: list[str]) -> str | None:
@@ -173,30 +220,9 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
     gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
-    return _gateway_args_with_default_log_level(gateway_args)
-
-
-def _overwrite_sampling_backend(engine_args: list[str]) -> list[str]:
-    if current_platform().is_nvidia:
-        return engine_args
-
-    # TODO: Remove this workaround after smg-grpc-servicer stops injecting
-    # ``--sampling-backend flashinfer`` on non-NVIDIA platforms.
-    # The currently pinned SMG TokenSpeed entrypoint forces flashinfer when the
-    # flag is absent, but flashinfer sampling kernels are NVIDIA-only.
-    result: list[str] = []
-    skip_next = False
-    for arg in engine_args:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg == "--sampling-backend":
-            skip_next = True
-            continue
-        if arg.startswith("--sampling-backend="):
-            continue
-        result.append(arg)
-    return [*result, "--sampling-backend", "greedy"]
+    gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
+    gateway_args = _gateway_args_with_default_log_level(gateway_args)
+    return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -380,7 +406,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
-    engine_args = _overwrite_sampling_backend(split.engine)
+    engine_args = split.engine
     gateway_args = _gateway_args_with_defaults(split.gateway)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
 

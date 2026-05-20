@@ -23,8 +23,10 @@ from __future__ import annotations
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 
@@ -34,11 +36,8 @@ __all__ = [
     "mha_prefill",
     "mha_prefill_with_kvcache",
     "mha_decode_with_kvcache",
+    "mha_decode_scheduler_metadata",
 ]
-
-
-def _requires_logit_cap(logit_cap: float) -> bool:
-    return logit_cap != 0.0
 
 
 def mha_prefill(
@@ -88,7 +87,7 @@ def mha_prefill(
         "head_dim": q.shape[-1],
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
@@ -204,7 +203,7 @@ def mha_prefill_with_kvcache(
         "prewritten_kv": prewritten_kv,
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
@@ -281,6 +280,7 @@ def mha_decode_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    scheduler_metadata: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -317,7 +317,7 @@ def mha_decode_with_kvcache(
         "page_size": k_cache.shape[1],
         "is_causal": is_causal,
         "sliding_window": window_left >= 0,
-        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
         "query_len": 1,
@@ -360,7 +360,7 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        kernel_kwargs = dict(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -374,3 +374,8 @@ def mha_decode_with_kvcache(
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
         )
+        # Only the FA3 path accepts pre-computed scheduler metadata; other
+        # backends would reject the unknown kwarg.
+        if scheduler_metadata is not None:
+            kernel_kwargs["scheduler_metadata"] = scheduler_metadata
+        return kernel(**kernel_kwargs)
