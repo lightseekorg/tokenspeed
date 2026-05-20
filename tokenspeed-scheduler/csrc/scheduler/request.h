@@ -140,13 +140,9 @@ public:
         return std::visit(Overloaded{
             []<typename T>(const T& s) -> std::vector<std::int32_t>
                 requires(std::derived_from<T, fsm::ForwardState> || std::derived_from<T, fsm::Submitted> ||
-                         std::same_as<T, fsm::Aborting> || std::same_as<T, fsm::PrefetchDone>)
+                         std::same_as<T, fsm::Aborting> || std::same_as<T, fsm::PrefetchDone> ||
+                         std::same_as<T, fsm::Retracted>)
             { return s.GetOccupiedPages(); },
-            // Retracted holds no device pages (tail page released at retract).
-            // ``applyPrefillEvent`` queries this on the pre-Apply state to
-            // compute the ``begin`` offset for the post-Apply page list;
-            // Retracted's "pre" page count is 0, matching Submitted.
-            [](const fsm::Retracted&) -> std::vector<std::int32_t> { return {}; },
             [this](const auto&) -> std::vector<std::int32_t> {
                 throw std::logic_error(
                     "Request::GetOccupiedPages: expected state=Submitted, PrefetchDone, Retracted, Aborting, or "
@@ -164,6 +160,25 @@ public:
             { return s.GetDeviceNode(); },
             [this](const auto&) -> const TreeNode* {
                 throw std::logic_error("Request::GetDeviceNode: expected a base request state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+
+    // Tokens past the last host-cached full-page boundary on a Retracted
+    // request; the dispatch uses this to pick the recovery path
+    // (Decode-from-Retracted when 0, Reprefill otherwise). Reads from the
+    // pinned ``host_node_ref_`` — no radix-tree walk. Throws if the state
+    // isn't Retracted (caller is expected to gate via ``Is<Retracted>()``).
+    std::int32_t RetractedPartialTailTokens() const {
+        return std::visit(Overloaded{
+            [this](const fsm::Retracted& s) -> std::int32_t {
+                const std::int32_t host_cached_tokens = s.HostMatchedPages() * s.GetPageSize();
+                return std::max(0, token_container_.Size() - host_cached_tokens);
+            },
+            [this](const auto&) -> std::int32_t {
+                throw std::logic_error("Request::RetractedPartialTailTokens: expected state=Retracted; got state=" +
                                        StateName());
             },
             },

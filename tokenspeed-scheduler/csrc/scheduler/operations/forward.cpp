@@ -201,15 +201,8 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 
     const std::int32_t device_matched2 = match_result.device.DepthInPage();
     const std::int32_t host_matched2 = match_result.host.DepthInPage();
-    // Precondition: caller only invokes scheduleDecodeFromRetracted when
-    // partial_tail_tokens == 0. The dispatch in newForwardOperation routes
-    // requests with a non-zero partial tail through
-    // scheduleRetractedReprefill instead, which emits a PrefillOperation
-    // capable of carrying the partial-tail token IDs (DecodeOperation only
-    // stores a single decode_input_id and cannot represent multi-token
-    // re-prefill — see PrefillOperation vs DecodeOperation in forward.h).
-    //
-    // Pages needed: LoadBack nodes (host→device) + the decode step itself.
+    // Pre: caller routes partial_tail > 0 through scheduleRetractedReprefill.
+    // Pages needed: loadback (host→device) + decode step itself.
     std::int32_t num_tokens = 0;
     if (host_matched2 > device_matched2) {
         num_tokens += (config_.page_size * (host_matched2 - device_matched2)) + config_.decode_input_tokens;
@@ -280,13 +273,9 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     };
 }
 
-// Retracted recovery for the case where partial_tail > 0: emit a
-// PrefillOperation that re-prefills the dropped-KV partial-tail tokens, then
-// the next plan picks up the PrefillDone state and schedules a normal decode.
-//
-// We can't reuse scheduleDecodeFromRetracted because DecodeOperation only
-// carries a single decode_input_id; multi-token re-prefill needs the
-// input_ids vector that lives on PrefillOperation.
+// Retracted recovery when partial_tail > 0: emit a PrefillOperation that
+// re-prefills the dropped-KV partial-tail tokens. The next plan picks up
+// PrefillDone and schedules a normal decode.
 std::optional<fsm::ScheduleRetractedReprefillEvent> Scheduler::scheduleRetractedReprefill(
     Request* request, std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
@@ -309,10 +298,7 @@ std::optional<fsm::ScheduleRetractedReprefillEvent> Scheduler::scheduleRetracted
     const std::int32_t host_matched = match_result.host.DepthInPage();
     const std::int32_t window_begin = host_matched * config_.page_size;
     const std::int32_t partial_tail_tokens = std::max(0, request->TokenSize() - window_begin);
-    if (partial_tail_tokens == 0) {
-        // Caller should have routed to scheduleDecodeFromRetracted instead.
-        return {};
-    }
+    if (partial_tail_tokens == 0) return {};  // routed to scheduleDecodeFromRetracted
 
     // Pages needed: loadback (host→device) + partial-tail re-prefill +
     // decode reserve for the immediately-following Decoding step.
@@ -371,9 +357,7 @@ std::optional<fsm::ScheduleRetractedReprefillEvent> Scheduler::scheduleRetracted
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
 
     return fsm::ScheduleRetractedReprefillEvent{
-        partial_tail_tokens,
         config_.decode_input_tokens,
-        window_begin,
         &device_allocator_,
         &req_pool_allocator_,
         &kv_prefix_cache_,
@@ -522,15 +506,17 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
     return op;
 }
 
-// Retracted → PrefillDone via the partial-tail re-prefill path.
-// Produces a normal PrefillOperation; executor handles it like any
-// prefill chunk that hit the host cache (existing code path).
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleRetractedReprefillEvent event) {
     auto match = event.GetMatchResult();
     auto op = applyPrefillEvent(request, std::move(event));
     op.mamba_cow_src_idx = match.mamba_cow_src_index;
     op.mamba_branching_seqlen = match.mamba_branching_seqlen;
-    acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
+    // Drop stale paged-cache table entries from the pre-retract Decoding
+    // life (pages they referenced are gone), then re-acquire the full
+    // [0, TokenSize) range so the post-recovery decode sees a consistent
+    // table. Mirrors ScheduleDecodeFromRetractedEvent's op-gen.
+    releasePagedCachePagesForRequest(op.request_id);
+    acquirePagedCachePagesForRequest(op.request_id, 0, request->TokenSize());
     populatePagedCachePagesForOp(op);
     return op;
 }
@@ -673,17 +659,11 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
             if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
 
-            // Recovery splits two ways based on whether the request's tokens
-            // align with the host-cached page boundary. If a partial tail
-            // exists, those tokens had their KV dropped at retract (no device
-            // tail page is kept) and must be re-prefilled — we emit a
-            // PrefillOperation. Otherwise plain loadback + decode is enough.
-            const std::int32_t host_matched_pages =
-                kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery)
-                    .host.DepthInPage();
-            const std::int32_t partial_tail =
-                std::max(0, request->TokenSize() - host_matched_pages * config_.page_size);
-            if (partial_tail > 0) {
+            // Recovery picks one of two paths by whether the request's tokens
+            // align with the host-cached page boundary. Partial tail > 0 →
+            // re-prefill (PrefillOperation carries input_ids). == 0 →
+            // straight loadback + decode (DecodeOperation).
+            if (request->RetractedPartialTailTokens() > 0) {
                 if (auto ev = scheduleRetractedReprefill(request, simulated_free)) {
                     std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                     push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);

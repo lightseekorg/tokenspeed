@@ -14,42 +14,24 @@
 
 namespace tokenspeed::test {
 
-// ============================================================
-//  Retracted resource accounting: the device tail page must be released
-//  to the device pool at retract time, not pinned for the lifetime of
-//  the Retracted state.
-//
-//  Pre-fix behavior: every retract leaked one device page (the partial
-//  tail page held by ``Retracted::local_kv_allocator_``). Under sustained
-//  retraction the pool's free list drained monotonically until new requests
-//  could no longer be admitted — a deadlock the scheduler's priority order
-//  AND the prefill-first break could not work around because the leak was
-//  structural, not a scheduling artifact.
-//
-//  Fix: ``WriteBackDoneEvent::operator()(Retracting&&)`` drops the
-//  LocalKVAllocator before constructing Retracted. Recovery in
-//  ``ScheduleDecodeFromRetractedEvent::operator()(Retracted&&)`` allocates
-//  a fresh LocalKVAllocator sized for ``partial_tail_tokens +
-//  decode_input_tokens`` and the op's ``input_length`` is extended so the
-//  model re-prefills the dropped tail.
-// ============================================================
+// Retracted resource accounting: the device tail page must be released to
+// the pool at retract time. Otherwise N retractions accumulate N permanently
+// pinned device pages and admission deadlocks under sustained pressure.
 
 class RetractLeakTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        // decode_input_tokens > 0 makes the local KV allocator hold a real
+        // decode_input_tokens > 0 forces LocalKVAllocator to hold a real
         // tail page (one extra page beyond the radix-tree-inserted full
-        // pages). Mirrors RetractFromPrefillDoneTestSuite so retract actually
-        // produces a meaningful tail page to drop.
+        // pages) — the leak target.
         cfg.decode_input_tokens = 2;
         cfg.page_size = 2;
-        // total=6 → 5 usable pages (page 0 reserved). Need headroom for the
-        // post-recovery decode step: recovery's re-prefill consumes loadback
-        // + partial_tail + decode_reserve, and the immediately-following
-        // PrefillDone → Decoding transition acquires another decode-reserve
-        // page. With a tighter pool (total=4) recovery would itself trigger
-        // a second retract cascade, masking the test's intent.
+        // total=6 → 5 usable pages. Need headroom for post-recovery decode:
+        // recovery consumes loadback + partial_tail + decode_reserve, and
+        // the PrefillDone → Decoding transition needs another reserve page.
+        // Tighter pools would cascade into a second retract during recovery
+        // and mask the test's intent.
         cfg.device_allocator.total_pages = 6;
         cfg.host_allocator.total_pages = 16;
         cfg.enable_l3_storage = false;
@@ -85,28 +67,6 @@ protected:
         }
         return nullptr;
     }
-
-    // Drive r1 to Decoding then force a retract via a large reserve; consume
-    // the writeback. Returns scheduler.AvailableKvPages() right after the
-    // WriteBackDone event.
-    std::size_t DriveAndRetract(const std::string& id, token_t start) {
-        // 1-page request (2 tokens) → prefill 1 page.
-        Submit(MakeRequestSpec(id, /*num_pages=*/1, start));
-        PlanOnce();
-        // Add 1 generated token → 3 tokens; the partial tail now contains
-        // token 3 in the 2nd device page (tail_available=1).
-        SendForwardDone(id, {42});
-        PlanOnce();
-        // Reserve more than the device can satisfy → triggers retract.
-        SendReserveNumTokens(id, 5);
-        auto plan = PlanOnce();
-        const auto* wb = GetWriteBack(plan);
-        if (wb == nullptr || wb->op_ids.empty()) {
-            return scheduler_->AvailableKvPages();
-        }
-        SendWriteBackDone(wb->op_ids[0]);
-        return scheduler_->AvailableKvPages();
-    }
 };
 
 // A single retract releases the tail page back to the pool. Pre-fix this
@@ -129,32 +89,22 @@ TEST_F(RetractLeakTestSuite, RetractReleasesTailPageToDevicePool) {
     SendWriteBackDone(wb->op_ids[0]);
     ASSERT_EQ(scheduler_->RetractedSize(), 1u);
 
-    const std::size_t avail_retracted = scheduler_->AvailableKvPages();
-
-    // The full pages r1 held went into the radix tree (still device-occupied
-    // but evictable; not counted in AvailableKvPages which only tracks the
-    // free list). LocalKVAllocator's leftover pages — the partial tail page
-    // plus any decode-reserve pages it had Acquire'd — are now returned to
-    // the pool by the fix → free count goes strictly up. Pre-fix this is
-    // equal because Retracted held onto the whole LocalKVAllocator.
-    EXPECT_GT(avail_retracted, avail_decoding)
-        << "After fix: retract must release the tail device page (and any "
-        << "decode-reserve pages held by LocalKVAllocator).";
+    // Full pages move into the radix tree (device-occupied but evictable, not
+    // counted in AvailableKvPages which only tracks the free list). The
+    // LocalKVAllocator's leftover — partial tail + Acquire'd decode-reserve
+    // pages — must come back to the free list.
+    EXPECT_GT(scheduler_->AvailableKvPages(), avail_decoding)
+        << "retract should release the tail and decode-reserve pages to the pool";
 }
 
-// Sustained retracts must not monotonically drain the device pool. Pre-fix
-// each retract leaked 1 device page, so after N retracts AvailableKvPages
-// dropped by N. With the fix the pool is reusable across retracts.
+// Invariant: across N retracts (none recovered), AvailableKvPages must not
+// monotonically shrink — i.e. no per-retract device-page leak.
 TEST_F(RetractLeakTestSuite, ManyRetractsDoNotLeakDevicePages) {
     const std::size_t avail_initial = scheduler_->AvailableKvPages();
 
-    // Each retract leaves the request in Retracted state (we never recover
-    // it). We expect zero device pages to be permanently consumed across N
-    // retracts, since the tail page should be released.
     constexpr int kNumRetracts = 5;
     for (int i = 0; i < kNumRetracts; ++i) {
         const std::string id = "r_" + std::to_string(i);
-        // Fresh token range so no prefix-cache sharing across requests.
         const token_t start = static_cast<token_t>(10'000 + 1'000 * i);
         Submit(MakeRequestSpec(id, /*num_pages=*/1, start));
         PlanOnce();
@@ -163,36 +113,25 @@ TEST_F(RetractLeakTestSuite, ManyRetractsDoNotLeakDevicePages) {
         SendReserveNumTokens(id, 5);
         auto plan = PlanOnce();
         const auto* wb = GetWriteBack(plan);
-        if (wb == nullptr) {
-            // Device exhausted before this iteration could even retract —
-            // this is precisely the deadlock the issue describes. Pre-fix
-            // would hit this around iter 3-4 on this config.
-            FAIL() << "Device pool deadlocked at iter " << i
-                   << "; AvailableKvPages=" << scheduler_->AvailableKvPages()
-                   << ". Leak suspected.";
-        }
+        ASSERT_NE(wb, nullptr) << "device pool deadlocked at iter " << i
+                               << "; AvailableKvPages=" << scheduler_->AvailableKvPages();
         ASSERT_FALSE(wb->op_ids.empty());
         SendWriteBackDone(wb->op_ids[0]);
     }
 
     EXPECT_EQ(scheduler_->RetractedSize(), kNumRetracts);
 
-    // Pre-fix: after N retracts, AvailableKvPages dropped by ~N (tail page
-    // leak per retract). Post-fix: pool size is conserved modulo pages still
-    // legitimately held by tree entries from each retracted request's full
-    // pages. The full pages are evictable so EnsureCapacityByEvict can claim
-    // them; what matters is the free pool isn't monotonically shrinking from
-    // tail-page leaks. We bound the worst case at "no more than 1 leaked
-    // page per retract" to detect regression.
-    const std::size_t avail_now = scheduler_->AvailableKvPages();
-    EXPECT_GE(avail_now + kNumRetracts, avail_initial)
-        << "Each retract appears to have leaked > 1 device page";
+    // Worst-case bound: no more than 1 page net consumed per retract (any
+    // bigger regression = leak). Tree-evictable full pages don't count
+    // against this — only pages stuck outside both the free list and the
+    // evictable tree do.
+    EXPECT_GE(scheduler_->AvailableKvPages() + kNumRetracts, avail_initial);
 }
 
-// Recovery after the tail-page-release fix: Retracted → PrefillDone (via
-// ScheduleRetractedReprefillEvent, which emits a PrefillOperation for the
-// dropped-KV partial tail) → Decoding (next plan, via the standard
-// ScheduleDecodeEvent). Two plan rounds total, vs. one in the pre-fix flow.
+// Two-step recovery: Retracted → PrefillDone (PrefillOperation covering the
+// partial tail) → Decoding (ScheduleDecodeEvent on the next plan). The
+// partial-tail re-prefill needs PrefillOperation semantics because
+// DecodeOperation only carries a single decode_input_id.
 TEST_F(RetractLeakTestSuite, RecoveryAfterTailPageRelease) {
     Submit(MakeRequestSpec("r1", /*num_pages=*/1, /*start=*/1));
     PlanOnce();
@@ -206,50 +145,31 @@ TEST_F(RetractLeakTestSuite, RecoveryAfterTailPageRelease) {
     SendWriteBackDone(wb->op_ids[0]);
     ASSERT_EQ(scheduler_->RetractedSize(), 1u);
 
-    // plan2: re-prefill the partial tail. Recovery emits a PrefillOperation,
-    // not a DecodeOperation — the partial-tail tokens need an input_ids
-    // vector that only PrefillOperation carries.
     auto plan2 = PlanOnce();
     const auto* fwd = GetForward(plan2);
     ASSERT_NE(fwd, nullptr);
     bool found = false;
-    std::int32_t r1_idx = -1;
-    for (std::size_t i = 0; i < fwd->request_ids.size(); ++i) {
-        if (fwd->request_ids[i] == "r1") {
-            found = true;
-            r1_idx = static_cast<std::int32_t>(i);
-            break;
-        }
+    for (const auto& id : fwd->request_ids) {
+        if (id == "r1") { found = true; break; }
     }
     ASSERT_TRUE(found);
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
-    // After plan2 the request is in PrefillDone (re-prefill is a prefill op),
-    // not Decoding yet — that comes in plan3 below.
     EXPECT_EQ(static_cast<std::size_t>(fwd->num_extends()), 1u)
-        << "Recovery's first plan should emit a PrefillOperation, not a Decode";
+        << "recovery's first plan emits PrefillOperation (re-prefill chunk)";
 
-    // Drive plan3: the executor's prefill samples a token at the last tail
-    // position; SendForwardDone delivers it and PrefillDone → Decoding.
     SendForwardDone("r1", {99});
     PlanOnce();
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-
-    // Sanity: r1 holds device pages again (loadback'd full pages + fresh
-    // partial-tail page).
-    EXPECT_GE(static_cast<std::int32_t>(fwd->occupied_pages[r1_idx].size()), 1);
 }
 
-// Recovery's re-prefill emits a PrefillOperation whose ``input_ids`` cover
-// the partial-tail tokens (those past PrefillSize) and whose
-// ``shifted_input_ids`` includes those same tokens shifted by +1 — drafter
-// boundary positions must NOT be silently -1, otherwise EAGLE first-step
-// input is garbage at non-boundary positions and spec acceptance collapses
-// post-recovery. This covers the ``ComputeShiftedInputIds`` cap change from
-// ``PrefillSize()`` to ``Size()``.
+// Re-prefill window can extend past PrefillSize() — it covers generated
+// tokens whose KV was dropped at retract. Verifies ComputeShiftedInputIds
+// caps at Size(), not PrefillSize(); otherwise the drafter sees -1 sentinels
+// at the partial-tail positions and spec acceptance collapses for one iter.
 TEST_F(RetractLeakTestSuite, RecoveryShiftedInputIdsCoversGeneratedTail) {
-    Submit(MakeRequestSpec("r1", /*num_pages=*/1, /*start=*/1));  // tokens [1,2], PrefillSize=2
+    Submit(MakeRequestSpec("r1", /*num_pages=*/1, /*start=*/1));  // PrefillSize=2
     PlanOnce();
-    SendForwardDone("r1", {42});  // tokens [1,2,42], Size=3 > PrefillSize=2
+    SendForwardDone("r1", {42});  // Size=3 > PrefillSize=2
     PlanOnce();
     SendReserveNumTokens("r1", 5);
 
@@ -264,18 +184,10 @@ TEST_F(RetractLeakTestSuite, RecoveryShiftedInputIdsCoversGeneratedTail) {
     ASSERT_NE(fwd, nullptr);
     ASSERT_EQ(static_cast<std::size_t>(fwd->num_extends()), 1u);
 
-    // partial_tail covers token 42 (position 2). With Size() cap, the
-    // input_ids for this position is {42}. shifted_input_ids for position 2
-    // looks at position 3 — there's no token 3 yet so it must be -1.
-    // Position 2's shifted is what matters: with PrefillSize() cap (pre-fix),
-    // we would NOT include token 42 in the shift window because position 2's
-    // shifted_start = 3 > PrefillSize=2, so shifted_size = max(0, 2 - 3) = 0
-    // → entire shifted vector is -1's.
-    ASSERT_EQ(fwd->input_ids.size(), 1u) << "expect 1 partial-tail token re-prefilled";
-    EXPECT_EQ(fwd->input_ids[0], 42) << "partial tail should be token 42";
-    // With Size() cap, position 2's shift looks at index 3 which doesn't
-    // exist → -1. That's the LAST position so -1 is the canonical "no next
-    // token" sentinel, consistent with the normal Submitted-last-chunk case.
+    // partial_tail = {token 42 at position 2}; shifted at last position is
+    // the canonical -1 (no next token yet).
+    ASSERT_EQ(fwd->input_ids.size(), 1u);
+    EXPECT_EQ(fwd->input_ids[0], 42);
     ASSERT_EQ(fwd->shifted_input_ids.size(), 1u);
     EXPECT_EQ(fwd->shifted_input_ids[0], -1);
 

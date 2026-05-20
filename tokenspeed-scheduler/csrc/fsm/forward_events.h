@@ -129,11 +129,10 @@ private:
     HybridPrefixCache* hybrid_prefix_cache_{};
 };
 
-// Retracted → Decoding recovery for the case where TokenSize is exactly
-// page-aligned with the host cache (partial_tail_tokens == 0). The forward op
-// is a normal DecodeOperation. Used only when there is no partial tail to
-// re-prefill; otherwise the scheduler routes the request through
-// ``ScheduleRetractedReprefillEvent`` instead (forward.cpp dispatch).
+// Retracted → Decoding recovery when TokenSize is page-aligned with the
+// host cache (partial_tail == 0). Caller routes partial_tail > 0 through
+// ScheduleRetractedReprefillEvent instead — DecodeOperation only carries
+// a single decode_input_id and can't represent multi-token re-prefill.
 struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecodeFromRetractedEvent> {
     using InvalidTransitionHandler<ScheduleDecodeFromRetractedEvent>::operator();
 
@@ -165,28 +164,23 @@ private:
     MambaChunkAllocator* mamba_allocator_{};
 };
 
-// Retracted → PrefillDone recovery for the case where TokenSize is NOT
-// page-aligned with the host cache. The partial tail (tokens past the last
-// full host-cached page) had its KV dropped at retract; we re-prefill those
-// tokens here so the executor can issue a normal PrefillOperation
-// (input_ids vector). After PrefillDone, the next plan transitions to
-// Decoding via the standard ScheduleDecodeEvent path.
+// Retracted → PrefillDone recovery. The partial tail — tokens past the last
+// host-cached full-page boundary — had its KV dropped at retract; this event
+// re-prefills those tokens as a PrefillOperation so the executor handles it
+// like any chunked prefill that hit the host cache. After PrefillDone the
+// next plan transitions to Decoding via ScheduleDecodeEvent.
 //
-// The window covers [host_matched * page_size, TokenSize) of token_container.
-// Unlike SchedulePrefillFirstChunkEvent (which sources from Submitted), the
-// window can extend past PrefillSize because the partial-tail tokens are
-// generated tokens, not original prompt tokens.
+// Identical ctor shape to ScheduleDecodeFromRetractedEvent — partial-tail
+// length and window begin are derived from match_result_ and the source
+// state inside operator().
 struct ScheduleRetractedReprefillEvent : InvalidTransitionHandler<ScheduleRetractedReprefillEvent> {
     using InvalidTransitionHandler<ScheduleRetractedReprefillEvent>::operator();
 
-    ScheduleRetractedReprefillEvent(std::int32_t partial_tail_tokens, std::int32_t decode_input_tokens,
-                                    std::int32_t window_begin, PageAllocator* device_allocator,
+    ScheduleRetractedReprefillEvent(std::int32_t decode_input_tokens, PageAllocator* device_allocator,
                                     ReqPoolAllocator* req_pool_allocator, KVPrefixCache* kv_prefix_cache,
                                     MatchResult match_result, std::vector<TreeNode*> loadback_diff,
                                     MambaChunkAllocator* mamba_allocator = nullptr)
-        : partial_tail_tokens_(partial_tail_tokens),
-          decode_input_tokens_(decode_input_tokens),
-          window_begin_(window_begin),
+        : decode_input_tokens_(decode_input_tokens),
           device_allocator_(device_allocator),
           req_pool_allocator_(req_pool_allocator),
           kv_prefix_cache_(kv_prefix_cache),
@@ -198,12 +192,9 @@ struct ScheduleRetractedReprefillEvent : InvalidTransitionHandler<ScheduleRetrac
 
     const MatchResult& GetMatchResult() const { return match_result_; }
     const std::vector<TreeNode*>& GetLoadbackDiff() const { return loadback_diff_; }
-    std::int32_t GetPartialTailTokens() const { return partial_tail_tokens_; }
 
 private:
-    std::int32_t partial_tail_tokens_{};
     std::int32_t decode_input_tokens_{};
-    std::int32_t window_begin_{};
     PageAllocator* device_allocator_{};
     ReqPoolAllocator* req_pool_allocator_{};
     KVPrefixCache* kv_prefix_cache_{};

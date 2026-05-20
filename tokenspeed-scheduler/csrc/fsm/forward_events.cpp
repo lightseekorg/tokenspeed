@@ -237,17 +237,9 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
                     decode_input_tokens_,          std::move(local_mamba_allocator)};
 }
 
-// Retracted -> Decoding: recover via LoadBack (host → device).
-// match_result_ was computed by the caller; alloc_device_node attaches device pages to LoadBack nodes.
-//
-// Precondition: partial_tail_tokens == 0 (TokenSize aligns with host-cached
-// page boundary). When partial_tail > 0 the scheduler routes through
-// ScheduleRetractedReprefillEvent (Retracted → PrefillDone) instead, because
-// re-prefilling the partial tail requires PrefillOperation semantics
-// (input_ids vector), not a DecodeOperation.
-//
-// Retracted holds NO tail page (released at retract time). We allocate a
-// fresh LocalKVAllocator here with capacity for decode_input_tokens.
+// Retracted → Decoding: recover via LoadBack (host → device).
+// Pre: partial_tail == 0; caller routes partial_tail > 0 through
+// ScheduleRetractedReprefillEvent.
 Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
@@ -277,8 +269,7 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
     }
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
-    // Fresh allocator sized for the upcoming decode step. The ctor calls
-    // Acquire(num_tokens) internally, so no extra Acquire here.
+    // LocalKVAllocator ctor calls Acquire(num_tokens) — no extra Acquire here.
     auto local_kv_allocator = std::make_unique<LocalKVAllocator>(device_allocator_, decode_input_tokens_);
     return Decoding{token_container,
                     page_size,
@@ -290,13 +281,9 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
                     std::move(local_mamba_allocator)};
 }
 
-// Retracted -> PrefillDone recovery: re-prefill the partial tail.
-//
-// Mirrors SchedulePrefillFirstChunkEvent's body (Submitted variant) but the
-// window covers the dropped-KV partial tail rather than the un-cached prompt
-// prefix. The state lands in PrefillDone because the partial tail fits in a
-// single chunk (it's bounded by page_size), and the next plan transitions
-// PrefillDone → Decoding via the standard ScheduleDecodeEvent path.
+// Retracted → PrefillDone: re-prefill the partial tail in a single chunk.
+// Pre: partial_tail > 0 (caller routes partial_tail == 0 through
+// ScheduleDecodeFromRetractedEvent instead).
 PrefillDone ScheduleRetractedReprefillEvent::operator()(Retracted&& state) {
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
@@ -313,7 +300,9 @@ PrefillDone ScheduleRetractedReprefillEvent::operator()(Retracted&& state) {
     }
 
     TokenContainer* token_container = state.GetTokenContainer();
-    std::int32_t page_size = state.GetPageSize();
+    const std::int32_t page_size = state.GetPageSize();
+    const std::int32_t window_begin = match_result_.host.DepthInPage() * page_size;
+    const std::int32_t partial_tail_tokens = token_container->Size() - window_begin;
 
     // Mamba: discard any stale request-local slots from the Retracted state,
     // allocate fresh working+checkpoint as recovery does.
@@ -327,15 +316,15 @@ PrefillDone ScheduleRetractedReprefillEvent::operator()(Retracted&& state) {
         }
     }
 
-    // Allocate KV pages: partial-tail (re-prefill) + decode reserve for the
-    // next step. Scheduler::scheduleRetractedReprefill already accounted for
-    // these pages via EnsureCapacityByEvict<Device>.
-    auto local_kv_allocator = std::make_unique<LocalKVAllocator>(device_allocator_, partial_tail_tokens_);
-    local_kv_allocator->Acquire(decode_input_tokens_);
+    // Single Allocate covering partial-tail re-prefill + decode reserve;
+    // ``scheduleRetractedReprefill`` already credited both via
+    // EnsureCapacityByEvict<Device>.
+    auto local_kv_allocator =
+        std::make_unique<LocalKVAllocator>(device_allocator_, partial_tail_tokens + decode_input_tokens_);
 
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
-    TokenContainer::Window window{.begin = window_begin_, .size = partial_tail_tokens_};
+    TokenContainer::Window window{.begin = window_begin, .size = partial_tail_tokens};
     return PrefillDone{token_container,
                        page_size,
                        std::move(host_node_ref),
@@ -437,15 +426,11 @@ Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
     TokenContainer* token_container = state.GetTokenContainer();
     std::int32_t page_size = state.GetPageSize();
     auto host_ref = std::move(static_cast<WritingBack&&>(state)).TakeHostNodeRef();
-    // Drop the tail device page held by the local allocator. The unique_ptr's
-    // destructor here returns the page to device_allocator_ — eliminating the
-    // per-retracted-request device-pool leak that otherwise accumulates under
-    // sustained memory pressure. On recovery, ScheduleDecodeFromRetractedEvent
-    // allocates a fresh LocalKVAllocator and re-prefills the (≤ page_size)
-    // partial-tail tokens.
+    // Release the tail device page (and any decode-reserve pages) to the
+    // pool. Retracted holds no device pages; recovery allocates a fresh
+    // LocalKVAllocator and re-prefills the ≤ page_size partial-tail tokens.
     std::move(state).TakeKVAllocator().reset();
     auto local_mamba_allocator = std::move(state).TakeMambaAllocator();
-    // DeviceNodeRef inside WritingBack base is released here (unique_ptr dtor).
     return Retracted{token_container, page_size, std::move(host_ref), std::move(local_mamba_allocator)};
 }
 
