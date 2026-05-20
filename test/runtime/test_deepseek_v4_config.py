@@ -1,6 +1,6 @@
 import argparse
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -12,6 +12,7 @@ from tokenspeed.runtime.configs.model_config import (
     configure_deepseek_v4_attention,
     is_deepseek_v4,
 )
+from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import (
@@ -44,6 +45,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Attention,
     DeepseekV4Indexer,
     DeepseekV4MLP,
+    DeepseekV4MoE,
     DeepseekV4MoEGate,
     _deepseek_v4_fused_select_experts,
     _deepseek_v4_gather_indexer_mxfp4_cache,
@@ -70,6 +72,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     mhc_pre,
     pack_topk_as_router_logits,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     _CONFIG_REGISTRY,
@@ -104,6 +107,258 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(ForwardMode.from_num_extends(0, 2), ForwardMode.DECODE)
         self.assertEqual(ForwardMode.from_num_extends(2, 2), ForwardMode.EXTEND)
         self.assertEqual(ForwardMode.from_num_extends(1, 2), ForwardMode.MIXED)
+
+    def _bind_deepseek_v4_moe_methods(self, moe):
+        for name in (
+            "_forward_shared_experts",
+            "forward_mega_moe",
+            "forward_normal",
+        ):
+            setattr(moe, name, MethodType(getattr(DeepseekV4MoE, name), moe))
+        return moe
+
+    def _make_fake_deepseek_v4_moe(self, hidden_states, input_ids, stream_fork, calls):
+        def select_experts(states, ids):
+            calls.append("select")
+            self.assertIs(states, hidden_states)
+            self.assertIs(ids, input_ids)
+            topk_shape = (states.shape[0], 2)
+            return (
+                torch.ones(topk_shape, device=states.device),
+                torch.zeros(topk_shape, device=states.device, dtype=torch.int32),
+                None,
+            )
+
+        def make_topk_output(states, weights, ids, scores):
+            del weights, ids, scores
+            calls.append("topk")
+            return states
+
+        def routed_experts(**kwargs):
+            calls.append("routed")
+            self.assertIs(kwargs["hidden_states"], hidden_states)
+            return hidden_states + 1
+
+        def shared_experts(states):
+            calls.append("shared")
+            self.assertIs(states, hidden_states)
+            return hidden_states + 3
+
+        moe = SimpleNamespace(
+            use_mega_moe=False,
+            n_shared_experts=1,
+            shared_experts=shared_experts,
+            stream_fork=stream_fork,
+            routed_scaling_factor=2.0,
+            experts=routed_experts,
+            _select_experts=select_experts,
+            _make_topk_output=make_topk_output,
+        )
+        return self._bind_deepseek_v4_moe_methods(moe)
+
+    def test_deepseek_v4_moe_stream_fork_fallback_order(self):
+        calls = []
+        hidden_states = torch.ones(2, 3)
+        input_ids = torch.arange(2)
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states, input_ids, StreamFork(None), calls
+        )
+
+        actual = DeepseekV4MoE.forward(
+            moe,
+            hidden_states,
+            input_ids,
+            num_global_tokens=2,
+            max_num_tokens_per_gpu=2,
+        )
+
+        self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+        self.assertTrue(
+            torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
+        )
+
+    def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=1,
+            attn_dp_size=4,
+            dense_tp_size=1,
+            dense_dp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=4,
+            moe_dp_size=1,
+        )
+
+        shared_mlp = DeepseekV4MLP(
+            hidden_size=8,
+            intermediate_size=16,
+            hidden_act="silu",
+            mapping=mapping,
+            quant_config=None,
+            prefix="model.layers.0.ffn.shared_experts",
+        )
+
+        self.assertEqual(shared_mlp.tp_rank, mapping.dense.tp_rank)
+        self.assertEqual(shared_mlp.tp_size, mapping.dense.tp_size)
+        self.assertEqual(shared_mlp.tp_group, mapping.dense.tp_group)
+        self.assertNotEqual(shared_mlp.tp_size, mapping.moe.tp_ep_size)
+
+    def _make_fake_mega_deepseek_v4_moe(
+        self, hidden_states, input_ids, shared_experts, calls
+    ):
+        def select_experts(states, ids):
+            calls.append("select")
+            self.assertIs(states, hidden_states)
+            self.assertIs(ids, input_ids)
+            topk_shape = (states.shape[0], 2)
+            return (
+                torch.ones(topk_shape, device=states.device),
+                torch.zeros(topk_shape, device=states.device, dtype=torch.int32),
+                None,
+            )
+
+        def routed_experts(states, topk_weights, topk_ids, activation_clamp=None):
+            del topk_weights, activation_clamp
+            calls.append("routed")
+            self.assertIs(states, hidden_states)
+            self.assertEqual(topk_ids.dtype, torch.int64)
+            return hidden_states + 1
+
+        moe = SimpleNamespace(
+            use_mega_moe=True,
+            config=SimpleNamespace(num_experts_per_tok=2),
+            n_shared_experts=1,
+            shared_experts=shared_experts,
+            stream_fork=StreamFork(None),
+            routed_scaling_factor=1.0,
+            experts=routed_experts,
+            _select_experts=select_experts,
+        )
+        return self._bind_deepseek_v4_moe_methods(moe)
+
+    def test_deepseek_v4_mega_moe_dense_tp_one_skips_shared_rsag(self):
+        calls = []
+        hidden_states = torch.ones(2, 3)
+        input_ids = torch.arange(2)
+        test_case = self
+
+        class SharedExperts:
+            tp_rank = 0
+            tp_size = 1
+            tp_group = (0,)
+
+            def __call__(self, states):
+                calls.append("shared")
+                test_case.assertIs(states, hidden_states)
+                return states + 3
+
+        moe = self._make_fake_mega_deepseek_v4_moe(
+            hidden_states, input_ids, SharedExperts(), calls
+        )
+
+        with (
+            patch.object(
+                deepseek_v4_model,
+                "token_all_gather",
+                side_effect=AssertionError("shared expert should not use MoE RSAG"),
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "token_reduce_scatter",
+                side_effect=AssertionError("shared expert should not use MoE RSAG"),
+            ),
+        ):
+            actual = DeepseekV4MoE.forward(
+                moe,
+                hidden_states,
+                input_ids,
+                num_global_tokens=2,
+                max_num_tokens_per_gpu=2,
+            )
+
+        self.assertEqual(calls, ["select", "routed", "shared"])
+        self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
+
+    def test_deepseek_v4_mega_moe_shared_rsag_uses_dense_tp_group(self):
+        calls = []
+        hidden_states = torch.ones(2, 3)
+        input_ids = torch.arange(2)
+
+        class SharedExperts:
+            tp_rank = 1
+            tp_size = 2
+            tp_group = (2, 3)
+
+            def __call__(self, states):
+                calls.append("shared")
+                return states + 3
+
+        moe = self._make_fake_mega_deepseek_v4_moe(
+            hidden_states, input_ids, SharedExperts(), calls
+        )
+        comm_calls = []
+
+        def fake_all_gather(states, *, rank, group, scattered_num_tokens):
+            comm_calls.append(("all_gather", rank, group, scattered_num_tokens))
+            return states
+
+        def fake_reduce_scatter(states, *, rank, group, scattered_num_tokens):
+            comm_calls.append(("reduce_scatter", rank, group, scattered_num_tokens))
+            return states
+
+        with (
+            patch.object(
+                deepseek_v4_model, "token_all_gather", side_effect=fake_all_gather
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "token_reduce_scatter",
+                side_effect=fake_reduce_scatter,
+            ),
+        ):
+            actual = DeepseekV4MoE.forward(
+                moe,
+                hidden_states,
+                input_ids,
+                num_global_tokens=2,
+                max_num_tokens_per_gpu=2,
+                shared_scattered_num_tokens=[1, 1],
+            )
+
+        self.assertEqual(calls, ["select", "routed", "shared"])
+        self.assertEqual(
+            comm_calls,
+            [
+                ("all_gather", 1, (2, 3), [1, 1]),
+                ("reduce_scatter", 1, (2, 3), [1, 1]),
+            ],
+        )
+        self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_deepseek_v4_moe_stream_fork_aux_path_matches_serial(self):
+        calls = []
+        hidden_states = torch.ones(2, 3, device="cuda")
+        input_ids = torch.arange(2, device="cuda")
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states, input_ids, StreamFork(torch.cuda.Stream()), calls
+        )
+
+        with patch.object(deepseek_v4_model, "get_is_capture_mode", return_value=True):
+            actual = DeepseekV4MoE.forward(
+                moe,
+                hidden_states,
+                input_ids,
+                num_global_tokens=2,
+                max_num_tokens_per_gpu=2,
+            )
+        torch.cuda.synchronize()
+
+        self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+        self.assertTrue(
+            torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
+        )
 
     def test_cuda_graph_group_table_padding_uses_dummy_page_rows(self):
         table = torch.tensor([[5, -1]], dtype=torch.int32)
@@ -2122,6 +2377,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             compress_ratio=4,
             topk_tokens=2,
             topk_buffer=None,
+            _persistent_topk_workspace=None,
             _prefill_gather_workspace=lambda rows, device: (
                 torch.empty((0, 0), dtype=torch.uint8, device=device),
                 torch.empty((0, 0), dtype=torch.uint8, device=device),

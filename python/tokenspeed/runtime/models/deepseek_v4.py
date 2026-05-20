@@ -77,6 +77,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     DEEPSEEK_V4_INDEXER_DIM,
     DeepseekV4AttentionOpUnavailable,
@@ -3205,21 +3206,20 @@ class DeepseekV4MLP(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        is_shared_expert: bool = False,
         swiglu_limit: float | None = None,
         reduce_results: bool = False,
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}")
-        tp = mapping.moe if is_shared_expert else mapping.dense
+        tp = mapping.dense
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            tp_rank=tp.tp_ep_rank if is_shared_expert else tp.tp_rank,
-            tp_size=tp.tp_ep_size if is_shared_expert else tp.tp_size,
-            tp_group=tp.tp_ep_group if is_shared_expert else tp.tp_group,
+            tp_rank=tp.tp_rank,
+            tp_size=tp.tp_size,
+            tp_group=tp.tp_group,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
@@ -3228,17 +3228,17 @@ class DeepseekV4MLP(nn.Module):
             hidden_size,
             bias=False,
             reduce_results=reduce_results,
-            tp_rank=tp.tp_ep_rank if is_shared_expert else tp.tp_rank,
-            tp_size=tp.tp_ep_size if is_shared_expert else tp.tp_size,
-            tp_group=tp.tp_ep_group if is_shared_expert else tp.tp_group,
+            tp_rank=tp.tp_rank,
+            tp_size=tp.tp_size,
+            tp_group=tp.tp_group,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
         self.swiglu_limit = swiglu_limit
         self.reduce_results = reduce_results
-        self.tp_rank = tp.tp_ep_rank if is_shared_expert else tp.tp_rank
-        self.tp_size = tp.tp_ep_size if is_shared_expert else tp.tp_size
-        self.tp_group = tp.tp_ep_group if is_shared_expert else tp.tp_group
+        self.tp_rank = tp.tp_rank
+        self.tp_size = tp.tp_size
+        self.tp_group = tp.tp_group
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[0] == 0:
@@ -3549,6 +3549,7 @@ class DeepseekV4MoE(nn.Module):
         quant_config: QuantizationConfig | None,
         layer_index: int,
         prefix: str,
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -3561,6 +3562,7 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError(
                 f"Unsupported DeepSeek V4 MoE scoring: {self.scoring_func}"
             )
+        self.stream_fork = StreamFork(aux_stream)
         from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 
         self.use_mega_moe = get_moe_backend().is_mega_moe()
@@ -3598,7 +3600,6 @@ class DeepseekV4MoE(nn.Module):
                 mapping,
                 quant_config,
                 add_prefix("shared_experts", prefix),
-                is_shared_expert=True,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
             )
@@ -3685,31 +3686,70 @@ class DeepseekV4MoE(nn.Module):
             )
         return StandardTopKOutput(topk_weights, topk_ids, router_scores)
 
-    def forward(
+    def _forward_shared_experts(
+        self, hidden_states: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        if (
+            self.n_shared_experts is None
+            or hidden_states is None
+            or hidden_states.shape[0] == 0
+        ):
+            return None
+        with deepseek_v4_profile_scope("moe_shared_experts"):
+            return self.shared_experts(hidden_states)
+
+    def forward_mega_moe(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-        global_num_tokens_per_rank: list[int] | None = None,
+        shared_scattered_num_tokens: list[int] | None,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0 and not self.use_mega_moe:
-            return hidden_states
-        if self.use_mega_moe:
-            if hidden_states.shape[0] == 0:
-                topk_weights = hidden_states.new_empty(
-                    (0, self.config.num_experts_per_tok), dtype=torch.float32
+        if hidden_states.shape[0] == 0:
+            topk_weights = hidden_states.new_empty(
+                (0, self.config.num_experts_per_tok), dtype=torch.float32
+            )
+            topk_ids = torch.empty(
+                (0, self.config.num_experts_per_tok),
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
+        else:
+            with deepseek_v4_profile_scope("moe_select_experts"):
+                topk_weights, topk_ids, _ = self._select_experts(
+                    hidden_states, input_ids
                 )
-                topk_ids = torch.empty(
-                    (0, self.config.num_experts_per_tok),
-                    device=hidden_states.device,
-                    dtype=torch.int64,
-                )
-            else:
-                with deepseek_v4_profile_scope("moe_select_experts"):
-                    topk_weights, topk_ids, _ = self._select_experts(
-                        hidden_states, input_ids
+
+        shared_input = None
+        shared_token_counts = None
+        if self.n_shared_experts is not None:
+            if self.shared_experts.tp_size > 1:
+                if shared_scattered_num_tokens is None:
+                    raise ValueError(
+                        "DeepSeek V4 shared expert dense TP requires token counts."
                     )
+                shared_token_counts = [
+                    int(count) for count in shared_scattered_num_tokens
+                ]
+                if len(shared_token_counts) != self.shared_experts.tp_size:
+                    raise ValueError(
+                        "DeepSeek V4 shared expert token count length must match "
+                        "the dense TP size."
+                    )
+                if sum(shared_token_counts) > 0:
+                    with deepseek_v4_profile_scope("moe_shared_all_gather"):
+                        shared_input = token_all_gather(
+                            hidden_states,
+                            rank=self.shared_experts.tp_rank,
+                            group=self.shared_experts.tp_group,
+                            scattered_num_tokens=shared_token_counts,
+                        )
+                else:
+                    shared_token_counts = None
+            else:
+                shared_input = hidden_states
+
+        shared = None
+        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with deepseek_v4_profile_scope("moe_mega_experts"):
                 if topk_ids.dtype != torch.int64:
                     topk_ids = topk_ids.to(torch.int64)
@@ -3721,13 +3761,28 @@ class DeepseekV4MoE(nn.Module):
                     topk_ids,
                     activation_clamp=getattr(self.config, "swiglu_limit", None),
                 )
-            if self.shared_experts is not None:
-                with deepseek_v4_profile_scope("moe_shared_experts"):
-                    shared = self._forward_shared_experts_for_mega_moe(
-                        hidden_states, global_num_tokens_per_rank
-                    )
-                routed = routed + shared
-            return routed
+            with fork.branch():
+                shared = self._forward_shared_experts(shared_input)
+
+        if shared is not None and shared_token_counts is not None:
+            with deepseek_v4_profile_scope("moe_shared_reduce_scatter"):
+                shared = token_reduce_scatter(
+                    shared,
+                    rank=self.shared_experts.tp_rank,
+                    group=self.shared_experts.tp_group,
+                    scattered_num_tokens=shared_token_counts,
+                )
+        return routed + shared if shared is not None else routed
+
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         with deepseek_v4_profile_scope("moe_select_experts"):
             topk_weights, topk_ids, router_scores = self._select_experts(
                 hidden_states, input_ids
@@ -3736,52 +3791,36 @@ class DeepseekV4MoE(nn.Module):
             topk_output = self._make_topk_output(
                 hidden_states, topk_weights, topk_ids, router_scores
             )
-        with deepseek_v4_profile_scope("moe_experts"):
-            routed = self.experts(
-                hidden_states=hidden_states,
-                topk_output=topk_output,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            )
-        if self.routed_scaling_factor != 1.0:
-            routed *= self.routed_scaling_factor
-        if self.shared_experts is not None:
-            with deepseek_v4_profile_scope("moe_shared_experts"):
-                shared = self.shared_experts(hidden_states)
-            routed = routed + shared
-        return routed
+        shared = None
+        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            with deepseek_v4_profile_scope("moe_experts"):
+                routed = self.experts(
+                    hidden_states=hidden_states,
+                    topk_output=topk_output,
+                    num_global_tokens=num_global_tokens,
+                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                )
+                if self.routed_scaling_factor != 1.0:
+                    routed *= self.routed_scaling_factor
+            with fork.branch():
+                shared = self._forward_shared_experts(hidden_states)
+        return routed + shared if shared is not None else routed
 
-    def _forward_shared_experts_for_mega_moe(
+    def forward(
         self,
         hidden_states: torch.Tensor,
-        global_num_tokens_per_rank: list[int] | None,
+        input_ids: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        shared_scattered_num_tokens: list[int] | None = None,
     ) -> torch.Tensor:
-        if self.shared_experts is None:
-            return torch.empty_like(hidden_states)
-        if not global_num_tokens_per_rank or self.mapping.moe.tp_ep_size <= 1:
-            return self.shared_experts(hidden_states)
-
-        token_counts = [int(count) for count in global_num_tokens_per_rank]
-        total_tokens = sum(token_counts)
-        if total_tokens == 0:
-            return hidden_states.new_empty((0, hidden_states.shape[-1]))
-
-        with deepseek_v4_profile_scope("moe_shared_all_gather"):
-            gathered = token_all_gather(
-                hidden_states,
-                rank=self.mapping.moe.tp_ep_rank,
-                group=self.mapping.moe.tp_ep_group,
-                scattered_num_tokens=token_counts,
+        if self.use_mega_moe:
+            return self.forward_mega_moe(
+                hidden_states, input_ids, shared_scattered_num_tokens
             )
-        with deepseek_v4_profile_scope("moe_shared_mlp"):
-            shared = self.shared_experts(gathered)
-        with deepseek_v4_profile_scope("moe_shared_reduce_scatter"):
-            return token_reduce_scatter(
-                shared,
-                rank=self.mapping.moe.tp_ep_rank,
-                group=self.mapping.moe.tp_ep_group,
-                scattered_num_tokens=token_counts,
-            )
+        return self.forward_normal(
+            hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu
+        )
 
 
 class DeepseekV4Compressor(nn.Module):
@@ -5632,7 +5671,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_buffer=topk_buffer,
         )
         self.ffn = DeepseekV4MoE(
-            config, mapping, quant_config, layer_id, add_prefix("ffn", prefix)
+            config,
+            mapping,
+            quant_config,
+            layer_id,
+            add_prefix("ffn", prefix),
+            aux_stream=aux_stream,
         )
         self.comm_manager = CommManager(
             mapping=mapping,
@@ -5730,10 +5774,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = self.ffn_norm(hidden_states)
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
+        shared_scattered_num_tokens = None
         if use_mega_moe:
             token_counts = self._mega_moe_token_counts(ctx)
             num_global_tokens = sum(token_counts)
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
+            if (
+                self.ffn.shared_experts is not None
+                and self.ffn.shared_experts.tp_size > 1
+            ):
+                shared_scattered_num_tokens = (
+                    self.comm_manager.dense_tp_group_scattered_num_tokens(ctx)
+                )
         else:
             token_counts = None
             with deepseek_v4_profile_scope("pre_mlp_comm"):
@@ -5751,7 +5803,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ffn_input_ids,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
-                global_num_tokens_per_rank=token_counts,
+                shared_scattered_num_tokens=shared_scattered_num_tokens,
             )
         if not use_mega_moe:
             with deepseek_v4_profile_scope("post_mlp_comm"):
@@ -5779,10 +5831,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
-        # Attention overlap (compressor/CSA on aux stream) is opt-in; the
-        # synchronous reference path is the default until a wider correctness
-        # sweep confirms the overlap path.
-        self.attention_aux_stream = None
+        self.aux_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -5800,7 +5849,7 @@ class DeepseekV4Model(nn.Module):
                     mapping,
                     quant_config,
                     add_prefix(f"layers.{layer_id}", prefix),
-                    aux_stream=self.attention_aux_stream,
+                    aux_stream=self.aux_stream,
                     topk_buffer=self.topk_indices_buffer,
                 )
                 for layer_id in range(config.num_hidden_layers)
