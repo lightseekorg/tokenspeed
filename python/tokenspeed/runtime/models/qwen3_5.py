@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
 # Configs
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -731,7 +732,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            # gate stays as the [..., num_heads, head_dim] strided view from
+            # chunk; sigmoid_mul reads it directly so the contiguous reshape
+            # is folded into the fused write.
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -740,8 +743,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            sigmoid_mul(attn_output, gate)
 
         output, _ = self.o_proj(attn_output)
         return output
