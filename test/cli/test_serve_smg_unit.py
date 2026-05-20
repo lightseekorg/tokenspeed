@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -36,12 +37,17 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 from tokenspeed.cli._argsplit import OrchestratorOpts
 from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
+    DEEPSEEK_V4_REASONING_PARSER,
+    DEEPSEEK_V4_TOOL_CALL_PARSER,
+    DEFAULT_REASONING_PARSER,
+    _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_port,
     _gateway_args_with_default_prometheus_port,
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
+    _is_deepseek_v4_model,
     _prewarm_hf_tokenizer,
     _user_host_port_from_gateway_args,
     _user_model_id,
@@ -180,6 +186,113 @@ def test_user_model_id_returns_none_when_absent():
 
 def test_user_model_id_returns_none_when_model_lacks_value():
     assert _user_model_id(["--model"]) is None
+
+
+def test_deepseek_v4_model_id_gets_default_parsers():
+    model = "deepseek-ai/DeepSeek-V4-Flash"
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        DEEPSEEK_V4_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        DEEPSEEK_V4_REASONING_PARSER,
+        "--tool-call-parser",
+        DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ]
+
+
+def test_deepseek_v4_parser_defaults_preserve_explicit_user_values():
+    model = "deepseek-ai/DeepSeek-V4-Flash"
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model, "--reasoning-parser", "none"],
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "none",
+            "--tool-call-parser",
+            "json",
+        ],
+    )
+
+    assert engine_args == ["--model", model, "--reasoning-parser", "none"]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "none",
+        "--tool-call-parser",
+        "json",
+    ]
+
+
+def test_deepseek_v4_parser_defaults_fill_missing_parser_only():
+    model = "deepseek-ai/DeepSeek-V4-Flash"
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model, "--reasoning-parser", "none"],
+        ["--model", model, "--reasoning-parser", "none"],
+    )
+    assert engine_args == ["--model", model, "--reasoning-parser", "none"]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "none",
+        "--tool-call-parser",
+        DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ]
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model, "--tool-call-parser", "json"],
+    )
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        DEEPSEEK_V4_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--tool-call-parser",
+        "json",
+        "--reasoning-parser",
+        DEEPSEEK_V4_REASONING_PARSER,
+    ]
+
+
+def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
+    model = "deepseek-ai/DeepSeek-V4-Flash"
+
+    _, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+    gateway_args = _gateway_args_with_defaults(gateway_args)
+
+    idx = gateway_args.index("--reasoning-parser")
+    assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
+    assert DEFAULT_REASONING_PARSER not in gateway_args
+
+
+def test_local_deepseek_v4_config_is_detected(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
+
+    assert _is_deepseek_v4_model(str(tmp_path))
 
 
 def test_prewarm_skips_local_path(tmp_path):
@@ -512,3 +625,43 @@ def test_run_smg_from_args_sets_process_title(monkeypatch):
     except SystemExit:
         pass
     assert captured.get("title") == "ts-serve"
+
+
+def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
+    captured = {}
+
+    async def fake_run_smg(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.print_logo", lambda: None)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._check_serve_extra_installed", lambda: None
+    )
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", lambda _: None
+    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
+
+    from argparse import Namespace
+
+    from tokenspeed.cli.serve_smg import run_smg_from_args
+
+    with pytest.raises(SystemExit) as exc:
+        run_smg_from_args(Namespace(), ["deepseek-ai/DeepSeek-V4-Flash"])
+
+    assert exc.value.code == 0
+    assert captured["engine_args"] == [
+        "--model",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "--reasoning-parser",
+        DEEPSEEK_V4_REASONING_PARSER,
+    ]
+    assert captured["gateway_args"][:6] == [
+        "--model",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "--reasoning-parser",
+        DEEPSEEK_V4_REASONING_PARSER,
+        "--tool-call-parser",
+        DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ]

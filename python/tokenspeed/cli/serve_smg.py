@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
 import sys
+from pathlib import Path
 
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
@@ -48,6 +50,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "none"
+DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
+DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
@@ -184,6 +188,58 @@ def _user_model_id(gateway_args: list[str]) -> str | None:
     if idx + 1 >= len(gateway_args):
         return None
     return gateway_args[idx + 1]
+
+
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
+    normalized = model_id.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if "deepseek-v4" in normalized or "deepseekv4" in compact:
+        return True
+
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return (
+        config.get("model_type") == "deepseek_v4"
+        or "DeepseekV4ForCausalLM" in architectures
+    )
+
+
+def _args_with_default_model_parsers(
+    engine_args: list[str], gateway_args: list[str]
+) -> tuple[list[str], list[str]]:
+    """Apply model-family parser defaults before smg gateway defaults.
+
+    Reasoning parser defaults must be visible to both processes: smg extracts
+    reasoning_content after generation, while the engine uses the same parser
+    name to defer json_schema grammars past the reasoning channel.
+    """
+    model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
+    if not _is_deepseek_v4_model(model_id):
+        return engine_args, gateway_args
+
+    engine_result = list(engine_args)
+    gateway_result = list(gateway_args)
+    if (
+        "--reasoning-parser" not in engine_result
+        and "--reasoning-parser" not in gateway_result
+    ):
+        engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+        gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+    if "--tool-call-parser" not in gateway_result:
+        gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
+    return engine_result, gateway_result
 
 
 def _prewarm_hf_tokenizer(model_id: str) -> None:
@@ -406,8 +462,10 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
-    engine_args = split.engine
-    gateway_args = _gateway_args_with_defaults(split.gateway)
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        split.engine, split.gateway
+    )
+    gateway_args = _gateway_args_with_defaults(gateway_args)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
 
     model_id = _user_model_id(gateway_args)
