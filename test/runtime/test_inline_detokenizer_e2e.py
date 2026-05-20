@@ -97,6 +97,18 @@ _TORCH_DTYPE = torch.bfloat16
 # prompts in the first CI run, so 0.9 is a generous-but-real bar.
 _ROUGE_L_TOLERANCE = 0.9
 
+# Some hardware (e.g. H100) produces a different but equally valid
+# list ordering for the first prompt ("Zurich" and "Geneva" swapped),
+# scoring ROUGE-L ≈ 0.73 against the primary HF reference.  Both
+# orderings are correct completions, so we register the alternative
+# here rather than lowering the global tolerance.
+_EXTRA_REFERENCES: List[List[str]] = [
+    [
+        " ____.\nA. Bern\nB. Zurich\nC. Geneva\nD.",
+        ", algae, and some bacteria convert light energy into chemical energy. It is a",
+    ],
+]
+
 
 def _run_rt_generate(
     prompts: List[str],
@@ -187,6 +199,7 @@ class TestAsyncLLMMatchesHuggingFaceReference(unittest.TestCase):
             rouge_l_tolerance=_ROUGE_L_TOLERANCE,
             debug_text=f"model={_MODEL}",
             check_logprobs=False,
+            extra_references=_EXTRA_REFERENCES,
         )
 
 
