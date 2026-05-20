@@ -61,7 +61,7 @@ class AttentionConfig:
     SM_SCALE: gl.constexpr
     PAGE_TABLE_STRIDE: gl.constexpr
     PAGE_SIZE: gl.constexpr
-    MAX_KV_SPLITS: gl.constexpr
+    NUM_KV_SPLITS: gl.constexpr
     NUM_Q_HEADS: gl.constexpr
     NUM_KV_HEADS: gl.constexpr
     HEAD_DIM: gl.constexpr
@@ -70,6 +70,7 @@ class AttentionConfig:
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     GROUP_SIZE: gl.constexpr
+    GROUP_BLOCKS: gl.constexpr
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
     q_layout: gl.constexpr
@@ -88,7 +89,7 @@ class AttentionConfig:
         SM_SCALE,
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
-        MAX_KV_SPLITS,
+        NUM_KV_SPLITS,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -97,11 +98,9 @@ class AttentionConfig:
         IS_SLIDING,
         WINDOW_LEFT,
     ):
-        assert NUM_Q_HEADS == 64
-        assert NUM_KV_HEADS == 8
+        assert NUM_Q_HEADS % NUM_KV_HEADS == 0
         assert HEAD_DIM == 64
         assert BLOCK_N == PAGE_SIZE
-        assert BLOCK_M >= NUM_Q_HEADS // NUM_KV_HEADS
         if IS_SLIDING:
             assert WINDOW_LEFT >= 0
         else:
@@ -117,7 +116,7 @@ class AttentionConfig:
         self.SM_SCALE = gl.constexpr(SM_SCALE)
         self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
         self.PAGE_SIZE = gl.constexpr(PAGE_SIZE)
-        self.MAX_KV_SPLITS = gl.constexpr(MAX_KV_SPLITS)
+        self.NUM_KV_SPLITS = gl.constexpr(NUM_KV_SPLITS)
         self.NUM_Q_HEADS = gl.constexpr(NUM_Q_HEADS)
         self.NUM_KV_HEADS = gl.constexpr(NUM_KV_HEADS)
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
@@ -126,6 +125,7 @@ class AttentionConfig:
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
+        self.GROUP_BLOCKS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
         self.qk_layout = gl.constexpr(mfma_layout)
         self.pv_layout = gl.constexpr(mfma_layout)
         self.q_layout = gl.constexpr(gl.DotOperandLayout(0, mfma_layout, k_width=8))
@@ -168,6 +168,7 @@ class AttentionProgram:
     mid_lse_ptr: gl.tensor
     batch: gl.tensor
     kv_head: gl.tensor
+    group_start: gl.tensor
     split_id: gl.tensor
     cache_len: gl.tensor
     kv_start: gl.tensor
@@ -187,6 +188,7 @@ class AttentionProgram:
         mid_lse_ptr,
         batch,
         kv_head,
+        group_start,
         split_id,
         cache_len,
         kv_start,
@@ -203,6 +205,7 @@ class AttentionProgram:
         self.mid_lse_ptr = mid_lse_ptr
         self.batch = batch
         self.kv_head = kv_head
+        self.group_start = group_start
         self.split_id = split_id
         self.cache_len = cache_len
         self.kv_start = kv_start
@@ -221,7 +224,10 @@ class AttentionProgram:
         mid_lse_ptr,
     ):
         batch = gl.program_id(0)
-        kv_head = gl.program_id(1)
+        head_block = gl.program_id(1)
+        kv_head = head_block // cfg.GROUP_BLOCKS
+        group_block = head_block - kv_head * cfg.GROUP_BLOCKS
+        group_start = group_block * cfg.BLOCK_M
         split_id = gl.program_id(2)
         cache_len = gl.load(cache_seqlens_ptr + batch)
         if cfg.IS_SLIDING:
@@ -232,7 +238,7 @@ class AttentionProgram:
         first_page = kv_start // cfg.PAGE_SIZE
         end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
         num_pages = end_page - first_page
-        pages_per_split = (num_pages + cfg.MAX_KV_SPLITS - 1) // cfg.MAX_KV_SPLITS
+        pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
         split_start_page = first_page + split_id * pages_per_split
         split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
@@ -248,6 +254,7 @@ class AttentionProgram:
             mid_lse_ptr,
             batch,
             kv_head,
+            group_start,
             split_id,
             cache_len,
             kv_start,
@@ -260,8 +267,8 @@ class AttentionProgram:
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
-        q_heads = self.kv_head * cfg.GROUP_SIZE + offs_m
-        valid = offs_m < cfg.GROUP_SIZE
+        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
+        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
         offsets = (
             self.batch * cfg.NUM_Q_HEADS * cfg.HEAD_DIM
             + q_heads[:, None] * cfg.HEAD_DIM
@@ -376,8 +383,10 @@ class AttentionProgram:
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
-        q_heads = self.kv_head * cfg.GROUP_SIZE + offs_m
-        valid = (offs_m < cfg.GROUP_SIZE) & (self.split_start < self.split_end)
+        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
+        valid = ((self.group_start + offs_m) < cfg.GROUP_SIZE) & (
+            self.split_start < self.split_end
+        )
         acc = gl.convert_layout(acc, cfg.store_layout)
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
         m_i = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.store_layout))
@@ -385,12 +394,12 @@ class AttentionProgram:
         part_o = acc * recip_l_i[:, None]
         part_lse = m_i * cfg.SM_SCALE + gl.log2(l_i)
         mid_o_offsets = (
-            (self.batch * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.MAX_KV_SPLITS
+            (self.batch * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.NUM_KV_SPLITS
             + self.split_id
         ) * cfg.HEAD_DIM + offs_d[None, :]
         mid_lse_offsets = (
             self.batch * cfg.NUM_Q_HEADS + q_heads
-        ) * cfg.MAX_KV_SPLITS + self.split_id
+        ) * cfg.NUM_KV_SPLITS + self.split_id
         cdna4.buffer_store(part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None])
         cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
 
@@ -412,7 +421,7 @@ def _mha_decode_fp16(
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
-    MAX_KV_SPLITS: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -425,7 +434,7 @@ def _mha_decode_fp16(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
-        MAX_KV_SPLITS,
+        NUM_KV_SPLITS,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -480,7 +489,7 @@ def _mha_decode_reduce_fp16(
     sink_ptr,
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
-    MAX_KV_SPLITS: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
@@ -495,7 +504,7 @@ def _mha_decode_reduce_fp16(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
-        MAX_KV_SPLITS,
+        NUM_KV_SPLITS,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -515,7 +524,7 @@ def _mha_decode_reduce_fp16(
     first_page = kv_start // cfg.PAGE_SIZE
     end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
     num_pages = end_page - first_page
-    pages_per_split = (num_pages + cfg.MAX_KV_SPLITS - 1) // cfg.MAX_KV_SPLITS
+    pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=cfg.reduce_layout)
     if HAS_SINK:
         m_i = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
@@ -525,18 +534,18 @@ def _mha_decode_reduce_fp16(
         l_i = gl.full((), value=0.0, dtype=gl.float32)
     acc = gl.full([cfg.HEAD_DIM], value=0.0, dtype=gl.float32, layout=cfg.reduce_layout)
 
-    for split_id in range(0, cfg.MAX_KV_SPLITS):
+    for split_id in range(0, cfg.NUM_KV_SPLITS):
         split_start_page = first_page + split_id * pages_per_split
         split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
         split_end = min(split_end_page * cfg.PAGE_SIZE, cache_len)
         if split_start < split_end:
             mid_o_base = (
-                (batch * cfg.NUM_Q_HEADS + q_head) * cfg.MAX_KV_SPLITS + split_id
+                (batch * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + split_id
             ) * cfg.HEAD_DIM
             mid_lse_offset = (
                 batch * cfg.NUM_Q_HEADS + q_head
-            ) * cfg.MAX_KV_SPLITS + split_id
+            ) * cfg.NUM_KV_SPLITS + split_id
             part_o = cdna4.buffer_load(mid_o_ptr, mid_o_base + offs_d)
             part_lse = gl.load(mid_lse_ptr + mid_lse_offset)
             m_new = maximum(m_i, part_lse)
@@ -556,9 +565,10 @@ def _mha_decode_reduce_fp16(
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
+    group_blocks: int
     head_dim: int
     page_size: int
-    max_kv_splits: int
+    num_kv_splits: int
     block_m: int
     block_n: int
     sm_scale: float
@@ -578,15 +588,18 @@ def get_config(
     page_size = k_cache.shape[1]
     block_m = 16
     block_n = 64
+    group_size = q.shape[1] // k_cache.shape[2]
+    group_blocks = (group_size + block_m - 1) // block_m
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     sm_scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
+        group_blocks=group_blocks,
         head_dim=head_dim,
         page_size=page_size,
-        max_kv_splits=8,
+        num_kv_splits=8,
         block_m=block_m,
         block_n=block_n,
         sm_scale=sm_scale * _INV_LN2_VALUE,
@@ -608,9 +621,6 @@ def get_config(
     dtypes={torch.float16, torch.bfloat16},
     priority=Priority.SPECIALIZED,
     traits={
-        "query_len": frozenset({1}),
-        "num_q_heads": frozenset({64}),
-        "num_kv_heads": frozenset({8}),
         "head_dim": frozenset({64}),
         "page_size": frozenset({64}),
         "sliding_window": frozenset({False, True}),
@@ -645,17 +655,19 @@ def gluon_mha_decode_fp16_gfx950(
     batch = q.shape[0]
     output = torch.empty_like(q)
     mid_o = torch.empty(
-        (batch, config.num_q_heads, config.max_kv_splits, config.head_dim),
+        (batch, config.num_q_heads, config.num_kv_splits, config.head_dim),
         device=q.device,
         dtype=torch.float32,
     )
     mid_lse = torch.empty(
-        (batch, config.num_q_heads, config.max_kv_splits),
+        (batch, config.num_q_heads, config.num_kv_splits),
         device=q.device,
         dtype=torch.float32,
     )
 
-    _mha_decode_fp16[(batch, config.num_kv_heads, config.max_kv_splits)](
+    _mha_decode_fp16[
+        (batch, config.num_kv_heads * config.group_blocks, config.num_kv_splits)
+    ](
         q,
         k_cache,
         v_cache,
@@ -666,7 +678,7 @@ def gluon_mha_decode_fp16_gfx950(
         config.sm_scale,
         page_table.stride(0),
         config.page_size,
-        config.max_kv_splits,
+        config.num_kv_splits,
         config.num_q_heads,
         config.num_kv_heads,
         config.head_dim,
@@ -684,7 +696,7 @@ def gluon_mha_decode_fp16_gfx950(
         sink_arg,
         config.sm_scale,
         page_table.stride(0),
-        config.max_kv_splits,
+        config.num_kv_splits,
         config.page_size,
         config.num_q_heads,
         config.num_kv_heads,
