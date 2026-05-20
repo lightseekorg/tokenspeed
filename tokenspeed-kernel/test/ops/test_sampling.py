@@ -219,6 +219,8 @@ def _ref_topk_topp(
 def test_fused_topk_topp_matches_pipeline(
     device: str, ks: list[int], ps: list[float], tag: str
 ) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_renorm test")
     torch.manual_seed(0)
     bs, V = len(ks), 8192
     logits = torch.randn(bs, V, device=device, dtype=torch.float32) * 3.0
@@ -248,6 +250,9 @@ def test_fused_topk_topp_matches_pipeline(
 def test_fused_topk_topp_workspace_size_grows_with_batch(device: str) -> None:
     """Workspace size must grow monotonically with batch and vocab so callers
     can pre-allocate a buffer sized for ``max_bs × vocab``."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_workspace_size test")
     V = 8192
     small = fused_topk_topp_workspace_size(1, V)
     large = fused_topk_topp_workspace_size(64, V)
@@ -259,6 +264,9 @@ def test_fused_topk_topp_external_workspace(device: str) -> None:
     """Pre-allocated workspace path must produce the same result as the
     auto-allocated one, so the runtime can hoist the alloc out of the hot
     path."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_external_workspace test")
     torch.manual_seed(1)
     bs, V = 4, 8192
     probs = torch.softmax(
