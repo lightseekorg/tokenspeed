@@ -195,6 +195,14 @@ def get_config(
     if text_config.architectures == ["LlamaForCausalLMNextN"]:
         text_config.num_hidden_layers = 1
 
+    # For MTP NextN draft models whose text_config carries
+    # mtp_num_hidden_layers, override num_hidden_layers so that the
+    # KV-cache budget uses the draft model's actual layer count instead
+    # of the full target model's layer count.
+    mtp_layers = getattr(text_config, "mtp_num_hidden_layers", None)
+    if is_draft_worker and mtp_layers is not None:
+        text_config.num_hidden_layers = mtp_layers
+
     if model_override_args:
         text_config.update(model_override_args)
 
