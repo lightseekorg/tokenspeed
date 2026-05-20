@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
