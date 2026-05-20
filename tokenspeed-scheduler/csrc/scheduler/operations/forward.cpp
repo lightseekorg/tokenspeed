@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -472,26 +473,29 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
 std::tuple<std::vector<ForwardOperation>, std::variant<std::vector<LoadBackOperation>, std::vector<WriteBackOperation>>>
 Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     auto priority = [&](const Request* req) -> int {
-        if (req->Is<fsm::Prefilling>()) return 0;
-        if (req->Is<fsm::Submitted>()) return 1;
-        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) return 2;
-        if (req->Is<fsm::Retracted>()) return 3;
-        return 4;
+        if (req->Is<fsm::Prefilling>()) return 1;
+        if (req->Is<fsm::Submitted>()) return 2;
+        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
+            // Decode-first if mixed-batch is enabled; prefill-first otherwise.
+            return config_.enable_mixed_prefill_decode? 0: 3;
+        }
+        if (req->Is<fsm::Retracted>()) return 4;
+        return 9;
     };
     std::sort(candidates.begin(), candidates.end(),
               [&](const auto& a, const auto& b) { return priority(a) < priority(b); });
 
     std::vector<ForwardOperation> ops;
     std::int32_t token_budget = config_.max_scheduled_tokens;
+    bool pushed_prefill = false;
     auto push_op = [&](auto op, bool uses_pool_slot = false) {
         if (config_.role != Role::kD) {
             token_budget -= op.input_length;
         }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, PrefillOperation>) {
+            pushed_prefill = true;
+        }
         ops.push_back(std::move(op));
-    };
-    auto has_prefill_op = [&]() {
-        return std::any_of(ops.begin(), ops.end(),
-                           [](const ForwardOperation& op) { return std::holds_alternative<PrefillOperation>(op); });
     };
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free =
@@ -519,14 +523,15 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
-            // Prefill-first: skip ALL decode if any prefill was scheduled this round.
-            if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
+            // If mixed-batch is disabled, skip ALL decode if any prefill was scheduled this round.
+            // If mixed-batch is enabled, the priority sort puts decodes first, so this branch is reached before any prefill push.
+            if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
-            if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
+            if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
