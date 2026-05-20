@@ -1254,7 +1254,8 @@ class ServerArgs:
             "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "
-            "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory).",
+            "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
+            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",

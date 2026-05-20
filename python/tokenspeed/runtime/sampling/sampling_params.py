@@ -30,6 +30,12 @@ _SAMPLING_EPS = 1e-6
 # unchanged to top_k kernels that expect a positive cutoff.
 _TOP_K_DISABLED = 1 << 30
 
+# Upper bound the fused top-k + top-p kernel sorts in its on-chip top-K
+# branch. Requests with a finite top_k above this would silently fall through
+# to the top-p-only branch, so reject them at request time. Must stay in sync
+# with K_TOPK_MAX in fused_topk_topp.h.
+_TOP_K_FUSED_MAX = 128
+
 
 class SamplingParams:
     """
@@ -120,6 +126,11 @@ class SamplingParams:
         if self.top_k < -1 or self.top_k == 0:
             raise ValueError(
                 f"top_k must be -1 (disable), or at least 1, " f"got {self.top_k}."
+            )
+        if self.top_k != _TOP_K_DISABLED and self.top_k >= _TOP_K_FUSED_MAX:
+            raise ValueError(
+                f"top_k must be < {_TOP_K_FUSED_MAX} (fused kernel limit) "
+                f"or -1 (disable), got {self.top_k}."
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
