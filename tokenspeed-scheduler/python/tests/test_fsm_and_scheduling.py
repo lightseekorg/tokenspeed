@@ -713,7 +713,14 @@ class TestDecodeInputIds:
         assert op.decode_input_ids[0] == -1
 
     def test_retract_recovered_carries_last_prefill_token(self):
-        """Retract-recovered request carries the last prefill token as decode_input_id."""
+        """Retract-recovered request preserves the last token across recovery.
+
+        Recovery has two shapes depending on whether the token count is
+        page-aligned with the host cache:
+          * partial_tail == 0 → DecodeOperation, last token in decode_input_ids
+          * partial_tail >  0 → PrefillOperation, last token in input_ids
+            (the partial-tail re-prefill window covers the dropped-KV tokens)
+        """
         # page_size=2, 4 device pages allow prefill to enter Decoding, then reserve
         # pressure triggers retract.
         s = Scheduler(_make_retract_config(page_size=2, num_device_pages=4))
@@ -737,14 +744,21 @@ class TestDecodeInputIds:
         assert wb_op_id is not None, "Expected a WriteBack cache op"
         _send_write_back_done(s, wb_op_id)
 
-        # Recovery plan: ScheduleDecodeFromRetractedEvent → decode_input_id = last_token.
         recovery_plan = s.next_execution_plan()
         assert recovery_plan.forward, "Expected forward op in recovery plan"
         op = recovery_plan.forward[0]
-        assert len(op.decode_input_ids) > 0
-        assert (
-            op.decode_input_ids[0] == last_token
-        ), f"Expected {last_token}, got {op.decode_input_ids[0]}"
+        if op.num_extends() > 0:
+            # Reprefill path: last token sits in the input_ids vector.
+            assert op.input_ids, "Expected input_ids on the reprefill op"
+            assert op.input_ids[-1] == last_token, (
+                f"Expected {last_token}, got {op.input_ids[-1]}"
+            )
+        else:
+            # Decode-from-retracted path: last token sits in decode_input_ids.
+            assert op.decode_input_ids, "Expected decode_input_ids on the decode op"
+            assert op.decode_input_ids[0] == last_token, (
+                f"Expected {last_token}, got {op.decode_input_ids[0]}"
+            )
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""
