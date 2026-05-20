@@ -74,8 +74,8 @@ perf:
     --dataset-path agentic_dataset.json
     --max-tokens 500
     --multi-turn
-    --number 4 8 8 16
-    --parallel 1 2 4 8
+    --number 4 8 8 16 32
+    --parallel 1 2 4 8 16
     --outputs-dir "$OUTPUTS_DIR"
     --extra-args '{"ignore_eos": true}'
     --no-timestamp;
