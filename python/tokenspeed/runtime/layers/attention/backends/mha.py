@@ -62,7 +62,6 @@ class MHAMetadata:
     prefix_seqlens_int32: torch.Tensor | None = None
     max_prefix_seq_len: int | None = None
     use_split_prefill: bool = False
-    use_direct_prefill: bool = False
     # FA3 scheduler metadata pre-computed once per scheduler step. When set,
     # the FA3 decode kernel skips its internal prepare_varlen_num_blocks
     # launch.
@@ -142,7 +141,6 @@ class MHAAttnBackend(AttentionBackend):
                 use_split_prefill = has_prefix
             else:
                 use_split_prefill = False
-            use_direct_prefill = not use_split_prefill
 
             prefix_seqlens = None
             max_prefix_seq_len = None
@@ -160,7 +158,6 @@ class MHAAttnBackend(AttentionBackend):
                 prefix_seqlens_int32=prefix_seqlens,
                 max_prefix_seq_len=max_prefix_seq_len,
                 use_split_prefill=use_split_prefill,
-                use_direct_prefill=use_direct_prefill,
             )
             return
 
