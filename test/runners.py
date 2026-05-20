@@ -700,8 +700,13 @@ def check_close_model_outputs(
     base_scores = calculate_rouge_l(hf_outputs.output_strs, rt_outputs.output_strs)
     if extra_references:
         rouge_l_scores = [
-            max(base, *(calculate_rouge_l([ref[i]], [rt_outputs.output_strs[i]])[0]
-                        for ref in extra_references))
+            max(
+                base,
+                *(
+                    calculate_rouge_l([ref[i]], [rt_outputs.output_strs[i]])[0]
+                    for ref in extra_references
+                ),
+            )
             for i, base in enumerate(base_scores)
         ]
     else:
