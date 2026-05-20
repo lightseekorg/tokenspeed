@@ -30,6 +30,8 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     min_p_sampling_from_probs,
     softmax,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
@@ -42,7 +44,10 @@ from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
     SamplingBackendConfig,
 )
-from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
+from tokenspeed.runtime.sampling.backends.flashinfer import (
+    _FUSED_TOPK_TOPP_AVAILABLE,
+    FlashInferSamplingBackend,
+)
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -306,10 +311,15 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
         )
 
-        # Fused replacement for the back-to-back top_k_renorm_prob +
-        # top_p_renorm_prob(is_deterministic=True) pair. Sentinel K = 1<<30
-        # in top_ks routes per-row through the radix top-p only path.
-        probs = fused_topk_topp_renorm(probs, top_ks, top_ps)
+        if _FUSED_TOPK_TOPP_AVAILABLE:
+            # Fused replacement for the back-to-back top_k_renorm_prob +
+            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+            # K = 1<<30 in top_ks routes per-row through the radix top-p
+            # only path.
+            probs = fused_topk_topp_renorm(probs, top_ks, top_ps)
+        else:
+            probs = top_k_renorm_prob(probs, top_ks)
+            probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
 
         batch_next_token_ids = min_p_sampling_from_probs(
             probs,
@@ -398,10 +408,17 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         target_probs = softmax(
             logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
         )
-        # Fused replacement for the back-to-back top_k_renorm_prob +
-        # top_p_renorm_prob(is_deterministic=True) pair. Sentinel K = 1<<30
-        # in top_ks routes per-row through the radix top-p only path.
-        target_probs = fused_topk_topp_renorm(target_probs, top_ks, top_ps)
+        if _FUSED_TOPK_TOPP_AVAILABLE:
+            # Fused replacement for the back-to-back top_k_renorm_prob +
+            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+            # K = 1<<30 in top_ks routes per-row through the radix top-p
+            # only path.
+            target_probs = fused_topk_topp_renorm(target_probs, top_ks, top_ps)
+        else:
+            target_probs = top_k_renorm_prob(target_probs, top_ks)
+            target_probs = top_p_renorm_prob(
+                target_probs, top_ps, is_deterministic=True
+            )
 
         target_probs = min_p_renorm_prob(target_probs, min_ps, enable_pdl=pdl_enabled())
 

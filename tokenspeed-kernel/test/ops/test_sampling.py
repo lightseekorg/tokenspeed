@@ -30,9 +30,18 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
 )
+from tokenspeed_kernel.platform import current_platform
 
 # Sentinel matching tokenspeed.runtime.sampling.sampling_params._TOP_K_DISABLED.
 _TOP_K_DISABLED = 1 << 30
+
+# The fused top-k + top-p kernel ships only as a CUDA build; on ROCm the
+# Python entry point resolves to a RuntimeError stub. Gate the tests instead
+# of failing loudly on AMD CI.
+requires_nvidia = pytest.mark.skipif(
+    not current_platform().is_nvidia,
+    reason="fused_topk_topp kernel is NVIDIA-only",
+)
 
 
 def _make_pools(pool_rows: int, device: str):
@@ -191,6 +200,7 @@ def _ref_topk_topp(
     return out
 
 
+@requires_nvidia
 @pytest.mark.parametrize(
     "ks,ps,tag",
     [
@@ -247,6 +257,7 @@ def test_fused_topk_topp_matches_pipeline(
     torch.testing.assert_close(ours, ref, atol=1e-5, rtol=1e-4)
 
 
+@requires_nvidia
 def test_fused_topk_topp_workspace_size_grows_with_batch(device: str) -> None:
     """Workspace size must grow monotonically with batch and vocab so callers
     can pre-allocate a buffer sized for ``max_bs × vocab``."""
@@ -260,6 +271,7 @@ def test_fused_topk_topp_workspace_size_grows_with_batch(device: str) -> None:
     assert large > small
 
 
+@requires_nvidia
 def test_fused_topk_topp_external_workspace(device: str) -> None:
     """Pre-allocated workspace path must produce the same result as the
     auto-allocated one, so the runtime can hoist the alloc out of the hot
