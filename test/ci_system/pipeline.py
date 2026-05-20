@@ -262,7 +262,8 @@ def kill_port_listeners(
 ) -> None:
     command = (
         "if ! command -v lsof >/dev/null 2>&1; then "
-        "sudo apt-get update -q && sudo apt-get install -y lsof; "
+        "sudo apt-get update -q && "
+        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y lsof; "
         "fi; "
         f"pids=$(lsof -tiTCP:{port} -sTCP:LISTEN 2>/dev/null || true); "
         'if [ -n "$pids" ]; then '
@@ -344,13 +345,13 @@ def setup_runner(
     kill_stale_processes(local_env, cwd, dry_run)
     shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
     shell_run(
-        "sudo apt-get install -y ninja-build",
+        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ninja-build",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,
     )
     shell_run(
-        "sudo apt-get install -y libspdlog-dev || "
+        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libspdlog-dev || "
         "(git clone --depth 1 https://github.com/gabime/spdlog.git /tmp/spdlog && "
         "sudo cp -r /tmp/spdlog/include/spdlog /usr/local/include/)",
         env=local_env,

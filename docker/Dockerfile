@@ -10,7 +10,7 @@ WORKDIR /workspace
 
 COPY . /workspace
 
-RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev && \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev && \
     rm -rf /var/lib/apt/lists/*
 
 RUN MAX_JOBS=${MAX_JOBS} FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a" TOKENSPEED_KERNEL_BACKEND=cuda \
