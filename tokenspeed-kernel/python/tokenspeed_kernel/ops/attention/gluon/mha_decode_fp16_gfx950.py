@@ -57,7 +57,7 @@ def max(input, axis=None, keep_dims=False):
 
 
 @gluon.aggregate
-class DecodeConfig:
+class AttentionConfig:
     SM_SCALE: gl.constexpr
     PAGE_TABLE_STRIDE: gl.constexpr
     PAGE_SIZE: gl.constexpr
@@ -421,7 +421,7 @@ def _mha_decode_fp16(
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
 ):
-    cfg = DecodeConfig(
+    cfg = AttentionConfig(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
@@ -491,7 +491,7 @@ def _mha_decode_reduce_fp16(
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
 ):
-    cfg = DecodeConfig(
+    cfg = AttentionConfig(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
