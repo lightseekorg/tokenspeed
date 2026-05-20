@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 
 # Configs
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -698,20 +699,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             post_attn_layernorm=self.post_attention_layernorm,
         )
 
-        self.stream_fork = StreamFork(alt_stream)
-
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with self.stream_fork.scope(enable=True) as fork:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with fork.branch():
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
+        # qk_rmsnorm expects GemmaRMSNorm's effective gamma.
+        return qk_rmsnorm(
+            q,
+            k,
+            self.q_norm.gemma_weight,
+            self.k_norm.gemma_weight,
+            self.q_norm.variance_epsilon,
+        )
 
     def self_attention(
         self,
