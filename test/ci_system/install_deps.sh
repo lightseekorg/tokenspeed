@@ -82,7 +82,7 @@ echo "FlashInfer architecture: ${FI_ARCH}"
 # ============================================================
 # Step 2: Upgrade base tools
 # ============================================================
-sudo apt install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config -y
+sudo DEBIAN_FRONTEND=noninteractive apt install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config -y
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip setuptools wheel
 

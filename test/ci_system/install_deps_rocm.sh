@@ -20,7 +20,7 @@ echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
 echo "=== Step 1: apt deps ==="
-sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip setuptools wheel
