@@ -30,8 +30,6 @@ import os
 import signal
 import sys
 
-from tokenspeed_kernel.platform import current_platform
-
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
@@ -227,29 +225,6 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
-def _overwrite_sampling_backend(engine_args: list[str]) -> list[str]:
-    if current_platform().is_nvidia:
-        return engine_args
-
-    # TODO: Remove this workaround after smg-grpc-servicer stops injecting
-    # ``--sampling-backend flashinfer`` on non-NVIDIA platforms.
-    # The currently pinned SMG TokenSpeed entrypoint forces flashinfer when the
-    # flag is absent, but flashinfer sampling kernels are NVIDIA-only.
-    result: list[str] = []
-    skip_next = False
-    for arg in engine_args:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg == "--sampling-backend":
-            skip_next = True
-            continue
-        if arg.startswith("--sampling-backend="):
-            continue
-        result.append(arg)
-    return [*result, "--sampling-backend", "greedy"]
-
-
 async def _stream_to(proc, tag: str) -> None:
     await asyncio.gather(
         tag_stream(proc.stdout, tag, sys.stdout),
@@ -431,7 +406,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
-    engine_args = _overwrite_sampling_backend(split.engine)
+    engine_args = split.engine
     gateway_args = _gateway_args_with_defaults(split.gateway)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
 
