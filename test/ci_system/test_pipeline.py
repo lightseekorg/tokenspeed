@@ -203,10 +203,13 @@ def test_resolve_score_threshold_passes_through_range_list():
 
 
 def test_resolve_score_threshold_picks_per_runner_value():
-    threshold = {"b200-2gpu": 0.7, "linux-mi355-2gpu-lightseek": 0.69}
+    threshold = {
+        "b200-2gpu": 0.7,
+        "linux-mi355-2gpu-lightseek-test": 0.69,
+    }
     assert resolve_score_threshold_for_runner(threshold, "b200-2gpu") == 0.7
     assert (
-        resolve_score_threshold_for_runner(threshold, "linux-mi355-2gpu-lightseek")
+        resolve_score_threshold_for_runner(threshold, "linux-mi355-2gpu-lightseek-test")
         == 0.69
     )
 
@@ -224,11 +227,14 @@ def test_check_eval_score_threshold_uses_per_runner_mapping_pass():
     task = {
         "score_threshold": {
             "b200-2gpu": 0.7,
-            "linux-mi355-2gpu-lightseek": 0.69,
+            "linux-mi355-2gpu-lightseek-test": 0.69,
         }
     }
     check = check_eval_score_threshold(
-        task, _eval_command_results(0.695), ["eval"], "linux-mi355-2gpu-lightseek"
+        task,
+        _eval_command_results(0.695),
+        ["eval"],
+        "linux-mi355-2gpu-lightseek-test",
     )
     assert check is not None
     assert check["passed"] is True
@@ -239,7 +245,7 @@ def test_check_eval_score_threshold_uses_per_runner_mapping_fail():
     task = {
         "score_threshold": {
             "b200-2gpu": 0.7,
-            "linux-mi355-2gpu-lightseek": 0.69,
+            "linux-mi355-2gpu-lightseek-test": 0.69,
         }
     }
     check = check_eval_score_threshold(
