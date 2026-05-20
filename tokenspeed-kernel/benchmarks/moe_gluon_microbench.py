@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Micro-benchmark for the three MI355 Gluon MoE kernels.
+"""Micro-benchmark for the MI355 Gluon MoE scaled-MFMA kernels.
 
 The shapes are derived from the gpt-oss-120b (mxfp4 weight + fp8 act)
 HF model card (https://huggingface.co/amd/gpt-oss-120b-w-mxfp4-a-fp8):
@@ -30,17 +30,10 @@ HF model card (https://huggingface.co/amd/gpt-oss-120b-w-mxfp4-a-fp8):
   num_experts_per_tok    K  = 4
 
 For each batch_size ``B`` (token count -- 1/32/64 cover decode,
-1024/4096/8192 cover prefill / chunked prefill) we compare the three
-Gluon kernels against their upstream baselines:
-
-  * Kernel 1 (router gating): GEMM ``(B, H) x (H, E)``  vs upstream
-    ``triton_kernels.matmul`` and ``torch.matmul``.
-  * Kernel 2 (dispatch + 1st GEMM + SwiGLU): per-expert GEMM
-    ``(M_d, H) x (E, H, 2I) -> SwiGLU -> (M_d, I)`` vs upstream
-    ``triton_kernels.matmul`` with ``FusedActivation(swiglu_fn)``.
-  * Kernel 3 (2nd GEMM + scatter combine): per-expert GEMM
-    ``(M_d, I) x (E, I, H)`` followed by scatter combine, vs upstream
-    ``triton_kernels.matmul`` with ``scatter_indx``.
+1024/4096/8192 cover prefill / chunked prefill) we run the three
+Gluon scaled-MFMA kernels (``gluon_mxfp_gating_gemm``,
+``gluon_mxfp_dispatch_swiglu``, ``gluon_mxfp_combine``) on both
+``e2m1`` (mxfp4 x mxfp4) and ``e4m3`` (fp8 x mxfp4) activations.
 
 For decode batch sizes only ``min(B*topk, E)`` experts are active, so
 the ragged metadata is built with that exact number of active experts;
@@ -79,10 +72,6 @@ def _bench(fn, *, warmup=10, rep=50, sync=True) -> float:
     if sync:
         torch.cuda.synchronize()
     return (time.perf_counter() - t0) / rep * 1e3  # ms
-
-
-def _bf16_tensor(*shape):
-    return torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16) * 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -136,273 +125,25 @@ def _build_ragged(B, *, E=GPTOSS_NUM_EXPERTS, topk=GPTOSS_TOPK, block_m=64):
 
 
 # ---------------------------------------------------------------------------
-# Kernel 1: bf16 gating GEMM   (B, H) x (H, E) -> (B, E)
-# ---------------------------------------------------------------------------
-
-
-def bench_gating_gemm(B, *, H=GPTOSS_HIDDEN, E=GPTOSS_NUM_EXPERTS, warmup=10, rep=50):
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_gating_gemm
-
-    x = _bf16_tensor(B, H)
-    w = _bf16_tensor(H, E)
-
-    def gluon_call():
-        return gluon_bf16_gating_gemm(x, w)
-
-    from triton_kernels.matmul import PrecisionConfig, matmul
-
-    def triton_call():
-        return matmul(x, w, None, precision_config=PrecisionConfig())
-
-    gluon_ms = _bench(gluon_call, warmup=warmup, rep=rep)
-    try:
-        triton_ms = _bench(triton_call, warmup=warmup, rep=rep)
-    except Exception:
-        triton_ms = float("nan")
-    torch_ms = _bench(lambda: torch.matmul(x, w), warmup=warmup, rep=rep)
-
-    flops = 2.0 * B * E * H
-    return {
-        "shape": f"B={B},H={H},E={E}",
-        "gluon_ms": gluon_ms,
-        "baseline_ms": triton_ms,
-        "torch_ms": torch_ms,
-        "gluon_tflops": flops / (gluon_ms * 1e-3) / 1e12,
-        "baseline_tflops": (
-            flops / (triton_ms * 1e-3) / 1e12
-            if triton_ms == triton_ms
-            else float("nan")
-        ),
-        "torch_tflops": flops / (torch_ms * 1e-3) / 1e12,
-        "speedup": triton_ms / gluon_ms if triton_ms == triton_ms else float("nan"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Kernel 2: dispatch + 1st GEMM + SwiGLU
-# (M_d, H) x (E, H, 2I) -> SwiGLU -> (M_d, I)
-# ---------------------------------------------------------------------------
-
-
-def bench_dispatch_swiglu(
-    B,
-    *,
-    H=GPTOSS_HIDDEN,
-    I=GPTOSS_INTERMEDIATE,
-    E=GPTOSS_NUM_EXPERTS,
-    topk=GPTOSS_TOPK,
-    warmup=10,
-    rep=50,
-):
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_dispatch_swiglu
-
-    md, M_padded, n_active, per_expert = _build_ragged(B, E=E, topk=topk, block_m=64)
-    x = _bf16_tensor(M_padded, H)
-    w = _bf16_tensor(E, H, 2 * I)
-
-    def gluon_call():
-        return gluon_bf16_dispatch_swiglu(
-            x,
-            w,
-            bias=None,
-            a_ragged_metadata=md,
-            gather_indx=None,
-            swiglu_alpha=1.0,
-            swiglu_limit=0.0,
-        )
-
-    def baseline_call():
-        from triton_kernels.matmul import (
-            FusedActivation,
-            PrecisionConfig,
-            matmul,
-        )
-        from triton_kernels.specialize import FnSpecs
-        from triton_kernels.swiglu import swiglu_fn
-
-        act = FusedActivation(
-            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-            (1.0, 0.0),
-        )
-        return matmul(
-            x,
-            w,
-            None,
-            a_ragged_metadata=md,
-            fused_activation=act,
-            precision_config=PrecisionConfig(),
-        )
-
-    try:
-        gluon_ms = _bench(gluon_call, warmup=warmup, rep=rep)
-    except Exception as e:
-        return {
-            "shape": (f"B={B},M_d={M_padded},I={I},H={H},E_act={n_active}/{E}"),
-            "error": str(e),
-        }
-    try:
-        baseline_ms = _bench(baseline_call, warmup=warmup, rep=rep)
-    except Exception:
-        baseline_ms = float("nan")
-
-    flops = 2.0 * M_padded * (2 * I) * H + 2.0 * M_padded * I  # GEMM + SwiGLU
-    return {
-        "shape": f"B={B},M_d={M_padded},I={I},H={H},E_act={n_active}/{E}",
-        "gluon_ms": gluon_ms,
-        "baseline_ms": baseline_ms,
-        "gluon_tflops": flops / (gluon_ms * 1e-3) / 1e12,
-        "baseline_tflops": flops / (baseline_ms * 1e-3) / 1e12,
-        "speedup": (
-            baseline_ms / gluon_ms if baseline_ms == baseline_ms else float("nan")
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Kernel 3: 2nd GEMM + scatter combine
-# (M_d, I) x (E, I, H) -> scatter -> (B, H)
-# ---------------------------------------------------------------------------
-
-
-def bench_combine(
-    B,
-    *,
-    H=GPTOSS_HIDDEN,
-    I=GPTOSS_INTERMEDIATE,
-    E=GPTOSS_NUM_EXPERTS,
-    topk=GPTOSS_TOPK,
-    warmup=10,
-    rep=50,
-):
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_combine
-
-    md, M_padded, n_active, per_expert = _build_ragged(B, E=E, topk=topk, block_m=64)
-    x = _bf16_tensor(M_padded, I)
-    w = _bf16_tensor(E, I, H)
-    scatter_indx = type(
-        "ScatterIndx",
-        (),
-        {"dst_indx": torch.arange(M_padded, device=DEVICE, dtype=torch.int32)},
-    )()
-
-    def gluon_call():
-        return gluon_bf16_combine(
-            x,
-            w,
-            bias=None,
-            a_ragged_metadata=md,
-            scatter_indx=scatter_indx,
-            gate_scal=None,
-            n_tokens=M_padded,
-            n_expts_act=1,
-        )
-
-    upstream_scatter = scatter_indx.dst_indx
-
-    def baseline_call():
-        from triton_kernels.matmul import PrecisionConfig, matmul
-
-        return matmul(
-            x,
-            w,
-            None,
-            a_ragged_metadata=md,
-            scatter_indx=upstream_scatter,
-            precision_config=PrecisionConfig(),
-        )
-
-    try:
-        gluon_ms = _bench(gluon_call, warmup=warmup, rep=rep)
-    except Exception as e:
-        return {
-            "shape": (f"B={B},M_d={M_padded},H={H},I={I},E_act={n_active}/{E}"),
-            "error": str(e),
-        }
-    try:
-        baseline_ms = _bench(baseline_call, warmup=warmup, rep=rep)
-    except Exception:
-        baseline_ms = float("nan")
-
-    flops = 2.0 * M_padded * H * I
-    return {
-        "shape": f"B={B},M_d={M_padded},H={H},I={I},E_act={n_active}/{E}",
-        "gluon_ms": gluon_ms,
-        "baseline_ms": baseline_ms,
-        "gluon_tflops": flops / (gluon_ms * 1e-3) / 1e12,
-        "baseline_tflops": flops / (baseline_ms * 1e-3) / 1e12,
-        "speedup": (
-            baseline_ms / gluon_ms if baseline_ms == baseline_ms else float("nan")
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Static profile dump
 # ---------------------------------------------------------------------------
 
 
 def dump_static_profiles():
-    """Run each Gluon kernel once and dump its AMDGCN GPR profile."""
-    from tokenspeed_kernel.ops.moe.gluon import (
-        _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
-    )
-    from tokenspeed_kernel.ops.moe.gluon import (
-        gluon_bf16_combine,
-        gluon_bf16_dispatch_swiglu,
-        gluon_bf16_gating_gemm,
-        static_profile,
-    )
-
-    print("\n=== Static GPR / spill profile (no spills allowed) ===")
-    # One representative shape per phase: decode B=32, prefill B=1024.
-    for B in (32, 1024):
-        x_dense = _bf16_tensor(B, GPTOSS_HIDDEN)
-        w_dense = _bf16_tensor(GPTOSS_HIDDEN, GPTOSS_NUM_EXPERTS)
-        gluon_bf16_gating_gemm(x_dense, w_dense)
-
-        md, M_padded, *_ = _build_ragged(B, block_m=64)
-        x_pad = _bf16_tensor(M_padded, GPTOSS_HIDDEN)
-        w_moe_2x = _bf16_tensor(
-            GPTOSS_NUM_EXPERTS, GPTOSS_HIDDEN, 2 * GPTOSS_INTERMEDIATE
-        )
-        gluon_bf16_dispatch_swiglu(
-            x_pad,
-            w_moe_2x,
-            bias=None,
-            a_ragged_metadata=md,
-            gather_indx=None,
-            swiglu_alpha=1.0,
-            swiglu_limit=0.0,
-        )
-        scatter = type(
-            "ScatterIndx",
-            (),
-            {"dst_indx": torch.arange(M_padded, device=DEVICE, dtype=torch.int32)},
-        )()
-        x_pad_i = _bf16_tensor(M_padded, GPTOSS_INTERMEDIATE)
-        w_moe = _bf16_tensor(GPTOSS_NUM_EXPERTS, GPTOSS_INTERMEDIATE, GPTOSS_HIDDEN)
-        gluon_bf16_combine(
-            x_pad_i,
-            w_moe,
-            bias=None,
-            a_ragged_metadata=md,
-            scatter_indx=scatter,
-            gate_scal=None,
-            n_tokens=M_padded,
-            n_expts_act=1,
-        )
-
-    # Also exercise the scaled-MFMA kernel at the same shapes so its
-    # spill profile shows up alongside the bf16 ones.
+    """Run each scaled-MFMA Gluon kernel once and dump its AMDGCN GPR profile."""
     from tokenspeed_kernel.ops.moe.gluon import (
         _pipelined_moe_kernel_scaled,
         gluon_mxfp_combine,
         gluon_mxfp_dispatch_swiglu,
         gluon_mxfp_gating_gemm,
+        static_profile,
     )
     from tokenspeed_kernel.ops.moe.gluon_persistent import (
         _pipelined_moe_kernel_scaled_persistent,
     )
+
+    print("\n=== Static GPR / spill profile (no spills allowed) ===")
+    # One representative shape per phase: decode B=32, prefill B=1024.
 
     for B in (32, 1024):
         # mxfp4 x mxfp4 gating
@@ -497,7 +238,7 @@ def dump_static_profiles():
                 f"scratch={prof['ScratchSize']} occupancy={prof['Occupancy']}"
             )
 
-    _scan(_pipelined_moe_kernel, "unified")
+    _scan(_pipelined_moe_kernel_scaled, "scaled  ")
     _scan(_pipelined_moe_kernel_scaled_persistent, "persist ")
     if bad:
         raise SystemExit(f"{bad} kernel(s) reported spill -- aborting")
@@ -705,7 +446,6 @@ def dump_scaled_mfma_autotune():
             GPTOSS_HIDDEN,
             do_swiglu=do_swiglu,
             ragged=ragged,
-            scaled_mfma=True,
         )
         assert (
             bk >= 128 and bk % 128 == 0
@@ -722,22 +462,6 @@ def dump_scaled_mfma_autotune():
 #   decode  : single-token / very small batch -> B in {1, 32, 64}
 #   prefill : full / chunked prefill          -> B in {1024, 4096, 8192}
 GPTOSS_BATCHES = (1, 32, 64, 1024, 4096, 8192)
-
-
-def _print_row(r):
-    if "error" in r:
-        print(f"  {r['shape']:55s}  ERROR: {r['error'][:80]}")
-        return
-    extras = ""
-    if "torch_tflops" in r:
-        extras = f"torch.mm={r['torch_tflops']:7.1f} TFLOPs ({r['torch_ms']:.3f} ms)  "
-    print(
-        f"  {r['shape']:55s} "
-        f"gluon={r['gluon_tflops']:7.1f} TFLOPs ({r['gluon_ms']:.3f} ms)  "
-        f"baseline={r['baseline_tflops']:7.1f} TFLOPs ({r['baseline_ms']:.3f} ms)  "
-        f"{extras}"
-        f"speedup={r['speedup']:.2f}x"
-    )
 
 
 def main():
@@ -762,21 +486,6 @@ def main():
         f"E={GPTOSS_NUM_EXPERTS}, topk={GPTOSS_TOPK}"
     )
     print("=" * 110)
-
-    print("\nKernel 1: bf16 gating GEMM  (B, H) x (H, E)")
-    print("-" * 110)
-    for B in args.batch_sizes:
-        _print_row(bench_gating_gemm(B, warmup=args.warmup, rep=args.rep))
-
-    print("\nKernel 2: dispatch + 1st GEMM + SwiGLU  (M_d, H) x (E, H, 2I)")
-    print("-" * 110)
-    for B in args.batch_sizes:
-        _print_row(bench_dispatch_swiglu(B, warmup=args.warmup, rep=args.rep))
-
-    print("\nKernel 3: 2nd GEMM + scatter combine  (M_d, I) x (E, I, H)")
-    print("-" * 110)
-    for B in args.batch_sizes:
-        _print_row(bench_combine(B, warmup=args.warmup, rep=args.rep))
 
     # ------ Scaled MFMA variants (mxfp4 / fp8) ------
     print("\n=== Scaled MFMA variants (instr 16x16x128) ===")

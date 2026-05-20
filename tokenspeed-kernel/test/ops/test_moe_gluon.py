@@ -18,15 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Correctness + spill tests for the MI355 Gluon MoE kernels.
+"""Correctness + spill tests for the MI355 Gluon MoE scaled-MFMA kernels.
 
-Three pieces are exercised:
-
-* ``gluon_bf16_gating_gemm`` -- bf16 dense GEMM (`x @ w`).
-* ``gluon_bf16_dispatch_swiglu`` -- ragged GEMM with optional gather +
-  fused SwiGLU.
-* ``gluon_bf16_combine`` -- ragged GEMM with optional scatter + weighted
-  combine across top-k.
+The Gluon MoE kernel only supports the mxfp4 / fp8 scaled-MFMA path
+(``e2m1`` x ``e2m1`` and ``e4m3`` / ``e5m2`` x ``e2m1``); plain bf16 / fp16
+inputs are routed to ``triton_kernels.matmul`` via the registered
+``_gluon_mxfp_ragged_matmul`` adapter.
 
 For each kernel we also assert (via ``static_profile``) that AMDGCN reports
 *zero* sgpr / vgpr spills.
@@ -74,392 +71,19 @@ def _build_ragged(M: int, E: int, *, block_m: int = 128, device: str = "cuda"):
     return md, gather_indx, counts, M_padded
 
 
-def _torch_ragged_matmul(x, w, counts, *, bias=None, gather_indx=None):
-    """Per-expert dense matmul on slices of x; reference for bf16 path."""
-    if gather_indx is not None:
-        x = x[gather_indx.src_indx.long()]
-    M, K = x.shape
-    E, K_W, N = w.shape
-    out = torch.zeros((M, N), device=x.device, dtype=torch.float32)
-    start = 0
-    for e in range(E):
-        n = int(counts[e].item())
-        if n == 0:
-            continue
-        slc = x[start : start + n].to(torch.float32)
-        we = w[e].to(torch.float32)
-        out[start : start + n] = slc @ we
-        if bias is not None:
-            out[start : start + n] += bias[e].to(torch.float32)
-        start += n
-    return out
-
-
-def _torch_swiglu(x, *, alpha: float, limit: float):
-    """Same recipe as ``triton_kernels.swiglu`` so we can compare bit-equally."""
-    gate, linear = x[..., 0::2], x[..., 1::2]
-    if limit > 0.0:
-        gate = torch.minimum(gate, torch.tensor(limit, device=gate.device))
-        linear = torch.minimum(
-            torch.maximum(linear, torch.tensor(-limit, device=linear.device)),
-            torch.tensor(limit, device=linear.device),
-        )
-    s = gate / (1.0 + torch.exp(-alpha * gate))
-    return s * (linear + 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Kernel 1: bf16 x bf16 gating GEMM
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("M,N,K", [(128, 128, 128), (256, 128, 256), (512, 128, 512)])
-def test_gating_gemm_correctness(M, N, K):
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_gating_gemm
-
-    torch.manual_seed(0)
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w = torch.randn(K, N, device="cuda", dtype=torch.bfloat16) * 0.05
-    y = gluon_bf16_gating_gemm(x, w, block_m=128, block_n=128, block_k=64)
-    ref = x.to(torch.float32) @ w.to(torch.float32)
-    torch.testing.assert_close(y.to(torch.float32), ref, rtol=5e-2, atol=5e-2)
-
-
-# ---------------------------------------------------------------------------
-# Kernel 2: dispatch + 1st GEMM + SwiGLU
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "M,N,K,E,block_m,block_n",
-    [
-        (128, 128, 128, 2, 128, 128),
-        (256, 256, 128, 4, 128, 128),
-    ],
-)
-def test_dispatch_swiglu_correctness(M, N, K, E, block_m, block_n):
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_dispatch_swiglu
-
-    torch.manual_seed(0)
-    md, gather_indx, counts, M_padded = _build_ragged(
-        M, E, block_m=block_m, device="cuda"
-    )
-    x = torch.randn(M_padded, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w = torch.randn(E, K, N, device="cuda", dtype=torch.bfloat16) * 0.05
-
-    y = gluon_bf16_dispatch_swiglu(
-        x,
-        w,
-        bias=None,
-        a_ragged_metadata=md,
-        gather_indx=None,  # x is already permuted to match the ragged layout
-        swiglu_alpha=1.0,
-        swiglu_limit=0.0,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=64,
-    )
-    raw = _torch_ragged_matmul(x, w, counts)
-    ref = _torch_swiglu(raw, alpha=1.0, limit=0.0)
-    torch.testing.assert_close(
-        y.to(torch.float32), ref.to(torch.float32), rtol=5e-2, atol=8e-2
-    )
-
-
-# ---------------------------------------------------------------------------
-# Kernel 3: 2nd GEMM + scatter combine
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "M,N,K,E,block_m,block_n",
-    [
-        (128, 128, 128, 2, 128, 128),
-        (256, 256, 128, 4, 128, 128),
-    ],
-)
-def test_combine_correctness(M, N, K, E, block_m, block_n):
-    """``y[token] = sum_{e in topk} x_e @ w_e`` -- check the scatter sum."""
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_combine
-
-    torch.manual_seed(0)
-    md, _, counts, M_padded = _build_ragged(M, E, block_m=block_m, device="cuda")
-    x = torch.randn(M_padded, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w = torch.randn(E, K, N, device="cuda", dtype=torch.bfloat16) * 0.05
-
-    # Identity scatter: each dispatched row writes back to its own row.
-    # n_expts_act=1 so the post-kernel reduce is a no-op.
-    scatter_indx = type(
-        "ScatterIndx",
-        (),
-        {"dst_indx": torch.arange(M_padded, device="cuda", dtype=torch.int32)},
-    )()
-
-    y = gluon_bf16_combine(
-        x,
-        w,
-        bias=None,
-        a_ragged_metadata=md,
-        scatter_indx=scatter_indx,
-        gate_scal=None,
-        n_tokens=M_padded,
-        n_expts_act=1,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=64,
-    )
-    ref = _torch_ragged_matmul(x, w, counts)
-    torch.testing.assert_close(
-        y.to(torch.float32), ref.to(torch.float32), rtol=5e-2, atol=5e-2
-    )
-
-
-# ---------------------------------------------------------------------------
-# Static spill profile: assert no sgpr / vgpr spill
-# ---------------------------------------------------------------------------
-
-
-def test_no_register_spill():
-    """Each kernel must compile without sgpr / vgpr spills.
-
-    We probe the AMDGCN dump after a real launch (which is what triggers
-    Gluon to actually JIT compile and cache an asm artifact).
-    """
-    from tokenspeed_kernel.ops.moe.gluon import (
-        _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
-    )
-    from tokenspeed_kernel.ops.moe.gluon import (
-        assert_no_spills,
-        gluon_bf16_combine,
-        gluon_bf16_dispatch_swiglu,
-        gluon_bf16_gating_gemm,
-        static_profile,
-    )
-
-    M, N, K, E, block_m, block_n, block_k = 256, 256, 128, 4, 128, 128, 64
-    md, _, _, M_padded = _build_ragged(M, E, block_m=block_m, device="cuda")
-    x = torch.randn(M_padded, K, device="cuda", dtype=torch.bfloat16)
-    w_dense = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    w_moe = torch.randn(E, K, N, device="cuda", dtype=torch.bfloat16)
-    w_moe_2x = torch.randn(E, K, 2 * N, device="cuda", dtype=torch.bfloat16)
-
-    # 1. gating
-    gluon_bf16_gating_gemm(
-        x[:128], w_dense, block_m=block_m, block_n=block_n, block_k=block_k
-    )
-    # 2. dispatch + swiglu (output N is 2*N // 2 = N)
-    gluon_bf16_dispatch_swiglu(
-        x,
-        w_moe_2x,
-        bias=None,
-        a_ragged_metadata=md,
-        gather_indx=None,
-        swiglu_alpha=1.0,
-        swiglu_limit=0.0,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-    )
-    # 3. combine (identity scatter)
-    scatter = type(
-        "ScatterIndx",
-        (),
-        {"dst_indx": torch.arange(M_padded, device="cuda", dtype=torch.int32)},
-    )()
-    gluon_bf16_combine(
-        x,
-        w_moe,
-        bias=None,
-        a_ragged_metadata=md,
-        scatter_indx=scatter,
-        gate_scal=None,
-        n_tokens=M_padded,
-        n_expts_act=1,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-    )
-
-    # The Gluon JIT caches per (device, signature); each compiled artifact
-    # holds the AMDGCN dump in ``.asm['amdgcn']`` which is what
-    # ``static_profile`` consumes.
-    device = torch.cuda.current_device()
-    device_cache = _pipelined_moe_kernel.device_caches.get(device, None)
-    assert device_cache, "expected the Gluon kernel to JIT-compile at least once"
-    # device_cache is a (kernel_cache, env, ...) tuple; first element maps
-    # signature -> compiled kernel.
-    kernel_cache = device_cache[0]
-    compiled = next(iter(kernel_cache.values()))
-    profile = static_profile(compiled, label="moe-pipe")
-    assert_no_spills(profile, allow_scratch=0)
-
-
-# ---------------------------------------------------------------------------
-# gpt-oss-120b shape coverage (decode + prefill)
-# ---------------------------------------------------------------------------
-#
-# Anchors for the per-shape regressions added in ``Update 2``: we exercise
-# the kernels at the *real* gpt-oss-120b MoE GEMM dimensions (per the HF
-# config: ``hidden_size=2880, intermediate_size=2880, num_local_experts=128,
-# num_experts_per_tok=4``) for both the sparse-decode (``B=1`` -> 4 active
-# experts via the new active-expert remap) and the dense-prefill (``B=64``
-# -> all 128 experts active) paths.
-#
-# These are correctness *and* spill checks but use small ``H/I/E`` to keep
-# CI runtime bounded; the full prefill scale (M_d=8192) is exercised by
-# ``benchmarks/moe_gluon_microbench.py``.
-
-GPTOSS_H = 2880
-GPTOSS_I = 2880
-GPTOSS_E = 128
-GPTOSS_TOPK = 4
-
-
-def _gptoss_ragged(B: int, *, block_m: int = 64, device: str = "cuda"):
-    """Build a gpt-oss-120b style ragged metadata: ``min(B*topk, E)``
-    active experts each holding ``per_expert >= block_m`` rows. Mirrors
-    the helper in ``benchmarks/moe_gluon_microbench.py``.
-    """
-    from triton_kernels.tensor import make_ragged_tensor_metadata
-
-    M_d = B * GPTOSS_TOPK
-    n_active = min(M_d, GPTOSS_E)
-    per_expert = max(
-        block_m,
-        ((M_d + n_active - 1) // n_active + block_m - 1) // block_m * block_m,
-    )
-    M_padded = per_expert * n_active
-    counts = torch.zeros((GPTOSS_E,), device=device, dtype=torch.int32)
-    counts[:n_active] = per_expert
-    md = make_ragged_tensor_metadata(counts, M_padded)
-    return md, counts, M_padded, n_active, per_expert
-
-
-@pytest.mark.parametrize("B", [1, 32, 64])
-def test_gpt_oss_decode_remap(B):
-    """Decode batches activate ``min(B*topk, E)`` experts; the active-expert
-    remap must keep the kernel numerically equivalent to the dense
-    reference (active experts only)."""
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_combine
-
-    torch.manual_seed(0)
-    md, counts, M_padded, n_active, per_expert = _gptoss_ragged(B)
-    # Use a small inner dim to keep the test fast.
-    K, N = 128, 128
-    x = torch.randn(M_padded, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w = torch.randn(GPTOSS_E, K, N, device="cuda", dtype=torch.bfloat16) * 0.05
-    scatter = type(
-        "ScatterIndx",
-        (),
-        {"dst_indx": torch.arange(M_padded, device="cuda", dtype=torch.int32)},
-    )()
-    y = gluon_bf16_combine(
-        x,
-        w,
-        bias=None,
-        a_ragged_metadata=md,
-        scatter_indx=scatter,
-        gate_scal=None,
-        n_tokens=M_padded,
-        n_expts_act=1,
-    )
-    # Reference: per-expert dense matmul over the *active* experts only.
-    ref = torch.zeros((M_padded, N), device="cuda", dtype=torch.float32)
-    start = 0
-    for e in range(GPTOSS_E):
-        n = int(counts[e].item())
-        if n == 0:
-            continue
-        ref[start : start + n] = x[start : start + n].to(torch.float32) @ w[e].to(
-            torch.float32
-        )
-        start += n
-    torch.testing.assert_close(y.to(torch.float32), ref, rtol=5e-2, atol=5e-2)
-
-
-@pytest.mark.parametrize("B", [1, 64])
-def test_gpt_oss_no_spill(B):
-    """The autotuner must pick a non-spilling config for both decode
-    (sparse, ``B=1``) and prefill (dense, ``B=64``) at gpt-oss-120b sizes."""
-    from tokenspeed_kernel.ops.moe.gluon import (
-        _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
-    )
-    from tokenspeed_kernel.ops.moe.gluon import (
-        assert_no_spills,
-        gluon_bf16_combine,
-        gluon_bf16_dispatch_swiglu,
-        gluon_bf16_gating_gemm,
-        static_profile,
-    )
-
-    torch.manual_seed(0)
-    # Use real gpt-oss H/I/E but cap K to the smaller of (H, 256) so
-    # JIT compile stays cheap; this still triggers the same kernel
-    # specialisation the production launcher does.
-    K = min(GPTOSS_H, 256)
-    md, _, M_padded, *_ = _gptoss_ragged(B)
-
-    x_dense = torch.randn(B, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w_dense = torch.randn(K, GPTOSS_E, device="cuda", dtype=torch.bfloat16) * 0.05
-    gluon_bf16_gating_gemm(x_dense, w_dense)
-
-    x_pad = torch.randn(M_padded, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w_2x = (
-        torch.randn(GPTOSS_E, K, 2 * GPTOSS_I, device="cuda", dtype=torch.bfloat16)
-        * 0.05
-    )
-    gluon_bf16_dispatch_swiglu(
-        x_pad,
-        w_2x,
-        bias=None,
-        a_ragged_metadata=md,
-        gather_indx=None,
-        swiglu_alpha=1.0,
-        swiglu_limit=0.0,
-    )
-
-    scatter = type(
-        "ScatterIndx",
-        (),
-        {"dst_indx": torch.arange(M_padded, device="cuda", dtype=torch.int32)},
-    )()
-    x_pad_i = (
-        torch.randn(M_padded, GPTOSS_I, device="cuda", dtype=torch.bfloat16) * 0.05
-    )
-    w_h = (
-        torch.randn(GPTOSS_E, GPTOSS_I, GPTOSS_H, device="cuda", dtype=torch.bfloat16)
-        * 0.05
-    )
-    gluon_bf16_combine(
-        x_pad_i,
-        w_h,
-        bias=None,
-        a_ragged_metadata=md,
-        scatter_indx=scatter,
-        gate_scal=None,
-        n_tokens=M_padded,
-        n_expts_act=1,
-    )
-
-    device = torch.cuda.current_device()
-    device_cache = _pipelined_moe_kernel.device_caches.get(device)
-    assert device_cache, "expected the Gluon kernel to JIT-compile at least once"
-    kernel_cache = device_cache[0]
-    for sig, compiled in kernel_cache.items():
-        prof = static_profile(compiled, label=f"B={B}")
-        assert_no_spills(prof, allow_scratch=0)
-
-
 # ---------------------------------------------------------------------------
 # Scaled MFMA / BLOCK_K constraint  (TASKS.md Update 3)
 # ---------------------------------------------------------------------------
 #
 # Per ``TASKS.md`` Update 3, the scaled MFMA op on CDNA4 has instruction
-# shape ``[16, 16, 128]``, so any kernel that swaps in
-# ``gl.amd.cdna4.mfma_scaled`` (mxfp4 weight + fp8 activation path) must
-# respect ``BLOCK_K >= 128`` and ``BLOCK_K % 128 == 0``. These tests
-# pin the autotuner contract today so the constraint can't silently
-# regress when the scaled path lands.
+# shape ``[16, 16, 128]``, so the launcher's ``BLOCK_K`` must be a multiple
+# of 128 and ``>= 128``. These tests pin the autotuner contract so the
+# constraint can't silently regress.
+
+GPTOSS_H = 2880
+GPTOSS_I = 2880
+GPTOSS_E = 128
+GPTOSS_TOPK = 4
 
 
 @pytest.mark.parametrize(
@@ -472,34 +96,27 @@ def test_gpt_oss_no_spill(B):
     ],
 )
 def test_autotune_scaled_mfma_block_k(M, N, K, do_swiglu, ragged):
-    """``_autotune_block(scaled_mfma=True)`` must enforce CDNA4's
-    16x16x128 scaled MFMA shape on ``BLOCK_K``."""
+    """``_autotune_block`` must enforce CDNA4's 16x16x128 scaled MFMA shape
+    on ``BLOCK_K`` for every supported (M, N, K, do_swiglu, ragged) tuple."""
     from tokenspeed_kernel.ops.moe.gluon import _autotune_block
 
-    bm, bn, bk, nw = _autotune_block(
-        M, N, K, do_swiglu=do_swiglu, ragged=ragged, scaled_mfma=True
-    )
+    bm, bn, bk, nw = _autotune_block(M, N, K, do_swiglu=do_swiglu, ragged=ragged)
     assert bk >= 128, f"scaled MFMA needs BLOCK_K >= 128, got {bk}"
     assert bk % 128 == 0, f"scaled MFMA needs BLOCK_K % 128 == 0, got {bk}"
     assert bm % 16 == 0, f"BLOCK_M must be a multiple of MFMA M (16), got {bm}"
 
-    # Sanity: ``scaled_mfma=False`` should keep the BK=32/64 fast path.
-    _, _, bk_unscaled, _ = _autotune_block(
-        M, N, K, do_swiglu=do_swiglu, ragged=ragged, scaled_mfma=False
-    )
-    assert bk_unscaled in (
-        32,
-        64,
-    ), f"regular MFMA fast path expects BK in {{32, 64}}, got {bk_unscaled}"
-
 
 def test_launcher_rejects_bad_block_k_for_scaled_mfma():
-    """The launcher must refuse a sub-128 ``BLOCK_K`` when the caller
-    advertises ``scaled_mfma=True`` (catches future mxfp4 mis-wirings)."""
+    """The launcher must refuse a sub-128 ``BLOCK_K`` since the kernel
+    only supports scaled MFMA (16x16x128) -- catches future mis-wirings.
+    """
     from tokenspeed_kernel.ops.moe.gluon import _launch_kernel
 
-    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    # Inputs are mxfp4-packed uint8 (the only format the launcher accepts).
+    x = torch.zeros((128, 64), device="cuda", dtype=torch.uint8)
+    w = torch.zeros((64, 128), device="cuda", dtype=torch.uint8)
+    w_scale = torch.zeros((128, 64 // 32), device="cuda", dtype=torch.uint8)
+    x_scale = torch.zeros((128, 64 // 32), device="cuda", dtype=torch.uint8)
     y = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match=r"BLOCK_K"):
         _launch_kernel(
@@ -518,26 +135,11 @@ def test_launcher_rejects_bad_block_k_for_scaled_mfma():
             block_k=64,
             num_warps=4,
             num_buffers=2,
-            scaled_mfma=True,
+            a_format="e2m1",
+            b_format="e2m1",
+            x_scale=x_scale,
+            w_scale=w_scale,
         )
-
-
-def test_kernel_compiles_with_block_k_128():
-    """Sanity check that the bf16 kernel still compiles and produces
-    correct output at ``BLOCK_K=128`` (matches the scaled-MFMA floor).
-    Speed-wise this config is slower than the BK=32/64 default for the
-    register-staged pipeline, but we want the *legality* covered so that
-    when we land scaled MFMA the kernel body keeps working at BK=128.
-    """
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_gating_gemm
-
-    torch.manual_seed(0)
-    M, N, K = 128, 128, 256
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w = torch.randn(K, N, device="cuda", dtype=torch.bfloat16) * 0.05
-    y = gluon_bf16_gating_gemm(x, w, block_m=64, block_n=64, block_k=128, num_warps=4)
-    ref = x.to(torch.float32) @ w.to(torch.float32)
-    torch.testing.assert_close(y.to(torch.float32), ref, rtol=5e-2, atol=5e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -582,9 +184,7 @@ def _fp8_pair(M: int, K: int, fmt: str, *, device="cuda"):
     return u, u.view(view).to(torch.float32)
 
 
-@pytest.mark.parametrize(
-    "scale_mode", ["bypass", "transpose", "swizzle", "cdna4_upstream"]
-)
+@pytest.mark.parametrize("scale_mode", ["bypass", "transpose", "swizzle"])
 @pytest.mark.parametrize(
     "M,N,K",
     [
@@ -619,19 +219,16 @@ def test_mxfp4_x_mxfp4_gating(M, N, K, scale_mode):
     assert rel < 5e-2, f"rel_max={rel} too large"
 
 
-@pytest.mark.parametrize(
-    "scale_mode", ["bypass", "transpose", "swizzle", "cdna4_upstream"]
-)
+@pytest.mark.parametrize("scale_mode", ["bypass", "transpose", "swizzle"])
 @pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("M,N,K", [(32, 32, 128), (64, 128, 256)])
 def test_fp8_x_mxfp4_gating(fmt, M, N, K, scale_mode):
     """``e4m3``/``e5m2`` (A) x ``e2m1`` (W) GEMM with global A scale."""
     from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
 
-    if scale_mode == "cdna4_upstream" and K < 256:
+    if scale_mode == "swizzle" and K < 256:
         pytest.skip(
-            "cdna4_upstream needs BLOCK_K >= 256 (-> K >= 256 for the "
-            "single-tile case)."
+            "swizzle needs BLOCK_K >= 256 (-> K >= 256 for the " "single-tile case)."
         )
 
     torch.manual_seed(0)
@@ -641,11 +238,11 @@ def test_fp8_x_mxfp4_gating(fmt, M, N, K, scale_mode):
     w_scale_kn = w_scale_nk.T.contiguous()
     a_global = 0.137
 
-    # cdna4_upstream requires block_k >= 256 (so MX_SCALE_BLOCK_K >= 8 for
+    # swizzle requires block_k >= 256 (so MX_SCALE_BLOCK_K >= 8 for
     # the inner-8 reshape in `unswizzle_mx_scale_cdna4`); the other modes
     # can use the smaller block_k=128 which exercises the partial-K-tile
-    # masking path. Let autotune pick block_k for cdna4_upstream.
-    block_k_arg = None if scale_mode == "cdna4_upstream" else 128
+    # masking path. Let autotune pick block_k for swizzle.
+    block_k_arg = None if scale_mode == "swizzle" else 128
     y = gluon_mxfp_gating_gemm(
         a_u8,
         w_packed,
@@ -809,25 +406,6 @@ def test_mxfp_dispatch_swiglu(fmt):
     assert rel < 5e-2, f"{fmt} swiglu rel_max={rel} too large"
 
 
-def test_oob_n_regression_bf16():
-    """Regression for the BLOCK_N > N OOB-write bug.
-
-    Before the ``actual_n = N if not DO_SWIGLU else N//2`` fix the mask
-    used ``OUT_BLOCK_N * grid_n`` which overshoots when N % BLOCK_N != 0
-    and writes garbage into the *next row* of the output tensor.
-    """
-    from tokenspeed_kernel.ops.moe.gluon import gluon_bf16_gating_gemm
-
-    torch.manual_seed(0)
-    # N=80 is not a multiple of BLOCK_N=64 -- grid_n=2, OUT_BLOCK_N*grid_n=128
-    M, N, K = 64, 80, 128
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.05
-    w = torch.randn(K, N, device="cuda", dtype=torch.bfloat16) * 0.05
-    y = gluon_bf16_gating_gemm(x, w, block_m=64, block_n=64, block_k=64, num_warps=4)
-    ref = x.to(torch.float32) @ w.to(torch.float32)
-    torch.testing.assert_close(y.to(torch.float32), ref, rtol=5e-2, atol=5e-2)
-
-
 def test_scaled_kernel_no_register_spill():
     """Compile the scaled kernel at a gpt-oss-sized prefill shape and
     verify the AMDGCN report contains zero spills + zero scratch."""
@@ -903,24 +481,31 @@ def test_gluon_kernel_selected_under_env(monkeypatch):
     importlib.reload(moe_pkg)
 
 
-def test_gluon_falls_back_for_mxfp4():
-    """mxfp4 weights / fp8 activations should fall back to triton_kernels."""
+def test_gluon_adapter_routes_pure_bf16_to_upstream():
+    """The adapter falls back to ``triton_kernels.matmul`` when neither
+    fp8 ``flex_ctx`` nor mxfp4 ``a_mx_scale`` are present (i.e. the
+    pure bf16 x bf16 path the Gluon kernel no longer supports natively).
+    """
     pytest.importorskip("triton_kernels")
-    from tokenspeed_kernel.ops.moe.gluon import _gluon_bf16_ragged_matmul
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.moe.gluon import _gluon_mxfp_ragged_matmul
     from triton_kernels.matmul import PrecisionConfig
 
     M, N, K, E = 64, 128, 128, 2
     device = "cuda"
     x = torch.randn(M, K, device=device, dtype=torch.bfloat16)
-    w_mxfp4 = torch.zeros(E, K // 2, N, device=device, dtype=torch.uint8)
-    w_scale = torch.zeros(E, K // 32, N, device=device, dtype=torch.uint8)
+    w_bf16 = torch.zeros(E, K, N, device=device, dtype=torch.bfloat16)
     md, _, _, _ = _build_ragged(M, E, device=device)
     pc = PrecisionConfig()
-    pc.b_mx_scale = w_scale
-    with pytest.raises(Exception):
-        _gluon_bf16_ragged_matmul(
+
+    sentinel = torch.zeros((M, N), device=device, dtype=torch.bfloat16)
+    with patch(
+        "tokenspeed_kernel.ops.moe.gluon._upstream_matmul", return_value=sentinel
+    ) as upstream:
+        out = _gluon_mxfp_ragged_matmul(
             x,
-            w_mxfp4,
+            w_bf16,
             bias=None,
             a_ragged_metadata=md,
             gather_indx=None,
@@ -930,3 +515,5 @@ def test_gluon_falls_back_for_mxfp4():
             n_tokens=None,
             n_expts_act=None,
         )
+    assert out is sentinel, "pure bf16 path should be forwarded to upstream matmul"
+    upstream.assert_called_once()
