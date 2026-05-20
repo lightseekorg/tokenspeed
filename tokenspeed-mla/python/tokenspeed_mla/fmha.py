@@ -2200,9 +2200,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         FMA_COUNT = 8
         CVT_COUNT = 8 if self.q_dtype.width == 8 else 4
         CVT_PER_STEP = 4 if self.q_dtype.width == 8 else 2
-        assert CVT_COUNT % CVT_PER_STEP == 0, (
-            f"CVT_COUNT {CVT_COUNT} must be divisible by CVT_PER_STEP {CVT_PER_STEP}"
-        )
+        assert (
+            CVT_COUNT % CVT_PER_STEP == 0
+        ), f"CVT_COUNT {CVT_COUNT} must be divisible by CVT_PER_STEP {CVT_PER_STEP}"
         tTMEM_LOADrS_cvt = cute.logical_divide(
             tTMEM_LOADrS, cute.make_layout(CVT_PER_STEP)
         )
