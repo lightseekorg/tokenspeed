@@ -38,6 +38,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -61,7 +62,7 @@ class MHAMetadata:
     max_seq_len_k: int | None = None
     prefix_seqlens_int32: torch.Tensor | None = None
     max_prefix_seq_len: int | None = None
-    use_split_prefill: bool = False
+    has_prefix: bool = False
     # FA3 scheduler metadata pre-computed once per scheduler step. When set,
     # the FA3 decode kernel skips its internal prepare_varlen_num_blocks
     # launch.
@@ -81,6 +82,7 @@ class MHAAttnBackend(AttentionBackend):
         if backend_name not in _KERNEL_SOLUTION_BY_BACKEND:
             raise ValueError(f"Unsupported MHA backend: {backend_name!r}")
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
+        self.mha_extend_mode = global_server_args_dict.get("mha_extend_mode", "paged")
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = (
@@ -133,14 +135,13 @@ class MHAAttnBackend(AttentionBackend):
             max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
             extend_prefix_lens_cpu = kwargs.get("extend_prefix_lens_cpu")
             if not forward_mode.is_extend():
-                use_split_prefill = False
+                has_prefix = False
             elif extend_prefix_lens is None:
-                use_split_prefill = False
+                has_prefix = False
             elif extend_prefix_lens_cpu is not None:
                 has_prefix = bool(extend_prefix_lens_cpu[:bs].any().item())
-                use_split_prefill = has_prefix
             else:
-                use_split_prefill = False
+                has_prefix = False
 
             prefix_seqlens = None
             max_prefix_seq_len = None
@@ -157,7 +158,7 @@ class MHAAttnBackend(AttentionBackend):
                 max_seq_len_k=self.max_context_len,
                 prefix_seqlens_int32=prefix_seqlens,
                 max_prefix_seq_len=max_prefix_seq_len,
-                use_split_prefill=use_split_prefill,
+                has_prefix=has_prefix,
             )
             return
 
@@ -407,32 +408,45 @@ class MHAAttnBackend(AttentionBackend):
             raise ValueError("mha extend requires k and v to both be present or absent")
 
         if has_kv:
-            if metadata.use_split_prefill:
-                return self._forward_split_prefill(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    out_cache_loc,
-                    token_to_kv_pool,
-                    metadata,
-                    cu_seqlens_q,
-                    save_kv_cache,
-                    kwargs.get("sinks"),
-                )
-            else:
-                return self._forward_prefill(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    out_cache_loc,
-                    token_to_kv_pool,
-                    metadata,
-                    cu_seqlens_q,
-                    save_kv_cache,
-                    kwargs.get("sinks"),
-                )
+            if metadata.has_prefix:
+                if self.mha_extend_mode == "ragged":
+                    return self._forward_split_prefill(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        out_cache_loc,
+                        token_to_kv_pool,
+                        metadata,
+                        cu_seqlens_q,
+                        save_kv_cache,
+                        kwargs.get("sinks"),
+                    )
+                else:
+                    return self._forward_extend(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        out_cache_loc,
+                        token_to_kv_pool,
+                        metadata,
+                        cu_seqlens_q,
+                        save_kv_cache,
+                        kwargs.get("sinks"),
+                    )
+            return self._forward_prefill(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                cu_seqlens_q,
+                save_kv_cache,
+                kwargs.get("sinks"),
+            )
         else:
             return self._forward_extend(
                 q,
