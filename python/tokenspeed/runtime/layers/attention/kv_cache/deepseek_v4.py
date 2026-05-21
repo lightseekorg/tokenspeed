@@ -20,10 +20,15 @@ import numpy as np
 import torch
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+    DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     build_v4_cache_specs,
+    deepseek_v4_indexer_fp8_row_bytes,
+    deepseek_v4_indexer_mxfp4_row_bytes,
+    deepseek_v4_swa_scale_dim,
+    deepseek_v4_swa_token_stride,
     parse_v4_compressor_state_group_id,
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
@@ -32,10 +37,6 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     compute_paged_cache_group_page_counts,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM,
-    DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
-    DEEPSEEK_V4_SWA_SCALE_DIM,
-    DEEPSEEK_V4_SWA_TOKEN_STRIDE,
     deepseek_v4_compressed_slot_mapping,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -43,26 +44,33 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE = 256
-
 
 @dataclass(frozen=True)
 class DeepseekV4CacheLayout:
     layer_ratio: tuple[int, ...]
     head_dim: int
+    rope_head_dim: int
     page_size: int
     use_fp4_indexer_cache: bool
     index_head_dim: int = 128
 
     @property
+    def swa_token_stride(self) -> int:
+        return deepseek_v4_swa_token_stride(self.head_dim, self.rope_head_dim)
+
+    @property
+    def swa_scale_dim(self) -> int:
+        return deepseek_v4_swa_scale_dim(self.head_dim, self.rope_head_dim)
+
+    @property
     def swa_row_bytes(self) -> int:
-        return DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM
+        return self.swa_token_stride + self.swa_scale_dim
 
     def swa_block_bytes(self, page_size: int | None = None) -> int:
         if page_size is None:
             page_size = self.page_size
         block_bytes = page_size * self.swa_row_bytes
-        alignment = DEEPSEEK_V4_SWA_TOKEN_STRIDE
+        alignment = self.swa_token_stride
         return ((block_bytes + alignment - 1) // alignment) * alignment
 
     def swa_cell_bytes(self) -> int:
@@ -88,11 +96,8 @@ class DeepseekV4CacheLayout:
     @property
     def indexer_row_bytes(self) -> int:
         if self.use_fp4_indexer_cache:
-            return (
-                DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
-                + DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM
-            )
-        return self.index_head_dim + (self.index_head_dim // 128) * 4
+            return deepseek_v4_indexer_mxfp4_row_bytes(self.index_head_dim)
+        return deepseek_v4_indexer_fp8_row_bytes(self.index_head_dim)
 
     def state_width(self, layer_id: int, *, indexer: bool = False) -> int:
         if indexer:
@@ -279,8 +284,7 @@ def _split_paged_cache_block_tables_into_v4_metadata(
 
     Returns (swa, {ratio: compressor_state}, indexer_state, swa_base,
     {ratio: compressor_state_base}, indexer_state_base). Unknown group ids
-    are ignored. Base offsets are None / missing when the input lacks them
-    (legacy scheduler binding).
+    are ignored. Base offsets are None / missing when the input lacks them.
     """
     offsets = paged_cache_block_table_base_offsets or {}
     swa = paged_cache_block_tables.get(V4_SWA_KV_GROUP_ID)
@@ -432,17 +436,6 @@ class DeepseekV4ForwardMetadata:
             int(self.token_to_req_indices.shape[0]) - int(self.num_prefill_tokens),
         )
 
-    def _use_decode_compressed_slot_cache(self, positions: torch.Tensor) -> bool:
-        return (
-            self.forward_mode is not None
-            and self.forward_mode.is_decode()
-            and positions.is_cuda
-            and (
-                self.compressed_block_table(1, self.page_size).is_cuda
-                or self.block_table.is_cuda
-            )
-        )
-
     def compressed_block_table(
         self,
         compress_ratio: int,
@@ -540,7 +533,13 @@ class DeepseekV4ForwardMetadata:
     ) -> torch.Tensor:
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
-        if self._use_decode_compressed_slot_cache(positions):
+        block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
+        if (
+            self.forward_mode is not None
+            and self.forward_mode.is_decode()
+            and positions.is_cuda
+            and (block_table.is_cuda or self.block_table.is_cuda)
+        ):
             cached = self.decode_compressed_slot_mappings.get(
                 (compress_ratio, kv_cache_block_size)
             )
@@ -562,7 +561,6 @@ class DeepseekV4ForwardMetadata:
             compressed_pos, kv_cache_block_size, rounding_mode="floor"
         )
         offsets = compressed_pos % kv_cache_block_size
-        block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
         req_idx = self.token_to_req_indices[: positions.numel()].long()
         if block_table is self.block_table:
             page_ids = block_table[req_idx, page_indices.long()].to(torch.int64)
@@ -584,6 +582,7 @@ def deepseek_v4_cache_layout_from_config(
     return DeepseekV4CacheLayout(
         layer_ratio=tuple(max(1, int(x)) for x in hf_config.compress_ratios),
         head_dim=int(hf_config.head_dim),
+        rope_head_dim=int(hf_config.qk_rope_head_dim),
         page_size=page_size,
         use_fp4_indexer_cache=use_fp4_indexer_cache,
         index_head_dim=int(getattr(hf_config, "index_head_dim", 128)),
@@ -593,11 +592,12 @@ def deepseek_v4_cache_layout_from_config(
 class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     """DeepSeek V4 fp8_ds_mla cache pool.
 
-    TokenSpeed keeps the SWA, compressed, compressor-state, and CSA indexer
-    caches in one V4-only pool so ordinary MLA models keep their existing cache
-    contract untouched. Compressed caches currently reuse the request page table;
-    this is correctness-first and leaves ratio-specific allocation for the
-    optimized follow-up.
+    TokenSpeed keeps SWA, compressed, compressor-state, and CSA indexer caches
+    in dedicated per-group paged pools (see PagedCacheGroup* on the scheduler
+    side and ``build_v4_cache_specs`` here), keeping ordinary MLA models on
+    their existing single-pool contract. The ``indexer_kv_buffer`` shares its
+    page table and page-count budget with the ``v4.c{ratio}a.compressed_kv``
+    group rather than owning a separate group of its own.
     """
 
     def __init__(
@@ -652,9 +652,6 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             spec = self._paged_cache_group_specs_by_id.get(group_id)
             return int(spec.rows_per_page) if spec is not None else int(default)
 
-        def _group_pages(group_id: str, default: int) -> int:
-            return int(self.paged_cache_group_page_counts.get(group_id, default))
-
         self.swa_block_size = _group_rows(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
         self.state_block_size = page_size
         self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
@@ -693,7 +690,10 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             self.compressed_block_sizes[0] if self.compressed_block_sizes else page_size
         )
 
-        swa_pages = _group_pages(V4_SWA_KV_GROUP_ID, self.num_pages)
+        swa_pages = self.paged_cache_group_page_counts.get(
+            V4_SWA_KV_GROUP_ID,
+            self.num_pages,
+        )
         self.swa_kv_buffer = [
             torch.zeros(
                 (swa_pages, self.swa_block_bytes),
@@ -710,11 +710,13 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             has_compressed = ratio > 1
             has_indexer = ratio == 4
             compressed_block_size = self.compressed_block_sizes[layer_id]
-            compressed_pages = (
-                _group_pages(v4_compressed_kv_group_id(ratio), self.num_pages)
-                if has_compressed
-                else self.num_pages
-            )
+            compressed_group_id = v4_compressed_kv_group_id(ratio)
+            compressed_pages = self.num_pages
+            if has_compressed:
+                compressed_pages = self.paged_cache_group_page_counts.get(
+                    compressed_group_id,
+                    self.num_pages,
+                )
             self.compressed_kv_buffer.append(
                 torch.zeros(
                     (
@@ -728,14 +730,13 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                 else None
             )
             compressor_state_block_size = self.compressor_state_block_sizes[layer_id]
-            compressor_state_pages = (
-                _group_pages(
-                    v4_compressor_state_group_id(ratio),
+            compressor_state_group_id = v4_compressor_state_group_id(ratio)
+            compressor_state_pages = self.num_pages
+            if has_compressed:
+                compressor_state_pages = self.paged_cache_group_page_counts.get(
+                    compressor_state_group_id,
                     self.num_pages,
                 )
-                if has_compressed
-                else self.num_pages
-            )
             self.compressor_state_buffer.append(
                 torch.empty(
                     (
@@ -763,11 +764,12 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                 else None
             )
             indexer_state_block_size = self.indexer_state_block_sizes[layer_id]
-            indexer_state_pages = (
-                _group_pages(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID, self.num_pages)
-                if has_indexer
-                else self.num_pages
-            )
+            indexer_state_pages = self.num_pages
+            if has_indexer:
+                indexer_state_pages = self.paged_cache_group_page_counts.get(
+                    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+                    self.num_pages,
+                )
             self.indexer_state_buffer.append(
                 torch.empty(
                     (
@@ -789,6 +791,11 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             layout.use_fp4_indexer_cache,
             self.compressed_block_sizes,
         )
+
+    @property
+    def prefix_cache_required_group_ids(self) -> tuple[str, ...]:
+        """All V4 paged-cache groups must be present for a snapshot to be complete."""
+        return tuple(str(spec.group_id) for spec in self.paged_cache_group_specs)
 
     def _require(
         self, buffers: list[torch.Tensor | None], layer_id: int, name: str
@@ -878,41 +885,43 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         tgt_pos = tgt % block_size
         src_pos = src % block_size
         block_stride = buf.stride(0)
+        token_stride = self.layout.swa_token_stride
+        scale_dim = self.layout.swa_scale_dim
 
         value_offsets = torch.arange(
-            DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+            token_stride,
             dtype=torch.int64,
             device=buf.device,
         )
         tgt_value = (
             tgt_page[:, None] * block_stride
-            + tgt_pos[:, None] * DEEPSEEK_V4_SWA_TOKEN_STRIDE
+            + tgt_pos[:, None] * token_stride
             + value_offsets[None, :]
         )
         src_value = (
             src_page[:, None] * block_stride
-            + src_pos[:, None] * DEEPSEEK_V4_SWA_TOKEN_STRIDE
+            + src_pos[:, None] * token_stride
             + value_offsets[None, :]
         )
         value_rows = flat[src_value].clone()
         flat[tgt_value] = value_rows
 
         scale_offsets = torch.arange(
-            DEEPSEEK_V4_SWA_SCALE_DIM,
+            scale_dim,
             dtype=torch.int64,
             device=buf.device,
         )
-        scale_base = block_size * DEEPSEEK_V4_SWA_TOKEN_STRIDE
+        scale_base = block_size * token_stride
         tgt_scale = (
             tgt_page[:, None] * block_stride
             + scale_base
-            + tgt_pos[:, None] * DEEPSEEK_V4_SWA_SCALE_DIM
+            + tgt_pos[:, None] * scale_dim
             + scale_offsets[None, :]
         )
         src_scale = (
             src_page[:, None] * block_stride
             + scale_base
-            + src_pos[:, None] * DEEPSEEK_V4_SWA_SCALE_DIM
+            + src_pos[:, None] * scale_dim
             + scale_offsets[None, :]
         )
         scale_rows = flat[src_scale].clone()

@@ -28,6 +28,7 @@ from typing import Iterable, NamedTuple
 import torch
 from tokenspeed_scheduler import Cache
 
+from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
@@ -82,60 +83,6 @@ def _dedupe_page_pairs(
         deduped_src.append(pair[0])
         deduped_dst.append(pair[1])
     return deduped_src, deduped_dst
-
-
-class LayerLoadingEvent:
-    def __init__(self, num_layers: int):
-        self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()
-
-    def complete(self, layer_index: int) -> None:
-        assert 0 <= layer_index < self._num_layers
-        self.load_events[layer_index].record()
-
-    def wait(self, layer_index: int) -> None:
-        device_module.current_stream().wait_event(self.load_events[layer_index])
-
-    @property
-    def finish_event(self):
-        return self.load_events[-1]
-
-
-class LayerDoneCounter:
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self.num_counters = 3
-        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
-        self.producer_index = -1
-        self.consumer_indices: tuple[int, ...] = ()
-
-    def update_producer(self) -> int:
-        next_index = (self.producer_index + 1) % self.num_counters
-        if not self.events[next_index].finish_event.query():
-            self.events[next_index].finish_event.synchronize()
-        self.producer_index = next_index
-        return self.producer_index
-
-    def set_consumer(self, indices: int | Iterable[int]) -> None:
-        if isinstance(indices, int):
-            self.consumer_indices = () if indices < 0 else (indices,)
-            return
-        deduped = []
-        for index in indices:
-            if index >= 0 and index not in deduped:
-                deduped.append(index)
-        self.consumer_indices = tuple(deduped)
-
-    def wait_until(self, threshold: int) -> None:
-        if not self.consumer_indices:
-            return
-        for consumer_index in self.consumer_indices:
-            self.events[consumer_index].wait(threshold)
-
-    def reset(self) -> None:
-        self.producer_index = -1
-        self.consumer_indices = ()
 
 
 class _TransferOp:

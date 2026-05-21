@@ -14,25 +14,35 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.flash_mla import (
+    flash_mla_sparse_fwd,
+    flash_mla_with_kvcache,
+    get_mla_metadata,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.registry import error_fn
 
+try:
+    from tokenspeed_kernel.thirdparty import deep_gemm
+except Exception:
+    deep_gemm = None  # type: ignore[assignment]
+
+from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    deepseek_v4_swa_row_bytes,
+)
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
-    DEEPSEEK_V4_SWA_SCALE_DIM,
-    DEEPSEEK_V4_SWA_TOKEN_STRIDE,
-    DeepseekV4AttentionOpUnavailable,
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
     deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
-    deepseek_v4_profile_scope,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     DeepseekV4ForwardMetadata,
@@ -40,23 +50,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
-
-
-def _swa_block_table(metadata: DeepseekV4ForwardMetadata) -> torch.Tensor:
-    return (
-        metadata.swa_block_table
-        if metadata.swa_block_table is not None
-        else metadata.block_table
-    )
-
-
-def _cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.pad(
-        torch.cumsum(lengths.to(torch.int32), dim=0, dtype=torch.int32),
-        (1, 0),
-    )
 
 
 def _decode_positions_from_metadata(
@@ -158,9 +154,7 @@ def _refresh_decode_indexer_schedule_metadata(
 ) -> None:
     if not metadata.decode_indexer_schedule_metadata:
         return
-    try:
-        from tokenspeed_kernel.thirdparty import deep_gemm
-    except Exception:
+    if deep_gemm is None:
         return
     get_metadata = getattr(deep_gemm, "get_paged_mqa_logits_metadata", None)
     if get_metadata is None:
@@ -225,6 +219,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         super().__init__(config)
         self.page_size = config.page_size
         self.context_len = config.context_len
+        rope_head_dim = getattr(config, "qk_rope_head_dim", None)
+        self._fp8_ds_mla_row_bytes = (
+            deepseek_v4_swa_row_bytes(config.head_dim, rope_head_dim)
+            if rope_head_dim is not None
+            else None
+        )
         prefill_chunk_size = getattr(config, "deepseek_v4_prefill_chunk_size", None)
         if prefill_chunk_size is None:
             prefill_chunk_size = global_server_args_dict.get(
@@ -468,13 +468,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_prefill_tokens = (
             int(query_lens[:num_prefill_reqs].sum().item()) if num_prefill_reqs else 0
         )
+        query_start_loc = torch.nn.functional.pad(
+            torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
+            (1, 0),
+        )
         self.forward_metadata = DeepseekV4ForwardMetadata(
             page_size=self.page_size,
             req_pool_indices=req_pool_indices,
             block_table=block_table,
             seq_lens=seq_lens,
             query_lens=query_lens,
-            query_start_loc=_cu_seqlens(query_lens),
+            query_start_loc=query_start_loc,
             token_to_req_indices=token_to_req,
             seq_lens_cpu=seq_lens_cpu,
             query_lens_cpu=query_lens_cpu,
@@ -525,11 +529,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     device=metadata.seq_lens.device,
                 )
 
+        swa_block_table = (
+            metadata.swa_block_table
+            if metadata.swa_block_table is not None
+            else metadata.block_table
+        )
         indices, lens = deepseek_v4_decode_swa_indices_and_lens(
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
-            block_table=_swa_block_table(metadata),
+            block_table=swa_block_table,
             block_table_base_offsets=metadata.swa_base_logical_page,
             window_size=window_size,
             block_size=block_size,
@@ -544,28 +553,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._decode_swa_window_size = window_size
         self._decode_swa_block_size = block_size
         return indices, lens
-
-    def _get_decode_swa_metadata(
-        self,
-        metadata: DeepseekV4ForwardMetadata,
-        *,
-        positions: torch.Tensor,
-        window_size: int,
-        block_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (
-            metadata.decode_swa_indices is not None
-            and metadata.decode_swa_lens is not None
-            and metadata.decode_swa_window_size == window_size
-            and metadata.decode_swa_block_size == block_size
-            and metadata.decode_swa_indices.shape[0] == positions.numel()
-        ):
-            return metadata.decode_swa_indices, metadata.decode_swa_lens
-        return self._update_decode_swa_metadata(
-            metadata,
-            window_size=window_size,
-            block_size=block_size,
-        )
 
     def _decode_compressed_attention_indices_and_lens(
         self,
@@ -692,34 +679,28 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         tile_metadata = self._decode_tile_metadata.get((phase, kind, bs))
         if tile_metadata is not None:
             return tile_metadata
-        try:
-            from flash_mla import get_mla_metadata
-        except Exception as exc:
-            raise DeepseekV4AttentionOpUnavailable(
+        if get_mla_metadata is error_fn:
+            raise RuntimeError(
                 "DeepSeek V4 decode requires FlashMLA latent attention. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            ) from exc
+            )
         tile_metadata = get_mla_metadata()[0]
         self._decode_tile_metadata[(phase, kind, bs)] = tile_metadata
         return tile_metadata
-
-    def _pad_query(self, q: torch.Tensor, padded_heads: int) -> torch.Tensor:
-        if q.shape[1] == padded_heads:
-            return q
-        q_padded = torch.zeros(
-            (q.shape[0], padded_heads, q.shape[2]),
-            dtype=q.dtype,
-            device=q.device,
-        )
-        q_padded[:, : q.shape[1]].copy_(q)
-        return q_padded
 
     def _fp8_ds_mla_cache_view(
         self,
         cache_2d: torch.Tensor,
         block_size: int,
     ) -> torch.Tensor:
-        row_bytes = DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM
+        row_bytes = self._fp8_ds_mla_row_bytes
+        if row_bytes is None:
+            if cache_2d.shape[1] % block_size != 0:
+                raise ValueError(
+                    "DeepSeek V4 fp8_ds_mla cache width must be divisible by "
+                    f"block_size={block_size}, got {cache_2d.shape[1]}"
+                )
+            row_bytes = cache_2d.shape[1] // block_size
         return torch.as_strided(
             cache_2d,
             (cache_2d.shape[0], block_size, 1, row_bytes),
@@ -755,21 +736,37 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError(
                 "forward_deepseek_v4_decode only supports ForwardMode.DECODE"
             )
-        try:
-            from flash_mla import flash_mla_with_kvcache
-        except Exception as exc:
-            raise DeepseekV4AttentionOpUnavailable(
+        if flash_mla_with_kvcache is error_fn:
+            raise RuntimeError(
                 "DeepSeek V4 decode requires FlashMLA latent attention. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            ) from exc
+            )
 
-        q_padded = self._pad_query(q, padded_heads).contiguous()
-        swa_indices, swa_lens = self._get_decode_swa_metadata(
-            metadata,
-            positions=positions,
-            window_size=window_size,
-            block_size=token_to_kv_pool.swa_block_size,
-        )
+        if q.shape[1] == padded_heads:
+            q_padded = q.contiguous()
+        else:
+            q_padded = torch.zeros(
+                (q.shape[0], padded_heads, q.shape[2]),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            q_padded[:, : q.shape[1]].copy_(q)
+        swa_block_size = token_to_kv_pool.swa_block_size
+        if (
+            metadata.decode_swa_indices is not None
+            and metadata.decode_swa_lens is not None
+            and metadata.decode_swa_window_size == window_size
+            and metadata.decode_swa_block_size == swa_block_size
+            and metadata.decode_swa_indices.shape[0] == positions.numel()
+        ):
+            swa_indices = metadata.decode_swa_indices
+            swa_lens = metadata.decode_swa_lens
+        else:
+            swa_indices, swa_lens = self._update_decode_swa_metadata(
+                metadata,
+                window_size=window_size,
+                block_size=swa_block_size,
+            )
         compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
         extra_indices, extra_lens = self._decode_compressed_attention_indices_and_lens(
             positions,
@@ -780,7 +777,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
         swa_cache = self._fp8_ds_mla_cache_view(
             token_to_kv_pool.get_swa_kv_buffer(layer_id),
-            token_to_kv_pool.swa_block_size,
+            swa_block_size,
         )
         compressed_cache = None
         if compress_ratio > 1:
@@ -872,7 +869,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         else None
                     ),
                 )
-                with deepseek_v4_profile_scope(f"attn_{kind}_mixed_prefill_copy"):
+                with nvtx_range(f"attn_{kind}_mixed_prefill_copy"):
                     out[:num_prefill_tokens].copy_(prefill_out)
             if num_decode_tokens > 0:
                 decode_end = num_prefill_tokens + num_decode_tokens
@@ -903,25 +900,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         else None
                     ),
                 )
-                with deepseek_v4_profile_scope(f"attn_{kind}_mixed_decode_copy"):
+                with nvtx_range(f"attn_{kind}_mixed_decode_copy"):
                     out[num_prefill_tokens:decode_end].copy_(decode_out)
         finally:
             self.forward_metadata = saved_metadata
         return out
-
-    def _prefill_gather_lens(
-        self,
-        *,
-        window_size: int,
-    ) -> torch.Tensor:
-        metadata = self.forward_metadata
-        if metadata is None:
-            raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        prefix_lens = metadata.seq_lens - metadata.query_lens
-        return metadata.query_lens + torch.minimum(
-            prefix_lens,
-            torch.full_like(prefix_lens, max(window_size - 1, 0)),
-        )
 
     def _prefill_workspace(
         self,
@@ -938,7 +921,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         num_reqs = metadata.seq_lens.numel()
-        gather_lens = self._prefill_gather_lens(window_size=window_size)
+        prefix_lens = metadata.seq_lens - metadata.query_lens
+        gather_lens = metadata.query_lens + torch.minimum(
+            prefix_lens,
+            torch.full_like(prefix_lens, max(window_size - 1, 0)),
+        )
+        swa_block_table = (
+            metadata.swa_block_table
+            if metadata.swa_block_table is not None
+            else metadata.block_table
+        )
         max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
             torch.div(metadata.seq_lens, compress_ratio, rounding_mode="floor")
@@ -977,7 +969,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 cache_2d=token_to_kv_pool.get_swa_kv_buffer(layer_id),
                 seq_lens=metadata.seq_lens,
                 gather_lens=gather_lens,
-                block_table=_swa_block_table(metadata),
+                block_table=swa_block_table,
                 block_table_base_offsets=metadata.swa_base_logical_page,
                 block_size=token_to_kv_pool.swa_block_size,
                 offset=compressed_base,
@@ -1025,7 +1017,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             cache_2d=swa_cache,
             seq_lens=metadata.seq_lens,
             gather_lens=gather_lens,
-            block_table=_swa_block_table(metadata),
+            block_table=swa_block_table,
             block_table_base_offsets=metadata.swa_base_logical_page,
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
@@ -1091,17 +1083,22 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             key: offsets[req_start:req_end]
             for key, offsets in metadata.compressor_state_base_logical_pages.items()
         }
+        query_lens = metadata.query_lens[req_start:req_end]
         req_count = max(0, req_end - req_start)
         token_count = max(0, token_end - token_start)
         num_prefill_reqs = req_count if forward_mode.is_extend_or_mixed() else 0
         num_prefill_tokens = token_count if forward_mode.is_extend_or_mixed() else 0
+        query_start_loc = torch.nn.functional.pad(
+            torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
+            (1, 0),
+        )
         return DeepseekV4ForwardMetadata(
             page_size=metadata.page_size,
             req_pool_indices=metadata.req_pool_indices[req_start:req_end],
             block_table=metadata.block_table[req_start:req_end],
             seq_lens=metadata.seq_lens[req_start:req_end],
-            query_lens=metadata.query_lens[req_start:req_end],
-            query_start_loc=_cu_seqlens(metadata.query_lens[req_start:req_end]),
+            query_lens=query_lens,
+            query_start_loc=query_start_loc,
             token_to_req_indices=token_to_req,
             is_valid_token=(
                 metadata.is_valid_token[token_start:token_end]
@@ -1174,17 +1171,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError(
                 "forward_deepseek_v4_prefill only supports extend/prefill modes"
             )
-        try:
-            from flash_mla import flash_mla_sparse_fwd
-        except Exception as exc:
-            raise DeepseekV4AttentionOpUnavailable(
+        if flash_mla_sparse_fwd is error_fn:
+            raise RuntimeError(
                 "DeepSeek V4 prefill requires FlashMLA sparse attention. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            ) from exc
+            )
 
-        with deepseek_v4_profile_scope(f"attn_{kind}_prefill_pad_q"):
-            q_padded = self._pad_query(q, padded_heads).contiguous()
-        with deepseek_v4_profile_scope(f"attn_{kind}_prefill_workspace"):
+        with nvtx_range(f"attn_{kind}_prefill_pad_q"):
+            if q.shape[1] == padded_heads:
+                q_padded = q.contiguous()
+            else:
+                q_padded = torch.zeros(
+                    (q.shape[0], padded_heads, q.shape[2]),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                q_padded[:, : q.shape[1]].copy_(q)
+        with nvtx_range(f"attn_{kind}_prefill_workspace"):
             kv_workspace, indices, lens = self._prefill_workspace(
                 positions=positions,
                 token_to_kv_pool=token_to_kv_pool,
@@ -1194,7 +1197,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 head_dim=head_dim,
                 topk_indices=topk_indices,
             )
-        with deepseek_v4_profile_scope(f"attn_{kind}_prefill_flashmla"):
+        with nvtx_range(f"attn_{kind}_prefill_flashmla"):
             out, _, _ = flash_mla_sparse_fwd(
                 q=q_padded,
                 kv=kv_workspace.view(-1, 1, head_dim),
@@ -1204,16 +1207,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_length=lens,
             )
         return out[:, :num_local_heads]
-
-    def _prefill_chunk_token_offsets(
-        self,
-        metadata: DeepseekV4ForwardMetadata,
-        num_reqs: int,
-    ) -> list[int]:
-        return [
-            int(x)
-            for x in metadata.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
-        ]
 
     def forward_deepseek_v4_prefill(
         self,
@@ -1261,7 +1254,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_indices=topk_indices,
             )
 
-        token_offsets = self._prefill_chunk_token_offsets(metadata, num_reqs)
+        token_offsets = [
+            int(x)
+            for x in metadata.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
+        ]
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
         saved_metadata = self.forward_metadata
         try:
@@ -1385,7 +1381,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_tables: dict[str, torch.Tensor],
         *,
         pad_value: int,
-        paged_cache_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         out: dict[str, torch.Tensor] = {}
         if not self._cuda_graph_paged_cache_block_tables:
@@ -1419,8 +1414,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> dict[str, torch.Tensor]:
         """Refresh persistent base-offset buffers from per-step input.
 
-        Sliding groups whose key is missing fall back to 0 (legacy
-        absolute scheduler binding). Returns the [:bs] views keyed by gid.
+        Sliding groups whose key is missing fall back to 0. Returns the [:bs]
+        views keyed by gid.
         """
         out: dict[str, torch.Tensor] = {}
         for gid, buf in self._cuda_graph_paged_cache_base_offsets.items():
@@ -1475,7 +1470,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 for group_id, table in paged_cache_block_tables.items()
             },
             pad_value=0,
-            paged_cache_block_table_base_offsets=offsets_on_device,
         )
         metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
             bs,
@@ -1564,7 +1558,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 for group_id, table in paged_cache_block_tables.items()
             },
             pad_value=-1,
-            paged_cache_block_table_base_offsets=offsets_on_device,
         )
         metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
             bs,

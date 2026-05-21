@@ -136,8 +136,8 @@ Input/output dtype behavior:
 
 Backend selection:
 
-- Default: binary AOT (`TOKENSPEED_MLA_PREFILL_BACKEND=binary`)
-- Optional: CuTe DSL JIT (`TOKENSPEED_MLA_PREFILL_BACKEND=cutedsl`)
+- Default: CuTe DSL JIT (`TOKENSPEED_MLA_PREFILL_BACKEND=cutedsl`)
+- Optional: binary AOT (`TOKENSPEED_MLA_PREFILL_BACKEND=binary`)
 - Binary `.so` path override: `TOKENSPEED_MLA_FMHA_BINARY_SO`
 - Availability probe API: `has_binary_prefill()`
 

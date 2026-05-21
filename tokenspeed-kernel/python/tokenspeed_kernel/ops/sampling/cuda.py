@@ -21,6 +21,13 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
 chain_speculative_sampling_target_only = error_fn
+# Prepare is a side-stream registration helper. On non-NVIDIA the fused
+# kernel doesn't exist, so callers should never reach the renorm path —
+# but prepare gets called unconditionally from FlashInfer backends'
+# __init__, so we keep it as a silent no-op rather than error_fn.
+fused_topk_topp_prepare = lambda *_args, **_kwargs: None  # noqa: E731
+fused_topk_topp_renorm = error_fn
+fused_topk_topp_workspace_size = error_fn
 verify_chain_greedy = error_fn
 
 if current_platform().is_nvidia:
@@ -32,4 +39,21 @@ if current_platform().is_nvidia:
     except ImportError:
         pass
 
-__all__ = ["chain_speculative_sampling_target_only", "verify_chain_greedy"]
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
+            fused_topk_topp_renorm,
+            fused_topk_topp_workspace_size,
+        )
+        from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
+            prepare_for_device as fused_topk_topp_prepare,
+        )
+    except ImportError:
+        pass
+
+__all__ = [
+    "chain_speculative_sampling_target_only",
+    "fused_topk_topp_prepare",
+    "fused_topk_topp_renorm",
+    "fused_topk_topp_workspace_size",
+    "verify_chain_greedy",
+]

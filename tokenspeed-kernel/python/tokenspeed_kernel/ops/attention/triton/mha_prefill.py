@@ -34,6 +34,7 @@ def _fwd_kernel(
     K_Extend,
     V_Extend,
     O_Extend,
+    LSE_Extend,
     K_Buffer,
     V_Buffer,
     cu_seqlens_q,
@@ -51,6 +52,8 @@ def _fwd_kernel(
     stride_vh,
     stride_obs,
     stride_oh,
+    stride_lse_bs,
+    stride_lse_h,
     stride_buf_kbs,
     stride_buf_kh,
     stride_buf_vbs,
@@ -69,10 +72,10 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
-    EXTEND_FROM_CACHE: tl.constexpr,
     HAS_KV_CACHE: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    HAS_LSE: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -82,12 +85,10 @@ def _fwd_kernel(
     cur_seq_extend_start_idx = tl.load(cu_seqlens_q + cur_seq)
     cur_seq_len_extend = tl.load(cu_seqlens_q + cur_seq + 1) - cur_seq_extend_start_idx
     if HAS_KV_CACHE:
-        cur_seq_len_prefix = tl.maximum(
-            tl.load(cache_seqlens + cur_seq) - cur_seq_len_extend, 0
-        )
+        cur_seq_len = tl.load(cache_seqlens + cur_seq)
     else:
-        cur_seq_len_prefix = 0
-    cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+        cur_seq_len = cur_seq_len_extend
+    cur_q_start = tl.maximum(cur_seq_len - cur_seq_len_extend, 0)
 
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(cu_seqlens_q + cur_seq)
@@ -120,117 +121,17 @@ def _fwd_kernel(
         )
         qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
-    # stage 1: compute scores with prefix
+    # Compute attention over the full visible KV range. For causal cached
+    # prefill, query tokens are treated as the suffix of the KV sequence.
     offs_n = tl.arange(0, BLOCK_N)
 
     acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    for start_n in range(0, cur_seq_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_seq_len_prefix
-
-        final_mask = mask_m[:, None] & mask_n[None, :]
-        if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
-            custom_mask = tl.load(
-                mask_ptr
-                + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
-                + start_n
-                + offs_n[None, :],
-                mask=(mask_m[:, None] & mask_n[None, :]),
-                other=0,
-            )
-            final_mask &= custom_mask
-        if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            # q_id = prefix_len + cur_m, kv_id = cur_n
-            window_mask = (
-                cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
-            ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
-            final_mask &= window_mask
-
-        SKIP_TILE = False
-        if (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK) or SLIDING_WINDOW_SIZE > 0:
-            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
-
-        if not SKIP_TILE:
-            cache_token_indices = start_n + offs_n
-            page_indices = cache_token_indices // PAGE_SIZE
-            page_offsets = cache_token_indices - page_indices * PAGE_SIZE
-            physical_pages = tl.load(
-                page_table + cur_seq * page_table_stride_b + page_indices,
-                mask=mask_n,
-                other=0,
-            )
-            offs_kv_loc = physical_pages * PAGE_SIZE + page_offsets
-
-            # load k in transposed way
-            offs_buf_k = (
-                offs_kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(mask_n[None, :]) & (mask_d[:, None]),
-                other=0.0,
-            )
-
-            qk = tl.dot(q.to(k.dtype), k)
-            if BLOCK_DPE > 0:
-                offs_kpe = (
-                    offs_kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + offs_dpe[:, None]
-                )
-                kpe = tl.load(
-                    K_Buffer + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
-            qk *= sm_scale
-
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
-
-            qk = tl.where(final_mask, qk, float("-inf"))
-
-            row_max = tl.max(qk, 1)
-            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
-            n_e_max = tl.maximum(row_max_fixed, e_max)
-
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            deno = deno * re_scale + tl.sum(p, 1)
-
-            offs_buf_v = (
-                offs_kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
-
-            e_max = n_e_max
-
-    # stage 2: compute the triangle part
-
-    cur_block_m_end = (
-        cur_seq_len_extend
-        if not IS_CAUSAL
-        else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
-    )
-    for start_n in range(0, cur_block_m_end, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_block_m_end
+        mask_n = (start_n + offs_n) < cur_seq_len
 
         final_mask = mask_m[:, None] & mask_n[None, :]
         if USE_CUSTOM_MASK:
@@ -238,29 +139,21 @@ def _fwd_kernel(
                 mask_ptr
                 + cur_seq_mask_start_idx
                 + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
-                + cur_seq_len_prefix
                 + start_n
                 + offs_n[None, :],
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            custom_mask &= mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:
-            mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
-                start_n + offs_n[None, :]
-            )
-            mask_causual &= mask_m[:, None] & mask_n[None, :]
-            final_mask &= mask_causual
-        else:
-            mask_non_causal = mask_m[:, None] & mask_n[None, :]
-            final_mask &= mask_non_causal
-
+            query_positions = cur_q_start + cur_block_m * BLOCK_M + offs_m[:, None]
+            key_positions = start_n + offs_n[None, :]
+            final_mask &= query_positions >= key_positions
         if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
-            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
-                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
-            )
+            query_positions = cur_q_start + cur_block_m * BLOCK_M + offs_m[:, None]
+            key_positions = start_n + offs_n[None, :]
+            window_mask = query_positions <= key_positions + SLIDING_WINDOW_SIZE
             final_mask &= window_mask
 
         SKIP_TILE = False
@@ -268,9 +161,8 @@ def _fwd_kernel(
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
-            # load k in transposed way
-            if EXTEND_FROM_CACHE:
-                cache_token_indices = cur_seq_len_prefix + start_n + offs_n
+            if HAS_KV_CACHE:
+                cache_token_indices = start_n + offs_n
                 page_indices = cache_token_indices // PAGE_SIZE
                 page_offsets = cache_token_indices - page_indices * PAGE_SIZE
                 physical_pages = tl.load(
@@ -301,9 +193,9 @@ def _fwd_kernel(
                     other=0.0,
                 )
 
-            qk = tl.dot(q, k, out_dtype=tl.float32)
+            qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
-                if EXTEND_FROM_CACHE:
+                if HAS_KV_CACHE:
                     offs_kpe = (
                         offs_kv_loc[None, :] * stride_buf_kbs
                         + cur_kv_head * stride_buf_kh
@@ -326,8 +218,7 @@ def _fwd_kernel(
                         mask=mask_n[None, :],
                         other=0.0,
                     )
-                qk += tl.dot(qpe, kpe)
-
+                qk += tl.dot(qpe.to(kpe.dtype), kpe)
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -343,7 +234,7 @@ def _fwd_kernel(
             p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
-            if EXTEND_FROM_CACHE:
+            if HAS_KV_CACHE:
                 offs_v = (
                     offs_kv_loc[:, None] * stride_buf_vbs
                     + cur_kv_head * stride_buf_vh
@@ -374,6 +265,8 @@ def _fwd_kernel(
         cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
 
+    safe_deno = tl.where(deno > 0.0, deno, 1.0)
+
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_obs
@@ -383,15 +276,22 @@ def _fwd_kernel(
     if STORE_TRANSPOSE:
         tl.store(
             O_Extend + offs_o.T,
-            (acc / deno[:, None]).T,
+            (acc / safe_deno[:, None]).T,
             mask=(mask_m[:, None] & mask_dv[None, :]).T,
         )
     else:
         tl.store(
             O_Extend + offs_o,
-            acc / deno[:, None],
+            acc / safe_deno[:, None],
             mask=mask_m[:, None] & mask_dv[None, :],
         )
+
+    if HAS_LSE:
+        offs_lse = (
+            cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
+        ) * stride_lse_bs + cur_head * stride_lse_h
+        lse = tl.where(deno > 0.0, tl.log(deno) + e_max, float("-inf"))
+        tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
 
 def prefill_attention_fwd(
@@ -414,8 +314,8 @@ def prefill_attention_fwd(
     page_table=None,
     page_table_stride_b=0,
     page_size=1,
-    extend_from_cache=False,
     has_kv_cache=False,
+    lse_extend=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -484,6 +384,8 @@ def prefill_attention_fwd(
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     HAS_SINK = sinks is not None
+    HAS_LSE = lse_extend is not None
+    lse_arg = lse_extend if lse_extend is not None else o_extend
     page_table_arg = page_table if page_table is not None else cache_seqlens
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
@@ -498,6 +400,7 @@ def prefill_attention_fwd(
         k_extend,
         v_extend,
         o_extend,
+        lse_arg,
         k_buffer,
         v_buffer,
         cu_seqlens_q,
@@ -515,6 +418,8 @@ def prefill_attention_fwd(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
+        lse_arg.stride(0),
+        lse_arg.stride(1),
         k_buffer.stride(0),
         k_buffer.stride(1),
         v_buffer.stride(0),
@@ -533,9 +438,9 @@ def prefill_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        EXTEND_FROM_CACHE=extend_from_cache,
         HAS_KV_CACHE=has_kv_cache,
         HAS_SINK=HAS_SINK,
+        HAS_LSE=HAS_LSE,
         STORE_TRANSPOSE=platform.is_amd,
         num_warps=num_warps,
         num_stages=num_stages,

@@ -255,6 +255,10 @@ class ModelConfig:
             for arch in self.hf_config.architectures
         ):
             self.num_attention_layers = self.num_hidden_layers * 2
+        if is_draft_worker:
+            mtp_layers = getattr(self.hf_text_config, "mtp_num_hidden_layers", None)
+            if mtp_layers is not None:
+                self.num_attention_layers = mtp_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization

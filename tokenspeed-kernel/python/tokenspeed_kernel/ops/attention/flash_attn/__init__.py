@@ -85,7 +85,7 @@ if (
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
         tags={"throughput"},
@@ -98,15 +98,14 @@ if (
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        out, _ = flash_attn_varlen_func(
+        out, lse = flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -115,14 +114,17 @@ if (
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=True,
+            return_lse=return_lse,
         )
+        if return_lse:
+            return out, lse.transpose(0, 1).contiguous()
         return out
 
     @register_kernel(
         "attention",
-        "mha_prefill_with_kvcache",
-        name="fa4_mha_prefill_with_kvcache_cached",
+        "mha_extend_with_kvcache",
+        name="fa4_mha_extend_with_kvcache_cached",
         solution="fa4",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
@@ -132,18 +134,15 @@ if (
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "prewritten_kv": frozenset({True}),
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
         tags={"throughput"},
     )
-    def fa4_mha_prefill_with_kvcache(
+    def fa4_mha_extend_with_kvcache(
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -152,17 +151,14 @@ if (
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-    ) -> torch.Tensor:
-        if k is not None or v is not None:
-            raise ValueError("FA4 cached prefill requires prewritten KV cache")
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        out, _ = flash_attn_varlen_func(
+        out, lse = flash_attn_varlen_func(
             q=q,
             k=k_cache,
             v=v_cache,
@@ -172,8 +168,11 @@ if (
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
+            return_lse=return_lse,
         )
+        if return_lse:
+            return out, lse.transpose(0, 1).contiguous()
         return out
 
     @register_kernel(
@@ -189,7 +188,6 @@ if (
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "query_len": frozenset({1}),
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -205,7 +203,6 @@ if (
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -224,7 +221,7 @@ if (
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
         )
         return out.view_as(q)
 
@@ -266,7 +263,6 @@ elif platform.is_nvidia and platform.is_hopper:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -283,7 +279,7 @@ elif platform.is_nvidia and platform.is_hopper:
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=True,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
@@ -291,8 +287,8 @@ elif platform.is_nvidia and platform.is_hopper:
 
     @register_kernel(
         "attention",
-        "mha_prefill_with_kvcache",
-        name="fa3_mha_prefill_with_kvcache_cached",
+        "mha_extend_with_kvcache",
+        name="fa3_mha_extend_with_kvcache_cached",
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -304,15 +300,12 @@ elif platform.is_nvidia and platform.is_hopper:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
-            "prewritten_kv": frozenset({True}),
             "return_lse": frozenset({False}),
         },
         tags={"throughput"},
     )
-    def fa3_mha_prefill_with_kvcache(
+    def fa3_mha_extend_with_kvcache(
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -321,14 +314,11 @@ elif platform.is_nvidia and platform.is_hopper:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        if k is not None or v is not None:
-            raise ValueError("FA3 cached prefill requires prewritten KV cache")
         cu_seqlens_k_new = torch.nn.functional.pad(
             torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
             (1, 0),
@@ -345,7 +335,7 @@ elif platform.is_nvidia and platform.is_hopper:
             cu_seqlens_k_new=cu_seqlens_k_new,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
@@ -366,7 +356,6 @@ elif platform.is_nvidia and platform.is_hopper:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
-            "query_len": frozenset({1}),
             "return_lse": frozenset({False}),
         },
         tags={"latency"},
@@ -379,7 +368,6 @@ elif platform.is_nvidia and platform.is_hopper:
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -395,7 +383,7 @@ elif platform.is_nvidia and platform.is_hopper:
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             softmax_scale=softmax_scale,
-            causal=is_causal,
+            causal=False,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,

@@ -58,6 +58,11 @@ public:
 
     TreeNode* PruneEmptyByNode(TreeNode* node);
 
+    // Find or create the node at depth_in_tokens on descendant's root path.
+    // depth_in_tokens must be page-aligned and within descendant's depth.
+    // Returns nullptr for root depth or invalid inputs.
+    TreeNode* SplitAt(TreeNode* descendant, std::int32_t depth_in_tokens);
+
 private:
     SplitResult splitChild(TreeNode* parent, const token_vec_t& child_key, std::size_t prefix_pages);
 

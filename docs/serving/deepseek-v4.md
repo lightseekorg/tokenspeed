@@ -33,6 +33,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
 | `--enable-mixed-batch` | Enables mixed prefill/decode scheduling for V4 sparse attention. It is off by default globally because other backend paths do not all support mixed batches yet. |
 | `--trust-remote-code` | The HF config uses model-class architectures registered via remote code. |
 
+## Parser defaults
+
+`tokenspeed serve deepseek-ai/DeepSeek-V4-Flash` automatically selects
+`--reasoning-parser deepseek_v31` and `--tool-call-parser deepseek_v4`.
+Pass explicit parser flags to override these defaults.
+
 ## Block size
 
 V4 uses `block_size=256` (`block_size / compress_ratio` cleanly divides the
@@ -44,9 +50,6 @@ also be bumped to 256.)
 
 ## Optional flags
 
-- `--disable-deepseek-v4-fast-mhc`: disables the tilelang+DeepGEMM fused mHC
-  path; falls back to the PyTorch reference. Use when tilelang or DeepGEMM JIT
-  is unavailable.
 - `--deepseek-v4-mega-moe-max-num-tokens N`: caps the DeepGEMM mega_moe
   workspace (`0` lets the kernel pick).
 - `--deepseek-v4-indexer-prefill-max-logits-mb N`: caps the FP4 indexer

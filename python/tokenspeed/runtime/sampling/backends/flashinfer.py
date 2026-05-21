@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
+    fused_topk_topp_prepare,
+    fused_topk_topp_renorm,
     verify_chain_greedy,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
@@ -34,7 +36,14 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
+
+# Resolved once at import: the fused top-k + top-p kernel is NVIDIA-only.
+# On non-NVIDIA platforms (e.g. ROCm) we fall back to the back-to-back
+# flashinfer renorm calls. Defining this at module scope keeps the hot path
+# branch-free in the captured graph.
+_FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
 
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -76,6 +85,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         super().__init__(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
+        # Pre-create the side stream used by fused_topk_topp_renorm. Must
+        # happen before any CUDA graph capture — cudaStreamCreate is illegal
+        # inside capture, and verify() runs from the captured graph.
+        fused_topk_topp_prepare(config.device)
 
     def _init_pool_scalars(self, config: SamplingBackendConfig) -> None:
         # Capture warm-up reads row 0 with req_pool_indices zeroed, so row 0
@@ -334,10 +347,17 @@ class FlashInferSamplingBackend(SamplingBackend):
                 temperature=temperatures,
                 enable_pdl=pdl_enabled(),
             )
-            target_probs = top_k_renorm_prob(target_probs, top_ks)
-            target_probs = top_p_renorm_prob(
-                target_probs, top_ps, is_deterministic=True
-            )
+            if _FUSED_TOPK_TOPP_AVAILABLE:
+                # Fused replacement for the back-to-back top_k_renorm_prob +
+                # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+                # K = 1<<30 in top_ks routes per-row through the radix top-p
+                # only path.
+                target_probs = fused_topk_topp_renorm(target_probs, top_ks, top_ps)
+            else:
+                target_probs = top_k_renorm_prob(target_probs, top_ks)
+                target_probs = top_p_renorm_prob(
+                    target_probs, top_ps, is_deterministic=True
+                )
             target_probs = target_probs.reshape(bs, n, -1)
 
             chain_speculative_sampling_target_only(

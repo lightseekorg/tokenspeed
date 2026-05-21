@@ -79,6 +79,11 @@ public:
     std::int32_t PageSize() const { return tree_.PageSize(); }
     DeviceManager& GetDeviceManager() { return device_; }
 
+    // Adjunct managers may need to materialize boundary nodes via SplitAt.
+    // The tree's lifetime remains owned by this KVPrefixCache.
+    RadixTree& GetRadixTree() { return tree_; }
+    const RadixTree& GetRadixTree() const { return tree_; }
+
 private:
     MatchResult RootMatch() const;
 

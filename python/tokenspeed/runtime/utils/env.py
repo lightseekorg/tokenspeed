@@ -28,9 +28,9 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
+    "mha_extend_mode": ServerArgs.mha_extend_mode,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
-    "disable_deepseek_v4_fast_mhc": ServerArgs.disable_deepseek_v4_fast_mhc,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
     "deepseek_v4_prefill_chunk_size": ServerArgs.deepseek_v4_prefill_chunk_size,
@@ -73,9 +73,9 @@ def global_server_args_dict_update(server_args: ServerArgs):
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
+            "mha_extend_mode": server_args.mha_extend_mode,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
-            "disable_deepseek_v4_fast_mhc": server_args.disable_deepseek_v4_fast_mhc,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
             "deepseek_v4_prefill_chunk_size": server_args.deepseek_v4_prefill_chunk_size,

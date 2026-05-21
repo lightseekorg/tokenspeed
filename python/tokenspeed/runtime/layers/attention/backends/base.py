@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    uses_paged_cache_groups: bool = False
+    uses_padded_decode_token_mask: bool = False
+
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device
         self.num_qo_heads = config.num_attention_heads // config.attn_tp_size

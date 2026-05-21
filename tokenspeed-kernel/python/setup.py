@@ -348,6 +348,18 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "fused_topk_topp",
+        [
+            CUDA_CSRC_DIR / "fused_topk_topp" / "fused_topk_topp.cu",
+            CUDA_CSRC_DIR / "fused_topk_topp" / "fused_topk_topp_binding.cu",
+        ],
+        [],
+        # Match the standalone build's flags. --use_fast_math + relaxed-constexpr
+        # are mostly redundant with the global -DFLASHINFER_ENABLE_* set, but
+        # --expt-extended-lambda is required by air_topk_stable.cuh's CUB usage.
+        ["-O3", "--use_fast_math", "--expt-extended-lambda"],
+    ),
+    (
         "rmsnorm_fused_parallel",
         [
             CUDA_CSRC_DIR / "rmsnorm_fused_parallel.cu",
