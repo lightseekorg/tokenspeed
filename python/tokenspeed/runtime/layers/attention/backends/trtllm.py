@@ -151,7 +151,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         #   - forward_mixed_metadata: sentinel + row partition counts
         #   - forward_prefill_metadata: row view of prefill rows
         #   - forward_decode_metadata: row view of decode rows
-        # forward_extend then dispatches to _forward_mixed_split_kernel which
+        # forward_extend then dispatches to _forward_mixed_kernel which
         # runs context kernel on prefill rows + decode kernel on decode rows.
         self.forward_prefill_metadata: TRTLLMMHAMetadata | None = None
         self.forward_decode_metadata: TRTLLMMHAMetadata | None = None
@@ -316,7 +316,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         # dedicated context kernel + decode kernel back to back (case1). The
         # forward_mixed_metadata sentinel is set by _init_mixed_metadata.
         if self.forward_mixed_metadata is not None:
-            return self._forward_mixed_split_kernel(
+            return self._forward_mixed_kernel(
                 q,
                 k,
                 v,
@@ -357,7 +357,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    def _forward_mixed_split_kernel(
+    def _forward_mixed_kernel(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -618,7 +618,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         The batch has prefill rows in [0, num_extends) and decode rows in
         [num_extends, bs). This populates:
           - forward_mixed_metadata: sentinel + row partition counts so
-            forward_extend can dispatch to _forward_mixed_split_kernel.
+            forward_extend can dispatch to _forward_mixed_kernel.
           - forward_prefill_metadata: row view (head) for the prefill subset,
             looks identical to what _init_extend_metadata would build.
           - forward_decode_metadata: row view (tail) for the decode subset,
@@ -657,7 +657,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         max_seq_len_q_prefill = max(max_extend, 1)
 
         # Pre-compute total prefill tokens (cumulative sum at the partition
-        # boundary) for slicing q in _forward_mixed_split_kernel without sync.
+        # boundary) for slicing q in _forward_mixed_kernel without sync.
         num_prefill_tokens = int(extend_seq_lens_cpu[:num_extends].sum().item())
 
         page_table = self._build_page_table(
