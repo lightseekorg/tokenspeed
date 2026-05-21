@@ -381,7 +381,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
         # knob and produces non-bit-identical results across ranks (sub-ulp
         # FP accumulation order).
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        # For fused top-k + top-p, the results are bit-identical across ranks.
+        # So we don't need to broadcast the results.
+        if not _FUSED_TOPK_TOPP_AVAILABLE:
+            self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:
 
