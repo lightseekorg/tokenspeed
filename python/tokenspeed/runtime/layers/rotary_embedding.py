@@ -166,11 +166,7 @@ class RotaryEmbedding(torch.nn.Module):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
-                **(
-                    dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
-                    if fused_set_kv_buffer_arg is not None
-                    else {}
-                ),
+                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
                 output_q_rope=output_q_rope,
                 output_k_rope=output_k_rope,
                 enable_pdl=enable_pdl,
