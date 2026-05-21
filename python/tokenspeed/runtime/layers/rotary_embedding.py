@@ -159,29 +159,23 @@ class RotaryEmbedding(torch.nn.Module):
                 output_k_rope if output_k_rope is not None else key
             )
         else:
-            if self.head_size in [64, 128, 256, 512]:
-                apply_rope_with_cos_sin_cache_inplace(
-                    positions=positions,
-                    query=query,
-                    key=key,
-                    head_size=self.head_size,
-                    cos_sin_cache=self.cos_sin_cache,
-                    is_neox=self.is_neox_style,
-                    **(
-                        dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
-                        if fused_set_kv_buffer_arg is not None
-                        else {}
-                    ),
-                    output_q_rope=output_q_rope,
-                    output_k_rope=output_k_rope,
-                    enable_pdl=enable_pdl,
-                )
-                return query, key
-            else:
-                raise NotImplementedError(
-                    "CUDA RoPE kernel only supports head sizes of 64, 128, 256 and 512. "
-                    f"Got head size {self.head_size}."
-                )
+            apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self.cos_sin_cache,
+                is_neox=self.is_neox_style,
+                **(
+                    dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
+                    if fused_set_kv_buffer_arg is not None
+                    else {}
+                ),
+                output_q_rope=output_q_rope,
+                output_k_rope=output_k_rope,
+                enable_pdl=enable_pdl,
+            )
+            return query, key
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
