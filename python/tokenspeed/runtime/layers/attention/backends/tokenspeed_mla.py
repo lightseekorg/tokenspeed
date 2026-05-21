@@ -490,6 +490,7 @@ class CuteDSLMLABackend(AttentionBackend):
         seq_lens,
         batch_size,
         causal,
+        out: torch.Tensor | None = None,
     ):
         if causal:
             step_counter = getattr(self, "step_counter", None)
@@ -525,6 +526,7 @@ class CuteDSLMLABackend(AttentionBackend):
             cum_seq_lens_q=cum_seq_lens_q,
             max_seq_len_q=max_q_len,
             enable_pdl=pdl_enabled(),
+            out=out,
         )
 
         if isinstance(result, tuple):

@@ -953,9 +953,11 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         # Causal self-attention over the new chunk tokens. q_lens == kv_lens ==
         # extend_seq_lens, so cum_seq_lens_q and cum_seq_lens_kv alias the same
-        # cum_extend_seq_lens.
+        # cum_extend_seq_lens. Causal pass writes directly into output; each
+        # chunk's merge accumulates in place via merge_state(inplace=True).
         num_extends = chunk_meta.extend_seq_lens.size(0)
-        accum_output, accum_lse = attn_backend.forward_extend_chunked(
+        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
+        _, accum_lse = attn_backend.forward_extend_chunked(
             q,
             k,
             v,
@@ -968,6 +970,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             seq_lens=chunk_meta.extend_seq_lens,
             batch_size=num_extends,
             causal=True,
+            out=output_view,
         )
 
         # Always read KV cache as BF16 for kv_b_proj (weight is BF16), even if Q is FP8.
@@ -1018,11 +1021,15 @@ class DeepseekV3AttentionMLA(nn.Module):
                 causal=False,
             )
 
-            accum_output, accum_lse = merge_state(
-                accum_output, accum_lse, chunk_output, lse, enable_pdl=pdl_enabled()
+            merge_state(
+                output_view,
+                accum_lse,
+                chunk_output,
+                lse,
+                inplace=True,
+                enable_pdl=pdl_enabled(),
             )
 
-        output.copy_(accum_output.view(output.shape))
         return output
 
 
