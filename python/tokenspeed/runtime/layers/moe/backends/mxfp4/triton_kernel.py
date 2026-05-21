@@ -37,7 +37,6 @@ from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 from tokenspeed.runtime.layers.quantization import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
-_is_nvidia = current_platform().is_nvidia
 _is_blackwell = current_platform().is_blackwell
 _is_hopper = current_platform().is_hopper
 _is_amd = current_platform().is_amd
