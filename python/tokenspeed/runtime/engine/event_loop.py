@@ -274,7 +274,9 @@ class EventLoop:
             )
 
         enable_mixed_prefill_decode = (
-            server_args.enable_mixed_batch and server_args.speculative_algorithm is None
+            server_args.enable_mixed_batch
+            and server_args.speculative_algorithm is None
+            and not mapping.has_attn_cp
         )
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)

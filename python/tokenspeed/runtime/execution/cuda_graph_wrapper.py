@@ -603,6 +603,7 @@ class CudaGraphWrapper:
     def _init_forward_metadata(
         self,
         padded_bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
@@ -611,10 +612,11 @@ class CudaGraphWrapper:
     ):
         """Eager path — allocate/refresh metadata for the upcoming forward."""
         self.attn_backend.init_forward_metadata(
-            padded_bs,
-            padded_bs * self.max_tokens_per_req,
-            req_pool_indices,
-            seq_lens,
+            bs=padded_bs,
+            num_extends=num_extends,
+            num_tokens=padded_bs * self.max_tokens_per_req,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
             req_to_page=req_to_page,
             forward_mode=forward_mode,
             **kwargs,
@@ -648,28 +650,31 @@ class CudaGraphWrapper:
                 # steps use one-token-per-request metadata. Populate each
                 # slot with its own init call.
                 self.draft_attn_backend.init_forward_metadata(
-                    padded_bs,
-                    padded_bs * self.max_tokens_per_req,
-                    req_pool_indices,
-                    seq_lens,
+                    bs=padded_bs,
+                    num_extends=num_extends,
+                    num_tokens=padded_bs * self.max_tokens_per_req,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=forward_mode,
                     **kwargs,
                 )
                 self.draft_attn_backend.init_forward_metadata(
-                    padded_bs,
-                    padded_bs,
-                    req_pool_indices,
-                    draft_seq_lens,
+                    bs=padded_bs,
+                    num_extends=num_extends,
+                    num_tokens=padded_bs,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=draft_seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=ForwardMode.DECODE,
                 )
             else:
                 self.draft_attn_backend.init_forward_metadata(
-                    padded_bs,
-                    padded_bs * self.max_tokens_per_req,
-                    req_pool_indices,
-                    draft_seq_lens,
+                    bs=padded_bs,
+                    num_extends=num_extends,
+                    num_tokens=padded_bs * self.max_tokens_per_req,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=draft_seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=ForwardMode.DECODE,
                 )
@@ -832,6 +837,7 @@ class CudaGraphWrapper:
         else:
             self._init_forward_metadata(
                 padded_bs,
+                ctx.num_extends,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=req_to_page,
@@ -841,7 +847,6 @@ class CudaGraphWrapper:
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
-                num_extends=ctx.num_extends,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
                 global_num_tokens=ctx.global_num_tokens,

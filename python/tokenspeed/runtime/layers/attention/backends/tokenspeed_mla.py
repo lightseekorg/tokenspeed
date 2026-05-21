@@ -100,6 +100,7 @@ class CuteDSLMLAPrefillMetadata:
 
 @dataclass
 class CuteDSLMLADecodeMetadata:
+    num_extends: int = 0
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
@@ -213,6 +214,7 @@ class CuteDSLMLABackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
+        num_extends: int,
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -224,41 +226,41 @@ class CuteDSLMLABackend(AttentionBackend):
     ):
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
-                seq_lens,
-                req_pool_indices=req_pool_indices,
+                seq_lens[:num_extends],
+                req_pool_indices=req_pool_indices[:num_extends],
                 req_to_page=req_to_page,
                 extend_prefix_lens=kwargs.pop("extend_prefix_lens"),
                 extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
             )
-        else:
+        if forward_mode.is_decode() or forward_mode.is_mixed():
             self._init_decode_metadata(
-                bs, req_pool_indices, seq_lens, forward_mode, req_to_page, spec_info
+                bs,
+                num_extends,
+                req_pool_indices,
+                seq_lens,
+                req_to_page,
             )
 
     def _init_decode_metadata(
         self,
         bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
-        spec_info=None,
     ):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
-
         block_kv_indices = self._create_block_kv_indices(
             bs, max_blocks, req_pool_indices, seq_lens, req_to_page
         )
 
-        assert (
-            seq_lens.dtype == torch.int32
-        ), f"seq_lens must be int32, got {seq_lens.dtype}"
         self.forward_decode_metadata = CuteDSLMLADecodeMetadata(
             block_kv_indices=block_kv_indices,
             max_seq_len_k=self.max_context_len,
             seq_lens_k=seq_lens,
+            num_extends=num_extends,
         )
 
     def _init_prefill_metadata(
@@ -354,15 +356,15 @@ class CuteDSLMLABackend(AttentionBackend):
                 f"tokenspeed_mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        metadata = CuteDSLMLADecodeMetadata()
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
 
-        metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
-        # seq_lens_k aliases seq_lens_buf (set in init_cuda_graph_state).
-        metadata.seq_lens_k = self.cuda_graph_seq_lens_buf[:bs]
-
+        metadata = CuteDSLMLADecodeMetadata(
+            block_kv_indices=block_kv_indices,
+            max_seq_len_k=self.max_context_len,
+            seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
+            num_extends=0,
+        )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -423,7 +425,9 @@ class CuteDSLMLABackend(AttentionBackend):
                 k[..., self.kv_lora_rank :],
             )
 
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        metadata = self.forward_decode_metadata
+        num_extends = metadata.num_extends
+        spec_num_tokens = q.shape[0] // bs
         query = q.view(bs, spec_num_tokens, layer.tp_q_head_num, layer.head_dim)
 
         softmax_scale = layer.scaling
@@ -441,8 +445,6 @@ class CuteDSLMLABackend(AttentionBackend):
         if self.data_type != k_cache.dtype:
             k_cache = k_cache.to(self.data_type)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-
-        metadata = self.forward_decode_metadata
 
         if not CuteDSLMLABackend._logged_decode:
             logger.info(
@@ -462,8 +464,8 @@ class CuteDSLMLABackend(AttentionBackend):
             workspace_buffer=self.cutedsl_workspace,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=metadata.block_kv_indices,
-            seq_lens=metadata.seq_lens_k,
+            block_tables=metadata.block_kv_indices[num_extends:],
+            seq_lens=metadata.seq_lens_k[num_extends:],
             max_seq_len=metadata.max_seq_len_k,
             softmax_scale=softmax_scale,
             enable_pdl=pdl_enabled(),
