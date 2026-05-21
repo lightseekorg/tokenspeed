@@ -134,7 +134,6 @@ jobs:
 
       - name: Install CI task
         run: |
-          rm -rf /home/runner/.cache/flashinfer || true
           cd "${{ env.WORK_DIR }}"
           mkdir -p .ci-artifacts
           python3 test/ci_system/pipeline.py execute \
