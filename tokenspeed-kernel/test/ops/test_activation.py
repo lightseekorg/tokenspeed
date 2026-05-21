@@ -84,9 +84,7 @@ def test_sigmoid_mul_strided_gate_from_qkv_split(
     num_tokens = 19
     q_size = num_heads * head_dim
     kv_size = num_kv_heads * head_dim
-    qkv = torch.randn(
-        num_tokens, 2 * q_size + 2 * kv_size, device=device, dtype=dtype
-    )
+    qkv = torch.randn(num_tokens, 2 * q_size + 2 * kv_size, device=device, dtype=dtype)
     q_gate, _k, _v = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
     q_gate = q_gate.view(num_tokens, num_heads, 2 * head_dim)
     _q, gate = torch.chunk(q_gate, 2, dim=-1)
