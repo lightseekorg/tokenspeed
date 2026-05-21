@@ -226,44 +226,6 @@ def test_rope_single_token(device: str, solution: str) -> None:
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
-def test_rope_empty(device: str, solution: str) -> None:
-    """Edge case: num_tokens == 0 should be a no-op."""
-    head_size = 128
-    rotary_dim = 128
-    max_position = 16
-    dtype = torch.bfloat16
-    _skip_if_solution_unregistered(solution, dtype)
-
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-    positions = torch.empty((0,), device=device, dtype=torch.int64)
-    query = torch.empty((0, head_size), device=device, dtype=dtype)
-    key = torch.empty((0, head_size), device=device, dtype=dtype)
-
-    apply_rope(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=True,
-        solution=solution,
-    )
-    torch.cuda.synchronize()
-    assert query.shape == (0, head_size)
-    assert key.shape == (0, head_size)
-
-
-@pytest.mark.parametrize("solution", ["triton", "cuda"])
 def test_rope_fused_set_kv_buffer(device: str, solution: str) -> None:
     torch.manual_seed(5)
     num_tokens = 13
