@@ -31,7 +31,10 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
+from tokenspeed_kernel.ops.layernorm.triton import (
+    fused_qk_rmsnorm_rope_gate,
+    qk_rmsnorm,
+)
 
 # Configs
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -43,7 +46,6 @@ from tokenspeed.runtime.configs.qwen3_5_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 
 # Layers - Attention
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
@@ -108,7 +110,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mapping: Mapping,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
-        alt_stream: torch.cuda.Stream | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -124,7 +125,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
-        self.stream_fork = StreamFork(alt_stream)
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
@@ -145,33 +145,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        self.in_proj_qkvz = MergedColumnParallelLinear(
+        self.in_proj_qkvzba = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_sizes=[self.key_dim, self.key_dim, self.value_dim, self.value_dim],
+            output_sizes=[
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+                self.value_dim,
+                self.num_v_heads,
+                self.num_v_heads,
+            ],
             bias=False,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             tp_group=self.attn_tp_group,
-            prefix=add_prefix("in_proj_qkvz", prefix),
+            prefix=add_prefix("in_proj_qkvzba", prefix),
         )
-
-        self.in_proj_ba = MergedColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_sizes=[self.num_v_heads, self.num_v_heads],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=self.attn_tp_group,
-            prefix=add_prefix("in_proj_ba", prefix),
-        )
+        self._qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) // self.attn_tp_size
+        self._ba_dim = (self.num_v_heads * 2) // self.attn_tp_size
 
         # Override weight loaders for packed checkpoint format.
         # Important: for FP8, this must cover not only `.weight` but also
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
-        self._bind_packed_weight_loaders(self.in_proj_qkvz)
-        self._bind_packed_weight_loaders(self.in_proj_ba)
+        self._bind_packed_weight_loaders(self.in_proj_qkvzba)
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -294,8 +291,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     @classmethod
     def _make_packed_weight_loader(cls, module, original_weight_loader):
         """Wrap the param's original loader so split checkpoints:
-          - in_proj_qkv + in_proj_z -> merged in_proj_qkvz
-          - in_proj_b + in_proj_a   -> merged in_proj_ba
+          - in_proj_qkv + in_proj_z + in_proj_b + in_proj_a -> merged in_proj_qkvzba
         can load correctly for both normal and FP8 params.
         """
 
@@ -355,15 +351,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
-
-        seq_len, _ = hidden_states.shape
-        with self.stream_fork.scope(
-            enable=get_is_capture_mode() and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
-        ) as fork:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            with fork.branch():
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        projected_all, _ = self.in_proj_qkvzba(hidden_states)
+        projected_states_qkvz, projected_states_ba = projected_all.split(
+            [self._qkvz_dim, self._ba_dim], dim=-1
+        )
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -459,7 +450,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             else quant_config
         )
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, linear_attn_quant_config, alt_stream, prefix
+            config, mapping, layer_id, linear_attn_quant_config, prefix=prefix
         )
 
         #  Determine the MLP type based on the model type
@@ -726,18 +717,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            # gate stays as the [..., num_heads, head_dim] strided view from
-            # chunk; sigmoid_mul reads it directly so the contiguous reshape
-            # is folded into the fused write.
+            q, k, gate = fused_qk_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                self.q_norm.gemma_weight,
+                self.k_norm.gemma_weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+            )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
 
         if self.attn_output_gate:
@@ -933,10 +930,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN (GatedDeltaNet) linear attention projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            # Split checkpoint format (separate qkv/z/b/a files)
+            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvzba.", "in_proj_z.", 3),
+            ("in_proj_qkvzba.", "in_proj_b.", 4),
+            ("in_proj_qkvzba.", "in_proj_a.", 5),
+            # Pre-packed checkpoint format (already merged qkvz and ba)
+            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
+            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
 
         loaded_params: set[str] = set()
@@ -1006,10 +1007,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN (GatedDeltaNet) linear attention projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            # Split checkpoint format (separate qkv/z/b/a files)
+            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvzba.", "in_proj_z.", 3),
+            ("in_proj_qkvzba.", "in_proj_b.", 4),
+            ("in_proj_qkvzba.", "in_proj_a.", 5),
+            # Pre-packed checkpoint format (already merged qkvz and ba)
+            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
+            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
 
         # Skip loading extra parameters for GPTQ/nvfp4 models.
@@ -1146,10 +1151,14 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN (GatedDeltaNet) linear attention projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            # Split checkpoint format (separate qkv/z/b/a files)
+            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvzba.", "in_proj_z.", 3),
+            ("in_proj_qkvzba.", "in_proj_b.", 4),
+            ("in_proj_qkvzba.", "in_proj_a.", 5),
+            # Pre-packed checkpoint format (already merged qkvz and ba)
+            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
+            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
 
         loaded_params: set[str] = set()
@@ -1223,10 +1232,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN (GatedDeltaNet) linear attention projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            # Split checkpoint format (separate qkv/z/b/a files)
+            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvzba.", "in_proj_z.", 3),
+            ("in_proj_qkvzba.", "in_proj_b.", 4),
+            ("in_proj_qkvzba.", "in_proj_a.", 5),
+            # Pre-packed checkpoint format (already merged qkvz and ba)
+            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
+            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
 
         ignore_suffixes = (
@@ -1335,6 +1348,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
+    stride_qkvz,
+    stride_ba,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
@@ -1344,23 +1359,21 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 
     V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
 
-    # ── Input dimensions (contiguous layout) ──
+    # ── Input dimensions ──
     TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-    TOTAL_QKVZ: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V + TOTAL_V
-    TOTAL_BA: tl.constexpr = NUM_HEADS_V * 2
 
     # ── Output dimensions ──
     QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
 
-    # ── Read from contiguous input ──
+    # ── Read from input (supports non-contiguous stride) ──
     # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * TOTAL_QKVZ + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    blk_q_ptr = mixed_qkvz + i_bs * stride_qkvz + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
     # k for head group i_qk: in the all_k region
     blk_k_ptr = (
         mixed_qkvz
-        + i_bs * TOTAL_QKVZ
+        + i_bs * stride_qkvz
         + TOTAL_Q
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
@@ -1368,7 +1381,7 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     # v for head group i_qk: in the all_v region
     blk_v_ptr = (
         mixed_qkvz
-        + i_bs * TOTAL_QKVZ
+        + i_bs * stride_qkvz
         + TOTAL_Q
         + TOTAL_K
         + i_qk * V_PER_GROUP * HEAD_V
@@ -1377,7 +1390,7 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     # z for head group i_qk: in the all_z region
     blk_z_ptr = (
         mixed_qkvz
-        + i_bs * TOTAL_QKVZ
+        + i_bs * stride_qkvz
         + TOTAL_Q
         + TOTAL_K
         + TOTAL_V
@@ -1413,14 +1426,14 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
     tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
 
-    # ── b and a from contiguous [all_b | all_a] ──
+    # ── b and a ──
     for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * TOTAL_BA + i_qk * V_PER_GROUP + i
+        blk_b_ptr = mixed_ba + i_bs * stride_ba + i_qk * V_PER_GROUP + i
         blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
 
     for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * TOTAL_BA + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        blk_a_ptr = mixed_ba + i_bs * stride_ba + NUM_HEADS_V + i_qk * V_PER_GROUP + i
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
@@ -1433,13 +1446,13 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     head_qk,
     head_v,
 ):
-    """Fused split/reshape/cat for CONTIGUOUS input format (Qwen3.5).
+    """Fused split/reshape/cat for Qwen3.5. Supports non-contiguous inputs.
 
-    Input layout:
+    Input layout (per row):
         mixed_qkvz: [all_q | all_k | all_v | all_z]
         mixed_ba:   [all_b | all_a]
 
-    Output layout (same as fused_qkvzba_split_reshape_cat):
+    Output layout:
         mixed_qkv: [all_q | all_k | all_v]  (z stripped)
         z: [num_v_heads, head_v]
         b: [num_v_heads]
@@ -1471,6 +1484,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         a,
         mixed_qkvz,
         mixed_ba,
+        mixed_qkvz.stride(0),
+        mixed_ba.stride(0),
         num_heads_qk,
         num_heads_v,
         head_qk,
