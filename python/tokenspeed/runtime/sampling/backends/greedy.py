@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
+from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -170,7 +171,7 @@ class GreedySamplingBackend(SamplingBackend):
             sampling_info.apply_vocab_mask(
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
-        tokens = torch.argmax(logits, -1).to(torch.int32)
+        tokens = cute_argmax(logits).to(torch.int32)
 
         if self.config.enable_output_logprobs:
 
@@ -207,7 +208,7 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits_output.next_token_logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).reshape(
+        target_predict = cute_argmax(logits_output.next_token_logits).reshape(
             bs, num_tokens_per_req
         )
 

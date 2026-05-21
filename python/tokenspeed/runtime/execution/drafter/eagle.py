@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -296,7 +297,7 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
+                draft_ids = cute_argmax(logits_output.next_token_logits)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
@@ -353,7 +354,7 @@ class Eagle(BaseDrafter):
         # arrive here already aligned to one row per request.
         logits_output = self._run_first_step(bs, draft_input)
 
-        draft_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
+        draft_ids = cute_argmax(logits_output.next_token_logits)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         # Draft step 2+ (multi-step decode).
