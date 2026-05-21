@@ -27,7 +27,7 @@ from typing import Optional
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-__all__ = ["apply_rope_triton", "apply_rope_with_cos_sin_cache_inplace_triton"]
+__all__ = ["apply_rope_triton"]
 
 
 def _next_power_of_2(n: int) -> int:
@@ -353,6 +353,3 @@ def apply_rope_triton(
         POSITION_INT64=positions.dtype == torch.int64,
         CACHE_LOC_INT64=cache_loc.dtype == torch.int64,
     )
-
-
-apply_rope_with_cos_sin_cache_inplace_triton = apply_rope_triton
