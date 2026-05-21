@@ -1,0 +1,137 @@
+name: Update tokenspeed-smg versions
+
+on:
+  workflow_dispatch:
+    inputs:
+      smg_version:
+        description: "tokenspeed-smg version pin, for example 1.4.1.post20260519."
+        required: true
+        type: string
+      smg_grpc_proto_version:
+        description: "tokenspeed-smg-grpc-proto version pin, for example 0.4.7.post20260519."
+        required: true
+        type: string
+      smg_grpc_servicer_version:
+        description: "tokenspeed-smg-grpc-servicer version pin, for example 0.5.3.post20260519."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.smg_version }}-${{ inputs.smg_grpc_proto_version }}-${{ inputs.smg_grpc_servicer_version }}
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure git author
+        run: |
+          git config user.name "lightseek-bot"
+          git config user.email "243258330+lightseek-bot@users.noreply.github.com"
+
+      - name: Update tokenspeed-smg* pins
+        id: update
+        env:
+          SMG_VERSION: ${{ inputs.smg_version }}
+          SMG_GRPC_PROTO_VERSION: ${{ inputs.smg_grpc_proto_version }}
+          SMG_GRPC_SERVICER_VERSION: ${{ inputs.smg_grpc_servicer_version }}
+        run: |
+          set -euo pipefail
+
+          pep440='^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?(\+[A-Za-z0-9.]+)?$'
+          for name_var in \
+              "tokenspeed-smg:SMG_VERSION" \
+              "tokenspeed-smg-grpc-proto:SMG_GRPC_PROTO_VERSION" \
+              "tokenspeed-smg-grpc-servicer:SMG_GRPC_SERVICER_VERSION"; do
+            name="${name_var%:*}"
+            var="${name_var##*:}"
+            value="${!var}"
+            if ! [[ "$value" =~ $pep440 ]]; then
+              echo "Invalid $name version: $value" >&2
+              exit 1
+            fi
+          done
+
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          targets = {
+              "tokenspeed-smg": os.environ["SMG_VERSION"],
+              "tokenspeed-smg-grpc-proto": os.environ["SMG_GRPC_PROTO_VERSION"],
+              "tokenspeed-smg-grpc-servicer": os.environ["SMG_GRPC_SERVICER_VERSION"],
+          }
+          path = Path("python/pyproject.toml")
+          text = path.read_text()
+          # Update the longer names first so the prefix match doesn't trip
+          # on tokenspeed-smg matching tokenspeed-smg-grpc-* lines.
+          for name in sorted(targets, key=len, reverse=True):
+              version = targets[name]
+              pattern = rf'(?m)^(?P<lead>\s*")(?P<name>{re.escape(name)})==[^"]+(?P<tail>",?)\s*$'
+              text, count = re.subn(pattern, lambda m: f'{m["lead"]}{m["name"]}=={version}{m["tail"]}', text, count=1)
+              if count != 1:
+                  raise SystemExit(f"pin for {name} not found in python/pyproject.toml")
+          path.write_text(text)
+          PY
+
+          echo "smg_version=${SMG_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "smg_grpc_proto_version=${SMG_GRPC_PROTO_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "smg_grpc_servicer_version=${SMG_GRPC_SERVICER_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          SMG_VERSION: ${{ steps.update.outputs.smg_version }}
+          SMG_GRPC_PROTO_VERSION: ${{ steps.update.outputs.smg_grpc_proto_version }}
+          SMG_GRPC_SERVICER_VERSION: ${{ steps.update.outputs.smg_grpc_servicer_version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required because this repository does not allow GITHUB_TOKEN to create pull requests." >&2
+            exit 1
+          fi
+
+          if git diff --quiet; then
+            echo "tokenspeed-smg* pins already match the requested versions."
+            exit 0
+          fi
+
+          branch="bot/update-tokenspeed-smg-${SMG_VERSION//+/-}"
+          git checkout -b "$branch"
+          git add python/pyproject.toml
+          git commit -s -m "Update tokenspeed-smg* pins to ${SMG_VERSION} / ${SMG_GRPC_PROTO_VERSION} / ${SMG_GRPC_SERVICER_VERSION}"
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          cat > pr-body.md <<EOF
+          ## Summary
+          - update \`tokenspeed-smg\` to ${SMG_VERSION}
+          - update \`tokenspeed-smg-grpc-proto\` to ${SMG_GRPC_PROTO_VERSION}
+          - update \`tokenspeed-smg-grpc-servicer\` to ${SMG_GRPC_SERVICER_VERSION}
+
+          ## Tests
+          - Not run (version-only workflow update)
+          EOF
+
+          title="Update tokenspeed-smg* pins to ${SMG_VERSION} / ${SMG_GRPC_PROTO_VERSION} / ${SMG_GRPC_SERVICER_VERSION}"
+          if gh pr view "$branch" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit "$branch" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body-file pr-body.md
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "$title" \
+              --body-file pr-body.md
+          fi

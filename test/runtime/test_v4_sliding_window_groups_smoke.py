@@ -114,6 +114,75 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             pool.paged_cache_group_page_counts["v4.c4a.compressed_kv"], 1
         )
 
+    def test_deepseek_v4_capacity_profile_matches_pool_buffers(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+            DeepseekV4TokenToKVPool,
+            deepseek_v4_cache_layout_from_config,
+            profile_deepseek_v4_max_num_pages,
+        )
+
+        hf_config = SimpleNamespace(
+            compress_ratios=(1, 4, 128),
+            head_dim=512,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            hf_config,
+            page_size=64,
+            use_fp4_indexer_cache=True,
+        )
+
+        def make_pool(num_pages: int) -> DeepseekV4TokenToKVPool:
+            return DeepseekV4TokenToKVPool(
+                size=num_pages * layout.page_size,
+                model_dtype=torch.bfloat16,
+                layout=layout,
+                layer_num=3,
+                device="cpu",
+                enable_memory_saver=False,
+                max_batch_size=2,
+                max_context_len=1024,
+                page_size=layout.page_size,
+                rank=0,
+                hf_config=hf_config,
+                max_scheduled_tokens=1,
+            )
+
+        def buffer_bytes(pool: DeepseekV4TokenToKVPool) -> int:
+            tensors = []
+            tensors.extend(pool.swa_kv_buffer)
+            tensors.extend(pool.compressed_kv_buffer)
+            tensors.extend(pool.compressor_state_buffer)
+            tensors.extend(pool.indexer_kv_buffer)
+            tensors.extend(pool.indexer_state_buffer)
+            return sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in tensors
+                if tensor is not None
+            )
+
+        target_pages = 8
+        current_bytes = buffer_bytes(make_pool(target_pages))
+        next_bytes = buffer_bytes(make_pool(target_pages + 1))
+
+        self.assertGreater(next_bytes, current_bytes)
+        self.assertEqual(
+            profile_deepseek_v4_max_num_pages(
+                layout=layout,
+                hf_config=hf_config,
+                layer_num=3,
+                max_live_requests=2,
+                max_scheduled_tokens=1,
+                max_context_len=1024,
+                available_cache_memory_bytes=current_bytes,
+            ),
+            target_pages,
+        )
+
+        legacy_pages = current_bytes // (layout.cache_cell_size(3) * layout.page_size)
+        self.assertLess(legacy_pages, target_pages)
+
 
 if __name__ == "__main__":
     unittest.main()

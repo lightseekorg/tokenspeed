@@ -33,6 +33,24 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
 For K2.6, keep the same parameter shape and change the checkpoint and parser
 only if the model card requires a different value.
 
+## Qwen3 Dense / Qwen3 30B-A3B
+
+Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
+For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
+`Qwen3MoeForCausalLM`, so launch it as a MoE model.
+
+```bash
+tokenspeed serve Qwen/Qwen3-30B-A3B \
+  --served-model-name qwen3-30b-a3b \
+  --tensor-parallel-size 2 \
+  --enable-expert-parallel \
+  --moe-backend flashinfer_cutlass \
+  --max-model-len 40960 \
+  --reasoning-parser qwen3 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

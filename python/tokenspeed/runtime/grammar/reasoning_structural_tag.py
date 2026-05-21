@@ -55,6 +55,7 @@ from typing import Any
 # json_schema for that family.
 _REASONING_PARSER_TO_XGRAMMAR_MODEL: dict[str, str] = {
     "deepseek_r1": "deepseek_r1",
+    "deepseek_v31": "deepseek_v3_2",
     "kimi": "kimi",
     "kimi_k25": "kimi",
     "minimax": "minimax",

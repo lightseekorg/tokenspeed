@@ -28,6 +28,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
+    "mha_extend_mode": ServerArgs.mha_extend_mode,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
     "disable_deepseek_v4_fast_mhc": ServerArgs.disable_deepseek_v4_fast_mhc,
@@ -73,6 +74,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
+            "mha_extend_mode": server_args.mha_extend_mode,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
             "disable_deepseek_v4_fast_mhc": server_args.disable_deepseek_v4_fast_mhc,

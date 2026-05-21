@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -51,15 +52,6 @@ if platform.is_nvidia:
     except ImportError:
         pass
 
-if platform.is_nvidia and platform.is_blackwell:
-    try:
-        from flashinfer.mla import (
-            BatchMLAPagedAttentionWrapper,
-            trtllm_batch_decode_with_kv_cache_mla,
-        )
-    except ImportError:
-        pass
-
     try:
         from flashinfer.prefill import (
             BatchPrefillWithPagedKVCacheWrapper,
@@ -70,15 +62,104 @@ if platform.is_nvidia and platform.is_blackwell:
     except ImportError:
         pass
 
+if platform.is_nvidia and platform.is_blackwell:
+    try:
+        from flashinfer.mla import (
+            BatchMLAPagedAttentionWrapper,
+            trtllm_batch_decode_with_kv_cache_mla,
+        )
+    except ImportError:
+        pass
+
 
 # ------------------------------------------------------------------------------
 # Kernel registration
 # ------------------------------------------------------------------------------
 
+_FLASHINFER_LOG2_E = math.log2(math.e)
 _workspace_buffer: torch.Tensor | None = None
+_ragged_prefill_workspaces: dict[torch.device, torch.Tensor] = {}
+_ragged_prefill_wrappers: dict[torch.device, BatchPrefillWithRaggedKVCacheWrapper] = {}
+_paged_prefill_workspaces: dict[torch.device, torch.Tensor] = {}
+_paged_prefill_wrappers: dict[torch.device, BatchPrefillWithPagedKVCacheWrapper] = {}
+_paged_prefill_metadata_buffers: dict[
+    tuple[torch.device, int, int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
 
 
-if platform.is_nvidia and platform.is_blackwell:
+@triton.jit
+def _build_paged_prefill_metadata_kernel(
+    page_table,
+    cache_seqlens,
+    paged_kv_indptr,
+    paged_kv_indices,
+    paged_kv_last_page_len,
+    page_table_stride_b: tl.constexpr,
+    page_size: tl.constexpr,
+    batch_size: tl.constexpr,
+    max_pages_per_seq: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    cache_seqlen = tl.load(cache_seqlens + batch_idx)
+    num_pages = tl.cdiv(cache_seqlen, page_size)
+    last_page_len = tl.where(cache_seqlen > 0, ((cache_seqlen - 1) % page_size) + 1, 0)
+
+    page_offset = 0
+    for prev_batch_idx in range(0, batch_size):
+        prev_seqlen = tl.load(cache_seqlens + prev_batch_idx)
+        prev_num_pages = tl.cdiv(prev_seqlen, page_size)
+        page_offset += tl.where(prev_batch_idx < batch_idx, prev_num_pages, 0)
+
+    tl.store(paged_kv_indptr, 0, mask=batch_idx == 0)
+    tl.store(paged_kv_indptr + batch_idx + 1, page_offset + num_pages)
+    tl.store(paged_kv_last_page_len + batch_idx, last_page_len)
+
+    for page_start in range(0, max_pages_per_seq, BLOCK_P):
+        page_offsets = page_start + tl.arange(0, BLOCK_P)
+        mask = page_offsets < num_pages
+        page_ids = tl.load(
+            page_table + batch_idx * page_table_stride_b + page_offsets,
+            mask=mask,
+            other=0,
+        )
+        tl.store(paged_kv_indices + page_offset + page_offsets, page_ids, mask=mask)
+
+
+def _get_ragged_prefill_wrapper(
+    device: torch.device,
+) -> BatchPrefillWithRaggedKVCacheWrapper:
+    wrapper = _ragged_prefill_wrappers.get(device)
+    if wrapper is None:
+        workspace = torch.empty(
+            256 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
+        _ragged_prefill_workspaces[device] = workspace
+        _ragged_prefill_wrappers[device] = wrapper
+    return wrapper
+
+
+def _get_paged_prefill_wrapper(
+    device: torch.device,
+) -> BatchPrefillWithPagedKVCacheWrapper:
+    wrapper = _paged_prefill_wrappers.get(device)
+    if wrapper is None:
+        workspace = torch.empty(
+            256 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+        _paged_prefill_workspaces[device] = workspace
+        _paged_prefill_wrappers[device] = wrapper
+    return wrapper
+
+
+if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
         "attention",
@@ -86,16 +167,17 @@ if platform.is_nvidia and platform.is_blackwell:
         name="flashinfer_mha_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={torch.float16, torch.bfloat16},
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.SPECIALIZED,
         traits={
+            "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({True, False}),
+            "support_sinks": frozenset({False}),
+            "support_logit_cap": frozenset({False, True}),
+            "return_lse": frozenset({False, True}),
         },
         tags={"throughput"},
     )
@@ -107,75 +189,63 @@ if platform.is_nvidia and platform.is_blackwell:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        global _workspace_buffer
-        if _workspace_buffer is None:
-            _workspace_buffer = torch.zeros(
-                150 * 1024 * 1024,
-                dtype=torch.uint8,
-                device=q.device,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if sinks is not None:
+            raise NotImplementedError(
+                "FlashInfer ragged prefill does not support sinks"
             )
-        seq_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        # TRTLLM kernels require fp32 sinks
-        if sinks is not None and sinks.dtype != torch.float32:
-            sinks = sinks.to(torch.float32)
-        result = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=_workspace_buffer,
-            seq_lens=seq_lens,
-            max_q_len=max_seqlen_q,
-            max_kv_len=max_seqlen_k,
-            bmm1_scale=(
+        wrapper = _get_ragged_prefill_wrapper(q.device)
+        wrapper.plan(
+            cu_seqlens_q,
+            cu_seqlens_q,
+            q.shape[1],
+            k.shape[1],
+            q.shape[-1],
+            head_dim_vo=v.shape[-1],
+            causal=True,
+            window_left=window_left,
+            logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
+            sm_scale=(
                 softmax_scale
                 if softmax_scale is not None
                 else 1.0 / math.sqrt(q.shape[-1])
             ),
-            bmm2_scale=1.0,
-            o_sf_scale=-1.0,
-            batch_size=seq_lens.shape[0],
-            window_left=window_left,
-            cum_seq_lens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cu_seqlens_q,
-            enable_pdl=False,
-            is_causal=is_causal,
-            return_lse=return_lse,
-            attention_sinks=sinks,
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+            o_data_type=q.dtype,
         )
+        result = wrapper.run(q, k, v, return_lse=return_lse)
         if return_lse:
-            return result
+            out, lse = result
+            return out, lse / _FLASHINFER_LOG2_E
         return result
 
     @register_kernel(
         "attention",
-        "mha_prefill_with_kvcache",
-        name="flashinfer_mha_prefill_with_kvcache_cached",
+        "mha_extend_with_kvcache",
+        name="flashinfer_mha_extend_with_kvcache",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={torch.float16, torch.bfloat16},
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.SPECIALIZED,
         traits={
+            "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
-            "prewritten_kv": frozenset({True}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({True}),
         },
         tags={"throughput"},
     )
-    def flashinfer_mha_prefill_with_kvcache(
+    def flashinfer_mha_extend_with_kvcache(
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -184,14 +254,118 @@ if platform.is_nvidia and platform.is_blackwell:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = True,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        wrapper = _get_paged_prefill_wrapper(q.device)
+        page_size = k_cache.shape[1]
+        batch_size = cache_seqlens.shape[0]
+        max_pages_per_seq = page_table.shape[1]
+        buffers_key = (page_table.device, batch_size, max_pages_per_seq)
+        buffers = _paged_prefill_metadata_buffers.get(buffers_key)
+        if buffers is None:
+            buffers = (
+                torch.empty(
+                    batch_size + 1,
+                    dtype=torch.int32,
+                    device=page_table.device,
+                ),
+                torch.empty(
+                    max(1, batch_size * max_pages_per_seq),
+                    dtype=torch.int32,
+                    device=page_table.device,
+                ),
+                torch.empty(
+                    batch_size,
+                    dtype=torch.int32,
+                    device=page_table.device,
+                ),
+            )
+            _paged_prefill_metadata_buffers[buffers_key] = buffers
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = buffers
+        _build_paged_prefill_metadata_kernel[(batch_size,)](
+            page_table,
+            cache_seqlens,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            page_table.stride(0),
+            page_size,
+            batch_size,
+            max_pages_per_seq,
+            BLOCK_P=min(1024, 1 << (max_pages_per_seq - 1).bit_length()),
+        )
+        wrapper.plan(
+            cu_seqlens_q,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            q.shape[1],
+            k_cache.shape[2],
+            q.shape[-1],
+            page_size,
+            head_dim_vo=v_cache.shape[-1],
+            causal=False,
+            sm_scale=(
+                softmax_scale
+                if softmax_scale is not None
+                else 1.0 / math.sqrt(q.shape[-1])
+            ),
+            window_left=window_left,
+            q_data_type=q.dtype,
+            kv_data_type=k_cache.dtype,
+            o_data_type=q.dtype,
+            seq_lens=cache_seqlens,
+            max_token_per_sequence=max_seqlen_q,
+        )
+        result = wrapper.run(
+            q,
+            (k_cache, v_cache),
+            return_lse=return_lse,
+            window_left=window_left,
+            sinks=sinks,
+        )
+
+        out, lse = result
+        return out, lse / _FLASHINFER_LOG2_E
+
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="flashinfer_trtllm_mha_extend_with_kvcache",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        dtypes={torch.float16, torch.bfloat16},
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({64, 128, 256}),
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+        tags={"throughput"},
+    )
+    def flashinfer_trtllm_mha_extend_with_kvcache(
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: float | None = None,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        if k is not None or v is not None:
-            raise ValueError("FlashInfer cached prefill requires prewritten KV cache")
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(
@@ -203,7 +377,7 @@ if platform.is_nvidia and platform.is_blackwell:
             torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
             (1, 0),
         )
-        # TRTLLM kernels require fp32 sinks
+        # TRTLLM kernels require fp32 sinks.
         if sinks is not None and sinks.dtype != torch.float32:
             sinks = sinks.to(torch.float32)
         return trtllm_batch_context_with_kv_cache(
@@ -234,14 +408,14 @@ if platform.is_nvidia and platform.is_blackwell:
     @register_kernel(
         "attention",
         "mha_decode_with_kvcache",
-        name="flashinfer_mha_decode_with_kvcache_cached",
+        name="flashinfer_trtllm_mha_decode_with_kvcache",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={torch.float16, torch.bfloat16},
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.SPECIALIZED,
         traits={
             "query_len": frozenset({1}),
             "sliding_window": frozenset({False, True}),
@@ -251,7 +425,7 @@ if platform.is_nvidia and platform.is_blackwell:
         },
         tags={"latency"},
     )
-    def flashinfer_mha_decode_with_kvcache(
+    def flashinfer_trtllm_mha_decode_with_kvcache(
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -259,7 +433,6 @@ if platform.is_nvidia and platform.is_blackwell:
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
-        is_causal: bool = True,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,

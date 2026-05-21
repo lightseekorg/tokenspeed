@@ -65,6 +65,7 @@ _MODEL_CASES = [
     ),
     ModelCase(
         "Qwen/Qwen3.5-35B-A3B",
+        extra_kwargs={"attention_backend": "trtllm"},
         is_thinking_model=True,
     ),
 ]

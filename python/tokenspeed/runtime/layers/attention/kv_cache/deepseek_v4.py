@@ -128,6 +128,142 @@ class DeepseekV4CacheLayout:
         return cell_size
 
 
+def _estimate_deepseek_v4_cache_bytes(
+    *,
+    layout: DeepseekV4CacheLayout,
+    hf_config: Any,
+    layer_num: int,
+    max_total_tokens: int,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    max_context_len: int,
+) -> int:
+    """Estimate bytes allocated by DeepseekV4TokenToKVPool for a token budget."""
+    if layer_num > len(layout.layer_ratio):
+        raise ValueError(
+            "DeepSeek V4 cache layout has fewer layer ratios "
+            f"({len(layout.layer_ratio)}) than requested layers ({layer_num})"
+        )
+    if max_total_tokens < 0:
+        raise ValueError(f"max_total_tokens must be >= 0, got {max_total_tokens}")
+
+    specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
+    counts = compute_paged_cache_group_page_counts(
+        specs,
+        max_live_requests=max_live_requests,
+        max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
+        max_total_tokens=max_total_tokens,
+        max_context_len=max_context_len,
+    )
+    group_rows = {spec.group_id: int(spec.rows_per_page) for spec in specs}
+
+    fp32_size = torch._utils._element_size(torch.float32)
+    total = 0
+    swa_pages = int(counts[V4_SWA_KV_GROUP_ID])
+    swa_block_bytes = layout.swa_block_bytes(
+        group_rows.get(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
+    )
+
+    for layer_id, ratio in enumerate(layout.layer_ratio[:layer_num]):
+        total += swa_pages * swa_block_bytes
+        if ratio <= 1:
+            continue
+
+        compressed_pages = int(counts[v4_compressed_kv_group_id(ratio)])
+        compressed_block_size = layout.storage_block_size(ratio)
+        total += compressed_pages * layout.swa_block_bytes(compressed_block_size)
+
+        state_pages = int(counts[v4_compressor_state_group_id(ratio)])
+        state_block_size = group_rows.get(
+            v4_compressor_state_group_id(ratio), layout.page_size
+        )
+        total += (
+            state_pages
+            * state_block_size
+            * layout.state_width(layer_id)
+            * 2
+            * fp32_size
+        )
+
+        if ratio == 4:
+            indexer_block_size = max(V4_KERNEL_BLOCK_ROWS, compressed_block_size)
+            total += compressed_pages * indexer_block_size * layout.indexer_row_bytes
+
+            indexer_state_pages = int(counts[V4_INDEXER_COMPRESSOR_STATE_GROUP_ID])
+            indexer_state_block_size = group_rows.get(
+                V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+                layout.compressor_state_block_size(ratio),
+            )
+            total += (
+                indexer_state_pages
+                * indexer_state_block_size
+                * layout.state_width(layer_id, indexer=True)
+                * 2
+                * fp32_size
+            )
+
+    return int(total)
+
+
+def profile_deepseek_v4_max_num_pages(
+    *,
+    layout: DeepseekV4CacheLayout,
+    hf_config: Any,
+    layer_num: int,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    max_context_len: int,
+    available_cache_memory_bytes: int,
+    draft_cache_cell_size: int = 0,
+) -> int:
+    """Return the largest scheduler page budget that fits V4 grouped caches."""
+    page_size = int(layout.page_size)
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if available_cache_memory_bytes <= 0:
+        return 0
+    if draft_cache_cell_size < 0:
+        raise ValueError(
+            f"draft_cache_cell_size must be >= 0, got {draft_cache_cell_size}"
+        )
+
+    def _bytes_for_pages(num_pages: int) -> int:
+        num_tokens = int(num_pages) * page_size
+        return (
+            _estimate_deepseek_v4_cache_bytes(
+                layout=layout,
+                hf_config=hf_config,
+                layer_num=layer_num,
+                max_total_tokens=num_tokens,
+                max_live_requests=max_live_requests,
+                max_scheduled_tokens=max_scheduled_tokens,
+                max_context_len=max_context_len,
+            )
+            + num_tokens * draft_cache_cell_size
+        )
+
+    if _bytes_for_pages(1) > available_cache_memory_bytes:
+        return 0
+
+    if not any(int(ratio) > 1 for ratio in layout.layer_ratio[:layer_num]):
+        return max(
+            1,
+            (int(max_live_requests) * int(max_context_len) + page_size - 1)
+            // page_size,
+        )
+    high = 1
+    while _bytes_for_pages(high) <= available_cache_memory_bytes:
+        high *= 2
+    low = high // 2
+    while low + 1 < high:
+        mid = (low + high) // 2
+        if _bytes_for_pages(mid) <= available_cache_memory_bytes:
+            low = mid
+        else:
+            high = mid
+    return int(low)
+
+
 def _split_paged_cache_block_tables_into_v4_metadata(
     paged_cache_block_tables: dict[str, torch.Tensor],
     paged_cache_block_table_base_offsets: dict[str, torch.Tensor] | None = None,

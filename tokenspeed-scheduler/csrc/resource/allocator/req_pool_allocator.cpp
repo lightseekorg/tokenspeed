@@ -33,6 +33,9 @@ ReqPoolIndex::ReqPoolIndex(ReqPoolIndex&& other) noexcept : slot_(other.slot_), 
 
 ReqPoolIndex& ReqPoolIndex::operator=(ReqPoolIndex&& other) noexcept {
     if (this != &other) {
+        if (allocator_) {
+            allocator_->deAllocate(slot_);
+        }
         slot_ = other.slot_;
         allocator_ = other.allocator_;
         other.slot_ = -1;

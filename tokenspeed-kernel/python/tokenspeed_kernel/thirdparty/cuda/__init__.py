@@ -26,6 +26,13 @@ from tokenspeed_kernel.thirdparty.cuda.activation import (
 )
 from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
 from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import fp32_router_gemm
+from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
+    fused_topk_topp_renorm,
+    fused_topk_topp_workspace_size,
+)
+from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
+    prepare_for_device as fused_topk_topp_prepare,
+)
 from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
 from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.rmsnorm import rmsnorm_fused_parallel
@@ -45,6 +52,9 @@ __all__ = [
     "chain_speculative_sampling_target_only",
     "dsv3_router_gemm",
     "fp32_router_gemm",
+    "fused_topk_topp_prepare",
+    "fused_topk_topp_renorm",
+    "fused_topk_topp_workspace_size",
     "gptq_marlin_repack",
     "hash_softplus_sqrt_topk_flash",
     "moe_finalize_fuse_shared",

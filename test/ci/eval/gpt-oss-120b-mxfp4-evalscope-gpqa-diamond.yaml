@@ -14,8 +14,8 @@ runner:
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_mxfp4
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     linux-mi355-2gpu-lightseek:
-      # speed up host-side mem alloc in ci
-      GPT_OSS_EVAL_KVSTORE_RATIO: "0.25"
+      GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
+      GPT_OSS_EVAL_DISABLE_PREFIX_CACHING: "1"
       GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
@@ -32,7 +32,8 @@ server:
     --reasoning-parser base
     ${GPT_OSS_EVAL_ATTENTION_BACKEND:+--attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND}}
     ${GPT_OSS_EVAL_MOE_BACKEND:+--moe-backend ${GPT_OSS_EVAL_MOE_BACKEND}}
-    ${GPT_OSS_EVAL_KVSTORE_RATIO:+--kvstore-ratio ${GPT_OSS_EVAL_KVSTORE_RATIO}}
+    ${GPT_OSS_EVAL_DISABLE_KVSTORE:+--disable-kvstore}
+    ${GPT_OSS_EVAL_DISABLE_PREFIX_CACHING:+--no-enable-prefix-caching}
     --enable-cache-report
     --host 127.0.0.1
     --port 8000

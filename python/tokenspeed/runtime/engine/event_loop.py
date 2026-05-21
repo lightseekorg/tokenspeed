@@ -640,6 +640,16 @@ class EventLoop:
         if host_exec is not None:
             self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
 
+    def _flush_mamba_retract_states(self, forward_op) -> None:
+        """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
+        if forward_op is not None:
+            return
+        if self.model_executor.drafter is None:
+            return
+        if self.model_executor.runtime_states.mamba_pool is None:
+            return
+        self.model_executor.flush_mamba_draft_to_working_on_retract()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -792,7 +802,6 @@ class EventLoop:
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),
             len(forward_op.request_ids),
-            has_drafter=self.server_args.speculative_algorithm is not None,
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -869,7 +878,6 @@ class EventLoop:
             forward_mode = ForwardMode.from_num_extends(
                 forward_op.num_extends(),
                 batch_size,
-                has_drafter=self.server_args.speculative_algorithm is not None,
             )
 
         self._dp_local_info[0, 0] = num_tokens
@@ -886,13 +894,7 @@ class EventLoop:
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
-            mode
-            in (
-                int(ForwardMode.DECODE),
-                int(ForwardMode.IDLE),
-                int(ForwardMode.TARGET_VERIFY),
-            )
-            for mode in global_forward_mode
+            ForwardMode(mode).is_decode_or_idle() for mode in global_forward_mode
         )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
@@ -938,6 +940,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_mamba_retract_states(forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1052,6 +1055,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_mamba_retract_states(forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1120,12 +1124,6 @@ class EventLoop:
 
             curr_results = None
             if forward_op is not None:
-                if forward_op.num_extends() <= 0:
-                    # Overlap dispatch may schedule one extra decode before
-                    # the previous result is committed. Snapshot the completed
-                    # working state before this decode mutates the same slot;
-                    # the snapshot helper only copies block-aligned states.
-                    self.model_executor.snapshot_mamba_checkpoints_for_op(forward_op)
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
