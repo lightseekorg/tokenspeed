@@ -18,35 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CUDA routing kernels."""
+from __future__ import annotations
 
-from tokenspeed_kernel.registry import error_fn
+from tokenspeed_kernel._triton import gl, gluon, tl
 
-try:
-    from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
-except ImportError:
-    dsv3_router_gemm = error_fn
+_INV_LN2_VALUE = 1.4426950408889634
+_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 
-try:
-    from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import fp32_router_gemm
-except ImportError:
-    fp32_router_gemm = error_fn
 
-try:
-    from tokenspeed_kernel.thirdparty.cuda.routing import (
-        hash_softplus_sqrt_topk_flash,
-        routing_flash,
-        softplus_sqrt_topk_flash,
-    )
-except ImportError:
-    hash_softplus_sqrt_topk_flash = error_fn
-    routing_flash = error_fn
-    softplus_sqrt_topk_flash = error_fn
+@gluon.jit
+def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
+    return gl.maximum(a, b, propagate_nan=propagate_nan)
 
-__all__ = [
-    "dsv3_router_gemm",
-    "fp32_router_gemm",
-    "hash_softplus_sqrt_topk_flash",
-    "routing_flash",
-    "softplus_sqrt_topk_flash",
-]
+
+@gluon.jit
+def max(input, axis=None, keep_dims=False):
+    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
+
+
+@gluon.aggregate
+class InputStrides:
+    stride_t: gl.constexpr
+    stride_h: gl.constexpr
+    stride_d: gl.constexpr
+
+    @gluon.jit
+    def offsets(self, token, head, dim):
+        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
+            gl.int32
+        )

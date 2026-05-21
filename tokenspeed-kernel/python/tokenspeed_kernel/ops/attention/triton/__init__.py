@@ -219,7 +219,6 @@ def triton_mha_extend_with_kvcache(
     dtypes={torch.float16, torch.bfloat16},
     priority=Priority.PORTABLE,
     traits={
-        "query_len": frozenset({1}),
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False, True}),

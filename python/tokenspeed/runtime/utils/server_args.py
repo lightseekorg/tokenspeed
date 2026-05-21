@@ -188,7 +188,6 @@ class ServerArgs:
     mha_extend_mode: Literal["paged", "ragged"] = "paged"
 
     # DeepSeek V4
-    disable_deepseek_v4_fast_mhc: bool = False
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -1277,16 +1276,6 @@ class ServerArgs:
             const=True,
             default=ServerArgs.use_trtllm_ragged_deepseek_prefill,
             help="Use ragged prefill for DeepSeek MLA attention.",
-        )
-        parser.add_argument(
-            "--disable-deepseek-v4-fast-mhc",
-            action="store_true",
-            default=ServerArgs.disable_deepseek_v4_fast_mhc,
-            help=(
-                "Disable the DeepSeek V4 fast multi-head capture (mHC) layer. "
-                "Falls back to the PyTorch reference when set or when nvcc is "
-                "not available."
-            ),
         )
         parser.add_argument(
             "--deepseek-v4-mega-moe-max-num-tokens",

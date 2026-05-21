@@ -307,7 +307,6 @@ def mha_decode_with_kvcache(
         "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
-        "query_len": 1,
     }
     kernel = select_kernel(
         "attention",
