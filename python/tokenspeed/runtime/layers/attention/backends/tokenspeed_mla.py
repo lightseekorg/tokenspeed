@@ -234,7 +234,16 @@ class CuteDSLMLABackend(AttentionBackend):
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
             )
-        if forward_mode.is_decode() or forward_mode.is_mixed():
+        # Drafter steps 1..N are pure DECODE on full bs regardless of target
+        # mode, so under is_draft we also fill decode_metadata under EXTEND
+        # so the multi-step loop has metadata. The wrapper pre-writes
+        # draft_seq_lens before calling here so `seq_lens` aliases the
+        # drafter's live buffer.
+        if (
+            forward_mode.is_decode()
+            or forward_mode.is_mixed()
+            or (forward_mode.is_extend() and self.is_draft)
+        ):
             self._init_decode_metadata(
                 bs,
                 num_extends,
@@ -242,6 +251,12 @@ class CuteDSLMLABackend(AttentionBackend):
                 seq_lens,
                 req_to_page,
             )
+
+    def set_decode_num_extends(self, num_extends: int):
+        """Mutate the decode-metadata slice discriminator. Used between drafter
+        step 0 (slice = [num_extends:]) and step 1+ (slice = [0:])."""
+        assert self.forward_decode_metadata is not None
+        self.forward_decode_metadata.num_extends = num_extends
 
     def _init_decode_metadata(
         self,

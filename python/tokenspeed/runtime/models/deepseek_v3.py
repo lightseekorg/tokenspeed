@@ -633,7 +633,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             self.kv_a_layernorm(kv_a, inplace=True)
 
         num_decodes = ctx.bs - ctx.num_extends
-        num_decode_tokens = num_decodes
+        num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
         num_prefill_tokens = q.size(0) - num_decode_tokens
         attn_output = torch.empty(
             q.size(0),

@@ -53,6 +53,7 @@ if TYPE_CHECKING:
 @dataclass
 class EagleDraftInput:
     input_num_tokens: int
+    num_extends: int
     forward_mode: ForwardMode
     base_model_output: torch.Tensor  # [bs]
     accept_lengths: torch.Tensor  # [bs]
@@ -189,12 +190,12 @@ class Eagle(BaseDrafter):
             last_index_offsets = self.last_index_offsets_buf[:bs]
 
         # make a ctx every time model runner forward
-        first_step_ctx = ForwardContext(
+        ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_page=self.req_to_page,
             bs=bs,
-            num_extends=0,
+            num_extends=draft_input.num_extends,
             input_num_tokens=draft_input.input_num_tokens,
             forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -207,7 +208,7 @@ class Eagle(BaseDrafter):
         )
 
         return self.draft_model_runner.forward(
-            ctx=first_step_ctx,
+            ctx=ctx,
             input_ids=input_ids,
             positions=buffers.positions_buf[: draft_input.input_num_tokens],
             out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
@@ -224,6 +225,10 @@ class Eagle(BaseDrafter):
         logits_output: LogitsProcessorOutput,
         draft_input: EagleDraftInput,
     ) -> None:
+        # Multi-step decode operates on full bs; drop the [num_extends:] slice
+        # that step 0 may have set up for MIXED target.
+        if hasattr(self.attn_backend, "set_decode_num_extends"):
+            self.attn_backend.set_decode_num_extends(0)
 
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         # Step 1's write position uses vc+accept_length under DECODE so the
@@ -386,6 +391,7 @@ class Eagle(BaseDrafter):
 
         draft_input = EagleDraftInput(
             input_num_tokens=base_ctx.input_num_tokens,
+            num_extends=base_ctx.num_extends,
             forward_mode=base_ctx.forward_mode,
             base_model_output=output_tokens,
             accept_lengths=accept_lengths,

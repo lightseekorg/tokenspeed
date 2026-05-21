@@ -46,6 +46,7 @@ class AttentionBackend(ABC):
         self.dtype = config.dtype
         self.head_dim = config.head_dim
         self.is_draft = config.is_draft
+        self.spec_num_tokens = config.speculative_num_draft_tokens
 
     @property
     def support_kv_cache_prewrite(self) -> bool:

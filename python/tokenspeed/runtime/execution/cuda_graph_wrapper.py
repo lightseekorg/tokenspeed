@@ -635,9 +635,11 @@ class CudaGraphWrapper:
             #     ``seq_lens_k=seq_lens[:bs]``).
             # So the kernel sees the value the drafter just wrote, without
             # rebuilding metadata per step.
-            # The EXTEND-mode prefill init still uses the controller's
-            # ``seq_lens`` because that path computes ``cu_seqlens_k`` from it
-            # eagerly (cumsum at init time), not via aliasing.
+            # Pre-write the buffer with the controller's seq_lens so the
+            # prefill-side eager work (cumsum at init) and the live-aliased
+            # decode side both see correct values from step 0 onward. Each
+            # is_draft backend fills both prefill+decode metadata in this
+            # one call.
             #
             # TODO: relying on aliasing for correctness is fragile — a stray
             # copy or a misrouted buffer silently produces wrong outputs.
@@ -645,39 +647,17 @@ class CudaGraphWrapper:
             # so each kernel invocation carries its own value rather than
             # reading through a tensor registered at init.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
-            if forward_mode.is_extend_or_mixed():
-                # Step 0 uses the caller's prefix kwargs; subsequent decode
-                # steps use one-token-per-request metadata. Populate each
-                # slot with its own init call.
-                self.draft_attn_backend.init_forward_metadata(
-                    bs=padded_bs,
-                    num_extends=num_extends,
-                    num_tokens=padded_bs * self.max_tokens_per_req,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=forward_mode,
-                    **kwargs,
-                )
-                self.draft_attn_backend.init_forward_metadata(
-                    bs=padded_bs,
-                    num_extends=num_extends,
-                    num_tokens=padded_bs,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=draft_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=ForwardMode.DECODE,
-                )
-            else:
-                self.draft_attn_backend.init_forward_metadata(
-                    bs=padded_bs,
-                    num_extends=num_extends,
-                    num_tokens=padded_bs * self.max_tokens_per_req,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=draft_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=ForwardMode.DECODE,
-                )
+            draft_seq_lens.copy_(seq_lens)
+            self.draft_attn_backend.init_forward_metadata(
+                bs=padded_bs,
+                num_extends=num_extends,
+                num_tokens=padded_bs * self.max_tokens_per_req,
+                req_pool_indices=req_pool_indices,
+                seq_lens=draft_seq_lens,
+                req_to_page=self.drafter.req_to_page,
+                forward_mode=forward_mode,
+                **kwargs,
+            )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
