@@ -364,6 +364,7 @@ def apply_rope_triton(
     dtypes={torch.float16, torch.bfloat16},
     priority=Priority.PORTABLE,
     traits={
+        "partial_rotary": frozenset({True, False}),
         "is_neox": frozenset({True, False}),
         "has_fused_kv": frozenset({True, False}),
         "has_q_out": frozenset({True, False}),
@@ -379,6 +380,7 @@ def triton_embedding_rope(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
+    rotary_dim: int | None = None,
     fused_set_kv_buffer_arg: Any = None,
     output_q_rope: torch.Tensor | None = None,
     output_k_rope: torch.Tensor | None = None,
@@ -391,6 +393,7 @@ def triton_embedding_rope(
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
+        rotary_dim=rotary_dim,
         fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
         output_q_rope=output_q_rope,
         output_k_rope=output_k_rope,

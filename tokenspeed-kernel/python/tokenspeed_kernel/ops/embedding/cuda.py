@@ -40,6 +40,7 @@ if platform.is_nvidia:
         priority=Priority.PERFORMANT,
         traits={
             "head_size": frozenset({64, 128, 256, 512}),
+            "partial_rotary": frozenset({True, False}),
             "is_neox": frozenset({True, False}),
             "has_fused_kv": frozenset({True, False}),
             "has_q_out": frozenset({True, False}),
@@ -55,6 +56,7 @@ if platform.is_nvidia:
         head_size: int,
         cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
+        rotary_dim: int | None = None,
         fused_set_kv_buffer_arg: Any = None,
         output_q_rope: torch.Tensor | None = None,
         output_k_rope: torch.Tensor | None = None,

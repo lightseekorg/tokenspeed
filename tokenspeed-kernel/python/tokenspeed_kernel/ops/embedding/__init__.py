@@ -61,14 +61,14 @@ def apply_rope(
         query: Query tensor with shape [num_tokens, num_q_heads * head_size].
         key: Key tensor with shape [num_tokens, num_kv_heads * head_size].
         head_size: Per-head hidden dimension.
-        cos_sin_cache: Packed RoPE cache with shape [max_position, head_size]
+        cos_sin_cache: Packed RoPE cache with shape [max_position, rotary_dim]
             as concat(cos, sin) along the last dimension.
         is_neox: Whether to use Neox-style half-split rotation. False uses
             GPT-J interleaved-pair rotation.
         offsets: Optional per-token offsets added to positions. Not supported
             by embedding.rope yet.
-        rotary_dim: Number of rotated channels per head. Defaults to head_size.
-            Must equal head_size for embedding.rope.
+        rotary_dim: Number of rotated channels per head. Defaults to
+            cos_sin_cache.shape[-1]. Must be even and no larger than head_size.
         fused_set_kv_buffer_arg: Optional fused KV-cache write arguments. Both
             CUDA and Triton implementations currently require k_scale and
             v_scale to be None.
@@ -85,20 +85,27 @@ def apply_rope(
         when provided, otherwise the input query / key.
     """
     if rotary_dim is None:
-        rotary_dim = head_size
+        rotary_dim = cos_sin_cache.shape[-1]
     assert offsets is None, "embedding.rope does not support offsets"
-    assert rotary_dim == head_size, "embedding.rope does not support partial rotary_dim"
+    assert rotary_dim % 2 == 0, "embedding.rope requires even rotary_dim"
+    assert rotary_dim <= head_size, "embedding.rope requires rotary_dim <= head_size"
     assert (
-        cos_sin_cache.shape[-1] == head_size
-    ), "embedding.rope requires cos_sin_cache last dim to equal head_size"
+        cos_sin_cache.shape[-1] == rotary_dim
+    ), "embedding.rope requires cos_sin_cache last dim to equal rotary_dim"
 
     positions = positions.flatten()
     num_tokens = positions.shape[0]
+    if num_tokens == 0:
+        return (
+            output_q_rope if output_q_rope is not None else query,
+            output_k_rope if output_k_rope is not None else key,
+        )
     num_q_heads = query.shape[-1] // head_size
     num_kv_heads = key.shape[-1] // head_size
 
     traits = {
         "head_size": head_size,
+        "partial_rotary": rotary_dim != head_size,
         "is_neox": is_neox,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
         "has_q_out": output_q_rope is not None,
@@ -118,6 +125,7 @@ def apply_rope(
         "num_q_heads": num_q_heads,
         "num_kv_heads": num_kv_heads,
         "head_size": head_size,
+        "rotary_dim": rotary_dim,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
         "has_q_out": output_q_rope is not None,
         "has_k_out": output_k_rope is not None,
@@ -144,6 +152,7 @@ def apply_rope(
             head_size=head_size,
             cos_sin_cache=cos_sin_cache,
             is_neox=is_neox,
+            rotary_dim=rotary_dim,
             fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
             output_q_rope=output_q_rope,
             output_k_rope=output_k_rope,
