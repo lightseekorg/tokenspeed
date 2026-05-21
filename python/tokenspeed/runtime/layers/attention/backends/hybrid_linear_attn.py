@@ -443,10 +443,6 @@ class MambaAttnBackend(AttentionBackend):
                     & (branch_lens < extend_lens)
                 )
                 track_mask = branch_inside & ((branch_lens % FLA_CHUNK_SIZE) == 0)
-                if (branch_inside & ~track_mask).any():
-                    raise RuntimeError(
-                        "Mamba branching seqlen must be aligned to FLA chunk size"
-                    )
 
                 page_size = getattr(self.pool, "page_size", 1)
                 final_lens = prefix + extend_lens

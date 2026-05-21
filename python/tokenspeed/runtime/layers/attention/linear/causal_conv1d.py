@@ -465,7 +465,11 @@ def causal_conv1d_fn(
         batch_ptr = metadata.batch_ptr
         token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
     else:
-        seqlens = np.diff(query_start_loc.to("cpu"))
+        seq_lens_cpu = kwargs.get("seq_lens_cpu")
+        if seq_lens_cpu is not None:
+            seqlens = np.asarray(seq_lens_cpu)
+        else:
+            seqlens = np.diff(query_start_loc.to("cpu"))
         args = seqlens
         MAX_NUM_PROGRAMS = 1024
 

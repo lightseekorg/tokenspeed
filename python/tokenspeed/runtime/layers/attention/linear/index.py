@@ -35,13 +35,17 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
-    indices = torch.cat(
-        [
-            torch.arange(n)
-            for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
-        ]
+    nums = triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
+    offsets = torch.zeros(
+        nums.shape[0] + 1, dtype=nums.dtype, device=nums.device
     )
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    torch.cumsum(nums, dim=0, out=offsets[1:])
+    total = offsets[-1]
+    total_int = total.item()
+    chunk_global = torch.arange(total_int, device=nums.device)
+    seq_ids = torch.searchsorted(offsets[1:], chunk_global, right=True)
+    local_indices = chunk_global - offsets[seq_ids]
+    return torch.stack([seq_ids, local_indices], 1).to(cu_seqlens)
 
 
 @tensor_cache
