@@ -228,11 +228,19 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(ForwardMode.EXTEND.is_extend_or_mixed())
         self.assertTrue(ForwardMode.MIXED.is_extend_or_mixed())
         self.assertFalse(ForwardMode.DECODE.is_extend_or_mixed())
+        self.assertFalse(ForwardMode.TARGET_VERIFY.is_extend_or_mixed())
+        self.assertTrue(ForwardMode.TARGET_VERIFY.is_target_verify())
+        self.assertTrue(ForwardMode.DRAFT_EXTEND.is_draft_extend())
         self.assertTrue(ForwardMode.DECODE.is_decode_or_idle())
         self.assertTrue(ForwardMode.IDLE.is_decode_or_idle())
         self.assertFalse(ForwardMode.EXTEND.is_decode_or_idle())
+        self.assertFalse(ForwardMode.TARGET_VERIFY.is_decode_or_idle())
         self.assertEqual(ForwardMode.from_num_extends(0, 0), ForwardMode.IDLE)
         self.assertEqual(ForwardMode.from_num_extends(0, 2), ForwardMode.DECODE)
+        self.assertEqual(
+            ForwardMode.from_num_extends(0, 2, has_drafter=True),
+            ForwardMode.TARGET_VERIFY,
+        )
         self.assertEqual(ForwardMode.from_num_extends(2, 2), ForwardMode.EXTEND)
         self.assertEqual(ForwardMode.from_num_extends(1, 2), ForwardMode.MIXED)
 

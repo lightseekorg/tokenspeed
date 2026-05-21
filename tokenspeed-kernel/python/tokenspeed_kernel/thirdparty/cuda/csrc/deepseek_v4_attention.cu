@@ -183,7 +183,8 @@ __global__ void fused_qnorm_rope_kv_insert_kernel(
     int num_heads,
     int cache_block_size,
     int64_t cache_block_stride,
-    bool enable_pdl) {
+    bool enable_pdl,
+    int64_t max_cache_slots) {
   const int warps_per_block = blockDim.x / kNumLanes;
   const int warp_id = threadIdx.x / kNumLanes;
   const int lane_id = threadIdx.x % kNumLanes;
@@ -290,7 +291,7 @@ __global__ void fused_qnorm_rope_kv_insert_kernel(
   }
 
   const int64_t slot = slot_mapping[token_idx];
-  if (slot < 0) {
+  if (slot < 0 || slot >= max_cache_slots) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 900)
     if (enable_pdl) {
@@ -383,6 +384,7 @@ void launch_fused_qnorm_rope_kv_insert(
     int cache_block_size,
     int64_t cache_block_stride,
     bool enable_pdl,
+    int64_t max_cache_slots,
     cudaStream_t stream) {
   constexpr int kWarpsPerBlock = kThreads / kNumLanes;
   const int64_t total_warps =
@@ -411,7 +413,8 @@ void launch_fused_qnorm_rope_kv_insert(
       cudaLaunchKernelEx(
           &config, fused_qnorm_rope_kv_insert_kernel<scalar_t>, q, kv, k_cache,
           slot_mapping, positions, cos_sin_cache, rms_norm_eps, num_tokens_full,
-          num_tokens_insert, num_heads, cache_block_size, cache_block_stride, true);
+          num_tokens_insert, num_heads, cache_block_size, cache_block_stride, true,
+          max_cache_slots);
       return;
     }
   }
@@ -419,7 +422,7 @@ void launch_fused_qnorm_rope_kv_insert(
   fused_qnorm_rope_kv_insert_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
       q, kv, k_cache, slot_mapping, positions, cos_sin_cache, rms_norm_eps,
       num_tokens_full, num_tokens_insert, num_heads, cache_block_size,
-      cache_block_stride, false);
+      cache_block_stride, false, max_cache_slots);
 }
 
 }  // namespace
@@ -574,6 +577,7 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
   const int num_tokens_insert = static_cast<int>(slot_mapping.size(0));
   const int num_heads = static_cast<int>(q.size(1));
   const int64_t cache_block_stride = k_cache.stride(0);
+  const int64_t max_cache_slots = k_cache.size(0) * cache_block_size;
 
   if (q.dtype() == dl_float16) {
     launch_fused_qnorm_rope_kv_insert<half>(
@@ -584,7 +588,7 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         static_cast<const float*>(cos_sin_cache.data_ptr()),
         static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
         num_heads, static_cast<int>(cache_block_size), cache_block_stride,
-        enable_pdl, stream);
+        enable_pdl, max_cache_slots, stream);
   } else if (q.dtype() == dl_bfloat16) {
     launch_fused_qnorm_rope_kv_insert<nv_bfloat16>(
         static_cast<nv_bfloat16*>(q.data_ptr()),
@@ -595,7 +599,7 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         static_cast<const float*>(cos_sin_cache.data_ptr()),
         static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
         num_heads, static_cast<int>(cache_block_size), cache_block_stride,
-        enable_pdl, stream);
+        enable_pdl, max_cache_slots, stream);
   } else {
     TVM_FFI_ICHECK(false) << "q/kv dtype must be float16 or bfloat16";
   }

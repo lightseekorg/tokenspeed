@@ -72,6 +72,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_indexer_mxfp4_scale_dim,
     deepseek_v4_indexer_mxfp4_value_bytes,
     deepseek_v4_nope_dim,
+    v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -1141,6 +1142,7 @@ def _deepseek_v4_indexer_decode_plan(
     compress_ratio: int,
     metadata: Optional[DeepseekV4ForwardMetadata] = None,
     is_valid_token: Optional[torch.Tensor] = None,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> DeepseekV4IndexerDecodePlan:
     num_tokens = positions.numel()
     key = (int(compress_ratio), int(cache_block_size), int(num_tokens))
@@ -1226,6 +1228,7 @@ def _deepseek_v4_indexer_decode_plan(
             max_blocks=max_blocks,
             out_context_lens=plan.context_lens,
             out_block_tables=plan.block_table,
+            block_table_base_offsets=block_table_base_offsets,
         )
         if is_valid_token is None:
             is_valid_token = getattr(metadata, "is_valid_token", None)
@@ -1914,6 +1917,19 @@ def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
         return 128
     raise ValueError(
         f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
+    )
+
+
+def _deepseek_v4_sanitize_swa_slot_mapping(
+    slot_mapping: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    capacity = int(swa_kv_cache.shape[0]) * int(block_size)
+    return torch.where(
+        (slot_mapping >= 0) & (slot_mapping < capacity),
+        slot_mapping,
+        torch.full_like(slot_mapping, -1),
     )
 
 
@@ -2802,7 +2818,11 @@ class DeepseekV4Indexer(nn.Module):
         if forward_mode is not None and forward_mode.is_mixed():
             num_prefill_tokens = int(metadata.num_prefill_tokens)
             num_decode_tokens = metadata.decode_token_count()
-        elif forward_mode is not None and forward_mode.is_decode():
+        elif forward_mode is not None and (
+            forward_mode.is_decode()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
+        ):
             num_prefill_tokens = 0
             num_decode_tokens = positions.numel()
         else:
@@ -2822,6 +2842,13 @@ class DeepseekV4Indexer(nn.Module):
             self.compress_ratio,
             indexer_block_size,
         )
+        indexer_block_table_base_offsets = None
+        if indexer_block_table is not metadata.cache.block_table:
+            indexer_block_table_base_offsets = (
+                metadata.cache.paged_cache_block_table_base_offsets.get(
+                    v4_compressed_kv_group_id(self.compress_ratio)
+                )
+            )
         decode_plan = _deepseek_v4_indexer_decode_plan(
             positions=decode_positions,
             token_to_req_indices=metadata.token_to_req_indices[decode_start:decode_end],
@@ -2830,6 +2857,7 @@ class DeepseekV4Indexer(nn.Module):
             compress_ratio=self.compress_ratio,
             metadata=metadata,
             is_valid_token=decode_valid_token,
+            block_table_base_offsets=indexer_block_table_base_offsets,
         )
         _deepseek_v4_indexer_decode_schedule_metadata(
             positions=decode_positions,
@@ -3278,6 +3306,11 @@ class DeepseekV4Attention(nn.Module):
     ) -> None:
         if q.shape[0] == 0:
             return
+        slot_mapping = _deepseek_v4_sanitize_swa_slot_mapping(
+            slot_mapping,
+            swa_kv_cache,
+            block_size,
+        )
         fused_qnorm_rope_kv_insert(
             q=q,
             kv=kv,

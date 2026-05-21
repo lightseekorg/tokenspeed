@@ -503,7 +503,19 @@ class DeepseekV4CacheMetadata:
         block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
         if block_table is not self.block_table:
             req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
-            positions = seq_lens[req_idx].to(torch.int64) - 1
+            query_starts = query_start_loc[req_idx].to(torch.int64)
+            query_lens = (
+                query_start_loc[req_idx + 1].to(torch.int64) - query_starts
+            )
+            seq_lens_for_token = seq_lens[req_idx].to(torch.int64)
+            token_offsets = torch.arange(
+                num_tokens,
+                dtype=torch.int64,
+                device=seq_lens.device,
+            )
+            positions = (
+                seq_lens_for_token - query_lens + token_offsets - query_starts
+            )
             compressed_pos = torch.div(
                 positions,
                 compress_ratio,
@@ -515,6 +527,17 @@ class DeepseekV4CacheMetadata:
                 rounding_mode="floor",
             )
             offsets = compressed_pos % kv_cache_block_size
+            base_offsets = self.paged_cache_block_table_base_offsets.get(
+                v4_compressed_kv_group_id(compress_ratio)
+            )
+            if base_offsets is not None:
+                page_indices = (
+                    page_indices
+                    - base_offsets.to(
+                        device=page_indices.device,
+                        dtype=torch.int64,
+                    )[req_idx]
+                )
             page_ids = _safe_page_ids(block_table, req_idx, page_indices)
             out.copy_(
                 torch.where(
@@ -600,6 +623,17 @@ class DeepseekV4CacheMetadata:
         if block_table is self.block_table:
             page_ids = block_table[req_idx, page_indices.long()].to(torch.int64)
         else:
+            base_offsets = self.paged_cache_block_table_base_offsets.get(
+                v4_compressed_kv_group_id(compress_ratio)
+            )
+            if base_offsets is not None:
+                page_indices = (
+                    page_indices
+                    - base_offsets.to(
+                        device=page_indices.device,
+                        dtype=torch.int64,
+                    )[req_idx]
+                )
             page_ids = _safe_page_ids(block_table, req_idx, page_indices.long())
         slots = page_ids.to(torch.int64) * kv_cache_block_size + offsets
         return torch.where(

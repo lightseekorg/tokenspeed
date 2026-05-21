@@ -34,6 +34,7 @@ except Exception:
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     deepseek_v4_swa_row_bytes,
+    v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -58,6 +59,31 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
+
+
+def _swa_block_table(metadata: DeepseekV4ForwardMetadata) -> torch.Tensor:
+    cache_metadata = metadata.cache
+    return (
+        cache_metadata.swa_block_table
+        if cache_metadata.swa_block_table is not None
+        else cache_metadata.block_table
+    )
+
+
+def _compressed_block_table_base_offsets(
+    metadata: DeepseekV4ForwardMetadata,
+    compress_ratio: int,
+) -> torch.Tensor | None:
+    return metadata.cache.paged_cache_block_table_base_offsets.get(
+        v4_compressed_kv_group_id(compress_ratio)
+    )
+
+
+def _cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.pad(
+        torch.cumsum(lengths.to(torch.int32), dim=0, dtype=torch.int32),
+        (1, 0),
+    )
 
 
 def _decode_positions_from_metadata(
@@ -109,6 +135,11 @@ def _refresh_decode_indexer_plan_cache(
             compress_ratio,
             cache_block_size,
         )
+        block_table_base_offsets = (
+            _compressed_block_table_base_offsets(metadata, compress_ratio)
+            if block_table is not metadata.cache.block_table
+            else None
+        )
         rows = int(block_table.shape[0]) if block_table.ndim >= 1 else 0
         cols = int(block_table.shape[1]) if block_table.ndim >= 2 else 0
         if rows <= 0 or cols <= 0:
@@ -140,6 +171,7 @@ def _refresh_decode_indexer_plan_cache(
             max_blocks=max_blocks,
             out_context_lens=plan.context_lens,
             out_block_tables=plan.block_table,
+            block_table_base_offsets=block_table_base_offsets,
         )
         if metadata.is_valid_token is not None:
             valid = metadata.is_valid_token[:num_tokens].to(
@@ -726,16 +758,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
 
         cache_metadata = metadata.cache
-        swa_block_table = (
-            cache_metadata.swa_block_table
-            if cache_metadata.swa_block_table is not None
-            else cache_metadata.block_table
-        )
         indices, lens = deepseek_v4_decode_swa_indices_and_lens(
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
-            block_table=swa_block_table,
+            block_table=_swa_block_table(metadata),
             block_table_base_offsets=cache_metadata.swa_base_logical_page,
             window_size=window_size,
             block_size=block_size,
@@ -767,6 +794,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_tokens = positions.numel()
         req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
         block_table = metadata.cache.compressed_block_table(compress_ratio, block_size)
+        block_table_base_offsets = (
+            _compressed_block_table_base_offsets(metadata, compress_ratio)
+            if block_table is not metadata.cache.block_table
+            else None
+        )
         is_valid_token = (
             metadata.is_valid_token[:num_tokens]
             if metadata.is_valid_token is not None
@@ -776,8 +808,20 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
+            topk_local = topk_indices
+            if block_table_base_offsets is not None:
+                base_slots = block_table_base_offsets.to(
+                    device=topk_indices.device,
+                    dtype=torch.int64,
+                )[req_idx] * int(block_size)
+                topk_i64 = topk_indices.to(torch.int64)
+                topk_local = torch.where(
+                    topk_i64 >= 0,
+                    topk_i64 - base_slots[:, None],
+                    topk_i64,
+                ).to(topk_indices.dtype)
             indices_2d, lens = deepseek_v4_compute_global_topk_indices_and_lens(
-                topk_indices=topk_indices,
+                topk_indices=topk_local,
                 token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
                 block_table=block_table,
                 block_size=block_size,
@@ -822,6 +866,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
         safe_local = torch.where(valid, local, torch.zeros_like(local))
         pages = torch.div(safe_local, block_size, rounding_mode="floor")
+        if block_table_base_offsets is not None:
+            pages = (
+                pages
+                - block_table_base_offsets.to(
+                    device=pages.device,
+                    dtype=torch.int64,
+                )[
+                    req_idx
+                ][:, None]
+            )
         page_offsets = safe_local % block_size
         page_ids = metadata.cache.safe_page_ids(
             block_table,
@@ -1976,7 +2030,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 
-    def advance_draft_forward_metadata(self):
+    def advance_draft_forward_metadata(self, seq_lens: Optional[torch.Tensor] = None):
         if (
             self._draft_decode_base_seq_lens is None
             or self.forward_prefill_metadata is None
@@ -1985,8 +2039,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
         self._draft_decode_step += 1
         metadata = self._draft_decode_metadata
-        metadata.seq_lens.add_(1)
+        if seq_lens is None:
+            metadata.seq_lens.add_(1)
+        else:
+            metadata.seq_lens.copy_(seq_lens[: metadata.seq_lens.numel()])
         metadata.forward_mode = ForwardMode.DECODE
+        if self._decode_swa_window_size > 0 and self._decode_swa_block_size > 0:
+            self._update_decode_swa_metadata(
+                metadata,
+                window_size=self._decode_swa_window_size,
+                block_size=self._decode_swa_block_size,
+            )
         # seq_lens just changed, so any previously-refreshed plan tensors are
         # stale. Re-run the same metadata-setup hooks the main path uses.
         metadata.cache.refresh_decode_compressed_slot_mappings(

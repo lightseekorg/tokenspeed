@@ -448,7 +448,9 @@ class ModelExecutor:
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
-            is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
+            is_spec_verify = n > 1 and (
+                ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()
+            )
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
@@ -831,6 +833,11 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
+        graph_forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if self.drafter is not None
+            else ForwardMode.DECODE
+        )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -838,7 +845,7 @@ class ModelExecutor:
             bs=0,
             num_extends=0,
             input_num_tokens=0,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=graph_forward_mode,
             global_num_tokens=global_num_tokens,
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
@@ -1097,7 +1104,11 @@ class ModelExecutor:
                 total_tokens=total_tokens,
             )
 
-            forward_mode = ForwardMode.from_num_extends(num_extends, bs)
+            forward_mode = ForwardMode.from_num_extends(
+                num_extends,
+                bs,
+                has_drafter=self.drafter is not None,
+            )
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs

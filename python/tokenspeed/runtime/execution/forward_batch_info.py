@@ -39,6 +39,10 @@ class ForwardMode(IntEnum):
     MIXED = auto()
     # No sequence to forward; used for data parallel attention idle ranks.
     IDLE = auto()
+    # Used in speculative decoding: verify a batch in the target model.
+    TARGET_VERIFY = auto()
+    # Used in speculative decoding: extend a batch in the draft model.
+    DRAFT_EXTEND = auto()
 
     def is_extend(self):
         return self == ForwardMode.EXTEND
@@ -55,17 +59,28 @@ class ForwardMode(IntEnum):
     def is_extend_or_mixed(self):
         return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
 
+    def is_target_verify(self):
+        return self == ForwardMode.TARGET_VERIFY
+
+    def is_draft_extend(self):
+        return self == ForwardMode.DRAFT_EXTEND
+
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     @staticmethod
-    def from_num_extends(num_extends: int, batch_size: int) -> "ForwardMode":
+    def from_num_extends(
+        num_extends: int,
+        batch_size: int,
+        *,
+        has_drafter: bool = False,
+    ) -> "ForwardMode":
         if batch_size <= 0:
             return ForwardMode.IDLE
         elif num_extends > 0:
             return ForwardMode.MIXED if num_extends < batch_size else ForwardMode.EXTEND
         else:
-            return ForwardMode.DECODE
+            return ForwardMode.TARGET_VERIFY if has_drafter else ForwardMode.DECODE
 
 
 class CaptureHiddenMode(IntEnum):

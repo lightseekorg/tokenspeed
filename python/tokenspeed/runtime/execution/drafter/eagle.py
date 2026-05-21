@@ -219,6 +219,9 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
+        draft_first_mode = (
+            ForwardMode.DRAFT_EXTEND if forward_mode.is_target_verify() else forward_mode
+        )
 
         draft_first_step_reduce = forward_mode.is_decode()
 
@@ -237,7 +240,7 @@ class Eagle(BaseDrafter):
             bs=bs,
             num_extends=draft_input.num_extends,
             input_num_tokens=draft_input.input_num_tokens,
-            forward_mode=forward_mode,
+            forward_mode=draft_first_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=gather_ids,
             global_num_tokens=draft_input.global_num_tokens,
@@ -267,7 +270,9 @@ class Eagle(BaseDrafter):
         num_extends = draft_input.num_extends
         num_decodes = bs - num_extends
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        cache_start = self.input_buffers.seq_lens_buf[:bs]
+        cache_start = self.input_buffers.seq_lens_buf[:bs].clone()
+        # Step 1's write position uses vc+accept_length after target verify so
+        # rotary/cache metadata stay on the accepted prefix, not rejected tail.
         if num_decodes > 0:
             cache_start[num_extends:] = (
                 self.runtime_states.valid_cache_lengths.index_select(
@@ -286,8 +291,7 @@ class Eagle(BaseDrafter):
             req_to_pages=self.req_to_page,
             page_size=self.page_size,
         )
-        cache_locs_trans = cache_locs.view(bs, self.spec_num_steps - 1).t().contiguous()
-
+        cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)

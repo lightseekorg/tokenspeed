@@ -163,6 +163,37 @@ def pool_to_prefix_cache_adjunct_spec(
     return spec
 
 
+def should_disable_prefix_cache(
+    enable_prefix_caching: bool,
+    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+) -> bool:
+    """Return the scheduler prefix-cache setting for the current cache layout.
+
+    The scheduler prefix cache currently owns only the ordinary KV page table.
+    Extra paged cache groups are request-local; a prefix hit would skip model
+    execution for prefix tokens without restoring those group caches.
+    """
+    return (not enable_prefix_caching) or bool(paged_cache_groups)
+
+
+def should_use_overlap_schedule(
+    *,
+    disable_overlap_schedule: bool,
+    disaggregation_mode: str,
+    speculative_algorithm: Any | None,
+    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+) -> bool:
+    """Return whether the runtime can use the overlapped scheduler loop."""
+
+    if disable_overlap_schedule:
+        return False
+    if disaggregation_mode == "prefill":
+        return False
+    if speculative_algorithm is not None and paged_cache_groups:
+        return False
+    return True
+
+
 def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id

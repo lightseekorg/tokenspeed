@@ -294,13 +294,18 @@ class CudaGraphWrapper:
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
 
+        capture_forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if self.drafter is not None
+            else ForwardMode.DECODE
+        )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=0,
             input_num_tokens=bs * self.max_tokens_per_req,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=capture_forward_mode,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.drafter is not None
@@ -453,7 +458,7 @@ class CudaGraphWrapper:
             bs,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
-            ForwardMode.DECODE,
+            ForwardMode.DECODE if self.drafter is None else ForwardMode.TARGET_VERIFY,
             **capture_kwargs,
         )
         if self.draft_attn_backend is not None:
@@ -475,7 +480,7 @@ class CudaGraphWrapper:
                 bs,
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
-                ForwardMode.DECODE,
+                ForwardMode.DRAFT_EXTEND,
                 **draft_kwargs,
             )
 
@@ -619,41 +624,50 @@ class CudaGraphWrapper:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            # The drafter's decode kernel reads ``seq_lens`` from the metadata
-            # via aliasing:
-            #   - Writer: ``Eagle._run_multi_step_decode`` mutates
-            #     ``draft_seq_lens_buf`` in place between draft steps
-            #     (eagle.py: ``torch.add(cache_start, 1, out=draft_seq_lens)``
-            #     and ``draft_seq_lens.add_(1)`` inside the per-step loop).
-            #   - Reader: each backend's ``forward_decode`` passes
-            #     ``metadata.<seq_lens field>`` to its decode kernel; that
-            #     field is a slice view of ``draft_seq_lens_buf`` written
-            #     here (``cache_seqlens_int32=seq_lens[:bs]`` /
-            #     ``seq_lens_k=seq_lens[:bs]``).
-            # So the kernel sees the value the drafter just wrote, without
-            # rebuilding metadata per step.
-            # Pre-write the buffer with the controller's seq_lens so the
-            # prefill-side eager work (cumsum at init) and the live-aliased
-            # decode side both see correct values from step 0 onward. Each
-            # is_draft backend fills both prefill+decode metadata in this
-            # one call.
-            #
-            # TODO: relying on aliasing for correctness is fragile — a stray
-            # copy or a misrouted buffer silently produces wrong outputs.
-            # Move to an explicit per-call ``seq_lens`` contract
-            # so each kernel invocation carries its own value rather than
-            # reading through a tensor registered at init.
+            draft_kwargs = {}
+            if getattr(self.draft_attn_backend, "uses_paged_cache_groups", False):
+                for key in (
+                    "paged_cache_block_tables",
+                    "paged_cache_block_table_base_offsets",
+                ):
+                    value = kwargs.get(key)
+                    if value is not None:
+                        draft_kwargs[key] = value
+
+            # The drafter mutates draft_seq_lens_buf between MTP draft steps;
+            # decode metadata must alias that buffer, while the first
+            # prefill/verify step uses the caller's accepted prefix lengths.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
-            draft_seq_lens.copy_(seq_lens)
-            self.draft_attn_backend.init_forward_metadata(
-                bs=padded_bs,
-                num_extends=num_extends,
-                req_pool_indices=req_pool_indices,
-                seq_lens=draft_seq_lens,
-                req_to_page=self.drafter.req_to_page,
-                forward_mode=forward_mode,
-                **kwargs,
-            )
+            draft_seq_lens.copy_(seq_lens[:padded_bs])
+            if forward_mode == ForwardMode.EXTEND or forward_mode.is_mixed():
+                self.draft_attn_backend.init_forward_metadata(
+                    bs=padded_bs,
+                    num_extends=num_extends,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    req_to_page=self.drafter.req_to_page,
+                    forward_mode=forward_mode,
+                    **kwargs,
+                )
+                self.draft_attn_backend.init_forward_metadata(
+                    bs=padded_bs,
+                    num_extends=0,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=draft_seq_lens,
+                    req_to_page=self.drafter.req_to_page,
+                    forward_mode=ForwardMode.DECODE,
+                    **draft_kwargs,
+                )
+            else:
+                self.draft_attn_backend.init_forward_metadata(
+                    bs=padded_bs,
+                    num_extends=0,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    req_to_page=self.drafter.req_to_page,
+                    forward_mode=ForwardMode.DRAFT_EXTEND,
+                    **draft_kwargs,
+                )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
@@ -664,7 +678,7 @@ class CudaGraphWrapper:
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
-        if not ctx.forward_mode.is_decode():
+        if not (ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()):
             return False
         if self.dp_size > 1:
             if not ctx.all_decode_or_idle:
@@ -847,7 +861,7 @@ class CudaGraphWrapper:
         # Update mamba/GDN state after speculative verify
         if (
             self.drafter is not None
-            and ctx.forward_mode.is_decode()
+            and ctx.forward_mode.is_target_verify()
             and hasattr(self.attn_backend, "update_mamba_state_after_mtp_verify")
         ):
             accept_lengths = result[1]
