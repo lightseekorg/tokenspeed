@@ -155,9 +155,7 @@ class RotaryEmbedding(torch.nn.Module):
                 output_q_rope=output_q_rope,
                 output_k_rope=output_k_rope,
             )
-            return output_q_rope if output_q_rope is not None else query, (
-                output_k_rope if output_k_rope is not None else key
-            )
+            return query, key
         else:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
