@@ -257,20 +257,28 @@ def warp_argmax_redux(current_max: Float32, current_argmax: Int32):
 
 @cute.jit
 def warp_reduce_argmax(current_max: Float32, current_argmax: Int32):
-    """Shuffle-based warp argmax - works on all architectures (Hopper+)."""
+    """Shuffle-based warp argmax - works on all architectures (Hopper+).
+
+    Ties are broken to the lowest index, matching ``torch.argmax``. The redux
+    path (``warp_argmax_redux``) already does this via ``redux.sync.min.u32``;
+    this path used to keep whichever side the strict ``>`` happened to retain,
+    so the tie-break-to-lowest invariant could fail on Hopper. The extra
+    ``==`` arm makes the two paths agree on Hopper and Blackwell.
+    """
     warp_max = current_max
     warp_argmax = current_argmax
 
-    # Use butterfly shuffle pattern for warp reduction
+    # Butterfly shuffle reduction.
     for i in cutlass.range_constexpr(int(5)):  # log2(32) = 5 iterations
-        # Get values from other lanes using butterfly pattern
         other_max = cute.arch.shuffle_sync_bfly(warp_max, offset=1 << i)
         other_argmax = cute.arch.shuffle_sync_bfly(warp_argmax, offset=1 << i)
 
-        # Inline argmax comparison
         if other_max > warp_max:
             warp_max = other_max
             warp_argmax = other_argmax
+        elif other_max == warp_max:
+            if other_argmax < warp_argmax:
+                warp_argmax = other_argmax
 
     return warp_max, warp_argmax
 
@@ -624,9 +632,14 @@ class ArgmaxKernel(ReductionBase):
                     element_argmax = reduction_buffer[row_idx, idx, 0, 1].to(
                         cutlass.Int32
                     )
+                    # Tie-break to the lowest index so the cluster-side
+                    # reduction agrees with torch.argmax / the redux path.
                     if element_max > block_reduce_val:
                         block_reduce_val = element_max
                         block_reduce_argmax = element_argmax
+                    elif element_max == block_reduce_val:
+                        if element_argmax < block_reduce_argmax:
+                            block_reduce_argmax = element_argmax
 
             if cutlass.const_expr(self.use_redux):
                 warp_max, warp_argmax = warp_argmax_redux(
