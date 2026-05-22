@@ -23,18 +23,17 @@ from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 
 __all__ = [
-    "quantize_fp8_static",
-    "quantize_fp8_dynamic",
+    "quantize_fp8",
+    "quantize_fp8_with_scale",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
 ]
 
 
-def quantize_fp8_static(
+def quantize_fp8(
     x: torch.Tensor,
-    scale: float | None = None,
-    out: torch.Tensor | None = None,
+    scale: float | torch.Tensor | None = None,
     # kernel options
     enable_pdl: bool = False,
     # dispatch options
@@ -50,19 +49,18 @@ def quantize_fp8_static(
 
     Args:
         x: Input tensor.
-        scale: Optional scalar scale. If provided, the backend computes
-            x / scale before casting. If omitted, the backend performs a pure
-            FP8 cast.
-        out: Optional pre-allocated FP8 output tensor.
+        scale: Optional scalar scale, as a Python value or scalar tensor. If
+            provided, the backend computes x / scale before casting. If omitted,
+            the backend performs a pure FP8 cast.
         enable_pdl: Whether to request Programmatic Dependent Launch support.
         override: Optional exact kernel name or solution override.
         solution: Optional registered solution to select.
 
     Returns:
-        Quantized FP8 tensor with the same shape as x, unless out is provided.
+        Quantized FP8 tensor with the same shape as x.
 
-    Scalar scales are Python values. Non-scalar scales belong in dynamic
-    quantization APIs and should be on-device tensors.
+    Non-scalar scales belong in dynamic quantization APIs and should be
+    on-device tensors.
 
     """
 
@@ -71,7 +69,7 @@ def quantize_fp8_static(
     }
     kernel = select_kernel(
         "quantization",
-        "fp8_static",
+        "fp8",
         x.dtype,
         traits=traits,
         solution=solution,
@@ -81,24 +79,19 @@ def quantize_fp8_static(
         "shape": tuple(x.shape),
         "has_scale": scale is not None,
     }
-    ShapeCapture.get().record(
-        "quantization", "fp8_static", kernel.name, x.dtype, shape_params
-    )
+    ShapeCapture.get().record("quantization", "fp8", kernel.name, x.dtype, shape_params)
     with kernel_scope(
-        "quantization", "fp8_static", x.dtype, kernel_name=kernel.name, **shape_params
+        "quantization", "fp8", x.dtype, kernel_name=kernel.name, **shape_params
     ):
         return kernel(
             x,
             scale=scale,
-            out=out,
             enable_pdl=enable_pdl,
         )
 
 
-def quantize_fp8_dynamic(
+def quantize_fp8_with_scale(
     x: torch.Tensor,
-    out: torch.Tensor | None = None,
-    out_scale: torch.Tensor | None = None,
     # quantization options
     granularity: Literal["tensor", "token", "token_group"] = "tensor",
     group_size: int | None = None,
@@ -124,8 +117,6 @@ def quantize_fp8_dynamic(
 
     Args:
         x: Input tensor.
-        out: Optional pre-allocated FP8 output tensor.
-        out_scale: Optional pre-allocated scale tensor.
         granularity: Scale granularity. Supported values are tensor, token, and
             token_group.
         group_size: Number of contiguous values per scale group along the last
@@ -165,7 +156,7 @@ def quantize_fp8_dynamic(
     }
     kernel = select_kernel(
         "quantization",
-        "fp8_dynamic",
+        "fp8_with_scale",
         x.dtype,
         traits=traits,
         solution=solution,
@@ -180,16 +171,18 @@ def quantize_fp8_dynamic(
         "scale_encoding": scale_encoding,
     }
     ShapeCapture.get().record(
-        "quantization", "fp8_dynamic", kernel.name, x.dtype, shape_params
+        "quantization", "fp8_with_scale", kernel.name, x.dtype, shape_params
     )
     with kernel_scope(
-        "quantization", "fp8_dynamic", x.dtype, kernel_name=kernel.name, **shape_params
+        "quantization",
+        "fp8_with_scale",
+        x.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
     ):
         return kernel(
             x,
             granularity=granularity,
-            out=out,
-            out_scale=out_scale,
             num_token_padding=num_token_padding,
             group_size=group_size,
             scale_dtype=scale_dtype,
