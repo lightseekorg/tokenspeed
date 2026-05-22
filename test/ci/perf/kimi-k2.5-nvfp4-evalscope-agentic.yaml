@@ -39,22 +39,44 @@ install:
         | sudo tee /etc/apt/sources.list.d/cuda.list > /dev/null
       sudo apt-get update -y -q
     fi
-    # python3.12-dev / python3.12-venv aren't in jammy's main repo (they need
-    # deadsnakes); the system python3 already works on this runner, so just
-    # skip them and rely on whatever pip is already installed.
+    # Jammy main only ships python3.10. The standard b200-4gpu pool uses
+    # python3.12 (matches `tokenspeed-trtllm-kernel`'s cp312 wheel, which
+    # is the one actually built against torch==2.11.0); the cp310 wheel
+    # for the same version was built against an older torch and fails at
+    # import with `torch::Library::_def(... vector<at::Tag>const&, ...) &`
+    # undefined-symbol. Pull python3.12 from the deadsnakes PPA and make
+    # it the default `python3` here so install_deps.sh + downstream pip
+    # land everything under python3.12 / cp312.
+    if ! command -v python3.12 >/dev/null; then
+      sudo apt-get install -y --no-install-recommends software-properties-common
+      sudo add-apt-repository -y ppa:deadsnakes/ppa
+      sudo apt-get update -y -q
+      sudo apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv python3.12-distutils
+    fi
+    # Bootstrap pip directly under 3.12 (deadsnakes' python3.12 doesn't
+    # bundle ensurepip).
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py \
+      | sudo python3.12 - --break-system-packages
+    # Make `python3` resolve to 3.12 (PATH-priority swap; leaves the
+    # system /usr/bin/python3 = 3.10 in place so anything else that
+    # hard-codes the absolute path keeps working).
+    sudo ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+    sudo ln -sf /usr/bin/python3.12 /usr/local/bin/python
+    hash -r
+    python3 --version
+    # pyyaml was previously installed for python3.10 by the
+    # `Install pipeline dependency` step; pipeline.py re-imports yaml
+    # under the new python3.12, so reinstall it there.
+    python3 -m pip install --break-system-packages --no-cache-dir pyyaml
     sudo apt-get install -y --no-install-recommends \
       libgomp1 \
       libnuma1 libibverbs1 rdma-core infiniband-diags ibverbs-providers \
       cuda-nvcc-13-0 libcublas-dev-13-0 cuda-nvrtc-dev-13-0 libcurand-dev-13-0
-    # The b200-4gpu-perf host has a stale `.local`-scope `trtllm_kernel`
-    # built against an older PyTorch. With torch==2.11.0 it raises
-    # `torch::Library::_def(..., std::vector<at::Tag> const&, ...) &`
-    # undefined-symbol at first import. `pip uninstall` only removes
-    # files tracked in the `tokenspeed-trtllm-kernel` RECORD; the stale
-    # `.so` was originally landed by a different dist, so the directory
-    # survives. Nuke the whole module dir (in both `~/.local` and the
-    # system path) so install_deps.sh's reinstall yields a clean tree.
-    python3 -m pip uninstall -y --break-system-packages trtllm_kernel tokenspeed-trtllm-kernel || true
+    # Drop any python3.10 leftovers that pip3 left at /home/ubuntu/.local
+    # (including the broken cp310 trtllm_kernel .so). With python3 now
+    # pointing at 3.12 those paths are unreachable for the engine, but
+    # we want a clean tree before install_deps.sh runs.
     for p in \
       /home/ubuntu/.local/lib/python3.10/site-packages/trtllm_kernel \
       /home/ubuntu/.local/lib/python3.10/site-packages/tokenspeed_trtllm_kernel* \
