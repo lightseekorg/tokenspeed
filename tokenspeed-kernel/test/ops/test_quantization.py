@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel import quantize_fp8
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 
 FP8_E4M3_MAX = 448.0
@@ -82,30 +83,35 @@ def test_pure_cast_e5m2(device: str) -> None:
     assert _bitwise_equal(out, ref)
 
 
-@pytest.mark.parametrize("scale_inv", [0.5, 2.0, 1.0 / 7.5])
-def test_scaled_cast_matches_reference(device: str, scale_inv: float) -> None:
-    """Scaled path: out = saturate((x * scale_inv) -> fp8). Compare bitwise to
-    the same recipe applied in eager torch."""
+@pytest.mark.parametrize("scale", [2.0, 0.5, 7.5])
+def test_scaled_cast_matches_reference(device: str, scale: float) -> None:
+    """Scaled path matches the runtime reciprocal-multiply quantization recipe."""
     torch.manual_seed(0)
     x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 100
+    inv_scale = 1.0 / scale
     ref = (
-        (x.to(torch.float32) * scale_inv)
+        (x.to(torch.float32) * inv_scale)
         .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
         .to(torch.float8_e4m3fn)
     )
-    out = fp8_quantize(x, scale_inv=scale_inv)
+    out = fp8_quantize(x, scale=scale)
     torch.cuda.synchronize()
     assert _bitwise_equal(out, ref)
 
 
-def test_preallocated_output(device: str) -> None:
+def test_registered_quantize_fp8_matches_reference(device: str) -> None:
     torch.manual_seed(0)
-    x = torch.randn(1024, 512, device=device, dtype=torch.bfloat16) * 50
-    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    ret = fp8_quantize(x, out=out)
+    x = torch.randn(8, 2880, device=device, dtype=torch.bfloat16) * 100
+    scale = torch.tensor([0.125], device=device, dtype=torch.float32)
+    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
+    ref = (
+        (x.to(torch.float32) * inv_scale)
+        .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+    out = quantize_fp8(x, scale=scale, solution="triton")
     torch.cuda.synchronize()
-    assert ret.data_ptr() == out.data_ptr()
-    assert _bitwise_equal(out, x.to(torch.float8_e4m3fn))
+    assert _bitwise_equal(out, ref)
 
 
 def test_rejects_unsupported_dtype(device: str) -> None:
