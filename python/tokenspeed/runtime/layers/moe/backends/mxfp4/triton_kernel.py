@@ -42,14 +42,6 @@ _is_hopper = current_platform().is_hopper
 _is_amd = current_platform().is_amd
 
 
-def _quantize_to_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    fp8 = current_platform().fp8e4m3fn
-    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
-    return (
-        (x.to(torch.float32) * inv_scale).clamp_(min=fp8.min, max=fp8.max).to(fp8.dtype)
-    )
-
-
 def swizzle_mxfp4(quant_tensor, scale, num_warps):
     """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
     from tokenspeed_kernel.ops.moe.triton_kernels import (
@@ -290,7 +282,11 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         )
 
         if self._is_w4a8_fp8:
-            gemm1_input = _quantize_to_fp8(hidden_states, layer.w13_act_scale)
+            gemm1_input = tokenspeed_kernel.quantize_fp8(
+                hidden_states,
+                scale=layer.w13_act_scale,
+                solution="triton",
+            )
         else:
             gemm1_input = hidden_states
 
@@ -310,7 +306,11 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         )
 
         if self._is_w4a8_fp8:
-            gemm2_input = _quantize_to_fp8(intermediate_cache, layer.w2_act_scale)
+            gemm2_input = tokenspeed_kernel.quantize_fp8(
+                intermediate_cache,
+                scale=layer.w2_act_scale,
+                solution="triton",
+            )
         else:
             gemm2_input = intermediate_cache
 
