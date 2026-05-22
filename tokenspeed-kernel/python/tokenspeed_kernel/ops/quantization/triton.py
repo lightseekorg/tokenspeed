@@ -66,7 +66,7 @@ def _fp8_quantize_kernel(
     if HAS_SCALE:
         if HAS_SCALE_TENSOR:
             scale = tl.load(scale)
-        x = x / scale
+        x = x * (1.0 / scale)
     x_fp8 = x.to(FP8_DTYPE)
 
     out_off = m_idx[:, None] * out_row_stride + n_idx[None, :]
