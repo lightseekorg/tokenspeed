@@ -55,6 +55,7 @@ class MambaForwardMetadata:
     mamba_output_indices: Optional[torch.Tensor] = None
     mamba_req_pool_indices: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
+    extend_seq_lens_cpu: Optional[torch.Tensor] = None
     # Pre-computed src/dst indices for extracting Mamba prefix-cache snapshots.
     track_ssm_h_src: Optional[torch.Tensor] = None
     track_ssm_h_dst: Optional[torch.Tensor] = None
@@ -351,6 +352,7 @@ class MambaAttnBackend(AttentionBackend):
         )
 
         mamba_output_indices = None
+        extend_seq_lens_cpu = None
         if is_target_verify:
             draft_token_num = int(
                 kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
@@ -391,6 +393,9 @@ class MambaAttnBackend(AttentionBackend):
                     )
                     query_start_loc[:bs] = extend_start_loc
                     query_start_loc[bs] = extend_start_loc[-1] + extend_seq_lens[-1]
+                    extend_seq_lens_cpu = extend_seq_lens[:bs].to(
+                        device="cpu", dtype=torch.int32
+                    )
                 else:
                     extend_prefix_lens = kwargs.get("extend_prefix_lens")
                     if extend_prefix_lens is not None:
@@ -404,6 +409,7 @@ class MambaAttnBackend(AttentionBackend):
                         bs + 1, dtype=torch.int32, device=self.device
                     )
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
+                    extend_seq_lens_cpu = extend_lens.to(device="cpu")
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -478,6 +484,7 @@ class MambaAttnBackend(AttentionBackend):
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices[:bs],
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
             track_conv_indices=track_conv_indices,
@@ -905,6 +912,8 @@ class MambaAttnBackend(AttentionBackend):
             if extend_prefix_lens is None:
                 extend_prefix_lens = self.forward_metadata.extend_prefix_lens
             extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+            if extend_seq_lens_cpu is None:
+                extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
             has_initial_states = (
                 extend_prefix_lens > 0 if extend_prefix_lens is not None else None
             )
