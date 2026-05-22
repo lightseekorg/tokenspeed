@@ -9,6 +9,14 @@ runner:
     - b200-4gpu-perf
 env:
   CI: "true"
+  # DEBUG (b200-4gpu-perf): host has 8 B200s but the job is allocated 4;
+  # NCCL's NVL Switch auto-probe iterates `nvmlDeviceGetHandleByIndex`
+  # over every physical index and fails (`Unknown Error`) on the four
+  # GPUs we don't own, aborting `dist.barrier()` during cudagraph
+  # capture. Disable the NVLS probe so NCCL only enumerates owned
+  # devices. Drop with the rest of the debug block once the perf
+  # runner image properly restricts NVML visibility.
+  NCCL_NVLS_ENABLE: "0"
 install:
   # DEBUG (b200-4gpu-perf): the perf-runner image is missing some of the
   # baseline deps the standard b200-4gpu image ships in its Dockerfile
