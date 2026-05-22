@@ -51,8 +51,7 @@ if platform.is_nvidia:
             "scale_layout": frozenset({"linear"}),
             "scale_encoding": frozenset({"mxfp8"}),
         },
-        priority=Priority.SPECIALIZED,
-        tags={"throughput"},
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_quantize_mxfp8(
         x: torch.Tensor,
@@ -73,8 +72,7 @@ if platform.is_nvidia:
             "has_global_scale": frozenset({True}),
             "per_token_activation": frozenset({False}),
         },
-        priority=Priority.SPECIALIZED,
-        tags={"throughput"},
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_quantize_nvfp4(
         x: torch.Tensor,

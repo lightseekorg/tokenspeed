@@ -72,7 +72,6 @@ if platform.is_nvidia:
             "scale_encoding": frozenset({"float32", "ue8m0"}),
         },
         priority=Priority.PERFORMANT,
-        tags={"throughput"},
     )
     def trtllm_quantize_fp8_with_scale(
         x: torch.Tensor,

@@ -193,8 +193,7 @@ def fp8_quantize(
     solution="triton",
     dtypes={torch.bfloat16, torch.float16},
     traits={"has_scale": frozenset({True, False})},
-    priority=Priority.PERFORMANT,
-    tags={"throughput"},
+    priority=Priority.PORTABLE,
 )
 def triton_quantize_fp8(
     x: torch.Tensor,
