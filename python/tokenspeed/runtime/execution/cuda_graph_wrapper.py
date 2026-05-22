@@ -684,11 +684,14 @@ class CudaGraphWrapper:
                     **draft_kwargs,
                 )
             else:
+                draft_metadata_seq_lens = (
+                    seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
+                )
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
                     num_extends=0,
                     req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
+                    seq_lens=draft_metadata_seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=_draft_decode_forward_mode(
                         self.use_target_verify_forward_mode

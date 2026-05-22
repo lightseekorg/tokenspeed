@@ -3389,8 +3389,12 @@ class DeepseekV4Attention(nn.Module):
         topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.compress_ratio <= 1:
-            return torch.empty(0, device=metadata.cache.block_table.device, dtype=torch.int64)
-        block_table = metadata.cache.compressed_block_table(self.compress_ratio, block_size)
+            return torch.empty(
+                0, device=metadata.cache.block_table.device, dtype=torch.int64
+            )
+        block_table = metadata.cache.compressed_block_table(
+            self.compress_ratio, block_size
+        )
         if self.compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("CSA attention requires indexer top-k indices")

@@ -226,7 +226,9 @@ class Eagle(BaseDrafter):
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
         draft_first_mode = (
-            ForwardMode.DRAFT_EXTEND if forward_mode.is_target_verify() else forward_mode
+            ForwardMode.DRAFT_EXTEND
+            if forward_mode.is_target_verify()
+            else forward_mode
         )
 
         draft_first_step_reduce = forward_mode.is_decode()

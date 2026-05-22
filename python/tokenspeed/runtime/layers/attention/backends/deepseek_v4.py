@@ -1516,7 +1516,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         self.forward_metadata = metadata
-        if metadata.forward_mode is None or not metadata.forward_mode.is_extend_or_mixed():
+        if (
+            metadata.forward_mode is None
+            or not metadata.forward_mode.is_extend_or_mixed()
+        ):
             raise RuntimeError(
                 "forward_deepseek_v4_prefill only supports extend/prefill modes"
             )

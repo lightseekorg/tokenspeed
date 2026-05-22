@@ -504,18 +504,14 @@ class DeepseekV4CacheMetadata:
         if block_table is not self.block_table:
             req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
             query_starts = query_start_loc[req_idx].to(torch.int64)
-            query_lens = (
-                query_start_loc[req_idx + 1].to(torch.int64) - query_starts
-            )
+            query_lens = query_start_loc[req_idx + 1].to(torch.int64) - query_starts
             seq_lens_for_token = seq_lens[req_idx].to(torch.int64)
             token_offsets = torch.arange(
                 num_tokens,
                 dtype=torch.int64,
                 device=seq_lens.device,
             )
-            positions = (
-                seq_lens_for_token - query_lens + token_offsets - query_starts
-            )
+            positions = seq_lens_for_token - query_lens + token_offsets - query_starts
             compressed_pos = torch.div(
                 positions,
                 compress_ratio,

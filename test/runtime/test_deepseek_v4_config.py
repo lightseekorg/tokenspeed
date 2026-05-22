@@ -623,6 +623,56 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DRAFT_EXTEND)
 
+    def test_cuda_graph_eager_draft_decode_preserves_non_v4_seq_lens_alias(self):
+        captured = {"target": [], "draft": []}
+
+        class FakeBackend:
+            uses_paged_cache_groups = False
+
+            def __init__(self, key):
+                self.key = key
+
+            def init_forward_metadata(self, *args, **kwargs):
+                captured[self.key].append((args, kwargs))
+
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.attn_backend = FakeBackend("target")
+        wrapper.draft_attn_backend = FakeBackend("draft")
+        wrapper.max_tokens_per_req = 4
+        wrapper.drafter = SimpleNamespace(
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            draft_seq_lens_buf=torch.tensor([11, 12], dtype=torch.int32),
+        )
+
+        seq_lens = torch.tensor([21, 22], dtype=torch.int32)
+        wrapper.use_target_verify_forward_mode = False
+        wrapper._init_forward_metadata(
+            padded_bs=2,
+            req_pool_indices=torch.zeros(2, dtype=torch.int32),
+            seq_lens=seq_lens,
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        non_v4_args, non_v4_kwargs = captured["draft"][-1]
+        self.assertEqual(
+            non_v4_args[3].data_ptr(), wrapper.drafter.draft_seq_lens_buf.data_ptr()
+        )
+        self.assertEqual(non_v4_kwargs["forward_mode"], ForwardMode.DECODE)
+
+        wrapper.use_target_verify_forward_mode = True
+        wrapper._init_forward_metadata(
+            padded_bs=2,
+            req_pool_indices=torch.zeros(2, dtype=torch.int32),
+            seq_lens=seq_lens,
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+        )
+
+        v4_args, v4_kwargs = captured["draft"][-1]
+        self.assertEqual(v4_args[3].data_ptr(), seq_lens.data_ptr())
+        self.assertEqual(v4_kwargs["forward_mode"], ForwardMode.DRAFT_EXTEND)
+
     def test_deepseek_v4_tokenizer_wrapper_uses_model_encoder(self):
         calls = []
 
@@ -967,6 +1017,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(deepseek_v4_swa_row_bytes(head_dim, rope_dim), 584)
         self.assertEqual(deepseek_v4_indexer_fp8_row_bytes(index_head_dim), 132)
         self.assertEqual(deepseek_v4_indexer_mxfp4_row_bytes(index_head_dim), 68)
+
     def test_deepseek_v4_nextn_architecture_uses_v4_runtime_metadata(self):
         model_config = object.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(
