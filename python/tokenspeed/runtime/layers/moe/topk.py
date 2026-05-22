@@ -25,11 +25,11 @@ from typing import NamedTuple, Protocol, runtime_checkable
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.numerics.reference.moe import _mask_topk_ids_padded_region
 from tokenspeed_kernel.ops.moe import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from tokenspeed_kernel.ops.moe.reference import _mask_topk_ids_padded_region
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
