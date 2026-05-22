@@ -361,6 +361,11 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
             )
+            # Drafter: also fill decode_metadata so step 1+ multi-step has
+            # metadata under EXTEND/MIXED target. seq_lens is the drafter's
+            # live alias buffer (wrapper pre-writes before this call).
+            if self.is_draft:
+                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
             return
 
         spec_num_tokens = num_tokens // bs if bs > 0 else 1

@@ -621,7 +621,10 @@ class FlashAttentionBackend(AttentionBackend):
         # the prefill slot; follow-up single-token steps use the decode slot.
         if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
             self.forward_decode_metadata = metadata
-        elif is_draft_extend:
+        elif is_draft_extend or (self.is_draft and forward_mode.is_extend_or_mixed()):
+            # Drafter: also fill decode slot so step 1+ multi-step has metadata
+            # under EXTEND/MIXED target. seqlens_in_batch aliases the drafter's
+            # live buffer (wrapper pre-writes it).
             self.forward_prefill_metadata = metadata
             decode_metadata = FlashAttentionMetadata()
             decode_metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -630,6 +633,15 @@ class FlashAttentionBackend(AttentionBackend):
                 0, batch_size + 1, dtype=torch.int32, device=device
             )
             decode_metadata.page_table = page_table
+            # Match the pre-cleanup "Normal Decode" path which always called
+            # _init_local_attn_metadata; required for chunked-attention models.
+            self._init_local_attn_metadata(
+                decode_metadata,
+                device,
+                cu_seqlens_q=decode_metadata.cu_seqlens_q,
+                cache_seqlens_int32=decode_metadata.cache_seqlens_int32,
+                page_table=page_table,
+            )
             self.forward_decode_metadata = decode_metadata
         else:
             self.forward_prefill_metadata = metadata

@@ -160,6 +160,16 @@ class MHAAttnBackend(AttentionBackend):
                 max_prefix_seq_len=max_prefix_seq_len,
                 has_prefix=has_prefix,
             )
+            if not self.is_draft:
+                return
+            # Drafter: also fill decode_metadata so step 1+ multi-step has
+            # metadata under EXTEND/MIXED target. seq_lens is the drafter's
+            # live alias buffer (wrapper pre-writes it before this call).
+            self.forward_decode_metadata = MHAMetadata(
+                cache_seqlens_int32=seq_lens,
+                page_table=page_table,
+                max_seq_len_k=self.max_context_len,
+            )
             return
 
         spec_num_tokens = num_tokens // bs if bs > 0 else 1
@@ -177,8 +187,10 @@ class MHAAttnBackend(AttentionBackend):
             )
             if self.is_draft:
                 # Drafter follow-up single-token steps after the first.
+                # cache_seqlens_int32 aliases seq_lens (drafter's live buffer)
+                # so multi-step in-place advances propagate to the kernel.
                 self.forward_decode_metadata = MHAMetadata(
-                    cache_seqlens_int32=seq_lens.clone(),
+                    cache_seqlens_int32=seq_lens,
                     page_table=page_table,
                     max_seq_len_k=self.max_context_len,
                 )
