@@ -542,32 +542,25 @@ def causal_conv1d_fn(
     if metadata is None:
 
         def num_program(META, seqlens):
-            tot = 0
+            nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
+            tot = int(nums.sum())
 
-            mlist = []
-            offsetlist = []  # type: ignore
-
-            nums = -(-seqlens // META["BLOCK_M"])
-
-            tot = nums.sum().item()
             mlist = np.repeat(np.arange(len(nums)), nums)
-            for idx, num in enumerate(nums):
-                offsetlist.extend(
-                    range(num)
-                )  # chunk-idx if a sequence is split into multiple chunks
+            # offsetlist[i] = local chunk index within its sequence
+            offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
+            mlist_len = mlist.shape[0]
 
-            if META["batch_ptr"].nelement() < len(mlist):
-                newlen = len(mlist) + 1
+            if META["batch_ptr"].nelement() < mlist_len:
+                newlen = mlist_len + 1
                 META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
                 META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
 
-            if META["batch_ptr"].nelement() >= len(mlist):
-                META["batch_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(mlist))
-                )
-                META["token_chunk_offset_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(offsetlist))
-                )
+            combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
+            combined_cpu = torch.from_numpy(combined_np).pin_memory()
+            META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
+            META["token_chunk_offset_ptr"][:mlist_len].copy_(
+                combined_cpu[1], non_blocking=True
+            )
 
             META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
             META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
