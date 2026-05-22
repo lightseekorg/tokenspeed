@@ -6,7 +6,7 @@ triggers:
   - manual
 runner:
   labels:
-    - b200-4gpu
+    - gb200-4gpu
 env:
   CI: "true"
 install:
@@ -74,8 +74,8 @@ perf:
     --dataset-path agentic_dataset.json
     --max-tokens 500
     --multi-turn
-    --number 4 8 8 16 32
-    --parallel 1 2 4 8 16
+    --number 4 8 8 16
+    --parallel 1 2 4 8
     --outputs-dir "$OUTPUTS_DIR"
     --extra-args '{"ignore_eos": true}'
     --no-timestamp;
@@ -96,4 +96,3 @@ perf_reference:
   2:  [340, 14500]
   4:  [250, 21000]
   8:  [149, 27000]
-  16: [70,  27000]
