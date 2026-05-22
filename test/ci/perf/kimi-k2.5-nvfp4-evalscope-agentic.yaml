@@ -26,13 +26,19 @@ install:
     esac
     sudo apt-get update -y -q
     sudo apt-get install -y --no-install-recommends gnupg curl ca-certificates
-    if [ ! -f /usr/share/keyrings/cuda-archive-keyring.gpg ]; then
-      curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/3bf863cc.pub" \
-        | sudo gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg
+    # The b200-4gpu-perf image already has the NVIDIA CUDA repo configured
+    # (keyring at /etc/apt/keyrings/nvidia.gpg). Only add our own list when
+    # no existing list references developer.download.nvidia.com/compute/cuda;
+    # otherwise apt fails with "Conflicting values set for option Signed-By".
+    if ! grep -rqsF 'developer.download.nvidia.com/compute/cuda' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+      if [ ! -f /usr/share/keyrings/cuda-archive-keyring.gpg ]; then
+        curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/3bf863cc.pub" \
+          | sudo gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg
+      fi
+      echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/ /" \
+        | sudo tee /etc/apt/sources.list.d/cuda.list > /dev/null
+      sudo apt-get update -y -q
     fi
-    echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/ /" \
-      | sudo tee /etc/apt/sources.list.d/cuda.list > /dev/null
-    sudo apt-get update -y -q
     sudo apt-get install -y --no-install-recommends \
       python3.12-dev python3.12-venv python3-pip libgomp1 \
       libnuma1 libibverbs1 rdma-core infiniband-diags ibverbs-providers \
