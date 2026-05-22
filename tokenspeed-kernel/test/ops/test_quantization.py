@@ -51,11 +51,11 @@ def test_quantize_fp8_pure_cast_bf16(
     device: str,
     solution: str,
     shape: tuple[int, ...],
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "fp8", solution, dtype)
+    require("quantization", "fp8", solution, dtype)
 
     x = torch.randn(shape, device=device, dtype=dtype) * 50
     fp8 = current_platform().fp8e4m3fn
@@ -73,11 +73,11 @@ def test_quantize_fp8_pure_cast_bf16(
 def test_quantize_fp8_strided_slice(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(1)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "fp8", solution, dtype)
+    require("quantization", "fp8", solution, dtype)
 
     s, h, qk_nope, v_head = 4096, 16, 128, 128
     kv = torch.randn(s, h, qk_nope + v_head, device=device, dtype=dtype) * 50
@@ -99,11 +99,11 @@ def test_quantize_fp8_scale_float(
     device: str,
     solution: str,
     scale: float,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(2)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "fp8", solution, dtype)
+    require("quantization", "fp8", solution, dtype)
 
     x = torch.randn(2048, 512, device=device, dtype=dtype) * 100
     fp8 = current_platform().fp8e4m3fn
@@ -122,11 +122,11 @@ def test_quantize_fp8_scale_float(
 def test_quantize_fp8_scale_tensor(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(3)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "fp8", solution, dtype)
+    require("quantization", "fp8", solution, dtype)
 
     x = torch.randn(8, 2880, device=device, dtype=dtype) * 100
     scale = torch.tensor([0.125], device=device, dtype=torch.float32)
@@ -148,11 +148,11 @@ def test_quantize_fp8_with_scale_tensor_and_token(
     device: str,
     solution: str,
     granularity: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(4)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "fp8_with_scale", solution, dtype)
+    require("quantization", "fp8_with_scale", solution, dtype)
 
     x = torch.randn(16, 128, device=device, dtype=dtype) * 10
     fp8 = current_platform().fp8e4m3fn
@@ -177,11 +177,11 @@ def test_quantize_fp8_with_scale_tensor_and_token(
 def test_quantize_fp8_with_scale_token_group(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(5)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "fp8_with_scale", solution, dtype)
+    require("quantization", "fp8_with_scale", solution, dtype)
 
     x = torch.randn(16, 256, device=device, dtype=dtype) * 10
     fp8 = current_platform().fp8e4m3fn
@@ -204,11 +204,11 @@ def test_quantize_fp8_with_scale_token_group(
 def test_quantize_mxfp8_shape_and_scale(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(6)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "mxfp8", solution, dtype)
+    require("quantization", "mxfp8", solution, dtype)
 
     x = torch.randn(17, 2880, device=device, dtype=dtype)
     out, scale = quantize_mxfp8(x, alignment=4096, solution=solution)
@@ -223,11 +223,11 @@ def test_quantize_mxfp8_shape_and_scale(
 def test_quantize_nvfp4_shape_and_scale(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(7)
     dtype = torch.bfloat16
-    require_registered_solution("quantization", "nvfp4", solution, dtype)
+    require("quantization", "nvfp4", solution, dtype)
 
     x = torch.randn(16, 256, device=device, dtype=dtype)
     out, scale = quantize_nvfp4(

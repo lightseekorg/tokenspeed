@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
 def test_rope_neox_full_bf16(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(0)
     num_tokens = 17
@@ -39,7 +39,7 @@ def test_rope_neox_full_bf16(
     rotary_dim = 128
     max_position = 1024
     dtype = torch.bfloat16
-    require_registered_solution("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -96,7 +96,7 @@ def test_rope_neox_full_bf16(
 def test_rope_gptj_full_bf16(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(1)
     num_tokens = 9
@@ -106,7 +106,7 @@ def test_rope_gptj_full_bf16(
     rotary_dim = 64
     max_position = 512
     dtype = torch.bfloat16
-    require_registered_solution("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -163,7 +163,7 @@ def test_rope_gptj_full_bf16(
 def test_rope_neox_partial_bf16(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(2)
     num_tokens = 5
@@ -173,7 +173,7 @@ def test_rope_neox_partial_bf16(
     rotary_dim = 64
     max_position = 256
     dtype = torch.bfloat16
-    require_registered_solution("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -240,7 +240,7 @@ def test_rope_neox_partial_bf16(
 def test_rope_single_token(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     """Edge case: num_tokens == 1 (decode step)."""
     torch.manual_seed(4)
@@ -251,7 +251,7 @@ def test_rope_single_token(
     rotary_dim = 128
     max_position = 64
     dtype = torch.bfloat16
-    require_registered_solution("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -301,7 +301,7 @@ def test_rope_single_token(
 def test_rope_fused_set_kv_buffer(
     device: str,
     solution: str,
-    require_registered_solution,
+    require,
 ) -> None:
     torch.manual_seed(5)
     num_tokens = 13
@@ -312,7 +312,7 @@ def test_rope_fused_set_kv_buffer(
     max_position = 512
     cache_size = 32
     dtype = torch.bfloat16
-    require_registered_solution("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0

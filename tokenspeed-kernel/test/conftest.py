@@ -45,7 +45,7 @@ from utils import make_sample_specs
 
 
 @pytest.fixture
-def require_registered_solution() -> Callable[[str, str, str, torch.dtype], None]:
+def require() -> Callable[[str, str, str, torch.dtype], None]:
     def _require(
         family: str,
         mode: str,
