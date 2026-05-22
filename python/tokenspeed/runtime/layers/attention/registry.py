@@ -64,6 +64,18 @@ def _resolve_max_num_tokens(
     return min(profiled_tokens, requested_pages * page_size)
 
 
+def _resolve_draft_cache_cell_size_for_profile(
+    draft_attn_config: BaseAttnConfig | None,
+    draft_model_config: ModelConfig | None,
+    draft_profile_cache_cell_size: int | None,
+) -> int:
+    if draft_profile_cache_cell_size is not None:
+        return draft_profile_cache_cell_size
+    if draft_attn_config is None or draft_model_config is None:
+        return 0
+    return draft_attn_config.cache_cell_size() * draft_model_config.num_attention_layers
+
+
 # ---------- backend registry ----------
 
 # Maps backend_name -> (supported archs, backend class)
@@ -431,12 +443,11 @@ def create_attn_components(
             profile_deepseek_v4_max_num_pages,
         )
 
-        draft_cache_cell_size = 0
-        if draft_attn_config is not None:
-            draft_cache_cell_size = (
-                draft_attn_config.cache_cell_size()
-                * draft_model_config.num_attention_layers
-            )
+        draft_cache_cell_size = _resolve_draft_cache_cell_size_for_profile(
+            draft_attn_config,
+            draft_model_config,
+            draft_profile_cache_cell_size,
+        )
         max_total_num_pages = profile_deepseek_v4_max_num_pages(
             layout=deepseek_v4_layout,
             hf_config=model_config.hf_config,

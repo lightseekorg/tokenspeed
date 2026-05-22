@@ -64,6 +64,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _group_slot_mapping_from_raw,
     deepseek_v4_cache_layout_from_config,
 )
+from tokenspeed.runtime.layers.attention.registry import (
+    _resolve_draft_cache_cell_size_for_profile,
+)
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
     _get_flashinfer_mxfp4_device_permute_indices,
@@ -983,6 +986,38 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(hca.compress_ratio, 128)
         self.assertTrue(hca.needs_compressed_cache)
         self.assertFalse(hca.needs_indexer)
+
+    def test_deepseek_v4_profile_uses_grouped_draft_cache_cell_size(self):
+        class GenericDraftAttnConfig:
+            def cache_cell_size(self):
+                return 11
+
+        draft_model_config = SimpleNamespace(num_attention_layers=3)
+
+        self.assertEqual(
+            _resolve_draft_cache_cell_size_for_profile(
+                GenericDraftAttnConfig(),
+                draft_model_config,
+                draft_profile_cache_cell_size=777,
+            ),
+            777,
+        )
+        self.assertEqual(
+            _resolve_draft_cache_cell_size_for_profile(
+                GenericDraftAttnConfig(),
+                draft_model_config,
+                draft_profile_cache_cell_size=None,
+            ),
+            33,
+        )
+        self.assertEqual(
+            _resolve_draft_cache_cell_size_for_profile(
+                None,
+                None,
+                draft_profile_cache_cell_size=None,
+            ),
+            0,
+        )
 
     def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
         config = SimpleNamespace(
