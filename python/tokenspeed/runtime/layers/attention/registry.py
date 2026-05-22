@@ -436,8 +436,14 @@ def create_attn_components(
         )
     elif has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
+        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
+        num_kv_layers = (
+            len(full_attn_layer_ids)
+            if full_attn_layer_ids is not None
+            else num_layers - len(mamba_cache_params[4])
+        )
         max_total_num_pages = profile_max_num_pages(
-            **_profile_kwargs,
+            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             cache_cell_size=profile_cache_cell_size,
         )
@@ -466,8 +472,14 @@ def create_attn_components(
             conv_size * conv_dtype.itemsize + temporal_size * ssm_dtype.itemsize
         ) * (1 + speculative_num_draft_tokens)
         memory_per_mamba_chunk = num_mamba_layers * per_layer_mamba_chunk_memory
+        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
+        num_kv_layers = (
+            len(full_attn_layer_ids)
+            if full_attn_layer_ids is not None
+            else num_layers - num_mamba_layers
+        )
         kv_max_num_pages, mamba_pool_total_chunks = profile_cache_budget(
-            **_profile_kwargs,
+            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
             mem_fraction_static=server_args.gpu_memory_utilization,
             mamba_memory_per_chunk=memory_per_mamba_chunk,
             mamba_ratio=server_args.mamba_full_memory_ratio,

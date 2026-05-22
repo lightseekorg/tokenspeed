@@ -50,9 +50,6 @@ also be bumped to 256.)
 
 ## Optional flags
 
-- `--disable-deepseek-v4-fast-mhc`: disables the tilelang+DeepGEMM fused mHC
-  path; falls back to the PyTorch reference. Use when tilelang or DeepGEMM JIT
-  is unavailable.
 - `--deepseek-v4-mega-moe-max-num-tokens N`: caps the DeepGEMM mega_moe
   workspace (`0` lets the kernel pick).
 - `--deepseek-v4-indexer-prefill-max-logits-mb N`: caps the FP4 indexer

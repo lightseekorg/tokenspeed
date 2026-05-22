@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -35,6 +36,9 @@ logger = get_colorful_logger(__name__)
 
 class BaseTokenToKVPool:
     """A memory pool that maps a token location to its kv cache data."""
+
+    paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
+    paged_cache_group_page_counts: dict[str, int] = {}
 
     def __init__(
         self,
@@ -105,6 +109,11 @@ class BaseTokenToKVPool:
         self, kv_cache_cpu: torch.Tensor, page_indices: list[int]
     ) -> None:
         raise NotImplementedError()
+
+    @property
+    def prefix_cache_required_group_ids(self) -> tuple[str, ...] | None:
+        """None means adjunct disabled; subclasses return required group ids."""
+        return None
 
     # Buffer metadata used by prefill/decode disaggregation.
     def get_contiguous_buf_infos(self):

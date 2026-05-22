@@ -417,7 +417,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED,
         traits={
-            "query_len": frozenset({1}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),

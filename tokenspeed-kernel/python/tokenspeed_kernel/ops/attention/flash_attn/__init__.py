@@ -188,7 +188,6 @@ if (
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "query_len": frozenset({1}),
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -357,7 +356,6 @@ elif platform.is_nvidia and platform.is_hopper:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
-            "query_len": frozenset({1}),
             "return_lse": frozenset({False}),
         },
         tags={"latency"},

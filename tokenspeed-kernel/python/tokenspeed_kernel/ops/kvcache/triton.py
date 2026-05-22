@@ -62,7 +62,7 @@ def _store_kv_cache_kernel(
     is_v = tl.program_id(0)
     row = tl.program_id(1)
 
-    dst_row = tl.load(loc_ptr + row)
+    dst_row = tl.load(loc_ptr + row).to(tl.int64)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < n_kv_per_token
 

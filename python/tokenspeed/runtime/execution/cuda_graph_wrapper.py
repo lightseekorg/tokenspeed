@@ -224,9 +224,7 @@ class CudaGraphWrapper:
         self.world_size = config.world_size
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        paged_cache_group_specs = tuple(
-            getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
-        )
+        paged_cache_group_specs = tuple(token_to_kv_pool.paged_cache_group_specs)
         try:
             attn_backend.init_cuda_graph_state(
                 self.max_bs,
@@ -241,7 +239,7 @@ class CudaGraphWrapper:
             )
         if draft_attn_backend is not None:
             draft_paged_cache_group_specs = tuple(
-                getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+                draft_token_to_kv_pool.paged_cache_group_specs
             )
             try:
                 draft_attn_backend.init_cuda_graph_state(
@@ -416,7 +414,7 @@ class CudaGraphWrapper:
         return graph, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
-        specs = tuple(getattr(pool, "paged_cache_group_specs", ()) or ())
+        specs = tuple(pool.paged_cache_group_specs)
         if not specs:
             return None
         out = {}
@@ -447,10 +445,9 @@ class CudaGraphWrapper:
             bs,
             self.token_to_kv_pool,
         )
-        if paged_cache_block_tables is not None and getattr(
-            self.attn_backend,
-            "uses_paged_cache_groups",
-            False,
+        if (
+            paged_cache_block_tables is not None
+            and self.attn_backend.uses_paged_cache_groups
         ):
             capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -468,10 +465,9 @@ class CudaGraphWrapper:
                     bs,
                     self.draft_token_to_kv_pool,
                 )
-                if draft_paged_cache_block_tables is not None and getattr(
-                    self.draft_attn_backend,
-                    "uses_paged_cache_groups",
-                    False,
+                if (
+                    draft_paged_cache_block_tables is not None
+                    and self.draft_attn_backend.uses_paged_cache_groups
                 ):
                     draft_kwargs["paged_cache_block_tables"] = (
                         draft_paged_cache_block_tables
@@ -581,7 +577,7 @@ class CudaGraphWrapper:
                 kwargs["paged_cache_block_table_base_offsets"] = (
                     paged_cache_block_table_base_offsets
                 )
-        if getattr(self.attn_backend, "uses_padded_decode_token_mask", False):
+        if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
@@ -790,7 +786,7 @@ class CudaGraphWrapper:
             if (
                 bs == 0
                 and paged_cache_block_tables is None
-                and getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                and self.attn_backend.uses_paged_cache_groups
             ):
                 paged_cache_block_tables = self._capture_paged_cache_block_tables(
                     padded_bs,
@@ -855,12 +851,12 @@ class CudaGraphWrapper:
                 spec_info=spec_info,
                 paged_cache_block_tables=(
                     paged_cache_block_tables
-                    if getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                    if self.attn_backend.uses_paged_cache_groups
                     else None
                 ),
                 paged_cache_block_table_base_offsets=(
                     paged_cache_block_table_base_offsets
-                    if getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                    if self.attn_backend.uses_paged_cache_groups
                     else None
                 ),
                 **mamba_kwargs,
