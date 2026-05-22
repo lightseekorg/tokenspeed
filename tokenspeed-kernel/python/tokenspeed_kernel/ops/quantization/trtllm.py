@@ -32,13 +32,9 @@ from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 
 platform = current_platform()
 
-_trtllm_per_tensor_quant_fp8 = error_fn
-_trtllm_per_token_group_quant_8bit = error_fn
-_trtllm_per_token_quant_fp8 = error_fn
 trtllm_fp8_token_group_128 = error_fn
 trtllm_fp8_token = error_fn
 trtllm_fp8_tensor = error_fn
-trtllm_quantize_fp8_with_scale = error_fn
 
 if platform.is_nvidia:
     from tokenspeed_kernel.thirdparty.trtllm import (
