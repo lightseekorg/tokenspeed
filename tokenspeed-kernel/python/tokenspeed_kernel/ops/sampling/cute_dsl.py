@@ -36,6 +36,15 @@ Exports two entry points:
   into two separate tensors; this entry point assembles them back into the
   legacy ``(M, 2)`` layout (one extra elementwise copy off the hot path). The
   runtime no longer uses this layout — kept for tests / future logprob users.
+
+Platform support:
+
+The CuTe DSL kernel ships only for NVIDIA Hopper/Blackwell (sm_90..<sm_120).
+On every other target — AMD ROCm, CPU-only, unsupported SM, missing
+``nvidia-cutlass-dsl`` — the public ``argmax`` / ``argmax_pair`` names are
+bound at import time to pure-torch fallback implementations, so callers don't
+need to test for kernel availability. The cute-DSL imports are gated behind
+``_ARCH_SUPPORTED`` and never executed on non-NVIDIA hosts.
 """
 
 from __future__ import annotations
@@ -182,63 +191,99 @@ def _invoke_kernel(
 _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
 
 
-def argmax(
+def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:
+    if out.shape != (logits.shape[0],):
+        raise ValueError(
+            f"out must have shape (M,)={(logits.shape[0],)}, got {tuple(out.shape)}"
+        )
+    if out.dtype not in _SUPPORTED_OUT_DTYPES:
+        raise ValueError(f"out must be int32 or int64; got {out.dtype}")
+    if out.device != logits.device:
+        raise ValueError("out must be on the same device as logits")
+
+
+def _validate_argmax_pair_out(logits: torch.Tensor, out: torch.Tensor) -> None:
+    M = logits.shape[0]
+    if out.shape != (M, 2):
+        raise ValueError(f"out must have shape (M, 2)={M, 2}, got {tuple(out.shape)}")
+    if out.dtype != torch.float32 or out.device != logits.device:
+        raise ValueError("out must be float32 on the same device as logits")
+
+
+def _argmax_torch_fallback(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Drop-in replacement for ``torch.argmax(logits, dim=-1)``.
+    """Pure-torch implementation of :func:`argmax`.
 
-    Returns an int64 tensor of shape ``(M,)`` by default. The CuTe DSL kernel
-    is used when ``logits`` is a 2D CUDA float32 tensor with N >= 4096 and
-    N % 32 == 0 on a supported Blackwell-class SM; otherwise this falls back
-    to ``torch.argmax`` for transparent compatibility.
-
-    The kernel writes the indices into ``out`` (or into a freshly allocated
-    int64 tensor) directly, so no post-kernel elementwise cast is launched on
-    the hot path. Callers that need int32 token ids can pass an int32 ``out``
-    to skip a downstream ``.to(torch.int32)`` cast — the kernel will write
-    int32 values straight into the buffer.
-
-    Args:
-        logits: 2D tensor of shape ``(M, N)``. Only the last dim is reduced.
-        out: Optional pre-allocated buffer of shape ``(M,)``. Must be int32
-            or int64 on the same device as ``logits``. Determines the dtype
-            of the returned tensor; defaults to int64 when omitted.
-
-    Returns:
-        Integer tensor of shape ``(M,)`` with dtype matching ``out`` (or
-        int64 when ``out`` was not supplied).
+    Selected at import time on non-NVIDIA / unsupported-SM hosts (AMD ROCm,
+    CPU-only, sm_80, sm_120+, missing ``nvidia-cutlass-dsl``). Also reached
+    per-call from the cute path when the input fails the kernel's
+    preconditions (1D / non-CUDA / fp16 / bf16 / small N / unaligned N).
     """
     if out is not None:
-        if out.shape != (logits.shape[0],):
-            raise ValueError(
-                f"out must have shape (M,)={(logits.shape[0],)}, "
-                f"got {tuple(out.shape)}"
-            )
-        if out.dtype not in _SUPPORTED_OUT_DTYPES:
-            raise ValueError(f"out must be int32 or int64; got {out.dtype}")
-        if out.device != logits.device:
-            raise ValueError("out must be on the same device as logits")
+        _validate_argmax_out(logits, out)
+    result = torch.argmax(logits, dim=-1)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def _argmax_pair_torch_fallback(
+    logits: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pure-torch implementation of :func:`argmax_pair`.
+
+    Selected at import time on non-NVIDIA / unsupported-SM hosts, and reached
+    per-call from the cute path when the input fails the kernel's
+    preconditions.
+    """
+    if logits.dim() != 2:
+        raise ValueError(f"argmax_pair expects 2D input, got {logits.dim()}D")
+    M = logits.shape[0]
+    device = logits.device
+    if out is None:
+        out = torch.empty((M, 2), dtype=torch.float32, device=device)
+    else:
+        _validate_argmax_pair_out(logits, out)
+
+    max_vals, max_indices = torch.max(logits, dim=-1, keepdim=True)
+    out[:, 0:1].copy_(max_vals.to(torch.float32))
+    out[:, 1:2].copy_(max_indices.to(torch.float32))
+    return out
+
+
+def _argmax_cute(
+    logits: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """CuTe DSL fast path for argmax.
+
+    Falls back per-call to :func:`_argmax_torch_fallback` when the input
+    isn't kernel-eligible (1D / non-CUDA / fp16 / bf16 / small N / unaligned N).
+    Only ever bound to the public ``argmax`` name on NVIDIA hosts with the
+    cute DSL Python packages available — see the module-level dispatch below.
+    """
+    if out is not None:
+        _validate_argmax_out(logits, out)
 
     if (
         logits.dim() != 2
         or not logits.is_cuda
         or not _supports_cute(logits.shape[1], logits.dtype)
     ):
-        result = torch.argmax(logits, dim=-1)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+        return _argmax_torch_fallback(logits, out=out)
 
     M = logits.shape[0]
     device = logits.device
-
-    if out is None:
-        out_idx = torch.empty((M,), dtype=torch.int64, device=device)
-    else:
-        out_idx = out
+    out_idx = (
+        out if out is not None else torch.empty((M,), dtype=torch.int64, device=device)
+    )
 
     # The max value is needed only inside the kernel reduction; the caller
     # never sees it. Allocate a scratch buffer so the kernel has somewhere to
@@ -248,31 +293,14 @@ def argmax(
     return out_idx
 
 
-def argmax_pair(
+def _argmax_pair_cute(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Row-wise ``(max_value, argmax_index)`` packed as a ``(M, 2)`` float32 tensor.
-
-    The index is stored as ``float32`` — exact for any vocab below ``2**24``
-    (16,777,216), which covers every shipped LLM vocab size. This is a legacy
-    layout kept for tests / future logprob users; the runtime hot path uses
-    :func:`argmax` instead and avoids the extra packing entirely.
-
-    Args:
-        logits: 2D tensor of shape ``(M, N)`` on CUDA.
-        out: Optional pre-allocated ``(M, 2)`` float32 tensor. When supplied,
-            the kernel writes into it (useful inside CUDA graphs).
-
-    Returns:
-        ``(M, 2)`` float32 tensor: ``out[:, 0]`` is the max value,
-        ``out[:, 1]`` is the argmax index.
-    """
+    """CuTe DSL fast path for argmax_pair. Falls back per-call when needed."""
     if logits.dim() != 2:
         raise ValueError(f"argmax_pair expects 2D input, got {logits.dim()}D")
-    if not logits.is_cuda:
-        raise ValueError("argmax_pair requires a CUDA tensor")
 
     M, N = logits.shape
     device = logits.device
@@ -280,20 +308,12 @@ def argmax_pair(
     if out is None:
         out = torch.empty((M, 2), dtype=torch.float32, device=device)
     else:
-        if out.shape != (M, 2):
-            raise ValueError(
-                f"out must have shape (M, 2)={M, 2}, got {tuple(out.shape)}"
-            )
-        if out.dtype != torch.float32 or out.device != device:
-            raise ValueError("out must be float32 on the same device as logits")
+        _validate_argmax_pair_out(logits, out)
 
-    if not _supports_cute(N, logits.dtype):
-        # Fallback: emulate the same (max, idx) packing using torch ops so the
-        # downstream extraction path is uniform.
-        max_vals, max_indices = torch.max(logits, dim=-1, keepdim=True)
-        out[:, 0:1].copy_(max_vals.to(torch.float32))
-        out[:, 1:2].copy_(max_indices.to(torch.float32))
-        return out
+    if not logits.is_cuda or not _supports_cute(N, logits.dtype):
+        # Reuse the pure-torch packing path; pass our pre-allocated buffer so
+        # the caller-supplied ``out`` is honored.
+        return _argmax_pair_torch_fallback(logits, out=out)
 
     # Kernel writes into separate (M,) tensors; assemble into the legacy
     # (M, 2) layout for backward compatibility. This is off the runtime hot
@@ -306,7 +326,14 @@ def argmax_pair(
     return out
 
 
-# Expose the underlying compiled-kernel entry as the registered impl so other
-# code can probe `is _argmax_kernel_impl` style availability checks if needed.
+# Public API binding. On NVIDIA + cute-DSL-installed hosts the fast path is
+# selected; everywhere else the public names refer to pure-torch
+# implementations so callers don't need to test for availability. Mirrors the
+# pattern used in ``tokenspeed_kernel.ops.sampling.cuda``.
 if _CUTE_AVAILABLE:
+    argmax = _argmax_cute
+    argmax_pair = _argmax_pair_cute
     _argmax_kernel_impl = _invoke_kernel
+else:
+    argmax = _argmax_torch_fallback
+    argmax_pair = _argmax_pair_torch_fallback

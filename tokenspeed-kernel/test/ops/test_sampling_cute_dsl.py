@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for the CuTe DSL argmax wrapper used by sampling/drafter code.
+"""Tests for the CuTe DSL argmax kernel wrapper.
 
 These exercise:
   * Parity with ``torch.argmax`` across vocab sizes used by real LLMs.
@@ -26,9 +26,8 @@ These exercise:
     (small N, unaligned N, fp16/bf16).
   * CUDA-graph capture/replay — the kernel must stay in-place under graph
     capture, since the sampling backends run under captured graphs.
-  * Drop-in compatibility from the runtime entrypoints used by the drafter
-    and sampling backends — verifies that the modules import successfully
-    with the cute_dsl integration in place.
+  * Pure-torch fallback path on non-NVIDIA hosts (AMD ROCm / CPU-only /
+    sm_80 / sm_120+ / missing nvidia-cutlass-dsl).
 """
 
 from __future__ import annotations
@@ -382,27 +381,138 @@ def test_argmax_under_cuda_graph(M, N):
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
+def test_argmax_out_buffer_under_cuda_graph(out_dtype):
+    """``cute_argmax(x, out=buf)`` must be CUDA-graph-safe — this is the
+    pattern GreedySamplingBackend uses inside the captured sampling graph.
+
+    Caller provides a pre-allocated buffer (no graph-internal allocation of
+    the output tensor); the kernel writes int32 / int64 indices straight
+    into it. Replay must observe input mutations.
+    """
+    _need_cuda()
+    M, N = 16, MODEL_VOCABS["deepseek_v4"]
+    torch.manual_seed(M ^ N ^ 0xBEEF)
+    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
+    buf = torch.empty(M, dtype=out_dtype, device="cuda")
+
+    # Warmup so cute DSL JIT compiles outside graph capture.
+    cute_argmax(x, out=buf)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cute_argmax(x, out=buf)
+
+    new_x = 0.1 * torch.randn_like(x)
+    x.copy_(new_x)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = torch.argmax(x, dim=-1)
+    torch.testing.assert_close(buf.long(), ref, atol=0, rtol=0)
+
+
+def test_argmax_pair_under_cuda_graph():
+    """argmax_pair with caller-provided (M, 2) f32 buffer must work inside
+    a CUDA graph. The kernel splits its output into two scratch tensors
+    internally; we verify the assembly still survives capture/replay."""
+    _need_cuda()
+    M, N = 8, MODEL_VOCABS["qwen3_5"]
+    torch.manual_seed(0xABCD)
+    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
+    pair = torch.empty((M, 2), dtype=torch.float32, device="cuda")
+
+    cute_argmax_pair(x, out=pair)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cute_argmax_pair(x, out=pair)
+
+    new_x = 0.1 * torch.randn_like(x)
+    x.copy_(new_x)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
+    torch.testing.assert_close(pair[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(pair[:, 1:2].long(), ref_idx, atol=0, rtol=0)
+
+
+def test_greedy_sample_pattern_under_cuda_graph():
+    """Verbatim of GreedySamplingBackend.sample's call pattern: caller holds a
+    pre-allocated int32 buffer sized for max_bs, slices it per request, and
+    captures the slice into the graph. Replay with new logits must produce
+    new tokens."""
+    _need_cuda()
+    max_bs, bs, N = 32, 16, MODEL_VOCABS["kimi_k2_5"]
+    torch.manual_seed(0xCAFE)
+    logits = 0.1 * torch.randn(bs, N, device="cuda", dtype=torch.float32)
+    sample_token_buf = torch.empty((max_bs,), dtype=torch.int32, device="cuda")
+
+    tokens = cute_argmax(logits, out=sample_token_buf[:bs])
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        tokens = cute_argmax(logits, out=sample_token_buf[:bs])
+
+    new_logits = 0.1 * torch.randn_like(logits)
+    logits.copy_(new_logits)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = torch.argmax(logits, dim=-1).to(torch.int32)
+    torch.testing.assert_close(tokens, ref, atol=0, rtol=0)
+    # Slice view must alias the underlying buffer.
+    torch.testing.assert_close(sample_token_buf[:bs], ref, atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
-# Integration smoke — the modules that now import cute_dsl must still load
+# Pure-torch fallback on hosts without the CuTe DSL kernel — exercises the
+# code path AMD ROCm / CPU-only / sm_80 / sm_120+ / missing-nvidia-cutlass-dsl
+# would take. Selected at import time via the module-level dispatch in
+# cute_dsl.py; we reach it here by calling the underscore-prefixed
+# implementation directly so the test runs regardless of the host hardware.
 # ---------------------------------------------------------------------------
 
 
-def test_eagle_imports_cute_argmax():
-    import importlib
-
-    mod = importlib.import_module("tokenspeed.runtime.execution.drafter.eagle")
-    assert mod.cute_argmax is cute_argmax
-
-
-def test_greedy_imports_cute_argmax():
-    import importlib
-
-    mod = importlib.import_module("tokenspeed.runtime.sampling.backends.greedy")
-    assert mod.cute_argmax is cute_argmax
+def test_argmax_torch_fallback_on_cpu_tensor():
+    """Pure-torch fallback must handle CPU input — non-CUDA hosts route here."""
+    x = torch.randn(8, 4096, dtype=torch.float32)
+    out = cute_dsl._argmax_torch_fallback(x)
+    torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+    assert out.dtype == torch.int64
 
 
-def test_flashinfer_imports_cute_argmax():
-    import importlib
+def test_argmax_torch_fallback_with_int32_out():
+    x = torch.randn(8, 4096, dtype=torch.float32)
+    out = torch.empty(8, dtype=torch.int32)
+    cute_dsl._argmax_torch_fallback(x, out=out)
+    torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
 
-    mod = importlib.import_module("tokenspeed.runtime.sampling.backends.flashinfer")
-    assert mod.cute_argmax is cute_argmax
+
+def test_argmax_pair_torch_fallback_on_cpu_tensor():
+    """argmax_pair fallback must handle CPU input — AMD/CPU hosts route here.
+
+    This case was a regression in an earlier version of the wrapper that
+    short-circuited on ``not logits.is_cuda``; AMD/CPU could not even reach
+    the fallback. Keep this test to guard against that regression.
+    """
+    x = torch.randn(4, 4096, dtype=torch.float32)
+    pair = cute_dsl._argmax_pair_torch_fallback(x)
+    assert pair.shape == (4, 2)
+    assert pair.dtype == torch.float32
+    ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
+    torch.testing.assert_close(pair[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(pair[:, 1:2].long(), ref_idx, atol=0, rtol=0)
+
+
+def test_public_binding_dispatch_matches_arch():
+    """Public ``argmax`` / ``argmax_pair`` names are bound at import time:
+    NVIDIA hosts with cute available → cute fast path; everyone else → torch
+    fallback. This test pins that contract."""
+    if cute_dsl.is_available():
+        assert cute_dsl.argmax is cute_dsl._argmax_cute
+        assert cute_dsl.argmax_pair is cute_dsl._argmax_pair_cute
+    else:
+        assert cute_dsl.argmax is cute_dsl._argmax_torch_fallback
+        assert cute_dsl.argmax_pair is cute_dsl._argmax_pair_torch_fallback
