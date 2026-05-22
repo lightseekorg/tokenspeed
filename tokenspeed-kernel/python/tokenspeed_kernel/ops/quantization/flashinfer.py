@@ -17,10 +17,15 @@
 
 """FlashInfer quantization kernels."""
 
+from __future__ import annotations
+
+import torch
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 
 fp4_quantize = error_fn
+flashinfer_quantize_mxfp8 = error_fn
+flashinfer_quantize_nvfp4 = error_fn
 mxfp8_quantize = error_fn
 nvfp4_block_scale_interleave = error_fn
 fp8_blockscale_quantize_runner_sm90 = error_fn
@@ -42,6 +47,70 @@ if current_platform().is_hopper:
         )
     except ImportError:
         pass
+
+
+if mxfp8_quantize is not error_fn:
+
+    @register_kernel(
+        "quantization",
+        "mxfp8",
+        name="flashinfer_quantize_mxfp8",
+        solution="flashinfer",
+        dtypes={torch.bfloat16, torch.float16},
+        traits={
+            "scale_layout": frozenset({"linear"}),
+            "scale_encoding": frozenset({"mxfp8"}),
+        },
+        priority=Priority.SPECIALIZED,
+        tags={"throughput"},
+    )
+    def flashinfer_quantize_mxfp8(
+        x: torch.Tensor,
+        alignment: int = 32,
+        scale_layout: str = "linear",
+        enable_pdl: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return mxfp8_quantize(x, False, alignment=alignment)
+
+
+if fp4_quantize is not error_fn:
+
+    @register_kernel(
+        "quantization",
+        "nvfp4",
+        name="flashinfer_quantize_nvfp4",
+        solution="flashinfer",
+        dtypes={torch.bfloat16, torch.float16},
+        traits={
+            "scale_size": frozenset({16}),
+            "has_global_scale": frozenset({True}),
+            "per_token_activation": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+        tags={"throughput"},
+    )
+    def flashinfer_quantize_nvfp4(
+        x: torch.Tensor,
+        global_scale: float | torch.Tensor | None = None,
+        scale_size: int = 16,
+        scale_layout: str = "128x4",
+        per_token_activation: bool = False,
+        expanded_idx_to_permuted_idx: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if expanded_idx_to_permuted_idx is not None:
+            raise ValueError("flashinfer nvfp4 does not support row remapping")
+
+        # The public quantization API uses the actual scale; FlashInfer's FP4
+        # helper expects the inverse scale used before packing.
+        global_scale_inv = 1.0 / global_scale
+        return fp4_quantize(
+            x,
+            global_scale=global_scale_inv,
+            sf_vec_size=scale_size,
+            is_sf_swizzled_layout=scale_layout != "linear",
+            enable_pdl=enable_pdl,
+        )
 
 
 __all__ = [
