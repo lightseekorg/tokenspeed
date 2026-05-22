@@ -92,11 +92,6 @@ jobs:
             TRIGGER=per-commit
           fi
           MATRIX=$(python3 test/ci_system/pipeline.py scan --root test/ci --trigger "$TRIGGER")
-          # DEBUG (zhyncs/debug-agentic-b200-4gpu-perf): restrict the matrix to
-          # the agentic perf task so the b200-4gpu-perf label change can be
-          # iterated on without spending budget on the rest of the suite.
-          # Revert before merge.
-          MATRIX=$(echo "$MATRIX" | jq -c '{include: [.include[] | select(.name == "perf-kimi-k2.5-nvfp4-agentic")]}')
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
   unit-test:
