@@ -65,10 +65,7 @@ if platform.is_nvidia:
         solution="trtllm",
         dtypes={torch.bfloat16, torch.float16},
         traits={
-            "granularity": frozenset({"tensor", "token", "token_group"}),
-            "group_size": frozenset({None, 128}),
-            "scale_layout": frozenset({"row_major", "linear"}),
-            "scale_dtype": frozenset({torch.float32}),
+            "granularity": frozenset({"tensor", "token", "token_group_128"}),
             "scale_encoding": frozenset({"float32", "ue8m0"}),
         },
         priority=Priority.PERFORMANT,
@@ -77,16 +74,9 @@ if platform.is_nvidia:
         x: torch.Tensor,
         granularity: str = "tensor",
         group_size: int | None = None,
-        num_token_padding: int | None = None,
-        scale_dtype: torch.dtype = torch.float32,
-        scale_layout: str = "row_major",
         scale_encoding: str = "float32",
-        eps: float = 1.0e-10,
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if num_token_padding is not None:
-            raise ValueError("TRT-LLM FP8 quantization does not support row padding")
-
         if granularity in {"tensor", "token"}:
             if scale_encoding != "float32":
                 raise ValueError(f"TRT-LLM {granularity} FP8 requires float32 scales")

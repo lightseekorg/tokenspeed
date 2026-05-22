@@ -47,19 +47,14 @@ if platform.is_nvidia:
         name="flashinfer_quantize_mxfp8",
         solution="flashinfer",
         dtypes={torch.bfloat16, torch.float16},
-        traits={
-            "scale_layout": frozenset({"linear"}),
-            "scale_encoding": frozenset({"mxfp8"}),
-        },
+        traits={},
         priority=Priority.PERFORMANT,
     )
     def flashinfer_quantize_mxfp8(
         x: torch.Tensor,
-        alignment: int = 32,
-        scale_layout: str = "linear",
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return mxfp8_quantize(x, False, alignment=alignment)
+        return mxfp8_quantize(x, False)
 
     @register_kernel(
         "quantization",
@@ -68,32 +63,24 @@ if platform.is_nvidia:
         solution="flashinfer",
         dtypes={torch.bfloat16, torch.float16},
         traits={
-            "scale_size": frozenset({16}),
-            "has_global_scale": frozenset({True}),
-            "per_token_activation": frozenset({False}),
+            "has_scale": frozenset({True}),
         },
         priority=Priority.PERFORMANT,
     )
     def flashinfer_quantize_nvfp4(
         x: torch.Tensor,
-        global_scale: float | torch.Tensor | None = None,
-        scale_size: int = 16,
-        scale_layout: str = "128x4",
-        per_token_activation: bool = False,
-        expanded_idx_to_permuted_idx: torch.Tensor | None = None,
+        scale: float | torch.Tensor | None = None,
+        scale_layout: str = "swizzled",
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if expanded_idx_to_permuted_idx is not None:
-            raise ValueError("flashinfer nvfp4 does not support row remapping")
-
         # The public quantization API uses the actual scale; FlashInfer's FP4
         # helper expects the inverse scale used before packing.
-        global_scale_inv = 1.0 / global_scale
+        scale_inv = 1.0 / scale
         return fp4_quantize(
             x,
-            global_scale=global_scale_inv,
-            sf_vec_size=scale_size,
-            is_sf_swizzled_layout=scale_layout != "linear",
+            global_scale=scale_inv,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=scale_layout == "swizzled",
             enable_pdl=enable_pdl,
         )
 

@@ -95,13 +95,7 @@ def quantize_fp8_with_scale(
     # quantization options
     granularity: Literal["tensor", "token", "token_group"] = "tensor",
     group_size: int | None = None,
-    num_token_padding: int | None = None,
-    scale_dtype: torch.dtype = torch.float32,
-    scale_layout: Literal[
-        "row_major", "column_major", "tma_aligned", "linear"
-    ] = "row_major",
     scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
-    eps: float = 1.0e-10,
     # kernel options
     enable_pdl: bool = False,
     # dispatch options
@@ -121,13 +115,8 @@ def quantize_fp8_with_scale(
             token_group.
         group_size: Number of contiguous values per scale group along the last
             dimension. Required for token_group granularity.
-        num_token_padding: Optional output row padding for GEMM/MoE kernels.
-        scale_dtype: Requested scale dtype for token_group granularity.
-        scale_layout: Scale memory layout for token_group granularity, such as
-            row_major, column_major, tma_aligned, or linear.
         scale_encoding: Scale encoding for token_group granularity, such as
             float32, ue8m0, or packed_ue8m0.
-        eps: Minimum value used by dynamic token_group scale computation.
         enable_pdl: Whether to request Programmatic Dependent Launch support.
         override: Optional exact kernel name or solution override.
         solution: Optional registered solution to select.
@@ -138,6 +127,9 @@ def quantize_fp8_with_scale(
     The expected scale shapes are [1] for tensor granularity, [M, 1] for token
     granularity, and [M, ceil(K / group_size)] or a backend-specific layout for
     token_group granularity, where M = x.reshape(-1, x.shape[-1]).shape[0].
+    Returned scales use float32 dtype for scale_encoding="float32" and a
+    backend-specific encoded integer dtype for non-float encodings such as
+    "ue8m0".
     """
 
     if granularity not in {"tensor", "token", "token_group"}:
@@ -147,11 +139,11 @@ def quantize_fp8_with_scale(
             raise ValueError(
                 f"token_group granularity requires positive group_size, got {group_size}"
             )
+        granularity_trait = f"token_group_{group_size}"
+    else:
+        granularity_trait = granularity
     traits = {
-        "granularity": granularity,
-        "group_size": group_size,
-        "scale_dtype": scale_dtype,
-        "scale_layout": scale_layout,
+        "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
     }
     kernel = select_kernel(
@@ -164,10 +156,8 @@ def quantize_fp8_with_scale(
     )
     shape_params = {
         "shape": tuple(x.shape),
-        "granularity": granularity,
+        "granularity": granularity_trait,
         "group_size": group_size,
-        "scale_dtype": str(scale_dtype),
-        "scale_layout": scale_layout,
         "scale_encoding": scale_encoding,
     }
     ShapeCapture.get().record(
@@ -183,21 +173,14 @@ def quantize_fp8_with_scale(
         return kernel(
             x,
             granularity=granularity,
-            num_token_padding=num_token_padding,
             group_size=group_size,
-            scale_dtype=scale_dtype,
-            scale_layout=scale_layout,
             scale_encoding=scale_encoding,
-            eps=eps,
             enable_pdl=enable_pdl,
         )
 
 
 def quantize_mxfp8(
     x: torch.Tensor,
-    # quantization options
-    alignment: int = 32,
-    scale_layout: Literal["linear", "128x4", "8x4"] = "linear",
     # kernel options
     enable_pdl: bool = False,
     # dispatch options
@@ -207,14 +190,10 @@ def quantize_mxfp8(
     """Quantize x to MXFP8 format.
 
     MXFP8 uses FP8 data plus encoded vector scales, commonly one scale per 32
-    values along the last dimension.  Backends may pad the last dimension to
-    alignment and may return a flat encoded scale buffer whose layout is
-    specified by scale_layout.
+    values along the last dimension.
 
     Args:
         x: Input tensor.
-        alignment: Last-dimension alignment requested from the backend.
-        scale_layout: Scale-factor layout, such as linear, 128x4, or 8x4.
         enable_pdl: Whether to request Programmatic Dependent Launch support.
         override: Optional exact kernel name or solution override.
         solution: Optional registered solution to select.
@@ -224,13 +203,7 @@ def quantize_mxfp8(
 
     """
 
-    if alignment <= 0:
-        raise ValueError(f"alignment must be positive, got {alignment}")
-    traits = {
-        "alignment": alignment,
-        "scale_layout": scale_layout,
-        "scale_encoding": "mxfp8",
-    }
+    traits = {}
     kernel = select_kernel(
         "quantization",
         "mxfp8",
@@ -241,8 +214,6 @@ def quantize_mxfp8(
     )
     shape_params = {
         "shape": tuple(x.shape),
-        "alignment": alignment,
-        "scale_layout": scale_layout,
     }
     ShapeCapture.get().record(
         "quantization", "mxfp8", kernel.name, x.dtype, shape_params
@@ -252,64 +223,46 @@ def quantize_mxfp8(
     ):
         return kernel(
             x,
-            alignment=alignment,
-            scale_layout=scale_layout,
             enable_pdl=enable_pdl,
         )
 
 
 def quantize_nvfp4(
     x: torch.Tensor,
+    scale: float | torch.Tensor | None = None,
     # quantization options
-    global_scale: float | None = None,
-    scale_size: int = 16,
-    scale_layout: Literal["linear", "128x4", "8x4"] = "128x4",
-    per_token_activation: bool = False,
-    expanded_idx_to_permuted_idx: torch.Tensor | None = None,
+    scale_layout: Literal["linear", "swizzled"] = "swizzled",
     # kernel options
     enable_pdl: bool = False,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
-) -> (
-    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize x to packed NVFP4.
 
-    NVFP4 uses packed E2M1x2 data with one E4M3 scale factor per scale_size
-    values, usually scale_size=16. The quantized output is usually shaped
-    [M, K/2].
+    NVFP4 uses packed E2M1x2 data with one E4M3 scale factor per 16 values.
+    The quantized output is usually shaped [M, K/2].
 
-    global_scale is the actual global scale. Backend adapters should handle any
+    scale is the actual input scale. Backend adapters should handle any
     backend-specific inverse-scale convention internally.
 
     Args:
         x: Input tensor.
-        global_scale: Optional scalar global scale.
-        scale_size: Number of values per scale-factor vector.
-        scale_layout: Scale-factor layout, such as linear, 128x4, or 8x4.
-        per_token_activation: Whether the backend should also produce per-token
-            activation scales.
-        expanded_idx_to_permuted_idx: Optional row remapping for per-token
-            activation quantization.
+        scale: Optional scalar input scale.
+        scale_layout: Scale-factor layout. "linear" returns unswizzled scales;
+            "swizzled" requests the backend-specific layout used by FP4 GEMM.
         enable_pdl: Whether to request Programmatic Dependent Launch support.
         override: Optional exact kernel name or solution override.
         solution: Optional registered solution to select.
 
     Returns:
-        Tuple of packed NVFP4 tensor and scale-factor tensor. Backends that
-        support per-token activation scales may return a third tensor.
+        Tuple of packed NVFP4 tensor and scale-factor tensor.
 
     """
 
-    if scale_size <= 0:
-        raise ValueError(f"scale_size must be positive, got {scale_size}")
-
     traits = {
-        "scale_size": scale_size,
         "scale_layout": scale_layout,
-        "has_global_scale": global_scale is not None,
-        "per_token_activation": per_token_activation,
+        "has_scale": scale is not None,
     }
     kernel = select_kernel(
         "quantization",
@@ -321,10 +274,8 @@ def quantize_nvfp4(
     )
     shape_params = {
         "shape": tuple(x.shape),
-        "scale_size": scale_size,
         "scale_layout": scale_layout,
-        "has_global_scale": global_scale is not None,
-        "per_token_activation": per_token_activation,
+        "has_scale": scale is not None,
     }
     ShapeCapture.get().record(
         "quantization", "nvfp4", kernel.name, x.dtype, shape_params
@@ -334,11 +285,8 @@ def quantize_nvfp4(
     ):
         return kernel(
             x,
-            global_scale=global_scale,
-            scale_size=scale_size,
+            scale=scale,
             scale_layout=scale_layout,
-            per_token_activation=per_token_activation,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             enable_pdl=enable_pdl,
         )
 
