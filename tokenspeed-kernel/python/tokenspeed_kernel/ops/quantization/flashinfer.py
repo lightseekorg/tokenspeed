@@ -23,6 +23,8 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 
+platform = current_platform()
+
 fp4_quantize = error_fn
 flashinfer_quantize_mxfp8 = error_fn
 flashinfer_quantize_nvfp4 = error_fn
@@ -30,26 +32,17 @@ mxfp8_quantize = error_fn
 nvfp4_block_scale_interleave = error_fn
 fp8_blockscale_quantize_runner_sm90 = error_fn
 
-if current_platform().is_nvidia:
-    try:
-        from flashinfer import (
-            fp4_quantize,
-            mxfp8_quantize,
-            nvfp4_block_scale_interleave,
-        )
-    except ImportError:
-        pass
+if platform.is_nvidia:
+    from flashinfer import (
+        fp4_quantize,
+        mxfp8_quantize,
+        nvfp4_block_scale_interleave,
+    )
 
-if current_platform().is_hopper:
-    try:
+    if platform.is_hopper:
         from flashinfer.gemm.gemm_base import (
             get_fp8_blockscale_gemm_runner_sm90 as fp8_blockscale_quantize_runner_sm90,
         )
-    except ImportError:
-        pass
-
-
-if mxfp8_quantize is not error_fn:
 
     @register_kernel(
         "quantization",
@@ -71,9 +64,6 @@ if mxfp8_quantize is not error_fn:
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return mxfp8_quantize(x, False, alignment=alignment)
-
-
-if fp4_quantize is not error_fn:
 
     @register_kernel(
         "quantization",

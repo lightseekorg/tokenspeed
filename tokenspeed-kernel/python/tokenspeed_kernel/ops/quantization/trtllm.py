@@ -27,17 +27,25 @@ without depending on TRT-LLM's scale tensor layout.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.platform import Platform, current_platform
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
-from tokenspeed_kernel.thirdparty.trtllm import (
-    per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
-)
-from tokenspeed_kernel.thirdparty.trtllm import (
-    per_token_group_quant_8bit as _trtllm_per_token_group_quant_8bit,
-)
-from tokenspeed_kernel.thirdparty.trtllm import (
-    per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
-)
+
+platform = current_platform()
+
+_trtllm_per_tensor_quant_fp8 = error_fn
+_trtllm_per_token_group_quant_8bit = error_fn
+_trtllm_per_token_quant_fp8 = error_fn
+
+if platform.is_nvidia:
+    from tokenspeed_kernel.thirdparty.trtllm import (
+        per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
+    )
+    from tokenspeed_kernel.thirdparty.trtllm import (
+        per_token_group_quant_8bit as _trtllm_per_token_group_quant_8bit,
+    )
+    from tokenspeed_kernel.thirdparty.trtllm import (
+        per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
+    )
 
 _FP8_DTYPE = Platform.get().fp8e4m3fn.dtype
 trtllm_quantize_fp8_with_scale = error_fn
@@ -62,11 +70,7 @@ def trtllm_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
     return output.float()
 
 
-if (
-    _trtllm_per_tensor_quant_fp8 is not error_fn
-    and _trtllm_per_token_quant_fp8 is not error_fn
-    and _trtllm_per_token_group_quant_8bit is not error_fn
-):
+if platform.is_nvidia:
 
     @register_kernel(
         "quantization",
