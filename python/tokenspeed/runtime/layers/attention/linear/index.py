@@ -68,6 +68,9 @@ def prepare_chunk_indices(
 def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
-    return torch.cat(
-        [cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
-    ).cumsum(-1)
+    nums = triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
+    offsets = torch.zeros(
+        nums.shape[0] + 1, dtype=nums.dtype, device=nums.device
+    )
+    torch.cumsum(nums, dim=0, out=offsets[1:])
+    return offsets
