@@ -242,6 +242,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(ForwardMode.from_num_extends(0, 2), ForwardMode.DECODE)
         self.assertEqual(
             ForwardMode.from_num_extends(0, 2, has_drafter=True),
+            ForwardMode.DECODE,
+        )
+        self.assertEqual(
+            ForwardMode.from_num_extends(
+                0, 2, has_drafter=True, use_target_verify=True
+            ),
             ForwardMode.TARGET_VERIFY,
         )
         self.assertEqual(ForwardMode.from_num_extends(2, 2), ForwardMode.EXTEND)

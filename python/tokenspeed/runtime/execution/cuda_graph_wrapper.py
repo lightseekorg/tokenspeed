@@ -220,6 +220,7 @@ class CudaGraphWrapper:
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
+        self.use_target_verify_forward_mode = config.use_target_verify_forward_mode
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
         # Backends alias their cache_seqlens buffer. Draft backend aliases
@@ -296,7 +297,7 @@ class CudaGraphWrapper:
 
         capture_forward_mode = (
             ForwardMode.TARGET_VERIFY
-            if self.drafter is not None
+            if self.drafter is not None and self.use_target_verify_forward_mode
             else ForwardMode.DECODE
         )
         ctx = ForwardContext(
@@ -458,7 +459,11 @@ class CudaGraphWrapper:
             bs,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
-            ForwardMode.DECODE if self.drafter is None else ForwardMode.TARGET_VERIFY,
+            (
+                ForwardMode.TARGET_VERIFY
+                if self.drafter is not None and self.use_target_verify_forward_mode
+                else ForwardMode.DECODE
+            ),
             **capture_kwargs,
         )
         if self.draft_attn_backend is not None:

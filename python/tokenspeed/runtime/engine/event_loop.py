@@ -928,6 +928,9 @@ class EventLoop:
             forward_op.num_extends(),
             len(forward_op.request_ids),
             has_drafter=self.server_args.speculative_algorithm is not None,
+            use_target_verify=(
+                self.model_executor.config.use_target_verify_forward_mode
+            ),
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -1005,6 +1008,9 @@ class EventLoop:
                 forward_op.num_extends(),
                 batch_size,
                 has_drafter=self.server_args.speculative_algorithm is not None,
+                use_target_verify=(
+                    self.model_executor.config.use_target_verify_forward_mode
+                ),
             )
 
         self._dp_local_info[0, 0] = num_tokens

@@ -74,13 +74,18 @@ class ForwardMode(IntEnum):
         batch_size: int,
         *,
         has_drafter: bool = False,
+        use_target_verify: bool = False,
     ) -> "ForwardMode":
         if batch_size <= 0:
             return ForwardMode.IDLE
         elif num_extends > 0:
             return ForwardMode.MIXED if num_extends < batch_size else ForwardMode.EXTEND
         else:
-            return ForwardMode.TARGET_VERIFY if has_drafter else ForwardMode.DECODE
+            return (
+                ForwardMode.TARGET_VERIFY
+                if has_drafter and use_target_verify
+                else ForwardMode.DECODE
+            )
 
 
 class CaptureHiddenMode(IntEnum):

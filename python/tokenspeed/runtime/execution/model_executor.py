@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.model_config import ModelConfig, is_deepseek_v4
 from tokenspeed.runtime.engine.scheduler_utils import (
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
@@ -100,6 +100,7 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    use_target_verify_forward_mode: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -153,6 +154,10 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            use_target_verify_forward_mode=(
+                server_args.speculative_algorithm is not None
+                and is_deepseek_v4(model_config.hf_config)
+            ),
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -1108,6 +1113,7 @@ class ModelExecutor:
                 num_extends,
                 bs,
                 has_drafter=self.drafter is not None,
+                use_target_verify=self.config.use_target_verify_forward_mode,
             )
 
             if num_extends <= 0:
