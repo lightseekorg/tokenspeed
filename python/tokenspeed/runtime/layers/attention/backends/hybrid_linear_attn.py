@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.linear.fused_sigmoid_gating_recurrent i
     fused_sigmoid_gating_delta_rule_update,
 )
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
+from tokenspeed.runtime.layers.attention.linear.index import set_total_chunks_hint
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -410,6 +411,7 @@ class MambaAttnBackend(AttentionBackend):
                     )
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
                     extend_seq_lens_cpu = extend_lens.to(device="cpu")
+                set_total_chunks_hint(extend_seq_lens_cpu)
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 

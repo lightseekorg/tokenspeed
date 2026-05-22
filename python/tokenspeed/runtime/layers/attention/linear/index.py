@@ -20,10 +20,25 @@
 
 # -*- coding: utf-8 -*-
 
+import numpy as np
 import torch
 import triton
 
 from tokenspeed.runtime.layers.attention.linear.utils import tensor_cache
+
+# Pre-computed total chunk counts keyed by chunk_size.
+_total_chunks_hint: dict[int, int] = {}
+
+
+def set_total_chunks_hint(
+    seq_lens_cpu,
+    chunk_sizes: tuple[int, ...] = (16, 64),
+) -> None:
+    """Pre-compute total chunk counts on CPU
+    """
+    lens = np.asarray(seq_lens_cpu, dtype=np.int64)
+    for cs in chunk_sizes:
+        _total_chunks_hint[cs] = int(np.sum(-(-lens // cs)))
 
 
 @tensor_cache
@@ -40,8 +55,9 @@ def prepare_chunk_indices(
         nums.shape[0] + 1, dtype=nums.dtype, device=nums.device
     )
     torch.cumsum(nums, dim=0, out=offsets[1:])
-    total = offsets[-1]
-    total_int = total.item()
+    total_int = _total_chunks_hint.pop(chunk_size, None)
+    if total_int is None:
+        total_int = offsets[-1].item()
     chunk_global = torch.arange(total_int, device=nums.device)
     seq_ids = torch.searchsorted(offsets[1:], chunk_global, right=True)
     local_indices = chunk_global - offsets[seq_ids]
