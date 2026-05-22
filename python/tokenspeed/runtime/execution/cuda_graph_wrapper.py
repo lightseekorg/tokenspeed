@@ -451,7 +451,6 @@ class CudaGraphWrapper:
             capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
-            bs * self.max_tokens_per_req,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
             ForwardMode.DECODE,
@@ -474,7 +473,6 @@ class CudaGraphWrapper:
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
-                bs * self.max_tokens_per_req,
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
                 ForwardMode.DECODE,
@@ -580,7 +578,6 @@ class CudaGraphWrapper:
             kwargs["actual_bs"] = actual_bs
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
-            padded_bs * self.max_tokens_per_req,
             req_pool_indices,
             seq_lens,
             req_to_page=req_to_page,
@@ -590,7 +587,6 @@ class CudaGraphWrapper:
         if self.draft_attn_backend is not None:
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
-                padded_bs * self.max_tokens_per_req,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,
@@ -613,7 +609,6 @@ class CudaGraphWrapper:
         self.attn_backend.init_forward_metadata(
             bs=padded_bs,
             num_extends=num_extends,
-            num_tokens=padded_bs * self.max_tokens_per_req,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             req_to_page=req_to_page,
@@ -650,7 +645,6 @@ class CudaGraphWrapper:
             self.draft_attn_backend.init_forward_metadata(
                 bs=padded_bs,
                 num_extends=num_extends,
-                num_tokens=padded_bs * self.max_tokens_per_req,
                 req_pool_indices=req_pool_indices,
                 seq_lens=draft_seq_lens,
                 req_to_page=self.drafter.req_to_page,

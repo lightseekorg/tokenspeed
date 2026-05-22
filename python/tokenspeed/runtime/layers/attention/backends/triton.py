@@ -178,7 +178,6 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -200,17 +199,18 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             if spec_info is None:
                 torch.cumsum(seq_lens, dim=0, out=kv_indptr[1 : bs + 1])
                 kv_indptr = kv_indptr[: bs + 1]
@@ -451,7 +451,6 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -462,17 +461,18 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             if spec_info is None:
                 kv_indptr = self.kv_indptr
                 torch.cumsum(seq_lens, dim=0, out=kv_indptr[1 : bs + 1])
@@ -613,7 +613,6 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -623,17 +622,18 @@ class TritonAttnBackend(AttentionBackend):
     ):
         _req_to_token = self.req_to_page
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             # Update kv_indptr, kv_indices
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
@@ -811,8 +811,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         # Multi-token decode (target verify or drafter compound) reuses
         # the multi-token kernel path in forward_extend.
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        if q_len_per_req > 1:
             return self.forward_extend(
                 q,
                 k,

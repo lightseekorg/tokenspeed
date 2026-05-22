@@ -182,7 +182,6 @@ class TRTLLMMLABackend(AttentionBackend):
         self,
         bs: int,
         num_extends: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -325,7 +324,6 @@ class TRTLLMMLABackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -354,7 +352,6 @@ class TRTLLMMLABackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -410,23 +407,23 @@ class TRTLLMMLABackend(AttentionBackend):
 
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        if spec_num_tokens > 1 and self.is_draft:
+        if q_len_per_req > 1 and self.is_draft:
             # First draft step catching up its KV after verify: one query entry per token;
             # per-token seq_lens advance by 1 so each successive token sees its own KV write.
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             block_tables = metadata.block_kv_indices[num_extends:].repeat_interleave(
-                spec_num_tokens, dim=0
+                q_len_per_req, dim=0
             )
             base_lens = metadata.seq_lens_k[num_extends:].repeat_interleave(
-                spec_num_tokens
+                q_len_per_req
             )
             offsets = torch.arange(
-                spec_num_tokens, device=base_lens.device, dtype=base_lens.dtype
+                q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
             ).repeat(bs)
             seq_lens = base_lens + offsets
-            max_seq_len = metadata.max_seq_len_k + spec_num_tokens
+            max_seq_len = metadata.max_seq_len_k + q_len_per_req
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)

@@ -460,8 +460,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             },
         )
 
-        # num_tokens = padded_bs * max_tokens_per_req is passed as 2nd positional.
-        self.assertEqual(captured["args"][1], 4)
+        # padded_bs is the first positional arg.
+        self.assertEqual(captured["args"][0], 4)
         self.assertEqual(captured["kwargs"]["actual_bs"], 0)
         self.assertEqual(
             captured["kwargs"]["paged_cache_block_tables"]["v4.swa"].shape,
@@ -1075,7 +1075,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
@@ -1107,7 +1106,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=3,
-            num_tokens=10,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1192,7 +1190,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
@@ -1450,7 +1447,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_forward_metadata(
             bs=3,
-            num_tokens=5,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1536,7 +1532,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_forward_metadata(
             bs=4,
-            num_tokens=8,
             req_pool_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12, 6], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1581,7 +1576,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_forward_metadata(
             bs=3,
-            num_tokens=5,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1676,7 +1670,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -1708,7 +1701,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([256, 129], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -1762,7 +1754,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([128, 64], device=device, dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], device=device, dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -1940,7 +1931,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -2004,7 +1994,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.init_cuda_graph_state(max_bs=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
-            num_tokens=4,
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
@@ -2012,7 +2001,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=4,
-            num_tokens=4,
             actual_bs=2,
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
@@ -2712,7 +2700,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens_cpu=torch.tensor([16], dtype=torch.int32),
             query_lens_cpu=torch.tensor([6], dtype=torch.int32),
             compress_ratio=4,
-            num_tokens=6,
             max_logits_bytes=32,
             workspace_size=100,
         )
@@ -2741,7 +2728,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens_cpu=torch.tensor([16, 8], dtype=torch.int32),
             query_lens_cpu=torch.tensor([2, 2], dtype=torch.int32),
             compress_ratio=4,
-            num_tokens=4,
             max_logits_bytes=128,
             workspace_size=100,
         )

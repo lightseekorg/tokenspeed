@@ -177,7 +177,6 @@ class FlashMLABackend(AttentionBackend):
         self,
         bs: int,
         num_extends: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -230,8 +229,9 @@ class FlashMLABackend(AttentionBackend):
         else:
             block_table = None
 
-        # spec_num_tokens > 1 (verify/draft) advances per-row seq_lens by the
-        # worst-case verify width so the tile planner covers the longest path.
+        # When spec-dec is active (self.spec_num_tokens > 1), advance per-row
+        # seq_lens by the worst-case verify width so the tile planner covers
+        # the longest path.
         if self.spec_num_tokens > 1:
             plan_seq_lens = seq_lens + self.draft_token_num
             num_heads_plan = self.draft_token_num * self.num_q_heads
@@ -366,23 +366,23 @@ class FlashMLABackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
         block_table = self.cuda_graph_kv_indices[:bs]
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
@@ -419,7 +419,6 @@ class FlashMLABackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -436,11 +435,10 @@ class FlashMLABackend(AttentionBackend):
             block_table = self.cuda_graph_kv_indices[:bs]
         seq_lens = seq_lens[:bs]
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
-        is_target_verify = not self.is_draft and spec_num_tokens > 1
-        is_draft_extend = self.is_draft and spec_num_tokens > 1
+        is_target_verify = not self.is_draft and self.spec_num_tokens > 1
+        is_draft_extend = self.is_draft and self.spec_num_tokens > 1
 
-        if spec_num_tokens == 1:
+        if self.spec_num_tokens == 1:
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
@@ -485,18 +483,18 @@ class FlashMLABackend(AttentionBackend):
         forward_mode: ForwardMode | None = None,
         **kwargs,
     ):
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and q_len_per_req > 1
         )
         is_draft_extend = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and self.is_draft
-            and spec_num_tokens > 1
+            and q_len_per_req > 1
         )
 
         if forward_mode is None or forward_mode.is_extend():
@@ -604,8 +602,8 @@ class FlashMLABackend(AttentionBackend):
     ) -> torch.Tensor:
         # Multi-token decode (target verify or drafter compound) reuses
         # the multi-token kernel path in forward_extend.
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        if q_len_per_req > 1:
             return self.forward_extend(
                 q,
                 k,

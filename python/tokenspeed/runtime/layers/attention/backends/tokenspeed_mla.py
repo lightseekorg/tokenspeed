@@ -215,7 +215,6 @@ class CuteDSLMLABackend(AttentionBackend):
         self,
         bs: int,
         num_extends: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -361,7 +360,6 @@ class CuteDSLMLABackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -386,7 +384,6 @@ class CuteDSLMLABackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -442,8 +439,8 @@ class CuteDSLMLABackend(AttentionBackend):
 
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
-        spec_num_tokens = q.shape[0] // bs
-        query = q.view(bs, spec_num_tokens, layer.tp_q_head_num, layer.head_dim)
+        q_len_per_req = q.shape[0] // bs
+        query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
 
         softmax_scale = layer.scaling
         if self.data_type == torch.float8_e4m3fn:

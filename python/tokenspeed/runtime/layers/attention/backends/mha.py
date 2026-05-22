@@ -100,7 +100,6 @@ class MHAAttnBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -172,17 +171,16 @@ class MHAAttnBackend(AttentionBackend):
             )
             return
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        if self.spec_num_tokens > 1:
             self.forward_prefill_metadata = MHAMetadata(
                 cache_seqlens_int32=seq_lens,
                 cu_seqlens_q=self._make_uniform_cu_seqlens(
                     bs,
-                    spec_num_tokens,
+                    self.spec_num_tokens,
                     seq_lens.device,
                 ),
                 page_table=page_table,
-                max_seq_len_q=spec_num_tokens,
+                max_seq_len_q=self.spec_num_tokens,
                 max_seq_len_k=self.max_context_len,
             )
             if self.is_draft:
@@ -247,7 +245,6 @@ class MHAAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -258,17 +255,16 @@ class MHAAttnBackend(AttentionBackend):
             )
 
         cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        if self.spec_num_tokens > 1:
             metadata = MHAMetadata(
                 cache_seqlens_int32=cache_seqlens,
                 cu_seqlens_q=self._make_uniform_cu_seqlens(
                     bs,
-                    spec_num_tokens,
+                    self.spec_num_tokens,
                     self.device,
                 ),
                 page_table=self.cuda_graph_page_table[:bs, :],
-                max_seq_len_q=spec_num_tokens,
+                max_seq_len_q=self.spec_num_tokens,
                 max_seq_len_k=self.max_context_len,
             )
             self.cuda_graph_prefill_metadata[bs] = metadata
@@ -293,7 +289,6 @@ class MHAAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -333,8 +328,8 @@ class MHAAttnBackend(AttentionBackend):
 
         # Multi-token decode (q_len > 1) reuses the prefill kernel via the
         # uniform-stride prefill slot; plain decode uses the single-token slot.
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        if q_len_per_req > 1:
             return self.forward_extend(
                 q,
                 k,

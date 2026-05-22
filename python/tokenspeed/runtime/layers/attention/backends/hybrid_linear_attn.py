@@ -328,7 +328,6 @@ class MambaAttnBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = ForwardMode.DECODE,
@@ -340,14 +339,15 @@ class MambaAttnBackend(AttentionBackend):
         else:
             mamba_cache_indices = self.pool.get_mamba_indices(req_pool_indices[:bs])
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
         mamba_output_indices = None
@@ -366,7 +366,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             mamba_cache_indices = mamba_input_indices
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
@@ -377,7 +377,7 @@ class MambaAttnBackend(AttentionBackend):
                 )
                 query_start_loc = torch.arange(
                     0,
-                    num_tokens + 1,
+                    bs * tokens_per_req + 1,
                     step=tokens_per_req,
                     dtype=torch.int32,
                     device=self.device,
@@ -578,23 +578,23 @@ class MambaAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         **kwargs,
     ):
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
@@ -632,7 +632,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             padded_mamba_indices.copy_(mamba_input_indices)
         self._qsl_dirty[bs - 1] = False
-        self._qsl_last_mode[bs - 1] = (forward_mode, spec_num_tokens > 1)
+        self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -643,7 +643,6 @@ class MambaAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -672,18 +671,17 @@ class MambaAttnBackend(AttentionBackend):
         if num_padding > 0:
             padded_mamba_indices[real_bs:].fill_(-1)
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
 
         mamba_output_indices = None
@@ -705,10 +703,10 @@ class MambaAttnBackend(AttentionBackend):
         if num_padding == 0:
             need_copy = self._qsl_dirty[bs - 1] or self._qsl_last_mode[bs - 1] != (
                 forward_mode,
-                spec_num_tokens > 1,
+                self.spec_num_tokens > 1,
             )
             if need_copy:
-                if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+                if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
                     self.query_start_loc_list[bs - 1].copy_(
                         self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
                     )
@@ -717,9 +715,9 @@ class MambaAttnBackend(AttentionBackend):
                         self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                     )
                 self._qsl_dirty[bs - 1] = False
-                self._qsl_last_mode[bs - 1] = (forward_mode, spec_num_tokens > 1)
+                self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
         else:
-            if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+            if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
                 self.query_start_loc_list[bs - 1][:real_bs].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[:real_bs]
                 )
@@ -734,7 +732,7 @@ class MambaAttnBackend(AttentionBackend):
             else:
                 raise ValueError(f"Invalid forward mode: {forward_mode=}")
             self._qsl_dirty[bs - 1] = True
-            self._qsl_last_mode[bs - 1] = (forward_mode, spec_num_tokens > 1)
+            self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
@@ -763,8 +761,8 @@ class MambaAttnBackend(AttentionBackend):
         # Multi-token decode (target verify or drafter compound) reuses
         # the multi-token kernel path in forward_extend. `q` is None for
         # hybrid linear-attn layers; the token count comes from mixed_qkv.
-        spec_num_tokens = kwargs["mixed_qkv"].shape[0] // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        q_len_per_req = kwargs["mixed_qkv"].shape[0] // bs if bs > 0 else 1
+        if q_len_per_req > 1:
             return self.forward_extend(
                 q,
                 k,
@@ -869,12 +867,12 @@ class MambaAttnBackend(AttentionBackend):
 
         # `q` is None for hybrid linear-attn layers; the token count comes
         # from seq_len carried in kwargs.
-        spec_num_tokens = seq_len // bs if bs > 0 else 1
+        q_len_per_req = seq_len // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and q_len_per_req > 1
         )
 
         query_start_loc = self.forward_metadata.query_start_loc
