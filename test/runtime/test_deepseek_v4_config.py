@@ -41,7 +41,13 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4_nextn,
 )
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    CudaGraphWrapper,
+    _draft_decode_forward_mode,
+)
+from tokenspeed.runtime.execution.drafter.eagle import (
+    _advance_draft_forward_metadata_if_supported,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import (
     deepseek_v4 as deepseek_v4_backend,
@@ -252,6 +258,21 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertEqual(ForwardMode.from_num_extends(2, 2), ForwardMode.EXTEND)
         self.assertEqual(ForwardMode.from_num_extends(1, 2), ForwardMode.MIXED)
+
+    def test_spec_helpers_preserve_non_v4_backend_contracts(self):
+        self.assertEqual(_draft_decode_forward_mode(False), ForwardMode.DECODE)
+        self.assertEqual(_draft_decode_forward_mode(True), ForwardMode.DRAFT_EXTEND)
+
+        seq_lens = object()
+        calls = []
+
+        class V4LikeBackend:
+            def advance_draft_forward_metadata(self, actual_seq_lens):
+                calls.append(actual_seq_lens)
+
+        _advance_draft_forward_metadata_if_supported(V4LikeBackend(), seq_lens)
+        _advance_draft_forward_metadata_if_supported(SimpleNamespace(), seq_lens)
+        self.assertEqual(calls, [seq_lens])
 
     def _bind_deepseek_v4_moe_methods(self, moe):
         for name in (

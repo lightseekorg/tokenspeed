@@ -61,6 +61,10 @@ def get_is_capture_mode() -> bool:
     return _is_capture_mode
 
 
+def _draft_decode_forward_mode(use_draft_extend: bool) -> ForwardMode:
+    return ForwardMode.DRAFT_EXTEND if use_draft_extend else ForwardMode.DECODE
+
+
 def compute_max_logical_pages_for_capture(
     spec,
     *,
@@ -485,7 +489,7 @@ class CudaGraphWrapper:
                 bs,
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
-                ForwardMode.DRAFT_EXTEND,
+                _draft_decode_forward_mode(self.use_target_verify_forward_mode),
                 **draft_kwargs,
             )
 
@@ -603,7 +607,9 @@ class CudaGraphWrapper:
                 req_pool_indices,
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,
-                forward_mode=ForwardMode.DRAFT_EXTEND,
+                forward_mode=_draft_decode_forward_mode(
+                    self.use_target_verify_forward_mode
+                ),
                 **draft_attn_kwargs,
             )
 
@@ -670,7 +676,9 @@ class CudaGraphWrapper:
                     req_pool_indices=req_pool_indices,
                     seq_lens=seq_lens,
                     req_to_page=self.drafter.req_to_page,
-                    forward_mode=ForwardMode.DRAFT_EXTEND,
+                    forward_mode=_draft_decode_forward_mode(
+                        self.use_target_verify_forward_mode
+                    ),
                     **draft_kwargs,
                 )
 

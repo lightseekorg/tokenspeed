@@ -51,6 +51,12 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
+def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None:
+    advance = getattr(attn_backend, "advance_draft_forward_metadata", None)
+    if advance is not None:
+        advance(seq_lens)
+
+
 @dataclass
 class EagleDraftInput:
     input_num_tokens: int
@@ -330,7 +336,9 @@ class Eagle(BaseDrafter):
             out_cache_loc = cache_locs[:, i - 1].contiguous()
             # Keep attention metadata on the accepted prefix; rejected verify
             # tail slots may still contain stale draft KV.
-            ctx.attn_backend.advance_draft_forward_metadata(draft_seq_lens)
+            _advance_draft_forward_metadata_if_supported(
+                ctx.attn_backend, draft_seq_lens
+            )
 
             with nvtx_range("draft_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
