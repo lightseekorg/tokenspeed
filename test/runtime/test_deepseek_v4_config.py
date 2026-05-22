@@ -258,6 +258,16 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertEqual(ForwardMode.from_num_extends(2, 2), ForwardMode.EXTEND)
         self.assertEqual(ForwardMode.from_num_extends(1, 2), ForwardMode.MIXED)
+        self.assertEqual(
+            ForwardMode.decode_or_target_verify(has_drafter=True),
+            ForwardMode.DECODE,
+        )
+        self.assertEqual(
+            ForwardMode.decode_or_target_verify(
+                has_drafter=True, use_target_verify=True
+            ),
+            ForwardMode.TARGET_VERIFY,
+        )
 
     def test_spec_helpers_preserve_non_v4_backend_contracts(self):
         self.assertEqual(_draft_decode_forward_mode(False), ForwardMode.DECODE)
@@ -565,6 +575,53 @@ class TestDeepseekV4Config(unittest.TestCase):
             captured["kwargs"]["paged_cache_block_tables"]["v4.swa"].shape,
             (4, 1),
         )
+
+    def test_cuda_graph_replay_forwards_group_tables_to_draft_backend(self):
+        captured = {"target": {}, "draft": {}}
+
+        class FakeBackend:
+            uses_paged_cache_groups = True
+            uses_padded_decode_token_mask = False
+
+            def __init__(self, key):
+                self.key = key
+
+            def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
+                captured[self.key]["args"] = args
+                captured[self.key]["kwargs"] = kwargs
+
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.attn_backend = FakeBackend("target")
+        wrapper.draft_attn_backend = FakeBackend("draft")
+        wrapper.drafter = SimpleNamespace(
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32)
+        )
+        wrapper.max_tokens_per_req = 4
+        wrapper.use_target_verify_forward_mode = True
+
+        table = torch.tensor([[7], [8]], dtype=torch.int32)
+        offsets = {"v4.swa": torch.tensor([1, 2], dtype=torch.int64)}
+        wrapper._init_replay_metadata(
+            padded_bs=4,
+            actual_bs=2,
+            req_pool_indices=torch.zeros(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            paged_cache_block_tables={"v4.swa": table},
+            paged_cache_block_table_base_offsets=offsets,
+        )
+
+        draft_kwargs = captured["draft"]["kwargs"]
+        self.assertEqual(
+            draft_kwargs["paged_cache_block_tables"]["v4.swa"].tolist(),
+            [[7], [8], [0], [0]],
+        )
+        self.assertEqual(
+            draft_kwargs["paged_cache_block_table_base_offsets"]["v4.swa"].tolist(),
+            [1, 2, 0, 0],
+        )
+        self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DRAFT_EXTEND)
 
     def test_deepseek_v4_tokenizer_wrapper_uses_model_encoder(self):
         calls = []

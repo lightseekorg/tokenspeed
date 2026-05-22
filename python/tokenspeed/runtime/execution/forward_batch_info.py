@@ -69,6 +69,18 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     @staticmethod
+    def decode_or_target_verify(
+        *,
+        has_drafter: bool = False,
+        use_target_verify: bool = False,
+    ) -> "ForwardMode":
+        return (
+            ForwardMode.TARGET_VERIFY
+            if has_drafter and use_target_verify
+            else ForwardMode.DECODE
+        )
+
+    @staticmethod
     def from_num_extends(
         num_extends: int,
         batch_size: int,
@@ -81,10 +93,9 @@ class ForwardMode(IntEnum):
         elif num_extends > 0:
             return ForwardMode.MIXED if num_extends < batch_size else ForwardMode.EXTEND
         else:
-            return (
-                ForwardMode.TARGET_VERIFY
-                if has_drafter and use_target_verify
-                else ForwardMode.DECODE
+            return ForwardMode.decode_or_target_verify(
+                has_drafter=has_drafter,
+                use_target_verify=use_target_verify,
             )
 
 

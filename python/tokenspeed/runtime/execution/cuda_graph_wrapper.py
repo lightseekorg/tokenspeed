@@ -560,10 +560,16 @@ class CudaGraphWrapper:
         paged_cache_block_table_base_offsets = kwargs.pop(
             "paged_cache_block_table_base_offsets", None
         )
-        if paged_cache_block_tables is not None and getattr(
+        target_uses_paged_groups = getattr(
             self.attn_backend,
             "uses_paged_cache_groups",
             False,
+        )
+        draft_uses_paged_groups = self.draft_attn_backend is not None and getattr(
+            self.draft_attn_backend, "uses_paged_cache_groups", False
+        )
+        if paged_cache_block_tables is not None and (
+            target_uses_paged_groups or draft_uses_paged_groups
         ):
             table_bs = next(
                 (
@@ -578,16 +584,18 @@ class CudaGraphWrapper:
                 actual_bs=table_bs,
                 padded_bs=padded_bs,
             )
-            kwargs["paged_cache_block_tables"] = paged_cache_block_tables
-            if paged_cache_block_table_base_offsets:
+            if paged_cache_block_table_base_offsets is not None:
                 paged_cache_block_table_base_offsets = self._pad_offsets_to_padded_bs(
                     paged_cache_block_table_base_offsets,
                     actual_bs=actual_bs,
                     padded_bs=padded_bs,
                 )
-                kwargs["paged_cache_block_table_base_offsets"] = (
-                    paged_cache_block_table_base_offsets
-                )
+            if target_uses_paged_groups:
+                kwargs["paged_cache_block_tables"] = paged_cache_block_tables
+                if paged_cache_block_table_base_offsets is not None:
+                    kwargs["paged_cache_block_table_base_offsets"] = (
+                        paged_cache_block_table_base_offsets
+                    )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -600,6 +608,12 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_attn_kwargs = {}
+            if draft_uses_paged_groups and paged_cache_block_tables is not None:
+                draft_attn_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
+                if paged_cache_block_table_base_offsets is not None:
+                    draft_attn_kwargs["paged_cache_block_table_base_offsets"] = (
+                        paged_cache_block_table_base_offsets
+                    )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(

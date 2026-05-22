@@ -838,10 +838,9 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
-        graph_forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if self.drafter is not None
-            else ForwardMode.DECODE
+        graph_forward_mode = ForwardMode.decode_or_target_verify(
+            has_drafter=self.drafter is not None,
+            use_target_verify=self.config.use_target_verify_forward_mode,
         )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
