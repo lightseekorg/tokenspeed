@@ -300,6 +300,53 @@ def test_argmax_mtp_pattern():
 
 
 # ---------------------------------------------------------------------------
+# ``out=`` parameter — the kernel must honor caller-provided int32 / int64
+# buffers (used by greedy / flashinfer / eagle to skip a downstream cast).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
+def test_argmax_writes_into_caller_buffer(out_dtype):
+    """Caller-provided int32 / int64 buffer: kernel writes indices directly,
+    no post-kernel cast on the hot path."""
+    _need_cuda()
+    M, N = 8, MODEL_VOCABS["deepseek_v4"]
+    torch.manual_seed(M ^ N ^ 1)
+    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
+    out = torch.empty(M, dtype=out_dtype, device="cuda")
+    returned = cute_argmax(x, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert out.dtype == out_dtype
+    ref = torch.argmax(x, dim=-1)
+    torch.testing.assert_close(out.long(), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
+def test_argmax_caller_buffer_via_fallback(out_dtype):
+    """``out=`` must still receive correct indices when the wrapper takes the
+    torch.argmax fallback (small N here). Catches dtype-cast issues in the
+    fallback's ``out.copy_(result)`` path."""
+    _need_cuda()
+    M, N = 4, 257  # unaligned N forces fallback.
+    torch.manual_seed(N)
+    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    out = torch.empty(M, dtype=out_dtype, device="cuda")
+    cute_argmax(x, out=out)
+    torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
+
+
+def test_argmax_rejects_invalid_out():
+    _need_cuda()
+    x = torch.randn(4, MODEL_VOCABS["deepseek_v4"], device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="shape"):
+        cute_argmax(x, out=torch.empty(5, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="int32 or int64"):
+        cute_argmax(x, out=torch.empty(4, dtype=torch.float32, device="cuda"))
+    with pytest.raises(ValueError, match="device"):
+        cute_argmax(x, out=torch.empty(4, dtype=torch.int32, device="cpu"))
+
+
+# ---------------------------------------------------------------------------
 # CUDA graph compatibility — the kernel must run from inside a captured graph
 # ---------------------------------------------------------------------------
 

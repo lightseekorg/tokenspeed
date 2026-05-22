@@ -26,12 +26,16 @@ third-party module directly.
 
 Exports two entry points:
 
-* :func:`argmax_pair`: row-wise ``(max_value, argmax_index)`` in a single
-  ``(M, 2)`` float32 tensor — direct passthrough to the kernel.
 * :func:`argmax`: drop-in replacement for ``torch.argmax(logits, dim=-1)``.
-  Returns int64 indices and transparently falls back to ``torch.argmax`` when
-  the CuTe DSL kernel is unavailable or its preconditions are not met
+  Returns int64 indices written by the kernel directly — no post-kernel cast
+  on the hot path. Transparently falls back to ``torch.argmax`` when the CuTe
+  DSL kernel is unavailable or its preconditions are not met
   (dtype/N/alignment/SM-version).
+* :func:`argmax_pair`: row-wise ``(max_value, argmax_index)`` packed as a
+  single ``(M, 2)`` float32 tensor. The kernel writes the max value and index
+  into two separate tensors; this entry point assembles them back into the
+  legacy ``(M, 2)`` layout (one extra elementwise copy off the hot path). The
+  runtime no longer uses this layout — kept for tests / future logprob users.
 """
 
 from __future__ import annotations
@@ -128,15 +132,133 @@ def _supports_cute(N: int, dtype: torch.dtype) -> bool:
     return True
 
 
+def _convert_to_cute(t: torch.Tensor):
+    """Wrap a torch tensor as a CuTe DSL tensor with a CUDA-graph-safe view."""
+    return from_dlpack(
+        CUDAGraphCompatibleWrapper(t.detach()), assumed_align=16
+    ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+
+
+def _convert_to_cute_1d(t: torch.Tensor):
+    """1D-tensor variant of :func:`_convert_to_cute`."""
+    return from_dlpack(
+        CUDAGraphCompatibleWrapper(t.detach()), assumed_align=16
+    ).mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+
+
+def _invoke_kernel(
+    logits: torch.Tensor, out_max: torch.Tensor, out_idx: torch.Tensor
+) -> None:
+    """Launch ArgmaxKernel with separate ``(M,)`` max and idx output tensors.
+
+    Caller is responsible for shape/dtype checks; this helper assumes inputs
+    are already validated by :func:`_supports_cute`.
+    """
+    dtype = torch2cute_dtype_map[logits.dtype]
+    x_tensor = _convert_to_cute(logits)
+    max_tensor = _convert_to_cute_1d(out_max)
+    idx_tensor = _convert_to_cute_1d(out_idx)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    # Blackwell (sm_100/103) supports redux.sync.max.f32; Hopper falls back to
+    # warp shuffles.
+    p = current_platform()
+    sm = p.arch_version.major * 10 + p.arch_version.minor
+    use_redux = 100 <= sm < 120
+
+    N = logits.shape[1]
+    # Cache by index dtype too: the kernel writes the index with the output
+    # tensor's element type, so int64 vs int32 produce distinct compiled units.
+    compile_key = (dtype, N, use_redux, out_idx.dtype)
+    compiled = _compile_cache.get(compile_key)
+    if compiled is None:
+        kernel = ArgmaxKernel(dtype, N, use_redux=use_redux)
+        compiled = cute.compile(kernel, x_tensor, max_tensor, idx_tensor, stream)
+        _compile_cache[compile_key] = compiled
+
+    compiled(x_tensor, max_tensor, idx_tensor, stream)
+
+
+_SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
+
+
+def argmax(
+    logits: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Drop-in replacement for ``torch.argmax(logits, dim=-1)``.
+
+    Returns an int64 tensor of shape ``(M,)`` by default. The CuTe DSL kernel
+    is used when ``logits`` is a 2D CUDA float32 tensor with N >= 4096 and
+    N % 32 == 0 on a supported Blackwell-class SM; otherwise this falls back
+    to ``torch.argmax`` for transparent compatibility.
+
+    The kernel writes the indices into ``out`` (or into a freshly allocated
+    int64 tensor) directly, so no post-kernel elementwise cast is launched on
+    the hot path. Callers that need int32 token ids can pass an int32 ``out``
+    to skip a downstream ``.to(torch.int32)`` cast — the kernel will write
+    int32 values straight into the buffer.
+
+    Args:
+        logits: 2D tensor of shape ``(M, N)``. Only the last dim is reduced.
+        out: Optional pre-allocated buffer of shape ``(M,)``. Must be int32
+            or int64 on the same device as ``logits``. Determines the dtype
+            of the returned tensor; defaults to int64 when omitted.
+
+    Returns:
+        Integer tensor of shape ``(M,)`` with dtype matching ``out`` (or
+        int64 when ``out`` was not supplied).
+    """
+    if out is not None:
+        if out.shape != (logits.shape[0],):
+            raise ValueError(
+                f"out must have shape (M,)={(logits.shape[0],)}, "
+                f"got {tuple(out.shape)}"
+            )
+        if out.dtype not in _SUPPORTED_OUT_DTYPES:
+            raise ValueError(f"out must be int32 or int64; got {out.dtype}")
+        if out.device != logits.device:
+            raise ValueError("out must be on the same device as logits")
+
+    if (
+        logits.dim() != 2
+        or not logits.is_cuda
+        or not _supports_cute(logits.shape[1], logits.dtype)
+    ):
+        result = torch.argmax(logits, dim=-1)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+    M = logits.shape[0]
+    device = logits.device
+
+    if out is None:
+        out_idx = torch.empty((M,), dtype=torch.int64, device=device)
+    else:
+        out_idx = out
+
+    # The max value is needed only inside the kernel reduction; the caller
+    # never sees it. Allocate a scratch buffer so the kernel has somewhere to
+    # write it.
+    scratch_max = torch.empty((M,), dtype=torch.float32, device=device)
+    _invoke_kernel(logits, scratch_max, out_idx)
+    return out_idx
+
+
 def argmax_pair(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Row-wise ``(max_value, argmax_index)`` in a single ``(M, 2)`` float32 tensor.
+    """Row-wise ``(max_value, argmax_index)`` packed as a ``(M, 2)`` float32 tensor.
 
     The index is stored as ``float32`` — exact for any vocab below ``2**24``
-    (16,777,216), which covers every shipped LLM vocab size.
+    (16,777,216), which covers every shipped LLM vocab size. This is a legacy
+    layout kept for tests / future logprob users; the runtime hot path uses
+    :func:`argmax` instead and avoids the extra packing entirely.
 
     Args:
         logits: 2D tensor of shape ``(M, N)`` on CUDA.
@@ -153,15 +275,16 @@ def argmax_pair(
         raise ValueError("argmax_pair requires a CUDA tensor")
 
     M, N = logits.shape
+    device = logits.device
 
     if out is None:
-        out = torch.empty((M, 2), dtype=torch.float32, device=logits.device)
+        out = torch.empty((M, 2), dtype=torch.float32, device=device)
     else:
         if out.shape != (M, 2):
             raise ValueError(
                 f"out must have shape (M, 2)={M, 2}, got {tuple(out.shape)}"
             )
-        if out.dtype != torch.float32 or out.device != logits.device:
+        if out.dtype != torch.float32 or out.device != device:
             raise ValueError("out must be float32 on the same device as logits")
 
     if not _supports_cute(N, logits.dtype):
@@ -172,73 +295,18 @@ def argmax_pair(
         out[:, 1:2].copy_(max_indices.to(torch.float32))
         return out
 
-    dtype = torch2cute_dtype_map[logits.dtype]
-
-    def _convert(t: torch.Tensor):
-        return from_dlpack(
-            CUDAGraphCompatibleWrapper(t.detach()), assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-
-    x_tensor = _convert(logits)
-    out_tensor = _convert(out)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    # Blackwell (sm_100/103) supports redux.sync.max.f32; Hopper falls back to
-    # warp shuffles.
-    p = current_platform()
-    sm = p.arch_version.major * 10 + p.arch_version.minor
-    use_redux = 100 <= sm < 120
-
-    compile_key = (dtype, N, use_redux)
-    compiled = _compile_cache.get(compile_key)
-    if compiled is None:
-        kernel = ArgmaxKernel(dtype, N, use_redux=use_redux)
-        compiled = cute.compile(kernel, x_tensor, out_tensor, stream)
-        _compile_cache[compile_key] = compiled
-
-    compiled(x_tensor, out_tensor, stream)
+    # Kernel writes into separate (M,) tensors; assemble into the legacy
+    # (M, 2) layout for backward compatibility. This is off the runtime hot
+    # path (callers use :func:`argmax` instead), so the extra copy/cast is OK.
+    tmp_max = torch.empty((M,), dtype=torch.float32, device=device)
+    tmp_idx = torch.empty((M,), dtype=torch.int64, device=device)
+    _invoke_kernel(logits, tmp_max, tmp_idx)
+    out[:, 0].copy_(tmp_max)
+    out[:, 1].copy_(tmp_idx.to(torch.float32))
     return out
-
-
-def argmax(
-    logits: torch.Tensor,
-    *,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Drop-in replacement for ``torch.argmax(logits, dim=-1)``.
-
-    Returns an int64 tensor of shape ``(M,)``. The CuTe DSL kernel is used
-    when ``logits`` is a 2D CUDA float32 tensor with N >= 256 and N % 32 == 0
-    on a supported Blackwell-class SM; otherwise this falls back to
-    ``torch.argmax`` for transparent compatibility.
-
-    Args:
-        logits: 2D tensor of shape ``(M, N)``. Only the last dim is reduced.
-        out: Optional pre-allocated int64 buffer of shape ``(M,)``.
-
-    Returns:
-        int64 tensor of shape ``(M,)``.
-    """
-    if (
-        logits.dim() != 2
-        or not logits.is_cuda
-        or not _supports_cute(logits.shape[1], logits.dtype)
-    ):
-        result = torch.argmax(logits, dim=-1)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
-
-    pair = argmax_pair(logits)
-    indices = pair[:, 1].to(torch.int64)
-    if out is not None:
-        out.copy_(indices)
-        return out
-    return indices
 
 
 # Expose the underlying compiled-kernel entry as the registered impl so other
 # code can probe `is _argmax_kernel_impl` style availability checks if needed.
 if _CUTE_AVAILABLE:
-    _argmax_kernel_impl = argmax_pair
+    _argmax_kernel_impl = _invoke_kernel

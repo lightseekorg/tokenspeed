@@ -429,13 +429,19 @@ class ArgmaxKernel(ReductionBase):
         )
 
     @cute.jit
-    def __call__(self, mX: cute.Tensor, mO: cute.Tensor, stream: cuda.CUstream):
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mO_max: cute.Tensor,
+        mO_idx: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
         self._set_cluster_n()
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
         num_warps = num_threads // cute.arch.WARP_SIZE
 
-        self.kernel(mX, mO, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mO_max, mO_idx, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=(
@@ -451,7 +457,8 @@ class ArgmaxKernel(ReductionBase):
     def kernel(
         self,
         mX: cute.Tensor,
-        mO: cute.Tensor,
+        mO_max: cute.Tensor,
+        mO_idx: cute.Tensor,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
@@ -466,8 +473,11 @@ class ArgmaxKernel(ReductionBase):
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
 
-        mX, mO = [domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mX, mO)]
-        gX, gO = [cute.local_tile(mT, tiler_mn, (0, cluster_y)) for mT in (mX, mO)]
+        mX = domain_offset_i64((bidx * tiler_mn[0], 0), mX)
+        gX = cute.local_tile(mX, tiler_mn, (0, cluster_y))
+        # Each output is 1D (M,); only a row-axis offset is needed.
+        mO_max = domain_offset_i64((bidx * tiler_mn[0],), mO_max)
+        mO_idx = domain_offset_i64((bidx * tiler_mn[0],), mO_idx)
         cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
         smem = cutlass.utils.SmemAllocator()
@@ -640,5 +650,5 @@ class ArgmaxKernel(ReductionBase):
             and local_row_idx < tiler_mn[0]
             and (self.cluster_n == 1 or bidy == 0)
         ):
-            mO[local_row_idx, 0] = warp_max.to(mO.element_type)
-            mO[local_row_idx, 1] = warp_argmax.to(mO.element_type)
+            mO_max[local_row_idx] = warp_max.to(mO_max.element_type)
+            mO_idx[local_row_idx] = warp_argmax.to(mO_idx.element_type)
