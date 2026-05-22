@@ -18,21 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TRT-LLM fp8 quantize kernels exposed via the numerics registry.
+"""TRT-LLM fp8 quantize helpers.
 
-We pair these against torch reference implementations so per-SM accuracy gets
-exercised on every CI run. Each registered impl returns ``qweight.float()`` —
-the fp8 quantized values cast back to fp32 for comparison. We deliberately
-skip comparing the scale tensor: its memory layout (1D vs 2D, padded vs
-contiguous) differs between SM90 and SM100 in trtllm; the qweight values
-already prove the per-group statistics + rounding agree.
+Each helper returns ``qweight.float()`` so callers can compare quantized values
+without depending on TRT-LLM's scale tensor layout.
 """
 
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
-from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.thirdparty.trtllm import (
     per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
 )
@@ -46,40 +41,11 @@ from tokenspeed_kernel.thirdparty.trtllm import (
 _FP8_DTYPE = Platform.get().fp8e4m3fn.dtype
 
 
-@register_kernel(
-    "quantize",
-    "fp8_token_group_128",
-    name="trtllm_fp8_token_group_128",
-    solution="trtllm",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    # The trtllm op asserts bf16-only input.
-    dtypes={torch.bfloat16},
-    traits={},
-    priority=12,
-    tags={"latency"},
-)
 def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
     qweight, _scale = _trtllm_per_token_group_quant_8bit(x, group_size=128)
     return qweight.float()
 
 
-@register_kernel(
-    "quantize",
-    "fp8_token",
-    name="trtllm_fp8_token",
-    solution="trtllm",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    dtypes={torch.bfloat16, torch.float16},
-    traits={},
-    priority=12,
-    tags={"latency"},
-)
 def trtllm_fp8_token(x: torch.Tensor) -> torch.Tensor:
     output = torch.empty_like(x, dtype=_FP8_DTYPE)
     scale = torch.empty(x.size(0), dtype=torch.float32, device=x.device)
@@ -87,20 +53,6 @@ def trtllm_fp8_token(x: torch.Tensor) -> torch.Tensor:
     return output.float()
 
 
-@register_kernel(
-    "quantize",
-    "fp8_tensor",
-    name="trtllm_fp8_tensor",
-    solution="trtllm",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    dtypes={torch.bfloat16, torch.float16},
-    traits={},
-    priority=12,
-    tags={"latency"},
-)
 def trtllm_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
     output = torch.empty_like(x, dtype=_FP8_DTYPE)
     scale = torch.zeros(1, dtype=torch.float32, device=x.device)

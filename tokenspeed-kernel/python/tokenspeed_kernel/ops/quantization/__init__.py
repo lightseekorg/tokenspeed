@@ -14,12 +14,3 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-"""Quantization kernel entry points."""
-
-# Backend registration (side-effect imports — decorators fire at module load)
-import tokenspeed_kernel.numerics.reference.quantize  # noqa: F401
-import tokenspeed_kernel.ops.quantization.trtllm  # noqa: F401
-from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
-
-__all__ = ["fp8_quantize"]

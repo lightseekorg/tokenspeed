@@ -36,8 +36,8 @@ from tokenspeed_kernel.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
 )
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.ops.quantization import fp8_quantize
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state

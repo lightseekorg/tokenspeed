@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.quantization import fp8_quantize
+from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 
 FP8_E4M3_MAX = 448.0
 
