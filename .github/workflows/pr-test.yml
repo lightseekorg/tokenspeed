@@ -137,15 +137,6 @@ jobs:
           done
           exit 1
 
-      # DEBUG (zhyncs/debug-agentic-b200-4gpu-perf): an earlier debug run on
-      # the b200-4gpu-perf host wrote /etc/apt/sources.list.d/cuda.list that
-      # references a different Signed-By keyring than the image's pre-baked
-      # NVIDIA source. Subsequent `apt-get update` in setup_runner then fails
-      # with "Conflicting values set for option Signed-By". Drop the stale
-      # list so apt-get can run again. Revert with the rest of this branch.
-      - name: Drop stale debug cuda.list (DEBUG)
-        run: sudo rm -f /etc/apt/sources.list.d/cuda.list
-
       - name: Install CI task
         run: |
           cd "${{ env.WORK_DIR }}"
