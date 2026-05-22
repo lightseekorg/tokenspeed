@@ -77,20 +77,47 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
+    def __getitem__(self, s: slice) -> SamplingBatchInfo:
+        """Row-slice batch-indexed fields; pool/scalar fields pass through.
+
+        Used by hybrid-batch samplers (MIXED + spec-dec) that apply
+        different sampler ops to a prefix vs suffix of rows. Only ``slice``
+        is supported — int indexing would yield 0-dim tensors and break
+        downstream gathers.
+
+        ``is_all_greedy`` is inherited from the parent; when ``top_ks`` is
+        populated the slice refines it from the sliced tensor (one GPU
+        sync, only on the disagg slice path).
+        """
+        if not isinstance(s, slice):
+            raise TypeError(
+                f"SamplingBatchInfo only supports slice indexing, got {type(s).__name__}"
+            )
+
+        def _slice(t):
+            return t[s] if t is not None else None
+
+        return dataclasses.replace(
+            self,
+            temperatures=_slice(self.temperatures),
+            top_ps=_slice(self.top_ps),
+            top_ks=_slice(self.top_ks),
+            min_ps=_slice(self.min_ps),
+            is_all_greedy=self.is_all_greedy,
+            req_pool_indices=_slice(self.req_pool_indices),
+            vocab_mask=_slice(self.vocab_mask),
+            grammars=_slice(self.grammars),
+        )
+
     @classmethod
     def from_schedule_batch(
         cls, batch: ScheduleBatch, vocab_size: int
     ) -> SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
-        temperatures = (
-            torch.tensor(
-                [r.sampling_params.temperature for r in reqs],
-                dtype=torch.float,
-            )
-            .view(-1, 1)
-            .to(device, non_blocking=True)
-        )
+        temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)

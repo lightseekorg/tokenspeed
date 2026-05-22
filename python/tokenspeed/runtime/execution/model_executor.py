@@ -45,6 +45,7 @@ from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
@@ -351,16 +352,45 @@ class ModelExecutor:
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
-        logits_output,
+        logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
-        candidates,
+        candidates: torch.Tensor | None = None,
     ):
-        if self.drafter is not None and ctx.forward_mode.is_decode():
+        if self.drafter is None:
+            return self.sampling_backend.sample(logits_output, sampling_info)
+
+        num_extends = ctx.num_extends
+        num_decodes = ctx.bs - num_extends
+
+        if num_decodes == 0:
+            return self.sampling_backend.sample(logits_output, sampling_info)
+
+        if num_extends == 0:
             return self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
-        return self.sampling_backend.sample(logits_output, sampling_info)
+
+        logits = logits_output.next_token_logits
+        prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
+        prefill_tokens, prefill_accept = self.sampling_backend.sample(
+            prefill_out, sampling_info[:num_extends]
+        )
+        decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
+        decode_tokens, decode_accept = self.sampling_backend.verify(
+            decode_out, sampling_info[num_extends:], candidates
+        )
+        if (
+            prefill_out.next_token_logprobs is not None
+            and decode_out.next_token_logprobs is not None
+        ):
+            logits_output.next_token_logprobs = torch.cat(
+                [prefill_out.next_token_logprobs, decode_out.next_token_logprobs]
+            )
+        return (
+            torch.cat([prefill_tokens, decode_tokens]),
+            torch.cat([prefill_accept, decode_accept]),
+        )
 
     @maybe_inference_mode()
     def _forward_step(
@@ -423,7 +453,7 @@ class ModelExecutor:
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
         input_lengths: torch.Tensor,
-        is_extend: bool,
+        num_extends: int,
     ):
         """Write output tokens to future_input_map and update cache lengths.
 
@@ -435,21 +465,24 @@ class ModelExecutor:
             # Without drafter, store output tokens for next round.
             # With drafter, _forward_step already wrote the drafter's
             # next-round input (verified + draft tokens) to future_input_map.
-            tokens_per_req = self.config.output_length if not is_extend else 1
+            tokens_per_req = self.config.output_length if num_extends == 0 else 1
             next_round_input_ids = output_tokens.to(torch.int32).reshape(
                 -1, tokens_per_req
             )
             self.runtime_states.future_input_map[req_pool_indices, :tokens_per_req] = (
                 next_round_input_ids
             )
-        if is_extend:
-            self.runtime_states.update_valid_cache_length(
-                req_pool_indices, input_lengths
-            )
+
+        bs = req_pool_indices.shape[0]
+        if num_extends == 0:
+            deltas = accept_lengths
+        elif num_extends == bs:
+            deltas = input_lengths
         else:
-            self.runtime_states.update_valid_cache_length(
-                req_pool_indices, accept_lengths
+            deltas = torch.cat(
+                [input_lengths[:num_extends], accept_lengths[num_extends:]]
             )
+        self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
     def _build_sampling_info(
         self,
@@ -956,6 +989,42 @@ class ModelExecutor:
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
             else:
+                gather_ids = None
+                if num_extends > 0:
+                    num_decodes = bs - num_extends
+                    if self.drafter is not None and num_decodes > 0:
+                        # MIXED + spec: prefill rows pruned to last token,
+                        # decode block kept full at verify width.
+                        num_decode_tokens = num_decodes * self.config.spec_num_tokens
+                        num_prefill_tokens = total_tokens - num_decode_tokens
+                        gather_ids = torch.empty(
+                            num_extends + num_decode_tokens,
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        gather_ids[:num_extends] = (
+                            torch.cumsum(
+                                self.input_buffers.input_lengths_buf[:num_extends],
+                                dim=0,
+                            )
+                            - 1
+                        )
+                        gather_ids[num_extends:] = torch.arange(
+                            num_prefill_tokens,
+                            total_tokens,
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                    else:
+                        # EXTEND, MIXED non-spec, or EXTEND + spec: last token
+                        # per request via cumsum.
+                        gather_ids = (
+                            torch.cumsum(
+                                self.input_buffers.input_lengths_buf[:bs], dim=0
+                            )
+                            - 1
+                        )
+
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -969,8 +1038,7 @@ class ModelExecutor:
                         if self.drafter is not None
                         else CaptureHiddenMode.NULL
                     ),
-                    padded_static_len=-1,
-                    keep_full_logits=forward_mode.is_decode_or_idle(),
+                    gather_ids=gather_ids,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -987,7 +1055,7 @@ class ModelExecutor:
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends <= 0,
+                        is_spec_decode=self.drafter is not None and num_extends < bs,
                         spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
@@ -1075,7 +1143,7 @@ class ModelExecutor:
                     output_tokens=output_tokens,
                     accept_lengths=output_lengths,
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],
-                    is_extend=num_extends > 0,
+                    num_extends=num_extends,
                 )
                 self._snapshot_mamba_checkpoints(
                     output_lengths,

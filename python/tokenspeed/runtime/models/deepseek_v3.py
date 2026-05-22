@@ -648,7 +648,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 bs=ctx.num_extends,
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
-                keep_full_logits=False,
             )
             self.forward_normal_chunked(
                 positions[:num_prefill_tokens],
@@ -666,7 +665,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 num_extends=0,
                 input_num_tokens=num_decode_tokens,
                 forward_mode=ForwardMode.DECODE,
-                keep_full_logits=False,
             )
             self.forward_absorb(
                 positions[num_prefill_tokens:],

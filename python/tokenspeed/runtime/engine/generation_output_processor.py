@@ -484,7 +484,6 @@ class OutputProcesser:
             forward_op.extend_prefix_lens,
         )
         num_extends = forward_op.num_extends()
-        is_decode_op = num_extends <= 0
 
         request_changes = []
         stream_out_rids = []
@@ -506,7 +505,7 @@ class OutputProcesser:
                 else None
             )
             is_decode_slot = i >= num_extends
-            if self.spec_num_tokens is not None and is_decode_op:
+            if self.spec_num_tokens is not None and is_decode_slot:
                 pt += self.spec_num_tokens
             else:
                 pt += output_length

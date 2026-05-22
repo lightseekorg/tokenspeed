@@ -306,7 +306,6 @@ class CudaGraphWrapper:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
-            keep_full_logits=True,
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -832,7 +831,6 @@ class CudaGraphWrapper:
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
-                padded_static_len=ctx.padded_static_len,
                 spec_info=spec_info,
                 paged_cache_block_tables=(
                     paged_cache_block_tables
