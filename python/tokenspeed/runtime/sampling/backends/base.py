@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.distributed as dist
@@ -67,6 +67,8 @@ class SamplingBackendConfig:
     tp_group: tuple[int, ...] | None = None
     enable_tp_sync: bool = True
 
+    dp_sampling_backend: Literal["auto", "nccl", "onesided"] = "auto"
+
     @classmethod
     def from_server_args(
         cls,
@@ -92,6 +94,7 @@ class SamplingBackendConfig:
             random_seed=random_seed,
             tp_group=tp_group,
             enable_tp_sync=not server_args.disable_sampling_tp_sync,
+            dp_sampling_backend=server_args.dp_sampling_backend,
         )
 
 

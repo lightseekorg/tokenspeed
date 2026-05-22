@@ -46,7 +46,7 @@ from tokenspeed_kernel.torch_compile import get_compiler_backend
 # branch-free in the captured graph.
 _FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
@@ -103,6 +103,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._dp_tp_group = tp_group
         self._dp_pg = None
         self._dp_rank = 0
+        self._dp_comm: DpSamplingComm | None = None
 
         if tp_size > 1:
             self._dp_max_pad_bs = (
@@ -120,6 +121,21 @@ class FlashInferSamplingBackend(SamplingBackend):
             import torch.distributed as dist
 
             self._dp_rank = dist.get_rank(group=self._dp_pg)
+
+            v_aligned = (
+                (max(config.vocab_size, tp_size) + tp_size - 1) // tp_size
+            ) * tp_size
+            self._dp_comm = DpSamplingComm(
+                tp_size=tp_size,
+                rank=self._dp_rank,
+                group=tp_group,
+                max_pad_bs=self._dp_max_pad_bs,
+                num_tokens_per_req=config.max_draft_tokens_per_req,
+                vocab_size=v_aligned,
+                logits_dtype=torch.bfloat16,
+                backend=config.dp_sampling_backend,
+                device=config.device,
+            )
         else:
             self._dp_max_pad_bs = config.max_bs
             self._dp_max_k_req = config.max_bs
@@ -232,15 +248,6 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
         self._accept_length_local_buf = torch.zeros(
             (max_k_req,), dtype=torch.int32, device=config.device
-        )
-        # Stack predict + accept_index to halve the DP output collectives
-        # (2 instead of 3); the gather destination must be contiguous so
-        # local and full are separate buffers.
-        self._combined_local_buf = torch.zeros(
-            (max_k_req, 2 * max_n), dtype=torch.int32, device=config.device
-        )
-        self._combined_full_buf = torch.zeros(
-            (max_pad_bs, 2 * max_n), dtype=torch.int32, device=config.device
         )
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -482,25 +489,19 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.dp_sampling:
             n = num_tokens_per_req
-            combined_local = self._combined_local_buf[:bs, : 2 * n]
-            combined_local[:, :n].copy_(predict.view(bs, n))
-            combined_local[:, n:].copy_(accept_index)
-
-            combined_full = self._combined_full_buf[:pad_bs, : 2 * n]
-            all_gather_into_tensor(
-                combined_full, combined_local, rank, self._dp_tp_group
+            assert self._dp_comm is not None
+            (
+                predict_full,
+                accept_index_full,
+                accept_length_full,
+            ) = self._dp_comm.gather_verify_outputs(
+                predict_local=predict.view(bs, n),
+                accept_index_local=accept_index,
+                accept_length_local=accept_length,
+                pad_bs=pad_bs,
             )
-            accept_length_full = self._accept_length_buf[:pad_bs]
-            all_gather_into_tensor(
-                accept_length_full, accept_length, rank, self._dp_tp_group
-            )
-
-            # Land outputs in the persistent full-batch buffers so caller
-            # view aliases stay stable across CUDA-graph replays.
-            predict = self._predict_buf[: full_bs * n]
-            accept_index = self._accept_index_buf[: full_bs * n].view(full_bs, n)
-            predict.view(full_bs, n).copy_(combined_full[:full_bs, :n])
-            accept_index.copy_(combined_full[:full_bs, n:])
+            predict = predict_full.view(-1)[: full_bs * n]
+            accept_index = accept_index_full[:full_bs]
             accept_length = accept_length_full[:full_bs]
         elif not _FUSED_TOPK_TOPP_AVAILABLE:
             # TP-rank sync: rank 0 wins on the full verify-output triple.

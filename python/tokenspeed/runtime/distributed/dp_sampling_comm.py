@@ -144,18 +144,6 @@ def _resolve_backend(requested: DpSamplingBackend, group: Group) -> _ResolvedBac
 
 
 class DpSamplingComm:
-    """Persistent comm context for one TP group, sized to its worst-case shape.
-
-    Construct once at engine init **before** any CUDA graph capture; the
-    constructor performs host-side rendezvous (when the one-sided fast
-    path is enabled) which is not graph-capturable. After construction,
-    ``swap_batch_vocab`` and ``gather_verify_outputs`` are pure CUDA
-    kernel launches over persistent device buffers and capture cleanly.
-
-    Lifecycle mirrors ``TrtllmAllReduceBackend.configure_group`` (which
-    also exchanges IPC handles up front and then reuses the workspace
-    across all subsequent captured launches).
-    """
 
     def __init__(
         self,
@@ -201,10 +189,6 @@ class DpSamplingComm:
         self._backend: _ResolvedBackend = _resolve_backend(backend, group)
         self._state = None
 
-        # Persistent stage-6 recv buffers, sized to the worst-case pad_bs.
-        # Slicing to [:pad_bs] per step yields contiguous views, which is
-        # what ``all_gather_into_tensor`` requires and what CUDA graph
-        # replay can reuse safely (the storage address never moves).
         n = num_tokens_per_req
         self._predict_full = torch.empty(
             max_pad_bs, n, dtype=torch.int32, device=self._device
@@ -215,6 +199,23 @@ class DpSamplingComm:
         self._accept_length_full = torch.empty(
             max_pad_bs, dtype=torch.int32, device=self._device
         )
+
+        if self._backend == "nccl":
+            self._combined_local_nccl: torch.Tensor | None = torch.empty(
+                self._max_k_req,
+                2 * n + 1,
+                dtype=torch.int32,
+                device=self._device,
+            )
+            self._combined_full_nccl: torch.Tensor | None = torch.empty(
+                max_pad_bs,
+                2 * n + 1,
+                dtype=torch.int32,
+                device=self._device,
+            )
+        else:
+            self._combined_local_nccl = None
+            self._combined_full_nccl = None
 
         if self._backend == "onesided":
             self._init_onesided()
@@ -341,31 +342,28 @@ class DpSamplingComm:
                 pad_bs=pad_bs,
             )
 
+        assert self._combined_local_nccl is not None
+        assert self._combined_full_nccl is not None
+        combined_local = self._combined_local_nccl[:k_req]
+        combined_local[:, :n].copy_(predict_local)
+        combined_local[:, n : 2 * n].copy_(accept_index_local)
+        combined_local[:, 2 * n].copy_(accept_length_local)
+
+        combined_full = self._combined_full_nccl[:pad_bs]
+        all_gather_into_tensor(
+            combined_full,
+            combined_local,
+            self._rank,
+            self._group,
+            backend=self._fallback_backend,
+        )
+
         predict_full = self._predict_full[:pad_bs]
         accept_index_full = self._accept_index_full[:pad_bs]
         accept_length_full = self._accept_length_full[:pad_bs]
-
-        all_gather_into_tensor(
-            predict_full,
-            predict_local,
-            self._rank,
-            self._group,
-            backend=self._fallback_backend,
-        )
-        all_gather_into_tensor(
-            accept_index_full,
-            accept_index_local,
-            self._rank,
-            self._group,
-            backend=self._fallback_backend,
-        )
-        all_gather_into_tensor(
-            accept_length_full,
-            accept_length_local,
-            self._rank,
-            self._group,
-            backend=self._fallback_backend,
-        )
+        predict_full.copy_(combined_full[:, :n])
+        accept_index_full.copy_(combined_full[:, n : 2 * n])
+        accept_length_full.copy_(combined_full[:, 2 * n])
         return predict_full, accept_index_full, accept_length_full
 
     # ------------------------------------------------------------------

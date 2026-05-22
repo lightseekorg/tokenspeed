@@ -107,23 +107,17 @@ from .triton import symm_mem_barrier
 
 @dataclass
 class DpSamplingState:
-    """Persistent workspace for ``dp_sampling_swap`` / ``dp_sampling_gather``.
+    """Persistent workspace. Allocated once at engine init; reused across
+    replays. All tensor fields below are symmetric-memory
+    backed (peer-importable VMM pages).
 
-    Allocated once via ``create_dp_sampling_state``; reused across every
-    captured-graph replay. All tensor fields below are symmetric-memory
-    backed (peer-importable VMM pages, NOT CUDACachingAllocator pages).
-
-    Sizing -- worst case the workspace must accommodate every value of
-    ``pad_bs`` the engine will pass in; per-step calls take ``pad_bs`` as
-    a runtime arg and use the prefix ``[:pad_bs * tp_size * ...]`` of
-    each buffer.
+    Sizing: the prefix [:pad_bs * tp_size * ...] of each buffer.
 
     Field overview:
-        recv_logits:     [max_K_req, N, V] -- stage-4 recv buffer in its
-                         natural shape (no permute on the recv path).
-        recv_predict:    [max_pad_bs, N] int32 -- stage-6 recv buffer.
-        recv_accept_idx: [max_pad_bs, N] int32 -- stage-6 recv buffer.
-        recv_accept_len: [max_pad_bs] int32 -- stage-6 recv buffer.
+        recv_logits:     [max_K_req, N, V]
+        recv_predict:    [max_pad_bs, N] int32
+        recv_accept_idx: [max_pad_bs, N] int32
+        recv_accept_len: [max_pad_bs] int32
         flags_peer_ptrs: Device-side signal-pad pointer table supplied by
                          symmetric memory. The Triton barrier flips each
                          per-CTA flag from 0 -> 1 -> 0, so no host-side
@@ -326,13 +320,7 @@ def create_dp_sampling_state(
 ) -> DpSamplingState:
     """Allocate symmetric-memory workspaces and rendezvous with peers.
 
-    MUST be called pre-capture: ``symm_mem.rendezvous`` performs a
-    host-side handle exchange and a barrier that is not CUDA-graph
-    capturable. Once this returns, the resulting state can be passed
-    into ``dp_sampling_swap`` / ``dp_sampling_gather`` from inside a
-    captured graph.
-
-    Implementation outline:
+    Outline:
       1. ``symm_mem.empty(...)`` for each of recv_logits, recv_predict,
          recv_accept_idx, recv_accept_len, flags, epoch.
       2. ``symm_mem.rendezvous(buf, group=group.group_name)`` to get the
@@ -340,9 +328,6 @@ def create_dp_sampling_state(
       3. ``handle.get_buffer(peer, shape, dtype)`` for every peer to
          build the peer-pointer tables.
       4. Keep handles alive so their signal-pad pointer table remains valid.
-
-    See ``flashinfer.comm.torch_symmetric_memory._alloc_symm_buffer_bytes``
-    for the wrapper this should be modeled on (~30 LOC).
     """
     assert type(group) == dist.ProcessGroup, f"Expected ProcessGroup, got {type(group)}"
     assert rank_in_group == dist.get_rank(group), (
@@ -495,14 +480,14 @@ def dp_sampling_gather(
     *,
     pad_bs: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Stage 6 fused one-sided gather over three payloads.
+    """One-sided gather:
+      - per-rank predict[K_req, N]
+      - accept_index[K_req, N]
+      - accept_length[K_req]
 
-    Equivalent to three ``all_gather_into_tensor`` calls but folded into
-    a single kernel: each CTA group handles one payload, every payload
-    finishes before the single shared flag barrier fires.
+    Replace three all_gather_into_tensor calls with a single kernel.
 
-    Returns ``(predict_full, accept_index_full, accept_length_full)``
-    aliased into ``state.recv_predict[:pad_bs]`` etc.
+    Returns (predict_full, accept_index_full, accept_length_full)
     """
     tp_size = state.tp_size
     n = state.num_tokens_per_req
