@@ -14,16 +14,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-"""Triton FP8 quantize / cast kernel.
-
-Drop-in replacement for ``x.to(torch.float8_e4m3fn)`` (or ``e5m2``) with
-optional per-tensor scale. Designed for the per-layer cast call sites in MLA
-prefill (deepseek_v3.py:1001/1005), where torch's default cast under-saturates
-HBM and the existing ``static_quant_fp8`` kernel is even slower because of its
-contiguous-input requirement and one-row-per-program tiling.
-"""
-
 from typing import Optional
 
 import torch
