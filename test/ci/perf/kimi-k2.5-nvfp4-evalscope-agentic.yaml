@@ -10,6 +10,38 @@ runner:
 env:
   CI: "true"
 install:
+  # DEBUG (b200-4gpu-perf): the perf-runner image is missing some of the
+  # baseline deps the standard b200-4gpu image ships in its Dockerfile
+  # (NVIDIA CUDA dev packages, mooncake transfer engine, flashinfer JIT
+  # cache wheel), so ts serve fails with undefined-symbol at startup.
+  # Install them inline here mirroring the runner Dockerfile until the
+  # perf-runner image is rebuilt. Revert this block once the image lands.
+  - |
+    set -eux
+    ARCH=$(uname -m)
+    case "$ARCH" in
+      x86_64)  CUDA_REPO_ARCH=x86_64;  WHEEL_ARCH=x86_64 ;;
+      aarch64) CUDA_REPO_ARCH=sbsa;    WHEEL_ARCH=aarch64 ;;
+      *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
+    esac
+    sudo apt-get update -y -q
+    sudo apt-get install -y --no-install-recommends gnupg curl ca-certificates
+    if [ ! -f /usr/share/keyrings/cuda-archive-keyring.gpg ]; then
+      curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/3bf863cc.pub" \
+        | sudo gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg
+    fi
+    echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/ /" \
+      | sudo tee /etc/apt/sources.list.d/cuda.list > /dev/null
+    sudo apt-get update -y -q
+    sudo apt-get install -y --no-install-recommends \
+      python3.12-dev python3.12-venv python3-pip libgomp1 \
+      libnuma1 libibverbs1 rdma-core infiniband-diags ibverbs-providers \
+      cuda-nvcc-13-0 libcublas-dev-13-0 cuda-nvrtc-dev-13-0 libcurand-dev-13-0
+    python3 -m pip install --break-system-packages --no-cache-dir \
+      mooncake-transfer-engine-cuda13 \
+      nvidia-cusparselt-cu13 \
+      torch==2.11.0 \
+      "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.11/flashinfer_jit_cache-0.6.11+cu130-cp39-abi3-manylinux_2_28_${WHEEL_ARCH}.whl"
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
