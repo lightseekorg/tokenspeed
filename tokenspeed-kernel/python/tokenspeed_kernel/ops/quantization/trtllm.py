@@ -27,7 +27,7 @@ without depending on TRT-LLM's scale tensor layout.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import Platform, current_platform
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 
 platform = current_platform()
@@ -35,6 +35,10 @@ platform = current_platform()
 _trtllm_per_tensor_quant_fp8 = error_fn
 _trtllm_per_token_group_quant_8bit = error_fn
 _trtllm_per_token_quant_fp8 = error_fn
+trtllm_fp8_token_group_128 = error_fn
+trtllm_fp8_token = error_fn
+trtllm_fp8_tensor = error_fn
+trtllm_quantize_fp8_with_scale = error_fn
 
 if platform.is_nvidia:
     from tokenspeed_kernel.thirdparty.trtllm import (
@@ -47,30 +51,23 @@ if platform.is_nvidia:
         per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
     )
 
-_FP8_DTYPE = Platform.get().fp8e4m3fn.dtype
-trtllm_quantize_fp8_with_scale = error_fn
+    _FP8_DTYPE = platform.fp8e4m3fn.dtype
 
+    def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
+        qweight, _scale = _trtllm_per_token_group_quant_8bit(x, group_size=128)
+        return qweight.float()
 
-def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
-    qweight, _scale = _trtllm_per_token_group_quant_8bit(x, group_size=128)
-    return qweight.float()
+    def trtllm_fp8_token(x: torch.Tensor) -> torch.Tensor:
+        output = torch.empty_like(x, dtype=_FP8_DTYPE)
+        scale = torch.empty(x.size(0), dtype=torch.float32, device=x.device)
+        _trtllm_per_token_quant_fp8(x, output, scale)
+        return output.float()
 
-
-def trtllm_fp8_token(x: torch.Tensor) -> torch.Tensor:
-    output = torch.empty_like(x, dtype=_FP8_DTYPE)
-    scale = torch.empty(x.size(0), dtype=torch.float32, device=x.device)
-    _trtllm_per_token_quant_fp8(x, output, scale)
-    return output.float()
-
-
-def trtllm_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
-    output = torch.empty_like(x, dtype=_FP8_DTYPE)
-    scale = torch.zeros(1, dtype=torch.float32, device=x.device)
-    _trtllm_per_tensor_quant_fp8(x, output, scale)
-    return output.float()
-
-
-if platform.is_nvidia:
+    def trtllm_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
+        output = torch.empty_like(x, dtype=_FP8_DTYPE)
+        scale = torch.zeros(1, dtype=torch.float32, device=x.device)
+        _trtllm_per_tensor_quant_fp8(x, output, scale)
+        return output.float()
 
     @register_kernel(
         "quantization",
