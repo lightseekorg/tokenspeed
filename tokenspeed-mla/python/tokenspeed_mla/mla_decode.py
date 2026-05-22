@@ -39,7 +39,10 @@ from tokenspeed_mla.mla_decode_fp8 import (
 from tokenspeed_mla.mla_decode_fp16 import (
     BlackwellMultiHeadLatentAttentionForwardFP16,
 )
-from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
+from tokenspeed_mla.mla_helpers import (
+    get_mla_decode_fold_sq_factor,
+    select_mla_decode_tilers,
+)
 from tokenspeed_mla.utils import (
     get_max_active_clusters,
     get_num_sm,
@@ -78,10 +81,10 @@ def _check_can_implement(
     is_var_split_kv: bool,
 ) -> None:
     """Check if the kernel supports the given configuration (cached)."""
-    mma_qk_tiler_mn = (128, 128)
-    mma_pv_tiler_mn = (128, 256)
-
     is_fp8 = torch_dtype == torch.float8_e4m3fn
+    mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
+        num_heads, seq_len_q, is_fp8=is_fp8
+    )
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
@@ -139,14 +142,12 @@ def _get_compiled_mla_kernel(
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
-    # Tile sizes for Blackwell mma.
-    # (128, 128) for QK and (128, 256) for PV.
-    mma_qk_tiler_mn = (128, 128)
-    mma_pv_tiler_mn = (128, 256)
-    # 2 CTAs along M (num_heads)
-    cluster_shape_mnk = (2, 1, 1)
-
     is_fp8 = torch_dtype == torch.float8_e4m3fn
+    mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
+        num_heads, seq_len_q, is_fp8=is_fp8
+    )
+    # 2 CTAs for M=128 path; 1 CTA for M=64 path.
+    cluster_shape_mnk = (2, 1, 1) if mma_qk_tiler_mn[0] == 128 else (1, 1, 1)
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
@@ -390,10 +391,11 @@ def tokenspeed_mla_decode(
     # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
-    # H=128: standard config. When H is smaller than M tile, fold only by a
-    # factor that exactly divides q_len; otherwise leave q_len on the scheduler
-    # dimension.
-    mma_m_tile = 128
+    is_fp8 = q_dtype == torch.float8_e4m3fn
+    mma_qk_tiler_mn, _ = select_mla_decode_tilers(H, q_len, is_fp8=is_fp8)
+    # Fold only by a factor that exactly divides q_len; otherwise leave q_len
+    # on the scheduler dimension.
+    mma_m_tile = mma_qk_tiler_mn[0]
     fold_sq_factor = get_mla_decode_fold_sq_factor(H, q_len, mma_m_tile)
 
     # Effective dimensions used by split_kv/workspace accounting.

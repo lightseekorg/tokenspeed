@@ -90,34 +90,6 @@ except ImportError:
         get_mla_decode_fold_sq_factor,
     )
 
-# ============================================================================
-#  Instruction descriptor constant for tcgen05.mma.ws.kind::f8f6f4
-#
-#  Configuration: E4M3→F32, M=64, N=128, K-major A/B, dense, 1-CTA, no negate
-#
-#  InstrDescriptor bit layout (uint32, from Sm100.h):
-#    Bits   Field          Value   Comment
-#    ─────────────────────────────────────────────
-#    [1:0]  sparse_id2_  = 0      dense
-#    [2]    sparse_flag_ = 0      dense
-#    [3]    saturate_    = 0      not IMMA
-#    [5:4]  c_format_    = 1      F32 accumulator
-#    [6]    sparse_fmt_  = 0      TID (irrelevant)
-#    [9:7]  a_format_    = 0      E4M3 (MXF8F6F4Format::E4M3)
-#    [12:10] b_format_   = 0      E4M3
-#    [13]   a_negate_    = 0      no negate (runtime, default 0)
-#    [14]   b_negate_    = 0      no negate (runtime, default 0)
-#    [15]   a_major_     = 0      K-major = no transpose
-#    [16]   b_major_     = 0      K-major = no transpose
-#    [22:17] n_dim_      = 16     128>>3 = 16  (N=128)
-#    [23]   reserved_0_  = 0
-#    [28:24] m_dim_      = 4      64>>4  = 4   (M=64)
-#    [29]   reserved_1_  = 0
-#    [31:30] max_shift_  = 0      NoShift
-#
-#  Result: 0x0000_0010 | (16 << 17) | (4 << 24) = 0x04200010
-# ============================================================================
-
 # Please refer to https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
 # For how to construct the Instruction Descriptor value.
 # Note: this is a WAR for WS mode MMA, need to be replaced when CuTe DSL supports.
@@ -142,7 +114,8 @@ def tcgen05_mma_ws_f8f6f4_one(
     idesc_val: Int32,
     accumulate: Boolean,
 ):
-    """Issue one K-block tcgen05.mma.ws.kind::f8f6f4 instruction."""
+    """Issue one K-block tcgen05.mma.ws.kind::f8f6f4 instruction.
+    Should be replaced when CuTe DSL supports."""
     d = builtin.unrealized_conversion_cast(
         [Int32.mlir_type], [tCtC.iterator.value]
     )
