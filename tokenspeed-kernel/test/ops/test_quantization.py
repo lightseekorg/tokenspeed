@@ -29,23 +29,6 @@ from tokenspeed_kernel import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import KernelRegistry
-
-
-def _skip_if_solution_unregistered(
-    mode: str,
-    solution: str,
-    dtype: torch.dtype,
-) -> None:
-    specs = KernelRegistry.get().get_for_operator(
-        "quantization",
-        mode,
-        platform=current_platform(),
-        dtype=dtype,
-        solution=solution,
-    )
-    if not specs:
-        pytest.skip(f"quantization.{mode} solution {solution!r} is not registered")
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -68,10 +51,11 @@ def test_quantize_fp8_pure_cast_bf16(
     device: str,
     solution: str,
     shape: tuple[int, ...],
+    require_registered_solution,
 ) -> None:
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("fp8", solution, dtype)
+    require_registered_solution("quantization", "fp8", solution, dtype)
 
     x = torch.randn(shape, device=device, dtype=dtype) * 50
     fp8 = current_platform().fp8e4m3fn
@@ -86,10 +70,14 @@ def test_quantize_fp8_pure_cast_bf16(
 
 
 @pytest.mark.parametrize("solution", ["triton"])
-def test_quantize_fp8_strided_slice(device: str, solution: str) -> None:
+def test_quantize_fp8_strided_slice(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(1)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("fp8", solution, dtype)
+    require_registered_solution("quantization", "fp8", solution, dtype)
 
     s, h, qk_nope, v_head = 4096, 16, 128, 128
     kv = torch.randn(s, h, qk_nope + v_head, device=device, dtype=dtype) * 50
@@ -111,10 +99,11 @@ def test_quantize_fp8_scale_float(
     device: str,
     solution: str,
     scale: float,
+    require_registered_solution,
 ) -> None:
     torch.manual_seed(2)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("fp8", solution, dtype)
+    require_registered_solution("quantization", "fp8", solution, dtype)
 
     x = torch.randn(2048, 512, device=device, dtype=dtype) * 100
     fp8 = current_platform().fp8e4m3fn
@@ -130,10 +119,14 @@ def test_quantize_fp8_scale_float(
 
 
 @pytest.mark.parametrize("solution", ["triton"])
-def test_quantize_fp8_scale_tensor(device: str, solution: str) -> None:
+def test_quantize_fp8_scale_tensor(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(3)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("fp8", solution, dtype)
+    require_registered_solution("quantization", "fp8", solution, dtype)
 
     x = torch.randn(8, 2880, device=device, dtype=dtype) * 100
     scale = torch.tensor([0.125], device=device, dtype=torch.float32)
@@ -155,10 +148,11 @@ def test_quantize_fp8_with_scale_tensor_and_token(
     device: str,
     solution: str,
     granularity: str,
+    require_registered_solution,
 ) -> None:
     torch.manual_seed(4)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("fp8_with_scale", solution, dtype)
+    require_registered_solution("quantization", "fp8_with_scale", solution, dtype)
 
     x = torch.randn(16, 128, device=device, dtype=dtype) * 10
     fp8 = current_platform().fp8e4m3fn
@@ -180,10 +174,14 @@ def test_quantize_fp8_with_scale_tensor_and_token(
 
 
 @pytest.mark.parametrize("solution", ["trtllm"])
-def test_quantize_fp8_with_scale_token_group(device: str, solution: str) -> None:
+def test_quantize_fp8_with_scale_token_group(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(5)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("fp8_with_scale", solution, dtype)
+    require_registered_solution("quantization", "fp8_with_scale", solution, dtype)
 
     x = torch.randn(16, 256, device=device, dtype=dtype) * 10
     fp8 = current_platform().fp8e4m3fn
@@ -203,10 +201,14 @@ def test_quantize_fp8_with_scale_token_group(device: str, solution: str) -> None
 
 
 @pytest.mark.parametrize("solution", ["flashinfer"])
-def test_quantize_mxfp8_shape_and_scale(device: str, solution: str) -> None:
+def test_quantize_mxfp8_shape_and_scale(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(6)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("mxfp8", solution, dtype)
+    require_registered_solution("quantization", "mxfp8", solution, dtype)
 
     x = torch.randn(17, 2880, device=device, dtype=dtype)
     out, scale = quantize_mxfp8(x, alignment=4096, solution=solution)
@@ -218,10 +220,14 @@ def test_quantize_mxfp8_shape_and_scale(device: str, solution: str) -> None:
 
 
 @pytest.mark.parametrize("solution", ["flashinfer"])
-def test_quantize_nvfp4_shape_and_scale(device: str, solution: str) -> None:
+def test_quantize_nvfp4_shape_and_scale(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(7)
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered("nvfp4", solution, dtype)
+    require_registered_solution("quantization", "nvfp4", solution, dtype)
 
     x = torch.randn(16, 256, device=device, dtype=dtype)
     out, scale = quantize_nvfp4(

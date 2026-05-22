@@ -23,24 +23,14 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import KernelRegistry
-
-
-def _skip_if_solution_unregistered(solution: str, dtype: torch.dtype) -> None:
-    specs = KernelRegistry.get().get_for_operator(
-        "embedding",
-        "rope",
-        platform=current_platform(),
-        dtype=dtype,
-        solution=solution,
-    )
-    if not specs:
-        pytest.skip(f"embedding.rope solution {solution!r} is not registered")
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
-def test_rope_neox_full_bf16(device: str, solution: str) -> None:
+def test_rope_neox_full_bf16(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(0)
     num_tokens = 17
     num_q_heads = 8
@@ -49,7 +39,7 @@ def test_rope_neox_full_bf16(device: str, solution: str) -> None:
     rotary_dim = 128
     max_position = 1024
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered(solution, dtype)
+    require_registered_solution("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -103,7 +93,11 @@ def test_rope_neox_full_bf16(device: str, solution: str) -> None:
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
-def test_rope_gptj_full_bf16(device: str, solution: str) -> None:
+def test_rope_gptj_full_bf16(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(1)
     num_tokens = 9
     num_q_heads = 4
@@ -112,7 +106,7 @@ def test_rope_gptj_full_bf16(device: str, solution: str) -> None:
     rotary_dim = 64
     max_position = 512
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered(solution, dtype)
+    require_registered_solution("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -166,7 +160,11 @@ def test_rope_gptj_full_bf16(device: str, solution: str) -> None:
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
-def test_rope_neox_partial_bf16(device: str, solution: str) -> None:
+def test_rope_neox_partial_bf16(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(2)
     num_tokens = 5
     num_q_heads = 4
@@ -175,7 +173,7 @@ def test_rope_neox_partial_bf16(device: str, solution: str) -> None:
     rotary_dim = 64
     max_position = 256
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered(solution, dtype)
+    require_registered_solution("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -239,7 +237,11 @@ def test_rope_neox_partial_bf16(device: str, solution: str) -> None:
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
-def test_rope_single_token(device: str, solution: str) -> None:
+def test_rope_single_token(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     """Edge case: num_tokens == 1 (decode step)."""
     torch.manual_seed(4)
     num_tokens = 1
@@ -249,7 +251,7 @@ def test_rope_single_token(device: str, solution: str) -> None:
     rotary_dim = 128
     max_position = 64
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered(solution, dtype)
+    require_registered_solution("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
@@ -296,7 +298,11 @@ def test_rope_single_token(device: str, solution: str) -> None:
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
-def test_rope_fused_set_kv_buffer(device: str, solution: str) -> None:
+def test_rope_fused_set_kv_buffer(
+    device: str,
+    solution: str,
+    require_registered_solution,
+) -> None:
     torch.manual_seed(5)
     num_tokens = 13
     num_q_heads = 4
@@ -306,7 +312,7 @@ def test_rope_fused_set_kv_buffer(device: str, solution: str) -> None:
     max_position = 512
     cache_size = 32
     dtype = torch.bfloat16
-    _skip_if_solution_unregistered(solution, dtype)
+    require_registered_solution("embedding", "rope", solution, dtype)
 
     inv_freq = 1.0 / (
         10000.0
