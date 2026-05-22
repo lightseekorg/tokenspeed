@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from fractions import Fraction
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.configs.paged_cache_spec import (
+    PagedCacheGroupSpec,
     compute_paged_cache_group_page_counts,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
@@ -41,6 +43,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.common import ceil_div
 
 logger = get_colorful_logger(__name__)
 
@@ -133,6 +136,59 @@ class DeepseekV4CacheLayout:
         return cell_size
 
 
+def _deepseek_v4_cache_group_page_bytes(
+    layout: DeepseekV4CacheLayout,
+    specs: Sequence[PagedCacheGroupSpec],
+    layer_num: int,
+) -> dict[str, int]:
+    if layer_num > len(layout.layer_ratio):
+        raise ValueError(
+            "DeepSeek V4 cache layout has fewer layer ratios "
+            f"({len(layout.layer_ratio)}) than requested layers ({layer_num})"
+        )
+
+    group_rows = {spec.group_id: int(spec.rows_per_page) for spec in specs}
+    page_bytes = {spec.group_id: 0 for spec in specs}
+    fp32_size = torch._utils._element_size(torch.float32)
+
+    swa_block_bytes = layout.swa_block_bytes(
+        group_rows.get(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
+    )
+    for layer_id, ratio in enumerate(layout.layer_ratio[:layer_num]):
+        page_bytes[V4_SWA_KV_GROUP_ID] += swa_block_bytes
+        if ratio <= 1:
+            continue
+
+        compressed_group_id = v4_compressed_kv_group_id(ratio)
+        compressed_block_size = layout.storage_block_size(ratio)
+        page_bytes[compressed_group_id] += layout.swa_block_bytes(compressed_block_size)
+
+        state_group_id = v4_compressor_state_group_id(ratio)
+        state_block_size = group_rows.get(state_group_id, layout.page_size)
+        page_bytes[state_group_id] += (
+            state_block_size * layout.state_width(layer_id) * 2 * fp32_size
+        )
+
+        if ratio == 4:
+            indexer_block_size = max(V4_KERNEL_BLOCK_ROWS, compressed_block_size)
+            page_bytes[compressed_group_id] += (
+                indexer_block_size * layout.indexer_row_bytes
+            )
+
+            indexer_state_block_size = group_rows.get(
+                V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+                layout.compressor_state_block_size(ratio),
+            )
+            page_bytes[V4_INDEXER_COMPRESSOR_STATE_GROUP_ID] += (
+                indexer_state_block_size
+                * layout.state_width(layer_id, indexer=True)
+                * 2
+                * fp32_size
+            )
+
+    return page_bytes
+
+
 def _estimate_deepseek_v4_cache_bytes(
     *,
     layout: DeepseekV4CacheLayout,
@@ -153,6 +209,7 @@ def _estimate_deepseek_v4_cache_bytes(
         raise ValueError(f"max_total_tokens must be >= 0, got {max_total_tokens}")
 
     specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
+    page_bytes = _deepseek_v4_cache_group_page_bytes(layout, specs, layer_num)
     counts = compute_paged_cache_group_page_counts(
         specs,
         max_live_requests=max_live_requests,
@@ -160,54 +217,12 @@ def _estimate_deepseek_v4_cache_bytes(
         max_total_tokens=max_total_tokens,
         max_context_len=max_context_len,
     )
-    group_rows = {spec.group_id: int(spec.rows_per_page) for spec in specs}
-
-    fp32_size = torch._utils._element_size(torch.float32)
-    total = 0
-    swa_pages = int(counts[V4_SWA_KV_GROUP_ID])
-    swa_block_bytes = layout.swa_block_bytes(
-        group_rows.get(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
+    return int(
+        sum(
+            int(counts[gid]) * bytes_per_page
+            for gid, bytes_per_page in page_bytes.items()
+        )
     )
-
-    for layer_id, ratio in enumerate(layout.layer_ratio[:layer_num]):
-        total += swa_pages * swa_block_bytes
-        if ratio <= 1:
-            continue
-
-        compressed_pages = int(counts[v4_compressed_kv_group_id(ratio)])
-        compressed_block_size = layout.storage_block_size(ratio)
-        total += compressed_pages * layout.swa_block_bytes(compressed_block_size)
-
-        state_pages = int(counts[v4_compressor_state_group_id(ratio)])
-        state_block_size = group_rows.get(
-            v4_compressor_state_group_id(ratio), layout.page_size
-        )
-        total += (
-            state_pages
-            * state_block_size
-            * layout.state_width(layer_id)
-            * 2
-            * fp32_size
-        )
-
-        if ratio == 4:
-            indexer_block_size = max(V4_KERNEL_BLOCK_ROWS, compressed_block_size)
-            total += compressed_pages * indexer_block_size * layout.indexer_row_bytes
-
-            indexer_state_pages = int(counts[V4_INDEXER_COMPRESSOR_STATE_GROUP_ID])
-            indexer_state_block_size = group_rows.get(
-                V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-                layout.compressor_state_block_size(ratio),
-            )
-            total += (
-                indexer_state_pages
-                * indexer_state_block_size
-                * layout.state_width(layer_id, indexer=True)
-                * 2
-                * fp32_size
-            )
-
-    return int(total)
 
 
 def profile_deepseek_v4_max_num_pages(
@@ -232,20 +247,27 @@ def profile_deepseek_v4_max_num_pages(
             f"draft_cache_cell_size must be >= 0, got {draft_cache_cell_size}"
         )
 
+    draft_cache_cell_size = int(draft_cache_cell_size)
+    max_live_requests = int(max_live_requests)
+    max_scheduled_tokens = max(0, int(max_scheduled_tokens))
+    max_context_len = int(max_context_len)
+    specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
+    page_bytes = _deepseek_v4_cache_group_page_bytes(layout, specs, layer_num)
+
     def _bytes_for_pages(num_pages: int) -> int:
         num_tokens = int(num_pages) * page_size
-        return (
-            _estimate_deepseek_v4_cache_bytes(
-                layout=layout,
-                hf_config=hf_config,
-                layer_num=layer_num,
-                max_total_tokens=num_tokens,
-                max_live_requests=max_live_requests,
-                max_scheduled_tokens=max_scheduled_tokens,
-                max_context_len=max_context_len,
-            )
-            + num_tokens * draft_cache_cell_size
+        counts = compute_paged_cache_group_page_counts(
+            specs,
+            max_live_requests=max_live_requests,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=num_tokens,
+            max_context_len=max_context_len,
         )
+        cache_bytes = sum(
+            int(counts[gid]) * bytes_per_page
+            for gid, bytes_per_page in page_bytes.items()
+        )
+        return int(cache_bytes + num_tokens * draft_cache_cell_size)
 
     if _bytes_for_pages(1) > available_cache_memory_bytes:
         return 0
@@ -256,17 +278,66 @@ def profile_deepseek_v4_max_num_pages(
             (int(max_live_requests) * int(max_context_len) + page_size - 1)
             // page_size,
         )
-    high = 1
-    while _bytes_for_pages(high) <= available_cache_memory_bytes:
-        high *= 2
-    low = high // 2
-    while low + 1 < high:
-        mid = (low + high) // 2
-        if _bytes_for_pages(mid) <= available_cache_memory_bytes:
-            low = mid
-        else:
-            high = mid
-    return int(low)
+
+    # Fixed bytes cover resident sliding windows, request fragments, and dummy
+    # pages. Variable bytes are piecewise linear before and after the global
+    # scheduled-token write budget is capped.
+    fixed_counts = compute_paged_cache_group_page_counts(
+        specs,
+        max_live_requests=max_live_requests,
+        max_scheduled_tokens=max_scheduled_tokens,
+        max_total_tokens=0,
+        max_context_len=max_context_len,
+    )
+    fixed_bytes = sum(
+        int(fixed_counts[gid]) * bytes_per_page
+        for gid, bytes_per_page in page_bytes.items()
+    )
+    full_history_slope = Fraction(page_size * draft_cache_cell_size, 1)
+    scheduled_slope = Fraction(0, 1)
+    scheduled_cap_bytes = 0
+    for spec in specs:
+        bytes_per_page = page_bytes[spec.group_id]
+        if bytes_per_page == 0:
+            continue
+        raw_per_page = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        if spec.retention == "full_history":
+            full_history_slope += Fraction(page_size * bytes_per_page, raw_per_page)
+        elif spec.retention == "sliding_window":
+            scheduled_slope += Fraction(page_size * bytes_per_page, raw_per_page)
+            scheduled_cap_bytes += (
+                ceil_div(max_scheduled_tokens, raw_per_page) * bytes_per_page
+            )
+
+    def _pages_from_budget(extra_bytes: int, slope: Fraction) -> int:
+        if extra_bytes <= 0 or slope <= 0:
+            return 0
+        return int(extra_bytes * slope.denominator // slope.numerator)
+
+    cap_pages = ceil_div(max_scheduled_tokens, page_size)
+    candidate = 0
+    pre_cap_slope = full_history_slope + scheduled_slope
+    if cap_pages > 0:
+        pre_cap_pages = _pages_from_budget(
+            available_cache_memory_bytes - fixed_bytes,
+            pre_cap_slope,
+        )
+        candidate = min(pre_cap_pages, cap_pages - 1)
+
+    post_cap_fixed_bytes = fixed_bytes + scheduled_cap_bytes
+    post_cap_pages = _pages_from_budget(
+        available_cache_memory_bytes - post_cap_fixed_bytes,
+        full_history_slope,
+    )
+    if post_cap_pages >= cap_pages:
+        candidate = max(candidate, post_cap_pages)
+    candidate = max(1, candidate)
+
+    while candidate > 0 and _bytes_for_pages(candidate) > available_cache_memory_bytes:
+        candidate -= 1
+    while _bytes_for_pages(candidate + 1) <= available_cache_memory_bytes:
+        candidate += 1
+    return int(candidate)
 
 
 def _split_paged_cache_block_tables_into_v4_metadata(
