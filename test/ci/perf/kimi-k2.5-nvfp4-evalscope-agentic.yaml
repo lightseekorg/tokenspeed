@@ -71,6 +71,17 @@ install:
     # `Install pipeline dependency` step; pipeline.py re-imports yaml
     # under the new python3.12, so reinstall it there.
     python3 -m pip install --break-system-packages --no-cache-dir pyyaml
+    # The b200-4gpu-perf image has apt-installed `python3-psutil`
+    # under /usr/lib/python3/dist-packages/psutil/ with a cp310-ABI
+    # `_psutil_linux.so`. python3.12's sys.path still includes that
+    # unversioned dist-packages dir (Debian patch), and tokenspeed's
+    # runtime imports psutil at startup — so the broken .so trips
+    # `cannot import name '_psutil_linux'` on first import. Drop the
+    # apt copy and force-install psutil under python3.12 so the cp312
+    # wheel lands in /usr/local/lib/python3.12/dist-packages/ ahead of
+    # the broken one on sys.path.
+    sudo rm -rf /usr/lib/python3/dist-packages/psutil /usr/lib/python3/dist-packages/psutil-*.dist-info /usr/lib/python3/dist-packages/psutil-*.egg-info
+    python3 -m pip install --break-system-packages --no-cache-dir --force-reinstall psutil
     sudo apt-get install -y --no-install-recommends \
       libgomp1 \
       libnuma1 libibverbs1 rdma-core infiniband-diags ibverbs-providers \
