@@ -211,11 +211,11 @@ def test_quantize_mxfp8_shape_and_scale(
     require("quantization", "mxfp8", solution, dtype)
 
     x = torch.randn(17, 2880, device=device, dtype=dtype)
-    out, scale = quantize_mxfp8(x, alignment=4096, solution=solution)
+    out, scale = quantize_mxfp8(x, solution=solution)
     torch.cuda.synchronize()
 
     assert out.shape[:-1] == x.shape[:-1]
-    assert out.shape[-1] == 4096
+    assert out.shape[-1] >= x.shape[-1]
     assert scale.numel() > 0
 
 
@@ -232,8 +232,7 @@ def test_quantize_nvfp4_shape_and_scale(
     x = torch.randn(16, 256, device=device, dtype=dtype)
     out, scale = quantize_nvfp4(
         x,
-        global_scale=torch.tensor([0.125], device=device, dtype=torch.float32),
-        scale_size=16,
+        scale=torch.tensor([0.125], device=device, dtype=torch.float32),
         solution=solution,
     )
     torch.cuda.synchronize()
