@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -210,11 +211,15 @@ class FlashMLABackend(AttentionBackend):
                 bs, num_extends, req_pool_indices, seq_lens, req_to_page
             )
 
-    def set_decode_num_extends(self, num_extends: int):
-        """Mutate the decode-metadata slice discriminator. Used between drafter
-        step 0 (slice = [num_extends:]) and step 1+ (slice = [0:])."""
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
         assert self.forward_decode_metadata is not None
+        prev = self.forward_decode_metadata.num_extends
         self.forward_decode_metadata.num_extends = num_extends
+        try:
+            yield
+        finally:
+            self.forward_decode_metadata.num_extends = prev
 
     def _init_decode_metadata(
         self,

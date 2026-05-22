@@ -245,11 +245,6 @@ class Eagle(BaseDrafter):
         logits_output: LogitsProcessorOutput,
         draft_input: EagleDraftInput,
     ) -> None:
-        # Multi-step decode operates on full bs; drop the [num_extends:] slice
-        # that step 0 may have set up for MIXED target.
-        if hasattr(self.attn_backend, "set_decode_num_extends"):
-            self.attn_backend.set_decode_num_extends(0)
-
         num_extends = draft_input.num_extends
         num_decodes = bs - num_extends
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
@@ -392,8 +387,10 @@ class Eagle(BaseDrafter):
         draft_ids = cute_argmax(logits_output.next_token_logits)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
-        # Draft step 2+ (multi-step decode).
-        if self.spec_num_steps > 1:
+        if self.spec_num_steps <= 1:
+            return next_tokens
+
+        if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
             # Skip multi-step when the whole batch is mid-chunk EXTEND: no
             # request transitions to target_verify after this forward, so
             # any speculative tokens we draft would be discarded.
@@ -401,12 +398,17 @@ class Eagle(BaseDrafter):
             # In DP we still run, because peer ranks may have completing
             # extends or decodes; diverging here would desync the drafter's
             # dense-TP / MoE-EP collectives (NCCL hang or RSAG mismatch).
-            skip = self.dp_size == 1 and self.input_buffers.all_extends_mid_chunk
-            if not skip:
-                self._run_multi_step_decode(
-                    bs, draft_ids, next_tokens, logits_output, draft_input
-                )
+            return next_tokens
 
+        # Draft step 2+ (multi-step decode).
+        # Multi-step decode operates on full bs; drop the [num_extends:]
+        # slice that step 0 may have set up for MIXED target. No-op on
+        # backends that fill separate prefill/decode metadata at init
+        # time.
+        with self.attn_backend.override_num_extends(0):
+            self._run_multi_step_decode(
+                bs, draft_ids, next_tokens, logits_output, draft_input
+            )
         return next_tokens
 
     @override
