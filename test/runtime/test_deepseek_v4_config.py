@@ -1066,6 +1066,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1099,6 +1100,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1138,6 +1140,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1176,6 +1179,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1241,6 +1245,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1441,6 +1446,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=576,
                 context_len=256,
             )
@@ -1526,6 +1532,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=576,
                 context_len=256,
             )
@@ -1570,6 +1577,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=576,
                 context_len=256,
             )
@@ -1663,6 +1671,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -1747,6 +1756,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -1807,6 +1817,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=1024,
             )
@@ -1924,6 +1935,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -1987,6 +1999,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -2700,6 +2713,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens_cpu=torch.tensor([16], dtype=torch.int32),
             query_lens_cpu=torch.tensor([6], dtype=torch.int32),
             compress_ratio=4,
+            num_tokens=6,
             max_logits_bytes=32,
             workspace_size=100,
         )
@@ -2728,6 +2742,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens_cpu=torch.tensor([16, 8], dtype=torch.int32),
             query_lens_cpu=torch.tensor([2, 2], dtype=torch.int32),
             compress_ratio=4,
+            num_tokens=4,
             max_logits_bytes=128,
             workspace_size=100,
         )
