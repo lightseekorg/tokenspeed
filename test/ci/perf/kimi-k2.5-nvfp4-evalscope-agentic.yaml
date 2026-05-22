@@ -49,10 +49,19 @@ install:
     # The b200-4gpu-perf host has a stale `.local`-scope `trtllm_kernel`
     # built against an older PyTorch. With torch==2.11.0 it raises
     # `torch::Library::_def(..., std::vector<at::Tag> const&, ...) &`
-    # undefined-symbol at first import. Drop it (plus its sibling
-    # tokenspeed-trtllm-kernel dist record) so install_deps.sh can
-    # reinstall the pinned tokenspeed-trtllm-kernel built against 2.11.0.
+    # undefined-symbol at first import. `pip uninstall` only removes
+    # files tracked in the `tokenspeed-trtllm-kernel` RECORD; the stale
+    # `.so` was originally landed by a different dist, so the directory
+    # survives. Nuke the whole module dir (in both `~/.local` and the
+    # system path) so install_deps.sh's reinstall yields a clean tree.
     python3 -m pip uninstall -y --break-system-packages trtllm_kernel tokenspeed-trtllm-kernel || true
+    for p in \
+      /home/ubuntu/.local/lib/python3.10/site-packages/trtllm_kernel \
+      /home/ubuntu/.local/lib/python3.10/site-packages/tokenspeed_trtllm_kernel* \
+      /usr/local/lib/python3.10/dist-packages/trtllm_kernel \
+      /usr/local/lib/python3.10/dist-packages/tokenspeed_trtllm_kernel*; do
+      sudo rm -rf $p 2>/dev/null || true
+    done
     python3 -m pip install --break-system-packages --no-cache-dir \
       mooncake-transfer-engine-cuda13 \
       nvidia-cusparselt-cu13 \
