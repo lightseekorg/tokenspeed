@@ -20,7 +20,6 @@ server:
     --max-model-len 80000
     --max-num-seqs 16
     --gpu-memory-utilization 0.95
-    --enable-mixed-batch
     --disable-cuda-graph-padding
     --trust-remote-code
     --attention-backend tokenspeed_mla

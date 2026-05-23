@@ -11,7 +11,6 @@ exec ts serve \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
     --gpu-memory-utilization 0.8 \
-    --enable-mixed-batch \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --attention-backend trtllm_mla \
