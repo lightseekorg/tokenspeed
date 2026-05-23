@@ -1,15 +1,7 @@
 import argparse
-import os
-import sys
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
-
-# CI Registration (parsed via AST, runtime no-op)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
