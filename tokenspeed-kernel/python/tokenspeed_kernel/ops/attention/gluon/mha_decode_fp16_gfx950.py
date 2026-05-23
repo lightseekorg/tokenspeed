@@ -35,10 +35,7 @@ from tokenspeed_kernel.ops.attention.gluon.utils import (
     maximum,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import (
-    Priority,
-    register_kernel,
-)
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4

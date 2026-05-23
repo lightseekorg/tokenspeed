@@ -24,10 +24,7 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.registry import (
-    Priority,
-    register_kernel,
-)
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)

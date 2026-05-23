@@ -27,11 +27,7 @@ from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import verify_kernel
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import (
-    KernelRegistry,
-    KernelSpec,
-    load_builtin_kernels,
-)
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     format_signatures,

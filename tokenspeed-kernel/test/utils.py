@@ -24,10 +24,7 @@ from typing import Callable
 
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import (
-    KernelRegistry,
-    KernelSpec,
-)
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.signature import format_signatures
 
 

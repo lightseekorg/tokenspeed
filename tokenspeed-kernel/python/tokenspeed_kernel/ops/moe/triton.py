@@ -32,10 +32,7 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
 )
-from tokenspeed_kernel.registry import (
-    Priority,
-    register_kernel,
-)
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.trtllm import (
     moe_align_block_size as _moe_align_block_size,

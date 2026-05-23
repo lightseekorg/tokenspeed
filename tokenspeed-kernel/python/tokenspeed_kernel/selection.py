@@ -29,10 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Generator
 
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
-from tokenspeed_kernel.registry import (
-    KernelRegistry,
-    KernelSpec,
-)
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.signature import FormatSignature
 
 logger = logging.getLogger(__name__)

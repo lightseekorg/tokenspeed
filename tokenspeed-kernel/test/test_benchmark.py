@@ -32,10 +32,7 @@ from tokenspeed_kernel.benchmark.runner import BenchmarkRunner
 from tokenspeed_kernel.benchmark.throughput import ThroughputCalculator
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ProfilingConfig
-from tokenspeed_kernel.registry import (
-    KernelRegistry,
-    KernelSpec,
-)
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.signature import format_signatures
 
 pytestmark = [

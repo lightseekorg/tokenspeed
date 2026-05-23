@@ -27,10 +27,7 @@ import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
 from tokenspeed_kernel.platform import PlatformInfo
-from tokenspeed_kernel.registry import (
-    KernelRegistry,
-    KernelSpec,
-)
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.selection import (
     AutotuneParams,
     NoKernelFoundError,

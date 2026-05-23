@@ -28,11 +28,7 @@ select_kernel("moe", ...).
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.registry import (
-    Priority,
-    error_fn,
-    register_kernel,
-)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 try:

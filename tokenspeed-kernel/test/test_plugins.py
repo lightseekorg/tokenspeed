@@ -37,10 +37,7 @@ from tokenspeed_kernel.plugins import (
     reset_plugins,
 )
 from tokenspeed_kernel.plugins.cli import main as cli_main
-from tokenspeed_kernel.registry import (
-    KernelRegistry,
-    register_kernel,
-)
+from tokenspeed_kernel.registry import KernelRegistry, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 # ---------------------------------------------------------------------------

@@ -25,10 +25,7 @@ import math
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import (
-    Priority,
-    register_kernel,
-)
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     format_signatures,
