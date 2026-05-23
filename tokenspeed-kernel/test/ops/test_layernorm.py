@@ -189,7 +189,9 @@ def _ref_qk_rmsnorm_rope_gate(
     # 3. Partial RoPE on the first rotary_dim elements of each head.
     half_rotary = rotary_dim // 2
     cos = cos_sin_cache[positions, :half_rotary].unsqueeze(1).to(torch.float32)
-    sin = cos_sin_cache[positions, half_rotary:rotary_dim].unsqueeze(1).to(torch.float32)
+    sin = (
+        cos_sin_cache[positions, half_rotary:rotary_dim].unsqueeze(1).to(torch.float32)
+    )
 
     def _apply_partial_rope(x: torch.Tensor, num_heads: int) -> torch.Tensor:
         x_h = x.reshape(n_tokens, num_heads, head_dim).to(torch.float32)

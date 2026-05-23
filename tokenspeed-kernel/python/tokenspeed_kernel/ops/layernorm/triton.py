@@ -263,13 +263,13 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     rot_offs = tl.arange(0, ROT_HALF_BLOCK)
     rot_mask = rot_offs < half_rotary
     x_rot1 = tl.load(in_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
-    x_rot2 = tl.load(
-        in_base + half_rotary + rot_offs, mask=rot_mask, other=0.0
-    ).to(tl.float32)
+    x_rot2 = tl.load(in_base + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(
+        tl.float32
+    )
     w_rot1 = tl.load(w_ptr + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
-    w_rot2 = tl.load(
-        w_ptr + half_rotary + rot_offs, mask=rot_mask, other=0.0
-    ).to(tl.float32)
+    w_rot2 = tl.load(w_ptr + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(
+        tl.float32
+    )
     x_rot1 = (x_rot1 * inv_rms * w_rot1).to(INPUT_DTYPE).to(tl.float32)
     x_rot2 = (x_rot2 * inv_rms * w_rot2).to(INPUT_DTYPE).to(tl.float32)
 
@@ -293,9 +293,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     # --- Gate copy (q heads only, verbatim) ---
     if not is_k:
         gate_in_base = in_base + head_dim
-        gate_out_base = (
-            gate_out_ptr + token * gate_out_stride_t + local_head * head_dim
-        )
+        gate_out_base = gate_out_ptr + token * gate_out_stride_t + local_head * head_dim
         g = tl.load(gate_in_base + head_offs, mask=head_mask, other=0.0)
         tl.store(gate_out_base + head_offs, g, mask=head_mask)
 

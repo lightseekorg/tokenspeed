@@ -888,10 +888,9 @@ class MambaAttnBackend(AttentionBackend):
             batch_size = seq_len // draft_token_num
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -902,9 +901,7 @@ class MambaAttnBackend(AttentionBackend):
                 output_state_indices=output_indices[:batch_size],
             )
             # needn't contiguous here.
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
