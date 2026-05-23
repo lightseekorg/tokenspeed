@@ -83,7 +83,13 @@ class TensorFormat:
 
 @dataclass(frozen=True)
 class FormatSignature:
-    """Role-indexed tensor formats for one supported operand-format combination."""
+    """Role-indexed tensor formats for one concrete operand-format combination.
+
+    Each role appears at most once and maps to exactly one ``TensorFormat``.
+    A kernel that supports alternatives for a role represents them as multiple
+    ``FormatSignature`` values in ``KernelSpec.format_signatures`` rather than
+    as multiple formats inside one signature.
+    """
 
     roles: tuple[tuple[str, TensorFormat], ...]
 
@@ -156,17 +162,28 @@ def dense_tensor_format(storage_dtype: torch.dtype) -> TensorFormat:
 
 
 def format_signature(**roles: TensorFormat) -> FormatSignature:
-    """Construct a role-indexed format signature.
+    """Construct one concrete role-indexed format signature.
 
     Keyword names are logical tensor roles for the operator, for example
     a/b for GEMM or q/k_cache/v_cache for attention.
-    Values are the exact formats required for those roles.
+    Values are the exact formats required for those roles. Each role gets
+    exactly one ``TensorFormat``; represent alternatives by constructing
+    multiple ``FormatSignature`` values.
 
     Examples:
         >>> import torch
         >>> format_signature(
         ...     a=dense_tensor_format(torch.bfloat16),
         ...     b=tensor_format("mxfp4", torch.uint8),
+        ... )
+
+        This creates one signature equivalent to:
+
+        >>> FormatSignature(
+        ...     (
+        ...         ("a", dense_tensor_format(torch.bfloat16)),
+        ...         ("b", tensor_format("mxfp4", torch.uint8)),
+        ...     )
         ... )
     """
     return FormatSignature(tuple(roles.items()))
@@ -179,7 +196,7 @@ def format_signatures(
     *,
     scale: ScaleFormat | None = None,
 ) -> frozenset[FormatSignature]:
-    """Construct same-format signatures for each dtype.
+    """Construct same-format signatures for each storage dtype.
 
     Args:
         roles: Logical tensor roles. Pass a string for one role or an iterable
@@ -191,7 +208,8 @@ def format_signatures(
 
     Use ``format="dense"`` for dense same-format signatures. Use
     ``format_signature`` directly for mixed-role combinations such as dense
-    activations with quantized weights.
+    activations with quantized weights. This helper expands dtype alternatives
+    into separate signatures; it does not put multiple formats on one role.
 
     Examples:
         >>> import torch
@@ -199,6 +217,24 @@ def format_signatures(
         ...     ("q", "k_cache", "v_cache"),
         ...     "dense",
         ...     {torch.float16, torch.bfloat16},
+        ... )
+
+        This expands to a ``frozenset`` containing one signature per dtype,
+        equivalent to:
+
+        >>> frozenset(
+        ...     {
+        ...         format_signature(
+        ...             q=dense_tensor_format(torch.float16),
+        ...             k_cache=dense_tensor_format(torch.float16),
+        ...             v_cache=dense_tensor_format(torch.float16),
+        ...         ),
+        ...         format_signature(
+        ...             q=dense_tensor_format(torch.bfloat16),
+        ...             k_cache=dense_tensor_format(torch.bfloat16),
+        ...             v_cache=dense_tensor_format(torch.bfloat16),
+        ...         ),
+        ...     }
         ... )
     """
     normalized_roles = (roles,) if isinstance(roles, str) else tuple(roles)
