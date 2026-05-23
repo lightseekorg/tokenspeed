@@ -21,7 +21,7 @@ from typing import Literal
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import dense_format, format_signature
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "quantize_fp8",
@@ -68,7 +68,7 @@ def quantize_fp8(
     traits = {
         "has_scale": scale is not None,
     }
-    signature = format_signature(x=dense_format(x.dtype))
+    signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
         "fp8",
@@ -148,7 +148,7 @@ def quantize_fp8_with_scale(
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
     }
-    signature = format_signature(x=dense_format(x.dtype))
+    signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
         "fp8_with_scale",
@@ -207,7 +207,7 @@ def quantize_mxfp8(
     """
 
     traits = {}
-    signature = format_signature(x=dense_format(x.dtype))
+    signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
         "mxfp8",
@@ -268,7 +268,7 @@ def quantize_nvfp4(
         "scale_layout": scale_layout,
         "has_scale": scale is not None,
     }
-    signature = format_signature(x=dense_format(x.dtype))
+    signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
         "nvfp4",
@@ -340,7 +340,7 @@ def quantize_mxfp4(
         "has_global_scale": global_scale is not None,
         "scale_encoding": "ue8m0",
     }
-    signature = format_signature(x=dense_format(x.dtype))
+    signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
         "mxfp4",

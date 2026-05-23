@@ -31,7 +31,7 @@ from tokenspeed_kernel.registry import (
 )
 from tokenspeed_kernel.signature import (
     ScaleFormat,
-    dense_format,
+    dense_tensor_format,
     format_signature,
     format_signatures,
     tensor_format,
@@ -67,12 +67,12 @@ class TestKernelSpec:
             block_shape=(32,),
         )
         mixed = format_signature(
-            a=dense_format(torch.bfloat16),
+            a=dense_tensor_format(torch.bfloat16),
             b=tensor_format("mxfp4", torch.uint8, scale=scale),
         )
         dense = format_signature(
-            a=dense_format(torch.bfloat16),
-            b=dense_format(torch.uint8),
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.uint8),
         )
 
         assert mixed != dense

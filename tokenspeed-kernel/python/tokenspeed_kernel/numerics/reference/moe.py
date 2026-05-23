@@ -33,7 +33,7 @@ from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_format, format_signature
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 # isort: split
 from tokenspeed_kernel.signature import format_signatures
@@ -51,7 +51,9 @@ from tokenspeed_kernel.torch_compile import get_compiler_backend
     features={"pre_routed"},
     solution="reference",
     signatures=frozenset(
-        format_signature(x=dense_format(dtype), weight=dense_format(torch.bfloat16))
+        format_signature(
+            x=dense_tensor_format(dtype), weight=dense_tensor_format(torch.bfloat16)
+        )
         for dtype in {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.REFERENCE,

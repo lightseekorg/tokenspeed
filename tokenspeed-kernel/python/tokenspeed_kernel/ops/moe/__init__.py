@@ -44,7 +44,7 @@ from tokenspeed_kernel.selection import (
 )
 from tokenspeed_kernel.signature import (
     ScaleFormat,
-    dense_format,
+    dense_tensor_format,
     format_signature,
     tensor_format,
 )
@@ -137,15 +137,15 @@ _MXFP4_SCALE = ScaleFormat(
 )
 
 
-def _single_dense_format_signature(role: str, storage_dtype: torch.dtype):
-    return format_signature(**{role: dense_format(storage_dtype)})
+def _single_dense_tensor_format_signature(role: str, storage_dtype: torch.dtype):
+    return format_signature(**{role: dense_tensor_format(storage_dtype)})
 
 
 def _moe_dispatch_format_signature(storage_dtype: torch.dtype, traits: Optional[dict]):
     comm_strategy = (traits or {}).get("comm_strategy")
     if storage_dtype == torch.int32 or comm_strategy == "local":
-        return _single_dense_format_signature("indices", storage_dtype)
-    return _single_dense_format_signature("x", storage_dtype)
+        return _single_dense_tensor_format_signature("indices", storage_dtype)
+    return _single_dense_tensor_format_signature("x", storage_dtype)
 
 
 def _moe_fused_format_signature(
@@ -159,7 +159,7 @@ def _moe_fused_format_signature(
     elif weight_format == WEIGHT_MXFP4:
         weight = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
     elif weight_format == WEIGHT_BF16:
-        weight = dense_format(torch.bfloat16)
+        weight = dense_tensor_format(torch.bfloat16)
     else:
         raise ValueError(f"Unsupported MoE fused weight_format={weight_format!r}")
 
@@ -170,7 +170,7 @@ def _moe_fused_format_signature(
     elif storage_dtype == torch.float8_e4m3fn:
         x = tensor_format("fp8", storage_dtype, scale=_FP8_SCALE)
     else:
-        x = dense_format(storage_dtype)
+        x = dense_tensor_format(storage_dtype)
 
     return format_signature(x=x, weight=weight)
 
@@ -193,7 +193,7 @@ def moe_route(
     * ``{"biased": True/False}``: whether correction_bias is applied.
     * ``{"grouped": True/False}``: whether grouped expert selection is used.
     """
-    signature = _single_dense_format_signature("logits", dtype)
+    signature = _single_dense_tensor_format_signature("logits", dtype)
     kernel = select_kernel(
         "moe",
         "route",
@@ -251,7 +251,7 @@ def moe_experts(
     * ``{"dispatch_gemm"}``: gather/dispatch tokens then GEMM (uses gather_indx).
     * ``{"gemm_combine"}``: GEMM then scatter/combine results (uses scatter_indx).
     """
-    signature = _single_dense_format_signature("x", dtype)
+    signature = _single_dense_tensor_format_signature("x", dtype)
     kernel = select_kernel(
         "moe",
         "experts",
@@ -272,7 +272,7 @@ def moe_combine(
     **kwargs,
 ):
     """Combine expert outputs with weighted reduction."""
-    signature = _single_dense_format_signature("x", dtype)
+    signature = _single_dense_tensor_format_signature("x", dtype)
     kernel = select_kernel(
         "moe",
         "combine",

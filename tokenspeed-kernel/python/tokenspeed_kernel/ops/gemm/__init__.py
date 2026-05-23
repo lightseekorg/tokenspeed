@@ -34,7 +34,7 @@ from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
-    dense_format,
+    dense_tensor_format,
     format_signature,
     tensor_format,
 )
@@ -122,7 +122,9 @@ def _gemm_format_signature(
             a=tensor_format("nvfp4", A.dtype, scale=scale),
             b=tensor_format("nvfp4", B.dtype, scale=scale),
         )
-    return format_signature(a=dense_format(A.dtype), b=dense_format(B.dtype))
+    return format_signature(
+        a=dense_tensor_format(A.dtype), b=dense_tensor_format(B.dtype)
+    )
 
 
 def _online_quantize_mxfp8(

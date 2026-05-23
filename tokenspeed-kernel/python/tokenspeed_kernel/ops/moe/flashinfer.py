@@ -25,7 +25,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
-    dense_format,
+    dense_tensor_format,
     format_signature,
     tensor_format,
 )
@@ -49,24 +49,27 @@ _MXFP4_SCALE = ScaleFormat(
 _BF16_FUSED_FORMAT_SIGNATURES = frozenset(
     {
         format_signature(
-            x=dense_format(torch.bfloat16), weight=dense_format(torch.bfloat16)
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
         )
     }
 )
 _CUTLASS_FUSED_FORMAT_SIGNATURES = frozenset(
     {
         format_signature(
-            x=dense_format(torch.bfloat16), weight=dense_format(torch.bfloat16)
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
         ),
         format_signature(
-            x=dense_format(torch.float16), weight=dense_format(torch.bfloat16)
+            x=dense_tensor_format(torch.float16),
+            weight=dense_tensor_format(torch.bfloat16),
         ),
         format_signature(
-            x=dense_format(torch.bfloat16),
+            x=dense_tensor_format(torch.bfloat16),
             weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
         ),
         format_signature(
-            x=dense_format(torch.float16),
+            x=dense_tensor_format(torch.float16),
             weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
         ),
         format_signature(
@@ -82,11 +85,11 @@ _CUTLASS_FUSED_FORMAT_SIGNATURES = frozenset(
 _FP4_FUSED_FORMAT_SIGNATURES = frozenset(
     {
         format_signature(
-            x=dense_format(torch.bfloat16),
+            x=dense_tensor_format(torch.bfloat16),
             weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
         ),
         format_signature(
-            x=dense_format(torch.bfloat16),
+            x=dense_tensor_format(torch.bfloat16),
             weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
         ),
         format_signature(
