@@ -997,10 +997,11 @@ def start_server(
     )
 
 
-def wrap_command_with_log(command: str, log_path: Path) -> str:
+def wrap_command_with_log(command: str, log_path: Path, *, login_shell: bool = True) -> str:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     wrapped = f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
-    return f"bash -lc {shlex.quote(wrapped)}"
+    flag = "-lc" if login_shell else "-c"
+    return f"bash {flag} {shlex.quote(wrapped)}"
 
 
 def stop_server(process: subprocess.Popen[str] | None) -> None:
@@ -1171,7 +1172,8 @@ def execute_task(
                 if pgm is not None:
                     server_process = pgm.start(
                         wrap_command_with_log(
-                            stage_payload["command"], server_log_path
+                            stage_payload["command"], server_log_path,
+                            login_shell=False,
                         ),
                         cwd=repo_root,
                         env=runner_env,
