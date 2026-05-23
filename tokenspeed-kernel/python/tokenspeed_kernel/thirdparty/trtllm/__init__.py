@@ -72,7 +72,10 @@ if platform.is_nvidia:
         def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
             return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
 
-        # FP8 blockwise matmul helper.
+        # FP8 blockwise matmul helper. trtllm v1.3+ dropped the alpha and
+        # out_dtype parameters; the kernel hardcodes alpha=1.0 and selects
+        # the output dtype internally (bf16 on Blackwell). We cast to the
+        # caller's requested dtype if it differs.
         def fp8_blockwise_scaled_mm(
             mat_a: torch.Tensor,
             mat_b: torch.Tensor,
@@ -80,10 +83,10 @@ if platform.is_nvidia:
             scales_b: torch.Tensor,
             out_dtype: torch.dtype,
         ) -> torch.Tensor:
-            alpha = torch.tensor(1.0, dtype=torch.float32, device=mat_a.device)
-            return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
-                mat_a, mat_b, alpha, scales_a, scales_b, out_dtype
+            result = torch.ops.trtllm.fp8_block_scaling_gemm_impl(
+                mat_a, mat_b, scales_a, scales_b
             )
+            return result if result.dtype == out_dtype else result.to(out_dtype)
 
         def per_token_group_quant_8bit(
             x: torch.Tensor,
