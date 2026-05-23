@@ -147,24 +147,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          changed=""
+          # Use curl + python3 instead of `gh api`: the self-hosted GPU
+          # runners (b200 / b300 / h100 / gb200 / MI355) don't ship the
+          # gh CLI, so `gh: command not found` would silently leave the
+          # env var unset and skip the source override on every host.
           case "${{ github.event_name }}" in
             pull_request)
-              changed=$(gh api \
-                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                --paginate -q '.[].filename' \
-                | grep '^tokenspeed-mla/' || true)
+              url="https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100"
               ;;
             push)
-              changed=$(gh api \
-                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
-                -q '.files[].filename' \
-                | grep '^tokenspeed-mla/' || true)
+              url="https://api.github.com/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}"
+              ;;
+            *)
+              echo "Unhandled event_name '${{ github.event_name }}'; assuming no tokenspeed-mla change."
+              exit 0
               ;;
           esac
+          changed=$(curl -sSL --fail \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$url" \
+            | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          files = d["files"] if isinstance(d, dict) and "files" in d else d
+          for f in files:
+              print(f["filename"])
+          ' \
+            | grep '^tokenspeed-mla/' || true)
           if [ -n "$changed" ]; then
             echo "tokenspeed-mla touched by this run; will reinstall from source"
+            echo "$changed"
             echo "INSTALL_TOKENSPEED_MLA_FROM_SOURCE=1" >> "$GITHUB_ENV"
+          else
+            echo "tokenspeed-mla not touched; keeping pinned PyPI wheel."
           fi
 
       - name: Install CI task
