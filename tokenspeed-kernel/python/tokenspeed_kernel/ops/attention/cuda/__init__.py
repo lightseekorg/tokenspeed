@@ -6,7 +6,11 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    register_kernel,
+)
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
@@ -22,7 +26,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("out_a", "out_b"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED + 2,
         traits={},
         tags={"throughput"},

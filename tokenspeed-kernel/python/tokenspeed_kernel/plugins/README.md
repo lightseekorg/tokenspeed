@@ -43,6 +43,7 @@ my-kernels-plugin/
 import torch
 
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.registry import register_kernel
 
 
@@ -53,7 +54,9 @@ def register() -> None:
         "attention",
         "decode",
         solution="my_custom",
-        dtypes={torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.bfloat16}
+        ),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
@@ -110,10 +113,17 @@ points at all — call `register_kernel(...)` directly:
 
 ```python
 import torch
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.registry import register_kernel
 
 
-@register_kernel("gemm", "mm", solution="experiment", dtypes={torch.bfloat16}, priority=15)
+@register_kernel(
+    "gemm",
+    "mm",
+    solution="experiment",
+    signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+    priority=15,
+)
 def my_experimental_gemm(a, b, **kwargs):
     ...
 ```

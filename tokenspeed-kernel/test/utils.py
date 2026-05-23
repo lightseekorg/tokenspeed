@@ -24,7 +24,11 @@ from typing import Callable
 
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+)
+from tokenspeed_kernel.signature import format_signatures
 
 
 def dummy_impl(name: str) -> Callable:
@@ -45,7 +49,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             mode="decode",
             solution="flashinfer",
             features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(8, 0),
@@ -63,7 +69,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             mode="decode",
             solution="triton",
             features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ),
             priority=10,
             tags=frozenset({"portability"}),
         ),
@@ -76,7 +84,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="attention",
             mode="prefill",
             solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(9, 0),
@@ -94,7 +104,11 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             mode="decode",
             solution="reference",
             features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32}),
+            format_signatures=format_signatures(
+                ("q", "k_cache", "v_cache"),
+                "dense",
+                {torch.float16, torch.bfloat16, torch.float32},
+            ),
             capability=CapabilityRequirement(),
             priority=10,
             tags=frozenset({"determinism", "portability"}),
@@ -109,7 +123,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             mode="decode",
             solution="aiter",
             features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"amd"}),
             ),
@@ -125,7 +141,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="gemm",
             mode="mm",
             solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("a", "b"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(8, 0),
@@ -142,7 +160,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="gemm",
             mode="mm",
             solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("a", "b"), "dense", {torch.float16, torch.bfloat16}
+            ),
             priority=10,
             tags=frozenset({"portability"}),
         ),
@@ -155,7 +175,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="gemm",
             mode="grouped_mm",
             solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("a", "b"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(9, 0),
@@ -172,7 +194,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="gemm",
             mode="grouped_mm",
             solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("a", "b"), "dense", {torch.float16, torch.bfloat16}
+            ),
             priority=10,
             tags=frozenset({"portability"}),
         ),
@@ -185,7 +209,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="moe",
             mode="fused",
             solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("x", "weight"), "dense", {torch.float16, torch.bfloat16}
+            ),
             priority=12,
             tags=frozenset({"throughput", "portability"}),
         ),
@@ -198,7 +224,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="moe",
             mode="fused",
             solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                ("x", "weight"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(9, 0),
@@ -215,7 +243,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="moe",
             mode="modular",
             solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                "x", "dense", {torch.float16, torch.bfloat16}
+            ),
             priority=10,
             tags=frozenset({"determinism", "portability"}),
         ),
@@ -228,7 +258,9 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             family="moe",
             mode="modular",
             solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            format_signatures=format_signatures(
+                "x", "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(8, 0),

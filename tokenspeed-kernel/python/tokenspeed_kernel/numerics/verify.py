@@ -86,10 +86,16 @@ def verify_kernel(
     if kernel is None:
         raise ValueError(f"Kernel implementation for {kernel_name!r} is missing")
 
+    signature = spec.format_signature_for_storage_dtype(dtype)
+    if signature is None:
+        raise ValueError(
+            f"Kernel {kernel_name!r} does not support primary storage dtype={dtype}"
+        )
+
     ref_specs = registry.get_for_operator(
         spec.family,
         spec.mode,
-        dtype=dtype,
+        format_signature=signature,
         solution="reference",
     )
     if not ref_specs:
@@ -119,6 +125,7 @@ def verify_kernel(
         spec.mode,
         dtype=dtype,
         traits=spec.traits,
+        format_signature=signature,
         device=device,
         seed=seed,
     )

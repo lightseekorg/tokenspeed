@@ -23,10 +23,19 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
+from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import verify_kernel
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    load_builtin_kernels,
+)
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    format_signatures,
+)
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 
@@ -59,6 +68,36 @@ class TestCompareOutputs:
         assert result.num_mismatches == 1
 
 
+def test_gemm_input_generator_uses_signature_scale_metadata() -> None:
+    scale = ScaleFormat(
+        storage_dtype=torch.float32,
+        granularity="block",
+        block_shape=(128, 128),
+        layout="mxfp8",
+    )
+    signature = next(
+        iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(M=4, N=256, K=128)
+
+    assert inputs["A"].dtype == _fp8_dtype
+    assert inputs["B"].dtype == _fp8_dtype
+    assert inputs["A_scales"].shape == (4, 1)
+    assert inputs["B_scales"].shape == (2, 1)
+    assert inputs["A_scales"].dtype == torch.float32
+    assert inputs["B_scales"].dtype == torch.float32
+    assert inputs["block_size"] == [128, 128]
+
+
 class TestNumericsVerification:
     def _get_verifiable_specs(
         dtype: torch.dtype, family: str | None = None
@@ -72,13 +111,16 @@ class TestNumericsVerification:
                 continue
             # Only run kernels that have a paired reference for this dtype;
             # otherwise verify_kernel raises ValueError and the test errors.
-            has_reference = any(
-                s.solution == "reference"
-                for s in registry.get_for_operator(family_name, mode, dtype=dtype)
-            )
+            op_specs = registry.get_for_operator(family_name, mode)
+            dtype_specs = [
+                s
+                for s in op_specs
+                if s.format_signature_for_storage_dtype(dtype) is not None
+            ]
+            has_reference = any(s.solution == "reference" for s in dtype_specs)
             if not has_reference:
                 continue
-            for spec in registry.get_for_operator(family_name, mode, dtype=dtype):
+            for spec in dtype_specs:
                 if spec.solution == "reference":
                     continue
                 if spec.solution == "deep_gemm":

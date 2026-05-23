@@ -22,9 +22,98 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    error_fn,
+    register_kernel,
+)
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_format,
+    format_signature,
+    tensor_format,
+)
 
 platform = current_platform()
+
+
+_FP8_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    layout="fp8",
+)
+_NVFP4_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    layout="nvfp4",
+)
+_MXFP4_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(32,),
+    layout="ue8m0",
+)
+_BF16_FUSED_FORMAT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            x=dense_format(torch.bfloat16), weight=dense_format(torch.bfloat16)
+        )
+    }
+)
+_CUTLASS_FUSED_FORMAT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            x=dense_format(torch.bfloat16), weight=dense_format(torch.bfloat16)
+        ),
+        format_signature(
+            x=dense_format(torch.float16), weight=dense_format(torch.bfloat16)
+        ),
+        format_signature(
+            x=dense_format(torch.bfloat16),
+            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+        ),
+        format_signature(
+            x=dense_format(torch.float16),
+            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+        ),
+        format_signature(
+            x=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+        ),
+        format_signature(
+            x=tensor_format("fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
+            weight=tensor_format("fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
+        ),
+    }
+)
+_FP4_FUSED_FORMAT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            x=dense_format(torch.bfloat16),
+            weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
+        ),
+        format_signature(
+            x=dense_format(torch.bfloat16),
+            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+        ),
+        format_signature(
+            x=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
+            weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
+        ),
+        format_signature(
+            x=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+        ),
+    }
+)
+_CUTEDSL_NVFP4_FORMAT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            x=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+            weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+        )
+    }
+)
 
 cutlass_fused_moe = error_fn
 fp4_quantize = error_fn
@@ -101,8 +190,8 @@ if trtllm_bf16_moe is not error_fn:
         name="flashinfer_trtllm_bf16_fused_moe",
         features={"self_routing"},
         solution="trtllm",
-        dtypes={torch.bfloat16},
-        traits={"weight_dtype": frozenset({"bf16"})},
+        signatures=_BF16_FUSED_FORMAT_SIGNATURES,
+        traits={},
         priority=Priority.SPECIALIZED,
         tags={"throughput"},
     )(trtllm_bf16_moe)
@@ -114,9 +203,8 @@ if cutlass_fused_moe is not error_fn:
         name="flashinfer_cutlass_fused_moe",
         features={"pre_routed"},
         solution="flashinfer",
-        dtypes={torch.bfloat16, torch.float16, torch.uint8, torch.float8_e4m3fn},
+        signatures=_CUTLASS_FUSED_FORMAT_SIGNATURES,
         traits={
-            "weight_dtype": frozenset({"bf16", "fp8", "nvfp4"}),
             "tp": frozenset({True, False}),
             "ep": frozenset({True, False}),
             "cuda_graph": frozenset({False}),
@@ -132,8 +220,8 @@ if trtllm_fp4_block_scale_moe is not error_fn:
         name="flashinfer_trtllm_fp4_fused_moe",
         features={"self_routing"},
         solution="trtllm",
-        dtypes={torch.uint8, torch.bfloat16},
-        traits={"weight_dtype": frozenset({"mxfp4", "nvfp4"})},
+        signatures=_FP4_FUSED_FORMAT_SIGNATURES,
+        traits={},
         priority=Priority.SPECIALIZED,
         tags={"throughput"},
     )(trtllm_fp4_block_scale_moe)
@@ -166,9 +254,8 @@ try:
         name="flashinfer_cutedsl_nvfp4_fused_moe",
         features={"pre_routed"},
         solution="cutedsl",
-        dtypes={torch.uint8},
+        signatures=_CUTEDSL_NVFP4_FORMAT_SIGNATURES,
         traits={
-            "weight_dtype": frozenset({"nvfp4"}),
             "tp": frozenset({False}),
             "ep": frozenset({True, False}),
             "cuda_graph": frozenset({True, False}),

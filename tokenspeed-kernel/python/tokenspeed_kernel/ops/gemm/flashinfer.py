@@ -27,12 +27,37 @@ from tokenspeed_kernel.platform import (
     Platform,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    error_fn,
+    register_kernel,
+)
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    format_signatures,
+)
 
 platform = current_platform()
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 
 _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
+_MXFP8_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(128, 128),
+    layout="mxfp8",
+)
+_NVFP4_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    layout="nvfp4",
+)
+_MXFP8_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE
+)
+_NVFP4_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "nvfp4", _fp4_dtypes, scale=_NVFP4_SCALE
+)
 
 # ---- FlashInfer block-scaled FP8 ----------------------------------------
 
@@ -59,9 +84,8 @@ if gemm_fp8_nt_groupwise is not error_fn:
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={_fp8_dtype},
+        signatures=_MXFP8_FORMAT_SIGNATURES,
         traits={
-            "quant": frozenset({"mxfp8"}),
             "n_align_128": frozenset({True}),
             "k_align_128": frozenset({True}),
         },
@@ -127,10 +151,8 @@ if mm_fp4 is not error_fn:
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes=_fp4_dtypes,
-        traits={
-            "quant": frozenset({"nvfp4"}),
-        },
+        signatures=_NVFP4_FORMAT_SIGNATURES,
+        traits={},
         priority=Priority.SPECIALIZED + 2,
     )
     def flashinfer_mm_nvfp4(

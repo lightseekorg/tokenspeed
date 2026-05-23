@@ -37,7 +37,11 @@ from tokenspeed_kernel.plugins import (
     reset_plugins,
 )
 from tokenspeed_kernel.plugins.cli import main as cli_main
-from tokenspeed_kernel.registry import KernelRegistry, register_kernel
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    register_kernel,
+)
+from tokenspeed_kernel.signature import format_signatures
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -104,7 +108,7 @@ def _make_register(
     mode: str = "mm",
     solution: str | None = None,
     priority: int = 12,
-    dtypes=None,
+    storage_dtypes=None,
     capability: CapabilityRequirement | None = None,
 ) -> Callable[[], None]:
     sol = solution or name
@@ -115,7 +119,9 @@ def _make_register(
             mode,
             name=name,
             solution=sol,
-            dtypes=dtypes or {torch.bfloat16},
+            signatures=format_signatures(
+                ("a", "b"), "dense", storage_dtypes or {torch.bfloat16}
+            ),
             priority=priority,
             capability=capability,
         )
@@ -147,7 +153,12 @@ class TestExplicitRegistration:
     """The decorator path is what plugins use; test it works standalone."""
 
     def test_register_kernel_decorator(self, fresh_plugins):
-        @register_kernel("gemm", "mm", solution="manual", dtypes={torch.bfloat16})
+        @register_kernel(
+            "gemm",
+            "mm",
+            solution="manual",
+            signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+        )
         def impl(a, b):
             return a @ b
 
@@ -202,7 +213,7 @@ class TestDiscovery:
                     "mm",
                     name=f"k_{name}",
                     solution=name,
-                    dtypes={torch.bfloat16},
+                    signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
                 )
                 def impl():
                     return name
@@ -232,7 +243,7 @@ class TestDiscovery:
                 "mm",
                 name="once_kernel",
                 solution="once",
-                dtypes={torch.bfloat16},
+                signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
             )
             def impl():
                 return None
@@ -253,7 +264,7 @@ class TestDiscovery:
                 "mm",
                 name="force_kernel",
                 solution="force",
-                dtypes={torch.bfloat16},
+                signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
             )
             def impl():
                 return None
@@ -274,7 +285,7 @@ class TestOverride:
             "mm",
             name="builtin_gemm",
             solution="builtin",
-            dtypes={torch.bfloat16},
+            signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
             priority=10,
         )
         def builtin(a, b):
@@ -363,7 +374,7 @@ class TestCollision:
             "mm",
             name="builtin_eq",
             solution="builtin",
-            dtypes={torch.bfloat16},
+            signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
             priority=14,
         )
         def b(a, x):

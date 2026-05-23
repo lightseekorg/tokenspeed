@@ -28,9 +28,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Generator
 
-import torch
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+)
+from tokenspeed_kernel.signature import FormatSignature
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +316,7 @@ def _get_config_override(family: str, mode: str) -> _ConfigOverrideEntry | None:
 def _make_cache_key(
     family: str,
     mode: str,
-    dtype: object,
+    format_signature: FormatSignature,
     arch: str,
     objective: SelectionObjective,
     features: frozenset[str] | None,
@@ -323,7 +326,16 @@ def _make_cache_key(
     """Build a hashable cache key including selection-relevant traits."""
     traits_key = tuple(sorted(traits.items())) if traits else ()
     mods_key = frozenset(features) if features else frozenset()
-    return (family, mode, dtype, arch, objective, mods_key, traits_key, solution)
+    return (
+        family,
+        mode,
+        format_signature,
+        arch,
+        objective,
+        mods_key,
+        traits_key,
+        solution,
+    )
 
 
 def _score_priority(spec: KernelSpec) -> int:
@@ -478,7 +490,7 @@ def _resolve_override(
     registry: KernelRegistry,
     family: str,
     mode: str,
-    dtype: object,
+    format_signature: object,
     override: str,
     platform: PlatformInfo,
 ) -> SelectedKernel:
@@ -494,14 +506,14 @@ def _resolve_override(
             return SelectedKernel(name=kernel_name, impl=impl)
 
     raise NoKernelFoundError(
-        f"Override '{override}' not found for {family}.{mode} ({dtype})"
+        f"Override '{override}' not found for {family}.{mode} ({format_signature})"
     )
 
 
 def _log_selection(
     family: str,
     mode: str,
-    dtype: object,
+    format_signature: object,
     winner: KernelSpec,
     scored: list[tuple[KernelSpec, ScoreBreakdown]],
     platform: PlatformInfo,
@@ -517,7 +529,7 @@ def _log_selection(
             "[tokenspeed_kernel] %s.%s(%s) -> %s (%s, %s)",
             family,
             mode,
-            dtype,
+            format_signature,
             winner.name,
             breakdown,
             platform.arch,
@@ -527,7 +539,7 @@ def _log_selection(
             "[tokenspeed_kernel] %s.%s(%s) -> %s (%s)",
             family,
             mode,
-            dtype,
+            format_signature,
             winner.name,
             platform.arch,
         )
@@ -536,7 +548,7 @@ def _log_selection(
 def select_kernel(
     family: str,
     mode: str,
-    dtype: torch.dtype,
+    format_signature: FormatSignature,
     *,
     features: frozenset[str] | None = None,
     platform: PlatformInfo | None = None,
@@ -548,21 +560,21 @@ def select_kernel(
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
-    On first call for a given (family, mode, dtype, platform, objective, traits,
+    On first call for a given (family, mode, format_signature, platform, objective, traits,
     solution) combination, runs the full selection pipeline. Subsequent calls
     with the same arguments return the cached result — a single dict lookup.
 
     Args:
         family: Operator family (e.g., "attention")
         mode: Operator mode (e.g., "decode")
-        dtype: Primary data type
+        format_signature: Role-indexed tensor format signature
         features: Required operator features (e.g., {"paged"})
         platform: Hardware to match (auto-detected if None)
         objective: Selection objective (see SelectionObjective enum)
         traits: Op-specific trait values that affect kernel applicability
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
-            normal platform, dtype, and trait filtering.
+            normal platform, format signature, and trait filtering.
         override: Force a specific kernel name or solution string
         expected_kernel_name: Debug-only hint. When set, a warning is
             logged if the selected kernel differs from this name. The
@@ -609,7 +621,14 @@ def select_kernel(
 
     # Fast path: check cache (skipped when override is active)
     cache_key = _make_cache_key(
-        family, mode, dtype, platform.arch, objective, features, traits, solution
+        family,
+        mode,
+        format_signature,
+        platform.arch,
+        objective,
+        features,
+        traits,
+        solution,
     )
     if override is None:
         cached = registry.cache_get(cache_key)
@@ -617,7 +636,9 @@ def select_kernel(
             return cached
 
     if override:
-        return _resolve_override(registry, family, mode, dtype, override, platform)
+        return _resolve_override(
+            registry, family, mode, format_signature, override, platform
+        )
 
     # Get candidates (same filtering for both strategies)
     candidates = registry.get_for_operator(
@@ -625,14 +646,14 @@ def select_kernel(
         mode,
         features=features,
         platform=platform,
-        dtype=dtype,
+        format_signature=format_signature,
         solution=solution,
     )
 
     solution_clause = f" with solution {solution!r}" if solution else ""
     if not candidates:
         raise NoKernelFoundError(
-            f"No kernel found for {family}.{mode} ({dtype})"
+            f"No kernel found for {family}.{mode} ({format_signature})"
             f"{solution_clause} on {platform.device_name}"
         )
 
@@ -641,7 +662,7 @@ def select_kernel(
 
     if not candidates:
         raise NoKernelFoundError(
-            f"No kernel found for {family}.{mode} ({dtype})"
+            f"No kernel found for {family}.{mode} ({format_signature})"
             f"{solution_clause} with traits {traits} on {platform.device_name}"
         )
 
@@ -653,7 +674,7 @@ def select_kernel(
             candidates,
             family,
             mode,
-            dtype,
+            format_signature,
             platform,
             traits,
             _policy.autotune_params,
@@ -662,7 +683,7 @@ def select_kernel(
         scored = _rank_by_objective(candidates, objective, platform, traits)
         winner = scored[0][0]
 
-    _log_selection(family, mode, dtype, winner, scored, platform, objective)
+    _log_selection(family, mode, format_signature, winner, scored, platform, objective)
 
     if expected_kernel_name and winner.name != expected_kernel_name:
         logger.warning(
@@ -670,7 +691,7 @@ def select_kernel(
             "expected '%s'. Score breakdown — selected: %s",
             family,
             mode,
-            dtype,
+            format_signature,
             winner.name,
             expected_kernel_name,
             next((s for sp, s in scored if sp.name == winner.name), "N/A"),
@@ -686,7 +707,7 @@ def _autotune_select(
     candidates: list[KernelSpec],
     family: str,
     mode: str,
-    dtype: object,
+    format_signature: object,
     platform: PlatformInfo,
     traits: dict[str, Any] | None,
     params: AutotuneParams,
@@ -704,7 +725,7 @@ def _autotune_select(
         "[tokenspeed_kernel:autotune] falling back to heuristic for %s.%s(%s)",
         family,
         mode,
-        dtype,
+        format_signature,
     )
     return winner, scored
 
@@ -729,7 +750,7 @@ def kernel_override(
 def explain_selection(
     family: str,
     mode: str,
-    dtype: torch.dtype,
+    format_signature: FormatSignature,
     *,
     features: frozenset[str] | None = None,
     platform: PlatformInfo | None = None,
@@ -764,7 +785,7 @@ def explain_selection(
         mode,
         features=features,
         platform=platform,
-        dtype=dtype,
+        format_signature=format_signature,
         solution=solution,
     )
 
@@ -777,7 +798,7 @@ def explain_selection(
     filtered_out = [s for s in all_specs if s.name not in filtered_names]
 
     lines = [
-        f"Op: {family}.{mode} ({dtype})",
+        f"Op: {family}.{mode} ({format_signature})",
         f"Platform: {platform.device_name} ({platform.arch})",
         f"Solution: {solution or 'any'}",
         f"Objective: {objective.value}",
@@ -813,10 +834,12 @@ def explain_selection(
                         f"arch mismatch (requires "
                         f"{spec.capability.min_arch_version})"
                     )
-            if dtype and dtype not in spec.dtypes:
+            if format_signature and not spec.supports_format_signature(
+                format_signature
+            ):
                 reasons.append(
-                    f"dtype mismatch (supports "
-                    f"{', '.join(str(d) for d in spec.dtypes)})"
+                    f"format signature mismatch (supports "
+                    f"{', '.join(str(d) for d in spec.format_signatures)})"
                 )
             if solution and spec.solution != solution:
                 reasons.append(f"solution mismatch (is {spec.solution!r})")
@@ -827,7 +850,7 @@ def explain_selection(
 
 
 def warmup_selection(
-    ops: list[tuple[str, str, torch.dtype, dict | None]] | None = None,
+    ops: list[tuple[str, str, FormatSignature, dict | None]] | None = None,
 ) -> None:
     """Pre-resolve kernel selection for the given ops (or all registered ops).
 
@@ -836,18 +859,22 @@ def warmup_selection(
     """
 
     if ops is None:
-        ops = [
-            (f, m, torch.bfloat16, None)
-            for f, m in KernelRegistry.get().list_operators()
-        ]
+        ops = []
+        registry = KernelRegistry.get()
+        for family, mode in registry.list_operators():
+            specs = registry.get_for_operator(family, mode)
+            if not specs or not specs[0].format_signatures:
+                continue
+            format_signature = sorted(specs[0].format_signatures, key=str)[0]
+            ops.append((family, mode, format_signature, None))
 
-    for family, mode, dtype, traits in ops:
+    for family, mode, format_signature, traits in ops:
         try:
-            select_kernel(family, mode, dtype, traits=traits)
+            select_kernel(family, mode, format_signature, traits=traits)
         except NoKernelFoundError:
             logger.debug(
                 "[tokenspeed_kernel] warmup: no kernel for %s.%s(%s)",
                 family,
                 mode,
-                dtype,
+                format_signature,
             )

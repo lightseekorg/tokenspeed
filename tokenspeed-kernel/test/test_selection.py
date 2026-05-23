@@ -27,7 +27,10 @@ import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
 from tokenspeed_kernel.platform import PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+)
 from tokenspeed_kernel.selection import (
     AutotuneParams,
     NoKernelFoundError,
@@ -55,9 +58,22 @@ from tokenspeed_kernel.selection import (
     spec_matches_traits,
     warmup_selection,
 )
+from tokenspeed_kernel.signature import (
+    format_signatures,
+)
 from utils import register_all_samples
 
 pytestmark = pytest.mark.usefixtures("fresh_registry")
+
+ATTN_DECODE_BF16 = next(
+    iter(format_signatures(("q", "k_cache", "v_cache"), "dense", {torch.bfloat16}))
+)
+ATTN_PREFILL_BF16 = next(
+    iter(format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}))
+)
+GEMM_BF16 = next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
+GEMM_FP16 = next(iter(format_signatures(("a", "b"), "dense", {torch.float16})))
+INPUT_BF16 = next(iter(format_signatures("input", "dense", {torch.bfloat16})))
 
 
 class TestSelectionObjective:
@@ -192,7 +208,7 @@ class TestRanking:
             "attention",
             "decode",
             platform=h100_platform,
-            dtype=torch.bfloat16,
+            format_signature=ATTN_DECODE_BF16,
         )
         scored = _rank_by_objective(
             candidates,
@@ -390,7 +406,7 @@ class TestSpecMatchesShapeTraits:
             name="k",
             family="f",
             mode="m",
-            traits={"quant": frozenset({"mxfp8"})},
+            traits={"persistent": frozenset({True})},
         )
 
         assert spec_matches_shape_traits(spec, {"N": 30, "K": 70})
@@ -401,7 +417,7 @@ class TestMakeCacheKey:
         k1 = _make_cache_key(
             "attn",
             "dec",
-            torch.bfloat16,
+            INPUT_BF16,
             "sm_90",
             SelectionObjective.DEFAULT,
             None,
@@ -410,7 +426,7 @@ class TestMakeCacheKey:
         k2 = _make_cache_key(
             "attn",
             "dec",
-            torch.bfloat16,
+            INPUT_BF16,
             "sm_90",
             SelectionObjective.DEFAULT,
             None,
@@ -422,7 +438,7 @@ class TestMakeCacheKey:
         k1 = _make_cache_key(
             "attn",
             "dec",
-            torch.bfloat16,
+            INPUT_BF16,
             "sm_90",
             SelectionObjective.DEFAULT,
             None,
@@ -431,7 +447,7 @@ class TestMakeCacheKey:
         k2 = _make_cache_key(
             "attn",
             "dec",
-            torch.bfloat16,
+            INPUT_BF16,
             "sm_90",
             SelectionObjective.LATENCY,
             None,
@@ -443,7 +459,7 @@ class TestMakeCacheKey:
         k1 = _make_cache_key(
             "a",
             "d",
-            torch.float16,
+            GEMM_FP16,
             "sm_90",
             SelectionObjective.DEFAULT,
             None,
@@ -452,7 +468,7 @@ class TestMakeCacheKey:
         k2 = _make_cache_key(
             "a",
             "d",
-            torch.float16,
+            GEMM_FP16,
             "sm_90",
             SelectionObjective.DEFAULT,
             None,
@@ -464,10 +480,10 @@ class TestMakeCacheKey:
         f1 = frozenset({"paged", "mla"})
         f2 = frozenset({"mla", "paged"})
         k1 = _make_cache_key(
-            "a", "d", torch.float16, "sm_90", SelectionObjective.DEFAULT, f1, None
+            "a", "d", GEMM_FP16, "sm_90", SelectionObjective.DEFAULT, f1, None
         )
         k2 = _make_cache_key(
-            "a", "d", torch.float16, "sm_90", SelectionObjective.DEFAULT, f2, None
+            "a", "d", GEMM_FP16, "sm_90", SelectionObjective.DEFAULT, f2, None
         )
         assert k1 == k2
 
@@ -475,7 +491,7 @@ class TestMakeCacheKey:
         k1 = _make_cache_key(
             "a",
             "d",
-            torch.float16,
+            GEMM_FP16,
             "sm_90",
             SelectionObjective.DEFAULT,
             None,
@@ -485,7 +501,7 @@ class TestMakeCacheKey:
         k2 = _make_cache_key(
             "a",
             "d",
-            torch.float16,
+            GEMM_FP16,
             "sm_90",
             SelectionObjective.DEFAULT,
             None,
@@ -503,7 +519,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
         )
         assert callable(impl)
@@ -513,16 +529,16 @@ class TestSelectKernel:
         register_all_samples(reg, sample_specs)
 
         impl1 = select_kernel(
-            "attention", "decode", torch.bfloat16, platform=h100_platform
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
         )
         impl2 = select_kernel(
-            "attention", "decode", torch.bfloat16, platform=h100_platform
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
         )
         assert impl1 is impl2
 
     def test_no_kernel_raises(self, h100_platform):
         with pytest.raises(NoKernelFoundError):
-            select_kernel("nonexistent", "op", torch.bfloat16, platform=h100_platform)
+            select_kernel("nonexistent", "op", INPUT_BF16, platform=h100_platform)
 
     def test_no_kernel_after_trait_filter(self, h100_platform):
         reg = KernelRegistry.get()
@@ -532,7 +548,7 @@ class TestSelectKernel:
             mode="m",
             solution="triton",
             priority=10,
-            dtypes=frozenset({torch.bfloat16}),
+            format_signatures=frozenset({INPUT_BF16}),
             traits={"head_dim": frozenset({64})},
         )
         reg.register(spec, lambda: None)
@@ -541,7 +557,7 @@ class TestSelectKernel:
             select_kernel(
                 "trait_op",
                 "m",
-                torch.bfloat16,
+                INPUT_BF16,
                 platform=h100_platform,
                 traits={"head_dim": 128},
             )
@@ -553,7 +569,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
             override="reference_decode",
         )
@@ -566,7 +582,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
             override="triton",
         )
@@ -580,7 +596,7 @@ class TestSelectKernel:
                 family="attention",
                 mode="prefill",
                 solution="fa4",
-                dtypes=frozenset({torch.bfloat16}),
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
                 traits={"head_dim": frozenset({128})},
                 priority=15,
             ),
@@ -592,7 +608,7 @@ class TestSelectKernel:
                 family="attention",
                 mode="prefill",
                 solution="triton",
-                dtypes=frozenset({torch.bfloat16}),
+                format_signatures=frozenset({ATTN_PREFILL_BF16}),
                 traits={"head_dim": frozenset({256})},
                 priority=10,
             ),
@@ -602,7 +618,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "prefill",
-            torch.bfloat16,
+            ATTN_PREFILL_BF16,
             platform=h100_platform,
             solution="fa4",
             traits={"head_dim": 128},
@@ -613,7 +629,7 @@ class TestSelectKernel:
             select_kernel(
                 "attention",
                 "prefill",
-                torch.bfloat16,
+                ATTN_PREFILL_BF16,
                 platform=h100_platform,
                 solution="fa4",
                 traits={"head_dim": 256},
@@ -627,7 +643,7 @@ class TestSelectKernel:
             select_kernel(
                 "attention",
                 "decode",
-                torch.bfloat16,
+                ATTN_DECODE_BF16,
                 platform=h100_platform,
                 override="nonexistent_kernel",
             )
@@ -643,7 +659,7 @@ class TestSelectKernel:
             impl = select_kernel(
                 "attention",
                 "decode",
-                torch.bfloat16,
+                ATTN_DECODE_BF16,
                 platform=h100_platform,
             )
             assert impl() == "reference_decode"
@@ -655,7 +671,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
             objective=SelectionObjective.PORTABILITY,
         )
@@ -669,7 +685,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
             objective=SelectionObjective.DEBUG,
         )
@@ -682,7 +698,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=mi300_platform,
         )
         assert impl() == "aiter_decode"
@@ -694,7 +710,7 @@ class TestSelectKernel:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=mi350_platform,
         )
         assert impl() == "aiter_decode"
@@ -721,7 +737,7 @@ class TestSelectionOracle:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
         )
         assert impl() == "triton_decode"
@@ -736,7 +752,7 @@ class TestKernelOverride:
             impl = select_kernel(
                 "attention",
                 "decode",
-                torch.bfloat16,
+                ATTN_DECODE_BF16,
                 platform=h100_platform,
             )
             assert impl() == "reference_decode"
@@ -751,7 +767,7 @@ class TestKernelOverride:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
         )
         assert impl() != "reference_decode" or True
@@ -762,18 +778,18 @@ class TestKernelOverride:
 
         with kernel_override("attention", "decode", "reference_decode"):
             impl1 = select_kernel(
-                "attention", "decode", torch.bfloat16, platform=h100_platform
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
             )
             assert impl1() == "reference_decode"
 
             with kernel_override("attention", "decode", "triton_decode"):
                 impl2 = select_kernel(
-                    "attention", "decode", torch.bfloat16, platform=h100_platform
+                    "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
                 )
                 assert impl2() == "triton_decode"
 
             impl3 = select_kernel(
-                "attention", "decode", torch.bfloat16, platform=h100_platform
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
             )
             assert impl3() == "reference_decode"
 
@@ -783,7 +799,7 @@ class TestSetPolicy:
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
-        select_kernel("attention", "decode", torch.bfloat16, platform=h100_platform)
+        select_kernel("attention", "decode", ATTN_DECODE_BF16, platform=h100_platform)
         set_selection_policy(
             SelectionPolicy(default_strategy=SelectionStrategy.AUTOTUNE)
         )
@@ -798,7 +814,7 @@ class TestExplainSelection:
         explanation = explain_selection(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
         )
         assert "attention.decode" in explanation
@@ -813,7 +829,7 @@ class TestExplainSelection:
         explanation = explain_selection(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
         )
         assert "Filtered out" in explanation
@@ -823,7 +839,7 @@ class TestExplainSelection:
         explanation = explain_selection(
             "nonexistent",
             "op",
-            torch.bfloat16,
+            INPUT_BF16,
             platform=h100_platform,
         )
         assert "0 matched" in explanation
@@ -853,8 +869,8 @@ class TestWarmupSelection:
         try:
             warmup_selection(
                 ops=[
-                    ("attention", "decode", torch.bfloat16, None),
-                    ("gemm", "mm", torch.bfloat16, None),
+                    ("attention", "decode", ATTN_DECODE_BF16, None),
+                    ("gemm", "mm", GEMM_BF16, None),
                 ]
             )
             assert len(reg._selection_cache) >= 2
@@ -867,7 +883,7 @@ class TestWarmupSelection:
 
         Platform.override(h100_platform)
         try:
-            warmup_selection(ops=[("nonexistent", "op", torch.bfloat16, None)])
+            warmup_selection(ops=[("nonexistent", "op", INPUT_BF16, None)])
         finally:
             Platform.reset()
 
@@ -885,7 +901,7 @@ class TestAutotuneStrategy:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
         )
         assert callable(impl)
@@ -1054,7 +1070,7 @@ class TestConfigOverrideIntegration:
         )
 
         impl = select_kernel(
-            "attention", "decode", torch.bfloat16, platform=h100_platform
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
         )
         assert impl() == "reference_decode"
 
@@ -1068,7 +1084,7 @@ class TestConfigOverrideIntegration:
         )
 
         impl = select_kernel(
-            "attention", "decode", torch.bfloat16, platform=h100_platform
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
         )
         assert impl() == "triton_decode"
 
@@ -1084,7 +1100,7 @@ class TestConfigOverrideIntegration:
         )
 
         impl = select_kernel(
-            "attention", "decode", torch.bfloat16, platform=h100_platform
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
         )
         assert impl() == "reference_decode"
 
@@ -1103,7 +1119,7 @@ class TestConfigOverrideIntegration:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
             override="triton_decode",
         )
@@ -1126,7 +1142,7 @@ class TestConfigOverrideIntegration:
             {"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE": "triton_decode"},
         ):
             impl = select_kernel(
-                "attention", "decode", torch.bfloat16, platform=h100_platform
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
             )
             assert impl() == "triton_decode"
 
@@ -1144,7 +1160,7 @@ class TestConfigOverrideIntegration:
 
         with kernel_override("attention", "decode", "triton_decode"):
             impl = select_kernel(
-                "attention", "decode", torch.bfloat16, platform=h100_platform
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
             )
             assert impl() == "triton_decode"
 
@@ -1163,7 +1179,7 @@ class TestConfigOverrideIntegration:
         impl = select_kernel(
             "attention",
             "decode",
-            torch.bfloat16,
+            ATTN_DECODE_BF16,
             platform=h100_platform,
             objective=SelectionObjective.PORTABILITY,
         )
@@ -1182,7 +1198,9 @@ class TestConfigOverrideIntegration:
         )
 
         with pytest.raises(NoKernelFoundError, match="Override"):
-            select_kernel("attention", "decode", torch.bfloat16, platform=h100_platform)
+            select_kernel(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
 
     def test_config_with_invalid_objective_falls_back(
         self, sample_specs, h100_platform, tmp_path
@@ -1199,7 +1217,7 @@ class TestConfigOverrideIntegration:
         )
 
         impl = select_kernel(
-            "attention", "decode", torch.bfloat16, platform=h100_platform
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
         )
         assert callable(impl)
 
@@ -1214,11 +1232,11 @@ class TestConfigOverrideIntegration:
         )
 
         attn_impl = select_kernel(
-            "attention", "decode", torch.bfloat16, platform=h100_platform
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
         )
         assert attn_impl() == "reference_decode"
 
-        gemm_impl = select_kernel("gemm", "mm", torch.bfloat16, platform=h100_platform)
+        gemm_impl = select_kernel("gemm", "mm", GEMM_BF16, platform=h100_platform)
         assert gemm_impl() != "reference_decode"
 
 
@@ -1248,7 +1266,7 @@ class TestGemmDispatchProfiling:
             family="gemm",
             mode="mm",
             solution=solution,
-            dtypes=frozenset({torch.float16}),
+            format_signatures=frozenset({GEMM_FP16}),
             priority=50,
         )
         KernelRegistry.get().register(spec, impl)

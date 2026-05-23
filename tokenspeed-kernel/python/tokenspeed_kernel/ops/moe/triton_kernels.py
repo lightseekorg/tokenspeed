@@ -28,7 +28,11 @@ from contextlib import contextmanager
 import tokenspeed_kernel.thirdparty.triton_kernels  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import (
+    Priority,
+    register_kernel,
+)
+from tokenspeed_kernel.signature import format_signatures
 
 try:
     import triton_kernels.matmul_details.opt_flags as opt_flags
@@ -92,7 +96,9 @@ if _routing_impl is not None:
         "route",
         name="triton_kernels_routing",
         solution="triton",
-        dtypes={torch.float16, torch.bfloat16, torch.float32},
+        signatures=format_signatures(
+            "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+        ),
         traits={"output_type": frozenset({"ragged_metadata"})},
         priority=Priority.PERFORMANT + 2,
         tags={"portability"},
@@ -175,7 +181,9 @@ if matmul is not None:
 
     _matmul_common = dict(
         solution="triton",
-        dtypes={torch.float16, torch.bfloat16, torch.uint8},
+        signatures=format_signatures(
+            "x", "dense", {torch.float16, torch.bfloat16, torch.uint8}
+        ),
         priority=Priority.PERFORMANT + 2,
         tags={"portability"},
     )

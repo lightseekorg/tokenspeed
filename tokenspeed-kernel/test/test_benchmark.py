@@ -32,7 +32,11 @@ from tokenspeed_kernel.benchmark.runner import BenchmarkRunner
 from tokenspeed_kernel.benchmark.throughput import ThroughputCalculator
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ProfilingConfig
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+)
+from tokenspeed_kernel.signature import format_signatures
 
 pytestmark = [
     pytest.mark.usefixtures("fresh_registry"),
@@ -66,7 +70,7 @@ def _register_test_gemm_kernels() -> None:
         family="gemm",
         mode="mm",
         solution="reference",
-        dtypes=frozenset({dtype}),
+        format_signatures=format_signatures(("a", "b"), "dense", {dtype}),
         traits=_TEST_GEMM_TRAITS,
         priority=0,
     )
@@ -75,7 +79,7 @@ def _register_test_gemm_kernels() -> None:
         family="gemm",
         mode="mm",
         solution="triton",
-        dtypes=frozenset({dtype}),
+        format_signatures=format_signatures(("a", "b"), "dense", {dtype}),
         traits=_TEST_GEMM_TRAITS,
         priority=10,
     )

@@ -32,6 +32,12 @@ import torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_format,
+    format_signature,
+    tensor_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,58 @@ def _infer_scale_type(
     if A_scales.numel() == 1 and B_scales.numel() == 1:
         return "per_tensor"
     return "per_channel"
+
+
+def _scale_storage_dtype(*scales: torch.Tensor | None) -> torch.dtype:
+    for scale in scales:
+        if scale is not None:
+            return scale.dtype
+    return torch.float32
+
+
+def _gemm_format_signature(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    quant: str | None,
+    block_size: list[int] | None,
+):
+    _ = out_dtype
+    if quant == "mxfp8":
+        scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(A_scales, B_scales),
+            granularity="block",
+            block_shape=tuple(block_size) if block_size is not None else None,
+            layout="mxfp8",
+        )
+        a_storage_dtype = _fp8_dtype if A_scales is None else A.dtype
+        return format_signature(
+            a=tensor_format("mxfp8", a_storage_dtype, scale=scale),
+            b=tensor_format("mxfp8", B.dtype, scale=scale),
+        )
+    if quant == "fp8":
+        scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(A_scales, B_scales),
+            granularity=_infer_scale_type(A_scales, B_scales) or "unknown",
+            layout="scaled",
+        )
+        return format_signature(
+            a=tensor_format("fp8", A.dtype, scale=scale),
+            b=tensor_format("fp8", B.dtype, scale=scale),
+        )
+    if quant == "nvfp4":
+        scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(A_scales, B_scales),
+            granularity="block",
+            layout="nvfp4",
+        )
+        return format_signature(
+            a=tensor_format("nvfp4", A.dtype, scale=scale),
+            b=tensor_format("nvfp4", B.dtype, scale=scale),
+        )
+    return format_signature(a=dense_format(A.dtype), b=dense_format(B.dtype))
 
 
 def _online_quantize_mxfp8(
@@ -184,13 +242,6 @@ def mm(
     M = A.shape[0]
     N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
-    if quant in ("mxfp8", "fp8"):
-        select_dtype = _fp8_dtype
-    elif quant == "nvfp4":
-        select_dtype = A.dtype
-    else:
-        select_dtype = A.dtype
-
     traits: dict[str, object] = {
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
@@ -199,18 +250,15 @@ def mm(
         "k_align_128": K % 128 == 0,
     }
 
-    if quant is not None:
-        traits["quant"] = quant
-
-    if quant == "fp8":
-        scale_type = _infer_scale_type(A_scales, B_scales)
-        if scale_type is not None:
-            traits["scale_type"] = scale_type
+    signature = _gemm_format_signature(
+        A, B, A_scales, B_scales, out_dtype, quant, block_size
+    )
+    select_dtype = signature.primary_storage_dtype() or A.dtype
 
     kernel = select_kernel(
         "gemm",
         "mm",
-        select_dtype,
+        signature,
         traits=traits,
         override=override,
         expected_kernel_name=expected_kernel_name,

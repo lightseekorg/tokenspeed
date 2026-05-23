@@ -36,7 +36,9 @@ if platform.is_nvidia:
         name="cuda_embedding_rope",
         solution="cuda",
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("query", "key"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.PERFORMANT,
         traits={
             "head_size": frozenset({64, 128, 256, 512}),

@@ -158,6 +158,29 @@ def _mm_mxfp8() -> torch.Tensor:
     )
 
 
+def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
+    a = torch.empty((4, 128), dtype=torch.bfloat16)
+    b = torch.empty((128, 128), dtype=_fp8_dtype())
+    b_scales = torch.empty((1, 1), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        None,
+        b_scales,
+        torch.bfloat16,
+        "mxfp8",
+        [128, 128],
+    )
+
+    a_format = signature.format_for("a")
+    b_format = signature.format_for("b")
+    assert a_format is not None
+    assert b_format is not None
+    assert a_format.storage_dtype == _fp8_dtype()
+    assert b_format.storage_dtype == _fp8_dtype()
+
+
 def _mm_nvfp4() -> torch.Tensor:
     a = torch.empty((4, 64), dtype=torch.uint8)
     b = torch.empty((128, 64), dtype=torch.uint8)
@@ -324,7 +347,7 @@ def _moe_fused_self_routing_bf16() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"self_routing"},
-        traits={"weight_dtype": "bf16"},
+        weight_format="bf16",
     )
 
 
@@ -332,7 +355,7 @@ def _moe_fused_self_routing_mxfp4() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"self_routing"},
-        traits={"weight_dtype": "mxfp4"},
+        weight_format="mxfp4",
     )
 
 
@@ -340,8 +363,8 @@ def _moe_fused_prerouted_nvfp4_cutlass() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"pre_routed"},
+        weight_format="nvfp4",
         traits={
-            "weight_dtype": "nvfp4",
             "tp": True,
             "ep": True,
             "cuda_graph": False,
@@ -353,8 +376,8 @@ def _moe_fused_prerouted_nvfp4_cutedsl() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.uint8,
         features={"pre_routed"},
+        weight_format="nvfp4",
         traits={
-            "weight_dtype": "nvfp4",
             "tp": False,
             "ep": True,
             "cuda_graph": True,
@@ -366,7 +389,8 @@ def _moe_fused_prerouted_bf16_reference() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"pre_routed"},
-        traits={"weight_dtype": "bf16", "tp": False, "ep": False},
+        weight_format="bf16",
+        traits={"tp": False, "ep": False},
     )
 
 
