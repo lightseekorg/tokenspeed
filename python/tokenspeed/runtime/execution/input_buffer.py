@@ -237,7 +237,7 @@ class InputBuffers:
                         torch.where(mask, decode_input_ids_tensor.unsqueeze(1), slot)
                     )
                 decode_ids = runtime_states.future_input_map[
-                    decode_req_pool_indices, :1
+                    decode_req_pool_indices
                 ].flatten()
                 self.input_ids_buf[prefill_token_count:total_tokens].copy_(
                     decode_ids,

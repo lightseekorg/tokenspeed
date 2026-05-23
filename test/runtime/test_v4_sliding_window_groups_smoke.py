@@ -48,9 +48,38 @@ _v4 = _load(
 
 build_v4_cache_specs = _v4.build_v4_cache_specs
 compute_paged_cache_group_page_counts = _generic.compute_paged_cache_group_page_counts
+PagedCacheGroupSpec = _generic.PagedCacheGroupSpec
 
 
 class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
+    def test_sliding_window_scheduled_tokens_are_global_and_capped(self):
+        specs = [
+            PagedCacheGroupSpec(
+                group_id="sliding",
+                retention="sliding_window",
+                rows_per_page=4,
+                entry_stride_tokens=1,
+                sliding_window_tokens=8,
+            )
+        ]
+
+        counts = compute_paged_cache_group_page_counts(
+            specs,
+            max_live_requests=10,
+            max_scheduled_tokens=100,
+            max_total_tokens=20,
+            max_context_len=4096,
+        )
+
+        resident_pages = 10 * math.ceil(7 / 4)
+        scheduled_pages = math.ceil(20 / 4)
+        request_fragment_pages = 10
+        dummy_pages = 1
+        self.assertEqual(
+            counts["sliding"],
+            resident_pages + scheduled_pages + request_fragment_pages + dummy_pages,
+        )
+
     def test_page_counts_positive_finite_and_under_total_times_live(self):
         inputs = dict(
             max_live_requests=32,
@@ -80,6 +109,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         hf_config = SimpleNamespace(
             compress_ratios=(1, 4, 128),
             head_dim=512,
+            qk_rope_head_dim=64,
             index_head_dim=128,
             sliding_window=128,
         )
@@ -124,6 +154,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         hf_config = SimpleNamespace(
             compress_ratios=(1, 4, 128),
             head_dim=512,
+            qk_rope_head_dim=64,
             index_head_dim=128,
             sliding_window=128,
         )
@@ -182,6 +213,38 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
 
         legacy_pages = current_bytes // (layout.cache_cell_size(3) * layout.page_size)
         self.assertLess(legacy_pages, target_pages)
+
+    def test_deepseek_v4_profile_does_not_multiply_scheduled_tokens_by_requests(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+            deepseek_v4_cache_layout_from_config,
+            profile_deepseek_v4_max_num_pages,
+        )
+
+        hf_config = SimpleNamespace(
+            compress_ratios=tuple([1, 1] + [4, 128] * 20 + [4, 1]),
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            hf_config,
+            page_size=256,
+            use_fp4_indexer_cache=True,
+        )
+
+        self.assertGreater(
+            profile_deepseek_v4_max_num_pages(
+                layout=layout,
+                hf_config=hf_config,
+                layer_num=43,
+                max_live_requests=160,
+                max_scheduled_tokens=8192,
+                max_context_len=4096,
+                available_cache_memory_bytes=80 * (1 << 30),
+            ),
+            0,
+        )
 
 
 if __name__ == "__main__":

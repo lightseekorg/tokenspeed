@@ -27,53 +27,76 @@ namespace tokenspeed {
 using flashinfer::vec_t;
 namespace math = flashinfer::math;
 
-template <uint32_t vec_size, typename DTypeIn, typename DTypeO>
-__global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ s_a,
-                                 DTypeIn* __restrict__ v_b, float* __restrict__ s_b,
-                                 DTypeO* __restrict__ v_merged, float* __restrict__ s_merged,
-                                 uint32_t num_heads, uint32_t head_dim,
+// In-place safe: v_merged may alias v_a, s_merged may alias s_a. See block
+// comment in the launcher for the contract.
+template <size_t HeadDim, typename DTypeIn, typename DTypeO>
+__global__ void MergeStateKernel(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b,
+                                 DTypeO* v_merged, float* s_merged, uint32_t num_heads,
                                  float lse_scale_log2, float lse_scale_inv) {
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
+  constexpr size_t kVecSize = std::max(16U / sizeof(DTypeIn), HeadDim / 32U);
+  constexpr size_t kBdx = HeadDim / kVecSize;
+
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = ty;
 
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+  // Load phase: snapshot every aliasable input into registers before any store fires.
   float s_a_val = s_a[pos * num_heads + head_idx] * lse_scale_log2;
   float s_b_val = s_b[pos * num_heads + head_idx] * lse_scale_log2;
+  vec_t<float, kVecSize> v_a_vec, v_b_vec, v_merged_vec;
+  v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+  v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+
+  // Compute phase: register-only.
   float s_max = max(s_a_val, s_b_val);
   s_a_val = math::ptx_exp2(s_a_val - s_max);
   s_b_val = math::ptx_exp2(s_b_val - s_max);
   float a_scale = s_a_val / (s_a_val + s_b_val);
   float b_scale = s_b_val / (s_a_val + s_b_val);
-  vec_t<float, vec_size> v_a_vec, v_b_vec, v_merged_vec;
-  v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
-  v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
 #pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
+  for (uint32_t i = 0; i < kVecSize; ++i) {
     v_merged_vec[i] = a_scale * v_a_vec[i] + b_scale * v_b_vec[i];
   }
-  v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
-  s_merged[pos * num_heads + head_idx] =
-      (math::ptx_log2(s_a_val + s_b_val) + s_max) * lse_scale_inv;
+
+  // v_merged store: per-lane disjoint slice, no cross-lane ordering needed.
+  v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+
+  // s_merged store: kBdx lanes share one slot. Sync so every lane's s_a load
+  // is complete before the writer fires, then a single lane writes.
+  if constexpr (kBdx <= 32) {
+    __syncwarp();
+  } else {
+    __syncthreads();
+  }
+  if (tx == 0) {
+    s_merged[pos * num_heads + head_idx] =
+        (math::ptx_log2(s_a_val + s_b_val) + s_max) * lse_scale_inv;
+  }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
+// Aliasing contract: v_merged may alias v_a, s_merged may alias s_a. The kernel
+// reorders all aliasable inputs into a register-only snapshot phase, then
+// stores. The s_merged write is single-writer per (pos, head_idx) and guarded
+// by __syncwarp/__syncthreads so cross-lane s_a reads finish before the aliased
+// store fires.
 template <typename DTypeIn, typename DTypeO>
 cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DTypeO* v_merged,
                        float* s_merged, uint32_t seq_len, uint32_t num_heads, uint32_t head_dim,
                        float lse_scale_log2, float lse_scale_inv, bool enable_pdl,
                        cudaStream_t stream = nullptr) {
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
-    uint32_t bdx = HEAD_DIM / vec_size;
+  DISPATCH_HEAD_DIM(head_dim, HeadDim, {
+    constexpr size_t kVecSize = std::max(16U / sizeof(DTypeIn), HeadDim / 32U);
+    constexpr size_t kBdx = HeadDim / kVecSize;
     uint32_t bdy = num_heads;
     dim3 nblks(seq_len);
-    dim3 nthrs(bdx, bdy);
-    auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeO>;
+    dim3 nthrs(static_cast<uint32_t>(kBdx), bdy);
+    auto kernel = MergeStateKernel<HeadDim, DTypeIn, DTypeO>;
 
     cudaLaunchConfig_t config;
     config.gridDim = nblks;
@@ -87,7 +110,7 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
     config.attrs = attrs;
 
     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v_a, s_a, v_b, s_b, v_merged, s_merged,
-                                             num_heads, head_dim, lse_scale_log2, lse_scale_inv));
+                                             num_heads, lse_scale_log2, lse_scale_inv));
   });
   return cudaSuccess;
 }

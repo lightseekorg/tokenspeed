@@ -122,6 +122,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             block_size=64,
             max_cudagraph_capture_size=4,
             kv_cache_quant_method="none",
+            speculative_algorithm="EAGLE3",
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
         )

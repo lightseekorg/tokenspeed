@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -46,6 +47,18 @@ class AttentionBackend(ABC):
         self.dtype = config.dtype
         self.head_dim = config.head_dim
         self.is_draft = config.is_draft
+        self.spec_num_tokens = config.speculative_num_draft_tokens
+
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        """Temporarily override the decode-metadata slice discriminator for the
+        wrapped block. Used by MLA backends to flip between drafter step 0
+        (slice = [num_extends:]) and step 1+ (slice = [0:]).
+
+        Default no-op for backends that fill separate prefill/decode metadata
+        at init time.
+        """
+        yield
 
     @property
     def support_kv_cache_prewrite(self) -> bool:
@@ -73,7 +86,6 @@ class AttentionBackend(ABC):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -84,7 +96,6 @@ class AttentionBackend(ABC):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
@@ -358,7 +360,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -374,7 +375,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         num_extends_arg = kwargs.pop("num_extends", None)
         num_extends = bs if num_extends_arg is None else int(num_extends_arg)
-        del num_tokens, kwargs
+        del kwargs
         device = seq_lens.device
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
@@ -1435,7 +1436,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -1445,7 +1445,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
-        del num_tokens, kwargs
+        del kwargs
         if forward_mode is not None and not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph capture not supported for {forward_mode}"
@@ -1513,7 +1513,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,

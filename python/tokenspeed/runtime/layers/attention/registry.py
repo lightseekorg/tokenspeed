@@ -218,10 +218,13 @@ def _create_hybrid_linear_attn(
         config,
     )
 
-    # Create mamba/linear attention backend
-    config.speculative_num_draft_tokens = getattr(
-        server_args, "speculative_num_draft_tokens", 0
-    )
+    # Create mamba/linear attention backend. Only propagate the configured
+    # verify width when spec-dec is actually enabled — matches MLAConfig /
+    # MHAConfig.generate. Otherwise the BaseAttnConfig sentinel (1) wins so
+    # non-spec hybrid decode doesn't get misclassified as target verify /
+    # draft extend by `self.spec_num_tokens > 1`.
+    if server_args.speculative_algorithm is not None:
+        config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
     # Create KV cache pool (only for full attention layers)
     num_full_attn_layers = len(full_attn_layers)

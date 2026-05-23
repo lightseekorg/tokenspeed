@@ -1,7 +1,15 @@
 import argparse
+import os
+import sys
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +22,7 @@ from tokenspeed_kernel.ops.routing.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.model_config import (
@@ -324,34 +333,36 @@ class TestDeepseekV4Config(unittest.TestCase):
         moe = self._make_fake_mega_deepseek_v4_moe(
             hidden_states, input_ids, SharedExperts(), calls
         )
+        ctx = object()
 
-        with (
-            patch.object(
-                deepseek_v4_model,
-                "token_all_gather",
-                side_effect=AssertionError("shared expert should not use MoE RSAG"),
-            ),
-            patch.object(
-                deepseek_v4_model,
-                "token_reduce_scatter",
-                side_effect=AssertionError("shared expert should not use MoE RSAG"),
-            ),
-        ):
-            actual = DeepseekV4MoE.forward(
-                moe,
-                hidden_states,
-                input_ids,
-                num_global_tokens=2,
-                max_num_tokens_per_gpu=2,
-            )
+        class FakeCommManager:
+            def pre_dense_comm(self, states, actual_ctx):
+                test_case.assertIs(actual_ctx, ctx)
+                return states
+
+            def post_dense_comm(self, states, residual, actual_ctx):
+                test_case.assertIs(actual_ctx, ctx)
+                return states, residual
+
+        actual = DeepseekV4MoE.forward(
+            moe,
+            hidden_states,
+            input_ids,
+            num_global_tokens=2,
+            max_num_tokens_per_gpu=2,
+            ctx=ctx,
+            comm_manager=FakeCommManager(),
+        )
 
         self.assertEqual(calls, ["select", "routed", "shared"])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
-    def test_deepseek_v4_mega_moe_shared_rsag_uses_dense_tp_group(self):
+    def test_deepseek_v4_mega_moe_shared_uses_comm_manager(self):
         calls = []
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
+        ctx = object()
+        test_case = self
 
         class SharedExperts:
             tp_rank = 1
@@ -360,6 +371,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
             def __call__(self, states):
                 calls.append("shared")
+                test_case.assertTrue(torch.equal(states, hidden_states + 2))
                 return states + 3
 
         moe = self._make_fake_mega_deepseek_v4_moe(
@@ -367,41 +379,32 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         comm_calls = []
 
-        def fake_all_gather(states, *, rank, group, scattered_num_tokens):
-            comm_calls.append(("all_gather", rank, group, scattered_num_tokens))
-            return states
+        class FakeCommManager:
+            def pre_dense_comm(self, states, actual_ctx):
+                comm_calls.append(("pre", actual_ctx))
+                test_case.assertIs(actual_ctx, ctx)
+                test_case.assertIs(states, hidden_states)
+                return states + 2
 
-        def fake_reduce_scatter(states, *, rank, group, scattered_num_tokens):
-            comm_calls.append(("reduce_scatter", rank, group, scattered_num_tokens))
-            return states
+            def post_dense_comm(self, states, residual, actual_ctx):
+                comm_calls.append(("post", actual_ctx))
+                test_case.assertIsNone(residual)
+                test_case.assertIs(actual_ctx, ctx)
+                test_case.assertTrue(torch.equal(states, hidden_states + 5))
+                return states - 2, residual
 
-        with (
-            patch.object(
-                deepseek_v4_model, "token_all_gather", side_effect=fake_all_gather
-            ),
-            patch.object(
-                deepseek_v4_model,
-                "token_reduce_scatter",
-                side_effect=fake_reduce_scatter,
-            ),
-        ):
-            actual = DeepseekV4MoE.forward(
-                moe,
-                hidden_states,
-                input_ids,
-                num_global_tokens=2,
-                max_num_tokens_per_gpu=2,
-                shared_scattered_num_tokens=[1, 1],
-            )
+        actual = DeepseekV4MoE.forward(
+            moe,
+            hidden_states,
+            input_ids,
+            num_global_tokens=2,
+            max_num_tokens_per_gpu=2,
+            ctx=ctx,
+            comm_manager=FakeCommManager(),
+        )
 
         self.assertEqual(calls, ["select", "routed", "shared"])
-        self.assertEqual(
-            comm_calls,
-            [
-                ("all_gather", 1, (2, 3), [1, 1]),
-                ("reduce_scatter", 1, (2, 3), [1, 1]),
-            ],
-        )
+        self.assertEqual(comm_calls, [("pre", ctx), ("post", ctx)])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -466,8 +469,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             },
         )
 
-        # num_tokens = padded_bs * max_tokens_per_req is passed as 2nd positional.
-        self.assertEqual(captured["args"][1], 4)
+        # padded_bs is the first positional arg.
+        self.assertEqual(captured["args"][0], 4)
         self.assertEqual(captured["kwargs"]["actual_bs"], 0)
         self.assertEqual(
             captured["kwargs"]["paged_cache_block_tables"]["v4.swa"].shape,
@@ -629,6 +632,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(config.is_checkpoint_fp8_serialized)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @unittest.skipUnless(
+        current_platform().is_blackwell_plus,
+        "trtllm fp8_quantize_1x128 kernel layout requires sm100+",
+    )
     def test_deepseek_v4_fp8_linear_deep_gemm_pads_partial_n_block(self):
         deep_gemm_module = deepseek_v4_model.deep_gemm
         if deep_gemm_module is None:
@@ -974,17 +981,17 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_scheduled_tokens=1,
         )
 
-        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (7, 37440))
+        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (8, 37440))
         self.assertIsNone(pool.compressed_kv_buffer[0])
         self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (4, 37440))
-        self.assertEqual(tuple(pool.get_compressor_state_buffer(1).shape), (7, 4, 2048))
+        self.assertEqual(tuple(pool.get_compressor_state_buffer(1).shape), (8, 4, 2048))
         self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(2).shape), (35, 8, 1024)
+            tuple(pool.get_compressor_state_buffer(2).shape), (36, 8, 1024)
         )
         self.assertEqual(pool.get_compressor_state_buffer(1).dtype, torch.float32)
         self.assertEqual(pool.get_compressor_state_buffer(2).dtype, torch.float32)
         self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (4, 64 * 68))
-        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (7, 4, 512))
+        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (8, 4, 512))
         self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
@@ -1072,6 +1079,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1081,7 +1089,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
@@ -1106,6 +1113,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1113,7 +1121,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=3,
-            num_tokens=10,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1146,6 +1153,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1184,6 +1192,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1198,7 +1207,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
@@ -1250,6 +1258,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=4096,
             )
@@ -1450,13 +1459,13 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=576,
                 context_len=256,
             )
         )
         backend.init_forward_metadata(
             bs=3,
-            num_tokens=5,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1536,13 +1545,13 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=576,
                 context_len=256,
             )
         )
         backend.init_forward_metadata(
             bs=4,
-            num_tokens=8,
             req_pool_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12, 6], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1581,13 +1590,13 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=576,
                 context_len=256,
             )
         )
         backend.init_forward_metadata(
             bs=3,
-            num_tokens=5,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
@@ -1675,6 +1684,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -1682,7 +1692,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -1714,7 +1723,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([256, 129], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -1761,6 +1769,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -1768,7 +1777,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([128, 64], device=device, dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], device=device, dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -1822,6 +1830,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=1024,
             )
@@ -1939,6 +1948,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -1946,7 +1956,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
-            num_tokens=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
@@ -2003,6 +2012,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
                 is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=512,
                 context_len=128,
             )
@@ -2010,7 +2020,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.init_cuda_graph_state(max_bs=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
-            num_tokens=4,
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
@@ -2018,7 +2027,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=4,
-            num_tokens=4,
             actual_bs=2,
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
@@ -3154,6 +3162,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @unittest.skipUnless(
+        current_platform().is_blackwell_plus,
+        "trtllm fp8_quantize_1x128 kernel layout requires sm100+",
+    )
     def test_deepseek_v4_fp8_activation_quant_matches_reference(self):
         x = torch.randn(5, 256, device="cuda", dtype=torch.bfloat16) * 3.0
 
@@ -3222,6 +3234,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             _maybe_get_cached_w3_w1_permute_indices,
             get_w2_permute_indices_with_cache,
         )
+        from tokenspeed_kernel.registry import error_fn
+
+        if (
+            _maybe_get_cached_w3_w1_permute_indices is error_fn
+            or get_w2_permute_indices_with_cache is error_fn
+        ):
+            self.skipTest("flashinfer.fused_moe permute helpers unavailable")
 
         x = torch.empty((4096, 2048), dtype=torch.uint8)
         expected_w13 = _maybe_get_cached_w3_w1_permute_indices({}, x, 128)

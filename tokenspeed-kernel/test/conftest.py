@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
@@ -40,6 +42,29 @@ from tokenspeed_kernel.selection import (
     clear_config_overrides,
 )
 from utils import make_sample_specs
+
+
+@pytest.fixture
+def require() -> Callable[[str, str, str, torch.dtype], None]:
+    def _require(
+        family: str,
+        mode: str,
+        solution: str,
+        dtype: torch.dtype,
+    ) -> None:
+        from tokenspeed_kernel.platform import current_platform
+
+        specs = KernelRegistry.get().get_for_operator(
+            family,
+            mode,
+            platform=current_platform(),
+            dtype=dtype,
+            solution=solution,
+        )
+        if not specs:
+            pytest.skip(f"{family}.{mode} solution {solution!r} is not registered")
+
+    return _require
 
 
 @pytest.fixture

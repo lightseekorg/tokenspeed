@@ -273,9 +273,6 @@ class EventLoop:
                 f"(ratio={server_args.mamba_full_memory_ratio})."
             )
 
-        enable_mixed_prefill_decode = (
-            server_args.enable_mixed_batch and server_args.speculative_algorithm is None
-        )
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         prefix_cache_adjunct = None
@@ -303,7 +300,7 @@ class EventLoop:
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             paged_cache_groups=paged_cache_groups,
-            enable_mixed_prefill_decode=enable_mixed_prefill_decode,
+            enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(

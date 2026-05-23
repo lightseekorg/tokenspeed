@@ -31,6 +31,7 @@ import pytest
 
 # GEMM
 import tokenspeed_kernel.numerics.reference.gemm
+import tokenspeed_kernel.numerics.reference.moe as _moe_reference
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
@@ -41,7 +42,6 @@ import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda
 import tokenspeed_kernel.ops.moe.deepep
 import tokenspeed_kernel.ops.moe.flashinfer
-import tokenspeed_kernel.ops.moe.reference
 import tokenspeed_kernel.ops.moe.triton
 import tokenspeed_kernel.ops.moe.triton_kernels
 import torch
@@ -57,7 +57,7 @@ from tokenspeed_kernel.selection import select_kernel
 
 _RELOAD_MODULES = [
     # MoE
-    tokenspeed_kernel.ops.moe.reference,
+    _moe_reference,
     tokenspeed_kernel.ops.moe.cuda,
     tokenspeed_kernel.ops.moe.triton,
     tokenspeed_kernel.ops.moe.triton_kernels,

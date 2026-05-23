@@ -305,7 +305,7 @@ def _biased_grouped_topk_reference(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    from tokenspeed_kernel.ops.moe.reference import biased_grouped_topk_gpu
+    from tokenspeed_kernel.numerics.reference.moe import biased_grouped_topk_gpu
 
     return biased_grouped_topk_gpu(
         hidden_states,

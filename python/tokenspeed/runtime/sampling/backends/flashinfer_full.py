@@ -332,7 +332,10 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         sampled = batch_next_token_ids.to(torch.int32)
 
         # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
-        self.maybe_broadcast(sampled)
+        # For fused top-k + top-p, the results are bit-identical across ranks.
+        # So we don't need to broadcast the results.
+        if not _FUSED_TOPK_TOPP_AVAILABLE:
+            self.maybe_broadcast(sampled)
 
         if raw_logprobs is not None:
 
@@ -445,7 +448,10 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         accept_length += 1
 
         # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        # For fused top-k + top-p, the results are bit-identical across ranks.
+        # So we don't need to broadcast the results.
+        if not _FUSED_TOPK_TOPP_AVAILABLE:
+            self.maybe_broadcast(predict, accept_index, accept_length)
 
         # Accumulate accepted tokens into counts. accept_index is [bs, N]
         # with -1 in unused slots; clamp to a safe index and mask with a

@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_renorm,
     verify_chain_greedy,
 )
+from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
     top_k_renorm_prob,
@@ -241,7 +242,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            batch_next_token_ids = torch.argmax(logits, -1)
+            batch_next_token_ids = cute_argmax(logits)
 
         else:
 
@@ -313,9 +314,9 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            target_predict = torch.argmax(
-                logits_output.next_token_logits, dim=-1
-            ).reshape(bs, num_tokens_per_req)
+            target_predict = cute_argmax(logits_output.next_token_logits).reshape(
+                bs, num_tokens_per_req
+            )
 
             verify_chain_greedy(
                 predicts=predict,
@@ -381,7 +382,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
         # knob and produces non-bit-identical results across ranks (sub-ulp
         # FP accumulation order).
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        # For fused top-k + top-p, the results are bit-identical across ranks.
+        # So we don't need to broadcast the results.
+        if not _FUSED_TOPK_TOPP_AVAILABLE:
+            self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:
 

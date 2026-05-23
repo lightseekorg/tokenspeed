@@ -39,6 +39,12 @@ class MHAConfig(BaseAttnConfig):
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
     ):
+        kwargs = {}
+        if server_args.speculative_algorithm is not None:
+            kwargs.update(
+                speculative_num_steps=server_args.speculative_num_steps,
+                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            )
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -58,9 +64,8 @@ class MHAConfig(BaseAttnConfig):
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             max_graph_bs=server_args.max_cudagraph_capture_size,
             kv_cache_quant_method=server_args.kv_cache_quant_method,
-            speculative_num_steps=server_args.speculative_num_steps,
-            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             is_draft=is_draft,
+            **kwargs,
         )
 
     def cache_cell_size(self) -> int:

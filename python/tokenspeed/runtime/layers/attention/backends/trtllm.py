@@ -265,10 +265,10 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
 
         # Multi-token decode (q_len > 1) reads the prefill slot's
         # uniform-stride metadata; plain decode reads the single-token slot.
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
         metadata = (
             self.forward_prefill_metadata
-            if spec_num_tokens > 1
+            if q_len_per_req > 1
             else self.forward_decode_metadata
         )
 
@@ -337,7 +337,6 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -361,12 +360,16 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
             )
+            # Drafter: also fill decode_metadata so step 1+ multi-step has
+            # metadata under EXTEND/MIXED target. seq_lens is the drafter's
+            # live alias buffer (wrapper pre-writes before this call).
+            if self.is_draft:
+                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
             return
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        if self.spec_num_tokens > 1:
             self._init_multi_token_metadata(
-                bs, spec_num_tokens, req_pool_indices, seq_lens, req_to_page
+                bs, self.spec_num_tokens, req_pool_indices, seq_lens, req_to_page
             )
             if self.is_draft:
                 # Drafter's N-1 single-token steps after the first.
@@ -511,7 +514,6 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -521,9 +523,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 f"trtllm CUDA graph capture not supported for {forward_mode}"
             )
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
-            self._init_multi_token_metadata_capture(bs, spec_num_tokens, seq_lens)
+        if self.spec_num_tokens > 1:
+            self._init_multi_token_metadata_capture(bs, self.spec_num_tokens, seq_lens)
             if self.is_draft:
                 self._init_decode_metadata_capture(bs, seq_lens)
         else:
@@ -564,7 +565,6 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
