@@ -11,6 +11,7 @@ on:
       - "python/pyproject.toml"
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
+      - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/pr-test.yml"
@@ -21,6 +22,7 @@ on:
       - "python/pyproject.toml"
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
+      - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/pr-test.yml"
@@ -131,6 +133,39 @@ jobs:
             sleep 10
           done
           exit 1
+
+      # When the diff touches `tokenspeed-mla/`, ask install_deps.sh to
+      # rebuild + install that package from the in-tree source after the
+      # pinned PyPI wheel has been installed (transitively via
+      # tokenspeed-kernel). Without this, CI keeps testing whichever
+      # `tokenspeed-mla` version is pinned in
+      # `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`, not
+      # the code on the PR/branch. When the diff doesn't touch
+      # `tokenspeed-mla/` we keep using the pinned PyPI wheel.
+      - name: Detect tokenspeed-mla source changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          changed=""
+          case "${{ github.event_name }}" in
+            pull_request)
+              changed=$(gh api \
+                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --paginate -q '.[].filename' \
+                | grep '^tokenspeed-mla/' || true)
+              ;;
+            push)
+              changed=$(gh api \
+                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
+                -q '.files[].filename' \
+                | grep '^tokenspeed-mla/' || true)
+              ;;
+          esac
+          if [ -n "$changed" ]; then
+            echo "tokenspeed-mla touched by this run; will reinstall from source"
+            echo "INSTALL_TOKENSPEED_MLA_FROM_SOURCE=1" >> "$GITHUB_ENV"
+          fi
 
       - name: Install CI task
         run: |
