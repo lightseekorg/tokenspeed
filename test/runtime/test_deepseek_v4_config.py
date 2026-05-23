@@ -1,7 +1,15 @@
 import argparse
+import os
+import sys
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
@@ -968,17 +976,17 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_scheduled_tokens=1,
         )
 
-        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (7, 37440))
+        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (8, 37440))
         self.assertIsNone(pool.compressed_kv_buffer[0])
         self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (4, 37440))
-        self.assertEqual(tuple(pool.get_compressor_state_buffer(1).shape), (7, 4, 2048))
+        self.assertEqual(tuple(pool.get_compressor_state_buffer(1).shape), (8, 4, 2048))
         self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(2).shape), (35, 8, 1024)
+            tuple(pool.get_compressor_state_buffer(2).shape), (36, 8, 1024)
         )
         self.assertEqual(pool.get_compressor_state_buffer(1).dtype, torch.float32)
         self.assertEqual(pool.get_compressor_state_buffer(2).dtype, torch.float32)
         self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (4, 64 * 68))
-        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (7, 4, 512))
+        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (8, 4, 512))
         self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
