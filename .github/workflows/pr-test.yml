@@ -67,6 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.scan.outputs.matrix }}
+      install_tokenspeed_mla_from_source: ${{ steps.detect_mla.outputs.changed }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -96,6 +97,41 @@ jobs:
           MATRIX=$(python3 test/ci_system/pipeline.py scan --root test/ci --trigger "$TRIGGER")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
+      # Compute this once on the hosted runner (where `gh` is pre-installed)
+      # and propagate the result to every matrix job via job output. The
+      # downstream unit-test job reads it as an env var and `install_deps.sh`
+      # gates its in-tree `tokenspeed-mla` reinstall on it. Without this
+      # detection, CI would always exercise the pinned PyPI wheel and edits
+      # under `tokenspeed-mla/` would be silently uncovered.
+      - name: Detect tokenspeed-mla source changes
+        id: detect_mla
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request)
+              files=$(gh api \
+                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --paginate -q '.[].filename')
+              ;;
+            push)
+              files=$(gh api \
+                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
+                -q '.files[].filename')
+              ;;
+            *)
+              files=""
+              ;;
+          esac
+          if printf '%s\n' "$files" | grep -q '^tokenspeed-mla/'; then
+            echo "tokenspeed-mla touched by this run; in-tree source will be installed."
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "tokenspeed-mla untouched; keeping pinned PyPI wheel."
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+          fi
+
   unit-test:
     needs: scan
     if: |
@@ -114,6 +150,11 @@ jobs:
     name: ${{ matrix.name }} / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      # When the scan job determined that this run touched `tokenspeed-mla/`,
+      # `install_deps.sh` will reinstall the in-tree source on top of the
+      # pinned PyPI wheel. See the matching detect step in the `scan` job.
+      INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -142,48 +183,6 @@ jobs:
       # `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`, not
       # the code on the PR/branch. When the diff doesn't touch
       # `tokenspeed-mla/` we keep using the pinned PyPI wheel.
-      - name: Detect tokenspeed-mla source changes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Use curl + python3 instead of `gh api`: the self-hosted GPU
-          # runners (b200 / b300 / h100 / gb200 / MI355) don't ship the
-          # gh CLI, so `gh: command not found` would silently leave the
-          # env var unset and skip the source override on every host.
-          case "${{ github.event_name }}" in
-            pull_request)
-              url="https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100"
-              ;;
-            push)
-              url="https://api.github.com/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}"
-              ;;
-            *)
-              echo "Unhandled event_name '${{ github.event_name }}'; assuming no tokenspeed-mla change."
-              exit 0
-              ;;
-          esac
-          changed=$(curl -sSL --fail \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$url" \
-            | python3 -c '
-          import json, sys
-          d = json.load(sys.stdin)
-          files = d["files"] if isinstance(d, dict) and "files" in d else d
-          for f in files:
-              print(f["filename"])
-          ' \
-            | grep '^tokenspeed-mla/' || true)
-          if [ -n "$changed" ]; then
-            echo "tokenspeed-mla touched by this run; will reinstall from source"
-            echo "$changed"
-            echo "INSTALL_TOKENSPEED_MLA_FROM_SOURCE=1" >> "$GITHUB_ENV"
-          else
-            echo "tokenspeed-mla not touched; keeping pinned PyPI wheel."
-          fi
-
       - name: Install CI task
         run: |
           cd "${{ env.WORK_DIR }}"
