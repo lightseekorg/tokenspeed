@@ -86,7 +86,7 @@ def verify_kernel(
     if kernel is None:
         raise ValueError(f"Kernel implementation for {kernel_name!r} is missing")
 
-    signature = spec.format_signature_for_storage_dtype(dtype)
+    signature = spec.format_signature_for_primary_storage_dtype(dtype)
     if signature is None:
         raise ValueError(
             f"Kernel {kernel_name!r} does not support primary storage dtype={dtype}"

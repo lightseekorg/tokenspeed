@@ -68,7 +68,7 @@ def _infer_scale_type(
     A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
 ) -> str | None:
-    """For fp8, distinguish tensor-scalar from channel/vector scaling."""
+    """For fp8, distinguish tensor/channel/scalar scaling."""
     if A_scales is None or B_scales is None:
         return None
     if A_scales.numel() == 1 and B_scales.numel() == 1:

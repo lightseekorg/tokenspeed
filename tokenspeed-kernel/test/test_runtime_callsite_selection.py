@@ -323,7 +323,7 @@ def _infer_format_signature(
 ) -> FormatSignature:
     if family == "moe" and mode == "fused":
         return _moe_pkg._moe_fused_format_signature(dtype, weight_format or "bf16")
-    signature = spec.format_signature_for_storage_dtype(dtype)
+    signature = spec.format_signature_for_primary_storage_dtype(dtype)
     if signature is None:
         pytest.skip(f"Kernel {spec.name!r} has no signature for {dtype}")
     return signature

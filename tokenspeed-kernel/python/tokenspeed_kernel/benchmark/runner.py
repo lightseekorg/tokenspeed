@@ -139,7 +139,7 @@ class BenchmarkRunner:
         if not spec_matches_shape_traits(spec, shape):
             return None
 
-        signature = spec.format_signature_for_storage_dtype(dtype)
+        signature = spec.format_signature_for_primary_storage_dtype(dtype)
         if signature is None:
             return None
 
@@ -229,7 +229,7 @@ class BenchmarkRunner:
             return None, None, None
 
         registry = KernelRegistry.get()
-        signature = spec.format_signature_for_storage_dtype(dtype)
+        signature = spec.format_signature_for_primary_storage_dtype(dtype)
         if signature is None:
             return None, None, None
 
@@ -294,7 +294,7 @@ class BenchmarkRunner:
         if spec is None:
             raise ValueError(f"Kernel {kernel_name!r} is not registered")
 
-        if spec.format_signature_for_storage_dtype(dtype) is None:
+        if spec.format_signature_for_primary_storage_dtype(dtype) is None:
             raise ValueError(
                 f"Kernel {kernel_name!r} does not support primary storage dtype={dtype}"
             )
@@ -355,7 +355,7 @@ class BenchmarkRunner:
                 op_mode,
                 platform=platform,
             )
-            if spec.format_signature_for_storage_dtype(dtype) is not None
+            if spec.format_signature_for_primary_storage_dtype(dtype) is not None
         ]
 
         results: list[BenchmarkResult] = []

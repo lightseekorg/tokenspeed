@@ -164,12 +164,13 @@ class KernelSpec:
     def supports_format_signature(self, format_signature: FormatSignature) -> bool:
         return format_signature in self.format_signatures
 
-    def format_signature_for_storage_dtype(
+    def format_signature_for_primary_storage_dtype(
         self,
-        storage_dtype: torch.dtype,
+        primary_storage_dtype: torch.dtype,
     ) -> FormatSignature | None:
+        """Return the first signature matching a dtype-oriented filter."""
         for signature in sorted(self.format_signatures, key=str):
-            if signature.primary_storage_dtype() == storage_dtype:
+            if signature.primary_storage_dtype() == primary_storage_dtype:
                 return signature
         return None
 

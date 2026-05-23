@@ -62,7 +62,7 @@ def require() -> Callable[[str, str, str, torch.dtype], None]:
                 platform=current_platform(),
                 solution=solution,
             )
-            if spec.format_signature_for_storage_dtype(dtype) is not None
+            if spec.format_signature_for_primary_storage_dtype(dtype) is not None
         ]
         if not specs:
             pytest.skip(f"{family}.{mode} solution {solution!r} is not registered")

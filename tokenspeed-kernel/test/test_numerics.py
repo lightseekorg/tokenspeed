@@ -107,7 +107,7 @@ class TestNumericsVerification:
             dtype_specs = [
                 s
                 for s in op_specs
-                if s.format_signature_for_storage_dtype(dtype) is not None
+                if s.format_signature_for_primary_storage_dtype(dtype) is not None
             ]
             has_reference = any(s.solution == "reference" for s in dtype_specs)
             if not has_reference:

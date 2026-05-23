@@ -83,7 +83,7 @@ def _iter_candidate_specs(
         specs = [
             s
             for s in specs
-            if s.format_signature_for_storage_dtype(dtype_filter) is not None
+            if s.format_signature_for_primary_storage_dtype(dtype_filter) is not None
         ]
 
     specs.sort(key=lambda s: (s.family, s.mode, s.name))
