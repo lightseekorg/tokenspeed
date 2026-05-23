@@ -34,8 +34,7 @@ def set_total_chunks_hint(
     seq_lens_cpu,
     chunk_sizes: tuple[int, ...] = (16, 64),
 ) -> None:
-    """Pre-compute total chunk counts on CPU
-    """
+    """Pre-compute total chunk counts on CPU"""
     lens = np.asarray(seq_lens_cpu, dtype=np.int64)
     for cs in chunk_sizes:
         _total_chunks_hint[cs] = int(np.sum(-(-lens // cs)))
@@ -51,9 +50,7 @@ def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
     nums = triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
-    offsets = torch.zeros(
-        nums.shape[0] + 1, dtype=nums.dtype, device=nums.device
-    )
+    offsets = torch.zeros(nums.shape[0] + 1, dtype=nums.dtype, device=nums.device)
     torch.cumsum(nums, dim=0, out=offsets[1:])
     total_int = _total_chunks_hint.pop(chunk_size, None)
     if total_int is None:
@@ -69,8 +66,6 @@ def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
     nums = triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
-    offsets = torch.zeros(
-        nums.shape[0] + 1, dtype=nums.dtype, device=nums.device
-    )
+    offsets = torch.zeros(nums.shape[0] + 1, dtype=nums.dtype, device=nums.device)
     torch.cumsum(nums, dim=0, out=offsets[1:])
     return offsets

@@ -189,7 +189,7 @@ def fused_mamba_state_copy(
         dst_indices: Destination slot indices [num_valid], int32 or int64.
         cache_lengths: Per-entry cache lengths for page-boundary filtering.
         page_size: When > 0, only copy entries where cache_lengths[i] is
-            aligned to page_size. Set to 0 to disable filtering (used by 
+            aligned to page_size. Set to 0 to disable filtering (used by
             COW copy where all valid entries must be copied).
     """
     num_valid = src_indices.shape[0]

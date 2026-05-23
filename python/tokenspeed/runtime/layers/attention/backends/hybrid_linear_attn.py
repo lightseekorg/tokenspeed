@@ -206,11 +206,7 @@ class SimpleMambaPool:
             steps = torch.arange(
                 draft_token_num - 1, dtype=torch.int32, device=working.device
             )
-            draft = (
-                draft_base
-                + req[:, None] * draft_slots_per_req
-                + steps[None, :]
-            )
+            draft = draft_base + req[:, None] * draft_slots_per_req + steps[None, :]
             output_indices[:, 1:] = torch.where(
                 valid[:, None] & (req >= 0)[:, None],
                 draft,

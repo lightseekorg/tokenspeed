@@ -638,12 +638,12 @@ register_backend("trtllm", {AttentionArch.MHA}, TRTLLMMHAAttnBackend)
 
 @triton.jit
 def _gather_page_table_with_padding_kernel(
-    req_to_page_ptr,        # [req_pool_size+1, src_stride0] int32
-    req_pool_indices_ptr,   # [bs] int32 or int64
-    seq_lens_ptr,           # [bs] int32 — KV length per req
-    out_ptr,                # [max_bs, max_num_pages] int32
-    src_stride0,            # row stride of req_to_page
-    out_stride0,            # row stride of cuda_graph_page_table
+    req_to_page_ptr,  # [req_pool_size+1, src_stride0] int32
+    req_pool_indices_ptr,  # [bs] int32 or int64
+    seq_lens_ptr,  # [bs] int32 — KV length per req
+    out_ptr,  # [max_bs, max_num_pages] int32
+    src_stride0,  # row stride of req_to_page
+    out_stride0,  # row stride of cuda_graph_page_table
     max_num_pages: tl.constexpr,
     page_size: tl.constexpr,
     dummy_slot: tl.constexpr,
