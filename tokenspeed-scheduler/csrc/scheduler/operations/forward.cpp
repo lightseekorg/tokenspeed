@@ -477,7 +477,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         if (req->Is<fsm::Submitted>()) return 2;
         if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
             // Decode-first if mixed-batch is enabled; prefill-first otherwise.
-            return config_.enable_mixed_prefill_decode? 0: 3;
+            return config_.enable_mixed_prefill_decode ? 0 : 3;
         }
         if (req->Is<fsm::Retracted>()) return 4;
         return 9;
@@ -524,7 +524,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
             // If mixed-batch is disabled, skip ALL decode if any prefill was scheduled this round.
-            // If mixed-batch is enabled, the priority sort puts decodes first, so this branch is reached before any prefill push.
+            // If mixed-batch is enabled, the priority sort puts decodes first, so this
+            // branch is reached before any prefill push.
             if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
