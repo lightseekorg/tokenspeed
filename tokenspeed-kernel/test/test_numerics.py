@@ -28,10 +28,7 @@ from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import verify_kernel
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
-from tokenspeed_kernel.signature import (
-    ScaleFormat,
-    format_signatures,
-)
+from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 

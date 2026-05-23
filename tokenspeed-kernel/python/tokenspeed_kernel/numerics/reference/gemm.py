@@ -26,10 +26,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import (
-    ScaleFormat,
-    format_signatures,
-)
+from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 fp8_dtype = Platform.get().fp8e4m3fn.dtype
 _FP8_BLOCK_SCALE = ScaleFormat(

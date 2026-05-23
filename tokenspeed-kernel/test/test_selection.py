@@ -55,9 +55,7 @@ from tokenspeed_kernel.selection import (
     spec_matches_traits,
     warmup_selection,
 )
-from tokenspeed_kernel.signature import (
-    format_signatures,
-)
+from tokenspeed_kernel.signature import format_signatures
 from utils import register_all_samples
 
 pytestmark = pytest.mark.usefixtures("fresh_registry")

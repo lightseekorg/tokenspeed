@@ -21,10 +21,7 @@ from typing import Literal
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import (
-    dense_format,
-    format_signature,
-)
+from tokenspeed_kernel.signature import dense_format, format_signature
 
 __all__ = [
     "quantize_fp8",

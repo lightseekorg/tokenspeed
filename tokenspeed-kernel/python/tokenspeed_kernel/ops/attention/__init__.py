@@ -32,10 +32,7 @@ import torch
 from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import (
-    dense_format,
-    format_signature,
-)
+from tokenspeed_kernel.signature import dense_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 

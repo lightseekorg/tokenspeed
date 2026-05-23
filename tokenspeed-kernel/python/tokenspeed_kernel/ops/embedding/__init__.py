@@ -23,10 +23,7 @@ from typing import Optional
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import (
-    dense_format,
-    format_signature,
-)
+from tokenspeed_kernel.signature import dense_format, format_signature
 
 
 @dataclass
