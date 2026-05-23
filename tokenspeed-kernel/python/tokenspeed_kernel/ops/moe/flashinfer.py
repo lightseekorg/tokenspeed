@@ -74,8 +74,8 @@ _CUTLASS_FUSED_FORMAT_SIGNATURES = frozenset(
             weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
         ),
         format_signature(
-            x=tensor_format("dense", torch.float8_e4m3fn, scale=_FP8_SCALE),
-            weight=tensor_format("dense", torch.float8_e4m3fn, scale=_FP8_SCALE),
+            x=tensor_format("fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
+            weight=tensor_format("fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
         ),
     }
 )

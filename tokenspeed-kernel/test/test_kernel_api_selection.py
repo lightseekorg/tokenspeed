@@ -181,7 +181,7 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     assert b_format.storage_dtype == _fp8_dtype()
 
 
-def test_gemm_fp8_scaled_signature_uses_dense_format_with_scale() -> None:
+def test_gemm_fp8_scaled_signature_uses_fp8_format_with_scale() -> None:
     a = torch.empty((4, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
     a_scales = torch.empty((1,), dtype=torch.float32)
@@ -200,7 +200,7 @@ def test_gemm_fp8_scaled_signature_uses_dense_format_with_scale() -> None:
     for role in ("a", "b"):
         tensor_format = signature.format_for(role)
         assert tensor_format is not None
-        assert tensor_format.format == "dense"
+        assert tensor_format.format == "fp8"
         assert tensor_format.storage_dtype == _fp8_dtype()
         assert tensor_format.scale is not None
         assert tensor_format.scale.granularity == "tensor"

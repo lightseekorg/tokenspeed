@@ -67,8 +67,7 @@ class TensorFormat:
     Args:
         storage_dtype: Physical dtype used by the main tensor payload.
         format: Logical representation format, such as "dense",
-            "mxfp8", "mxfp4", or "nvfp4". Use "dense" for ordinary
-            dense tensors, including dense FP8 payloads with optional scales.
+            "fp8", "mxfp8", "mxfp4", or "nvfp4".
         scale: Optional scale sidecar metadata bundled with this tensor role.
     """
 
@@ -143,9 +142,8 @@ def tensor_format(
     """Construct a format for one tensor role.
 
     Args:
-        format: Logical representation format, such as "dense", "mxfp8",
-            "mxfp4", or "nvfp4". Use "dense" for ordinary dense tensors,
-            including dense FP8 payloads with optional scales.
+        format: Logical representation format, such as "dense", "fp8",
+            "mxfp8", "mxfp4", or "nvfp4".
         storage_dtype: Physical dtype used by the main tensor payload.
         scale: Optional scale sidecar metadata bundled with this tensor role.
     """
