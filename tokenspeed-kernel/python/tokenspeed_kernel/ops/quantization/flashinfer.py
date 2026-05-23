@@ -17,7 +17,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 
 platform = current_platform()
@@ -30,11 +34,7 @@ nvfp4_block_scale_interleave = error_fn
 fp8_blockscale_quantize_runner_sm90 = error_fn
 
 if platform.is_nvidia:
-    from flashinfer import (
-        fp4_quantize,
-        mxfp8_quantize,
-        nvfp4_block_scale_interleave,
-    )
+    from flashinfer import mxfp8_quantize
 
     if platform.is_hopper:
         from flashinfer.gemm.gemm_base import (
@@ -56,11 +56,22 @@ if platform.is_nvidia:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return mxfp8_quantize(x, False)
 
+
+if platform.is_nvidia and platform.is_blackwell:
+    from flashinfer import (
+        fp4_quantize,
+        nvfp4_block_scale_interleave,
+    )
+
     @register_kernel(
         "quantization",
         "nvfp4",
         name="flashinfer_quantize_nvfp4",
         solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
         dtypes={torch.bfloat16, torch.float16},
         traits={
             "has_scale": frozenset({True}),
