@@ -180,6 +180,43 @@ class SimpleMambaPool:
         """Return mamba cache indices directly (allocated by C++ scheduler)."""
         return mamba_pool_indices.to(torch.int32)
 
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _build_mtp_output_indices_kernel(
+        output_indices: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        working_indices: torch.Tensor,
+        draft_base: int,
+        draft_slots_per_req: int,
+        draft_token_num: int,
+    ) -> None:
+        """Fused fill of MTP target-verify output index table.
+
+        Inductor fuses the working-column write and the draft-grid write into
+        as few elementwise kernels as possible.  The host-side early returns
+        (draft_token_num<=0, ``out is None``) are kept in the wrapper.
+        """
+        bs = working_indices.shape[0]
+        working = working_indices.to(torch.int32)
+        valid = working >= 0
+        output_indices[:, 0] = torch.where(valid, working, -1)
+
+        if draft_token_num > 1 and draft_slots_per_req > 0:
+            req = req_pool_indices[:bs].to(torch.int32)
+            steps = torch.arange(
+                draft_token_num - 1, dtype=torch.int32, device=working.device
+            )
+            draft = (
+                draft_base
+                + req[:, None] * draft_slots_per_req
+                + steps[None, :]
+            )
+            output_indices[:, 1:] = torch.where(
+                valid[:, None] & (req >= 0)[:, None],
+                draft,
+                -1,
+            )
+
     def get_mtp_output_indices(
         self,
         req_pool_indices: torch.Tensor,
@@ -202,26 +239,60 @@ class SimpleMambaPool:
         if draft_token_num <= 0:
             return output_indices
 
-        working = working_indices.to(torch.int32)
-        valid = working >= 0
-        output_indices[:, 0] = torch.where(valid, working, -1)
-
-        if draft_token_num > 1 and self.draft_slots_per_req > 0:
-            req = req_pool_indices[:bs].to(torch.int32)
-            steps = torch.arange(
-                draft_token_num - 1, dtype=torch.int32, device=working.device
-            )
-            draft = (
-                self.draft_base
-                + req[:, None] * self.draft_slots_per_req
-                + steps[None, :]
-            )
-            output_indices[:, 1:] = torch.where(
-                valid[:, None] & (req >= 0)[:, None],
-                draft,
-                -1,
-            )
+        self._build_mtp_output_indices_kernel(
+            output_indices,
+            req_pool_indices,
+            working_indices,
+            self.draft_base,
+            self.draft_slots_per_req,
+            draft_token_num,
+        )
         return output_indices
+
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _get_current_input_indices_kernel(
+        req_pool_indices: torch.Tensor,
+        working_indices: torch.Tensor,
+        current_input_indices_buf: torch.Tensor,
+        current_input_size: int,
+    ) -> torch.Tensor:
+        """Fused gather + masked-where for the no-COW path."""
+        n = working_indices.shape[0]
+        req = req_pool_indices[:n].to(torch.int32)
+        working = working_indices.to(torch.int32)
+        valid = (working >= 0) & (req >= 0)
+        safe = req.clamp(0, current_input_size - 1).to(torch.int64)
+        stored = current_input_indices_buf[safe]
+        current = torch.where(valid & (stored >= 0), stored, working)
+        current = torch.where(valid, current, torch.full_like(current, -1))
+        return current
+
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _get_current_input_indices_with_cow_kernel(
+        req_pool_indices: torch.Tensor,
+        working_indices: torch.Tensor,
+        cow_src_indices: torch.Tensor,
+        current_input_indices_buf: torch.Tensor,
+        current_input_size: int,
+    ) -> torch.Tensor:
+        """Fused gather + masked-where for the COW path."""
+        n = working_indices.shape[0]
+        req = req_pool_indices[:n].to(torch.int32)
+        working = working_indices.to(torch.int32)
+        cow = cow_src_indices[:n].to(torch.int32)
+        valid = (working >= 0) & (req >= 0)
+        safe = req.clamp(0, current_input_size - 1).to(torch.int64)
+        stored = current_input_indices_buf[safe]
+        current = torch.where(valid & (stored >= 0), stored, working)
+        current = torch.where(valid, current, torch.full_like(current, -1))
+        current = torch.where(
+            (cow >= 0) & valid & (current == working),
+            cow,
+            current,
+        )
+        return current
 
     def get_current_input_indices(
         self,
@@ -230,24 +301,20 @@ class SimpleMambaPool:
         cow_src_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the row each request should read at the start of target verify."""
-        req_pool_indices = req_pool_indices[: working_indices.shape[0]].to(torch.int32)
-        working_indices = working_indices.to(torch.int32)
-        # Only keep >= 0 checks; upper bounds are guaranteed by the scheduler.
-        valid = (working_indices >= 0) & (req_pool_indices >= 0)
-        safe_req_indices = req_pool_indices.clamp(0, self.current_input_size - 1).long()
-        stored = self.current_input_indices[safe_req_indices]
-        current = torch.where(valid & (stored >= 0), stored, working_indices)
-        current = torch.where(valid, current, torch.full_like(current, -1))
-        if cow_src_indices is not None:
-            cow_src_indices = cow_src_indices[: working_indices.shape[0]].to(
-                torch.int32
+        if cow_src_indices is None:
+            return self._get_current_input_indices_kernel(
+                req_pool_indices,
+                working_indices,
+                self.current_input_indices,
+                self.current_input_size,
             )
-            current = torch.where(
-                (cow_src_indices >= 0) & valid & (current == working_indices),
-                cow_src_indices,
-                current,
-            )
-        return current
+        return self._get_current_input_indices_with_cow_kernel(
+            req_pool_indices,
+            working_indices,
+            cow_src_indices,
+            self.current_input_indices,
+            self.current_input_size,
+        )
 
     def reset_current_inputs(
         self, req_pool_indices: torch.Tensor, working_indices: torch.Tensor
@@ -257,6 +324,28 @@ class SimpleMambaPool:
         working_indices = working_indices.to(torch.int32)
         self.current_input_indices[req_pool_indices.long()] = working_indices
 
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _update_current_inputs_after_verify_kernel(
+        req_pool_indices: torch.Tensor,
+        output_indices: torch.Tensor,
+        accepted_lengths: torch.Tensor,
+        current_input_indices: torch.Tensor,
+        max_col: int,
+    ) -> None:
+        """Fused gather-scatter for the after-verify input pointer update.
+
+        Inductor fuses clamp/arange/sub/dtype-convert into a single elementwise
+        kernel; the gather and the in-place scatter on ``current_input_indices``
+        each remain a single kernel.  All tensors stay on GPU; no host sync.
+        """
+        n = accepted_lengths.shape[0]
+        req = req_pool_indices[:n].to(torch.int64)
+        idx = (accepted_lengths.clamp(min=1, max=max_col) - 1).to(torch.int64)
+        rows = torch.arange(n, device=accepted_lengths.device, dtype=torch.int64)
+        selected = output_indices[rows, idx].to(torch.int32)
+        current_input_indices[req] = selected
+
     def update_current_inputs_after_verify(
         self,
         req_pool_indices: torch.Tensor,
@@ -265,14 +354,13 @@ class SimpleMambaPool:
     ) -> None:
         if output_indices is None or output_indices.numel() == 0:
             return
-        n = accepted_lengths.shape[0]
-        req_pool_indices = req_pool_indices[:n].to(torch.int32)
-        accepted_lengths = accepted_lengths.clamp(
-            min=1, max=output_indices.shape[1]
-        ).to(torch.int32)
-        rows = torch.arange(n, device=accepted_lengths.device, dtype=torch.long)
-        selected = output_indices[rows, (accepted_lengths - 1).long()].to(torch.int32)
-        self.current_input_indices[req_pool_indices.long()] = selected
+        self._update_current_inputs_after_verify_kernel(
+            req_pool_indices,
+            output_indices,
+            accepted_lengths,
+            self.current_input_indices,
+            output_indices.shape[1],
+        )
 
     def get_mamba_params(self, layer_id: int):
         """Return per-layer cache slices."""
