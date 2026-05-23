@@ -41,6 +41,7 @@
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
+#include "resource/allocator/mamba_host_allocator.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 
 #include "fsm/forward_events.h"
@@ -133,6 +134,7 @@ private:
     PageAllocator device_allocator_;
     PageAllocator host_allocator_;
     std::optional<MambaChunkAllocator> mamba_allocator_{};
+    std::optional<MambaHostAllocator> mamba_host_allocator_{};
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};

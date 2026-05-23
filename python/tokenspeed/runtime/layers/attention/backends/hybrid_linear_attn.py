@@ -169,6 +169,7 @@ class SimpleMambaPool:
         )
 
         self.mamba_cache = (self.conv_state, self.ssm_state)
+        self.layer_transfer_counter = None
 
         self.current_input_indices = torch.full(
             (self.current_input_size,), -1, dtype=torch.int32, device=device
@@ -272,13 +273,20 @@ class SimpleMambaPool:
         selected = output_indices[rows, (accepted_lengths - 1).long()].to(torch.int32)
         self.current_input_indices[req_pool_indices.long()] = selected
 
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
+
     def get_mamba_params(self, layer_id: int):
         """Return per-layer cache slices."""
         internal_idx = self.mamba_map[layer_id]
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(internal_idx)
         return [self.mamba_cache[i][internal_idx] for i in range(len(self.mamba_cache))]
 
     def get_mamba_params_all_layers(self):
         """Return all layers for all cache components."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(self.conv_state.shape[0] - 1)
         return [self.mamba_cache[i] for i in range(len(self.mamba_cache))]
 
     def get_contiguous_buf_infos(self):
@@ -415,17 +423,12 @@ class MambaAttnBackend(AttentionBackend):
         if (
             forward_mode.is_extend_or_mixed() or is_draft_extend
         ) and not is_target_verify:
-            mamba_branching_seqlens = kwargs.get("mamba_branching_seqlens")
             extend_prefix_lens_kw = kwargs.get("extend_prefix_lens")
             mamba_track_pool_indices = kwargs.get("mamba_track_pool_indices")
             if (
-                mamba_branching_seqlens is not None
-                and extend_prefix_lens_kw is not None
+                extend_prefix_lens_kw is not None
                 and mamba_track_pool_indices is not None
             ):
-                branching = mamba_branching_seqlens[:bs].to(
-                    dtype=torch.int32, device=self.device
-                )
                 prefix = extend_prefix_lens_kw[:bs].to(
                     dtype=torch.int32, device=self.device
                 )
@@ -435,24 +438,19 @@ class MambaAttnBackend(AttentionBackend):
                 extend_lens = (seq_lens[:bs] - prefix).to(torch.int32)
                 checkpoint_mask = (track_indices >= 0) & (mamba_cache_indices >= 0)
 
-                branch_lens = branching - prefix
-                branch_inside = (
-                    (branching > 0)
-                    & checkpoint_mask
-                    & (branch_lens > 0)
-                    & (branch_lens < extend_lens)
-                )
-                track_mask = branch_inside & ((branch_lens % FLA_CHUNK_SIZE) == 0)
-                if (branch_inside & ~track_mask).any():
-                    raise RuntimeError(
-                        "Mamba branching seqlen must be aligned to FLA chunk size"
-                    )
-
                 page_size = getattr(self.pool, "page_size", 1)
                 final_lens = prefix + extend_lens
+                last_inserted_lens = (final_lens // page_size) * page_size
+                track_lens = last_inserted_lens - prefix
+                track_inside = (
+                    checkpoint_mask & (track_lens > 0) & (track_lens < extend_lens)
+                )
+                track_mask = track_inside & ((track_lens % FLA_CHUNK_SIZE) == 0)
+                # C++ attaches the checkpoint slot to the last KV page inserted
+                # for this chunk. When a chunk has an intermediate branch and
+                # ends exactly on a page boundary, the final state must win.
                 final_mask = (
                     checkpoint_mask
-                    & ~branch_inside
                     & (final_lens >= page_size)
                     & ((final_lens % page_size) == 0)
                 )
@@ -465,14 +463,14 @@ class MambaAttnBackend(AttentionBackend):
                         track_ssm_h_src,
                         track_ssm_h_dst,
                     ) = self._compute_track_ssm_indices(
-                        branch_lens,
+                        track_lens,
                         track_mask,
                         track_indices,
                         seq_lens[:bs] - prefix,  # extend_seq_lens
                     )
                     track_conv_indices = self._compute_track_conv_indices(
                         query_start_loc,
-                        branch_lens,
+                        track_lens,
                         track_mask,
                     )
 
@@ -492,12 +490,12 @@ class MambaAttnBackend(AttentionBackend):
     def _compute_track_conv_indices(
         self,
         query_start_loc: torch.Tensor,
-        branch_lens: torch.Tensor,
+        track_lens: torch.Tensor,
         track_mask: torch.Tensor,
     ):
         """Compute packed input indices for conv windows at tracked boundaries."""
         conv_state_len = self.pool.conv_state.shape[-1]
-        lens_m = branch_lens[track_mask]
+        lens_m = track_lens[track_mask]
         start = query_start_loc[:-1][track_mask] + lens_m - conv_state_len
         indices = start.unsqueeze(-1) + torch.arange(
             conv_state_len,
@@ -508,7 +506,7 @@ class MambaAttnBackend(AttentionBackend):
 
     def _compute_track_ssm_indices(
         self,
-        branch_lens: torch.Tensor,
+        track_lens: torch.Tensor,
         track_mask: torch.Tensor,
         mamba_track_indices: torch.Tensor,
         extend_seq_lens: torch.Tensor,
@@ -521,7 +519,7 @@ class MambaAttnBackend(AttentionBackend):
         offset = torch.zeros_like(num_h_states)
         offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
 
-        lens_m = branch_lens[track_mask]
+        lens_m = track_lens[track_mask]
         offset_m = offset[track_mask]
         dst_m = mamba_track_indices[track_mask]  # write to TRACKING slots
 

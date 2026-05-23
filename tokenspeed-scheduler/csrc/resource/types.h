@@ -70,6 +70,7 @@ struct MatchResult {
     // Mamba extension (default: no mamba cache, -1 = inactive)
     std::int32_t mamba_branching_seqlen{-1};
     std::int32_t mamba_cow_src_index{-1};
+    std::int32_t mamba_host_src_index{-1};
 
     // Paged-cache adjunct hit. Null last_node or zero prefix means no hit.
     // When hit, device/host last_node also sit at or before prefix_len_tokens.

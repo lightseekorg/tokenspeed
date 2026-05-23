@@ -18,45 +18,42 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "resource/allocator/mamba_chunk_allocator.h"
+#include "resource/allocator/mamba_host_allocator.h"
+
+#include <algorithm>
 
 namespace tokenspeed {
 
-MambaSlot::MambaSlot(std::int32_t index, MambaChunkAllocator* allocator)
-    : MambaSlot(index, [allocator](std::int32_t i) {
-          if (allocator != nullptr) allocator->Free(i);
-      }) {}
-
-MambaChunkAllocator::MambaChunkAllocator(std::int32_t num_slots) : total_slots_{num_slots} {
+MambaHostAllocator::MambaHostAllocator(std::int32_t num_slots) : total_slots_{num_slots} {
     free_list_.reserve(num_slots);
+    released_idx_queue_.reserve(num_slots);
     for (std::int32_t i = num_slots - 1; i >= 0; --i) {
         free_list_.push_back(i);
     }
 }
 
-std::optional<MambaSlot> MambaChunkAllocator::Allocate() {
+std::optional<MambaSlot> MambaHostAllocator::Allocate() {
     if (free_list_.empty()) {
         return std::nullopt;
     }
     std::int32_t index = free_list_.back();
     free_list_.pop_back();
-    return MambaSlot{index, this};
+    return MambaSlot{index, [this](std::int32_t i) { Free(i); }};
 }
 
-void MambaChunkAllocator::Free(std::int32_t index) {
-    free_list_.push_back(index);
-}
-
-MambaSlot::~MambaSlot() {
-    release();
-}
-
-void MambaSlot::release() {
-    if (index_ >= 0 && releaser_) {
-        releaser_(index_);
-        index_ = -1;
-        releaser_ = {};
+void MambaHostAllocator::Free(std::int32_t index) {
+    if (index < 0 || index >= total_slots_) {
+        return;
     }
+    free_list_.push_back(index);
+    released_idx_queue_.push_back(index);
+}
+
+std::vector<std::int32_t> MambaHostAllocator::DrainReleased(std::size_t max) {
+    std::size_t n = std::min(max, released_idx_queue_.size());
+    std::vector<std::int32_t> released(released_idx_queue_.begin(), released_idx_queue_.begin() + n);
+    released_idx_queue_.erase(released_idx_queue_.begin(), released_idx_queue_.begin() + n);
+    return released;
 }
 
 }  // namespace tokenspeed

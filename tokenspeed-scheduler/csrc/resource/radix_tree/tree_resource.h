@@ -105,6 +105,7 @@ public:
 
     void SetEvictionCallback(EvictionCallback cb) { eviction_callback_ = std::move(cb); }
 
+    void RemoveLeaf(TreeNode* node);
     void UpdateLeaves(TreeNode* node);
     std::vector<TreeNode*> Evict(std::int32_t num_pages);
     std::vector<TreeNode*> EnsureCapacity(std::int32_t required_num_pages);
@@ -128,6 +129,7 @@ public:
     }
 
 private:
+    void removeLeaf(TreeNode* node);
     void updateLeaf(TreeNode* node);
 
     PageAllocator* allocator_;

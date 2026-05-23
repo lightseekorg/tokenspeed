@@ -34,18 +34,21 @@
 #include "resource/allocator/paged_cache_group.h"
 #include "resource/hybrid_prefix_cache/mamba_eviction_manager.h"
 #include "resource/radix_tree/mamba_slot.h"
+#include "scheduler/operations/cache.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/types.h"
 
 namespace tokenspeed {
 
 class MambaChunkAllocator;
+class MambaHostAllocator;
 class ForwardOperationBase;
 
 class HybridPrefixCache {
 public:
     // `mamba_allocator` may be null; paged-cache adjunct is enabled separately.
-    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size);
+    HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size,
+                      MambaHostAllocator* mamba_host_allocator = nullptr);
 
     MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
@@ -55,6 +58,15 @@ public:
     void InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot);
     std::int32_t AlignMambaCacheSeqlen(std::int32_t seqlen) const;
     TreeNode* FindLastMambaNode(TreeNode* from) const;
+    TreeNode* FindLastMambaHostNode(TreeNode* from) const;
+    bool EnsureMambaHostCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node = nullptr);
+    std::vector<TransferPair> PrepareMambaHostWriteBack(const std::vector<TreeNode*>& nodes);
+    std::vector<TransferPair> PrepareMambaDeviceLoadBack(const std::vector<TreeNode*>& nodes);
+    void OnKVHostEvict(TreeNode* node);
+    void OnKVDeviceDemote(TreeNode* node);
+    void OnMambaHostWriteBackDone(TreeNode* last_node);
+    void OnMambaHostWriteBackDone(const std::vector<TreeNode*>& nodes);
+    void DemoteIdleMambaDeviceCopiesPresentOnHost();
 
     // Takes ownership. Duplicate group_id throws std::invalid_argument.
     void RegisterPagedCacheGroup(std::unique_ptr<PagedCacheGroupAllocator> allocator);
@@ -184,8 +196,12 @@ private:
 
     KVPrefixCache& kv_prefix_cache_;
     MambaChunkAllocator* mamba_allocator_;
+    MambaHostAllocator* mamba_host_allocator_;
     MambaEvictionManager mamba_eviction_manager_;
     std::int32_t mamba_cache_chunk_size_;
+    std::unordered_set<TreeNode*> mamba_host_nodes_;
+    std::unordered_map<TreeNode*, std::unique_ptr<MambaSlot>> pending_mamba_host_writebacks_;
+    std::unordered_set<TreeNode*> mamba_host_writeback_done_nodes_;
 
     // `paged_cache_history_alignment_tokens_ == 0` means adjunct disabled; tables still work.
     std::map<std::string, std::unique_ptr<PagedCacheGroupAllocator>> paged_cache_allocators_;

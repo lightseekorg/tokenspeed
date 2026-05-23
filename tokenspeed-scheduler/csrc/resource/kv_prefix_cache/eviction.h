@@ -33,6 +33,16 @@
 namespace tokenspeed {
 
 template <ResourceType RType>
+inline bool HasResource(const TreeNode* node) {
+    if (node == nullptr) return false;
+    if constexpr (RType == ResourceType::Device) {
+        return node->OnDevice();
+    } else {
+        return node->OnHost();
+    }
+}
+
+template <ResourceType RType>
 inline bool HasChildWithPages(const TreeNode* node) {
     for (const auto& [_, child] : node->Children()) {
         if (child == nullptr) continue;
@@ -62,16 +72,30 @@ inline bool IsLeaf(const TreeNode* node) {
 }
 
 template <ResourceType RType>
-void ResourceManager<RType>::updateLeaf(TreeNode* node) {
+void ResourceManager<RType>::removeLeaf(TreeNode* node) {
     if (node == nullptr || node->IsRoot()) return;
 
-    // Remove stale entry (if any) using the stored sort key for O(1) erase.
     auto it = node_time_.find(node);
     if (it != node_time_.end()) {
         lru_leaves_.erase({it->second, node});
         node_time_.erase(it);
-        GetResource<RType>(node).ClearEvictableNotifier();
+        if (HasResource<RType>(node)) {
+            GetResource<RType>(node).ClearEvictableNotifier();
+        }
     }
+}
+
+template <ResourceType RType>
+void ResourceManager<RType>::RemoveLeaf(TreeNode* node) {
+    removeLeaf(node);
+}
+
+template <ResourceType RType>
+void ResourceManager<RType>::updateLeaf(TreeNode* node) {
+    if (node == nullptr || node->IsRoot()) return;
+
+    // Remove stale entry (if any) using the stored sort key for O(1) erase.
+    removeLeaf(node);
 
     if (IsLeaf<RType>(node)) {
         auto ts = node->Time();

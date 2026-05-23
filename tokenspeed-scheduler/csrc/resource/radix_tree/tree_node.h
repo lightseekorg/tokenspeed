@@ -103,9 +103,13 @@ public:
     const HostResource& Host() const { return *host_resource_; }
 
     bool HasMamba() const { return mamba_slot_ != nullptr; }
+    bool HasMambaOnHost() const { return mamba_host_slot_ != nullptr; }
     std::int32_t MambaSlotIndex() const;
+    std::int32_t MambaHostSlotIndex() const;
     void AttachMamba(std::unique_ptr<MambaSlot> slot) { mamba_slot_ = std::move(slot); }
+    void AttachMambaHost(std::unique_ptr<MambaSlot> slot) { mamba_host_slot_ = std::move(slot); }
     std::unique_ptr<MambaSlot> DetachMamba() { return std::move(mamba_slot_); }
+    std::unique_ptr<MambaSlot> DetachMambaHost() { return std::move(mamba_host_slot_); }
 
     // Paged-cache snapshot adjunct. Completeness is now per-family on the
     // snapshot itself (see `PagedCacheSnapshot::IsCompleteFor`).
@@ -143,6 +147,7 @@ private:
     std::unique_ptr<DeviceResource> device_resource_{};
     std::unique_ptr<HostResource> host_resource_{};
     std::unique_ptr<MambaSlot> mamba_slot_{};
+    std::unique_ptr<MambaSlot> mamba_host_slot_{};
     std::unique_ptr<PagedCacheSnapshot> paged_cache_snapshot_{};
 };
 

@@ -104,6 +104,8 @@ struct SchedulerConfig {
     bool enable_mamba{false};
     std::int32_t mamba_cache_chunk_size{64};
     std::int32_t mamba_pool_total_chunks{0};
+    bool enable_mamba_l2{false};
+    std::int32_t mamba_l2_host_slots{0};
 };
 
 }  // namespace tokenspeed
