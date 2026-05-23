@@ -61,13 +61,4 @@ class ForwardContext:
     keep_full_logits: bool = False
     last_index_offsets: torch.Tensor | None = None
 
-    # --- Batch-DP spec-verify sampling ---
-    # Per-bucket toggle set at CUDA-graph capture time (M5). When True, the
-    # logits processor + sampler take the all_to_all_single batch-shard path
-    # (see bench/dp_sampling_flow.html and
-    # .skills/validate-collective-refactor/SKILL.md); when False the legacy
-    # vocab-all_gather + redundant-sampling path runs unchanged. The padded
-    # batch size and per-request draft count are both derived (pad_bs from
-    # bs + tp_size, N from input_num_tokens // bs), so this is the only flag
-    # the caller needs to set.
     dp_sampling: bool = False

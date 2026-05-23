@@ -1,19 +1,4 @@
-"""Tests for tokenspeed.runtime.distributed.dp_sampling_swap.
-
-Spawns real NCCL workers and verifies that ``swap_batch_vocab`` re-shards
-logits exactly the way the Batch-DP spec-sampling pipeline expects:
-
-  rank r before: [pad_bs * N, V/TP]  -- vocab cols [r*V/TP, (r+1)*V/TP)
-  rank r after : [K_req * N,  V]     -- request rows [r*K_req, (r+1)*K_req)
-
-The ground-truth tensor for the test is a globally-ordered ``arange`` so
-every cell encodes (global request, draft position, vocab column); after
-the swap each rank's output must equal the matching slice of that
-ground-truth tensor.
-
-Usage:
-    python -m pytest test/runtime/distributed/test_dp_sampling_swap.py -v
-"""
+"""Tests for ``swap_batch_vocab``."""
 
 import socket
 
@@ -72,14 +57,7 @@ def _run(world_size, test_fn, **args):
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-# ---------------------------------------------------------------------------
-# Worker test bodies
-# ---------------------------------------------------------------------------
-
-
 def _ground_truth_full(pad_bs: int, n: int, vocab: int, *, dtype, device):
-    """[pad_bs * N, V] where cell (i, v) = i * V + v (compact globally-unique
-    ids). Each rank then takes a vocab-column slice as its local_logits."""
     return torch.arange(pad_bs * n * vocab, dtype=dtype, device=device).view(
         pad_bs * n, vocab
     )
@@ -92,12 +70,10 @@ def _test_swap_matches_reference(
 
     tp = world_size
     v_local = vocab // tp
-    k_req = pad_bs // tp
+    reqs_per_rank = pad_bs // tp
 
     full = _ground_truth_full(pad_bs, n, vocab, dtype=dtype, device=device)
 
-    # rank r owns vocab cols [r*v_local, (r+1)*v_local) — exactly today's
-    # vocab-parallel LM head shard layout.
     local_logits = full[:, rank * v_local : (rank + 1) * v_local].contiguous()
 
     out = swap_batch_vocab(
@@ -110,7 +86,7 @@ def _test_swap_matches_reference(
         group=group,
     )
 
-    expected = full[rank * k_req * n : (rank + 1) * k_req * n].contiguous()
+    expected = full[rank * reqs_per_rank * n : (rank + 1) * reqs_per_rank * n].contiguous()
     assert tuple(out.shape) == tuple(
         expected.shape
     ), f"shape mismatch: got {tuple(out.shape)} expected {tuple(expected.shape)}"
@@ -120,20 +96,12 @@ def _test_swap_matches_reference(
 def _test_swap_chain_safety(
     rank, world_size, device, group, *, pad_bs, n, vocab, dtype
 ):
-    """Per-request N rows must end up on the same rank, in order. We tag
-    each cell with (global_req, draft_pos) and verify rank r's output owns
-    exactly requests [r*K_req, (r+1)*K_req) with draft positions 0..N-1
-    contiguous per request.
-    """
     from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
 
     tp = world_size
     v_local = vocab // tp
-    k_req = pad_bs // tp
+    reqs_per_rank = pad_bs // tp
 
-    # cell value = global_req * 10_000 + draft_pos * 100 + vocab_col.
-    # 10_000 is well above any (n * 100 + vocab_col) at the sizes we test,
-    # so collisions are impossible.
     full = torch.empty(pad_bs * n, vocab, dtype=dtype, device=device)
     for req in range(pad_bs):
         for d in range(n):
@@ -151,30 +119,23 @@ def _test_swap_chain_safety(
         group=group,
     )
 
-    for r_local in range(k_req):
-        global_req = rank * k_req + r_local
+    for local_req in range(reqs_per_rank):
+        global_req = rank * reqs_per_rank + local_req
         for d in range(n):
-            row = out[r_local * n + d]
-            expected_first = global_req * 10_000 + d * 100  # vocab_col == 0
+            row = out[local_req * n + d]
+            expected_first = global_req * 10_000 + d * 100
             assert int(row[0].item()) == expected_first, (
-                f"rank={rank} r_local={r_local} d={d} got row[0]={int(row[0].item())}"
+                f"rank={rank} local_req={local_req} d={d} got row[0]={int(row[0].item())}"
                 f" expected {expected_first}"
             )
-            # Last vocab col should differ by (vocab-1) from the first.
             assert int(row[-1].item()) == expected_first + (vocab - 1)
 
-
-# ---------------------------------------------------------------------------
-# Public test cases
-# ---------------------------------------------------------------------------
 
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
     pytest.param(4, id="tp4"),
 ]
 
-# (pad_bs, N, vocab) — all chosen so pad_bs is divisible by every world_size
-# in WORLD_SIZES and vocab stays small for runtime budget.
 SHAPES = [
     pytest.param(8, 1, 64, id="sample_pad_bs8"),
     pytest.param(8, 4, 64, id="spec_pad_bs8_n4"),

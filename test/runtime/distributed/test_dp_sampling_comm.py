@@ -1,28 +1,4 @@
-"""Tests for tokenspeed.runtime.distributed.dp_sampling_comm.
-
-Validates ``DpSamplingComm`` end-to-end across real multi-rank NCCL workers.
-Three properties are tested per worker:
-
-  1. Stage-4 swap matches the standalone ``swap_batch_vocab`` helper
-     bit-for-bit (parity between the class API and the existing free
-     function -- so production callers can migrate without behavior
-     change).
-
-  2. Stage-6 ``gather_verify_outputs`` returns the global concatenation
-     of per-rank inputs in source-rank order, exactly as 3 separate
-     ``all_gather_into_tensor`` calls would.
-
-  3. Full swap + sample-stub + gather cycle captures cleanly into
-     ``torch.cuda.graph()`` and is bit-identical on replay -- the
-     decode-loop graph-safety guarantee.
-
-The fast-path (``backend="onesided"``) is exercised when the local
-PyTorch/platform combo supports symmetric memory; otherwise those cases
-skip cleanly and NCCL remains the reference path.
-
-Usage:
-    python -m pytest test/runtime/distributed/test_dp_sampling_comm.py -v
-"""
+"""Tests for ``DpSamplingComm``."""
 
 import socket
 
@@ -30,11 +6,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
-
-# ---------------------------------------------------------------------------
-# Multi-rank harness (mirrors test_dp_sampling_swap.py)
-# ---------------------------------------------------------------------------
 
 
 def _get_open_port() -> int:
@@ -86,11 +57,6 @@ def _run(world_size, test_fn, **args):
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-# ---------------------------------------------------------------------------
-# Fixtures shared across tests
-# ---------------------------------------------------------------------------
-
-
 def _onesided_available_for_test(group) -> bool:
     try:
         from tokenspeed.runtime.distributed.dp_sampling_comm import _onesided_available
@@ -116,21 +82,14 @@ def _build_comm(rank, world_size, group, *, pad_bs, n, vocab, dtype, backend):
 
 
 def _ground_truth_full_logits(pad_bs, n, vocab, *, dtype, device):
-    """[pad_bs * N, V] arange tensor; each cell is globally-unique."""
     return torch.arange(pad_bs * n * vocab, dtype=dtype, device=device).view(
         pad_bs * n, vocab
     )
 
 
-# ---------------------------------------------------------------------------
-# Worker test bodies
-# ---------------------------------------------------------------------------
-
-
 def _test_swap_parity_with_free_function(
     rank, world_size, device, group, *, pad_bs, n, vocab, dtype, backend
 ):
-    """Stage 4 via DpSamplingComm == stage 4 via the standalone helper."""
     from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
 
     tp = world_size
@@ -171,9 +130,8 @@ def _test_swap_parity_with_free_function(
 def _test_gather_verify_outputs_correctness(
     rank, world_size, device, group, *, pad_bs, n, backend
 ):
-    """Stage 6: 3 per-rank tensors -> contiguous full-batch concatenation."""
     tp = world_size
-    k_req = pad_bs // tp
+    reqs_per_rank = pad_bs // tp
 
     comm = _build_comm(
         rank,
@@ -187,11 +145,11 @@ def _test_gather_verify_outputs_correctness(
     )
 
     predict_local = torch.arange(
-        rank * k_req * n, (rank + 1) * k_req * n, dtype=torch.int32, device=device
-    ).view(k_req, n)
+        rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n, dtype=torch.int32, device=device
+    ).view(reqs_per_rank, n)
     accept_index_local = (predict_local * 2 + 1).contiguous()
     accept_length_local = torch.arange(
-        rank * k_req, (rank + 1) * k_req, dtype=torch.int32, device=device
+        rank * reqs_per_rank, (rank + 1) * reqs_per_rank, dtype=torch.int32, device=device
     )
 
     predict_full, accept_index_full, accept_length_full = comm.gather_verify_outputs(
@@ -215,12 +173,8 @@ def _test_gather_verify_outputs_correctness(
 def _test_gather_persistent_buffer_reuse(
     rank, world_size, device, group, *, pad_bs, n, backend
 ):
-    """Stage 6 returns aliases into persistent storage -- repeated calls
-    must reuse the same underlying storage so the buffer addresses stay
-    stable across captured-graph replays.
-    """
     tp = world_size
-    k_req = pad_bs // tp
+    reqs_per_rank = pad_bs // tp
 
     comm = _build_comm(
         rank,
@@ -233,9 +187,9 @@ def _test_gather_persistent_buffer_reuse(
         backend=backend,
     )
 
-    predict_local = torch.zeros(k_req, n, dtype=torch.int32, device=device)
-    accept_index_local = torch.zeros(k_req, n, dtype=torch.int32, device=device)
-    accept_length_local = torch.zeros(k_req, dtype=torch.int32, device=device)
+    predict_local = torch.zeros(reqs_per_rank, n, dtype=torch.int32, device=device)
+    accept_index_local = torch.zeros(reqs_per_rank, n, dtype=torch.int32, device=device)
+    accept_length_local = torch.zeros(reqs_per_rank, dtype=torch.int32, device=device)
 
     p1, ai1, al1 = comm.gather_verify_outputs(
         predict_local, accept_index_local, accept_length_local, pad_bs=pad_bs
@@ -244,8 +198,6 @@ def _test_gather_persistent_buffer_reuse(
         predict_local, accept_index_local, accept_length_local, pad_bs=pad_bs
     )
 
-    # ``data_ptr()`` equality proves both outputs alias the same persistent
-    # tensor -- the property a CUDA graph relies on across replays.
     assert p1.data_ptr() == p2.data_ptr()
     assert ai1.data_ptr() == ai2.data_ptr()
     assert al1.data_ptr() == al2.data_ptr()
@@ -254,13 +206,8 @@ def _test_gather_persistent_buffer_reuse(
 def _test_swap_and_gather_cuda_graph_replay(
     rank, world_size, device, group, *, pad_bs, n, vocab, backend
 ):
-    """The graph-safety contract: capture one (swap + sample-stub +
-    gather) pass into ``torch.cuda.graph()`` then replay N times with
-    different input values. Every replay must produce bit-identical
-    output to a non-graphed reference run.
-    """
     tp = world_size
-    k_req = pad_bs // tp
+    reqs_per_rank = pad_bs // tp
     v_local = vocab // tp
 
     comm = _build_comm(
@@ -274,13 +221,12 @@ def _test_swap_and_gather_cuda_graph_replay(
         backend=backend,
     )
 
-    # Persistent input buffers -- the addresses captured by the graph.
     local_logits_buf = torch.empty(
         pad_bs * n, v_local, dtype=torch.float32, device=device
     )
-    predict_local_buf = torch.empty(k_req, n, dtype=torch.int32, device=device)
-    accept_index_local_buf = torch.empty(k_req, n, dtype=torch.int32, device=device)
-    accept_length_local_buf = torch.empty(k_req, dtype=torch.int32, device=device)
+    predict_local_buf = torch.empty(reqs_per_rank, n, dtype=torch.int32, device=device)
+    accept_index_local_buf = torch.empty(reqs_per_rank, n, dtype=torch.int32, device=device)
+    accept_length_local_buf = torch.empty(reqs_per_rank, dtype=torch.int32, device=device)
 
     def _fill_inputs(step: int):
         full = _ground_truth_full_logits(
@@ -290,18 +236,16 @@ def _test_swap_and_gather_cuda_graph_replay(
         local_logits_buf.copy_(
             full[:, rank * v_local : (rank + 1) * v_local].contiguous()
         )
-        # The "sampled" outputs are derived deterministically from the step
-        # so we can verify graph replay didn't capture stale values.
         predict_local_buf.copy_(
             torch.arange(
-                rank * k_req * n, (rank + 1) * k_req * n,
+                rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n,
                 dtype=torch.int32, device=device,
-            ).view(k_req, n) + step
+            ).view(reqs_per_rank, n) + step
         )
         accept_index_local_buf.copy_(predict_local_buf * 2)
         accept_length_local_buf.copy_(
             torch.arange(
-                rank * k_req, (rank + 1) * k_req,
+                rank * reqs_per_rank, (rank + 1) * reqs_per_rank,
                 dtype=torch.int32, device=device,
             ) + step
         )
@@ -316,7 +260,6 @@ def _test_swap_and_gather_cuda_graph_replay(
         )
         return swapped, p, ai, al
 
-    # Warm NCCL on a side stream so allocator state is stable, then capture.
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -334,8 +277,6 @@ def _test_swap_and_gather_cuda_graph_replay(
     torch.cuda.synchronize(device)
     dist.barrier()
 
-    # Replay 5 times with different input values; compare against a fresh
-    # non-graphed run with the same inputs.
     for step in range(1, 6):
         _fill_inputs(step=step)
         graph.replay()
@@ -359,12 +300,6 @@ def _test_swap_and_gather_cuda_graph_replay(
 
 
 class _CountingNcclBackend:
-    """Thin wrapper around the global comm backend that counts how many
-    ``all_gather_into_tensor`` calls land on it. Used by Phase B to prove
-    the packed-payload NCCL gather collapses three back-to-back gathers
-    into exactly one collective launch.
-    """
-
     def __init__(self, inner):
         self._inner = inner
         self.all_gather_calls = 0
@@ -380,7 +315,6 @@ class _CountingNcclBackend:
 def _test_nccl_single_allgather(
     rank, world_size, device, group, *, pad_bs, n
 ):
-    """Phase B: NCCL ``gather_verify_outputs`` issues exactly one collective."""
     from tokenspeed.runtime.distributed.comm_backend import get_global_backend
     from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 
@@ -399,13 +333,13 @@ def _test_nccl_single_allgather(
     )
 
     tp = world_size
-    k_req = pad_bs // tp
+    reqs_per_rank = pad_bs // tp
     predict_local = torch.arange(
-        rank * k_req * n, (rank + 1) * k_req * n, dtype=torch.int32, device=device
-    ).view(k_req, n)
+        rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n, dtype=torch.int32, device=device
+    ).view(reqs_per_rank, n)
     accept_index_local = (predict_local * 5 + 3).contiguous()
     accept_length_local = torch.arange(
-        rank * k_req, (rank + 1) * k_req, dtype=torch.int32, device=device
+        rank * reqs_per_rank, (rank + 1) * reqs_per_rank, dtype=torch.int32, device=device
     )
 
     predict_full, accept_index_full, accept_length_full = comm.gather_verify_outputs(
@@ -436,7 +370,7 @@ def _test_onesided_matches_nccl(
 ):
     tp = world_size
     v_local = vocab // tp
-    k_req = pad_bs // tp
+    reqs_per_rank = pad_bs // tp
 
     full = _ground_truth_full_logits(pad_bs, n, vocab, dtype=dtype, device=device)
     local_logits = full[:, rank * v_local : (rank + 1) * v_local].contiguous()
@@ -468,11 +402,11 @@ def _test_onesided_matches_nccl(
     )
 
     predict_local = torch.arange(
-        rank * k_req * n, (rank + 1) * k_req * n, dtype=torch.int32, device=device
-    ).view(k_req, n)
+        rank * reqs_per_rank * n, (rank + 1) * reqs_per_rank * n, dtype=torch.int32, device=device
+    ).view(reqs_per_rank, n)
     accept_index_local = (predict_local * 3 + 7).contiguous()
     accept_length_local = torch.arange(
-        rank * k_req, (rank + 1) * k_req, dtype=torch.int32, device=device
+        rank * reqs_per_rank, (rank + 1) * reqs_per_rank, dtype=torch.int32, device=device
     )
 
     onesided_outputs = onesided_comm.gather_verify_outputs(
@@ -484,10 +418,6 @@ def _test_onesided_matches_nccl(
     for actual, expected in zip(onesided_outputs, nccl_outputs, strict=True):
         torch.testing.assert_close(actual, expected)
 
-
-# ---------------------------------------------------------------------------
-# Public test cases
-# ---------------------------------------------------------------------------
 
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
@@ -588,10 +518,6 @@ class TestDpSamplingComm:
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     @pytest.mark.parametrize("pad_bs,n", [(8, 1), (8, 4), (12, 3)])
     def test_nccl_single_allgather(self, world_size, pad_bs, n):
-        """Phase B: NCCL ``gather_verify_outputs`` packs three int32
-        payloads into one buffer so the collective count drops from
-        three back-to-back ``all_gather_into_tensor`` calls to one.
-        """
         if pad_bs % world_size != 0:
             pytest.skip("pad_bs not divisible by tp")
         _run(

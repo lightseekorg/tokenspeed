@@ -57,6 +57,21 @@ logger = get_colorful_logger(__name__)
 _is_capture_mode = False
 
 
+def should_use_dp_sampling_for_bucket(
+    *,
+    dp_sampling_enabled: bool,
+    forward_mode: ForwardMode | None,
+    effective_bs: int,
+    min_bs: int,
+) -> bool:
+    return (
+        dp_sampling_enabled
+        and forward_mode is not None
+        and forward_mode.is_decode()
+        and effective_bs >= min_bs
+    )
+
+
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
 
@@ -195,6 +210,7 @@ class CudaGraphWrapper:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
         dp_sampling_enabled: bool = False,
+        dp_sampling_min_bs: int = 1,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -208,6 +224,7 @@ class CudaGraphWrapper:
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
         self.dp_sampling_enabled = dp_sampling_enabled
+        self.dp_sampling_min_bs = max(1, int(dp_sampling_min_bs))
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -295,6 +312,7 @@ class CudaGraphWrapper:
 
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
+        dp_sampling = self._dp_sampling_for_effective_bs(bs, ForwardMode.DECODE)
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -309,7 +327,7 @@ class CudaGraphWrapper:
                 else CaptureHiddenMode.NULL
             ),
             keep_full_logits=True,
-            dp_sampling=self.dp_sampling_enabled,
+            dp_sampling=dp_sampling,
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -334,7 +352,7 @@ class CudaGraphWrapper:
             is_all_greedy=False,
             vocab_size=self.vocab_size,
             device=self.device,
-            dp_sampling=self.dp_sampling_enabled,
+            dp_sampling=dp_sampling,
         )
 
         from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -663,6 +681,25 @@ class CudaGraphWrapper:
         max_num_tokens = max(ctx.global_num_tokens)
         return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
 
+    def _dp_sampling_for_effective_bs(
+        self, effective_bs: int, forward_mode: ForwardMode | None
+    ) -> bool:
+        return should_use_dp_sampling_for_bucket(
+            dp_sampling_enabled=self.dp_sampling_enabled,
+            forward_mode=forward_mode,
+            effective_bs=effective_bs,
+            min_bs=self.dp_sampling_min_bs,
+        )
+
+    def dp_sampling_route(self, bs: int, ctx: ForwardContext) -> tuple[bool, bool, int]:
+        use_graph = self._can_use_graph(bs, ctx)
+        effective_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        return (
+            self._dp_sampling_for_effective_bs(effective_bs, ctx.forward_mode),
+            use_graph,
+            effective_bs,
+        )
+
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
@@ -766,6 +803,14 @@ class CudaGraphWrapper:
             mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
         if use_graph:
+            expected_dp_sampling = self._dp_sampling_for_effective_bs(
+                padded_bs, ctx.forward_mode
+            )
+            assert ctx.dp_sampling == expected_dp_sampling, (
+                f"ctx.dp_sampling={ctx.dp_sampling} does not match captured "
+                f"bucket policy for bs={bs}, padded_bs={padded_bs}, "
+                f"min_bs={self.dp_sampling_min_bs}"
+            )
             if (
                 bs == 0
                 and paged_cache_block_tables is None

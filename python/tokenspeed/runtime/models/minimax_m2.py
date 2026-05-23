@@ -824,7 +824,13 @@ class MiniMaxM2ForCausalLM(BaseCausalLM):
     def resolve_logits_processor(self, config):
 
         if self.mapping.attn.has_dp:
-            return LogitsProcessor(config, skip_all_gather=True)
+            return LogitsProcessor(
+                config,
+                skip_all_gather=True,
+                tp_rank=self.mapping.attn.tp_rank,
+                tp_size=self.mapping.attn.tp_size,
+                tp_group=self.mapping.attn.tp_group,
+            )
 
         return LogitsProcessor(
             config,

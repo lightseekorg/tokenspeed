@@ -190,7 +190,13 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 bias=False,
             )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
+            self.logits_processor = LogitsProcessor(
+                config,
+                skip_all_gather=True,
+                tp_rank=self.mapping.attn.tp_rank,
+                tp_size=self.mapping.attn.tp_size,
+                tp_group=self.mapping.attn.tp_group,
+            )
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,

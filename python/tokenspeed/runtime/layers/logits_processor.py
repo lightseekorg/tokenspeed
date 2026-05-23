@@ -110,9 +110,6 @@ class LogitsMetadata:
     padded_static_len: int = -1
     last_index_offsets: torch.Tensor | None = None
 
-    # Batch-DP spec-verify sampling toggle. When True the logits processor
-    # takes the all_to_all_single batch-shard path (M3); N is read from the
-    # owning LogitsProcessor instance, not from this metadata.
     dp_sampling: bool = False
 
     @classmethod
@@ -195,13 +192,7 @@ class LogitsProcessor(nn.Module):
         self.dp_sampling_enabled = dp_sampling_enabled
         self.dp_num_tokens_per_req = dp_num_tokens_per_req
         self.logit_scale = logit_scale
-        # Optional DpSamplingComm injected by ModelExecutor when M4.6+ is
-        # active. When set, `_dp_swap_batch_vocab` dispatches through it
-        # (which picks NCCL or onesided per resolved backend) instead of
-        # calling the raw NCCL `swap_batch_vocab` helper directly. We
-        # forward-declare the type as Any to avoid the runtime-level
-        # import in a layer module.
-        self._dp_comm = None  # type: ignore[assignment]
+        self._dp_comm = None
 
         if tp_rank is None:
             assert tp_size is None
@@ -212,15 +203,6 @@ class LogitsProcessor(nn.Module):
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
 
         if dp_sampling_enabled:
-            # dp_sampling is orthogonal to skip_all_gather:
-            #   skip_all_gather=False: vocab-sharded LM head -> swap_batch_vocab
-            #                          gathers V and shards the batch in one a2a.
-            #   skip_all_gather=True : replicated LM head     -> pre-slice the
-            #                          batch on hidden_states so the LM head
-            #                          matmul runs only on this rank's K_req*N
-            #                          rows. No comm at the LM-head boundary.
-            # Both paths produce the same per-rank shape [K_req*N, V] and feed
-            # the same DP-aware sampler that gathers tokens at the end.
             assert (
                 tp_size > 1 and tp_group is not None
             ), "dp_sampling requires tp_size > 1 and a real tp_group"
@@ -421,23 +403,11 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         dp_sampling = logits_metadata.dp_sampling
-        # Cross-check the per-batch toggle against the install-time config.
-        # Catches mis-routes early: e.g. a caller flipping ctx.dp_sampling=True
-        # on a model whose LogitsProcessor was constructed without
-        # dp_sampling_enabled (no tp_group wired, GGUF lm_head, etc.).
         assert (not dp_sampling) or self.dp_sampling_enabled, (
             "logits_metadata.dp_sampling=True but LogitsProcessor was not "
             "built with dp_sampling_enabled=True"
         )
 
-        # Pre-matmul batch slice: replicated LM head + DP sampling.
-        # When the LM head is replicated across TP (skip_all_gather=True),
-        # the matmul has no per-rank vocab dependency, so we can shard the
-        # batch dimension *before* the matmul and save (TP-1)/TP of the
-        # LM-head FLOPs in addition to the redundant-sampling savings.
-        # Pre-slice fires only when dp_sampling is on AND the LM head is
-        # replicated; the vocab-sharded path takes its own swap_batch_vocab
-        # branch below.
         if dp_sampling and self.skip_all_gather:
             assert hasattr(lm_head, "weight"), (
                 "skip_all_gather+dp_sampling requires a standard LM head with "
@@ -450,19 +420,17 @@ class LogitsProcessor(nn.Module):
             ), f"hidden_states have {rows} rows, not divisible by N={n}"
             bs = rows // n
             pad_bs = ((bs + self.tp_size - 1) // self.tp_size) * self.tp_size
-            k_req = pad_bs // self.tp_size
+            reqs_per_rank = pad_bs // self.tp_size
             pad_rows = (pad_bs - bs) * n
             if pad_rows > 0:
                 hidden_states = torch.nn.functional.pad(
                     hidden_states, (0, 0, 0, pad_rows)
                 )
-            start = self.tp_rank * k_req * n
-            hidden_states = hidden_states[start : start + k_req * n]
+            start = self.tp_rank * reqs_per_rank * n
+            hidden_states = hidden_states[start : start + reqs_per_rank * n]
 
         if hasattr(lm_head, "weight"):
             if self._use_fused_lm_head:
-                # TODO(ywang): verify the fused kernel is correct on the
-                # batch-DP path; currently used identically to legacy.
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(
@@ -476,9 +444,6 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if dp_sampling and not self.skip_all_gather:
-            # Vocab-sharded LM head + DP sampling: each rank produced
-            # [bs*N, V/TP] and we need [K_req*N, V_padded]. swap_batch_vocab
-            # fuses the vocab gather and the batch shard into one a2a.
             assert hasattr(lm_head, "weight"), (
                 "dp_sampling requires a standard LM head with .weight; "
                 "GGUF linear_method is not supported on this path"
@@ -495,10 +460,6 @@ class LogitsProcessor(nn.Module):
                 logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_rows))
             v_padded = logits.shape[1] * self.tp_size
             if self._dp_comm is not None:
-                # M4.7: DpSamplingComm owns the resolved backend. The
-                # onesided swap uses a store-only kernel followed by a
-                # single cross-rank barrier, avoiding the old per-CTA
-                # barrier cost and the NCCL helper's permute-copy tail.
                 logits = self._dp_comm.swap_batch_vocab(logits, pad_bs=pad_bs)
             else:
                 logits = swap_batch_vocab(
@@ -509,9 +470,8 @@ class LogitsProcessor(nn.Module):
                     vocab_size=v_padded,
                     rank=self.tp_rank,
                     group=self.tp_group,
-                )  # (req * N, V_padded)
+                )
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
-            # Legacy: gather full vocab on the full batch, sample redundantly.
             gathered_logits = torch.empty(
                 self.tp_size * logits.size(0),
                 logits.size(1),

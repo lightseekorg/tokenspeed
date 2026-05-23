@@ -18,40 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Persistent comm context for the Batch-DP spec-sampling pipeline.
+"""Communication helper for Batch-DP speculative verify.
 
-See ``bench/dp_sampling_flow.html`` for the end-to-end shape flow and
-``.skills/validate-collective-refactor/SKILL.md`` for the design rationale.
+Here N is num_tokens_per_req, V is vocab_size, V/TP is the local vocab
+shard, and reqs_per_rank=pad_bs/TP.
 
-This module owns the two cross-rank collective stages of DP sampling:
+swap_batch_vocab maps each rank's full-batch vocab shard
+[pad_bs * N, V/TP] to its request shard with full vocab [reqs_per_rank * N, V].
 
-  * Stage 4 -- ``swap_batch_vocab``: ``[pad_bs * N, V/TP]`` (full batch,
-    my vocab shard)  ->  ``[K_req * N, V]`` (my K_req requests, all
-    vocab). The N draft positions of a single request always stay on
-    the same rank so ``chain_speculative_sampling_target_only`` can
-    walk N causally without cross-rank synchronization.
-
-  * Stage 6 -- ``gather_verify_outputs``: three per-rank tensors
-    ``predict[K_req, N]``, ``accept_index[K_req, N]``,
-    ``accept_length[K_req]`` get gathered back to the full
-    ``[pad_bs, N]`` / ``[pad_bs]`` shape on every rank. Real requests
-    occupy the ``[0:bs]`` prefix; phantom requests in
-    ``[bs:pad_bs]`` are never read downstream.
-
-Two implementations live behind a single API:
-
-  * ``backend="nccl"``: plain ``all_to_all_single`` + 3
-    ``all_gather_into_tensor``. Safe everywhere, used for parity
-    testing.
-
-  * ``backend="onesided"``: NVLinkOneSided-style symmetric-memory put
-    + flag-based release/acquire barrier. Lower launch overhead, no
-    permute+contiguous on the recv path, can fold the three gathers
-    into one kernel. Intra-NVLink-domain only. Construct **before**
-    any CUDA graph capture; per-step ops are pure kernel launches and
-    capture cleanly.
-
-Environment override: ``TOKENSPEED_DP_SAMPLING_BACKEND={auto,nccl,onesided}``.
+gather_verify_outputs maps per-rank verify outputs
+predict_local[reqs_per_rank, N], accept_index_local[reqs_per_rank, N], and
+accept_length_local[reqs_per_rank] to persistent full-batch buffers
+predict_full[pad_bs, N], accept_index_full[pad_bs, N], and
+accept_length_full[pad_bs].
 """
 
 from __future__ import annotations
@@ -92,12 +71,6 @@ def _env_override() -> DpSamplingBackend | None:
 
 
 def _onesided_available(group: Group) -> bool:
-    """Capability probe for the one-sided NVLink fast path.
-
-    The fast path needs PyTorch symmetric memory and NVIDIA peer access.
-    Any probe failure falls back to NCCL instead of making backend="auto"
-    brittle across CI and older PyTorch wheels.
-    """
     if len(group) <= 1:
         return False
     try:
@@ -105,11 +78,6 @@ def _onesided_available(group: Group) -> bool:
 
         if not current_platform().is_nvidia:
             return False
-        # `from ... import _symmetric_memory` binds only the leaf name as a
-        # local; an `import torch.distributed._symmetric_memory` would rebind
-        # `torch` itself to a function-local, which then breaks the
-        # `torch.__version__` access below with an UnboundLocalError that
-        # this try/except would silently swallow.
         from torch.distributed import _symmetric_memory  # noqa: F401
 
         major, minor = torch.__version__.split("+", 1)[0].split(".")[:2]
@@ -122,12 +90,6 @@ def _onesided_available(group: Group) -> bool:
 
 
 def _resolve_backend(requested: DpSamplingBackend, group: Group) -> _ResolvedBackend:
-    """Resolve ``"auto"`` against actual platform/group capability.
-
-    Env-var ``TOKENSPEED_DP_SAMPLING_BACKEND`` takes precedence over the
-    Python argument so operators can force-disable the fast path without
-    code changes.
-    """
     env = _env_override()
     if env is not None:
         requested = env
@@ -178,7 +140,7 @@ class DpSamplingComm:
         self._rank = rank
         self._group = group
         self._max_pad_bs = max_pad_bs
-        self._max_k_req = max_pad_bs // tp_size
+        self._max_reqs_per_rank = max_pad_bs // tp_size
         self._num_tokens_per_req = num_tokens_per_req
         self._vocab_size = vocab_size
         self._logits_dtype = logits_dtype
@@ -216,7 +178,7 @@ class DpSamplingComm:
 
         if self._backend == "nccl":
             self._combined_local_nccl: torch.Tensor | None = torch.empty(
-                self._max_k_req,
+                self._max_reqs_per_rank,
                 2 * n + 1,
                 dtype=torch.int32,
                 device=self._device,
@@ -234,27 +196,17 @@ class DpSamplingComm:
         if self._backend == "onesided":
             self._init_onesided()
 
-    # ------------------------------------------------------------------
-    # Introspection
-    # ------------------------------------------------------------------
-
     @property
     def backend(self) -> _ResolvedBackend:
-        """Resolved backend (``"nccl"`` or ``"onesided"``)."""
         return self._backend
 
     @property
     def fast_path_enabled(self) -> bool:
-        """True when the one-sided NVLink kernel is in use."""
         return self._backend == "onesided"
 
     @property
     def max_pad_bs(self) -> int:
         return self._max_pad_bs
-
-    # ------------------------------------------------------------------
-    # Stage 4: swap (bs <-> vocab)
-    # ------------------------------------------------------------------
 
     def swap_batch_vocab(
         self,
@@ -262,20 +214,14 @@ class DpSamplingComm:
         *,
         pad_bs: int,
     ) -> torch.Tensor:
-        """``[pad_bs * N, V/TP]`` -> ``[K_req * N, V]``.
+        """Move from vocab shards to request shards.
 
-        Rank ``r`` owns the contiguous request range
-        ``[r * K_req, (r+1) * K_req)`` after the swap. The N draft
-        positions of every request stay on the same rank so
-        ``chain_speculative_sampling_target_only`` walks N causally
-        without cross-rank synchronization.
-
-        Args:
-            local_logits: vocab-sharded logits of shape
-                ``(pad_bs * num_tokens_per_req, vocab_size // tp_size)``.
-            pad_bs: per-step padded batch size. Must be a multiple of
-                ``tp_size`` and not exceed the ``max_pad_bs`` set at
-                construction time.
+        Input on each rank is local_logits[pad_bs * N, V_local], where
+        N=num_tokens_per_req and V_local=V/TP. Output is
+        [reqs_per_rank * N, V] for this rank's reqs_per_rank=pad_bs/TP
+        requests.
+        Returned row local_req * N + d is global request
+        rank * reqs_per_rank + local_req at draft position d.
         """
         assert pad_bs <= self._max_pad_bs, (
             f"pad_bs={pad_bs} exceeds max_pad_bs={self._max_pad_bs} "
@@ -296,10 +242,6 @@ class DpSamplingComm:
             backend=self._fallback_backend,
         )
 
-    # ------------------------------------------------------------------
-    # Stage 6: gather per-rank verify outputs
-    # ------------------------------------------------------------------
-
     def gather_verify_outputs(
         self,
         predict_local: torch.Tensor,
@@ -308,41 +250,30 @@ class DpSamplingComm:
         *,
         pad_bs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather per-rank verify outputs back to the full padded batch.
+        """Gather local verify outputs into full padded-batch outputs.
 
-        Returns three tensors aliased into persistent storage:
-          * ``predict_full[pad_bs, N]``
-          * ``accept_index_full[pad_bs, N]``
-          * ``accept_length_full[pad_bs]``
-
-        Real-request results occupy the ``[0:bs]`` prefix; the caller is
-        responsible for slicing if needed. Phantom requests in
-        ``[bs:pad_bs]`` are never read downstream (see
-        ``_accumulate_counts`` contract in
-        ``bench/dp_sampling_flow.html`` stage 6).
-
-        Args:
-            predict_local: ``[K_req, N]`` int32.
-            accept_index_local: ``[K_req, N]`` int32.
-            accept_length_local: ``[K_req]`` int32.
-            pad_bs: per-step padded batch size, must equal
-                ``K_req * tp_size`` where ``K_req`` is the local shape's
-                first dim.
+        Inputs are predict_local[reqs_per_rank, N],
+        accept_index_local[reqs_per_rank, N], and
+        accept_length_local[reqs_per_rank].
+        Returns predict_full[pad_bs, N], accept_index_full[pad_bs, N], and
+        accept_length_full[pad_bs].
+        Row r from source rank src lands at src * reqs_per_rank + r.
+        Callers slice the real [0:bs] prefix and ignore phantom rows.
         """
         assert pad_bs <= self._max_pad_bs
-        k_req = pad_bs // self._tp_size
+        reqs_per_rank = pad_bs // self._tp_size
         n = self._num_tokens_per_req
 
-        assert tuple(predict_local.shape) == (k_req, n), (
-            f"predict_local shape {tuple(predict_local.shape)} != ({k_req}, {n})"
+        assert tuple(predict_local.shape) == (reqs_per_rank, n), (
+            f"predict_local shape {tuple(predict_local.shape)} != ({reqs_per_rank}, {n})"
         )
-        assert tuple(accept_index_local.shape) == (k_req, n), (
+        assert tuple(accept_index_local.shape) == (reqs_per_rank, n), (
             f"accept_index_local shape {tuple(accept_index_local.shape)} "
-            f"!= ({k_req}, {n})"
+            f"!= ({reqs_per_rank}, {n})"
         )
-        assert tuple(accept_length_local.shape) == (k_req,), (
+        assert tuple(accept_length_local.shape) == (reqs_per_rank,), (
             f"accept_length_local shape {tuple(accept_length_local.shape)} "
-            f"!= ({k_req},)"
+            f"!= ({reqs_per_rank},)"
         )
         assert predict_local.dtype == torch.int32
         assert accept_index_local.dtype == torch.int32
@@ -358,7 +289,7 @@ class DpSamplingComm:
 
         assert self._combined_local_nccl is not None
         assert self._combined_full_nccl is not None
-        combined_local = self._combined_local_nccl[:k_req]
+        combined_local = self._combined_local_nccl[:reqs_per_rank]
         combined_local[:, :n].copy_(predict_local)
         combined_local[:, n : 2 * n].copy_(accept_index_local)
         combined_local[:, 2 * n].copy_(accept_length_local)
@@ -379,16 +310,6 @@ class DpSamplingComm:
         accept_index_full.copy_(combined_full[:, n : 2 * n])
         accept_length_full.copy_(combined_full[:, 2 * n])
         return predict_full, accept_index_full, accept_length_full
-
-    # ------------------------------------------------------------------
-    # One-sided NVLink fast path
-    # ------------------------------------------------------------------
-    #
-    # The NCCL-fallback gather buffers above are intentionally separate
-    # from the symm-mem buffers owned by ``self._state``. Both expose the
-    # same [pad_bs, ...] contract to callers, but the fast path returns
-    # zero-copy views into peer-importable VMM storage.
-    # ------------------------------------------------------------------
 
     def _init_onesided(self) -> None:
         from tokenspeed.runtime.distributed.process_group_manager import (

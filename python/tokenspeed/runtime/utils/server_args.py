@@ -191,6 +191,7 @@ class ServerArgs:
     sampling_backend: str | None = None
     dp_sampling: bool = False
     dp_sampling_backend: Literal["auto", "nccl", "onesided"] = "auto"
+    dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
     mha_extend_mode: Literal["paged", "ragged"] = "paged"
@@ -1305,22 +1306,24 @@ class ServerArgs:
             "--dp-sampling",
             action="store_true",
             default=ServerArgs.dp_sampling,
-            help="Opt into the Batch-DP spec-verify sampling path. "
-            "When omitted, spec-verify uses the legacy TP all-gather "
-            "sampling path.",
+            help="Enable Batch-DP spec-verify sampling.",
         )
         parser.add_argument(
             "--dp-sampling-backend",
             type=str,
             choices=["auto", "nccl", "onesided"],
             default=ServerArgs.dp_sampling_backend,
-            help="Backend for the Batch-DP sampling pipeline's cross-rank "
-            "collectives (see bench/dp_sampling_flow.html). "
-            "'nccl': all_to_all_single + 3x all_gather_into_tensor on top of NCCL. "
-            "'onesided': symmetric-memory one-sided puts with a flag-based "
-            "release/acquire barrier (NVLinkOneSided-style), intra-NVLink-domain only. "
-            "'auto': prefer 'onesided' when supported, fall back to 'nccl'. "
-            "Override at runtime with TOKENSPEED_DP_SAMPLING_BACKEND.",
+            help="Batch-DP collective backend. 'auto' prefers one-sided "
+            "NVLink when supported and falls back to NCCL. Override with "
+            "TOKENSPEED_DP_SAMPLING_BACKEND.",
+        )
+        parser.add_argument(
+            "--dp-sampling-min-bs",
+            type=int,
+            default=ServerArgs.dp_sampling_min_bs,
+            help="Minimum effective decode batch for Batch-DP spec-verify. "
+            "Defaults to 2 * TP size. "
+            "Override at runtime with TOKENSPEED_DP_SAMPLING_MIN_BS.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",

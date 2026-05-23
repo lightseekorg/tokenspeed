@@ -103,7 +103,13 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 )
 
         if self.mapping.attn.has_dp:
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
+            self.logits_processor = LogitsProcessor(
+                config,
+                skip_all_gather=True,
+                tp_rank=self.mapping.attn.tp_rank,
+                tp_size=self.mapping.attn.tp_size,
+                tp_group=self.mapping.attn.tp_group,
+            )
         else:
             self.logits_processor = LogitsProcessor(
                 config,

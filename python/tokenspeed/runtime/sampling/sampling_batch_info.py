@@ -74,8 +74,6 @@ class SamplingBatchInfo:
     # index_select inside the captured graph.
     valid_cache_lengths: torch.Tensor | None = None
 
-    # Batch-DP spec-verify path toggle. Set by the caller per bucket;
-    # never inferred from tensor shapes. See bench/dp_sampling_flow.html.
     dp_sampling: bool = False
 
     # Device

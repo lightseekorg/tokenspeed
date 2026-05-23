@@ -18,17 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Multi-rank end-to-end correctness for the always-on DP spec-verify path
-(M4.5).
-
-Wires ``ForwardContext.dp_sampling`` through ``LogitsMetadata`` ->
-``LogitsProcessor.forward`` -> ``LogitsProcessorOutput.next_token_logits``
--> ``SamplingBatchInfo.dp_sampling`` -> ``FlashInferSamplingBackend.verify``,
-and asserts the chained output matches the legacy (full-batch, vocab
-all_gather + redundant verify) chain bit-exactly across a bucket sweep
-that includes small bs (1, 2, 4, 8, 9) -- the buckets M4.5 is
-specifically designed to land on without a threshold.
-"""
+"""End-to-end Batch-DP sampling parity test."""
 
 from __future__ import annotations
 
@@ -39,11 +29,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
-
-# ---------------------------------------------------------------------------
-# Process-group scaffolding (mirrors test_flashinfer_verify_dp.py).
-# ---------------------------------------------------------------------------
 
 
 def _get_open_port() -> int:
@@ -95,19 +80,7 @@ def _run(world_size, test_fn, **args):
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-# ---------------------------------------------------------------------------
-# Stubs: LM head + model config that LogitsProcessor expects.
-# ---------------------------------------------------------------------------
-
-
 class _StubLMHead(torch.nn.Module):
-    """Vocab-sharded LM head stub: holds [V_local, H] on each rank.
-
-    LogitsProcessor._get_logits only reads .weight and runs torch.matmul,
-    so we don't need a real ParallelLMHead -- just an nn.Module with a
-    weight attribute of the right shape and dtype.
-    """
-
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
         self.weight = weight
@@ -120,14 +93,7 @@ class _StubConfig:
     model_type: str = "test_dp_sampling_e2e"
 
 
-# ---------------------------------------------------------------------------
-# Synthetic input generation.
-# ---------------------------------------------------------------------------
-
-
 def _make_hidden_states(bs: int, n: int, hidden: int, *, dtype, device, seed: int):
-    # Same seed on every rank -> identical hidden states. The DP path
-    # shards these internally; the legacy path keeps the full tensor.
     g = torch.Generator(device=device)
     g.manual_seed(seed)
     return torch.empty(bs * n, hidden, dtype=dtype, device=device).normal_(generator=g)
@@ -160,11 +126,6 @@ def _seed_coins(backend, *, bs: int, n: int, seed: int):
     backend._final_coins_buf[:bs].uniform_(1e-6, 1.0, generator=g)
 
 
-# ---------------------------------------------------------------------------
-# Builders.
-# ---------------------------------------------------------------------------
-
-
 def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
     from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
     from tokenspeed.runtime.sampling.backends.flashinfer import (
@@ -181,9 +142,6 @@ def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
         device=device,
         random_seed=123,
         tp_group=group,
-        # Off so the legacy verify() does not broadcast, mirroring
-        # M4's test setup -- deterministic kernels + identical seeds
-        # already give cross-rank bit-equality on the legacy path.
         enable_tp_sync=False,
     )
     return FlashInferSamplingBackend(cfg)
@@ -222,11 +180,6 @@ def _build_metadata(*, dp_sampling: bool):
         capture_hidden_mode=CaptureHiddenMode.NULL,
         dp_sampling=dp_sampling,
     )
-
-
-# ---------------------------------------------------------------------------
-# Worker bodies.
-# ---------------------------------------------------------------------------
 
 
 def _test_dp_chain_matches_legacy(
@@ -276,7 +229,6 @@ def _test_dp_chain_matches_legacy(
     candidates = _make_candidates(bs, n, vocab, device=device, seed=2024)
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
 
-    # ---- Legacy path: dp_sampling=False end-to-end. -------------------
     legacy_meta = _build_metadata(dp_sampling=False)
     legacy_logits = processor._get_logits(
         hidden_states.clone(), lm_head, legacy_meta
@@ -300,14 +252,13 @@ def _test_dp_chain_matches_legacy(
     legacy_predict = legacy_predict.clone()
     legacy_accept_length = legacy_accept_length.clone()
 
-    # ---- DP path: dp_sampling=True end-to-end. ------------------------
     dp_meta = _build_metadata(dp_sampling=True)
     dp_logits = processor._get_logits(
         hidden_states.clone(), lm_head, dp_meta
     )
-    k_req = pad_bs // tp_size
-    assert dp_logits.shape == (k_req * n, vocab), (
-        f"dp logits {dp_logits.shape}, expected {(k_req*n, vocab)}"
+    reqs_per_rank = pad_bs // tp_size
+    assert dp_logits.shape == (reqs_per_rank * n, vocab), (
+        f"dp logits {dp_logits.shape}, expected {(reqs_per_rank*n, vocab)}"
     )
 
     dp_info = SamplingBatchInfo(
@@ -321,10 +272,7 @@ def _test_dp_chain_matches_legacy(
     _seed_coins(backend, bs=bs, n=n, seed=2024)
     dp_predict, dp_accept_length = backend.verify(dp_out, dp_info, candidates)
 
-    # Real rows [0:bs] must match bit-exact. Phantom rows [bs:pad_bs]
-    # are intentionally not checked -- they consume pool row 0 (neutral
-    # scalars) and discard candidate values, but their logits depend on
-    # the pad zeros so any compare there would be coincidental.
+    # Phantom rows consume neutral pool values and are not part of the result.
     torch.testing.assert_close(
         dp_predict, legacy_predict, rtol=0, atol=0,
         msg="DP predict diverged from legacy",
@@ -335,20 +283,11 @@ def _test_dp_chain_matches_legacy(
     )
 
 
-# ---------------------------------------------------------------------------
-# Public test cases.
-# ---------------------------------------------------------------------------
-
-
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
     pytest.param(4, id="tp4"),
 ]
 
-# Bucket sweep that exercises the always-on policy:
-#   bs1, bs2, bs4 -- small buckets where M4.5's "no threshold" matters.
-#   bs8         -- standard small-batch bucket.
-#   bs9         -- non-multiple-of-tp; covers the pad_bs > bs path.
 SHAPES = [
     pytest.param(1, 2, id="bs1_n2"),
     pytest.param(2, 2, id="bs2_n2"),
@@ -359,10 +298,6 @@ SHAPES = [
 
 
 class TestDPSamplingE2E:
-    """End-to-end LogitsProcessor + FlashInferSamplingBackend chain
-    with always-on DP, covering bucket sizes that the M4.5 no-threshold
-    policy explicitly turns on (bs >= 1)."""
-
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     @pytest.mark.parametrize("bs,n", SHAPES)
     def test_stochastic(self, world_size, bs, n):

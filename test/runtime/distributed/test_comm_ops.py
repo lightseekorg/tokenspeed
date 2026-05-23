@@ -168,7 +168,6 @@ def _test_all_to_all_single(rank, world_size, device, group, ref_group):
             all_to_all_single(output, inp, rank, group)
             torch.testing.assert_close(output, expected)
 
-    # 2D: even split along dim 0, full rows traverse the a2a together.
     for dtype in DTYPES:
         rows_per_rank = 4
         total_rows = rows_per_rank * world_size

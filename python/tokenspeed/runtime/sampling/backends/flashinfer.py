@@ -108,8 +108,6 @@ class FlashInferSamplingBackend(SamplingBackend):
         fused_topk_topp_prepare(config.device)
 
     def _init_dp_geometry(self, config: SamplingBackendConfig) -> None:
-        # DP sampling needs the TP group unconditionally (verify contract),
-        # not gated on enable_tp_sync like maybe_broadcast.
         tp_group = config.tp_group
         tp_size = len(tp_group) if tp_group is not None else 1
 
@@ -123,15 +121,13 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._dp_max_pad_bs = (
                 (config.max_bs + tp_size - 1) // tp_size
             ) * tp_size
-            self._dp_max_k_req = self._dp_max_pad_bs // tp_size
+            self._dp_max_reqs_per_rank = self._dp_max_pad_bs // tp_size
 
             from tokenspeed.runtime.distributed.process_group_manager import (
                 process_group_manager as pg_manager,
             )
 
             self._dp_pg = pg_manager.get_process_group("nccl", tp_group)
-            # Use the resolved PG's rank, not tp_group.index(global_rank),
-            # so we don't assume the caller's PG layout matches global rank order.
             import torch.distributed as dist
 
             self._dp_rank = dist.get_rank(group=self._dp_pg)
@@ -152,7 +148,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
         else:
             self._dp_max_pad_bs = config.max_bs
-            self._dp_max_k_req = config.max_bs
+            self._dp_max_reqs_per_rank = config.max_bs
 
     def _init_pool_scalars(self, config: SamplingBackendConfig) -> None:
         # Capture warm-up reads row 0 with req_pool_indices zeroed, so row 0
@@ -203,15 +199,19 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     def _init_shared_buffers(self, config: SamplingBackendConfig) -> None:
 
+        max_pad_bs = self._dp_max_pad_bs
+        max_n = config.max_draft_tokens_per_req
+        max_reqs_per_rank = self._dp_max_reqs_per_rank
+
         # Persistent coin buffers. Filled per-request in prepare() outside the
-        # _dp_max_pad_bs can go over max_bs
+        # CUDA graph so verify() only reads from them.
         self._coins_buf = torch.zeros(
-            (self._dp_max_pad_bs, config.max_draft_tokens_per_req),
+            (max_pad_bs, max_n),
             dtype=torch.float32,
             device=config.device,
         )
         self._final_coins_buf = torch.zeros(
-            (self._dp_max_pad_bs,), dtype=torch.float32, device=config.device
+            (max_pad_bs,), dtype=torch.float32, device=config.device
         )
 
         self._cpu_coins_buf = torch.empty(
@@ -229,11 +229,6 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._capture_gen.manual_seed(config.random_seed)
 
         # Pre-allocated persistent buffers — no per-step alloc in the hot path.
-        # Sized to max_pad_bs so the DP gather destination has stable storage;
-        # legacy path slices [:bs * n] / [:bs] so the extra capacity is invisible.
-        max_pad_bs = self._dp_max_pad_bs
-        max_n = config.max_draft_tokens_per_req
-        max_k_req = self._dp_max_k_req
         self._ones_buf = torch.ones(
             (max_pad_bs,), dtype=torch.int32, device=config.device
         )
@@ -253,15 +248,14 @@ class FlashInferSamplingBackend(SamplingBackend):
             (max_pad_bs,), dtype=torch.int32, device=config.device
         )
 
-        # DP shard buffers; unused when tp_size==1.
         self._predict_local_buf = torch.zeros(
-            (max_k_req * max_n,), dtype=torch.int32, device=config.device
+            (max_reqs_per_rank * max_n,), dtype=torch.int32, device=config.device
         )
         self._accept_index_local_buf = torch.zeros(
-            (max_k_req * max_n,), dtype=torch.int32, device=config.device
+            (max_reqs_per_rank * max_n,), dtype=torch.int32, device=config.device
         )
         self._accept_length_local_buf = torch.zeros(
-            (max_k_req,), dtype=torch.int32, device=config.device
+            (max_reqs_per_rank,), dtype=torch.int32, device=config.device
         )
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -380,12 +374,10 @@ class FlashInferSamplingBackend(SamplingBackend):
                 self._dp_tp_size > 1 and self._dp_pg is not None
             ), "dp_sampling requires tp_size > 1 and a resolved tp_group"
             assert sampling_info.vocab_mask is None, (
-                "dp_sampling + grammar bitmask is not supported in M4"
+                "dp_sampling + grammar bitmask is not supported"
             )
             tp_size = self._dp_tp_size
             rank = self._dp_rank
-            # Whole-request padding (not flat-row) keeps N causally co-located
-            # on one rank; chain_speculative_sampling walks N sequentially.
             full_bs = bs
             pad_bs = ((bs + tp_size - 1) // tp_size) * tp_size
             assert pad_bs <= self._dp_max_pad_bs, (
@@ -393,8 +385,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
             bs = pad_bs // tp_size
 
-            # Padded rows in [full_bs:pad_bs] get pool_idx=0
-            # keeping the scalar gather NaN/inf-free.
+            # Shard by request so each request's draft chain stays on one rank.
             shard = slice(rank * bs, (rank + 1) * bs)
             if pad_bs > full_bs:
                 candidates = torch.nn.functional.pad(
@@ -495,7 +486,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 draft_probs=None,
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=True,
+                deterministic=not sampling_info.dp_sampling,
                 enable_pdl=pdl_enabled(),
             )
 
@@ -517,11 +508,13 @@ class FlashInferSamplingBackend(SamplingBackend):
             predict = predict_full.view(-1)[: full_bs * n]
             accept_index = accept_index_full[:full_bs]
             accept_length = accept_length_full[:full_bs]
+        # TP-rank sync: rank 0 wins on the full verify-output triple.
+        # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
+        # knob and produces non-bit-identical results across ranks (sub-ulp
+        # FP accumulation order).
+        # For fused top-k + top-p, the results are bit-identical across ranks.
+        # So we don't need to broadcast the results.
         elif not _FUSED_TOPK_TOPP_AVAILABLE:
-            # TP-rank sync: rank 0 wins on the full verify-output triple.
-            # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
-            # knob and produces non-bit-identical results across ranks (sub-ulp
-            # FP accumulation order).
             self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:

@@ -62,6 +62,23 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+_DP_SAMPLING_MIN_BS_ENV = "TOKENSPEED_DP_SAMPLING_MIN_BS"
+
+
+def _resolve_dp_sampling_min_bs(tp_size: int, configured_min_bs: int | None) -> int:
+    env_value = os.environ.get(_DP_SAMPLING_MIN_BS_ENV)
+    if env_value is not None:
+        try:
+            min_bs = int(env_value)
+        except ValueError as exc:
+            raise ValueError(f"{_DP_SAMPLING_MIN_BS_ENV} must be an integer") from exc
+    elif configured_min_bs is not None:
+        min_bs = int(configured_min_bs)
+    else:
+        min_bs = 2 * tp_size
+    if min_bs < 1:
+        raise ValueError("dp_sampling_min_bs must be >= 1")
+    return min_bs
 
 
 @dataclass
@@ -100,6 +117,7 @@ class ModelExecutorConfig:
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
     dp_sampling: bool = False
+    dp_sampling_min_bs: int | None = None
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -148,6 +166,7 @@ class ModelExecutorConfig:
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             dp_sampling=server_args.dp_sampling,
+            dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -277,30 +296,14 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
-        # Batch-DP spec-verify gate. The CLI flag is opt-in so ordinary
-        # spec-verify launches keep the legacy TP all-gather + redundant
-        # sampling path unless --dp-sampling (or the env override) requests DP.
-        # The bs-threshold refinement is M5; until then an opted-in DP launch
-        # runs for every bucket and sampling_backend.verify pads internally.
-        # DP-attention models (skip_all_gather=True without tp_group)
-        # have processor.tp_size == 1 and naturally fall through.
-        #
-        # Env-var override TOKENSPEED_DP_SAMPLING={auto,on,off} lets bench
-        # scripts pin the path without editing launch scripts:
-        #   auto           - engage iff infra supports it.
-        #   on             - assert infra supports it, then engage. Hard
-        #                    error if any precondition is missing -- this
-        #                    catches silent fallbacks on the DP bench
-        #                    script (e.g. accidentally launched without
-        #                    spec, or with a Greedy backend).
-        #   off            - force the legacy path even when infra would
-        #                    support DP. Used by the baseline launch
-        #                    script for A/B comparison.
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             FlashInferSamplingBackend,
         )
 
         processor = self.model_runner.model.logits_processor
+        self.dp_sampling_min_bs = _resolve_dp_sampling_min_bs(
+            processor.tp_size, self.config.dp_sampling_min_bs
+        )
         infra_supports_dp = (
             self.drafter is not None
             and isinstance(self.sampling_backend, FlashInferSamplingBackend)
@@ -332,20 +335,14 @@ class ModelExecutor:
         if self.dp_sampling_enabled:
             processor.dp_sampling_enabled = True
             processor.dp_num_tokens_per_req = spec_num_tokens
-            # M4.6+: share the FlashInfer backend's DpSamplingComm with the
-            # LogitsProcessor so the stage-4 batch<->vocab swap dispatches
-            # through the same resolved backend (NCCL or onesided) as the
-            # stage-6 verify gather. Without this, the LM-head swap stays
-            # on raw NCCL all_to_all_single even when dp_sampling_backend=
-            # onesided, defeating onesided's bandwidth win on the bigger
-            # (16 MB) of the two DP collectives.
             processor._dp_comm = self.sampling_backend._dp_comm
         logger.info(
             "Batch-DP spec-verify: mode=%s, infra_supports=%s, enabled=%s "
-            "(drafter=%s, flashinfer=%s, tp_size=%s, tp_group=%s)",
+            "min_bs=%s (drafter=%s, flashinfer=%s, tp_size=%s, tp_group=%s)",
             dp_mode,
             infra_supports_dp,
             self.dp_sampling_enabled,
+            self.dp_sampling_min_bs,
             self.drafter is not None,
             isinstance(self.sampling_backend, FlashInferSamplingBackend),
             processor.tp_size,
@@ -366,12 +363,14 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             dp_sampling_enabled=self.dp_sampling_enabled,
+            dp_sampling_min_bs=self.dp_sampling_min_bs,
         )
 
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
+        self._logged_dp_sampling_routes: set[tuple[int, int, bool, bool]] = set()
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
@@ -1151,9 +1150,7 @@ class ModelExecutor:
                     gather_ids=gather_ids,
                     padded_static_len=-1,
                     keep_full_logits=forward_mode.is_decode_or_idle(),
-                    dp_sampling=(
-                        self.dp_sampling_enabled and forward_mode.is_decode()
-                    ),
+                    dp_sampling=False,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -1164,6 +1161,29 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
+                (
+                    ctx.dp_sampling,
+                    route_uses_graph,
+                    route_effective_bs,
+                ) = self.forward_step.dp_sampling_route(bs, ctx)
+                if forward_mode.is_decode() and self.config.global_rank == 0:
+                    route_key = (
+                        bs,
+                        route_effective_bs,
+                        route_uses_graph,
+                        ctx.dp_sampling,
+                    )
+                    if route_key not in self._logged_dp_sampling_routes:
+                        self._logged_dp_sampling_routes.add(route_key)
+                        logger.info(
+                            "Batch-DP route: bs=%s effective_bs=%s "
+                            "use_graph=%s dp_sampling=%s min_bs=%s",
+                            bs,
+                            route_effective_bs,
+                            route_uses_graph,
+                            ctx.dp_sampling,
+                            self.dp_sampling_min_bs,
+                        )
 
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(

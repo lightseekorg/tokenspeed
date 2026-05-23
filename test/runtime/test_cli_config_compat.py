@@ -508,10 +508,18 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model"])
         sa = self._from_cli_args_no_init(args)
         self.assertFalse(sa.dp_sampling)
+        self.assertIsNone(sa.dp_sampling_min_bs)
 
         args = self._parse_args(["--model", "test/model", "--dp-sampling"])
         sa = self._from_cli_args_no_init(args)
         self.assertTrue(sa.dp_sampling)
+
+    def test_dp_sampling_min_bs_arg(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--dp-sampling-min-bs", "16"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        self.assertEqual(sa.dp_sampling_min_bs, 16)
 
     # ---- Full server command example ----
 
