@@ -11,6 +11,7 @@ on:
       - "python/pyproject.toml"
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
+      - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/pr-test.yml"
@@ -21,6 +22,7 @@ on:
       - "python/pyproject.toml"
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
+      - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/pr-test.yml"
@@ -65,6 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.scan.outputs.matrix }}
+      install_tokenspeed_mla_from_source: ${{ steps.detect_mla.outputs.changed }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -94,6 +97,41 @@ jobs:
           MATRIX=$(python3 test/ci_system/pipeline.py scan --root test/ci --trigger "$TRIGGER")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
+      # Compute this once on the hosted runner (where `gh` is pre-installed)
+      # and propagate the result to every matrix job via job output. The
+      # downstream unit-test job reads it as an env var and `install_deps.sh`
+      # gates its in-tree `tokenspeed-mla` reinstall on it. Without this
+      # detection, CI would always exercise the pinned PyPI wheel and edits
+      # under `tokenspeed-mla/` would be silently uncovered.
+      - name: Detect tokenspeed-mla source changes
+        id: detect_mla
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request)
+              files=$(gh api \
+                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --paginate -q '.[].filename')
+              ;;
+            push)
+              files=$(gh api \
+                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
+                -q '.files[].filename')
+              ;;
+            *)
+              files=""
+              ;;
+          esac
+          if printf '%s\n' "$files" | grep -q '^tokenspeed-mla/'; then
+            echo "tokenspeed-mla touched by this run; in-tree source will be installed."
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "tokenspeed-mla untouched; keeping pinned PyPI wheel."
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+          fi
+
   unit-test:
     needs: scan
     if: |
@@ -112,6 +150,11 @@ jobs:
     name: ${{ matrix.name }} / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      # When the scan job determined that this run touched `tokenspeed-mla/`,
+      # `install_deps.sh` will reinstall the in-tree source on top of the
+      # pinned PyPI wheel. See the matching detect step in the `scan` job.
+      INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -132,6 +175,14 @@ jobs:
           done
           exit 1
 
+      # When the diff touches `tokenspeed-mla/`, ask install_deps.sh to
+      # rebuild + install that package from the in-tree source after the
+      # pinned PyPI wheel has been installed (transitively via
+      # tokenspeed-kernel). Without this, CI keeps testing whichever
+      # `tokenspeed-mla` version is pinned in
+      # `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`, not
+      # the code on the PR/branch. When the diff doesn't touch
+      # `tokenspeed-mla/` we keep using the pinned PyPI wheel.
       - name: Install CI task
         run: |
           cd "${{ env.WORK_DIR }}"

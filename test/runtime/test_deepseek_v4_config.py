@@ -324,34 +324,36 @@ class TestDeepseekV4Config(unittest.TestCase):
         moe = self._make_fake_mega_deepseek_v4_moe(
             hidden_states, input_ids, SharedExperts(), calls
         )
+        ctx = object()
 
-        with (
-            patch.object(
-                deepseek_v4_model,
-                "token_all_gather",
-                side_effect=AssertionError("shared expert should not use MoE RSAG"),
-            ),
-            patch.object(
-                deepseek_v4_model,
-                "token_reduce_scatter",
-                side_effect=AssertionError("shared expert should not use MoE RSAG"),
-            ),
-        ):
-            actual = DeepseekV4MoE.forward(
-                moe,
-                hidden_states,
-                input_ids,
-                num_global_tokens=2,
-                max_num_tokens_per_gpu=2,
-            )
+        class FakeCommManager:
+            def pre_dense_comm(self, states, actual_ctx):
+                test_case.assertIs(actual_ctx, ctx)
+                return states
+
+            def post_dense_comm(self, states, residual, actual_ctx):
+                test_case.assertIs(actual_ctx, ctx)
+                return states, residual
+
+        actual = DeepseekV4MoE.forward(
+            moe,
+            hidden_states,
+            input_ids,
+            num_global_tokens=2,
+            max_num_tokens_per_gpu=2,
+            ctx=ctx,
+            comm_manager=FakeCommManager(),
+        )
 
         self.assertEqual(calls, ["select", "routed", "shared"])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
-    def test_deepseek_v4_mega_moe_shared_rsag_uses_dense_tp_group(self):
+    def test_deepseek_v4_mega_moe_shared_uses_comm_manager(self):
         calls = []
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
+        ctx = object()
+        test_case = self
 
         class SharedExperts:
             tp_rank = 1
@@ -360,6 +362,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
             def __call__(self, states):
                 calls.append("shared")
+                test_case.assertTrue(torch.equal(states, hidden_states + 2))
                 return states + 3
 
         moe = self._make_fake_mega_deepseek_v4_moe(
@@ -367,41 +370,32 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         comm_calls = []
 
-        def fake_all_gather(states, *, rank, group, scattered_num_tokens):
-            comm_calls.append(("all_gather", rank, group, scattered_num_tokens))
-            return states
+        class FakeCommManager:
+            def pre_dense_comm(self, states, actual_ctx):
+                comm_calls.append(("pre", actual_ctx))
+                test_case.assertIs(actual_ctx, ctx)
+                test_case.assertIs(states, hidden_states)
+                return states + 2
 
-        def fake_reduce_scatter(states, *, rank, group, scattered_num_tokens):
-            comm_calls.append(("reduce_scatter", rank, group, scattered_num_tokens))
-            return states
+            def post_dense_comm(self, states, residual, actual_ctx):
+                comm_calls.append(("post", actual_ctx))
+                test_case.assertIsNone(residual)
+                test_case.assertIs(actual_ctx, ctx)
+                test_case.assertTrue(torch.equal(states, hidden_states + 5))
+                return states - 2, residual
 
-        with (
-            patch.object(
-                deepseek_v4_model, "token_all_gather", side_effect=fake_all_gather
-            ),
-            patch.object(
-                deepseek_v4_model,
-                "token_reduce_scatter",
-                side_effect=fake_reduce_scatter,
-            ),
-        ):
-            actual = DeepseekV4MoE.forward(
-                moe,
-                hidden_states,
-                input_ids,
-                num_global_tokens=2,
-                max_num_tokens_per_gpu=2,
-                shared_scattered_num_tokens=[1, 1],
-            )
+        actual = DeepseekV4MoE.forward(
+            moe,
+            hidden_states,
+            input_ids,
+            num_global_tokens=2,
+            max_num_tokens_per_gpu=2,
+            ctx=ctx,
+            comm_manager=FakeCommManager(),
+        )
 
         self.assertEqual(calls, ["select", "routed", "shared"])
-        self.assertEqual(
-            comm_calls,
-            [
-                ("all_gather", 1, (2, 3), [1, 1]),
-                ("reduce_scatter", 1, (2, 3), [1, 1]),
-            ],
-        )
+        self.assertEqual(comm_calls, [("pre", ctx), ("post", ctx)])
         self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

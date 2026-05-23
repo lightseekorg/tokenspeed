@@ -22,12 +22,12 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-
-__all__ = ["apply_rope_triton", "apply_rope_with_cos_sin_cache_inplace_triton"]
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
 
 
 def _next_power_of_2(n: int) -> int:
@@ -355,4 +355,46 @@ def apply_rope_triton(
     )
 
 
-apply_rope_with_cos_sin_cache_inplace_triton = apply_rope_triton
+@register_kernel(
+    "embedding",
+    "rope",
+    name="triton_embedding_rope",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    dtypes={torch.float16, torch.bfloat16},
+    priority=Priority.PORTABLE,
+    traits={
+        "partial_rotary": frozenset({True, False}),
+        "is_neox": frozenset({True, False}),
+        "has_fused_kv": frozenset({True, False}),
+        "has_q_out": frozenset({True, False}),
+        "has_k_out": frozenset({True, False}),
+    },
+    tags={"portability"},
+)
+def triton_embedding_rope(
+    *,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+    rotary_dim: int | None = None,
+    fused_set_kv_buffer_arg: Any = None,
+    output_q_rope: torch.Tensor | None = None,
+    output_k_rope: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> None:
+    apply_rope_triton(
+        positions=positions,
+        query=query,
+        key=key,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        rotary_dim=rotary_dim,
+        fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+        output_q_rope=output_q_rope,
+        output_k_rope=output_k_rope,
+    )

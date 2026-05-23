@@ -339,21 +339,21 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     const int32_t k_raw = top_ks[b];
     const float p = top_ps[b];
 
-    // (value, index) pair sort, 6-bit radix groups → 6 passes for the 32-bit
-    // float key (vs 11 passes for the 64-bit packed key). The original uint64
-    // packed-key version is retained as a dummy union member so the kernel's
-    // static smem footprint stays at the level that locks SM occupancy to
-    // 1 block/SM (preserves mode 3.2's V-scan HBM bandwidth).
-    using BlockRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, ITEMS_PER_THREAD, int32_t,
-                                                /*RADIX_BITS=*/6>;
-    using BlockRadixSortLarge = cub::BlockRadixSort<uint64_t, BLOCK_SIZE, ITEMS_PER_THREAD,
-                                                     cub::NullType, /*RADIX_BITS=*/6>;
+    // Packed (val ↓, idx ↑) uint64 sort. Upper 32 bits = twiddle_in(val, false)
+    // so ascending uint order == descending val order; lower 32 bits = idx so
+    // ties on val break by smaller idx first. This makes the sort tie-break
+    // deterministic (matches baseline `is_deterministic=True`), independent
+    // of how air_topk_stable's strictly-greater branch happened to order tied
+    // items via atomicAdd. The smem footprint matches what the dummy uint64
+    // pad used to provide, so SM occupancy is unchanged (still 1 block/SM,
+    // which mode 3.2's V-scan needs to keep HBM bandwidth).
+    using BlockRadixSort = cub::BlockRadixSort<uint64_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                                cub::NullType, /*RADIX_BITS=*/6>;
     using BlockScan = cub::BlockScan<float, BLOCK_SIZE>;
     using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
 
     __shared__ union {
         typename BlockRadixSort::TempStorage sort;
-        typename BlockRadixSortLarge::TempStorage sort_pad;  // smem occupancy pad.
         typename BlockScan::TempStorage scan;
         typename BlockReduce::TempStorage reduce;
     } temp_storage;
@@ -368,34 +368,42 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
         __shared__ int s_cutoff_j;
         __shared__ float s_inv_factor;
 
-        // (value, index) sort descending: ties on the float key are broken by
-        // whatever cub's radix produces — for softmax-shaped distributions tie
-        // collisions on 32-bit floats are essentially never seen, so this still
-        // matches the baseline within fp32 ulp.
-        float t_vals[ITEMS_PER_THREAD];
-        int32_t t_idxs[ITEMS_PER_THREAD];
-
+        // Build packed keys, sort ascending → descending val, ascending idx on ties.
+        uint64_t t_keys[ITEMS_PER_THREAD];
         const int row_base = b * max_k;
 #pragma unroll
         for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
             const int pos = threadIdx.x * ITEMS_PER_THREAD + i;
+            float val;
+            int32_t idx;
             if (pos < max_k) {
-                t_vals[i] = top_k_vals[row_base + pos];
-                t_idxs[i] = top_k_idx[row_base + pos];
+                val = top_k_vals[row_base + pos];
+                idx = top_k_idx[row_base + pos];
             } else {
-                t_vals[i] = -FLT_MAX;
-                t_idxs[i] = INT32_MAX;
+                val = -FLT_MAX;
+                idx = INT32_MAX;
             }
+            uint32_t v_bits = nv::air_topk_stable::twiddle_in<float>(val, /*select_min=*/false);
+            t_keys[i] = (static_cast<uint64_t>(v_bits) << 32) | static_cast<uint32_t>(idx);
         }
 
-        BlockRadixSort(temp_storage.sort).SortDescending(t_vals, t_idxs);
+        BlockRadixSort(temp_storage.sort).Sort(t_keys);
         __syncthreads();
 
+        // Unpack into thread-local t_vals (for the upcoming BlockScan) and
+        // mirror to smem so the scatter step can read by sorted position.
+        float t_vals[ITEMS_PER_THREAD];
 #pragma unroll
         for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            const uint64_t key = t_keys[i];
+            const uint32_t v_bits = static_cast<uint32_t>(key >> 32);
+            const int32_t idx = static_cast<int32_t>(static_cast<uint32_t>(key));
+            const float val =
+                nv::air_topk_stable::twiddle_out<float>(v_bits, /*select_min=*/false);
+            t_vals[i] = val;
             const int pos = threadIdx.x * ITEMS_PER_THREAD + i;
-            s_vals[pos] = t_vals[i];
-            s_idx[pos] = t_idxs[i];
+            s_vals[pos] = val;
+            s_idx[pos] = idx;
         }
 
         float t_scan[ITEMS_PER_THREAD];

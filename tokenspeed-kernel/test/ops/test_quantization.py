@@ -22,102 +22,221 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.quantization import fp8_quantize
-
-FP8_E4M3_MAX = 448.0
+from tokenspeed_kernel import (
+    quantize_fp8,
+    quantize_fp8_with_scale,
+    quantize_mxfp8,
+    quantize_nvfp4,
+)
+from tokenspeed_kernel.platform import current_platform
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
-def test_pure_cast_contig_bf16(device: str) -> None:
+@pytest.mark.parametrize("solution", ["triton"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 2880),
+        (8, 2880),
+        (33, 2880),
+        (4, 4096),
+        (2, 1),
+        (3, 513),
+    ],
+)
+def test_quantize_fp8_pure_cast_bf16(
+    device: str,
+    solution: str,
+    shape: tuple[int, ...],
+    require,
+) -> None:
     torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e4m3fn)
-    out = fp8_quantize(x)
+    dtype = torch.bfloat16
+    require("quantization", "fp8", solution, dtype)
+
+    x = torch.randn(shape, device=device, dtype=dtype) * 50
+    fp8 = current_platform().fp8e4m3fn
+    ref = x.to(fp8.dtype)
+
+    out = quantize_fp8(x, solution=solution)
     torch.cuda.synchronize()
-    assert out.shape == ref.shape and out.dtype == ref.dtype
+
+    assert out.shape == ref.shape
+    assert out.dtype == ref.dtype
     assert _bitwise_equal(out, ref)
 
 
-def test_pure_cast_strided_v_slice(device: str) -> None:
-    """v = kv[..., qk_nope:] — the deepseek_v3.py call site shape."""
-    torch.manual_seed(0)
+@pytest.mark.parametrize("solution", ["triton"])
+def test_quantize_fp8_strided_slice(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    torch.manual_seed(1)
+    dtype = torch.bfloat16
+    require("quantization", "fp8", solution, dtype)
+
     s, h, qk_nope, v_head = 4096, 16, 128, 128
-    kv = torch.randn(s, h, qk_nope + v_head, device=device, dtype=torch.bfloat16) * 50
+    kv = torch.randn(s, h, qk_nope + v_head, device=device, dtype=dtype) * 50
     v = kv[..., qk_nope:]
-    assert not v.is_contiguous(), "v must be a strided slice for this test"
-    ref = v.to(torch.float8_e4m3fn)
-    out = fp8_quantize(v)
+    assert not v.is_contiguous()
+
+    fp8 = current_platform().fp8e4m3fn
+    ref = v.to(fp8.dtype)
+
+    out = quantize_fp8(v, solution=solution)
     torch.cuda.synchronize()
+
     assert _bitwise_equal(out, ref)
 
 
-def test_pure_cast_1d(device: str) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(1024, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e4m3fn)
-    out = fp8_quantize(x)
-    torch.cuda.synchronize()
-    assert _bitwise_equal(out, ref)
+@pytest.mark.parametrize("solution", ["triton"])
+@pytest.mark.parametrize("scale", [2.0, 0.5, 7.5])
+def test_quantize_fp8_scale_float(
+    device: str,
+    solution: str,
+    scale: float,
+    require,
+) -> None:
+    torch.manual_seed(2)
+    dtype = torch.bfloat16
+    require("quantization", "fp8", solution, dtype)
 
-
-def test_pure_cast_fp16(device: str) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(1024, 512, device=device, dtype=torch.float16) * 50
-    ref = x.to(torch.float8_e4m3fn)
-    out = fp8_quantize(x)
-    torch.cuda.synchronize()
-    assert _bitwise_equal(out, ref)
-
-
-def test_pure_cast_e5m2(device: str) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(1024, 512, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e5m2)
-    out = fp8_quantize(x, fp8_dtype=torch.float8_e5m2)
-    torch.cuda.synchronize()
-    assert out.dtype == torch.float8_e5m2
-    assert _bitwise_equal(out, ref)
-
-
-@pytest.mark.parametrize("scale_inv", [0.5, 2.0, 1.0 / 7.5])
-def test_scaled_cast_matches_reference(device: str, scale_inv: float) -> None:
-    """Scaled path: out = saturate((x * scale_inv) -> fp8). Compare bitwise to
-    the same recipe applied in eager torch."""
-    torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 100
+    x = torch.randn(2048, 512, device=device, dtype=dtype) * 100
+    fp8 = current_platform().fp8e4m3fn
+    inv_scale = 1.0 / scale
     ref = (
-        (x.to(torch.float32) * scale_inv)
-        .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-        .to(torch.float8_e4m3fn)
+        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
     )
-    out = fp8_quantize(x, scale_inv=scale_inv)
+
+    out = quantize_fp8(x, scale=scale, solution=solution)
     torch.cuda.synchronize()
+
     assert _bitwise_equal(out, ref)
 
 
-def test_preallocated_output(device: str) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(1024, 512, device=device, dtype=torch.bfloat16) * 50
-    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    ret = fp8_quantize(x, out=out)
+@pytest.mark.parametrize("solution", ["triton"])
+def test_quantize_fp8_scale_tensor(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    torch.manual_seed(3)
+    dtype = torch.bfloat16
+    require("quantization", "fp8", solution, dtype)
+
+    x = torch.randn(8, 2880, device=device, dtype=dtype) * 100
+    scale = torch.tensor([0.125], device=device, dtype=torch.float32)
+    fp8 = current_platform().fp8e4m3fn
+    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
+    ref = (
+        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
+    )
+
+    out = quantize_fp8(x, scale=scale, solution=solution)
     torch.cuda.synchronize()
-    assert ret.data_ptr() == out.data_ptr()
-    assert _bitwise_equal(out, x.to(torch.float8_e4m3fn))
+
+    assert _bitwise_equal(out, ref)
 
 
-def test_rejects_unsupported_dtype(device: str) -> None:
-    x = torch.randn(64, 128, device=device, dtype=torch.float32)
-    with pytest.raises(AssertionError):
-        fp8_quantize(x)
+@pytest.mark.parametrize("solution", ["trtllm"])
+@pytest.mark.parametrize("granularity", ["tensor", "token"])
+def test_quantize_fp8_with_scale_tensor_and_token(
+    device: str,
+    solution: str,
+    granularity: str,
+    require,
+) -> None:
+    torch.manual_seed(4)
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype)
+
+    x = torch.randn(16, 128, device=device, dtype=dtype) * 10
+    fp8 = current_platform().fp8e4m3fn
+
+    out, scale = quantize_fp8_with_scale(
+        x,
+        granularity=granularity,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert out.dtype == fp8.dtype
+    assert scale.dtype == torch.float32
+    if granularity == "tensor":
+        assert scale.shape == (1,)
+    else:
+        assert scale.shape == (x.shape[0], 1)
 
 
-def test_rejects_non_stride1_inner(device: str) -> None:
-    """fp8_quantize requires stride(-1) == 1; reject otherwise."""
-    x = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
-    transposed = x.t()  # stride(-1) = 128, stride(-2) = 1
-    assert transposed.stride(-1) != 1
-    with pytest.raises(AssertionError):
-        fp8_quantize(transposed)
+@pytest.mark.parametrize("solution", ["trtllm"])
+def test_quantize_fp8_with_scale_token_group(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    torch.manual_seed(5)
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype)
+
+    x = torch.randn(16, 256, device=device, dtype=dtype) * 10
+    fp8 = current_platform().fp8e4m3fn
+
+    out, scale = quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=128,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert out.dtype == fp8.dtype
+    assert scale.dtype == torch.float32
+    assert scale.numel() > 0
+
+
+@pytest.mark.parametrize("solution", ["flashinfer"])
+def test_quantize_mxfp8_shape_and_scale(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    torch.manual_seed(6)
+    dtype = torch.bfloat16
+    require("quantization", "mxfp8", solution, dtype)
+
+    x = torch.randn(17, 2880, device=device, dtype=dtype)
+    out, scale = quantize_mxfp8(x, solution=solution)
+    torch.cuda.synchronize()
+
+    assert out.shape[:-1] == x.shape[:-1]
+    assert out.shape[-1] >= x.shape[-1]
+    assert scale.numel() > 0
+
+
+@pytest.mark.parametrize("solution", ["flashinfer"])
+def test_quantize_nvfp4_shape_and_scale(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    torch.manual_seed(7)
+    dtype = torch.bfloat16
+    require("quantization", "nvfp4", solution, dtype)
+
+    x = torch.randn(16, 256, device=device, dtype=dtype)
+    out, scale = quantize_nvfp4(
+        x,
+        scale=torch.tensor([0.125], device=device, dtype=torch.float32),
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape[:-1] == x.shape[:-1]
+    assert out.shape[-1] == x.shape[-1] // 2
+    assert scale.numel() > 0

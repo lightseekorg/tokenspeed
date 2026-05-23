@@ -27,9 +27,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg
-from tokenspeed_kernel.ops.embedding.cuda import apply_rope_with_cos_sin_cache_inplace
-from tokenspeed_kernel.ops.embedding.triton import apply_rope_triton
+from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
@@ -139,49 +137,20 @@ class RotaryEmbedding(torch.nn.Module):
         output_k_rope: torch.Tensor | None = None,
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if _is_amd:
-            positions = positions.flatten()
-            offsets_arg = offsets.flatten() if offsets is not None else None
-            apply_rope_triton(
-                positions=positions,
-                query=query,
-                key=key,
-                head_size=self.head_size,
-                cos_sin_cache=self.cos_sin_cache,
-                is_neox=self.is_neox_style,
-                offsets=offsets_arg,
-                rotary_dim=self.rotary_dim,
-                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-                output_q_rope=output_q_rope,
-                output_k_rope=output_k_rope,
-            )
-            return output_q_rope if output_q_rope is not None else query, (
-                output_k_rope if output_k_rope is not None else key
-            )
-        else:
-            if self.head_size in [64, 128, 256, 512]:
-                apply_rope_with_cos_sin_cache_inplace(
-                    positions=positions,
-                    query=query,
-                    key=key,
-                    head_size=self.head_size,
-                    cos_sin_cache=self.cos_sin_cache,
-                    is_neox=self.is_neox_style,
-                    **(
-                        dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
-                        if fused_set_kv_buffer_arg is not None
-                        else {}
-                    ),
-                    output_q_rope=output_q_rope,
-                    output_k_rope=output_k_rope,
-                    enable_pdl=enable_pdl,
-                )
-                return query, key
-            else:
-                raise NotImplementedError(
-                    "CUDA RoPE kernel only supports head sizes of 64, 128, 256 and 512. "
-                    f"Got head size {self.head_size}."
-                )
+        return apply_rope(
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            cos_sin_cache=self.cos_sin_cache,
+            is_neox=self.is_neox_style,
+            offsets=offsets,
+            rotary_dim=self.rotary_dim,
+            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            output_q_rope=output_q_rope,
+            output_k_rope=output_k_rope,
+            enable_pdl=enable_pdl,
+        )
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"

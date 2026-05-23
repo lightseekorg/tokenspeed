@@ -82,11 +82,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
 )
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import (
-    all_reduce,
-    token_all_gather,
-    token_reduce_scatter,
-)
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -3388,22 +3384,29 @@ class DeepseekV4MoE(nn.Module):
         return StandardTopKOutput(topk_weights, topk_ids, router_scores)
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext | None = None,
+        comm_manager: CommManager | None = None,
     ) -> torch.Tensor | None:
-        if (
-            self.n_shared_experts is None
-            or hidden_states is None
-            or hidden_states.shape[0] == 0
-        ):
+        if self.shared_experts is None:
+            return None
+        if comm_manager is not None:
+            hidden_states = comm_manager.pre_dense_comm(hidden_states, ctx)
+        if hidden_states.shape[0] == 0:
             return None
         with nvtx_range("moe_shared_experts"):
-            return self.shared_experts(hidden_states)
+            shared = self.shared_experts(hidden_states)
+        if comm_manager is not None:
+            shared, _ = comm_manager.post_dense_comm(shared, None, ctx)
+        return shared
 
     def forward_mega_moe(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
-        shared_scattered_num_tokens: list[int] | None,
+        ctx: ForwardContext,
+        comm_manager: CommManager,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             topk_weights = hidden_states.new_empty(
@@ -3420,35 +3423,6 @@ class DeepseekV4MoE(nn.Module):
                     hidden_states, input_ids
                 )
 
-        shared_input = None
-        shared_token_counts = None
-        if self.n_shared_experts is not None:
-            if self.shared_experts.tp_size > 1:
-                if shared_scattered_num_tokens is None:
-                    raise ValueError(
-                        "DeepSeek V4 shared expert dense TP requires token counts."
-                    )
-                shared_token_counts = [
-                    int(count) for count in shared_scattered_num_tokens
-                ]
-                if len(shared_token_counts) != self.shared_experts.tp_size:
-                    raise ValueError(
-                        "DeepSeek V4 shared expert token count length must match "
-                        "the dense TP size."
-                    )
-                if sum(shared_token_counts) > 0:
-                    with nvtx_range("moe_shared_all_gather"):
-                        shared_input = token_all_gather(
-                            hidden_states,
-                            rank=self.shared_experts.tp_rank,
-                            group=self.shared_experts.tp_group,
-                            scattered_num_tokens=shared_token_counts,
-                        )
-                else:
-                    shared_token_counts = None
-            else:
-                shared_input = hidden_states
-
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_mega_experts"):
@@ -3463,15 +3437,10 @@ class DeepseekV4MoE(nn.Module):
                     activation_clamp=getattr(self.config, "swiglu_limit", None),
                 )
             with fork.branch():
-                shared = self._forward_shared_experts(shared_input)
-
-        if shared is not None and shared_token_counts is not None:
-            with nvtx_range("moe_shared_reduce_scatter"):
-                shared = token_reduce_scatter(
-                    shared,
-                    rank=self.shared_experts.tp_rank,
-                    group=self.shared_experts.tp_group,
-                    scattered_num_tokens=shared_token_counts,
+                shared = self._forward_shared_experts(
+                    hidden_states,
+                    ctx=ctx,
+                    comm_manager=comm_manager,
                 )
         return routed + shared if shared is not None else routed
 
@@ -3513,11 +3482,15 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-        shared_scattered_num_tokens: list[int] | None = None,
+        ctx: ForwardContext | None = None,
+        comm_manager: CommManager | None = None,
     ) -> torch.Tensor:
         if self.use_mega_moe:
             return self.forward_mega_moe(
-                hidden_states, input_ids, shared_scattered_num_tokens
+                hidden_states,
+                input_ids,
+                ctx,
+                comm_manager,
             )
         return self.forward_normal(
             hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu
@@ -5444,18 +5417,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = self.ffn_norm(hidden_states)
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
-        shared_scattered_num_tokens = None
         if use_mega_moe:
             token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             num_global_tokens = sum(token_counts)
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
-            if (
-                self.ffn.shared_experts is not None
-                and self.ffn.shared_experts.tp_size > 1
-            ):
-                shared_scattered_num_tokens = (
-                    self.comm_manager.dense_tp_group_scattered_num_tokens(ctx)
-                )
         else:
             token_counts = None
             with nvtx_range("pre_mlp_comm"):
@@ -5473,7 +5438,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ffn_input_ids,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
-                shared_scattered_num_tokens=shared_scattered_num_tokens,
+                ctx=ctx if use_mega_moe else None,
+                comm_manager=self.comm_manager if use_mega_moe else None,
             )
         if not use_mega_moe:
             with nvtx_range("post_mlp_comm"):

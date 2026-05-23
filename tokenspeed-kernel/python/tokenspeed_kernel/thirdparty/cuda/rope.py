@@ -26,10 +26,9 @@ output_k_rope (out-of-place mode) and fused KV-buffer scatter.
 
 import functools
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
-from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg
 
 
 def _objs_dir() -> Path:
@@ -57,7 +56,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-    fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    fused_set_kv_buffer_arg: Any = None,
     output_q_rope: Optional[torch.Tensor] = None,
     output_k_rope: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
@@ -67,6 +66,9 @@ def apply_rope_with_cos_sin_cache_inplace(
     Supports both in-place and out-of-place (via output_q_rope / output_k_rope).
     Optionally fuses with KV-buffer scatter when fused_set_kv_buffer_arg is provided.
     """
+    if head_size not in [64, 128, 256, 512]:
+        raise ValueError("Unsupported head_size, only 64/128/256/512 are supported")
+
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 

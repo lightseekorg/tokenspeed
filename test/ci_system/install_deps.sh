@@ -113,9 +113,23 @@ pip_install_with_retry pip3 install -e "./python[cuda_${SM}]" \
     --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
 
 # ============================================================
-# Step 6: Fix Triton ptxas (CUDA 13+ only)
+# Step 6: Optionally override tokenspeed-mla with in-tree source
 # ============================================================
-echo "=== Step 6: Fix Triton ptxas ==="
+# Set by `.github/workflows/pr-test.yml` when the diff touches
+# `tokenspeed-mla/`. Without this override CI exercises whichever
+# `tokenspeed-mla` version is pinned in
+# `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt` and the
+# in-tree change is silently ignored.
+if [ "${INSTALL_TOKENSPEED_MLA_FROM_SOURCE:-0}" = "1" ]; then
+    echo "=== Step 6: Reinstall tokenspeed-mla from in-tree source ==="
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${WORKSPACE}/tokenspeed-mla"
+fi
+
+# ============================================================
+# Step 7: Fix Triton ptxas (CUDA 13+ only)
+# ============================================================
+echo "=== Step 7: Fix Triton ptxas ==="
 if [ "${CUDA_VERSION%%.*}" = "13" ]; then
     TRITON_BIN="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin"
     if [ -d "${TRITON_BIN}" ]; then
