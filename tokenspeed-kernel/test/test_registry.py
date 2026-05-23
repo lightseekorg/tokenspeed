@@ -65,7 +65,6 @@ class TestKernelSpec:
             storage_dtype=torch.float32,
             granularity="block",
             block_shape=(32,),
-            layout="ue8m0",
         )
         mixed = format_signature(
             a=dense_format(torch.bfloat16),

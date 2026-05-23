@@ -125,18 +125,15 @@ EXPERTS_GEMM_COMBINE = (
 _FP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
-    layout="fp8",
 )
 _NVFP4_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
-    layout="nvfp4",
 )
 _MXFP4_SCALE = ScaleFormat(
     storage_dtype=torch.uint8,
     granularity="block",
     block_shape=(32,),
-    layout="ue8m0",
 )
 
 
@@ -156,7 +153,7 @@ def _moe_fused_format_signature(
     weight_format: str,
 ):
     if weight_format == WEIGHT_FP8:
-        weight = tensor_format("fp8", torch.float8_e4m3fn, scale=_FP8_SCALE)
+        weight = tensor_format("dense", torch.float8_e4m3fn, scale=_FP8_SCALE)
     elif weight_format == WEIGHT_NVFP4:
         weight = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
     elif weight_format == WEIGHT_MXFP4:
@@ -171,7 +168,7 @@ def _moe_fused_format_signature(
     elif storage_dtype == torch.uint8 and weight_format == WEIGHT_MXFP4:
         x = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
     elif storage_dtype == torch.float8_e4m3fn:
-        x = tensor_format("fp8", storage_dtype, scale=_FP8_SCALE)
+        x = tensor_format("dense", storage_dtype, scale=_FP8_SCALE)
     else:
         x = dense_format(storage_dtype)
 

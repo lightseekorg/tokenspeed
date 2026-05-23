@@ -38,12 +38,10 @@ _MXFP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
     block_shape=(128, 128),
-    layout="mxfp8",
 )
 _NVFP4_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
-    layout="nvfp4",
 )
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE

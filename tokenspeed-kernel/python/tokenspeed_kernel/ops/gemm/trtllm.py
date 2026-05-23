@@ -39,7 +39,6 @@ _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1f
 _NVFP4_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
-    layout="nvfp4",
 )
 _NVFP4_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "nvfp4", _fp4_dtypes, scale=_NVFP4_SCALE

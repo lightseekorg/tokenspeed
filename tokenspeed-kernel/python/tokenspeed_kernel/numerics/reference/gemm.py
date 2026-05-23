@@ -33,18 +33,16 @@ _FP8_BLOCK_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
     block_shape=(128, 128),
-    layout="mxfp8",
 )
 _FP8_TENSOR_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
-    granularity="per_tensor",
-    layout="scaled",
+    granularity="tensor",
 )
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {fp8_dtype}, scale=_FP8_BLOCK_SCALE
 )
-_FP8_PER_TENSOR_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
+_FP8_TENSOR_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "dense", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
 )
 _DENSE_GEMM_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "dense", {torch.bfloat16, torch.float16, torch.float32}
@@ -111,7 +109,7 @@ def torch_mm_fp8_blockscale(
     "mm",
     name="torch_mm_fp8_scaled_mnk",
     solution="reference",
-    signatures=_FP8_PER_TENSOR_FORMAT_SIGNATURES,
+    signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"NK"}),
     },
@@ -153,7 +151,7 @@ def torch_mm_fp8_scaled_mnk(
     "mm",
     name="torch_mm_fp8_scaled_nkm",
     solution="reference",
-    signatures=_FP8_PER_TENSOR_FORMAT_SIGNATURES,
+    signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
     },

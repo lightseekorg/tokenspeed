@@ -149,7 +149,7 @@ class GemmInputGenerator(InputGenerator):
         if scale is None:
             return None
 
-        if scale.granularity == "block" and scale.layout == "mxfp8":
+        if scale.granularity == "block" and tensor_format.format == "mxfp8":
             block_n, block_k = block_size or [128, 128]
             k_tiles = math.ceil(K / block_k)
             if role == "a":
@@ -158,7 +158,7 @@ class GemmInputGenerator(InputGenerator):
                 n_tiles = math.ceil(N / block_n)
                 return self._generate_scales((n_tiles, k_tiles), scale.storage_dtype)
 
-        if scale.granularity == "per_channel":
+        if scale.granularity == "channel":
             return self._generate_scales(
                 (M,) if role == "a" else (N,),
                 scale.storage_dtype,

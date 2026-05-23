@@ -68,12 +68,12 @@ def _infer_scale_type(
     A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
 ) -> str | None:
-    """For fp8, distinguish per-tensor from per-channel scaling."""
+    """For fp8, distinguish tensor-scalar from channel/vector scaling."""
     if A_scales is None or B_scales is None:
         return None
     if A_scales.numel() == 1 and B_scales.numel() == 1:
-        return "per_tensor"
-    return "per_channel"
+        return "tensor"
+    return "channel"
 
 
 def _scale_storage_dtype(*scales: torch.Tensor | None) -> torch.dtype:
@@ -98,7 +98,6 @@ def _gemm_format_signature(
             storage_dtype=_scale_storage_dtype(A_scales, B_scales),
             granularity="block",
             block_shape=tuple(block_size) if block_size is not None else None,
-            layout="mxfp8",
         )
         a_storage_dtype = _fp8_dtype if A_scales is None else A.dtype
         return format_signature(
@@ -109,17 +108,15 @@ def _gemm_format_signature(
         scale = ScaleFormat(
             storage_dtype=_scale_storage_dtype(A_scales, B_scales),
             granularity=_infer_scale_type(A_scales, B_scales) or "unknown",
-            layout="scaled",
         )
         return format_signature(
-            a=tensor_format("fp8", A.dtype, scale=scale),
-            b=tensor_format("fp8", B.dtype, scale=scale),
+            a=tensor_format("dense", A.dtype, scale=scale),
+            b=tensor_format("dense", B.dtype, scale=scale),
         )
     if quant == "nvfp4":
         scale = ScaleFormat(
             storage_dtype=_scale_storage_dtype(A_scales, B_scales),
             granularity="block",
-            layout="nvfp4",
         )
         return format_signature(
             a=tensor_format("nvfp4", A.dtype, scale=scale),

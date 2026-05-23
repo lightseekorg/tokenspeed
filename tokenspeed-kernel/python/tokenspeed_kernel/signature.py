@@ -43,24 +43,20 @@ class ScaleFormat:
 
     Args:
         storage_dtype: Physical dtype used by the scale tensor.
-        granularity: Scale granularity, such as "per_tensor",
-            "per_channel", or "block".
+        granularity: Scale granularity, such as "tensor", "channel",
+            or "block".
         block_shape: Logical block shape covered by each scale value when
             granularity is block-based.
-        layout: Optional backend or format layout name for the scale tensor.
     """
 
     storage_dtype: torch.dtype
     granularity: str
     block_shape: tuple[int, ...] | None = None
-    layout: str | None = None
 
     def __str__(self) -> str:
         parts = [self.granularity, f"storage={self.storage_dtype}"]
         if self.block_shape is not None:
             parts.append(f"block={self.block_shape}")
-        if self.layout is not None:
-            parts.append(f"layout={self.layout}")
         return "scale(" + ", ".join(parts) + ")"
 
 
@@ -71,7 +67,8 @@ class TensorFormat:
     Args:
         storage_dtype: Physical dtype used by the main tensor payload.
         format: Logical representation format, such as "dense",
-            "fp8", "mxfp4", or "nvfp4".
+            "mxfp8", "mxfp4", or "nvfp4". Use "dense" for ordinary
+            dense tensors, including dense FP8 payloads with optional scales.
         scale: Optional scale sidecar metadata bundled with this tensor role.
     """
 
@@ -146,8 +143,9 @@ def tensor_format(
     """Construct a format for one tensor role.
 
     Args:
-        format: Logical representation format, such as "dense", "fp8",
-            "mxfp4", or "nvfp4".
+        format: Logical representation format, such as "dense", "mxfp8",
+            "mxfp4", or "nvfp4". Use "dense" for ordinary dense tensors,
+            including dense FP8 payloads with optional scales.
         storage_dtype: Physical dtype used by the main tensor payload.
         scale: Optional scale sidecar metadata bundled with this tensor role.
     """

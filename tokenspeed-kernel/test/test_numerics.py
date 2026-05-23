@@ -66,7 +66,6 @@ def test_gemm_input_generator_uses_signature_scale_metadata() -> None:
         storage_dtype=torch.float32,
         granularity="block",
         block_shape=(128, 128),
-        layout="mxfp8",
     )
     signature = next(
         iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
