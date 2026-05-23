@@ -86,9 +86,9 @@ if platform.is_nvidia:
                 scale = torch.empty(1, dtype=torch.float32, device=x.device)
                 _trtllm_per_tensor_quant_fp8(x, q, scale)
             else:
-                scale_shape = (*x.shape[:-1], 1)
-                scale = torch.empty(scale_shape, dtype=torch.float32, device=x.device)
+                scale = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
                 _trtllm_per_token_quant_fp8(x, q, scale)
+                scale = scale.unsqueeze(-1)
             return q, scale
 
         if granularity == "token_group":
