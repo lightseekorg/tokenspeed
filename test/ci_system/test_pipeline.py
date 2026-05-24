@@ -11,6 +11,8 @@ from pipeline import (
     check_perf_reference,
     extract_evalscope_score,
     extract_perf_summary_rows,
+    format_perf_reference_markdown_table,
+    format_perf_reference_table,
     resolve_score_threshold_for_runner,
     validate_task,
 )
@@ -452,3 +454,116 @@ def test_build_matrix_sort_is_stable_within_priority(tmp_path):
         ("a", "b200-4gpu"),
         ("b", "gb200-4gpu"),
     ]
+
+
+def _checks_fixture():
+    def mk(conc, la, lr, ta, tr, threshold=0.95):
+        return {
+            "conc": conc,
+            "Latency (tps/user)": {
+                "actual": la,
+                "ref": lr,
+                "floor": lr * threshold,
+                "passed": la >= lr * threshold,
+            },
+            "Throughput (tps/gpu)": {
+                "actual": ta,
+                "ref": tr,
+                "floor": tr * threshold,
+                "passed": ta >= tr * threshold,
+            },
+        }
+
+    return [
+        mk(1, 446.43, 423.21, 10014.97, 9679.21),
+        mk(2, 315.46, 312.51, 14877.08, 14635.51),
+        mk(16, 76.63, 78.31, 29807.71, 30845.64),
+    ]
+
+
+def test_format_perf_reference_table_columns_and_pct():
+    lines = format_perf_reference_table(_checks_fixture())
+    header, rule, *body = lines
+    assert "Conc" in header
+    assert "Lat actual" in header
+    assert "Lat ref" in header
+    assert "Lat floor" in header
+    # Header makes the comparison base explicit so readers do not have to
+    # guess whether the percentage is against `ref` or the threshold floor.
+    assert "Lat actual/ref" in header
+    assert "Thru actual" in header
+    assert "Thru ref" in header
+    assert "Thru floor" in header
+    assert "Thru actual/ref" in header
+    assert set(rule) == {"-"}
+    assert len(body) == 3
+    assert "446.43" in body[0]  # actual
+    assert "423.21" in body[0]  # ref
+    assert "402.05" in body[0]  # floor = 423.21 * 0.95
+    # 446.43 / 423.21 = 1.0549... -> 105.5%
+    assert "105.5%" in body[0]
+    # 76.63 / 78.31 = 0.9785... -> 97.9% (below 100%, sanity)
+    assert "97.9%" in body[2]
+
+
+def test_format_perf_reference_table_empty_when_no_checks():
+    assert format_perf_reference_table([]) == []
+
+
+def test_format_perf_reference_markdown_table_has_header_and_alignment():
+    lines = format_perf_reference_markdown_table(_checks_fixture())
+    assert lines[0].startswith("| Conc |")
+    assert "Lat ref" in lines[0]
+    assert "Lat floor" in lines[0]
+    assert "Lat actual/ref" in lines[0]
+    assert "Thru ref" in lines[0]
+    assert "Thru floor" in lines[0]
+    assert "Thru actual/ref" in lines[0]
+    # Alignment row: all-right-aligned (`---:`)
+    assert "---:" in lines[1]
+    # Body rows
+    assert lines[2].startswith("| 1 |")
+    assert "446.43" in lines[2]  # actual
+    assert "423.21" in lines[2]  # ref
+    assert "402.05" in lines[2]  # floor
+    assert "105.5%" in lines[2]
+    assert "97.9%" in lines[-1]
+
+
+def test_format_perf_reference_markdown_table_empty_when_no_checks():
+    assert format_perf_reference_markdown_table([]) == []
+
+
+def test_step_summary_embeds_perf_reference_table():
+    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 0.9,
+        "perf_reference": {16: [33.0, 26000.0]},
+    }
+    check = check_perf_reference(task, _command_results_with(rows), ["perf"])
+    summary = "\n".join(
+        build_step_summary_lines(_base_result(perf_reference_check=check))
+    )
+    # Comparison table interleaved so a passing run still shows actual,
+    # raw ref (non-threshold), threshold-adjusted floor, and actual/ref %.
+    assert "| Conc | Lat actual | Lat ref | Lat floor | Lat actual/ref" in summary
+    assert "Thru floor" in summary
+    assert "Thru actual/ref" in summary
+    assert "| 16 |" in summary
+    assert "%" in summary
+
+
+def test_perf_reference_table_rendered_for_passing_check(capsys):
+    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 0.9,
+        "perf_reference": {16: [33.0, 26000.0]},
+    }
+    check_perf_reference(task, _command_results_with(rows), ["perf"])
+    out = capsys.readouterr().out
+    # Even when status=passed, the per-conc comparison table is now printed
+    # to stdout (previously only failures were detailed).
+    assert "[perf-ref] threshold=0.9, status=passed" in out
+    assert "[perf-ref]   Conc" in out
+    assert "[perf-ref]   ---" in out
+    assert "%" in out
