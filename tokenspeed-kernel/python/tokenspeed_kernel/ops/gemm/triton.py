@@ -36,7 +36,7 @@ from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 logger = logging.getLogger(__name__)
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
-_MXFP8_SCALE = ScaleFormat(
+_MXFP8_BLOCK_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
     block_shape=(128, 128),
@@ -50,7 +50,7 @@ _FP8_CHANNEL_SCALE = ScaleFormat(
     granularity="channel",
 )
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE
+    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE
 )
 _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE

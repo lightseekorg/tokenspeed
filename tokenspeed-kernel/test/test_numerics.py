@@ -90,6 +90,27 @@ def test_gemm_input_generator_uses_signature_scale_metadata() -> None:
     assert inputs["block_size"] == [128, 128]
 
 
+def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
+    scale = ScaleFormat(
+        storage_dtype=torch.float32,
+        granularity="block",
+    )
+    signature = next(
+        iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="requires block_shape"):
+        generator.generate(M=4, N=256, K=128)
+
+
 class TestNumericsVerification:
     def _get_verifiable_specs(
         dtype: torch.dtype, family: str | None = None
