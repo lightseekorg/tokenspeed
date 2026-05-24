@@ -370,7 +370,7 @@ void HybridPrefixCache::OnMambaHostWriteBackDone(const std::vector<TreeNode*>& n
     }
     if (attached > 0 || completed > 0) {
         spdlog::debug("[HybridPrefixCache][mamba_l2] host writeback done attach_count={} completed_nodes={}", attached,
-                     completed);
+                      completed);
     }
     DemoteIdleMambaDeviceCopiesPresentOnHost();
 }
