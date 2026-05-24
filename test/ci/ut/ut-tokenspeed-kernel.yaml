@@ -4,6 +4,10 @@ type: ut
 triggers:
   - per-commit
   - manual
+# Shares the b300 box with eval-qwen3.5 / eval-kimi-k2.5 / perf-kimi-k2.5
+# (all b300-4gpu). Drop this one to `low` so the 4gpu jobs claim the box
+# first.
+priority: low
 runner:
   labels:
     - h100-1gpu
