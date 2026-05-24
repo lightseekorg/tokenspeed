@@ -39,12 +39,11 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ScaleFormat:
-    """Representation metadata for a tensor scale sidecar.
+    """Metadata representation for one tensor scale sidecar.
 
     Args:
         storage_dtype: Physical dtype used by the scale tensor.
-        granularity: Scale granularity, such as "tensor", "channel",
-            or "block".
+        granularity: Scale granularity, such as "tensor", "channel", "block".
         block_shape: Logical block shape covered by each scale value when
             granularity is block-based.
     """
@@ -62,12 +61,12 @@ class ScaleFormat:
 
 @dataclass(frozen=True)
 class TensorFormat:
-    """Storage representation for one logical tensor role.
+    """Metadata representation for one logical tensor.
 
     Args:
         storage_dtype: Physical dtype used by the main tensor payload.
-        format: Logical representation format, such as "dense",
-            "fp8", "mxfp8", "mxfp4", or "nvfp4".
+        format: Logical representation format, such as "dense", "fp8",
+            "mxfp8", "mxfp4", or "nvfp4".
         scale: Optional scale sidecar metadata bundled with this tensor role.
     """
 
@@ -83,7 +82,7 @@ class TensorFormat:
 
 @dataclass(frozen=True)
 class FormatSignature:
-    """Role-indexed tensor formats for one concrete operand-format combination.
+    """One concrete set of role-indexed tensor formats for all tensor operands.
 
     Each role appears at most once and maps to exactly one ``TensorFormat``.
     A kernel that supports alternatives for a role represents them as multiple
@@ -206,10 +205,9 @@ def format_signatures(
             dtype.
         scale: Optional scale sidecar metadata assigned to every role.
 
-    Use ``format="dense"`` for dense same-format signatures. Use
-    ``format_signature`` directly for mixed-role combinations such as dense
-    activations with quantized weights. This helper expands dtype alternatives
-    into separate signatures; it does not put multiple formats on one role.
+    This helper expands dtype alternatives into separate signatures; it does
+    not put multiple formats on one role. Use ``format_signature`` directly for
+    mixed-role combinations such as dense activations with quantized weights.
 
     Examples:
         >>> import torch
