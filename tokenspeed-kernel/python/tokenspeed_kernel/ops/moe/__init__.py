@@ -301,8 +301,19 @@ def moe_fused(
     * ``{"pre_routed"}``: routing already done by caller (cutlass, reference).
 
     Args:
-        weight_format: Weight tensor encoding. Supported values are ``"bf16"``,
-            ``"fp8"``, ``"mxfp4"``, and ``"nvfp4"``.
+        weight_format: Weight tensor encoding used for the expert weights.
+            Supported values are:
+
+            * ``"bf16"``: dense bfloat16 weights with no scale tensor.
+            * ``"fp8"``: FP8 E4M3 weights with float32 block scales.
+            * ``"mxfp4"``: packed MXFP4 weights stored as uint8 with uint8
+              block scales over 32-value blocks.
+            * ``"nvfp4"``: packed NVFP4 weights stored as uint8 with float32
+              block scales.
+
+            The activation/input format is selected by ``dtype``. When
+            ``dtype=torch.uint8``, ``weight_format`` disambiguates whether the
+            input is interpreted as MXFP4 or NVFP4.
     """
     signature = _moe_fused_format_signature(dtype, weight_format)
     selection_traits = dict(traits or {})
