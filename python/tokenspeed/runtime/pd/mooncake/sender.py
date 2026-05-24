@@ -71,9 +71,10 @@ class MooncakeKVSender:
     ):
         """
         Send the kv cache at the given kv indices to the decoder server
-        mla_l1_5_args: optional (page_transfer_mask, page_local_indices)
+        mla_l1_5_args: optional PageTransferMetadata dataclass with fields:
+            indices_are_local: whether page_local_indices are already in local address space
             page_transfer_mask: boolean mask to select decode pages that will receive data from this prefill rank
-            page_local_indices: remapped local page indices that this prefill rank will send
+            page_local_indices: remapped local page indices that this prefill rank will send (optional)
         bootstrap_token: first output token produced by prefill (shipped via ZMQ status msg).
         """
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))

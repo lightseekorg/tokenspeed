@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Minimal HTTP load balancer for prefill and decode servers used in tests."""
+"""Minimal HTTP load balancer for routing requests between prefill and decode servers."""
 
 import asyncio
 import contextlib
