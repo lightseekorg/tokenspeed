@@ -4,6 +4,9 @@ type: perf
 triggers:
   - per-commit
   - manual
+# Agentic perf claims the b300-4gpu box ahead of the b300-4gpu evals so
+# the long-running sweep starts on the freshest runner state.
+priority: high
 runner:
   labels:
     - b300-4gpu
