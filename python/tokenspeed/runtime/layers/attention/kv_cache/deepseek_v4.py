@@ -437,28 +437,9 @@ def _group_slot_mapping_from_raw(
 
 
 @dataclass
-class DeepseekV4ForwardMetadata:
+class DeepseekV4CacheMetadata:
     page_size: int
-    req_pool_indices: torch.Tensor
     block_table: torch.Tensor
-    seq_lens: torch.Tensor
-    query_lens: torch.Tensor
-    query_start_loc: torch.Tensor
-    token_to_req_indices: torch.Tensor
-    # Padding mask for CUDA graph replay rows; this is not mixed-batch state.
-    is_valid_token: Optional[torch.Tensor] = None
-    # CPU lens are retained for sparse prefill/indexer planning without
-    # forcing another device-to-host sync in the model path.
-    seq_lens_cpu: Optional[torch.Tensor] = None
-    query_lens_cpu: Optional[torch.Tensor] = None
-    # Cached split boundary derived from scheduler num_extends/query_lens.
-    num_prefill_reqs: int = 0
-    num_prefill_tokens: int = 0
-    forward_mode: object = None
-    decode_swa_indices: torch.Tensor | None = None
-    decode_swa_lens: torch.Tensor | None = None
-    decode_swa_window_size: int = 0
-    decode_swa_block_size: int = 0
     paged_cache_block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
     # Per-sliding-group [num_reqs] int32 base logical-page offset that
     # accompanies each compact block table. Consumers index sliding tables as
@@ -477,35 +458,6 @@ class DeepseekV4ForwardMetadata:
     decode_compressed_slot_mappings: dict[tuple[int, int], torch.Tensor] = field(
         default_factory=dict
     )
-    # Cache for dense compressed decode attention indices/lens. CSA decode uses
-    # dynamic top-k indices and does not populate this cache.
-    decode_dense_compressed_indices_cache: dict[
-        tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
-    ] = field(default_factory=dict)
-    decode_dense_compressed_indices_capture_safe_keys: set[
-        tuple[int, int, int, int]
-    ] = field(default_factory=set)
-    decode_indexer_schedule_metadata: dict[tuple[int, int, int], torch.Tensor] = field(
-        default_factory=dict
-    )
-    decode_indexer_plan_cache: dict[tuple[int, int, int], Any] = field(
-        default_factory=dict
-    )
-    decode_indexer_plan_refreshed_keys: set[tuple[int, int, int]] = field(
-        default_factory=set
-    )
-    prefill_indexer_plan_cache: dict[tuple[int, int, int], Any] = field(
-        default_factory=dict
-    )
-
-    def decode_req_count(self) -> int:
-        return max(0, int(self.req_pool_indices.shape[0]) - int(self.num_prefill_reqs))
-
-    def decode_token_count(self) -> int:
-        return max(
-            0,
-            int(self.token_to_req_indices.shape[0]) - int(self.num_prefill_tokens),
-        )
 
     def compressed_block_table(
         self,
@@ -528,32 +480,30 @@ class DeepseekV4ForwardMetadata:
 
     def _update_decode_compressed_slot_mapping(
         self,
+        *,
+        token_to_req_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
         compress_ratio: int,
         kv_cache_block_size: int,
     ) -> torch.Tensor:
-        num_tokens = self.token_to_req_indices.shape[0]
+        num_tokens = token_to_req_indices.shape[0]
         key = (compress_ratio, kv_cache_block_size)
         out = self.decode_compressed_slot_mappings.get(key)
-        if (
-            out is None
-            or out.shape[0] < num_tokens
-            or out.device != self.seq_lens.device
-        ):
+        if out is None or out.shape[0] < num_tokens or out.device != seq_lens.device:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "DeepSeek V4 compressed slot metadata must be allocated before "
                     "CUDA graph capture"
                 )
             with torch.inference_mode(False):
-                out = torch.empty(
-                    num_tokens, dtype=torch.int64, device=self.seq_lens.device
-                )
+                out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
             self.decode_compressed_slot_mappings[key] = out
 
         block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
         if block_table is not self.block_table:
-            req_idx = self.token_to_req_indices[:num_tokens].to(torch.int64)
-            positions = self.seq_lens[req_idx].to(torch.int64) - 1
+            req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
+            positions = seq_lens[req_idx].to(torch.int64) - 1
             compressed_pos = torch.div(
                 positions,
                 compress_ratio,
@@ -577,37 +527,48 @@ class DeepseekV4ForwardMetadata:
 
         return deepseek_v4_compressed_slot_mapping(
             num_tokens=num_tokens,
-            query_start_loc=self.query_start_loc,
-            seq_lens=self.seq_lens,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
             block_table=self.block_table,
             block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
             out=out,
         )
 
-    def refresh_decode_compressed_slot_mappings(self) -> None:
-        if self.forward_mode is None or not self.forward_mode.is_decode():
-            return
+    def refresh_decode_compressed_slot_mappings(
+        self,
+        *,
+        token_to_req_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
         for compress_ratio, kv_cache_block_size in list(
             self.decode_compressed_slot_mappings
         ):
             self._update_decode_compressed_slot_mapping(
-                compress_ratio,
-                kv_cache_block_size,
+                token_to_req_indices=token_to_req_indices,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                compress_ratio=compress_ratio,
+                kv_cache_block_size=kv_cache_block_size,
             )
 
     def compressed_slot_mapping(
         self,
         positions: torch.Tensor,
         compress_ratio: int,
+        *,
+        token_to_req_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
         kv_cache_block_size: int | None = None,
+        use_decode_cache: bool = False,
     ) -> torch.Tensor:
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
         block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
         if (
-            self.forward_mode is not None
-            and self.forward_mode.is_decode()
+            use_decode_cache
             and positions.is_cuda
             and (block_table.is_cuda or self.block_table.is_cuda)
         ):
@@ -617,12 +578,15 @@ class DeepseekV4ForwardMetadata:
             if (
                 cached is not None
                 and cached.shape[0] >= positions.numel()
-                and cached.device == self.seq_lens.device
+                and cached.device == seq_lens.device
             ):
                 return cached[: positions.numel()]
             mapping = self._update_decode_compressed_slot_mapping(
-                compress_ratio,
-                kv_cache_block_size,
+                token_to_req_indices=token_to_req_indices,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                compress_ratio=compress_ratio,
+                kv_cache_block_size=kv_cache_block_size,
             )
             return mapping[: positions.numel()]
         compressed_pos = torch.div(
@@ -632,7 +596,7 @@ class DeepseekV4ForwardMetadata:
             compressed_pos, kv_cache_block_size, rounding_mode="floor"
         )
         offsets = compressed_pos % kv_cache_block_size
-        req_idx = self.token_to_req_indices[: positions.numel()].long()
+        req_idx = token_to_req_indices[: positions.numel()].long()
         if block_table is self.block_table:
             page_ids = block_table[req_idx, page_indices.long()].to(torch.int64)
         else:

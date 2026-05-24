@@ -11,8 +11,8 @@
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 #
-# DeepSeek V4 attention helpers keep runtime validation and reference paths here;
-# production Triton kernels live under tokenspeed-kernel ops.
+# DeepSeek V4 attention helpers keep runtime validation here; production Triton
+# kernels live under tokenspeed-kernel ops.
 
 """DeepSeek V4 attention kernel boundaries.
 
@@ -48,9 +48,6 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_gather_indexer_mxfp4_cache,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_save_compressor_state as _triton_save_compressor_state,
@@ -196,32 +193,6 @@ def _fp8_e4m3_pow2_bytes(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     return scaled.to(torch.float8_e4m3fn).view(torch.uint8), block.new_tensor(scale)
 
 
-def _fp8_e4m3_pow2_dequant_rows(
-    rows: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows_f = rows.float()
-    scale = (rows_f.detach().abs().amax(dim=-1) / DEEPSEEK_V4_FP8_MAX).clamp_min(
-        1.0e-10
-    )
-    scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
-    scaled = torch.clamp(
-        rows_f / scale.unsqueeze(-1),
-        -DEEPSEEK_V4_FP8_MAX,
-        DEEPSEEK_V4_FP8_MAX,
-    )
-    dequant = scaled.to(torch.float8_e4m3fn).float() * scale.unsqueeze(-1)
-    return dequant, scale
-
-
-def _e2m1_nibbles(x: torch.Tensor) -> torch.Tensor:
-    abs_x = torch.clamp(x.abs(), max=6.0)
-    code = torch.zeros_like(abs_x, dtype=torch.uint8)
-    for idx, boundary in enumerate((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)):
-        code = torch.where(abs_x > boundary, idx + 1, code)
-    sign = ((x < 0) & (code != 0)).to(torch.uint8)
-    return code | (sign << 3)
-
-
 def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
     table = nibbles.new_tensor(
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
@@ -229,24 +200,6 @@ def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
     magnitude = table[(nibbles & 0x7).long()]
     sign = torch.where((nibbles & 0x8) != 0, -1.0, 1.0)
     return magnitude * sign
-
-
-def _mxfp4_e2m1_ue8m0_dequant_rows(rows: torch.Tensor) -> torch.Tensor:
-    orig_shape = rows.shape
-    if orig_shape[-1] % DEEPSEEK_V4_MXFP4_BLOCK_SIZE != 0:
-        raise ValueError(
-            f"MXFP4 rows require last dim divisible by {DEEPSEEK_V4_MXFP4_BLOCK_SIZE}, "
-            f"got {orig_shape[-1]}"
-        )
-    blocks = rows.float().reshape(
-        -1, orig_shape[-1] // DEEPSEEK_V4_MXFP4_BLOCK_SIZE, DEEPSEEK_V4_MXFP4_BLOCK_SIZE
-    )
-    absmax = blocks.detach().abs().amax(dim=-1).clamp_min(1.0e-4)
-    exponent = torch.ceil(torch.log2(absmax / 6.0)).clamp(-127, 127)
-    scale = torch.pow(2.0, exponent)
-    nibbles = _e2m1_nibbles(blocks / scale.unsqueeze(-1))
-    dequant = _e2m1_values(nibbles) * scale.unsqueeze(-1)
-    return dequant.reshape(orig_shape)
 
 
 def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
@@ -268,7 +221,7 @@ def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
     return rotated.reshape(shape)
 
 
-def deepseek_v4_inv_rope_reference(
+def deepseek_v4_inv_rope_grouped(
     o: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
@@ -355,50 +308,6 @@ def dequantize_deepseek_v4_fp8_ds_mla_cache(
     out = torch.cat([nope.float() * scales, rope.view(torch.bfloat16).float()], dim=1)
     out = out.to(torch.bfloat16)
     return torch.where(valid[:, None], out, torch.zeros_like(out))
-
-
-def deepseek_v4_prepare_indexer_q_reference(
-    index_q: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    weights: torch.Tensor,
-    softmax_scale: float,
-    head_scale: float,
-    use_fp4: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply indexer Q RoPE and quant/dequant with folded weight rules."""
-
-    if index_q.dim() != 3:
-        raise ValueError(f"index_q must be [tokens, heads, dim], got {index_q.shape}")
-    rope_dim = int(cos_sin_cache.shape[-1])
-    if index_q.shape[-1] <= rope_dim:
-        raise ValueError(
-            f"index_q dim must be larger than rope_dim={rope_dim}, got {index_q.shape}"
-        )
-    if weights.dim() == 3:
-        weights = weights.squeeze(-1)
-    if weights.shape != index_q.shape[:2]:
-        raise ValueError(f"weights must be [tokens, heads], got {tuple(weights.shape)}")
-
-    rotated = index_q.float().clone()
-    half_rope = rope_dim // 2
-    nope_dim = index_q.shape[-1] - rope_dim
-    cos = cos_sin_cache[positions.long(), :half_rope].float().unsqueeze(1)
-    sin = cos_sin_cache[positions.long(), half_rope:rope_dim].float().unsqueeze(1)
-    even = rotated[..., nope_dim::2].clone()
-    odd = rotated[..., nope_dim + 1 :: 2].clone()
-    rotated[..., nope_dim::2] = even * cos - odd * sin
-    rotated[..., nope_dim + 1 :: 2] = even * sin + odd * cos
-
-    rotated = _deepseek_v4_hadamard_rotate(rotated).float()
-    weights_out = weights.float().clone()
-    if use_fp4:
-        q_out = _mxfp4_e2m1_ue8m0_dequant_rows(rotated)
-        weights_out *= softmax_scale * head_scale
-    else:
-        q_out, q_scale = _fp8_e4m3_pow2_dequant_rows(rotated)
-        weights_out *= q_scale * softmax_scale * head_scale
-    return q_out.to(index_q.dtype), weights_out
 
 
 def deepseek_v4_prepare_indexer_q_mxfp4(
@@ -871,40 +780,6 @@ def read_deepseek_v4_indexer_fp8_cache(
         )
         out[token_idx].copy_(values.float() * scale)
     return out
-
-
-def deepseek_v4_indexer_topk_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    top_k: int,
-    lengths: torch.Tensor | None = None,
-    row_starts: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Reference weighted ReLU MQA top-k for the CSA sparse indexer."""
-
-    if q.dim() != 3 or k.dim() != 2:
-        raise ValueError(
-            f"expected q [tokens, heads, dim], k [kv, dim], got {q.shape}, {k.shape}"
-        )
-    if q.shape[-1] != k.shape[-1]:
-        raise ValueError(f"q/k dims must match, got {q.shape[-1]} and {k.shape[-1]}")
-    if weights.dim() == 3:
-        weights = weights.squeeze(-1)
-    if weights.shape != q.shape[:2]:
-        raise ValueError(f"weights must be [tokens, heads], got {weights.shape}")
-
-    logits = torch.einsum("thd,kd->thk", q.float(), k.float()).relu()
-    logits = (logits * weights.float().unsqueeze(-1)).sum(dim=1)
-    if lengths is not None:
-        if row_starts is None:
-            row_starts = torch.zeros_like(lengths)
-        cols = torch.arange(k.shape[0], device=k.device)
-        valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
-            cols.unsqueeze(0) < (row_starts + lengths).unsqueeze(1)
-        )
-        logits = logits.masked_fill(~valid, -float("inf"))
-    return torch.topk(logits, k=top_k, dim=-1, sorted=False).indices.to(torch.int32)
 
 
 def _compress_v4_state_windows_capturable(
