@@ -29,8 +29,8 @@
   load-update watcher.
 * ``recv_from_detokenizer`` — ``PULL`` socket on
   ``PortArgs.tokenizer_ipc_name``; receives ``BatchStrOut`` /
-  ``BatchTokenIDOut`` / ``BatchEmbeddingOut`` / ``BatchMultimodalOut``
-  and control-plane replies from the scheduler.
+  ``BatchTokenIDOut`` / ``BatchEmbeddingOut`` and control-plane replies from
+  the scheduler.
 
 Concrete (not ABC): tokenspeed has a single transport (ZMQ in-proc
 over ``PortArgs``-provided names) and a single caller (``AsyncLLM``),

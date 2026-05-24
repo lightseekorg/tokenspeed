@@ -28,17 +28,10 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from tokenspeed.runtime.engine.request import BaseFinishReason
+from tokenspeed.runtime.engine.request_types import BaseFinishReason
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-from tokenspeed.runtime.utils import ImageData
-
-# Handle serialization of Image for pydantic
-if TYPE_CHECKING:
-    from PIL.Image import Image
-else:
-    Image = Any
 
 
 @dataclass
@@ -63,21 +56,6 @@ class SessionParams:
     replace: bool | None = None
 
 
-# Type definitions for multimodal input data
-# Individual data item types for each modality
-ImageDataInputItem = Image | str | ImageData | dict
-AudioDataInputItem = str | dict
-VideoDataInputItem = str | dict
-# Union type for any multimodal data item
-MultimodalDataInputItem = ImageDataInputItem | VideoDataInputItem | AudioDataInputItem
-# Format types supporting single items, lists, or nested lists for batch processing
-MultimodalDataInputFormat = (
-    list[list[MultimodalDataInputItem]]
-    | list[MultimodalDataInputItem]
-    | MultimodalDataInputItem
-)
-
-
 @dataclass
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
@@ -87,13 +65,13 @@ class GenerateReqInput:
     input_multi_ids: list[list[int]] | list[list[int]] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
-    # The image input. It can be a file name, a url, or base64 encoded string.
-    # See also python/tokenspeed/runtime/utils/common.py:load_image.
-    image_data: list[str] | str | None = None
-    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
-    video_data: MultimodalDataInputFormat | None = None
-    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: MultimodalDataInputFormat | None = None
+    # Pre-built MultimodalInputs (already produced by an upstream preprocessor,
+    # e.g. SMG's Rust crates/multimodal pipeline). The engine's InputProcessor
+    # uses this directly (it does no in-process image preprocessing). input_ids
+    # must already contain expanded image placeholder tokens at the right
+    # offsets — the gateway is responsible for that. Typed as Any to avoid a
+    # circular import on MultimodalInputs.
+    precomputed_multimodal_inputs: Any | None = None
     # The sampling_params. See descriptions below.
     sampling_params: list[dict] | dict | None = None
     input_extra_infos: list[dict] | dict | None = None
@@ -116,9 +94,6 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
-
-    # The modalities of the image data [image, multi-images, video]
-    modalities: list[str] | None = None
 
     # Session info for continual prompting
     session_params: list[dict] | dict | None = None
@@ -235,13 +210,6 @@ class GenerateReqInput:
                 # Expand parallel_sample_num
                 num = self.batch_size * self.parallel_sample_num
 
-            if not self.image_data:
-                self.image_data = [None] * num
-            elif not isinstance(self.image_data, list):
-                self.image_data = [self.image_data] * num
-            elif isinstance(self.image_data, list):
-                pass
-
             if self.sampling_params is None:
                 self.sampling_params = [{}] * num
             elif not isinstance(self.sampling_params, list):
@@ -334,6 +302,11 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            # precomputed_multimodal_inputs is a single prompt's MM; the SMG
+            # path only clears is_single via n>1 (batch_size == 1), so all n
+            # parallel samples correctly share it. Without this the image is
+            # silently dropped on the n>1 fan-out (placeholders -> text path).
+            precomputed_multimodal_inputs=self.precomputed_multimodal_inputs,
             input_multi_ids=(
                 self.input_multi_ids[i] if self.input_multi_ids is not None else None
             ),
@@ -345,7 +318,6 @@ class GenerateReqInput:
                 if self.input_extra_infos is not None
                 else None
             ),
-            image_data=self.image_data[i],
             sampling_params=self.sampling_params[i],
             user_rid=self.user_rid[i],
             return_logprob=self.return_logprob[i],
@@ -355,7 +327,6 @@ class GenerateReqInput:
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
-            modalities=self.modalities[i] if self.modalities else None,
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -422,6 +393,10 @@ class TokenizedGenerateReqInput:
 
     input_multi_ids: list[list[int]] = None
     input_extra_infos: list[dict] | None = None
+    # Original prompt ids before multimodal pad/hash replacement. The scheduler
+    # uses input_ids, while detokenization must use these tokenizer-valid ids.
+    input_ids_unpadded: list[int] | None = None
+    multimodal_inputs: Any | None = None
 
 
 @dataclass
@@ -579,12 +554,6 @@ class BatchTokenIDOut:
 
 
 @dataclass
-class BatchMultimodalDecodeReq:
-    # The request id
-    rids: list[str]
-
-
-@dataclass
 class BatchStrOut:
     # The request id
     rids: list[str]
@@ -623,12 +592,6 @@ class BatchStrOut:
     output_extra_infos: list[dict[str, Any]]
 
     generated_time: int
-
-
-@dataclass
-class BatchMultimodalOut:
-    # The request id
-    rids: list[str]
 
 
 @dataclass
