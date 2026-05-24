@@ -31,6 +31,13 @@ except ImportError as exc:  # pragma: no cover
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
+# Lower sort key = dispatched earlier. GitHub Actions starts matrix jobs in
+# include-list order, so `high` entries reach runner pools first when several
+# jobs contend for the same label (typical case: heavy 4gpu evals beating a
+# 1gpu unit-test for the same b300 box).
+SUPPORTED_PRIORITIES = ("high", "normal", "low")
+DEFAULT_PRIORITY = "normal"
+_PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 STALE_PROCESS_PATTERNS = [
     r"ts serve",
@@ -107,6 +114,37 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 raise ValueError(
                     f"{path}: runner.env[{label!r}] must be a string mapping"
                 )
+    if "priority" in data:
+        priority = data["priority"]
+        if isinstance(priority, str):
+            if priority not in SUPPORTED_PRIORITIES:
+                raise ValueError(
+                    f"{path}: priority must be one of "
+                    f"{sorted(SUPPORTED_PRIORITIES)}; got {priority!r}"
+                )
+        elif isinstance(priority, dict):
+            unknown_labels = sorted(set(priority) - set(labels))
+            if unknown_labels:
+                raise ValueError(
+                    f"{path}: priority contains unknown labels: {unknown_labels}"
+                )
+            bad_values = sorted(
+                {
+                    value
+                    for value in priority.values()
+                    if value not in SUPPORTED_PRIORITIES
+                }
+            )
+            if bad_values:
+                raise ValueError(
+                    f"{path}: priority values must each be one of "
+                    f"{sorted(SUPPORTED_PRIORITIES)}; got {bad_values}"
+                )
+        else:
+            raise ValueError(
+                f"{path}: priority must be a string or a per-label mapping; "
+                f"got {type(priority).__name__}"
+            )
 
 
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
@@ -139,21 +177,48 @@ def find_task_files(root: Path) -> List[Path]:
     return sorted(root.rglob("*.yaml"))
 
 
+def resolve_priority_for_label(priority: Any, label: str) -> str:
+    """Pick the effective priority for ``label`` from the task's ``priority``.
+
+    - Missing / ``None`` -> ``DEFAULT_PRIORITY``.
+    - String -> applies to every label.
+    - Mapping -> only the listed labels are overridden; everything else
+      stays at ``DEFAULT_PRIORITY``. ``validate_task`` is the source of
+      truth for accepted keys and values.
+    """
+    if priority is None:
+        return DEFAULT_PRIORITY
+    if isinstance(priority, str):
+        return priority
+    if isinstance(priority, dict):
+        return priority.get(label, DEFAULT_PRIORITY)
+    return DEFAULT_PRIORITY
+
+
 def build_matrix(root: Path, repo_root: Path, trigger: str | None) -> Dict[str, Any]:
     include = []
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
             continue
-        for label in resolve_runner_labels(task["runner"]["labels"]):
+        priority = task.get("priority")
+        for label in task["runner"]["labels"]:
+            # `priority` keys are the labels as written in YAML, so look
+            # up before `resolve_runner_label` rewrites b200 to b200v2.
+            effective = resolve_priority_for_label(priority, label)
             include.append(
                 {
                     "name": task["name"],
                     "type": task["type"],
                     "config": task["_source_path"],
-                    "runner": label,
+                    "runner": resolve_runner_label(label),
+                    "priority": effective,
                 }
             )
+    # Stable sort: tasks at the same priority keep their file-path / label
+    # order, so tasks that omit `priority` see no change from the previous
+    # behaviour.
+    include.sort(key=lambda entry: _PRIORITY_ORDER[entry["priority"]])
     return {"include": include}
 
 

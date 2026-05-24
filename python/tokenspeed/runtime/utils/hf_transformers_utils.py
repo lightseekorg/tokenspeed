@@ -73,19 +73,31 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
+def resolve_architecture(config: PretrainedConfig) -> str:
+    """Return ``config.architectures[0]`` or the config class name.
+
+    ``config.architectures`` can be ``None`` on configs that forward
+    attribute access to a nested ``text_config`` (e.g. ``Qwen3_5MoeConfig``).
+    Callers should use this helper instead of indexing the list directly.
+    """
+    archs = getattr(config, "architectures", None)
+    if archs:
+        return archs[0]
+    return type(config).__name__
+
+
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
     """
-    if config.architectures is not None:
-        class_name = config.architectures[0]
-        if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
-            # We support non-hf version of llava models, so we do not want to
-            # read the wrong values from the unused default text_config.
-            #  We set `torch_dtype` of config to `torch.float16` for the weights, as
-            # `torch.float16` is default used for image features in `python/tokenspeed/runtime/models/llava.py`.
-            setattr(config, "torch_dtype", torch.float16)
-            return config
+    class_name = resolve_architecture(config)
+    if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
+        # We support non-hf version of llava models, so we do not want to
+        # read the wrong values from the unused default text_config.
+        #  We set `torch_dtype` of config to `torch.float16` for the weights, as
+        # `torch.float16` is default used for image features in `python/tokenspeed/runtime/models/llava.py`.
+        setattr(config, "torch_dtype", torch.float16)
+        return config
 
     text_config = None
     if hasattr(config, "text_config"):
@@ -133,6 +145,34 @@ def get_hf_text_config(config: PretrainedConfig):
     return text_config
 
 
+def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> None:
+    """Ensure ``config.architectures`` resolves to a real ``list[str]``.
+
+    HuggingFace's ``from_pretrained`` sometimes returns a config whose
+    ``.architectures`` attribute resolves to ``None`` via ``__getattr__``
+    forwarding to a nested text_config (observed on ``Qwen3_5MoeConfig``;
+    likely to repeat on any wrapper class with the same pattern). The
+    on-disk ``config.json`` is the source of truth, so pin its value
+    onto ``config.__dict__`` when the live config has lost it. Bypasses
+    ``__setattr__`` deliberately — that's the only way around the
+    ``__getattr__`` redirect.
+
+    Silently no-ops when the raw value is missing, empty, or not a
+    ``list[str]``; downstream code already handles the absence via
+    ``resolve_architecture``.
+    """
+    if getattr(config, "architectures", None):
+        return
+    raw_archs = raw_config.get("architectures")
+    if not (
+        isinstance(raw_archs, list)
+        and raw_archs
+        and all(isinstance(a, str) for a in raw_archs)
+    ):
+        return
+    config.__dict__["architectures"] = list(raw_archs)
+
+
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -150,15 +190,16 @@ def get_config(
 
     try:
         with open(os.path.join(model_path, "config.json")) as file:
-            config = json.load(file)
+            raw_config = json.load(file)
     except FileNotFoundError:
         raise RuntimeError(f"Config file not found in {model}. Please check the path.")
     except json.JSONDecodeError:
         raise RuntimeError(
             f"Failed to decode JSON from config file in {model}. Please ensure the file is valid JSON."
         )
-    if config.get("model_type", "llama") in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[config["model_type"]]
+
+    if raw_config.get("model_type", "llama") in _CONFIG_REGISTRY:
+        config_class = _CONFIG_REGISTRY[raw_config["model_type"]]
         config = config_class.from_pretrained(model, revision=revision)
         setattr(config, "_name_or_path", model)
     else:
@@ -168,6 +209,8 @@ def get_config(
             )
         except ValueError as e:
             raise e
+
+    _materialize_architectures(config, raw_config)
 
     # extract 'text_config'
     text_config = get_hf_text_config(config)
@@ -180,10 +223,16 @@ def get_config(
             )
             del text_config.quantization_config["modules_to_not_convert"]
 
-    # Adapt to the case where the draft head and base model are placed together.
-    # Check if config.architectures already points at a draft implementation.
+    # If the draft head ships in the same checkpoint as the base model,
+    # rewrite the architecture in place so the model loader dispatches
+    # to the *NextN / *Eagle3 entry class instead of the base one.
+    # ``architectures`` is guaranteed non-None here when the on-disk
+    # config.json declared it (see the source-of-truth pin above);
+    # the truthiness check stays for configs that genuinely lack the
+    # field.
     if (
         is_draft_worker
+        and config.architectures
         and "NextN" not in config.architectures[0]
         and "Eagle" not in config.architectures[0]
     ):
@@ -198,12 +247,7 @@ def get_config(
     if model_override_args:
         text_config.update(model_override_args)
 
-    # update text_config for qwen3.5
-    # config.architectures may be None if Qwen3_5MoeConfig.__getattr__ redirects to
-    # text_config (which has architectures=None) in certain subprocess environments.
-    # Fall back to checking the config class name when architectures is unavailable.
-    _arch = config.architectures[0] if config.architectures else type(config).__name__
-    if _arch in [
+    if resolve_architecture(config) in [
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",
@@ -211,11 +255,6 @@ def get_config(
         "Qwen3_5ForConditionalGenerationNextN",
     ]:
         config.text_config = text_config
-        # Ensure architectures is set in the instance __dict__ so downstream code
-        # doesn't get redirected via __getattr__ to text_config.architectures
-        # (which may be ['Qwen2ForCausalLM'] or None).
-        if not config.architectures:
-            config.__dict__["architectures"] = ["Qwen3_5MoeForConditionalGeneration"]
         return config
 
     return text_config

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.activation.triton import (
+    fused_gate_sigmoid_mul_add,
+    sigmoid_mul,
+)
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
@@ -108,3 +111,54 @@ def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:
     gate = torch.randn(4, 2, 4, 4, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="gate must be 2D or 3D"):
         sigmoid_mul(x, gate)
+
+
+# --- fused_gate_sigmoid_mul_add tests ---
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_dim",
+    [(1, 3584), (1, 5120), (17, 3584), (128, 5120), (256, 3584)],
+)
+def test_fused_gate_sigmoid_mul_add_matches_eager(
+    dtype: torch.dtype, num_tokens: int, hidden_dim: int, device: str
+) -> None:
+    hidden_states = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    gate_weight = torch.randn(hidden_dim, device=device, dtype=dtype)
+    shared_output = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    final = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+
+    # Eager reference
+    gate_val = (hidden_states.float() @ gate_weight.float().unsqueeze(1)).sigmoid()
+    ref = final.float() + gate_val * shared_output.float()
+    ref = ref.to(dtype)
+
+    out = fused_gate_sigmoid_mul_add(
+        hidden_states, gate_weight, shared_output.clone(), final.clone()
+    )
+
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_fused_gate_sigmoid_mul_add_is_inplace(device: str) -> None:
+    hidden_states = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+    gate_weight = torch.randn(256, device=device, dtype=torch.bfloat16)
+    shared_output = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+    final = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+
+    result = fused_gate_sigmoid_mul_add(
+        hidden_states, gate_weight, shared_output, final
+    )
+    assert result.data_ptr() == final.data_ptr()
+
+
+def test_fused_gate_sigmoid_mul_add_empty(device: str) -> None:
+    hidden_states = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+    gate_weight = torch.randn(256, device=device, dtype=torch.bfloat16)
+    shared_output = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+    final = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+
+    out = fused_gate_sigmoid_mul_add(hidden_states, gate_weight, shared_output, final)
+    assert out.shape == (0, 256)

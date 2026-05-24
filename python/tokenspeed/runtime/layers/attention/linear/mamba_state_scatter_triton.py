@@ -168,7 +168,7 @@ def _mamba_state_snapshot_kernel(
         tl.store(pool_ptr + dst_offset + offsets, data, mask=mask)
 
 
-def fused_mamba_state_snapshot(
+def fused_mamba_state_copy(
     pool: torch.Tensor,  # [num_layers, pool_size, *state_shape]
     src_indices: torch.Tensor,  # [num_valid]
     dst_indices: torch.Tensor,  # [num_valid]
@@ -176,18 +176,21 @@ def fused_mamba_state_snapshot(
     page_size: int = 0,  # 0 means no page filtering
 ):
     """
-    Snapshot mamba states: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
+    Copy mamba states: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
 
-    Specialized for checkpoint snapshot with page-boundary filtering.
-    When page_size > 0 and cache_lengths is provided, skips entries where
-    cache_lengths[i] % page_size != 0 (all done inside a single kernel).
+    Handles both COW copy and checkpoint snapshot. Invalid indices (< 0 or
+    >= pool_size) are skipped inside the kernel. When page_size > 0 and
+    cache_lengths is provided, also skips entries where
+    cache_lengths[i] % page_size != 0.
 
     Args:
         pool: State tensor [num_layers, pool_size, *state_shape], must be contiguous.
         src_indices: Source slot indices [num_valid], int32 or int64.
         dst_indices: Destination slot indices [num_valid], int32 or int64.
         cache_lengths: Per-entry cache lengths for page-boundary filtering.
-        page_size: Page size for filtering; 0 disables.
+        page_size: When > 0, only copy entries where cache_lengths[i] is
+            aligned to page_size. Set to 0 to disable filtering (used by
+            COW copy where all valid entries must be copied).
     """
     num_valid = src_indices.shape[0]
     if num_valid == 0:
@@ -233,6 +236,91 @@ def fused_mamba_state_snapshot(
         dst_indices,
         cache_lengths,
         page_size,
+        elem_per_entry,
+        layer_stride,
+        req_stride,
+        pool_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+
+
+@triton.jit
+def _mamba_state_zero_kernel(
+    pool_ptr,
+    indices_ptr,  # [bs] — indices to zero; negative values are skipped
+    elem_per_entry: tl.constexpr,
+    layer_stride,
+    req_stride,
+    pool_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Zero kernel: pool[:, indices[i], :] = 0
+    Skips entries where indices[i] < 0 or indices[i] >= pool_size.
+
+    Grid: (bs, num_layers) — loops over elem_per_entry internally.
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+
+    idx = tl.load(indices_ptr + pid_req).to(tl.int64)
+
+    # Skip invalid entries (negative sentinel from torch.where)
+    if (idx < 0) | (idx >= pool_size):
+        return
+
+    dst_offset = pid_layer * layer_stride + idx * req_stride
+
+    zero_val = tl.zeros([BLOCK_SIZE], dtype=pool_ptr.dtype.element_ty)
+    for start in tl.static_range(0, elem_per_entry, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < elem_per_entry
+        tl.store(pool_ptr + dst_offset + offsets, zero_val, mask=mask)
+
+
+def fused_mamba_state_zero(
+    pool: torch.Tensor,  # [num_layers, pool_size, *state_shape]
+    indices: torch.Tensor,  # [bs] — slots to zero; negative values skipped inside kernel
+):
+    """
+    Zero mamba states: pool[:, indices[i], :] = 0 for valid indices.
+
+    Invalid indices (< 0) are skipped inside the kernel, avoiding any
+    CPU-GPU synchronization from boolean indexing or .any() checks.
+
+    Args:
+        pool: State tensor [num_layers, pool_size, *state_shape], must be contiguous.
+        indices: Slot indices [bs], int64. Negative values are treated as invalid
+            and skipped (no-op).
+    """
+    bs = indices.shape[0]
+    if bs == 0:
+        return
+
+    if not pool.is_cuda:
+        raise ValueError("fused_mamba_state_zero only supports CUDA tensors.")
+    if not pool.is_contiguous():
+        raise ValueError("pool tensor must be contiguous")
+    if pool.ndim < 2:
+        raise ValueError(f"pool must be at least 2D, got {pool.ndim}D")
+
+    num_layers = pool.shape[0]
+    pool_size = pool.shape[1]
+    elem_per_entry = pool.numel() // (num_layers * pool_size)
+
+    layer_stride = pool.stride(0)
+    req_stride = pool.stride(1)
+
+    if not indices.is_contiguous():
+        indices = indices.contiguous()
+
+    BLOCK_SIZE = 8192
+    grid = (bs, num_layers)
+
+    _mamba_state_zero_kernel[grid](
+        pool,
+        indices,
         elem_per_entry,
         layer_stride,
         req_stride,

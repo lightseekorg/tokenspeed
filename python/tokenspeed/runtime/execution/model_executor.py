@@ -502,6 +502,47 @@ class ModelExecutor:
         self.num_generated_tokens += int(results.output_lengths.sum().item())
         self.num_decode_steps += bs
 
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _compute_mtp_snapshot_indices(
+        valid_cache_lengths: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        accept_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        track_indices: torch.Tensor,
+        sentinel: torch.Tensor,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused elementwise pipeline computing snapshot src/dst for MTP.
+
+        All operations are batched and fused by torch.compile into a single
+        Triton kernel (plus the two gathers), eliminating the ~14 individual
+        elementwise kernel launches of the eager implementation.
+        """
+        new_cl = valid_cache_lengths[req_pool_indices]
+        old_cl = new_cl - accept_lengths.to(new_cl.dtype)
+        first_boundary = ((old_cl // page_size) + 1) * page_size
+
+        step_raw = first_boundary - old_cl - 1
+        max_col = output_indices.shape[1] - 1
+        step = step_raw.clamp(min=0, max=max_col).to(torch.int64)
+
+        bs = req_pool_indices.shape[0]
+        req_range = torch.arange(bs, device=req_pool_indices.device)
+        src_raw = output_indices[req_range, step].to(torch.int64)
+        dst_raw = track_indices.to(torch.int64)
+
+        invalid = (
+            (first_boundary > new_cl)
+            | (dst_raw < 0)
+            | (src_raw < 0)
+            | (src_raw == dst_raw)
+            | (step_raw < 0)
+        )
+        src = torch.where(invalid, sentinel, src_raw)
+        dst = torch.where(invalid, sentinel, dst_raw)
+        return src, dst
+
     def _snapshot_mamba_checkpoints(
         self,
         accept_lengths: torch.Tensor,
@@ -549,27 +590,15 @@ class ModelExecutor:
             if output_indices is None:
                 return
 
-            new_cl = self.runtime_states.valid_cache_lengths[req_pool_indices]
-            old_cl = new_cl - accept_lengths[:bs].to(device=dev, dtype=new_cl.dtype)
-            first_boundary = ((old_cl // page_size) + 1) * page_size
-
-            step_raw = first_boundary - old_cl - 1
-            max_col = output_indices.shape[1] - 1
-            step = step_raw.clamp(min=0, max=max_col).to(torch.int64)
-
-            req_range = torch.arange(bs, device=dev)
-            src_raw = output_indices[req_range, step].to(torch.int64)
-            dst_raw = track_indices.to(device=dev, dtype=torch.int64)
-
-            invalid = (
-                (first_boundary > new_cl)
-                | (dst_raw < 0)
-                | (src_raw < 0)
-                | (src_raw == dst_raw)
-                | (step_raw < 0)
+            src, dst = self._compute_mtp_snapshot_indices(
+                self.runtime_states.valid_cache_lengths,
+                req_pool_indices,
+                accept_lengths[:bs].to(device=dev),
+                output_indices,
+                track_indices,
+                sentinel,
+                page_size,
             )
-            src = torch.where(invalid, sentinel, src_raw)
-            dst = torch.where(invalid, sentinel, dst_raw)
 
             self.runtime_states.snapshot_mamba_checkpoints(
                 src,
