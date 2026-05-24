@@ -55,7 +55,13 @@ from tokenspeed_kernel.selection import (
     spec_matches_traits,
     warmup_selection,
 )
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 from utils import register_all_samples
 
 pytestmark = pytest.mark.usefixtures("fresh_registry")
@@ -556,6 +562,96 @@ class TestSelectKernel:
                 platform=h100_platform,
                 traits={"head_dim": 128},
             )
+
+    def test_selects_exact_mixed_operand_signature(self, h100_platform):
+        reg = KernelRegistry.get()
+        scale = ScaleFormat(
+            storage_dtype=torch.uint8,
+            granularity="block",
+            block_shape=(32,),
+        )
+        mixed_signature = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=tensor_format("mxfp4", torch.uint8, scale=scale),
+        )
+        dense_uint8_signature = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.uint8),
+        )
+
+        reg.register(
+            KernelSpec(
+                name="dense_uint8",
+                family="gemm",
+                mode="mm",
+                solution="test",
+                format_signatures=frozenset({dense_uint8_signature}),
+                priority=19,
+            ),
+            lambda: "dense_uint8",
+        )
+        reg.register(
+            KernelSpec(
+                name="mixed_mxfp4",
+                family="gemm",
+                mode="mm",
+                solution="test",
+                format_signatures=frozenset({mixed_signature}),
+                priority=5,
+            ),
+            lambda: "mixed_mxfp4",
+        )
+
+        impl = select_kernel(
+            "gemm",
+            "mm",
+            mixed_signature,
+            platform=h100_platform,
+        )
+
+        assert impl() == "mixed_mxfp4"
+
+    def test_selects_each_registered_format_signature(self, h100_platform):
+        reg = KernelRegistry.get()
+        fp8_scale = ScaleFormat(
+            storage_dtype=torch.float32,
+            granularity="tensor",
+        )
+        fp8_signature = format_signature(
+            a=tensor_format("fp8", torch.float8_e4m3fn, scale=fp8_scale),
+            b=tensor_format("fp8", torch.float8_e4m3fn, scale=fp8_scale),
+        )
+
+        reg.register(
+            KernelSpec(
+                name="dense_multi",
+                family="gemm",
+                mode="mm",
+                solution="test",
+                format_signatures=frozenset({GEMM_BF16, GEMM_FP16}),
+                priority=10,
+            ),
+            lambda: "dense_multi",
+        )
+        reg.register(
+            KernelSpec(
+                name="fp8_scaled",
+                family="gemm",
+                mode="mm",
+                solution="test",
+                format_signatures=frozenset({fp8_signature}),
+                priority=10,
+            ),
+            lambda: "fp8_scaled",
+        )
+
+        bf16_impl = select_kernel("gemm", "mm", GEMM_BF16, platform=h100_platform)
+        fp16_impl = select_kernel("gemm", "mm", GEMM_FP16, platform=h100_platform)
+        fp8_impl = select_kernel("gemm", "mm", fp8_signature, platform=h100_platform)
+
+        assert bf16_impl() == "dense_multi"
+        assert fp16_impl() == "dense_multi"
+        assert fp8_impl() == "fp8_scaled"
 
     def test_override_by_name(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()

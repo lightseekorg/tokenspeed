@@ -37,14 +37,12 @@ from tokenspeed_kernel.signature import FormatSignature
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "ErrorClass",
     "KernelSpec",
     "KernelRegistry",
     "Priority",
     "load_builtin_kernels",
     "register_kernel",
     "describe_kernel",
-    "error_fn",
 ]
 
 
