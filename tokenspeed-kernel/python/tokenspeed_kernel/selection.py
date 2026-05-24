@@ -849,10 +849,17 @@ def explain_selection(
 def warmup_selection(
     ops: list[tuple[str, str, FormatSignature, dict | None]] | None = None,
 ) -> None:
-    """Pre-resolve kernel selection for the given ops (or all registered ops).
+    """Pre-resolve kernel selection for explicit op signatures.
 
-    Call this at model init to front-load both heuristic and autotune costs.
-    After warmup, every select_kernel() call on the hot path is a cache hit.
+    Pass ``ops`` from model initialization to front-load heuristic and autotune
+    costs for the actual hot-path call sites. Each entry must include the exact
+    ``FormatSignature`` and trait values used by runtime selection.
+
+    When ``ops`` is ``None``, this performs only a deterministic smoke warmup:
+    one representative signature for each registered operator, with no traits.
+    That path verifies the registry and fills a small cache sample, but it does
+    not warm all supported signatures, trait combinations, or feature-specific
+    call paths.
     """
 
     if ops is None:
@@ -862,6 +869,9 @@ def warmup_selection(
             specs = registry.get_for_operator(family, mode)
             if not specs or not specs[0].format_signatures:
                 continue
+            # No-arg warmup is intentionally a smoke path. Pick a stable
+            # representative from the highest-priority spec; callers that need
+            # comprehensive warmup should pass explicit op signatures.
             format_signature = sorted(specs[0].format_signatures, key=str)[0]
             ops.append((family, mode, format_signature, None))
 
