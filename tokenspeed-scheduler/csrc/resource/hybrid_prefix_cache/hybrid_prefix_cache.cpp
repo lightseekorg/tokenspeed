@@ -335,7 +335,7 @@ void HybridPrefixCache::DemoteIdleMambaDeviceCopiesPresentOnHost() {
         ++demoted;
     }
     if (demoted > 0) {
-        spdlog::info("[HybridPrefixCache][mamba_l2] demoted device copies after host writeback count={}", demoted);
+        spdlog::debug("[HybridPrefixCache][mamba_l2] demoted device copies after host writeback count={}", demoted);
     }
 }
 
@@ -369,7 +369,7 @@ void HybridPrefixCache::OnMambaHostWriteBackDone(const std::vector<TreeNode*>& n
         }
     }
     if (attached > 0 || completed > 0) {
-        spdlog::info("[HybridPrefixCache][mamba_l2] host writeback done attach_count={} completed_nodes={}", attached,
+        spdlog::debug("[HybridPrefixCache][mamba_l2] host writeback done attach_count={} completed_nodes={}", attached,
                      completed);
     }
     DemoteIdleMambaDeviceCopiesPresentOnHost();
