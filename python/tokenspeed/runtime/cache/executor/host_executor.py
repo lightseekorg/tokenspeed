@@ -389,7 +389,7 @@ class HostExecutor:
         results = []
         completed_writebacks = getattr(self, "completed_writebacks", [])
         for op_id in completed_writebacks:
-            logger.info("[cache_op] writeback done op_id=%s immediate=True", op_id)
+            logger.debug("[cache_op] writeback done op_id=%s immediate=True", op_id)
             evt = Cache.WriteBackDoneEvent()
             evt.op_id = op_id
             evt.success = True
@@ -398,7 +398,7 @@ class HostExecutor:
         remaining = []
         for ack in self.ack_write_queue:
             if ack.finish_event.query():
-                logger.info(
+                logger.debug(
                     "[cache_op] writeback done op_ids=%s immediate=False", ack.op_ids
                 )
                 for op_id in ack.op_ids:

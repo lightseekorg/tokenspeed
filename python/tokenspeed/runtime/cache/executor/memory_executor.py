@@ -203,7 +203,7 @@ class MemoryExecutor:
                     io_backend=config.mamba_l2_io_backend,
                 ),
             ]
-            logger.info(
+            logger.debug(
                 "[cache_op] MemoryExecutor init pools=%s host_pools=%s draft=%s mamba=%s io_backend=%s host_layout=%s",
                 [pool.kind.value for pool in pools],
                 [type(self.host_pool).__name__, type(self.mamba_host_pool).__name__],
@@ -280,7 +280,7 @@ class MemoryExecutor:
                     if not src_pages:
                         continue
                     if kind == CacheKind.MAMBA:
-                        logger.info(
+                        logger.debug(
                             "[cache_op][mamba_l2] writeback schedule "
                             "op_id=%s slots=%s device_slots=%s host_slots=%s "
                             "is_retract=%s",
@@ -321,7 +321,7 @@ class MemoryExecutor:
                     if not src_pages:
                         continue
                     if kind == CacheKind.MAMBA:
-                        logger.info(
+                        logger.debug(
                             "[cache_op][mamba_l2] loadback schedule "
                             "op_id=%s slots=%s host_slots=%s device_slots=%s",
                             op_id,
