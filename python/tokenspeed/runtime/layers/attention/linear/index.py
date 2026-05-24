@@ -26,18 +26,36 @@ import triton
 
 from tokenspeed.runtime.layers.attention.linear.utils import tensor_cache
 
-# Pre-computed total chunk counts keyed by chunk_size.
-_total_chunks_hint: dict[int, int] = {}
+# Pre-computed total chunk counts. Keyed by (chunk_size, id(cu_seqlens)) so a
+# hint produced for one batch can never be reused by a later unrelated call
+# that happens to use the same chunk_size
+_total_chunks_hint: dict[tuple[int, int], int] = {}
 
 
 def set_total_chunks_hint(
     seq_lens_cpu,
+    cu_seqlens: torch.Tensor,
     chunk_sizes: tuple[int, ...] = (16, 64),
 ) -> None:
-    """Pre-compute total chunk counts on CPU"""
+    """Pre-compute total chunk counts on CPU and bind them to a specific
+    cu_seqlens tensor (by id), avoiding cross-batch hint pollution."""
     lens = np.asarray(seq_lens_cpu, dtype=np.int64)
+    key_id = id(cu_seqlens)
     for cs in chunk_sizes:
-        _total_chunks_hint[cs] = int(np.sum(-(-lens // cs)))
+        _total_chunks_hint[(cs, key_id)] = int(np.sum(-(-lens // cs)))
+
+
+def set_total_chunks_hint_uniform(
+    bs: int,
+    tokens_per_seq: int,
+    cu_seqlens: torch.Tensor,
+    chunk_sizes: tuple[int, ...] = (16, 64),
+) -> None:
+    """Fast path for spec verify / draft-extend where every sequence has the
+    same length (tokens_per_seq). Avoids allocating a per-seq numpy array."""
+    key_id = id(cu_seqlens)
+    for cs in chunk_sizes:
+        _total_chunks_hint[(cs, key_id)] = bs * (-(-tokens_per_seq // cs))
 
 
 @tensor_cache
@@ -52,7 +70,7 @@ def prepare_chunk_indices(
     nums = triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
     offsets = torch.zeros(nums.shape[0] + 1, dtype=nums.dtype, device=nums.device)
     torch.cumsum(nums, dim=0, out=offsets[1:])
-    total_int = _total_chunks_hint.pop(chunk_size, None)
+    total_int = _total_chunks_hint.pop((chunk_size, id(cu_seqlens)), None)
     if total_int is None:
         total_int = offsets[-1].item()
     chunk_global = torch.arange(total_int, device=nums.device)
