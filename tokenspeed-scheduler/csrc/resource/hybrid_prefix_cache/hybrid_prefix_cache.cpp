@@ -41,8 +41,7 @@
 namespace tokenspeed {
 
 HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
-                                     std::int32_t mamba_cache_chunk_size,
-                                     MambaHostAllocator* mamba_host_allocator)
+                                     std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator)
     : kv_prefix_cache_{kv_prefix_cache},
       mamba_allocator_{mamba_allocator},
       mamba_host_allocator_{mamba_host_allocator},
@@ -173,9 +172,8 @@ bool HybridPrefixCache::EnsureMambaHostCapacityByEvict(std::int32_t num_slots, T
         if (node->OnHost() && GetResource<ResourceType::Host>(node).RefCount() > 0) continue;
         candidates.push_back(node);
     }
-    std::sort(candidates.begin(), candidates.end(), [](const TreeNode* lhs, const TreeNode* rhs) {
-        return lhs->Time() < rhs->Time();
-    });
+    std::sort(candidates.begin(), candidates.end(),
+              [](const TreeNode* lhs, const TreeNode* rhs) { return lhs->Time() < rhs->Time(); });
 
     for (TreeNode* node : candidates) {
         if (mamba_host_allocator_->AvailableSlots() >= num_slots) break;
@@ -371,8 +369,8 @@ void HybridPrefixCache::OnMambaHostWriteBackDone(const std::vector<TreeNode*>& n
         }
     }
     if (attached > 0 || completed > 0) {
-        spdlog::info("[HybridPrefixCache][mamba_l2] host writeback done attach_count={} completed_nodes={}",
-                     attached, completed);
+        spdlog::info("[HybridPrefixCache][mamba_l2] host writeback done attach_count={} completed_nodes={}", attached,
+                     completed);
     }
     DemoteIdleMambaDeviceCopiesPresentOnHost();
 }

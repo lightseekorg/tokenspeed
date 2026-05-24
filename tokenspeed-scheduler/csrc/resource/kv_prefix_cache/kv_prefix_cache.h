@@ -66,8 +66,8 @@ public:
     template <ResourceType RType>
     bool EnsureCapacityByEvict(std::int32_t required_num_pages);
 
-    std::vector<TreeNode*> ReleaseDeviceResourcesPresentOnHost(
-        TreeNode* last_node, std::function<void(TreeNode*)> on_release = {});
+    std::vector<TreeNode*> ReleaseDeviceResourcesPresentOnHost(TreeNode* last_node,
+                                                               std::function<void(TreeNode*)> on_release = {});
 
     void EnqueueTransfer(TreeNode* last_node);
 

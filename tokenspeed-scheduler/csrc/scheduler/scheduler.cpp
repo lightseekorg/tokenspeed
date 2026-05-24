@@ -289,8 +289,8 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
             CacheOpSpec spec;
             spec.request_id = id;
             cache_op_tracker_[op_id] = std::move(spec);
-            ops.push_back(WriteBackOperation{op_id, std::vector<TransferPair>(
-                                                        pages_to_transfer.begin(), pages_to_transfer.end())});
+            ops.push_back(WriteBackOperation{
+                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
             req->Apply(fsm::AbortEvent{});

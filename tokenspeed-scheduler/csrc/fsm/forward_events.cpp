@@ -45,22 +45,21 @@ namespace {
 
 // Build a flat list of (device_page, host_page) pairs from the given write_diff nodes.
 // Both Draining::PagePair and Retracting::PagePair are std::tuple<int32_t, int32_t>.
-std::vector<tokenspeed::TransferPair> BuildWriteBackPairs(
-    const std::vector<tokenspeed::TreeNode*>& write_diff) {
+std::vector<tokenspeed::TransferPair> BuildWriteBackPairs(const std::vector<tokenspeed::TreeNode*>& write_diff) {
     std::vector<tokenspeed::TransferPair> pages_to_transfer;
     for (tokenspeed::TreeNode* n : write_diff) {
         const auto& dev_pages = n->Device().Pages();
         const auto& host_pages = n->Host().Pages();
         for (std::size_t i = 0; i < dev_pages.size(); ++i) {
-            pages_to_transfer.push_back(tokenspeed::TransferPair{tokenspeed::CacheKind::kKV, dev_pages[i], host_pages[i]});
+            pages_to_transfer.push_back(
+                tokenspeed::TransferPair{tokenspeed::CacheKind::kKV, dev_pages[i], host_pages[i]});
         }
     }
     return pages_to_transfer;
 }
 
-std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(
-    const std::vector<tokenspeed::TreeNode*>& candidates,
-    const std::vector<tokenspeed::TransferPair>& transfers) {
+std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(const std::vector<tokenspeed::TreeNode*>& candidates,
+                                                              const std::vector<tokenspeed::TransferPair>& transfers) {
     std::unordered_set<std::int32_t> src_slots;
     for (const auto& transfer : transfers) {
         if (transfer.kind == tokenspeed::CacheKind::kMamba) {
@@ -78,8 +77,7 @@ std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(
 }
 
 void DemoteWrittenBackDevice(tokenspeed::KVPrefixCache* kv_prefix_cache,
-                             tokenspeed::HybridPrefixCache* hybrid_prefix_cache,
-                             tokenspeed::TreeNode* device_node) {
+                             tokenspeed::HybridPrefixCache* hybrid_prefix_cache, tokenspeed::TreeNode* device_node) {
     if (kv_prefix_cache == nullptr || device_node == nullptr) return;
     kv_prefix_cache->ReleaseDeviceResourcesPresentOnHost(device_node, [hybrid_prefix_cache](tokenspeed::TreeNode* n) {
         if (hybrid_prefix_cache != nullptr) {
@@ -107,8 +105,8 @@ namespace tokenspeed::fsm {
 void InsertHybridCache(HybridPrefixCache* hybrid_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
-                       LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin,
-                       std::int32_t chunk_size, std::int32_t page_size) {
+                       LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
+                       std::int32_t page_size) {
     if (hybrid_cache == nullptr) return;
 
     std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
@@ -329,7 +327,8 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
             throw std::logic_error("ScheduleDecodeFromRetractedEvent: failed to allocate Mamba recovery working slot");
         }
         if (!local_mamba_allocator->AllocateCheckpoint()) {
-            throw std::logic_error("ScheduleDecodeFromRetractedEvent: failed to allocate Mamba recovery checkpoint slot");
+            throw std::logic_error(
+                "ScheduleDecodeFromRetractedEvent: failed to allocate Mamba recovery checkpoint slot");
         }
     }
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());

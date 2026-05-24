@@ -52,8 +52,6 @@ TEST(MambaChunkAllocatorTest, ExhaustedPoolReturnsNullopt) {
     EXPECT_FALSE(s2.has_value());
 }
 
-
-
 TEST(MambaHostAllocatorTest, AllocateFreeAndDrainReleased) {
     tokenspeed::MambaHostAllocator allocator(3);
     auto slot = allocator.Allocate();
@@ -143,8 +141,6 @@ TEST(TreeNodeMambaTest, DestructorFreesMambaSlot) {
     }
     EXPECT_EQ(allocator.AvailableSlots(), 4);
 }
-
-
 
 TEST(TreeNodeMambaTest, AttachAndDetachMambaHost) {
     tokenspeed::MambaHostAllocator allocator(4);

@@ -152,7 +152,6 @@ TEST_F(MambaDecodeCapacityTest, PrefillDoneDecodeCapacityMissRetractsInsteadOfTh
     ASSERT_EQ(writebacks.size(), 1u);
 }
 
-
 class MambaUnalignedCheckpointTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

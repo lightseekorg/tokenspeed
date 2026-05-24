@@ -353,8 +353,8 @@ bool KVPrefixCache::EnsureCapacityByEvict(std::int32_t required_num_pages) {
     return manager.AvailablePages() >= required_num_pages;
 }
 
-std::vector<TreeNode*> KVPrefixCache::ReleaseDeviceResourcesPresentOnHost(
-    TreeNode* last_node, std::function<void(TreeNode*)> on_release) {
+std::vector<TreeNode*> KVPrefixCache::ReleaseDeviceResourcesPresentOnHost(TreeNode* last_node,
+                                                                          std::function<void(TreeNode*)> on_release) {
     std::vector<TreeNode*> released;
     for (TreeNode* node : LeafToRoot(last_node)) {
         if (node == nullptr || node->IsRoot()) continue;

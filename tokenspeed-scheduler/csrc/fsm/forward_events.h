@@ -55,8 +55,8 @@ struct Prefetching;
 void InsertHybridCache(HybridPrefixCache* hybrid_prefix_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
-                       LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin,
-                       std::int32_t chunk_size, std::int32_t page_size);
+                       LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
+                       std::int32_t page_size);
 
 struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefillFirstChunkEvent> {
     using InvalidTransitionHandler<SchedulePrefillFirstChunkEvent>::operator();

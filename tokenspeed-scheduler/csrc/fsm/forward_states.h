@@ -287,8 +287,7 @@ struct Draining {
     // split-safe: it never needs to re-walk the radix tree.
     using PagePair = TransferPair;
     Draining(std::vector<PagePair> pages_to_transfer, std::unique_ptr<DeviceNodeRef>&& device_node_ref,
-             std::unique_ptr<HostNodeRef>&& host_node_ref,
-             std::vector<TreeNode*> mamba_writeback_nodes = {})
+             std::unique_ptr<HostNodeRef>&& host_node_ref, std::vector<TreeNode*> mamba_writeback_nodes = {})
         : pages_to_transfer_(std::move(pages_to_transfer)),
           device_node_ref_(std::move(device_node_ref)),
           host_node_ref_(std::move(host_node_ref)),

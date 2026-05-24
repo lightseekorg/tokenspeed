@@ -71,8 +71,8 @@ struct TransferPair {
     }
 };
 
-inline std::vector<TransferPair> ToTransferPairs(
-    CacheKind kind, const std::vector<std::tuple<std::int32_t, std::int32_t>>& pages) {
+inline std::vector<TransferPair> ToTransferPairs(CacheKind kind,
+                                                 const std::vector<std::tuple<std::int32_t, std::int32_t>>& pages) {
     std::vector<TransferPair> transfers;
     transfers.reserve(pages.size());
     for (const auto& page : pages) {

@@ -118,8 +118,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         return {};
     }
 
-    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() &&
-        match_result.mamba_host_src_index >= 0 && match_result.mamba_cow_src_index < 0) {
+    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() && match_result.mamba_host_src_index >= 0 &&
+        match_result.mamba_cow_src_index < 0) {
         TreeNode* host_mamba_node = hybrid_prefix_cache_->FindLastMambaHostNode(match_result.host.last_node);
         if (host_mamba_node != nullptr && host_mamba_node->HasMambaOnHost() && !host_mamba_node->HasMamba()) {
             AddUniqueNode(mamba_loadback_nodes, host_mamba_node);
@@ -338,8 +338,7 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
-LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff,
-                                     const std::vector<TreeNode*>& mamba_nodes,
+LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff, const std::vector<TreeNode*>& mamba_nodes,
                                      cache_op_id op_id) {
     std::vector<TransferPair> transfers;
 
@@ -366,8 +365,8 @@ std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* re
     const auto& pages_to_transfer = request->GetPagesToTransfer<fsm::Retracting>();
     if (pages_to_transfer.empty()) {
         // No copy needed; advance Retracting to Retracted without an op_id.
-        request->Apply(fsm::WriteBackDoneEvent{&kv_prefix_cache_,
-                                               hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
+        request->Apply(
+            fsm::WriteBackDoneEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
         return std::nullopt;
     }
     // Register op_id so WriteBackDone can route back.
@@ -375,9 +374,8 @@ std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* re
     CacheOpSpec spec;
     spec.request_id = request->Id();
     cache_op_tracker_[op_id] = std::move(spec);
-    return WriteBackOperation{
-        op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end()),
-        true};
+    return WriteBackOperation{op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end()),
+                              true};
 }
 
 std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retract_request) {

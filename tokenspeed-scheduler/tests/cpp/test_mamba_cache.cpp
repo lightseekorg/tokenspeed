@@ -202,7 +202,6 @@ TEST_F(MambaCacheTest, KVEvictionTriggersMambaEviction) {
     EXPECT_FALSE(node->HasMamba());
 }
 
-
 class MambaL2CacheTest : public ::testing::Test {
 protected:
     static constexpr std::int32_t kPageSize = 2;
@@ -218,13 +217,13 @@ protected:
         prefix_cache_ = std::make_unique<KVPrefixCache>(device_alloc_.get(), host_alloc_.get());
         mamba_alloc_ = std::make_unique<MambaChunkAllocator>(kMambaSlots);
         mamba_host_alloc_ = std::make_unique<MambaHostAllocator>(kMambaHostSlots);
-        hybrid_prefix_cache_ = std::make_unique<HybridPrefixCache>(
-            *prefix_cache_, mamba_alloc_.get(), kMambaCacheChunkSize, mamba_host_alloc_.get());
+        hybrid_prefix_cache_ = std::make_unique<HybridPrefixCache>(*prefix_cache_, mamba_alloc_.get(),
+                                                                   kMambaCacheChunkSize, mamba_host_alloc_.get());
     }
 
     TreeNode* InsertHostKV(const token_vec_t& tokens) {
-        auto result = prefix_cache_->Insert<ResourceType::Host>(tokens, {}, host_alloc_->Allocate(
-            static_cast<std::int32_t>(tokens.size()) / kPageSize));
+        auto result = prefix_cache_->Insert<ResourceType::Host>(
+            tokens, {}, host_alloc_->Allocate(static_cast<std::int32_t>(tokens.size()) / kPageSize));
         return result.last_node;
     }
 
