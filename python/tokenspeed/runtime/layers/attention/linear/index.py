@@ -26,9 +26,8 @@ import triton
 
 from tokenspeed.runtime.layers.attention.linear.utils import tensor_cache
 
-# Pre-computed total chunk counts. Keyed by (chunk_size, id(cu_seqlens)) so a
-# hint produced for one batch can never be reused by a later unrelated call
-# that happens to use the same chunk_size
+# Pre-computed total chunk counts. Keyed by (chunk_size, id(cu_seqlens)) and
+# cleared at the start of every set_*() call. 
 _total_chunks_hint: dict[tuple[int, int], int] = {}
 
 
@@ -41,6 +40,7 @@ def set_total_chunks_hint(
     cu_seqlens tensor (by id), avoiding cross-batch hint pollution."""
     lens = np.asarray(seq_lens_cpu, dtype=np.int64)
     key_id = id(cu_seqlens)
+    _total_chunks_hint.clear()
     for cs in chunk_sizes:
         _total_chunks_hint[(cs, key_id)] = int(np.sum(-(-lens // cs)))
 
@@ -54,6 +54,7 @@ def set_total_chunks_hint_uniform(
     """Fast path for spec verify / draft-extend where every sequence has the
     same length (tokens_per_seq). Avoids allocating a per-seq numpy array."""
     key_id = id(cu_seqlens)
+    _total_chunks_hint.clear()
     for cs in chunk_sizes:
         _total_chunks_hint[(cs, key_id)] = bs * (-(-tokens_per_seq // cs))
 
