@@ -27,7 +27,7 @@ import triton
 from tokenspeed.runtime.layers.attention.linear.utils import tensor_cache
 
 # Pre-computed total chunk counts. Keyed by (chunk_size, id(cu_seqlens)) and
-# cleared at the start of every set_*() call. 
+# cleared at the start of every set_*() call.
 _total_chunks_hint: dict[tuple[int, int], int] = {}
 
 
