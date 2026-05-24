@@ -37,6 +37,7 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
     get_generation_config,
+    resolve_architecture,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -85,10 +86,7 @@ def override_model_config(model_config, ext_yaml):
 
 
 def is_deepseek_v4(config: PretrainedConfig) -> bool:
-    return (
-        config.architectures is not None
-        and config.architectures[0] in _DEEPSEEK_V4_ARCHITECTURES
-    )
+    return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
 
 
 def configure_deepseek_v4_attention(model_config) -> None:
@@ -395,7 +393,7 @@ def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
     """
-    class_name = config.architectures[0]
+    class_name = resolve_architecture(config)
     if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
         # We support non-hf version of llava models, so we do not want to
         # read the wrong values from the unused default text_config.

@@ -25,7 +25,108 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-__all__ = ["sigmoid_mul"]
+__all__ = ["fused_gate_sigmoid_mul_add", "sigmoid_mul"]
+
+
+@triton.jit
+def _fused_gate_sigmoid_mul_add_kernel(
+    hidden_states_ptr,
+    gate_weight_ptr,
+    shared_output_ptr,
+    final_ptr,
+    hidden_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_id = tl.program_id(0).to(tl.int64)
+    row_offset = token_id * hidden_dim
+
+    # Phase 1: gate = dot(hidden_states[token_id], gate_weight)
+    # BLOCK >= hidden_dim so this loop is single-iteration (unrolled away).
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for k_offset in range(0, hidden_dim, BLOCK):
+        cols = k_offset + tl.arange(0, BLOCK)
+        mask = cols < hidden_dim
+        h = tl.load(hidden_states_ptr + row_offset + cols, mask=mask, other=0.0)
+        w = tl.load(gate_weight_ptr + cols, mask=mask, other=0.0)
+        acc += h.to(tl.float32) * w.to(tl.float32)
+    gate_val = tl.sigmoid(tl.sum(acc, axis=0))
+
+    # Phase 2: final[token_id] += gate_val * shared_output[token_id]
+    for n_offset in range(0, hidden_dim, BLOCK):
+        cols = n_offset + tl.arange(0, BLOCK)
+        mask = cols < hidden_dim
+        s = tl.load(shared_output_ptr + row_offset + cols, mask=mask)
+        f = tl.load(final_ptr + row_offset + cols, mask=mask)
+        out = f.to(tl.float32) + gate_val * s.to(tl.float32)
+        tl.store(final_ptr + row_offset + cols, out.to(f.dtype), mask=mask)
+
+
+def fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Fused ``final_hidden_states += sigmoid(hidden_states @ gate_weight) * shared_output``.
+
+    Computes the gate dot-product (reduction over hidden_dim), applies sigmoid,
+    multiplies by ``shared_output``, and adds to ``final_hidden_states`` in-place.
+
+    Args:
+        hidden_states: ``[num_tokens, hidden_dim]`` contiguous input.
+        gate_weight: ``[hidden_dim]`` contiguous 1-D weight vector.
+        shared_output: ``[num_tokens, hidden_dim]`` contiguous shared expert output.
+        final_hidden_states: ``[num_tokens, hidden_dim]`` contiguous MoE output,
+            modified in-place.
+
+    Returns:
+        ``final_hidden_states`` (same storage, mutated in-place).
+    """
+    if hidden_states.ndim != 2:
+        raise ValueError(f"hidden_states must be 2D, got {hidden_states.ndim}D")
+    if not hidden_states.is_contiguous():
+        raise ValueError("hidden_states must be contiguous")
+    if gate_weight.ndim != 1:
+        raise ValueError(f"gate_weight must be 1D, got {gate_weight.ndim}D")
+    if not gate_weight.is_contiguous():
+        raise ValueError("gate_weight must be contiguous")
+    if not shared_output.is_contiguous():
+        raise ValueError("shared_output must be contiguous")
+    if not final_hidden_states.is_contiguous():
+        raise ValueError("final_hidden_states must be contiguous")
+
+    num_tokens, hidden_dim = hidden_states.shape
+    if gate_weight.shape[0] != hidden_dim:
+        raise ValueError(
+            f"gate_weight dim mismatch: expected {hidden_dim}, got {gate_weight.shape[0]}"
+        )
+    if shared_output.shape != (num_tokens, hidden_dim):
+        raise ValueError(
+            f"shared_output shape mismatch: expected {(num_tokens, hidden_dim)}, "
+            f"got {shared_output.shape}"
+        )
+    if final_hidden_states.shape != (num_tokens, hidden_dim):
+        raise ValueError(
+            f"final_hidden_states shape mismatch: expected {(num_tokens, hidden_dim)}, "
+            f"got {final_hidden_states.shape}"
+        )
+
+    if num_tokens == 0:
+        return final_hidden_states
+
+    BLOCK = triton.next_power_of_2(hidden_dim)
+    num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
+    grid = (num_tokens,)
+    _fused_gate_sigmoid_mul_add_kernel[grid](
+        hidden_states,
+        gate_weight,
+        shared_output,
+        final_hidden_states,
+        hidden_dim=hidden_dim,
+        BLOCK=BLOCK,
+        num_warps=num_warps,
+    )
+    return final_hidden_states
 
 
 @triton.jit
