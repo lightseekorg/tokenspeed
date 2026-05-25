@@ -93,6 +93,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_prefill_metadata,
     _deepseek_v4_indexer_prefill_request_chunks,
     _deepseek_v4_indexer_prefill_request_gather_plan,
+    _deepseek_v4_indexer_token_split,
     _deepseek_v4_indexer_topk_from_logits,
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
@@ -269,6 +270,27 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
             ForwardMode.TARGET_VERIFY,
         )
+
+    def test_deepseek_v4_indexer_token_split_treats_spec_modes_as_decode(self):
+        metadata = SimpleNamespace(num_prefill_tokens=2)
+        metadata.decode_token_count = lambda: 3
+
+        self.assertEqual(
+            _deepseek_v4_indexer_token_split(ForwardMode.MIXED, metadata, 5),
+            (2, 3),
+        )
+        self.assertEqual(
+            _deepseek_v4_indexer_token_split(ForwardMode.EXTEND, metadata, 5),
+            (5, 0),
+        )
+        for mode in (
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND,
+        ):
+            self.assertEqual(
+                _deepseek_v4_indexer_token_split(mode, metadata, 5), (0, 5)
+            )
 
     def test_spec_helpers_preserve_non_v4_backend_contracts(self):
         self.assertEqual(_draft_decode_forward_mode(False), ForwardMode.DECODE)

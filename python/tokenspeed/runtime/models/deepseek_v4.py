@@ -154,6 +154,22 @@ def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
     )
 
 
+def _deepseek_v4_indexer_token_split(
+    forward_mode: Optional[ForwardMode],
+    metadata,
+    total_tokens: int,
+) -> tuple[int, int]:
+    if forward_mode is not None and forward_mode.is_mixed():
+        return int(metadata.num_prefill_tokens), metadata.decode_token_count()
+    if forward_mode is not None and (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend()
+    ):
+        return 0, int(total_tokens)
+    return int(total_tokens), 0
+
+
 def _deepseek_v4_forward_metadata(ctx: ForwardContext):
     metadata = getattr(ctx.attn_backend, "forward_metadata", None)
     if ctx.forward_mode == ForwardMode.EXTEND:
@@ -2894,15 +2910,11 @@ class DeepseekV4Indexer(nn.Module):
                 device=positions.device,
                 dtype=torch.int32,
             )
-        if forward_mode is not None and forward_mode.is_mixed():
-            num_prefill_tokens = int(metadata.num_prefill_tokens)
-            num_decode_tokens = metadata.decode_token_count()
-        elif forward_mode is not None and forward_mode.is_decode():
-            num_prefill_tokens = 0
-            num_decode_tokens = total_tokens
-        else:
-            num_prefill_tokens = total_tokens
-            num_decode_tokens = 0
+        num_prefill_tokens, num_decode_tokens = _deepseek_v4_indexer_token_split(
+            forward_mode,
+            metadata,
+            total_tokens,
+        )
 
         with nvtx_range("indexer_wq_b"):
             index_q, _ = self.wq_b(qr)
