@@ -64,7 +64,20 @@ void MambaEvictionManager::UpdateLeaf(TreeNode* node) {
 }
 
 std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* protected_node) {
-    auto older = [](const TreeNode* a, const TreeNode* b) { return a->Time() > b->Time(); };
+    // TP-determinism: ties on Time() must resolve identically across ranks.
+    // mamba_leaves_ is unordered_set<TreeNode*> whose iteration order is
+    // pointer-hash-randomized per-process, so the priority_queue's push order
+    // (and thus internal heap structure for tied elements) diverges across
+    // ranks. Comparing only on Time() leaves ties resolved by heap order →
+    // different ranks evict different leaves on Time ties → cascading parent
+    // re-insertions cause mamba_leaves_ membership to permanently diverge,
+    // eventually wedging the next NCCL collective.
+    // SeqId() is assigned monotonically at TreeNode construction; all ranks
+    // construct nodes in the same order, so SeqId() is identical across ranks.
+    auto older = [](const TreeNode* a, const TreeNode* b) {
+        if (a->Time() != b->Time()) return a->Time() > b->Time();
+        return a->SeqId() > b->SeqId();
+    };
     std::priority_queue<TreeNode*, std::vector<TreeNode*>, decltype(older)> candidates(older);
 
     for (TreeNode* n : mamba_leaves_) {
