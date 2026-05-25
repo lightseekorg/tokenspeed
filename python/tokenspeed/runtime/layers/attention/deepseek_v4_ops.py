@@ -759,8 +759,13 @@ def read_deepseek_v4_indexer_fp8_cache(
         )
 
     out_shape = (slot_mapping.numel(), index_head_dim)
-    if slot_mapping.numel() == 0:
-        return torch.empty(out_shape, device=cache_2d.device, dtype=torch.float32)
+    # Also bail when cache_2d has zero pages: the gather below uses
+    # `where(valid, slots, 0)` to keep offsets in-range, but the resulting
+    # row-0 read still OOBs against an empty `flat_cache`. The reference
+    # per-token loop tolerated this (it iterates `slot_mapping.tolist()` and
+    # `continue`s on `slot < 0`), so preserve that behavior with zeros.
+    if slot_mapping.numel() == 0 or cache_2d.shape[0] == 0:
+        return torch.zeros(out_shape, device=cache_2d.device, dtype=torch.float32)
 
     flat_cache = cache_2d.reshape(-1)
     # Move slot_mapping to cache_2d.device so the gather offsets composed below
