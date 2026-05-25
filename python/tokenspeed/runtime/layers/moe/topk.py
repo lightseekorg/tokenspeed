@@ -36,6 +36,23 @@ from tokenspeed.runtime.moe.distribution_recorder import (
 )
 
 
+def _resolve_expert_location_dispatch_info(expert_location_dispatch_info):
+    if expert_location_dispatch_info is not None:
+        return expert_location_dispatch_info
+    recorder = get_global_expert_distribution_recorder()
+    layer_idx = getattr(recorder, "current_layer_idx", None)
+    if layer_idx is None:
+        return None
+    try:
+        from tokenspeed.runtime.moe.eplb_runtime import get_global_eplb_runtime
+    except Exception:
+        return None
+    runtime = get_global_eplb_runtime()
+    if runtime is None:
+        return None
+    return runtime.get_dispatch_info(int(layer_idx))
+
+
 class TopKOutputFormat(Enum):
     STANDARD = auto()
     BYPASSED = auto()
@@ -153,6 +170,9 @@ class TopK(torch.nn.Module):
             output_format = self.topk_config.output_format
         else:
             output_format = TopKOutputFormat.STANDARD
+        expert_location_dispatch_info = _resolve_expert_location_dispatch_info(
+            expert_location_dispatch_info
+        )
 
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
@@ -213,6 +233,9 @@ def select_experts(
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
 ) -> StandardTopKOutput:
 
+    expert_location_dispatch_info = _resolve_expert_location_dispatch_info(
+        expert_location_dispatch_info
+    )
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group

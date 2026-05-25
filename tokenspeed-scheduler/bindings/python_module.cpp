@@ -34,6 +34,7 @@
 #include "scheduler/request.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
+#include "fsm/eplb_states.h"
 
 /*
 Writable types:
@@ -127,6 +128,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("none", tokenspeed::DisaggregationMode::kNone)
         .value("prefill", tokenspeed::DisaggregationMode::kPrefill)
         .value("decode", tokenspeed::DisaggregationMode::kDecode);
+
+    nb::enum_<tokenspeed::EplbState>(m, "EplbState")
+        .value("Disabled", tokenspeed::EplbState::kDisabled)
+        .value("WarmingUp", tokenspeed::EplbState::kWarmingUp)
+        .value("Idle", tokenspeed::EplbState::kIdle)
+        .value("Collecting", tokenspeed::EplbState::kCollecting)
+        .value("Planning", tokenspeed::EplbState::kPlanning)
+        .value("Relocating", tokenspeed::EplbState::kRelocating)
+        .value("Swapping", tokenspeed::EplbState::kSwapping);
+
+    nb::class_<tokenspeed::EplbControllerConfig>(m, "EplbControllerConfig")
+        .def(nb::init<>())
+        .def_rw("enabled", &tokenspeed::EplbControllerConfig::enabled)
+        .def_rw("warmup_steps", &tokenspeed::EplbControllerConfig::warmup_steps)
+        .def_rw("interval", &tokenspeed::EplbControllerConfig::interval)
+        .def_rw("max_layers_per_step", &tokenspeed::EplbControllerConfig::max_layers_per_step)
+        .def_rw("max_rebalance_period_ms", &tokenspeed::EplbControllerConfig::max_rebalance_period_ms)
+        .def_rw("planner_timeout_ms", &tokenspeed::EplbControllerConfig::planner_timeout_ms)
+        .def_rw("max_consecutive_failures", &tokenspeed::EplbControllerConfig::max_consecutive_failures);
 
     nb::module_ kv_event = m.def_submodule("KVEvent");
     nb::class_<tokenspeed::KvBlockStoredEvent>(kv_event, "BlockStored")
@@ -241,7 +261,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)
         .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks)
         .def_rw("enable_mamba_l2", &tokenspeed::SchedulerConfig::enable_mamba_l2)
-        .def_rw("mamba_l2_host_slots", &tokenspeed::SchedulerConfig::mamba_l2_host_slots);
+        .def_rw("mamba_l2_host_slots", &tokenspeed::SchedulerConfig::mamba_l2_host_slots)
+        .def_rw("eplb", &tokenspeed::SchedulerConfig::eplb);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
@@ -274,6 +295,67 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::module_ pd = m.def_submodule("PD");
     nb::module_ cache = m.def_submodule("Cache");
+
+    nb::module_ eplb = m.def_submodule("EPLB");
+
+    nb::class_<tokenspeed::EplbCollectStatsOperation>(eplb, "CollectStatsOp")
+        .def_prop_ro("op_id", [](const tokenspeed::EplbCollectStatsOperation& op) { return op.op_id; });
+    nb::class_<tokenspeed::EplbPlanOperation>(eplb, "PlanOp")
+        .def_prop_ro("op_id", [](const tokenspeed::EplbPlanOperation& op) { return op.op_id; })
+        .def_prop_ro("stats_handle", [](const tokenspeed::EplbPlanOperation& op) { return op.stats_handle; });
+    nb::class_<tokenspeed::EplbRelocateOperation>(eplb, "RelocateOp")
+        .def_prop_ro("op_id", [](const tokenspeed::EplbRelocateOperation& op) { return op.op_id; })
+        .def_prop_ro("plan_handle", [](const tokenspeed::EplbRelocateOperation& op) { return op.plan_handle; })
+        .def_prop_ro(
+            "layer_ids",
+            [](const tokenspeed::EplbRelocateOperation& op) -> const std::vector<std::int32_t>& {
+                return op.layer_ids;
+            },
+            nb::rv_policy::reference_internal);
+    nb::class_<tokenspeed::EplbSwapOperation>(eplb, "SwapOp")
+        .def_prop_ro("op_id", [](const tokenspeed::EplbSwapOperation& op) { return op.op_id; })
+        .def_prop_ro("plan_handle", [](const tokenspeed::EplbSwapOperation& op) { return op.plan_handle; })
+        .def_prop_ro(
+            "layer_ids",
+            [](const tokenspeed::EplbSwapOperation& op) -> const std::vector<std::int32_t>& { return op.layer_ids; },
+            nb::rv_policy::reference_internal);
+
+    nb::class_<tokenspeed::eplb::StatsCollected>(eplb, "StatsCollected")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::StatsCollected::op_id)
+        .def_rw("stats_handle", &tokenspeed::eplb::StatsCollected::stats_handle)
+        .def_rw("total_count", &tokenspeed::eplb::StatsCollected::total_count);
+    nb::class_<tokenspeed::eplb::StatsEmpty>(eplb, "StatsEmpty")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::StatsEmpty::op_id);
+    nb::class_<tokenspeed::eplb::PlanDone>(eplb, "PlanDone")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::PlanDone::op_id)
+        .def_rw("plan_handle", &tokenspeed::eplb::PlanDone::plan_handle)
+        .def_rw("layers_changed", &tokenspeed::eplb::PlanDone::layers_changed)
+        .def_rw("balancedness_before", &tokenspeed::eplb::PlanDone::balancedness_before)
+        .def_rw("balancedness_pred", &tokenspeed::eplb::PlanDone::balancedness_pred);
+    nb::class_<tokenspeed::eplb::PlanFailed>(eplb, "PlanFailed")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::PlanFailed::op_id)
+        .def_rw("reason", &tokenspeed::eplb::PlanFailed::reason);
+    nb::class_<tokenspeed::eplb::PlanIdentical>(eplb, "PlanIdentical")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::PlanIdentical::op_id);
+    nb::class_<tokenspeed::eplb::RelocateDone>(eplb, "RelocateDone")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::RelocateDone::op_id)
+        .def_rw("layer_ids", &tokenspeed::eplb::RelocateDone::layer_ids);
+    nb::class_<tokenspeed::eplb::RelocateFailed>(eplb, "RelocateFailed")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::RelocateFailed::op_id)
+        .def_rw("layer_id", &tokenspeed::eplb::RelocateFailed::layer_id)
+        .def_rw("reason", &tokenspeed::eplb::RelocateFailed::reason);
+    nb::class_<tokenspeed::eplb::SwapDone>(eplb, "SwapDone")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::eplb::SwapDone::op_id)
+        .def_rw("layer_ids", &tokenspeed::eplb::SwapDone::layer_ids)
+        .def_rw("blocked_us", &tokenspeed::eplb::SwapDone::blocked_us);
 
     nb::class_<tokenspeed::cache::PrefetchDone>(cache, "PrefetchDoneEvent")
         .def(nb::init<>())
@@ -309,6 +391,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(
             "add_event",
             [](tokenspeed::ExecutionEvent& self, tokenspeed::Event e) -> tokenspeed::ExecutionEvent& {
+                return self.With(std::move(e));
+            },
+            nb::arg("event"), nb::rv_policy::reference)
+        .def(
+            "add_eplb_event",
+            [](tokenspeed::ExecutionEvent& self, tokenspeed::eplb::EplbEvent e) -> tokenspeed::ExecutionEvent& {
                 return self.With(std::move(e));
             },
             nb::arg("event"), nb::rv_policy::reference);
@@ -398,10 +486,21 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         return result;
     };
 
+    auto collect_eplb = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
+        nb::list result;
+        for (const auto& op : plan.Operations()) {
+            if (auto* e = std::get_if<tokenspeed::EplbOperation>(&op)) {
+                std::visit([&result](const auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, *e);
+            }
+        }
+        return result;
+    };
+
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
-        .def_prop_ro("cache", collect_cache);
+        .def_prop_ro("cache", collect_cache)
+        .def_prop_ro("eplb", collect_eplb);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
@@ -409,6 +508,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
         .def("next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); })
+        .def("set_eplb_config", &tokenspeed::Scheduler::SetEplbConfig, nb::arg("config"))
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
         .def(
             "drain_kv_events",

@@ -32,6 +32,7 @@
 #include "resource/allocator/paged_cache_group.h"
 #include "resource/types.h"
 #include "scheduler/operations/inc.h"
+#include "scheduler/eplb/config.h"
 
 namespace tokenspeed {
 
@@ -106,6 +107,8 @@ struct SchedulerConfig {
     std::int32_t mamba_pool_total_chunks{0};
     bool enable_mamba_l2{false};
     std::int32_t mamba_l2_host_slots{0};
+
+    EplbControllerConfig eplb{};
 };
 
 }  // namespace tokenspeed

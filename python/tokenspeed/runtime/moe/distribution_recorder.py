@@ -56,10 +56,11 @@ class ExpertDistributionRecorder(ABC):
         server_args: ServerArgs,
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
+        pg=None,
     ):
         if server_args.expert_distribution_recorder_mode is not None:
             return _ExpertDistributionRecorderReal(
-                server_args, expert_location_metadata, rank
+                server_args, expert_location_metadata, rank, pg=pg
             )
         else:
             return _ExpertDistributionRecorderNoop()
@@ -99,6 +100,16 @@ class ExpertDistributionRecorder(ABC):
     def dump_record(self, output_mode: _OutputMode = "file"):
         self._on_not_implemented()
 
+    def snapshot_logical_count(self, reset: bool = True):
+        return None
+
+    def rebind(self, new_metadata: "ExpertLocationMetadata") -> None:
+        pass
+
+    @property
+    def current_layer_idx(self):
+        return None
+
     @property
     def recording(self):
         return False
@@ -119,16 +130,18 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         server_args: ServerArgs,
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
+        pg=None,
     ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
+        self._pg = pg
 
         self._recording = False
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
         self._accumulator = _Accumulator.init_new(
-            server_args, expert_location_metadata, rank
+            server_args, expert_location_metadata, rank, pg=pg
         )
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
@@ -233,6 +246,22 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._reset()
         return output
 
+    def snapshot_logical_count(self, reset: bool = True):
+        snapshot = getattr(self._accumulator, "snapshot_logical_count", None)
+        if snapshot is None:
+            return None
+        return snapshot(reset=reset, pg=self._pg)
+
+    def rebind(self, new_metadata: "ExpertLocationMetadata") -> None:
+        self._expert_location_metadata = new_metadata
+        self._accumulator._expert_location_metadata = new_metadata
+        for gatherer in self._single_pass_gatherers.values():
+            gatherer._expert_location_metadata = new_metadata
+
+    @property
+    def current_layer_idx(self):
+        return self._current_layer_idx.value
+
     @property
     def recording(self):
         return self._recording
@@ -245,6 +274,13 @@ _global_expert_distribution_recorder: ExpertDistributionRecorder | None = (
 
 def get_global_expert_distribution_recorder():
     return _global_expert_distribution_recorder
+
+
+def set_global_expert_distribution_recorder(
+    recorder: ExpertDistributionRecorder | None,
+):
+    global _global_expert_distribution_recorder
+    _global_expert_distribution_recorder = recorder or _ExpertDistributionRecorderNoop()
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
@@ -505,9 +541,10 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
+        pg=None,
     ) -> "_Accumulator":
         return _Accumulator.get_class(server_args)(
-            server_args, expert_location_metadata, rank
+            server_args, expert_location_metadata, rank, pg=pg
         )
 
     @staticmethod
@@ -524,9 +561,11 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
+        pg=None,
     ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
+        self._pg = pg
         self._rank = rank
 
     def get_single_pass_gatherer_keys(self):
@@ -581,13 +620,24 @@ class _UtilizationRateAccumulator(_Accumulator):
     def _append_utilization_rate(
         self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor
     ):
+        if getattr(self._server_args, "enable_eplb", False):
+            return
+
         gpu_physical_count = compute_gpu_physical_count(
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
         )
-        gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+        if self._pg is not None:
+            gpu_physical_count = gpu_physical_count.detach().cpu()
+            dst_rank = torch.distributed.get_global_rank(self._pg, 0)
+        else:
+            gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+            dst_rank = 0
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=dst_rank,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._pg,
         )
 
         if self._rank == 0:
@@ -597,7 +647,7 @@ class _UtilizationRateAccumulator(_Accumulator):
 
             gpu_physical_count_sum = gpu_physical_count.sum().item()
 
-            logger.info(
+            logger.debug(
                 "[Expert Balancedness] forward_pass_id=%s current_pass_balancedness=%.03f %s gpu_physical_count_sum=%s",
                 forward_pass_id,
                 utilization_rate,
@@ -704,6 +754,34 @@ class _StatAccumulator(_UtilizationRateAccumulator):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
+    def snapshot_logical_count(self, reset: bool = True, pg=None):
+        global_physical_count = self._global_physical_count_of_buffered_step.get_all()
+        physical_to_logical_map = self._expert_location_metadata.physical_to_logical_map
+        if pg is not None:
+            global_physical_count = global_physical_count.detach().cpu()
+            physical_to_logical_map = (
+                self._expert_location_metadata.physical_to_logical_map_cpu
+            )
+
+        logical_count_of_buffered_step = (
+            _convert_global_physical_count_to_logical_count(
+                global_physical_count,
+                num_layers=self._expert_location_metadata.num_layers,
+                num_logical_experts=self._expert_location_metadata.num_logical_experts,
+                physical_to_logical_map=physical_to_logical_map,
+            ).sum(dim=0)
+        )
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step,
+                op=torch.distributed.ReduceOp.SUM,
+                group=pg,
+            )
+        if reset:
+            self._global_physical_count_of_buffered_step.reset()
+        return logical_count_of_buffered_step
+
     def dump(self, output_mode: _OutputMode):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
@@ -745,7 +823,9 @@ def _dump_to_file(name, data):
 
 class _Buffer:
     @staticmethod
-    def init_new(item_shape: tuple, buffer_size: int, dtype, device):
+    def init_new(item_shape: tuple, buffer_size: int | None, dtype, device):
+        if buffer_size is None:
+            buffer_size = -1
         if buffer_size < 0:
             return _InfiniteBuffer(item_shape, dtype=dtype, device=device)
         else:
@@ -821,12 +901,13 @@ def _convert_global_physical_count_to_logical_count(
     logical_count = torch.zeros(
         (dim_extra, num_layers, num_logical_experts), dtype=dtype, device=device
     )
+    valid_physical = physical_to_logical_map >= 0
+    scatter_index = physical_to_logical_map.masked_fill(~valid_physical, 0)
+    scatter_src = global_physical_count * valid_physical.unsqueeze(0).to(dtype)
     logical_count.scatter_add_(
         dim=2,
-        index=physical_to_logical_map.unsqueeze(0)
-        .expand(dim_extra, -1, -1)
-        .to(torch.int64),
-        src=global_physical_count,
+        index=scatter_index.unsqueeze(0).expand(dim_extra, -1, -1).to(torch.int64),
+        src=scatter_src,
     )
     return logical_count
 

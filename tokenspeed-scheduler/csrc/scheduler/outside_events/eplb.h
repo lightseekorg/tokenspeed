@@ -20,14 +20,58 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
 #include <variant>
+#include <vector>
 
-#include "scheduler/operations/forward.h"
-#include "scheduler/operations/cache.h"
-#include "scheduler/operations/eplb.h"
+namespace tokenspeed::eplb {
 
-namespace tokenspeed {
+struct StatsCollected {
+    std::int32_t op_id{};
+    std::int32_t stats_handle{};
+    double total_count{};
+};
 
-using Operation = std::variant<CacheOperation, ForwardOperation, FlatForwardOperation, EplbOperation>;
+struct StatsEmpty {
+    std::int32_t op_id{};
+};
 
-}  // namespace tokenspeed
+struct PlanDone {
+    std::int32_t op_id{};
+    std::int32_t plan_handle{};
+    std::vector<std::int32_t> layers_changed;
+    double balancedness_before{};
+    double balancedness_pred{};
+};
+
+struct PlanFailed {
+    std::int32_t op_id{};
+    std::string reason;
+};
+
+struct PlanIdentical {
+    std::int32_t op_id{};
+};
+
+struct RelocateDone {
+    std::int32_t op_id{};
+    std::vector<std::int32_t> layer_ids;
+};
+
+struct RelocateFailed {
+    std::int32_t op_id{};
+    std::int32_t layer_id{-1};
+    std::string reason;
+};
+
+struct SwapDone {
+    std::int32_t op_id{};
+    std::vector<std::int32_t> layer_ids;
+    std::int64_t blocked_us{};
+};
+
+using EplbEvent = std::variant<StatsCollected, StatsEmpty, PlanDone, PlanFailed, PlanIdentical, RelocateDone,
+                               RelocateFailed, SwapDone>;
+
+}  // namespace tokenspeed::eplb

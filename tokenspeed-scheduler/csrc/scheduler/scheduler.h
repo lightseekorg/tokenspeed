@@ -44,6 +44,7 @@
 #include "resource/allocator/mamba_host_allocator.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 
+#include "scheduler/eplb/eplb_controller.h"
 #include "fsm/forward_events.h"
 #include "fsm/cache_events.h"
 #include "fsm/pd_events.h"
@@ -57,6 +58,8 @@ public:
     std::vector<std::string> CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match = false);
 
     ExecutionPlan NextExecutionPlan();
+
+    void SetEplbConfig(EplbControllerConfig config);
 
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
@@ -129,6 +132,7 @@ private:
 
 private:
     SchedulerConfig config_;
+    EplbController eplb_controller_;
 
 private:
     PageAllocator device_allocator_;

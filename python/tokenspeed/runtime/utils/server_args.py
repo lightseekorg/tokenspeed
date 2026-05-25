@@ -157,6 +157,16 @@ class ServerArgs:
     expert_distribution_recorder_buffer_size: int | None = None
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
+    eplb_rebalance_interval: int = 200
+    eplb_warmup_steps: int = 20
+    eplb_max_rebalance_period_s: float = 30.0
+    eplb_max_layers_per_step: int = 1
+    eplb_planner_timeout_s: float = 1.0
+    eplb_max_consecutive_failures: int = 3
+    eplb_planner_mitigation: Literal["rollback", "reuse", "disable"] = "reuse"
+    eplb_relocate_strategy: Literal["host_first", "p2p"] = "host_first"
+    eplb_persist_dir: str | None = None
+    eplb_include_drafter: bool = False
 
     # MoE backend
     moe_backend: str = "auto"
@@ -627,7 +637,7 @@ class ServerArgs:
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
-            logger.info(
+            logger.debug(
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
@@ -635,9 +645,25 @@ class ServerArgs:
             self.ep_dispatch_algorithm is None
         ):
             self.ep_dispatch_algorithm = "static"
-            logger.info(
+            logger.debug(
                 "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
+
+        if self.enable_eplb:
+            if self.eplb_rebalance_interval <= 0:
+                raise ValueError("eplb_rebalance_interval must be positive")
+            if self.eplb_warmup_steps < 0:
+                raise ValueError("eplb_warmup_steps must be non-negative")
+            if self.eplb_max_layers_per_step <= 0:
+                raise ValueError("eplb_max_layers_per_step must be positive")
+            if self.eplb_planner_timeout_s <= 0:
+                raise ValueError("eplb_planner_timeout_s must be positive")
+            if self.eplb_max_consecutive_failures <= 0:
+                raise ValueError("eplb_max_consecutive_failures must be positive")
+            if self.disaggregation_mode == "prefill":
+                logger.warning(
+                    "EPLB is disabled by the scheduler on prefill-only workers."
+                )
 
         from tokenspeed.runtime.utils.env import envs
 
@@ -1177,6 +1203,68 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-interval",
+            type=int,
+            default=ServerArgs.eplb_rebalance_interval,
+            help="Run EPLB every N scheduler iterations after warmup.",
+        )
+        parser.add_argument(
+            "--eplb-warmup-steps",
+            type=int,
+            default=ServerArgs.eplb_warmup_steps,
+            help="Number of scheduler iterations before EPLB starts collecting stats.",
+        )
+        parser.add_argument(
+            "--eplb-max-rebalance-period-s",
+            type=float,
+            default=ServerArgs.eplb_max_rebalance_period_s,
+            help="Maximum wall-clock period in seconds between EPLB attempts.",
+        )
+        parser.add_argument(
+            "--eplb-max-layers-per-step",
+            type=int,
+            default=ServerArgs.eplb_max_layers_per_step,
+            help="Maximum MoE layers relocated by one EPLB scheduler step.",
+        )
+        parser.add_argument(
+            "--eplb-planner-timeout-s",
+            type=float,
+            default=ServerArgs.eplb_planner_timeout_s,
+            help="Timeout budget for asynchronous EPLB planning.",
+        )
+        parser.add_argument(
+            "--eplb-max-consecutive-failures",
+            type=int,
+            default=ServerArgs.eplb_max_consecutive_failures,
+            help="Disable EPLB after this many consecutive non-gate failures.",
+        )
+        parser.add_argument(
+            "--eplb-planner-mitigation",
+            type=str,
+            choices=["rollback", "reuse", "disable"],
+            default=ServerArgs.eplb_planner_mitigation,
+            help="Mitigation policy when EPLB planning fails.",
+        )
+        parser.add_argument(
+            "--eplb-relocate-strategy",
+            type=str,
+            choices=["host_first", "p2p"],
+            default=ServerArgs.eplb_relocate_strategy,
+            help="Weight relocation transport strategy for EPLB.",
+        )
+        parser.add_argument(
+            "--eplb-persist-dir",
+            type=str,
+            default=ServerArgs.eplb_persist_dir,
+            help="Optional directory for persisting EPLB placement snapshots.",
+        )
+        parser.add_argument(
+            "--eplb-include-drafter",
+            action="store_true",
+            default=ServerArgs.eplb_include_drafter,
+            help="Include speculative drafter MoE layers in EPLB.",
         )
         parser.add_argument(
             "--moe-backend",

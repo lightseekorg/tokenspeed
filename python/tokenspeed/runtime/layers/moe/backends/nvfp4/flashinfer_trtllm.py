@@ -53,6 +53,59 @@ from tokenspeed.runtime.utils import next_power_of_2
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
+def _expand_self_routing_logits_for_eplb(
+    routing_logits: torch.Tensor,
+    expert_location_dispatch_info: object | None,
+    *,
+    num_experts: int,
+) -> torch.Tensor:
+    if expert_location_dispatch_info is None or routing_logits.shape[-1] == num_experts:
+        return routing_logits
+    logical_to_physical = getattr(
+        expert_location_dispatch_info, "partial_logical_to_all_physical_map", None
+    )
+    if (
+        logical_to_physical is None
+        or logical_to_physical.shape[0] != routing_logits.shape[-1]
+    ):
+        return routing_logits
+
+    fill = torch.finfo(routing_logits.dtype).min
+    out = torch.full(
+        (*routing_logits.shape[:-1], int(num_experts)),
+        fill,
+        dtype=routing_logits.dtype,
+        device=routing_logits.device,
+    )
+    physical_ids = logical_to_physical[:, 0].to(
+        device=routing_logits.device, dtype=torch.long
+    )
+    return out.index_copy(1, physical_ids, routing_logits)
+
+
+def _record_self_routing_topk_for_eplb(
+    routing_logits: torch.Tensor,
+    topk_config: object,
+    *,
+    num_experts: int,
+) -> None:
+    from tokenspeed.runtime.moe.distribution_recorder import (
+        get_global_expert_distribution_recorder,
+    )
+
+    recorder = get_global_expert_distribution_recorder()
+    capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    if not (getattr(recorder, "recording", False) or capturing):
+        return
+    top_k = int(getattr(topk_config, "top_k", 0))
+    top_k -= int(getattr(topk_config, "num_fused_shared_experts", 0) or 0)
+    top_k = min(top_k, int(routing_logits.shape[-1]))
+    if top_k <= 0:
+        return
+    topk_ids = torch.topk(routing_logits, k=top_k, dim=-1).indices.to(torch.int32)
+    recorder.on_select_experts(topk_ids=topk_ids, num_experts=num_experts)
+
+
 class Nvfp4FlashinferTrtllmBackend(MoEBackend):
     supported_arches = frozenset({"sm100"})
 
@@ -301,6 +354,16 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
 
         routing_logits = topk_output.router_logits.to(self._routing_logits_dtype)
         routing_bias = self._correction_bias
+        routing_logits = _expand_self_routing_logits_for_eplb(
+            routing_logits,
+            getattr(topk_output, "expert_location_dispatch_info", None),
+            num_experts=self.spec.num_experts,
+        )
+        _record_self_routing_topk_for_eplb(
+            routing_logits,
+            topk_output.topk_config,
+            num_experts=self.spec.num_experts,
+        )
 
         result = tokenspeed_kernel.moe_fused(
             routing_logits=routing_logits,

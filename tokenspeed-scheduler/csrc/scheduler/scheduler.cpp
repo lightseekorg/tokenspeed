@@ -21,6 +21,7 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,6 +58,7 @@ namespace tokenspeed {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
+      eplb_controller_{config_.role == Role::kP ? EplbControllerConfig{} : config_.eplb},
       device_allocator_{config_.page_size, config_.device_allocator.total_pages},
       host_allocator_{config_.page_size, config_.host_allocator.total_pages},
       mamba_allocator_{},
@@ -338,6 +341,9 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             plan.With(CacheOperation{FlatLoadBackOperation{*lb}});
         }
     }
+    if (auto op = eplb_controller_.NextOperation()) {
+        plan.With(std::move(*op));
+    }
     if (std::getenv("DEBUG_MEM")) {
         check_device_mem();
     }
@@ -416,10 +422,37 @@ void Scheduler::check_device_mem() {
     }
 }
 
+void Scheduler::SetEplbConfig(EplbControllerConfig config) {
+    if (config_.role == Role::kP) {
+        config.enabled = false;
+    }
+    config_.eplb = config;
+    eplb_controller_.Configure(config);
+}
+
 void Scheduler::Advance(const ExecutionEvent& event) {
     auto dispatch = [this](const auto& inner) { handleEvent(inner); };
+    bool saw_forward_event = false;
     for (const auto& item : event.Events()) {
-        std::visit([&](const auto& outer) { std::visit(dispatch, outer); }, item);
+        std::visit(
+            [&](const auto& outer) {
+                using Outer = std::decay_t<decltype(outer)>;
+                if constexpr (std::is_same_v<Outer, ForwardEvent>) {
+                    saw_forward_event = true;
+                    std::visit(dispatch, outer);
+                } else if constexpr (std::is_same_v<Outer, eplb::EplbEvent>) {
+                    eplb_controller_.Advance(outer);
+                } else {
+                    std::visit(dispatch, outer);
+                }
+            },
+            item);
+    }
+    if (saw_forward_event) {
+        const auto now =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        eplb_controller_.OnStepCompleted(now);
     }
 }
 

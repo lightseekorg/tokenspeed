@@ -1,0 +1,20 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-eplb
+type: ut
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - h100-1gpu
+    - b200-1gpu
+    - gb200-1gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest test/runtime/moe/test_eplb_data_plane.py test/runtime/moe/test_eplb_integration.py -q
+report:
+  github_step_summary: true

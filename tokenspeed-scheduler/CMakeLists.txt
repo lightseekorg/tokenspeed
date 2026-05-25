@@ -57,6 +57,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/request.cpp
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp
+    csrc/scheduler/eplb/eplb_controller.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -101,6 +102,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
+        tests/cpp/test_eplb_controller.cpp
         tests/cpp/test_write_back.cpp
         tests/cpp/test_load_back.cpp
         tests/cpp/test_cache_operation_kinds.cpp

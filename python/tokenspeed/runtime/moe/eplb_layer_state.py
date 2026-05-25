@@ -1,0 +1,64 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+
+
+class _NullEvent:
+    def record(self):
+        pass
+
+    def synchronize(self):
+        pass
+
+    def query(self) -> bool:
+        return True
+
+
+class _NullStream:
+    pass
+
+
+@dataclass
+class SingleLayerEplbState:
+    layer_index: int
+    num_local: int
+    num_experts: int
+    device: torch.device | str
+    dispatch_info: object | None = None
+    aux_stream: object = field(init=False)
+    relocate_start_event: object = field(init=False)
+    relocate_done_event: object = field(init=False)
+
+    def __post_init__(self):
+        device = torch.device(self.device)
+        use_cuda = device.type == "cuda" and torch.cuda.is_available()
+        if use_cuda:
+            self.aux_stream = torch.cuda.Stream(device=device)
+            self.relocate_start_event = torch.cuda.Event()
+            self.relocate_done_event = torch.cuda.Event()
+        else:
+            self.aux_stream = _NullStream()
+            self.relocate_start_event = _NullEvent()
+            self.relocate_done_event = _NullEvent()

@@ -26,7 +26,9 @@ from typing import Any, Mapping
 
 import torch
 from tokenspeed_scheduler import (
+    EPLB,
     Cache,
+    EplbControllerConfig,
     ExecutionEvent,
     ForwardEvent,
     PagedCacheGroupConfig,
@@ -40,6 +42,32 @@ from tokenspeed_scheduler import (
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
+}
+_EPLB_EVENT_TYPES = {
+    "StatsCollected": EPLB.StatsCollected,
+    "StatsEmpty": EPLB.StatsEmpty,
+    "PlanDone": EPLB.PlanDone,
+    "PlanFailed": EPLB.PlanFailed,
+    "PlanIdentical": EPLB.PlanIdentical,
+    "RelocateDone": EPLB.RelocateDone,
+    "RelocateFailed": EPLB.RelocateFailed,
+    "SwapDone": EPLB.SwapDone,
+}
+_EPLB_EVENT_FIELDS = {
+    "StatsCollected": ("op_id", "stats_handle", "total_count"),
+    "StatsEmpty": ("op_id",),
+    "PlanDone": (
+        "op_id",
+        "plan_handle",
+        "layers_changed",
+        "balancedness_before",
+        "balancedness_pred",
+    ),
+    "PlanFailed": ("op_id", "reason"),
+    "PlanIdentical": ("op_id",),
+    "RelocateDone": ("op_id", "layer_ids"),
+    "RelocateFailed": ("op_id", "layer_id", "reason"),
+    "SwapDone": ("op_id", "layer_ids", "blocked_us"),
 }
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
@@ -72,6 +100,7 @@ def make_config(
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
+    eplb_controller_config: "EplbControllerConfig | None" = None,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -106,7 +135,45 @@ def make_config(
     # Opt-in; unset means paged-cache groups are transport-only.
     if prefix_cache_adjunct is not None:
         cfg.prefix_cache_adjunct = prefix_cache_adjunct
+    if eplb_controller_config is not None:
+        for attr in [
+            "enabled",
+            "warmup_steps",
+            "interval",
+            "max_layers_per_step",
+            "max_rebalance_period_ms",
+            "planner_timeout_ms",
+            "max_consecutive_failures",
+        ]:
+            setattr(cfg.eplb, attr, getattr(eplb_controller_config, attr))
     return cfg
+
+
+def make_eplb_controller_config(server_args) -> EplbControllerConfig:
+    cfg = EplbControllerConfig()
+    cfg.enabled = bool(getattr(server_args, "enable_eplb", False))
+    cfg.warmup_steps = int(getattr(server_args, "eplb_warmup_steps", 0))
+    cfg.interval = int(getattr(server_args, "eplb_rebalance_interval", 1))
+    cfg.max_layers_per_step = int(getattr(server_args, "eplb_max_layers_per_step", 1))
+    cfg.max_rebalance_period_ms = int(
+        1000 * float(getattr(server_args, "eplb_max_rebalance_period_s", 0.0))
+    )
+    cfg.planner_timeout_ms = int(
+        1000 * float(getattr(server_args, "eplb_planner_timeout_s", 0.0))
+    )
+    cfg.max_consecutive_failures = int(
+        getattr(server_args, "eplb_max_consecutive_failures", 3)
+    )
+    return cfg
+
+
+def advance_eplb(scheduler, eplb_events: list) -> None:
+    if not eplb_events:
+        return
+    ec = ExecutionEvent()
+    for event in eplb_events:
+        ec.add_eplb_event(event)
+    scheduler.advance(ec)
 
 
 def pool_to_paged_cache_groups(pool: Any) -> list:
@@ -239,6 +306,92 @@ def pop_common_cache_event_payloads(
     for key in sorted(common_keys, key=lambda item: (item[1], item[0])):
         payload = dict(rank_maps[0][key])
         payload["success"] = all(rank_map[key]["success"] for rank_map in rank_maps)
+        ready_payloads.append(payload)
+    return ready_payloads
+
+
+def eplb_event_to_payload(event) -> dict:
+    kind = type(event).__name__
+    fields = _EPLB_EVENT_FIELDS.get(kind)
+    if fields is None:
+        raise ValueError(f"Unsupported EPLB event type: {kind}")
+
+    payload = {"kind": kind}
+    for field in fields:
+        value = getattr(event, field)
+        if field in ("layers_changed", "layer_ids"):
+            value = [int(item) for item in list(value)]
+        elif field in (
+            "op_id",
+            "stats_handle",
+            "plan_handle",
+            "layer_id",
+            "blocked_us",
+        ):
+            value = int(value)
+        elif field in ("total_count", "balancedness_before", "balancedness_pred"):
+            value = float(value)
+        elif field == "reason":
+            value = str(value)
+        payload[field] = value
+    return payload
+
+
+def eplb_event_from_payload(payload: dict):
+    kind = payload["kind"]
+    cls = _EPLB_EVENT_TYPES.get(kind)
+    fields = _EPLB_EVENT_FIELDS.get(kind)
+    if cls is None or fields is None:
+        raise ValueError(f"Unsupported EPLB event type: {kind}")
+    event = cls()
+    for field in fields:
+        value = payload[field]
+        if field in ("layers_changed", "layer_ids"):
+            value = [int(item) for item in value]
+        elif field in (
+            "op_id",
+            "stats_handle",
+            "plan_handle",
+            "layer_id",
+            "blocked_us",
+        ):
+            value = int(value)
+        elif field in ("total_count", "balancedness_before", "balancedness_pred"):
+            value = float(value)
+        elif field == "reason":
+            value = str(value)
+        setattr(event, field, value)
+    return event
+
+
+def eplb_event_key(payload: dict) -> tuple[str, int]:
+    return payload["kind"], int(payload["op_id"])
+
+
+def pop_common_eplb_event_payloads(
+    pending_payloads_by_rank: Sequence[Sequence[dict]],
+) -> list[dict]:
+    if not pending_payloads_by_rank:
+        return []
+
+    rank_maps = []
+    common_keys = None
+    for payloads in pending_payloads_by_rank:
+        rank_map = {eplb_event_key(payload): payload for payload in payloads}
+        rank_maps.append(rank_map)
+        rank_keys = set(rank_map)
+        common_keys = rank_keys if common_keys is None else common_keys & rank_keys
+        if not common_keys:
+            return []
+
+    ready_payloads = []
+    for key in sorted(common_keys, key=lambda item: (item[1], item[0])):
+        payload = dict(rank_maps[0][key])
+        if payload["kind"] in ("PlanFailed", "RelocateFailed"):
+            reasons = [rank_map[key].get("reason", "") for rank_map in rank_maps]
+            reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+            if reasons:
+                payload["reason"] = "; ".join(reasons)
         ready_payloads.append(payload)
     return ready_payloads
 

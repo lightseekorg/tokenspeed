@@ -44,6 +44,7 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: torch.Tensor | None
+    ep_dispatch_algorithm: str = "static"
 
     # -------------------------------- properties ------------------------------------
 
@@ -85,17 +86,49 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
-        """Trivial location - logical expert i corresponds to physical expert i"""
+        """Initial location matching checkpoint-loaded EP slots.
+
+        Checkpoint loading still loads only the canonical logical experts for each
+        EP rank. Redundant physical slots start empty and must not participate in
+        dispatch until EPLB relocates a logical expert into them.
+        """
         common = ExpertLocationMetadata._init_common(server_args, model_config)
         num_physical_experts = common["num_physical_experts"]
+        num_local_physical_experts = common["num_local_physical_experts"]
+        ep_size = common["ep_size"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_layers = model_config_for_expert_location.num_layers
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
-        physical_to_logical_map = (
-            torch.arange(0, num_physical_experts).repeat(num_layers, 1)
-            % num_logical_experts
+        if num_logical_experts % ep_size != 0:
+            raise ValueError(
+                "EPLB initial placement requires logical experts to be evenly "
+                f"sharded across EP ranks: {num_logical_experts=} {ep_size=}"
+            )
+        num_loaded_per_rank = num_logical_experts // ep_size
+        if num_loaded_per_rank > num_local_physical_experts:
+            raise ValueError(
+                "EPLB initial placement has fewer physical slots than checkpoint "
+                f"experts: {num_loaded_per_rank=} {num_local_physical_experts=}"
+            )
+
+        physical_to_logical_map = torch.full(
+            (num_layers, num_physical_experts),
+            -1,
+            dtype=torch.int64,
         )
+        for ep_rank in range(ep_size):
+            physical_start = ep_rank * num_local_physical_experts
+            logical_start = ep_rank * num_loaded_per_rank
+            logical_ids = torch.arange(
+                logical_start,
+                logical_start + num_loaded_per_rank,
+                dtype=torch.int64,
+            )
+            physical_to_logical_map[
+                :,
+                physical_start : physical_start + num_loaded_per_rank,
+            ] = logical_ids.view(1, -1).expand(num_layers, -1)
 
         return ExpertLocationMetadata.init_by_mapping(
             server_args,
@@ -198,6 +231,13 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map: torch.Tensor,
     ):
         _, num_physical_experts = physical_to_logical_map.shape
+        ep_dispatch_algorithm = (
+            getattr(server_args, "ep_dispatch_algorithm", "static") or "static"
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            ep_rank = torch.distributed.get_rank() % ep_size
+        else:
+            ep_rank = getattr(server_args.mapping.moe, "ep_rank", 0)
 
         logical_to_all_physical_map_padded = F.pad(
             logical_to_all_physical_map,
@@ -219,12 +259,13 @@ class ExpertLocationMetadata:
                     logical_to_all_physical_map=logical_to_all_physical_map,
                     num_gpus=ep_size,
                     num_physical_experts=num_physical_experts,
-                    ep_rank=torch.distributed.get_rank() % ep_size,
+                    ep_rank=ep_rank,
                 )
-                if server_args.ep_dispatch_algorithm == "static"
-                or server_args.ep_dispatch_algorithm == "static_with_zero_expert"
+                if ep_dispatch_algorithm == "static"
+                or ep_dispatch_algorithm == "static_with_zero_expert"
                 else None
             ),
+            ep_dispatch_algorithm=ep_dispatch_algorithm,
         )
 
     # -------------------------------- mutation ------------------------------------
@@ -234,10 +275,38 @@ class ExpertLocationMetadata:
         other: "ExpertLocationMetadata",
         update_layer_ids: list[int],
     ):
-        for field in [
-            "ep_size",
-        ]:
-            assert getattr(self, field) == getattr(other, field)
+        assert self.ep_size == other.ep_size
+        assert self.ep_dispatch_algorithm == other.ep_dispatch_algorithm
+        update_layer_ids = list(dict.fromkeys(int(x) for x in update_layer_ids))
+        if not update_layer_ids:
+            return
+
+        layer_indices_by_device: dict[tuple[str, int | None], torch.Tensor] = {}
+
+        def _layer_index(device: torch.device) -> torch.Tensor:
+            key = (device.type, device.index)
+            index = layer_indices_by_device.get(key)
+            if index is None:
+                index = torch.tensor(update_layer_ids, dtype=torch.long, device=device)
+                layer_indices_by_device[key] = index
+            return index
+
+        def _apply_tensor_update(field: str):
+            other_field = getattr(other, field)
+            self_field = getattr(self, field)
+            assert (other_field is not None) == (self_field is not None)
+            if self_field is None:
+                return
+            self_index = _layer_index(self_field.device)
+            other_index = (
+                self_index
+                if other_field.device == self_field.device
+                else _layer_index(other_field.device)
+            )
+            source = other_field.index_select(0, other_index)
+            if source.device != self_field.device:
+                source = source.to(self_field.device, non_blocking=True)
+            self_field.index_copy_(0, self_index, source)
 
         for field in [
             "physical_to_logical_map",
@@ -246,16 +315,7 @@ class ExpertLocationMetadata:
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
         ]:
-            other_field = getattr(other, field)
-            self_field = getattr(self, field)
-            assert (other_field is not None) == (self_field is not None)
-            if self_field is not None:
-                mask_update = torch.tensor(
-                    [i in update_layer_ids for i in range(self.num_layers)]
-                )
-                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
-                mask_update = mask_update.to(self_field.device, non_blocking=True)
-                self_field[...] = torch.where(mask_update, other_field, self_field)
+            _apply_tensor_update(field)
 
     # -------------------------------- usage ------------------------------------
 
@@ -269,6 +329,24 @@ class ExpertLocationMetadata:
             ].tolist()
             if physical_expert_id != -1
         ]
+
+    def dispatch_info_for_layer(self, layer_id: int):
+        from tokenspeed_kernel.ops.moe import ExpertLocationDispatchInfo
+
+        partial_rank_map = None
+        if self.logical_to_rank_dispatch_physical_map is not None:
+            partial_rank_map = self.logical_to_rank_dispatch_physical_map[layer_id]
+        return ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm=self.ep_dispatch_algorithm,
+            partial_logical_to_rank_dispatch_physical_map=partial_rank_map,
+            partial_logical_to_all_physical_map=self.logical_to_all_physical_map[
+                layer_id
+            ],
+            partial_logical_to_all_physical_map_num_valid=self.logical_to_all_physical_map_num_valid[
+                layer_id
+            ],
+            num_physical_experts=self.num_physical_experts,
+        )
 
 
 def _compute_logical_to_all_physical_map(
@@ -286,6 +364,13 @@ def _compute_logical_to_all_physical_map(
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
+            if logical_expert_id < 0:
+                continue
+            if logical_expert_id >= num_logical_experts:
+                raise ValueError(
+                    f"physical expert {physical_expert_id} in layer {layer_id} "
+                    f"maps to invalid logical expert {logical_expert_id}"
+                )
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
@@ -332,6 +417,11 @@ def compute_logical_to_rank_dispatch_physical_map(
             candidate_physical_expert_ids = _logical_to_all_physical_raw(
                 logical_to_all_physical_map, layer_id, logical_expert_id
             )
+            if not candidate_physical_expert_ids:
+                raise ValueError(
+                    f"logical expert {logical_expert_id} in layer {layer_id} "
+                    "has no physical slot"
+                )
             output_partial = logical_to_rank_dispatch_physical_map[
                 :, layer_id, logical_expert_id
             ]

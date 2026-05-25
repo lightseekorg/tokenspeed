@@ -43,15 +43,21 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
+    advance_eplb,
     advance_forward,
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
     cache_sync_debug_enabled,
+    eplb_event_from_payload,
+    eplb_event_key,
+    eplb_event_to_payload,
     make_config,
+    make_eplb_controller_config,
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
+    pop_common_eplb_event_payloads,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
@@ -143,6 +149,9 @@ class EventLoop:
             draft_model_config = None
 
         min_per_gpu_mem = self._init_distributed()
+        self.eplb_pg = self._init_eplb_process_group(server_args)
+        self.eplb_control_pg = self._init_eplb_control_process_group(server_args)
+        self.eplb_event_pg = self._init_eplb_control_process_group(server_args)
 
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
@@ -188,6 +197,9 @@ class EventLoop:
             draft_model_runner=draft,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
+            model_config=self.model_config,
+            eplb_pg=self.eplb_pg,
+            eplb_control_pg=self.eplb_control_pg,
             draft_attn_backend=draft_attn_backend,
             draft_token_to_kv_pool=draft_token_to_kv_pool,
             mamba_pool=mamba_pool,
@@ -211,6 +223,11 @@ class EventLoop:
         # rank has anything pending. Lets us skip the TP collective in
         # _commit_cache_results entirely when nothing is in flight.
         self._num_inflight_cache_ops = 0
+        self._pending_eplb_event_payloads: OrderedDict[tuple[str, int], dict] = (
+            OrderedDict()
+        )
+        self._num_inflight_eplb_plan_ops = 0
+        self._num_inflight_eplb_relocate_ops = 0
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -331,6 +348,7 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
+            eplb_controller_config=make_eplb_controller_config(server_args),
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
@@ -487,6 +505,82 @@ class EventLoop:
         logger.debug("[cache_poll] scheduler.advance() done")
         self._publish_scheduler_kv_events()
 
+    def _init_eplb_process_group(self, server_args: ServerArgs):
+        if not getattr(server_args, "enable_eplb", False):
+            return None
+        if server_args.mapping.moe.ep_size <= 1:
+            return None
+        group = server_args.mapping.moe.ep_group
+        pg_manager.init_process_group(group)
+        return pg_manager.get_process_group("nccl", group)
+
+    def _init_eplb_control_process_group(self, server_args: ServerArgs):
+        if not getattr(server_args, "enable_eplb", False):
+            return None
+        if server_args.mapping.moe.ep_size <= 1:
+            return None
+        group = tuple(server_args.mapping.moe.ep_group)
+        size = len(group)
+        stride = group[1] - group[0] if size > 1 else 1
+        block = size * stride
+        world_size = dist.get_world_size()
+        eplb_control_pg = None
+        for base in range(0, world_size, block):
+            for offset in range(stride):
+                ranks = tuple(base + offset + i * stride for i in range(size))
+                pg = dist.new_group(ranks=list(ranks), backend="gloo")
+                if ranks == group:
+                    eplb_control_pg = pg
+        if eplb_control_pg is None:
+            raise RuntimeError(f"failed to create EPLB control group for {group}")
+        return eplb_control_pg
+
+    def _commit_eplb_events(self) -> None:
+        local_events = self.model_executor.drain_eplb_events()
+        for event in local_events:
+            payload = eplb_event_to_payload(event)
+            self._pending_eplb_event_payloads[eplb_event_key(payload)] = payload
+
+        if self.eplb_event_pg is None:
+            if local_events:
+                advance_eplb(self.scheduler, local_events)
+            return
+
+        if (
+            not self._pending_eplb_event_payloads
+            and self._num_inflight_eplb_plan_ops == 0
+            and self._num_inflight_eplb_relocate_ops == 0
+        ):
+            return
+
+        ready_payloads = self._pop_ready_eplb_event_payloads()
+        if not ready_payloads:
+            return
+
+        for payload in ready_payloads:
+            if payload["kind"] in ("PlanDone", "PlanFailed", "PlanIdentical"):
+                self._num_inflight_eplb_plan_ops = max(
+                    0, self._num_inflight_eplb_plan_ops - 1
+                )
+            elif payload["kind"] in ("RelocateDone", "RelocateFailed"):
+                self._num_inflight_eplb_relocate_ops = max(
+                    0, self._num_inflight_eplb_relocate_ops - 1
+                )
+        advance_eplb(
+            self.scheduler,
+            [eplb_event_from_payload(payload) for payload in ready_payloads],
+        )
+
+    def _handle_eplb_ops(self, execution_plan) -> None:
+        for op in getattr(execution_plan, "eplb", []) or []:
+            op_name = type(op).__name__
+            if op_name == "PlanOp":
+                self._num_inflight_eplb_plan_ops += 1
+            elif "Relocate" in op_name:
+                self._num_inflight_eplb_relocate_ops += 1
+            self.model_executor.handle_eplb_op(op)
+        self._commit_eplb_events()
+
     def _publish_scheduler_kv_events(self) -> None:
         raw_events = drain_scheduler_kv_events(
             self.scheduler,
@@ -533,6 +627,24 @@ class EventLoop:
 
         for payload in ready_payloads:
             self._pending_cache_event_payloads.pop(cache_event_key(payload), None)
+        return ready_payloads
+
+    def _pop_ready_eplb_event_payloads(self) -> list[dict]:
+        local_payloads = list(self._pending_eplb_event_payloads.values())
+        group_size = dist.get_world_size(self.eplb_event_pg)
+        if group_size == 1:
+            ready_payloads = local_payloads
+        else:
+            gathered_payloads = [None] * group_size
+            dist.all_gather_object(
+                gathered_payloads,
+                local_payloads,
+                group=self.eplb_event_pg,
+            )
+            ready_payloads = pop_common_eplb_event_payloads(gathered_payloads)
+
+        for payload in ready_payloads:
+            self._pending_eplb_event_payloads.pop(eplb_event_key(payload), None)
         return ready_payloads
 
     def _dispatch_forward(
@@ -1015,7 +1127,9 @@ class EventLoop:
         while True:
             self._process_new_requests()
             self._commit_cache_results()
+            self._commit_eplb_events()
             execution_plan = self.scheduler.next_execution_plan()
+            self._handle_eplb_ops(execution_plan)
             self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
 
@@ -1129,7 +1243,9 @@ class EventLoop:
             )
             self._process_new_requests()
             self._commit_cache_results()
+            self._commit_eplb_events()
             execution_plan = self.scheduler.next_execution_plan()
+            self._handle_eplb_ops(execution_plan)
             self._publish_scheduler_kv_events()
 
             self._submit_cache_ops(execution_plan)

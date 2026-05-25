@@ -23,6 +23,8 @@
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
     DisaggregationMode,
+    EplbControllerConfig,
+    EplbState,
     ExecutionEvent,
     ExecutionPlan,
     PagedCacheGroupAllocator,
@@ -39,6 +41,7 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
 
 PD = _ext.PD
 Cache = _ext.Cache
+EPLB = _ext.EPLB
 Forward = _ext.Forward
 ForwardEvent = _ext.ForwardEvent
 KVEvent = _ext.KVEvent
@@ -69,6 +72,8 @@ __all__ = [
     "SchedulerConfig",
     "SchedulerStats",
     "DisaggregationMode",
+    "EplbState",
+    "EplbControllerConfig",
     "RequestSpec",
     "PagedCacheRetention",
     "PagedCacheGroupConfig",
@@ -81,6 +86,7 @@ __all__ = [
     "Forward",
     "PD",
     "Cache",
+    "EPLB",
     "KVEvent",
     # Events
     "ExecutionEvent",

@@ -20,14 +20,16 @@
 
 #pragma once
 
-#include <variant>
-
-#include "scheduler/operations/forward.h"
-#include "scheduler/operations/cache.h"
-#include "scheduler/operations/eplb.h"
-
 namespace tokenspeed {
 
-using Operation = std::variant<CacheOperation, ForwardOperation, FlatForwardOperation, EplbOperation>;
+enum class EplbState {
+    kDisabled = 0,
+    kWarmingUp = 1,
+    kIdle = 2,
+    kCollecting = 3,
+    kPlanning = 4,
+    kRelocating = 5,
+    kSwapping = 6,
+};
 
 }  // namespace tokenspeed

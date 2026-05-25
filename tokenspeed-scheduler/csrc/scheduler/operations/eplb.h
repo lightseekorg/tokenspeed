@@ -20,14 +20,34 @@
 
 #pragma once
 
+#include <cstdint>
 #include <variant>
-
-#include "scheduler/operations/forward.h"
-#include "scheduler/operations/cache.h"
-#include "scheduler/operations/eplb.h"
+#include <vector>
 
 namespace tokenspeed {
 
-using Operation = std::variant<CacheOperation, ForwardOperation, FlatForwardOperation, EplbOperation>;
+struct EplbCollectStatsOperation {
+    std::int32_t op_id{};
+};
+
+struct EplbPlanOperation {
+    std::int32_t op_id{};
+    std::int32_t stats_handle{};
+};
+
+struct EplbRelocateOperation {
+    std::int32_t op_id{};
+    std::int32_t plan_handle{};
+    std::vector<std::int32_t> layer_ids;
+};
+
+struct EplbSwapOperation {
+    std::int32_t op_id{};
+    std::int32_t plan_handle{};
+    std::vector<std::int32_t> layer_ids;
+};
+
+using EplbOperation =
+    std::variant<EplbCollectStatsOperation, EplbPlanOperation, EplbRelocateOperation, EplbSwapOperation>;
 
 }  // namespace tokenspeed

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,14 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.moe.distribution_recorder import (
+    ExpertDistributionRecorder,
+    set_global_expert_distribution_recorder,
+)
+from tokenspeed.runtime.moe.eplb_runtime import EplbRuntime, set_global_eplb_runtime
+from tokenspeed.runtime.moe.expert_location import (
+    compute_initial_expert_location_metadata,
+)
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
@@ -171,6 +180,10 @@ class ModelExecutor:
         attn_backend: AttentionBackend,
         token_to_kv_pool: BaseTokenToKVPool,
         sampling_backend: SamplingBackend,
+        server_args: ServerArgs | None = None,
+        model_config: ModelConfig | None = None,
+        eplb_pg=None,
+        eplb_control_pg=None,
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
@@ -240,6 +253,11 @@ class ModelExecutor:
                 self.model_runner.model.set_eagle3_layers_to_capture()
         else:
             self.drafter = None
+
+        self.expert_location_metadata = None
+        self.expert_distribution_recorder = None
+        self.eplb_runtime = None
+        self._init_eplb(server_args, model_config, eplb_pg, eplb_control_pg)
 
         # Single grammar handle: CapturableGrammarExecutor on CUDA (uses
         # cudaLaunchHostFunc on a side stream so the xgrammar fill +
@@ -328,6 +346,66 @@ class ModelExecutor:
         set_random_seed(48)
 
         logger.info("ModelExecutor initialized")
+
+    def _init_eplb(
+        self,
+        server_args: ServerArgs | None,
+        model_config: ModelConfig | None,
+        eplb_pg,
+        eplb_control_pg,
+    ) -> None:
+        if server_args is None or model_config is None:
+            set_global_expert_distribution_recorder(None)
+            set_global_eplb_runtime(None)
+            return
+
+        init_location = getattr(server_args, "init_expert_location", None)
+        needs_metadata = (
+            bool(getattr(server_args, "enable_eplb", False))
+            or init_location not in (None, "trivial")
+            or int(getattr(server_args, "ep_num_redundant_experts", 0)) > 0
+        )
+        if not needs_metadata:
+            set_global_expert_distribution_recorder(None)
+            set_global_eplb_runtime(None)
+            return
+
+        metadata = compute_initial_expert_location_metadata(server_args, model_config)
+        moe_rank = getattr(server_args.mapping.moe, "ep_rank", server_args.mapping.rank)
+        moe_size = getattr(server_args.mapping.moe, "ep_size", 1)
+        recorder_pg = eplb_control_pg if eplb_control_pg is not None else eplb_pg
+        recorder = ExpertDistributionRecorder.init_new(
+            server_args, metadata, moe_rank, pg=recorder_pg
+        )
+        set_global_expert_distribution_recorder(recorder)
+
+        runtime = EplbRuntime(
+            server_args=server_args,
+            model_config=model_config,
+            initial_metadata=metadata,
+            recorder=recorder,
+            rank=moe_rank,
+            ep_size=moe_size,
+            eplb_pg=eplb_pg,
+            eplb_control_pg=eplb_control_pg,
+        )
+        runtime.bind_to_model(
+            self.model_runner.model,
+            build_host_cache=bool(getattr(server_args, "enable_eplb", False)),
+        )
+        self.expert_location_metadata = metadata
+        self.expert_distribution_recorder = recorder
+        self.eplb_runtime = runtime
+
+    def handle_eplb_op(self, op) -> None:
+        if self.eplb_runtime is None:
+            return
+        self.eplb_runtime.handle(op)
+
+    def drain_eplb_events(self) -> list[object]:
+        if self.eplb_runtime is None:
+            return []
+        return self.eplb_runtime.drain_events()
 
     @property
     def capturable_grammar(self):
@@ -1186,30 +1264,46 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
-                        bs=bs,
-                        ctx=ctx,
-                        sampling_info=sampling_info,
-                        req_to_page=self.req_to_page,
-                        extend_with_prefix=extend_with_prefix,
-                        extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
-                            :num_extends
-                        ],
-                        extend_prefix_lens_cpu=self.input_buffers.extend_prefix_lens_cpu[
-                            :num_extends
-                        ],
-                        extend_seq_lens=self.input_buffers.extend_seq_lens_buf[
-                            :num_extends
-                        ],
-                        extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
-                            :num_extends
-                        ],
-                        paged_cache_block_tables=paged_cache_block_tables,
-                        paged_cache_block_table_base_offsets=(
-                            paged_cache_block_table_base_offsets
-                        ),
-                        **mamba_kwargs,
+                    recorder = self.expert_distribution_recorder
+                    recorder_ctx = (
+                        recorder.with_forward_pass(
+                            int(self.log_step),
+                            metadata={
+                                "batch_size": int(bs),
+                                "num_extends": int(num_extends),
+                                "total_tokens": int(total_tokens),
+                            },
+                        )
+                        if recorder is not None
+                        else nullcontext()
                     )
+                    with recorder_ctx:
+                        output_tokens, output_lengths, output_logprobs = (
+                            self.forward_step(
+                                bs=bs,
+                                ctx=ctx,
+                                sampling_info=sampling_info,
+                                req_to_page=self.req_to_page,
+                                extend_with_prefix=extend_with_prefix,
+                                extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
+                                    :num_extends
+                                ],
+                                extend_prefix_lens_cpu=self.input_buffers.extend_prefix_lens_cpu[
+                                    :num_extends
+                                ],
+                                extend_seq_lens=self.input_buffers.extend_seq_lens_buf[
+                                    :num_extends
+                                ],
+                                extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
+                                    :num_extends
+                                ],
+                                paged_cache_block_tables=paged_cache_block_tables,
+                                paged_cache_block_table_base_offsets=(
+                                    paged_cache_block_table_base_offsets
+                                ),
+                                **mamba_kwargs,
+                            )
+                        )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

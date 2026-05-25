@@ -20,14 +20,18 @@
 
 #pragma once
 
-#include <variant>
-
-#include "scheduler/operations/forward.h"
-#include "scheduler/operations/cache.h"
-#include "scheduler/operations/eplb.h"
+#include <cstdint>
 
 namespace tokenspeed {
 
-using Operation = std::variant<CacheOperation, ForwardOperation, FlatForwardOperation, EplbOperation>;
+struct EplbControllerConfig {
+    bool enabled{false};
+    std::int32_t warmup_steps{200};
+    std::int32_t interval{400};
+    std::int32_t max_layers_per_step{0};
+    std::int64_t max_rebalance_period_ms{60000};
+    std::int32_t planner_timeout_ms{5000};
+    std::int32_t max_consecutive_failures{3};
+};
 
 }  // namespace tokenspeed

@@ -28,10 +28,11 @@
 #include "scheduler/outside_events/pd.h"
 #include "scheduler/outside_events/cache.h"
 #include "scheduler/outside_events/forward.h"
+#include "scheduler/outside_events/eplb.h"
 #include "resource/types.h"
 
 namespace tokenspeed {
 
-using Event = std::variant<CacheEvent, ForwardEvent, PDEvent>;
+using Event = std::variant<CacheEvent, ForwardEvent, PDEvent, eplb::EplbEvent>;
 
 }  // namespace tokenspeed
