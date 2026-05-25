@@ -51,7 +51,6 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
             and platform.arch_version.major >= 9
             and isinstance(quant_config, Fp8Config)
             and tuple(quant_config.weight_block_size or ()) == (128, 128)
-            and spec.ep_size > 1
             and spec.activation == "silu"
         )
 
