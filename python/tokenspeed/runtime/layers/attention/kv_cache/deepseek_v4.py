@@ -656,8 +656,16 @@ def deepseek_v4_cache_layout_from_config(
                 f"indices={layer_indices}, ratios={len(compress_ratios)}"
             )
         layer_ratios = [compress_ratios[idx] for idx in layer_indices]
+    raw_layer_ratios = tuple(int(x) for x in layer_ratios)
+    for ratio in raw_layer_ratios:
+        if ratio not in (0, 1, 4, 128):
+            raise ValueError(
+                "Unsupported DeepSeek V4 cache compress_ratio="
+                f"{ratio}; expected one of 0, 1, 4, or 128"
+            )
+
     return DeepseekV4CacheLayout(
-        layer_ratio=tuple(max(1, int(x)) for x in layer_ratios),
+        layer_ratio=tuple(max(1, ratio) for ratio in raw_layer_ratios),
         head_dim=int(hf_config.head_dim),
         rope_head_dim=int(hf_config.qk_rope_head_dim),
         page_size=page_size,

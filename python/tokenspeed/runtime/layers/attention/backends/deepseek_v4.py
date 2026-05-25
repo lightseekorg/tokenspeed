@@ -1429,6 +1429,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
+            forward_mode=forward_mode,
         )
 
     def _forward_deepseek_v4_prefill_chunk(
@@ -1527,7 +1528,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if (
             metadata is None
             or metadata.forward_mode is None
-            or not metadata.forward_mode.is_extend()
+            or not metadata.forward_mode.is_extend_or_mixed()
         ):
             metadata = self.forward_prefill_metadata or metadata
         if metadata is None:

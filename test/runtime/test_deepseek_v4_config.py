@@ -671,29 +671,32 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.use_target_verify_forward_mode = False
         wrapper._init_forward_metadata(
             padded_bs=2,
+            num_extends=0,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
             req_to_page=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
 
-        non_v4_args, non_v4_kwargs = captured["draft"][-1]
+        _, non_v4_kwargs = captured["draft"][-1]
         self.assertEqual(
-            non_v4_args[3].data_ptr(), wrapper.drafter.draft_seq_lens_buf.data_ptr()
+            non_v4_kwargs["seq_lens"].data_ptr(),
+            wrapper.drafter.draft_seq_lens_buf.data_ptr(),
         )
         self.assertEqual(non_v4_kwargs["forward_mode"], ForwardMode.DECODE)
 
         wrapper.use_target_verify_forward_mode = True
         wrapper._init_forward_metadata(
             padded_bs=2,
+            num_extends=0,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
             req_to_page=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.TARGET_VERIFY,
         )
 
-        v4_args, v4_kwargs = captured["draft"][-1]
-        self.assertEqual(v4_args[3].data_ptr(), seq_lens.data_ptr())
+        _, v4_kwargs = captured["draft"][-1]
+        self.assertEqual(v4_kwargs["seq_lens"].data_ptr(), seq_lens.data_ptr())
         self.assertEqual(v4_kwargs["forward_mode"], ForwardMode.DRAFT_EXTEND)
 
     def test_deepseek_v4_tokenizer_wrapper_uses_model_encoder(self):
@@ -1116,34 +1119,30 @@ class TestDeepseekV4Config(unittest.TestCase):
             index_head_dim=128,
         )
 
-        swa = deepseek_v4_attention_layout(config, 0, attn_tp_size=4)
-        csa = deepseek_v4_attention_layout(config, 1, attn_tp_size=4)
-        csa_fp4 = deepseek_v4_attention_layout(
-            config, 1, attn_tp_size=4, use_fp4_indexer_cache=True
+        layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=64,
+            use_fp4_indexer_cache=False,
         )
-        hca = deepseek_v4_attention_layout(config, 2, attn_tp_size=4)
+        layout_fp4 = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=64,
+            use_fp4_indexer_cache=True,
+        )
 
-        self.assertEqual(swa.kind, "swa")
-        self.assertEqual(swa.compress_ratio, 1)
-        self.assertEqual(swa.num_local_heads, 16)
-        self.assertEqual(swa.padded_heads, 64)
-        self.assertEqual(swa.nope_head_dim, 448)
-        self.assertEqual(swa.swa_head_bytes, 584)
-        self.assertFalse(swa.needs_compressed_cache)
-        self.assertFalse(swa.needs_indexer)
-
-        self.assertEqual(csa.kind, "csa")
-        self.assertEqual(csa.compress_ratio, 4)
-        self.assertTrue(csa.needs_compressed_cache)
-        self.assertTrue(csa.needs_indexer)
-        self.assertEqual(csa.compressed_cache_alignment, 576)
-        self.assertEqual(csa.indexer_cache_head_bytes, 132)
-        self.assertEqual(csa_fp4.indexer_cache_head_bytes, 68)
-
-        self.assertEqual(hca.kind, "hca")
-        self.assertEqual(hca.compress_ratio, 128)
-        self.assertTrue(hca.needs_compressed_cache)
-        self.assertFalse(hca.needs_indexer)
+        self.assertEqual(layout.layer_ratio, (1, 4, 128))
+        self.assertEqual(layout.swa_token_stride, 576)
+        self.assertEqual(layout.swa_scale_dim, 8)
+        self.assertEqual(layout.swa_row_bytes, 584)
+        self.assertEqual(layout.swa_cell_bytes(), 585)
+        self.assertEqual(layout.compressed_cell_bytes(4), 585)
+        self.assertEqual(layout.compressed_cell_bytes(128), 27)
+        self.assertEqual(layout.state_width(0), 512)
+        self.assertEqual(layout.state_width(1), 1024)
+        self.assertEqual(layout.state_width(2), 512)
+        self.assertEqual(layout.state_width(1, indexer=True), 256)
+        self.assertEqual(layout.indexer_row_bytes, 132)
+        self.assertEqual(layout_fp4.indexer_row_bytes, 68)
 
     def test_deepseek_v4_profile_uses_grouped_draft_cache_cell_size(self):
         class GenericDraftAttnConfig:
@@ -1181,6 +1180,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         config = SimpleNamespace(
             compress_ratios=[0, 4, 128, 0],
             head_dim=512,
+            qk_rope_head_dim=64,
             index_head_dim=128,
         )
 
@@ -1212,7 +1212,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "compress_ratio=8"):
-            deepseek_v4_attention_layout(config, 0)
+            deepseek_v4_cache_layout_from_config(
+                config,
+                page_size=64,
+                use_fp4_indexer_cache=False,
+            )
 
     def test_deepseek_v4_rope_config_matches_layer_type(self):
         config = SimpleNamespace(
@@ -1660,6 +1664,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         config = SimpleNamespace(
             compress_ratios=[1],
             head_dim=512,
+            qk_rope_head_dim=64,
             index_head_dim=128,
         )
         layout = deepseek_v4_cache_layout_from_config(
@@ -2025,6 +2030,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
                 head_dim=576,
                 context_len=256,
             )
@@ -2117,6 +2124,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=4096,
                 speculative_num_draft_tokens=4,
@@ -2665,6 +2673,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
                 speculative_num_draft_tokens=4,
@@ -2745,6 +2754,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
                 speculative_num_draft_tokens=4,
@@ -2836,6 +2846,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
                 speculative_num_draft_tokens=4,
@@ -2892,6 +2903,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_kv_heads=1,
                 attn_tp_size=1,
                 dtype=torch.bfloat16,
+                is_draft=False,
                 head_dim=512,
                 context_len=128,
                 speculative_num_draft_tokens=4,
@@ -2932,50 +2944,54 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(out.shape, (6, 1, 2))
         self.assertIs(backend.forward_metadata, prefill_metadata)
 
-    def test_deepseek_v4_indexer_decode_batches_cache_reads(self):
-        torch.manual_seed(0)
+    def test_deepseek_v4_indexer_decode_plan_batches_metadata(self):
         positions = torch.tensor([15, 7, 3], dtype=torch.int64)
         token_to_req_indices = torch.tensor([0, 1, 2], dtype=torch.int32)
-        block_table = torch.tensor([[0], [1], [2]], dtype=torch.int32)
-        cache = torch.randn(12, 128, dtype=torch.float32)
-        index_q = torch.randn(3, 2, 128, dtype=torch.float32)
-        weights = torch.randn(3, 2, dtype=torch.float32)
-
-        def cache_reader(cache_2d, slot_mapping, block_size):
-            del block_size
-            return cache_2d[slot_mapping.long()]
-
-        actual = _deepseek_v4_indexer_topk_from_cache_batched(
-            cache_reader=cache_reader,
-            cache_2d=cache,
-            positions=positions,
-            token_to_req_indices=token_to_req_indices,
-            block_table=block_table,
-            cache_block_size=4,
-            index_q=index_q,
-            weights=weights,
-            compress_ratio=4,
-            topk_tokens=3,
+        block_table = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23], [30, 31, 32, 33]],
+            dtype=torch.int32,
         )
+        calls = []
 
-        expected = torch.full((3, 3), -1, dtype=torch.int32)
-        for token_idx, position in enumerate(positions.tolist()):
-            num_compressed = (position + 1) // 4
-            local = torch.arange(num_compressed, dtype=torch.int64)
-            req_idx = int(token_to_req_indices[token_idx].item())
-            pages = torch.div(local, 4, rounding_mode="floor")
-            offsets = local % 4
-            page_ids = block_table[req_idx, pages.long()].to(torch.int64)
-            slots = page_ids * 4 + offsets
-            selected = min(num_compressed, expected.shape[1])
-            expected[token_idx, :selected] = deepseek_v4_indexer_topk_reference(
-                index_q[token_idx : token_idx + 1],
-                cache_reader(cache, slots, 4),
-                weights[token_idx : token_idx + 1],
-                top_k=selected,
-            )[0]
+        def fake_decode_metadata_compute(**kwargs):
+            calls.append(kwargs)
+            kwargs["out_context_lens"].copy_(
+                torch.tensor([[4], [2], [1]], dtype=torch.int32)
+            )
+            kwargs["out_block_tables"].copy_(
+                torch.tensor([[10], [20], [30]], dtype=torch.int32)
+            )
 
-        self.assertTrue(torch.equal(actual, expected))
+        with patch.dict(global_server_args_dict, {"max_model_len": None}):
+            with patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_indexer_decode_metadata_compute",
+                fake_decode_metadata_compute,
+            ):
+                plan = deepseek_v4_model._deepseek_v4_indexer_decode_plan(
+                    positions=positions,
+                    token_to_req_indices=token_to_req_indices,
+                    block_table=block_table,
+                    cache_block_size=4,
+                    compress_ratio=4,
+                    is_valid_token=torch.tensor([True, False, True]),
+                )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["max_blocks"], 1)
+        self.assertEqual(plan.max_context_len, 4)
+        self.assertTrue(
+            torch.equal(
+                plan.context_lens,
+                torch.tensor([[4], [0], [1]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                plan.block_table,
+                torch.tensor([[10], [0], [30]], dtype=torch.int32),
+            )
+        )
 
     def test_deepseek_v4_indexer_decode_max_len_uses_context_or_cache_window(self):
         block_table = torch.zeros((2, 257), dtype=torch.int32)
