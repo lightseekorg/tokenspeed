@@ -70,6 +70,7 @@ def make_config(
     mamba_l2_host_slots: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    max_loras: int = 0,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -99,6 +100,7 @@ def make_config(
     cfg.enable_mamba_l2 = enable_mamba_l2
     cfg.mamba_l2_host_slots = mamba_l2_host_slots
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
+    cfg.max_loras = max_loras
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg

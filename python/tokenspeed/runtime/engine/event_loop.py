@@ -334,6 +334,7 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=enable_mixed_prefill_decode,
             prefix_cache_adjunct=prefix_cache_adjunct,
+            max_loras=server_args.max_loras if server_args.enable_lora else 0,
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
