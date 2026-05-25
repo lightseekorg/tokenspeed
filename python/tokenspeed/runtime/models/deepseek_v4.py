@@ -3775,13 +3775,9 @@ class DeepseekV4Attention(nn.Module):
                     topk_indices=topk_indices,
                 )
         elif (
-            backend_decode is not None
-            and ctx.forward_mode is not None
-            and (
-                ctx.forward_mode.is_decode()
-                or ctx.forward_mode.is_target_verify()
-                or ctx.forward_mode.is_draft_extend()
-            )
+            forward_mode.is_decode()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
         ):
             with nvtx_range(f"{profile_prefix}_decode_backend"):
                 attn_output = ctx.attn_backend.forward_deepseek_v4_decode(
