@@ -231,7 +231,9 @@ class LoraManager:
         # the most recent prepare_loras call, and defer GPU weight eviction for
         # any adapter that is unloaded while still in use.
         self._active_names: set[str] = set()
-        self._pending_eviction: set[str] = set()  # names to evict when safe
+        self._pending_eviction: set[tuple[str, int]] = (
+            set()
+        )  # (name, lora_id) to evict when safe
 
         # ── Tier 2: pinned CPU pool ─────────────────────────────────────
         # ``_cpu_cache[name]`` holds parsed weights in pinned host memory.
@@ -451,27 +453,31 @@ class LoraManager:
         if name not in self._name_to_id:
             raise KeyError(f"Adapter '{name}' is not loaded.")
 
-        # Remove from identity tables immediately so no NEW requests are assigned
-        # to this adapter.  GPU weight eviction may be deferred (see below).
         lora_id = self._name_to_id.pop(name)
-        del self._id_to_name[lora_id]
+        # Keep _id_to_name[lora_id] alive until eviction fires so retracted
+        # requests that resume with this lora_id can still be recognised and
+        # get the correct weights rather than silently falling back to the base
+        # model.  It is cleared when the GPU slot is finally freed below.
 
         if name in self._active_names:
             # The adapter was used in the most recent forward step; its GPU
-            # weights may still be needed if the scheduler is mid-decode for
-            # one of those requests.  Defer the weight zeroing until the next
-            # prepare_loras confirms the adapter is no longer in the batch.
+            # weights may still be needed if the scheduler is mid-decode or has
+            # retracted a request that it will later reschedule.  Defer the
+            # weight zeroing until a batch arrives that does not include this
+            # adapter — at that point the previous step is confirmed complete.
             logger.warning(
                 "Adapter '%s' (lora_id=%d) unloaded while potentially in-flight; "
                 "GPU slot eviction deferred until next batch that does not use it.",
                 name,
                 lora_id,
             )
-            self._pending_eviction.add(name)
-            # Keep CPU weights alive so retracted requests can still reload.
-            # The CPU entry is removed when the deferred eviction fires.
+            # Store (name, lora_id) so the flush can distinguish this entry from
+            # a same-name re-registration that might occur before flushing.
+            self._pending_eviction.add((name, lora_id))
+            # CPU weights kept alive so retracted requests can still reload.
         else:
             # Safe to evict immediately — not active in the current batch.
+            del self._id_to_name[lora_id]
             self._evict_by_name(name)
             self._cpu_store.remove(name)
 
@@ -479,6 +485,35 @@ class LoraManager:
 
     def get_id(self, name: str) -> int | None:
         return self._name_to_id.get(name)
+
+    def _flush_one_pending(self, name: str, lora_id: int) -> None:
+        """Carry out the deferred GPU+CPU eviction for one (name, lora_id) entry.
+
+        Guards against two edge cases:
+        - Re-registration: the same name was re-loaded after unload; the new
+          slot should NOT be zeroed.  Detected by checking that _id_to_name
+          still maps lora_id → name (the old entry, kept alive for retracted
+          requests) and that the current name→id mapping no longer exists.
+        - Already-evicted slot: LRU pressure may have freed the GPU slot
+          before the deferred flush fires; _evict_by_name is idempotent.
+        """
+        # If the same name was re-registered, _name_to_id[name] exists again
+        # with a NEW lora_id.  Skip GPU eviction — the slot now belongs to the
+        # new adapter.  The CPU copy for the OLD weights was already removed or
+        # never loaded under the new id.
+        if self._name_to_id.get(name) is not None:
+            # Name was re-registered; clear the stale _id_to_name entry for the
+            # old lora_id only if it still points to this name.
+            if self._id_to_name.get(lora_id) == name:
+                del self._id_to_name[lora_id]
+            return
+
+        # Clear the reverse mapping kept alive for retracted-request safety.
+        if self._id_to_name.get(lora_id) == name:
+            del self._id_to_name[lora_id]
+
+        self._evict_by_name(name)  # idempotent if already LRU-evicted
+        self._cpu_store.remove(name)
 
     def flush_pending_evictions(self) -> None:
         """Evict all deferred adapter weights immediately, regardless of active state.
@@ -489,11 +524,10 @@ class LoraManager:
         same as the original unload_adapter (slot zeroed while in-flight), so
         only call this when you are certain no requests are running.
         """
-        for name in list(self._pending_eviction):
+        for name, lora_id in list(self._pending_eviction):
             logger.info("Flushing deferred eviction for adapter '%s'.", name)
-            self._evict_by_name(name)
-            self._cpu_store.remove(name)
-            self._pending_eviction.discard(name)
+            self._flush_one_pending(name, lora_id)
+            self._pending_eviction.discard((name, lora_id))
 
     def prepare_loras(
         self,
@@ -534,15 +568,14 @@ class LoraManager:
         # synchronously before each forward).  Flush any deferred evictions for
         # adapters that are NOT needed by the current batch.
         current_batch_names = set(unique_names.values())
-        for pending_name in list(self._pending_eviction):
+        for pending_name, pending_lora_id in list(self._pending_eviction):
             if pending_name not in current_batch_names:
                 logger.info(
                     "Deferred eviction: removing adapter '%s' GPU weights now.",
                     pending_name,
                 )
-                self._evict_by_name(pending_name)
-                self._cpu_store.remove(pending_name)
-                self._pending_eviction.discard(pending_name)
+                self._flush_one_pending(pending_name, pending_lora_id)
+                self._pending_eviction.discard((pending_name, pending_lora_id))
 
         # Track which adapters are active in this batch for mid-decode unload safety.
         self._active_names = current_batch_names
