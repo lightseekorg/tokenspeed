@@ -879,6 +879,8 @@ def check_perf_reference(
     passed = not failures
     status = "passed" if passed else "failed"
     print(f"[perf-ref] threshold={threshold:g}, status={status}", flush=True)
+    for line in format_perf_reference_table(checks):
+        print(f"[perf-ref]   {line}", flush=True)
     for line in failures:
         print(f"[perf-ref]   {line}", flush=True)
     return {
@@ -887,6 +889,77 @@ def check_perf_reference(
         "checks": checks,
         "failures": failures,
     }
+
+
+def _ratio_pct(actual: float, ref: float) -> str:
+    """Format actual/ref as a percentage, e.g. ``105.5%``."""
+    if ref == 0:
+        return "n/a"
+    return f"{actual / ref * 100:.1f}%"
+
+
+def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
+    """Render the per-concurrency actual-vs-reference comparison as a
+    monospace text table. Each metric shows four columns: ``actual``, the
+    raw ``ref`` (un-thresholded), the ``floor`` (``ref * perf_threshold`` —
+    the value an actual must clear to pass), and ``actual/ref`` (the raw
+    percentage against ref, ``perf_threshold`` is NOT applied). Returns a
+    list of lines without any prefix so the caller can decorate (e.g.
+    ``[perf-ref]`` for stdout). Empty when ``checks`` has no entries."""
+    if not checks:
+        return []
+    header = (
+        f"{'Conc':>4}  "
+        f"{'Lat actual':>10} {'Lat ref':>9} {'Lat floor':>10} {'Lat actual/ref':>14}  "
+        f"{'Thru actual':>12} {'Thru ref':>10} {'Thru floor':>11} {'Thru actual/ref':>15}"
+    )
+    rule = "-" * len(header)
+    lines = [header, rule]
+    for entry in checks:
+        lat = entry.get("Latency (tps/user)") or {}
+        thru = entry.get("Throughput (tps/gpu)") or {}
+        lines.append(
+            f"{entry['conc']:>4}  "
+            f"{lat.get('actual', 0):>10.2f} "
+            f"{lat.get('ref', 0):>9.2f} "
+            f"{lat.get('floor', 0):>10.2f} "
+            f"{_ratio_pct(lat.get('actual', 0), lat.get('ref', 0)):>14}  "
+            f"{thru.get('actual', 0):>12.2f} "
+            f"{thru.get('ref', 0):>10.2f} "
+            f"{thru.get('floor', 0):>11.2f} "
+            f"{_ratio_pct(thru.get('actual', 0), thru.get('ref', 0)):>15}"
+        )
+    return lines
+
+
+def format_perf_reference_markdown_table(checks: List[Dict[str, Any]]) -> List[str]:
+    """Markdown-table variant of ``format_perf_reference_table`` for the
+    GitHub Step Summary. Same four columns per metric: ``actual``, raw
+    ``ref``, the threshold-adjusted ``floor``, and ``actual/ref`` (raw
+    percentage against ref). Empty when ``checks`` has no entries."""
+    if not checks:
+        return []
+    lines = [
+        "| Conc | Lat actual | Lat ref | Lat floor | Lat actual/ref "
+        "| Thru actual | Thru ref | Thru floor | Thru actual/ref |",
+        "|-----:|-----------:|--------:|----------:|---------------:"
+        "|------------:|---------:|-----------:|----------------:|",
+    ]
+    for entry in checks:
+        lat = entry.get("Latency (tps/user)") or {}
+        thru = entry.get("Throughput (tps/gpu)") or {}
+        lines.append(
+            f"| {entry['conc']} "
+            f"| {lat.get('actual', 0):.2f} "
+            f"| {lat.get('ref', 0):.2f} "
+            f"| {lat.get('floor', 0):.2f} "
+            f"| {_ratio_pct(lat.get('actual', 0), lat.get('ref', 0))} "
+            f"| {thru.get('actual', 0):.2f} "
+            f"| {thru.get('ref', 0):.2f} "
+            f"| {thru.get('floor', 0):.2f} "
+            f"| {_ratio_pct(thru.get('actual', 0), thru.get('ref', 0))} |"
+        )
+    return lines
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -954,6 +1027,9 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
             f"(threshold `{check['threshold']:g}`, "
             f"{len(check['checks'])} concurrency levels)"
         )
+        md_table = format_perf_reference_markdown_table(check["checks"])
+        if md_table:
+            lines.extend(["", *md_table, ""])
         if not check["passed"]:
             lines.extend([f"  - {failure}" for failure in check["failures"]])
     if result.get("eval_accept_rate"):

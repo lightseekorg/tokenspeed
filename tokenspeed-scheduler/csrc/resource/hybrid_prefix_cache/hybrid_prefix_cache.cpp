@@ -20,8 +20,10 @@
 
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
+#include "resource/allocator/mamba_host_allocator.h"
 #include "resource/allocator/paged_cache_group.h"
 #include "resource/radix_tree/paged_cache_snapshot.h"
+#include "resource/radix_tree/node_range.h"
 #include "resource/radix_tree/radix_tree.h"
 #include "resource/radix_tree/tree_node.h"
 #include "scheduler/operations/forward.h"
@@ -39,9 +41,10 @@
 namespace tokenspeed {
 
 HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
-                                     std::int32_t mamba_cache_chunk_size)
+                                     std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator)
     : kv_prefix_cache_{kv_prefix_cache},
       mamba_allocator_{mamba_allocator},
+      mamba_host_allocator_{mamba_host_allocator},
       mamba_eviction_manager_{mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
@@ -62,28 +65,74 @@ MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int3
 
 void HybridPrefixCache::augmentMatch(MatchResult& match) const {
     if (mamba_allocator_ == nullptr) return;
-    TreeNode* kv_terminal = match.device.last_node;
-    if (kv_terminal == nullptr || kv_terminal->IsRoot()) return;
+    TreeNode* root = match.device.last_node;
+    while (root != nullptr && !root->IsRoot()) root = root->Parent();
+    if (root == nullptr) return;
 
-    TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
-    if (mamba_node == nullptr) {
-        const std::int32_t kv_depth = match.device.DepthInPage();
-        const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * match.device.page_size);
-        if (aligned_seqlen > 0) {
-            match.mamba_branching_seqlen = aligned_seqlen;
+    // Backward-compatible path: before Mamba L2 is enabled, only device Mamba is
+    // a valid hybrid prefix source and both match tiers are truncated together.
+    if (mamba_host_allocator_ == nullptr) {
+        TreeNode* kv_terminal = match.device.last_node;
+        if (kv_terminal == nullptr || kv_terminal->IsRoot()) return;
+
+        TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
+        if (mamba_node == nullptr) {
+            const std::int32_t kv_depth = match.device.DepthInPage();
+            const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * match.device.page_size);
+            if (aligned_seqlen > 0) {
+                match.mamba_branching_seqlen = aligned_seqlen;
+            }
+            match.device.last_node = root;
+            match.host.last_node = root;
+            return;
         }
-        TreeNode* root = kv_terminal;
-        while (!root->IsRoot()) root = root->Parent();
-        match.device.last_node = root;
-        match.host.last_node = root;
+
+        std::int32_t page_size = match.device.page_size;
+        std::int32_t kv_depth = match.device.DepthInPage();
+        std::int32_t mamba_depth = mamba_node->DepthInPage(page_size);
+        match.mamba_cow_src_index = mamba_node->MambaSlotIndex();
+        if (kv_depth > mamba_depth) {
+            const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * page_size);
+            if (aligned_seqlen > mamba_depth * page_size) {
+                match.mamba_branching_seqlen = aligned_seqlen;
+            }
+        }
+        match.device.last_node = mamba_node;
+        match.host.last_node = mamba_node;
         return;
     }
 
-    std::int32_t page_size = match.device.page_size;
-    std::int32_t kv_depth = match.device.DepthInPage();
-    std::int32_t mamba_depth = mamba_node->DepthInPage(page_size);
+    const std::int32_t page_size = match.device.page_size;
+    const std::int32_t kv_depth = std::max(match.device.DepthInPage(), match.host.DepthInPage());
 
-    match.mamba_cow_src_index = mamba_node->MambaSlotIndex();
+    TreeNode* device_mamba_node = FindLastMambaNode(match.device.last_node);
+    TreeNode* host_mamba_node = FindLastMambaHostNode(match.host.last_node);
+    const std::int32_t device_mamba_depth =
+        device_mamba_node == nullptr ? 0 : device_mamba_node->DepthInPage(page_size);
+    const std::int32_t host_mamba_depth = host_mamba_node == nullptr ? 0 : host_mamba_node->DepthInPage(page_size);
+    const bool prefer_host_mamba = host_mamba_depth > device_mamba_depth;
+    std::int32_t mamba_depth = 0;
+
+    if (device_mamba_node != nullptr) {
+        match.device.last_node = device_mamba_node;
+        if (!prefer_host_mamba) {
+            match.mamba_cow_src_index = device_mamba_node->MambaSlotIndex();
+        }
+        mamba_depth = std::max(mamba_depth, device_mamba_depth);
+    } else {
+        match.device.last_node = root;
+    }
+
+    if (host_mamba_node != nullptr) {
+        match.host.last_node = host_mamba_node;
+        match.mamba_host_src_index = host_mamba_node->MambaHostSlotIndex();
+        if (prefer_host_mamba) {
+            match.mamba_cow_src_index = -1;
+        }
+        mamba_depth = std::max(mamba_depth, host_mamba_depth);
+    } else {
+        match.host.last_node = root;
+    }
 
     if (kv_depth > mamba_depth) {
         const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * page_size);
@@ -91,9 +140,6 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
             match.mamba_branching_seqlen = aligned_seqlen;
         }
     }
-
-    match.device.last_node = mamba_node;
-    match.host.last_node = mamba_node;
 }
 
 std::int32_t HybridPrefixCache::AlignMambaCacheSeqlen(std::int32_t seqlen) const {
@@ -106,6 +152,82 @@ TreeNode* HybridPrefixCache::FindLastMambaNode(TreeNode* from) const {
         if (cur->HasMamba()) return cur;
     }
     return nullptr;
+}
+
+TreeNode* HybridPrefixCache::FindLastMambaHostNode(TreeNode* from) const {
+    for (TreeNode* cur = from; cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
+        if (cur->HasMambaOnHost()) return cur;
+    }
+    return nullptr;
+}
+
+bool HybridPrefixCache::EnsureMambaHostCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node) {
+    if (mamba_host_allocator_ == nullptr) return num_slots <= 0;
+    if (mamba_host_allocator_->AvailableSlots() >= num_slots) return true;
+
+    std::vector<TreeNode*> candidates;
+    candidates.reserve(mamba_host_nodes_.size());
+    for (TreeNode* node : mamba_host_nodes_) {
+        if (node == nullptr || node == protected_node || !node->HasMambaOnHost()) continue;
+        if (node->OnHost() && GetResource<ResourceType::Host>(node).RefCount() > 0) continue;
+        candidates.push_back(node);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const TreeNode* lhs, const TreeNode* rhs) { return lhs->Time() < rhs->Time(); });
+
+    for (TreeNode* node : candidates) {
+        if (mamba_host_allocator_->AvailableSlots() >= num_slots) break;
+        node->DetachMambaHost();
+        mamba_host_nodes_.erase(node);
+    }
+    if (mamba_host_allocator_->AvailableSlots() < num_slots) {
+        spdlog::warn("[HybridPrefixCache] mamba host capacity exhausted required={} after_evict_available={}",
+                     num_slots, mamba_host_allocator_->AvailableSlots());
+    }
+    return mamba_host_allocator_->AvailableSlots() >= num_slots;
+}
+
+std::vector<TransferPair> HybridPrefixCache::PrepareMambaHostWriteBack(const std::vector<TreeNode*>& nodes) {
+    std::vector<TransferPair> transfers;
+    if (mamba_allocator_ == nullptr || mamba_host_allocator_ == nullptr) return transfers;
+
+    std::int32_t needed = 0;
+    for (TreeNode* node : nodes) {
+        if (node != nullptr && node->HasMamba() && !node->HasMambaOnHost() &&
+            pending_mamba_host_writebacks_.find(node) == pending_mamba_host_writebacks_.end()) {
+            needed++;
+        }
+    }
+    if (!EnsureMambaHostCapacityByEvict(needed)) return transfers;
+
+    for (TreeNode* node : nodes) {
+        if (node == nullptr || !node->HasMamba() || node->HasMambaOnHost()) continue;
+        if (pending_mamba_host_writebacks_.find(node) != pending_mamba_host_writebacks_.end()) continue;
+        auto slot = mamba_host_allocator_->Allocate();
+        if (!slot.has_value()) break;
+        const std::int32_t device_idx = node->MambaSlotIndex();
+        const std::int32_t host_idx = slot->Index();
+        pending_mamba_host_writebacks_.emplace(node, std::make_unique<MambaSlot>(std::move(*slot)));
+        transfers.push_back(TransferPair{CacheKind::kMamba, device_idx, host_idx});
+    }
+    return transfers;
+}
+
+std::vector<TransferPair> HybridPrefixCache::PrepareMambaDeviceLoadBack(const std::vector<TreeNode*>& nodes) {
+    std::vector<TransferPair> transfers;
+    if (mamba_allocator_ == nullptr || mamba_host_allocator_ == nullptr) return transfers;
+
+    for (TreeNode* node : nodes) {
+        if (node == nullptr || !node->HasMambaOnHost() || node->HasMamba()) continue;
+        auto slot = mamba_allocator_->Allocate();
+        if (!slot.has_value()) break;
+        const std::int32_t host_idx = node->MambaHostSlotIndex();
+        const std::int32_t device_idx = slot->Index();
+        node->AttachMamba(std::make_unique<MambaSlot>(std::move(*slot)));
+        mamba_eviction_manager_.TrackNode(node);
+        transfers.push_back(TransferPair{CacheKind::kMamba, host_idx, device_idx});
+    }
+    return transfers;
 }
 
 bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node) {
@@ -178,6 +300,89 @@ void HybridPrefixCache::OnKVEvict(TreeNode* node) {
     // Route through DetachPagedCacheSnapshotFromNode to keep membership set in sync.
     if (node->HasPagedCacheSnapshot()) {
         DetachPagedCacheSnapshotFromNode(node);
+    }
+}
+
+void HybridPrefixCache::OnKVHostEvict(TreeNode* node) {
+    if (node == nullptr || mamba_host_allocator_ == nullptr) return;
+    pending_mamba_host_writebacks_.erase(node);
+    if (node->HasMambaOnHost()) {
+        node->DetachMambaHost();
+        mamba_host_nodes_.erase(node);
+        mamba_host_writeback_done_nodes_.erase(node);
+    }
+}
+
+void HybridPrefixCache::DemoteIdleMambaDeviceCopiesPresentOnHost() {
+    if (mamba_allocator_ == nullptr || mamba_host_allocator_ == nullptr) return;
+
+    std::int32_t demoted = 0;
+    std::vector<TreeNode*> nodes(mamba_host_writeback_done_nodes_.begin(), mamba_host_writeback_done_nodes_.end());
+    for (TreeNode* node : nodes) {
+        if (node == nullptr || !node->HasMambaOnHost()) {
+            mamba_host_writeback_done_nodes_.erase(node);
+            continue;
+        }
+        if (!node->HasMamba()) {
+            mamba_host_writeback_done_nodes_.erase(node);
+            continue;
+        }
+        if (node->OnDevice() && node->Device().RefCount() != 0) {
+            continue;
+        }
+        OnKVDeviceDemote(node);
+        mamba_host_writeback_done_nodes_.erase(node);
+        ++demoted;
+    }
+    if (demoted > 0) {
+        spdlog::debug("[HybridPrefixCache][mamba_l2] demoted device copies after host writeback count={}", demoted);
+    }
+}
+
+void HybridPrefixCache::OnMambaHostWriteBackDone(TreeNode* last_node) {
+    if (last_node == nullptr) return;
+    std::vector<TreeNode*> nodes;
+    for (TreeNode* node : LeafToRoot(last_node)) {
+        if (node == nullptr || !node->OnHost()) break;
+        nodes.push_back(node);
+    }
+    OnMambaHostWriteBackDone(nodes);
+}
+
+void HybridPrefixCache::OnMambaHostWriteBackDone(const std::vector<TreeNode*>& nodes) {
+    if (mamba_allocator_ == nullptr || mamba_host_allocator_ == nullptr) return;
+
+    std::int32_t attached = 0;
+    std::int32_t completed = 0;
+    for (TreeNode* node : nodes) {
+        if (node == nullptr || !node->OnHost()) continue;
+        auto pending = pending_mamba_host_writebacks_.find(node);
+        if (pending != pending_mamba_host_writebacks_.end()) {
+            node->AttachMambaHost(std::move(pending->second));
+            pending_mamba_host_writebacks_.erase(pending);
+            mamba_host_nodes_.insert(node);
+            ++attached;
+        }
+        if (node->HasMambaOnHost()) {
+            mamba_host_writeback_done_nodes_.insert(node);
+            ++completed;
+        }
+    }
+    if (attached > 0 || completed > 0) {
+        spdlog::debug("[HybridPrefixCache][mamba_l2] host writeback done attach_count={} completed_nodes={}", attached,
+                      completed);
+    }
+    DemoteIdleMambaDeviceCopiesPresentOnHost();
+}
+
+void HybridPrefixCache::OnKVDeviceDemote(TreeNode* node) {
+    if (node == nullptr || mamba_allocator_ == nullptr) return;
+    if (node->HasMamba() && node->HasMambaOnHost()) {
+        mamba_eviction_manager_.UntrackNode(node);
+        node->DetachMamba();
+        if (node->Parent() != nullptr) {
+            mamba_eviction_manager_.UpdateLeaf(node->Parent());
+        }
     }
 }
 
@@ -550,11 +755,13 @@ void HybridPrefixCache::AcquireForRequest(const std::string& request_id, std::in
 
 void HybridPrefixCache::ReleaseRequest(const std::string& request_id) {
     auto it = request_paged_cache_tables_.find(request_id);
-    if (it == request_paged_cache_tables_.end()) return;
-    for (auto& [_, table] : it->second) {
-        table.ReleaseAll();
+    if (it != request_paged_cache_tables_.end()) {
+        for (auto& [_, table] : it->second) {
+            table.ReleaseAll();
+        }
+        request_paged_cache_tables_.erase(it);
     }
-    request_paged_cache_tables_.erase(it);
+    DemoteIdleMambaDeviceCopiesPresentOnHost();
 }
 
 void HybridPrefixCache::PopulateOp(ForwardOperationBase& op_base) const {

@@ -32,6 +32,7 @@
 #include "resource/allocator/kv_allocator.h"
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/local_mamba_allocator.h"
+#include "scheduler/operations/cache.h"
 #include "resource/page_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "resource/types.h"
@@ -284,52 +285,62 @@ struct Draining {
     // can redistribute pages across new prefix/suffix nodes).
     // Storing concrete (device_page, host_page) pairs here makes newWriteBackOperation
     // split-safe: it never needs to re-walk the radix tree.
-    using PagePair = std::tuple<std::int32_t, std::int32_t>;
+    using PagePair = TransferPair;
     Draining(std::vector<PagePair> pages_to_transfer, std::unique_ptr<DeviceNodeRef>&& device_node_ref,
-             std::unique_ptr<HostNodeRef>&& host_node_ref)
+             std::unique_ptr<HostNodeRef>&& host_node_ref, std::vector<TreeNode*> mamba_writeback_nodes = {})
         : pages_to_transfer_(std::move(pages_to_transfer)),
           device_node_ref_(std::move(device_node_ref)),
-          host_node_ref_(std::move(host_node_ref)) {}
+          host_node_ref_(std::move(host_node_ref)),
+          mamba_writeback_nodes_(std::move(mamba_writeback_nodes)) {}
 
 public:
-    // (device_page, host_page) pairs that must be transferred Device→Host.
+    // Transfer pairs that must be copied Device→Host.
     const std::vector<PagePair>& GetPagesToTransfer() const { return pages_to_transfer_; }
 
     std::unique_ptr<DeviceNodeRef> TakeDeviceNodeRef() && { return std::move(device_node_ref_); }
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+    std::vector<TreeNode*> TakeMambaWriteBackNodes() && { return std::move(mamba_writeback_nodes_); }
 
 private:
-    std::vector<PagePair> pages_to_transfer_;         // concrete (dev, host) page pairs to copy
+    std::vector<PagePair> pages_to_transfer_;         // concrete mixed-kind pairs to copy
     std::unique_ptr<DeviceNodeRef> device_node_ref_;  // keeps matched Device node alive until WritingBack
     std::unique_ptr<HostNodeRef> host_node_ref_;      // keeps pre-allocated Host node alive until WritingBack
+    std::vector<TreeNode*> mamba_writeback_nodes_;    // exact Mamba nodes covered by this writeback op
 };
 
 // WritingBack OP has been generated, executing offload.
 // Holds both node refs as RAII locks so the pages are not evicted while the
 // async Device→Host transfer is in flight.
 struct WritingBack {
-    WritingBack(std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<HostNodeRef>&& host_node_ref)
-        : device_node_ref_(std::move(device_node_ref)), host_node_ref_(std::move(host_node_ref)) {}
+    WritingBack(std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<HostNodeRef>&& host_node_ref,
+                std::vector<TreeNode*> mamba_writeback_nodes = {})
+        : device_node_ref_(std::move(device_node_ref)),
+          host_node_ref_(std::move(host_node_ref)),
+          mamba_writeback_nodes_(std::move(mamba_writeback_nodes)) {}
 
     WritingBack(WritingBack&&) noexcept = default;
     WritingBack& operator=(WritingBack&&) noexcept = default;
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+    TreeNode* DeviceNode() const { return device_node_ref_ ? device_node_ref_->Node() : nullptr; }
+    const std::vector<TreeNode*>& MambaWriteBackNodes() const { return mamba_writeback_nodes_; }
+    void DropDeviceNodeRef() { device_node_ref_.reset(); }
 
 private:
     std::unique_ptr<DeviceNodeRef> device_node_ref_;  // released after WriteBackDone
     std::unique_ptr<HostNodeRef> host_node_ref_;      // released after WriteBackDone
+    std::vector<TreeNode*> mamba_writeback_nodes_;    // pending host Mamba slots published by this op ack
 };
 
 // Need to hold local_kv_allocator(has tail page info), and token container for recovery
 struct Retracting : public WritingBack {
-    using PagePair = std::tuple<std::int32_t, std::int32_t>;
+    using PagePair = TransferPair;
 
     Retracting(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
-               std::vector<PagePair> pages_to_transfer,
+               std::vector<PagePair> pages_to_transfer, std::vector<TreeNode*> mamba_writeback_nodes = {},
                std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
-        : WritingBack(std::move(device_node_ref), std::move(host_node_ref)),
+        : WritingBack(std::move(device_node_ref), std::move(host_node_ref), std::move(mamba_writeback_nodes)),
           token_container_{token_container},
           page_size_{page_size},
           local_kv_allocator_(std::move(local_kv_allocator)),

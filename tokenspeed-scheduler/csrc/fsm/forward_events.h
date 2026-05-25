@@ -55,7 +55,8 @@ struct Prefetching;
 void InsertHybridCache(HybridPrefixCache* hybrid_prefix_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
-                       LocalMambaAllocator* local_mamba_allocator);
+                       LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
+                       std::int32_t page_size);
 
 struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefillFirstChunkEvent> {
     using InvalidTransitionHandler<SchedulePrefillFirstChunkEvent>::operator();
@@ -64,7 +65,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    MatchResult match_result, Role role, KVPrefixCache* kv_prefix_cache,
                                    bool disable_l2_cache, std::vector<TreeNode*> loadback_diff,
                                    HybridPrefixCache* hybrid_prefix_cache = nullptr,
-                                   MambaChunkAllocator* mamba_allocator = nullptr)
+                                   MambaChunkAllocator* mamba_allocator = nullptr,
+                                   std::vector<TreeNode*> mamba_loadback_nodes = {})
         : tokens_this_round_(tokens_this_round),
           decode_input_tokens_(decode_input_tokens),
           device_allocator_(device_allocator),
@@ -73,6 +75,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           role_{role},
           disable_l2_cache_{disable_l2_cache},
           loadback_diff_(std::move(loadback_diff)),
+          mamba_loadback_nodes_(std::move(mamba_loadback_nodes)),
           kv_prefix_cache_(kv_prefix_cache),
           hybrid_prefix_cache_(hybrid_prefix_cache),
           mamba_allocator_(mamba_allocator) {}
@@ -83,6 +86,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
     const MatchResult GetMatchResult() const { return match_result_; }
 
     const std::vector<TreeNode*>& GetLoadbackDiff() const { return loadback_diff_; }
+    const std::vector<TreeNode*>& GetMambaLoadbackNodes() const { return mamba_loadback_nodes_; }
 
 private:
     std::int32_t tokens_this_round_{};
@@ -93,6 +97,7 @@ private:
     const Role role_;
     bool disable_l2_cache_{};
     std::vector<TreeNode*> loadback_diff_;
+    std::vector<TreeNode*> mamba_loadback_nodes_;
     KVPrefixCache* kv_prefix_cache_;
     HybridPrefixCache* hybrid_prefix_cache_{};
     MambaChunkAllocator* mamba_allocator_{};
@@ -136,13 +141,15 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
     ScheduleDecodeFromRetractedEvent(std::int32_t decode_input_tokens, PageAllocator* device_allocator,
                                      ReqPoolAllocator* req_pool_allocator, KVPrefixCache* kv_prefix_cache,
                                      MatchResult match_result, std::vector<TreeNode*> loadback_diff,
-                                     MambaChunkAllocator* mamba_allocator = nullptr)
+                                     MambaChunkAllocator* mamba_allocator = nullptr,
+                                     std::vector<TreeNode*> mamba_loadback_nodes = {})
         : decode_input_tokens_(decode_input_tokens),
           device_allocator_(device_allocator),
           req_pool_allocator_(req_pool_allocator),
           kv_prefix_cache_(kv_prefix_cache),
           match_result_(std::move(match_result)),
           loadback_diff_(std::move(loadback_diff)),
+          mamba_loadback_nodes_(std::move(mamba_loadback_nodes)),
           mamba_allocator_(mamba_allocator) {}
 
     Decoding operator()(Retracted&& state);
@@ -150,6 +157,7 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
     const MatchResult& GetMatchResult() const { return match_result_; }
 
     const std::vector<TreeNode*>& GetLoadbackDiff() const { return loadback_diff_; }
+    const std::vector<TreeNode*>& GetMambaLoadbackNodes() const { return mamba_loadback_nodes_; }
 
 private:
     std::int32_t decode_input_tokens_{};
@@ -158,6 +166,7 @@ private:
     KVPrefixCache* kv_prefix_cache_{};
     MatchResult match_result_{};
     std::vector<TreeNode*> loadback_diff_;
+    std::vector<TreeNode*> mamba_loadback_nodes_;
     MambaChunkAllocator* mamba_allocator_{};
 };
 
@@ -245,9 +254,17 @@ struct CommitDrainingEvent : InvalidTransitionHandler<CommitDrainingEvent> {
 // Retracting  → Retracted: same transfer path for preempted requests;
 //                          device_node_ref drops (frees GPU pages), host_node_ref moves into Retracted.
 struct WriteBackDoneEvent : InvalidTransitionHandler<WriteBackDoneEvent> {
+    explicit WriteBackDoneEvent(KVPrefixCache* kv_prefix_cache = nullptr,
+                                HybridPrefixCache* hybrid_prefix_cache = nullptr)
+        : kv_prefix_cache_(kv_prefix_cache), hybrid_prefix_cache_(hybrid_prefix_cache) {}
+
     using InvalidTransitionHandler<WriteBackDoneEvent>::operator();
     Finished operator()(WritingBack&& state);
     Retracted operator()(Retracting&& state);
+
+private:
+    KVPrefixCache* kv_prefix_cache_{};
+    HybridPrefixCache* hybrid_prefix_cache_{};
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {

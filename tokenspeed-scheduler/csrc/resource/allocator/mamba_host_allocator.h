@@ -18,45 +18,32 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "resource/allocator/mamba_chunk_allocator.h"
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+#include "resource/radix_tree/mamba_slot.h"
 
 namespace tokenspeed {
 
-MambaSlot::MambaSlot(std::int32_t index, MambaChunkAllocator* allocator)
-    : MambaSlot(index, [allocator](std::int32_t i) {
-          if (allocator != nullptr) allocator->Free(i);
-      }) {}
+class MambaHostAllocator {
+public:
+    explicit MambaHostAllocator(std::int32_t num_slots);
 
-MambaChunkAllocator::MambaChunkAllocator(std::int32_t num_slots) : total_slots_{num_slots} {
-    free_list_.reserve(num_slots);
-    for (std::int32_t i = num_slots - 1; i >= 0; --i) {
-        free_list_.push_back(i);
-    }
-}
+    std::optional<MambaSlot> Allocate();
+    void Free(std::int32_t index);
+    std::vector<std::int32_t> DrainReleased(std::size_t max = 1024);
 
-std::optional<MambaSlot> MambaChunkAllocator::Allocate() {
-    if (free_list_.empty()) {
-        return std::nullopt;
-    }
-    std::int32_t index = free_list_.back();
-    free_list_.pop_back();
-    return MambaSlot{index, this};
-}
+    std::int32_t AvailableSlots() const { return static_cast<std::int32_t>(free_list_.size()); }
+    std::int32_t TotalSlots() const { return total_slots_; }
 
-void MambaChunkAllocator::Free(std::int32_t index) {
-    free_list_.push_back(index);
-}
-
-MambaSlot::~MambaSlot() {
-    release();
-}
-
-void MambaSlot::release() {
-    if (index_ >= 0 && releaser_) {
-        releaser_(index_);
-        index_ = -1;
-        releaser_ = {};
-    }
-}
+private:
+    std::vector<std::int32_t> free_list_;
+    std::vector<std::int32_t> released_idx_queue_;
+    std::int32_t total_slots_;
+};
 
 }  // namespace tokenspeed

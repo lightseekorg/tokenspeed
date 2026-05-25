@@ -74,6 +74,10 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (has_mamba_pool) {
         mamba_allocator_.emplace(config_.mamba_pool_total_chunks);
     }
+    const bool has_mamba_l2_pool = has_mamba_pool && config_.enable_mamba_l2 && config_.mamba_l2_host_slots > 0;
+    if (has_mamba_l2_pool) {
+        mamba_host_allocator_.emplace(config_.mamba_l2_host_slots);
+    }
 
     // Construct HybridPrefixCache when any adjunct/paged-cache feature is configured.
     // Role::kD skips Mamba but still participates in paged-cache transport.
@@ -82,9 +86,12 @@ Scheduler::Scheduler(SchedulerConfig config)
     const bool has_paged_cache_groups = !config_.paged_cache_groups.empty();
     if (has_mamba_adjunct || has_prefix_cache_adjunct || has_paged_cache_groups) {
         MambaChunkAllocator* mamba_ptr = has_mamba_adjunct ? &*mamba_allocator_ : nullptr;
-        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size);
+        MambaHostAllocator* mamba_host_ptr = has_mamba_l2_pool ? &*mamba_host_allocator_ : nullptr;
+        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size, mamba_host_ptr);
         kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
             [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
+        kv_prefix_cache_.GetHostManager().SetEvictionCallback(
+            [this](TreeNode* node) { hybrid_prefix_cache_->OnKVHostEvict(node); });
 
         for (const auto& cfg : config_.paged_cache_groups) {
             PagedCacheGroupConfig copy = cfg;
@@ -282,8 +289,8 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
             CacheOpSpec spec;
             spec.request_id = id;
             cache_op_tracker_[op_id] = std::move(spec);
-            ops.push_back(WriteBackOperation{op_id, std::vector<std::tuple<std::int32_t, std::int32_t>>(
-                                                        pages_to_transfer.begin(), pages_to_transfer.end())});
+            ops.push_back(WriteBackOperation{
+                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
             req->Apply(fsm::AbortEvent{});

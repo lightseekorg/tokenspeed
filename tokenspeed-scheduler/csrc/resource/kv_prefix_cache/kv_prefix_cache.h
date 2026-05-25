@@ -66,6 +66,9 @@ public:
     template <ResourceType RType>
     bool EnsureCapacityByEvict(std::int32_t required_num_pages);
 
+    std::vector<TreeNode*> ReleaseDeviceResourcesPresentOnHost(TreeNode* last_node,
+                                                               std::function<void(TreeNode*)> on_release = {});
+
     void EnqueueTransfer(TreeNode* last_node);
 
     template <ResourceType RType>
@@ -78,6 +81,7 @@ public:
 
     std::int32_t PageSize() const { return tree_.PageSize(); }
     DeviceManager& GetDeviceManager() { return device_; }
+    HostManager& GetHostManager() { return host_; }
 
     // Adjunct managers may need to materialize boundary nodes via SplitAt.
     // The tree's lifetime remains owned by this KVPrefixCache.

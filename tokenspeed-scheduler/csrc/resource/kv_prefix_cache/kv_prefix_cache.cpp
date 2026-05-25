@@ -353,6 +353,38 @@ bool KVPrefixCache::EnsureCapacityByEvict(std::int32_t required_num_pages) {
     return manager.AvailablePages() >= required_num_pages;
 }
 
+std::vector<TreeNode*> KVPrefixCache::ReleaseDeviceResourcesPresentOnHost(TreeNode* last_node,
+                                                                          std::function<void(TreeNode*)> on_release) {
+    std::vector<TreeNode*> released;
+    for (TreeNode* node : LeafToRoot(last_node)) {
+        if (node == nullptr || node->IsRoot()) continue;
+        if (!node->OnDevice()) continue;
+
+        if (!node->OnHost()) {
+            break;
+        }
+        if (node->Device().RefCount() != 0) {
+            break;
+        }
+        if (on_release) {
+            on_release(node);
+        }
+        if (HasChildWithPages<ResourceType::Device>(node)) {
+            break;
+        }
+
+        device_.RemoveLeaf(node);
+        recordDeviceBlockRemoved(node);
+        auto detached = node->DetachResource<ResourceType::Device>();
+        if (detached == nullptr) {
+            break;
+        }
+        released.push_back(node);
+        device_.UpdateLeaves(node->Parent());
+    }
+    return released;
+}
+
 cache_op_id KVPrefixCache::AllocateCacheOpId() {
     return next_op_id_++;
 }
