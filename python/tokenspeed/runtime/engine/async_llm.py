@@ -56,7 +56,6 @@ from tokenspeed.runtime.engine.input_processor import InputProcessor
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
-    BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
     CloseSessionReqInput,
@@ -97,7 +96,7 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
-from tokenspeed.runtime.utils.hf_transformers_utils import get_processor, get_tokenizer
+from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
@@ -158,28 +157,21 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
-        # Create tokenizer
+        # Create tokenizer. The engine never preprocesses images -- the SMG
+        # gateway ships precomputed multimodal inputs -- so even multimodal
+        # models only need the tokenizer, not the full HF AutoProcessor.
         if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
+            self.tokenizer = None
         else:
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                architectures=self.model_config.hf_config.architectures,
+            )
             if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    server_args.tokenizer,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
-                self.tokenizer = self.processor.tokenizer
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            else:
-                self.tokenizer = get_tokenizer(
-                    server_args.tokenizer,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    architectures=self.model_config.hf_config.architectures,
-                )
-
         # Store states
         self.no_create_loop = False
         self.rid_to_state: dict[str, ReqState] = {}
@@ -222,7 +214,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                         BatchStrOut,
                         BatchEmbeddingOut,
                         BatchTokenIDOut,
-                        BatchMultimodalOut,
                     ),
                     self.output_processor.handle_batch_output,
                 ),
@@ -315,6 +306,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             tokenized_time=tokenized_obj.created_time,
         )
         self.rid_to_state[obj.rid] = state
+        mm_inputs = getattr(tokenized_obj, "multimodal_inputs", None)
+        if mm_inputs is not None:
+            mm_inputs.publish_shm_features()
         self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
 
     async def _wait_one_response(

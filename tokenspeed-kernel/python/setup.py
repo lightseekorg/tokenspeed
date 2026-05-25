@@ -520,13 +520,6 @@ class CudaKernelBuilder:
                     _add_dir(candidate)
                 if (candidate / "cccl").exists():
                     _add_dir(candidate / "cccl")
-            for rel in (
-                "tokenspeed_triton/backends/nvidia/include",
-                "triton/backends/nvidia/include",
-            ):
-                candidate = base_path / rel
-                if (candidate / "cuda_runtime.h").exists():
-                    _add_dir(candidate)
 
         try:
             tvm_ffi = importlib.import_module("tvm_ffi")

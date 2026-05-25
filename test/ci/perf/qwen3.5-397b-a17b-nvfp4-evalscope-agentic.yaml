@@ -6,7 +6,7 @@ triggers:
   - manual
 runner:
   labels:
-    - gb200-4gpu
+    - gb200-4gpu-perf
 env:
   CI: "true"
 install:

@@ -23,7 +23,7 @@
 
 import itertools
 import math
-from typing import Any
+from typing import Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -75,6 +75,45 @@ def _apply_rotary_emb(
         return torch.cat((o1, o2), dim=-1)
     else:
         return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+
+# Copied from transformers
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def apply_rotary_pos_emb_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+
+    # embedding is performed in float
+    cos = cos.unsqueeze(unsqueeze_dim).float()
+    sin = sin.unsqueeze(unsqueeze_dim).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+
+    return q_embed, k_embed
+
+
+def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
+    x_t = x[0].clone()
+    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
+    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
+    return x_t
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -778,12 +817,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: torch.dtype,
         mrope_section: list[int] | None = None,
+        mrope_interleaved: bool = False,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
         self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             expected_sum = rotary_dim // 2
             actual_sum = sum(self.mrope_section)
@@ -845,14 +886,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         if positions.ndim == 2:
             assert self.mrope_section
 
-            cos = torch.cat(
-                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
-            sin = torch.cat(
-                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -968,7 +1013,13 @@ class MRotaryEmbedding(RotaryEmbedding):
 
                         time_tensor_long = time_tensor.long()
                         t_index = time_tensor_long.flatten()
-                    elif model_type in ("qwen2_vl", "qwen3_vl", "qwen3_vl_moe"):
+                    elif model_type in (
+                        "qwen2_vl",
+                        "qwen3_vl",
+                        "qwen3_vl_moe",
+                        "qwen3_5",
+                        "qwen3_5_moe",
+                    ):
                         t_index = (
                             torch.arange(llm_grid_t)
                             .view(-1, 1)
@@ -1302,6 +1353,7 @@ def get_rope(
                     is_neox_style,
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
                 )
             else:
                 rotary_emb = RotaryEmbedding(

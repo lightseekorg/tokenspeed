@@ -44,6 +44,23 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 
 
+def _own_multimodal_inputs(tokenized_copy) -> None:
+    """Give this fan-out copy its own multimodal feature tensors.
+
+    ``MultimodalInputs.publish_shm_features`` rewrites ``item.feature``
+    in place from tensor to SHM handle, and consumers later unlink the
+    segment. The prefix warmup and each n>1 replica are shallow
+    ``copy.copy`` of the same tokenized payload, so without an independent
+    copy they would publish only once (the 2nd+ ``publish`` is a no-op
+    because the feature is already a handle) and share the SHM segment.
+    When the first replica's scheduler step consumes-and-unlinks, the
+    later replicas hit ``FileNotFoundError`` on their own attach.
+    """
+    mm = getattr(tokenized_copy, "multimodal_inputs", None)
+    if mm is not None:
+        tokenized_copy.multimodal_inputs = copy.deepcopy(mm)
+
+
 def prepare_prefix_warmup(
     tmp_obj: GenerateReqInput | EmbeddingReqInput,
     tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
@@ -55,6 +72,7 @@ def prepare_prefix_warmup(
     prefix before the replicas are dispatched.
     """
     tokenized_copy = copy.copy(tokenized_obj)
+    _own_multimodal_inputs(tokenized_copy)
     tokenized_copy.rid = tmp_obj.regenerate_rid()
     tokenized_copy.sampling_params = copy.copy(tokenized_copy.sampling_params)
     tokenized_copy.sampling_params.max_new_tokens = 0
@@ -74,5 +92,6 @@ def prepare_parallel_sampling_replica(
     the replicas share everything except their request identity.
     """
     tokenized_copy = copy.copy(tokenized_obj)
+    _own_multimodal_inputs(tokenized_copy)
     tokenized_copy.rid = tmp_obj.regenerate_rid()
     return tokenized_copy

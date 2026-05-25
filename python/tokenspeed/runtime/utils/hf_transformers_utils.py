@@ -34,7 +34,6 @@ import torch
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
-    AutoProcessor,
     AutoTokenizer,
     GenerationConfig,
     PretrainedConfig,
@@ -46,6 +45,7 @@ from transformers.utils import cached_file
 from tokenspeed.runtime.configs import (
     DeepseekV4Config,
     KimiK2Config,
+    KimiK25Config,
     MiniMaxM2Config,
     Qwen2Config,
     Qwen3_5Config,
@@ -64,6 +64,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     MiniMaxM2Config.model_type: MiniMaxM2Config,
     KimiK2Config.model_type: KimiK2Config,
+    KimiK25Config.model_type: KimiK25Config,
 }
 
 _DEEPSEEK_V4_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_v4_encoding"
@@ -248,6 +249,8 @@ def get_config(
         text_config.update(model_override_args)
 
     if resolve_architecture(config) in [
+        "KimiK25ForConditionalGeneration",
+        "KimiK25Config",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",
@@ -570,26 +573,6 @@ def get_tokenizer(
 
     attach_additional_stop_token_ids(tokenizer)
     return tokenizer
-
-
-def get_processor(
-    tokenizer_name: str,
-    *args,
-    tokenizer_mode: str = "auto",
-    trust_remote_code: bool = False,
-    tokenizer_revision: str | None = None,
-    **kwargs,
-):
-    processor = AutoProcessor.from_pretrained(
-        tokenizer_name,
-        *args,
-        trust_remote_code=trust_remote_code,
-        tokenizer_revision=tokenizer_revision,
-        **kwargs,
-    )
-
-    attach_additional_stop_token_ids(processor.tokenizer)
-    return processor
 
 
 def attach_additional_stop_token_ids(tokenizer):

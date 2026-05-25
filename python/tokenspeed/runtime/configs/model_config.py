@@ -54,6 +54,7 @@ _MLA_ARCHITECTURES = frozenset(
         "DeepseekV3ForCausalLMNextN",
         "Eagle3DeepseekV2ForCausalLM",
         "LongcatFlashForCausalLM",
+        "KimiK25ForConditionalGeneration",
     }
 )
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
@@ -192,6 +193,9 @@ class ModelConfig:
 
         # MLA models carry per-head dimension metadata that does not follow the
         # standard hidden_size / num_attention_heads derivation above.
+        model_architectures = list(self.hf_config.architectures or []) + list(
+            getattr(self.hf_text_config, "architectures", []) or []
+        )
         if is_deepseek_v4(self.hf_config):
             block_size_default = ServerArgs.__dataclass_fields__["block_size"].default
             if server_args.block_size == block_size_default:
@@ -203,22 +207,25 @@ class ModelConfig:
                 )
                 server_args.block_size = 256
             configure_deepseek_v4_attention(self)
-        elif any(arch in _MLA_ARCHITECTURES for arch in self.hf_config.architectures):
+        elif any(arch in _MLA_ARCHITECTURES for arch in model_architectures):
+            mla_config = (
+                self.hf_text_config
+                if hasattr(self.hf_text_config, "kv_lora_rank")
+                else self.hf_config
+            )
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
+            self.kv_lora_rank = mla_config.kv_lora_rank
+            self.qk_nope_head_dim = mla_config.qk_nope_head_dim
+            self.qk_rope_head_dim = mla_config.qk_rope_head_dim
+            self.v_head_dim = mla_config.v_head_dim
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            rope_scaling = getattr(self.hf_config, "rope_scaling", None)
+            rope_scaling = getattr(mla_config, "rope_scaling", None)
             if rope_scaling and "factor" in rope_scaling:
-                mscale_all_dim = self.hf_config.rope_scaling.get(
-                    "mscale_all_dim", False
-                )
-                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+                scaling_factor = rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
 
@@ -476,20 +483,13 @@ def is_generation_model(model_architectures: list[str]):
     return True
 
 
-def is_multimodal_model(model_architectures: list[str]):
+def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
-        "LlavaLlamaForCausalLM",
-        "LlavaQwenForCausalLM",
-        "LlavaMistralForCausalLM",
-        "LlavaVidForCausalLM",
-        "MllamaForConditionalGeneration",
-        "Qwen2VLForConditionalGeneration",
-        "Qwen2_5_VLForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
-        "MiniCPMV",
+        "KimiK25ForConditionalGeneration",
     }
-    return any(arch in multimodal_architectures for arch in model_architectures)
+    return any(arch in multimodal_architectures for arch in model_architectures or [])
 
 
 def is_multimodal_gen_model(model_architectures: list[str]):
