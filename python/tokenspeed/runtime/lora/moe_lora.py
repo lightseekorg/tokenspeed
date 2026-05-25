@@ -29,8 +29,6 @@ from tokenspeed.runtime.lora.lora_batch import NO_LORA_SLOT, LoraBatchInfo
 
 try:
     from tokenspeed_kernel.ops.moe_lora import (
-        fused_a_b_down_expand,
-        fused_shared_a_b_gate_up_expand,
         gate_up_b_expand,
         per_expert_a_shrink,
         per_expert_b_down_expand,
