@@ -25,7 +25,10 @@ import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import Tolerance
-from tokenspeed_kernel.numerics.verify import verify_kernel
+from tokenspeed_kernel.numerics.verify import (
+    _verification_signature_and_reference,
+    verify_kernel,
+)
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
@@ -109,6 +112,43 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
 
     with pytest.raises(ValueError, match="requires block_shape"):
         generator.generate(M=4, N=256, K=128)
+
+
+def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:
+    tensor_scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+    channel_scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+    tensor_signature = next(
+        iter(format_signatures(("a", "b"), "fp8", {_fp8_dtype}, scale=tensor_scale))
+    )
+    channel_signature = next(
+        iter(format_signatures(("a", "b"), "fp8", {_fp8_dtype}, scale=channel_scale))
+    )
+    ref_spec = KernelSpec(
+        name="test_tensor_scale_reference",
+        family="gemm",
+        mode="mm",
+        solution="reference",
+        format_signatures=frozenset({tensor_signature}),
+        traits={"b_layout": frozenset({"KN"})},
+    )
+    test_spec = KernelSpec(
+        name="test_fp8_scaled",
+        family="gemm",
+        mode="mm",
+        solution="triton",
+        format_signatures=frozenset({channel_signature, tensor_signature}),
+        traits={"b_layout": frozenset({"KN"})},
+    )
+    registry = KernelRegistry.get()
+    registry.register(ref_spec, lambda **_kwargs: None)
+    registry.register(test_spec, lambda **_kwargs: None)
+
+    signature, reference = _verification_signature_and_reference(
+        registry, test_spec, _fp8_dtype
+    )
+
+    assert signature == tensor_signature
+    assert reference is ref_spec
 
 
 class TestNumericsVerification:
