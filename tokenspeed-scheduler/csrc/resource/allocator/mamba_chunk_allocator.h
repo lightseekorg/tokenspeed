@@ -47,8 +47,7 @@ private:
     // releases may fire from async transfer-completion callbacks whose
     // ordering differs per rank, but the resulting allocator state must be
     // identical across ranks (the C++ scheduler is mirrored).
-    std::priority_queue<std::int32_t, std::vector<std::int32_t>, std::greater<std::int32_t>>
-        free_list_;
+    std::priority_queue<std::int32_t, std::vector<std::int32_t>, std::greater<std::int32_t>> free_list_;
     std::int32_t total_slots_;
 };
 

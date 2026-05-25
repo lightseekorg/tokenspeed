@@ -46,8 +46,7 @@ private:
     // See mamba_chunk_allocator.h for the rationale: min-heap free list keeps
     // Allocate() output independent of Free() ordering so TP ranks stay in sync
     // even when slot-release callbacks fire at different times per rank.
-    std::priority_queue<std::int32_t, std::vector<std::int32_t>, std::greater<std::int32_t>>
-        free_list_;
+    std::priority_queue<std::int32_t, std::vector<std::int32_t>, std::greater<std::int32_t>> free_list_;
     // DrainReleased() sorts before returning, so insertion order here doesn't
     // affect cross-rank determinism.
     std::vector<std::int32_t> released_idx_queue_;

@@ -199,15 +199,13 @@ TEST(EvictionLRUDeterminism, EvictionDeterministicOnTimeTies) {
 
     auto t1 = MakeAlignedTokens(1, kPageSize, 1);
     auto first = std::make_unique<TreeNode>(t1, ts);
-    first->AttachResource<ResourceType::Device>(
-        std::make_unique<DeviceResource>(alloc.Allocate(1)));
+    first->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(alloc.Allocate(1)));
     TreeNode* first_raw = first.get();
     root.AddChild(t1, std::move(first));
 
     auto t2 = MakeAlignedTokens(1, kPageSize, 5);
     auto second = std::make_unique<TreeNode>(t2, ts);
-    second->AttachResource<ResourceType::Device>(
-        std::make_unique<DeviceResource>(alloc.Allocate(1)));
+    second->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(alloc.Allocate(1)));
     TreeNode* second_raw = second.get();
     root.AddChild(t2, std::move(second));
 

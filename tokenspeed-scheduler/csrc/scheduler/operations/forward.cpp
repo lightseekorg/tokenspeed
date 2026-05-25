@@ -565,11 +565,10 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     // and — when token_budget / page / mamba-slot constraints are tight — picks
     // a different subset to schedule. That made forward_op None on some ranks
     // and non-None on others, deadlocking the next NCCL collective.
-    std::sort(candidates.begin(), candidates.end(),
-              [&](const auto& a, const auto& b) {
-                  int pa = priority(a), pb = priority(b);
-                  return pa != pb ? pa < pb : a->Id() < b->Id();
-              });
+    std::sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
+        int pa = priority(a), pb = priority(b);
+        return pa != pb ? pa < pb : a->Id() < b->Id();
+    });
 
     std::vector<ForwardOperation> ops;
     std::int32_t token_budget = config_.max_scheduled_tokens;

@@ -134,8 +134,7 @@ TEST_F(MambaEvictionTest, EvictDeterministicOnTimeTies) {
 
     auto t1 = token_vec_t{1, 2};
     auto first = std::make_unique<TreeNode>(t1, ts);
-    first->AttachResource<ResourceType::Device>(
-        std::make_unique<DeviceResource>(page_alloc_->Allocate(1)));
+    first->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(page_alloc_->Allocate(1)));
     auto slot1 = mamba_alloc_->Allocate();
     ASSERT_TRUE(slot1.has_value());
     first->AttachMamba(std::make_unique<MambaSlot>(std::move(*slot1)));
@@ -145,8 +144,7 @@ TEST_F(MambaEvictionTest, EvictDeterministicOnTimeTies) {
 
     auto t2 = token_vec_t{3, 4};
     auto second = std::make_unique<TreeNode>(t2, ts);
-    second->AttachResource<ResourceType::Device>(
-        std::make_unique<DeviceResource>(page_alloc_->Allocate(1)));
+    second->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(page_alloc_->Allocate(1)));
     auto slot2 = mamba_alloc_->Allocate();
     ASSERT_TRUE(slot2.has_value());
     second->AttachMamba(std::make_unique<MambaSlot>(std::move(*slot2)));
