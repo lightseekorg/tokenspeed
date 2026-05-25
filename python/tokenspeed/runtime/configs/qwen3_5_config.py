@@ -23,9 +23,10 @@
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
+from tokenspeed.runtime.configs.qwen3_vision_config import Qwen3VLVisionConfig
 
 
-class Qwen3_5VisionConfig:
+class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
 
@@ -71,6 +72,7 @@ class Qwen3_5Config(PretrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
+        self.vision_config = self._ensure_vision_config(vision_config)
         self.text_config = self._ensure_text_config(text_config)
 
         self.image_token_id = image_token_id
@@ -88,11 +90,22 @@ class Qwen3_5Config(PretrainedConfig):
             return text_cls()
         return text_config
 
+    def _ensure_vision_config(self, vision_config):
+        """Convert vision_config to the proper config class if it's a dict."""
+        vision_cls = self.sub_configs["vision_config"]
+        if isinstance(vision_config, dict):
+            return vision_cls(**vision_config)
+        if vision_config is None:
+            return vision_cls()
+        return vision_config
+
     def __setattr__(self, name, value):
         # from_pretrained re-assigns text_config as a raw dict after __init__;
         # intercept and convert it back to the proper config class.
         if name == "text_config" and isinstance(value, dict):
             value = self._ensure_text_config(value)
+        elif name == "vision_config" and isinstance(value, dict):
+            value = self._ensure_vision_config(value)
         super().__setattr__(name, value)
 
     def __getattr__(self, name):

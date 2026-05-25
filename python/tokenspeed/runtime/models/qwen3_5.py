@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -62,6 +61,7 @@ from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.moe.checkpoint import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -84,23 +84,30 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
 )
+from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
-
-# Utils
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    VisionEmbedder,
+    pad_input_tokens,
+)
+from tokenspeed.runtime.multimodal.encoder_cudagraph import EncoderCudaGraphWrapper
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from tokenspeed.runtime.utils import (
     add_prefix,
     make_layers,
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -1128,6 +1135,146 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.config, "rope_scaling", {}
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
+        self.visual = Qwen3VLMoeVisionModel(
+            config.vision_config,
+            quant_config=None,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            prefix=add_prefix("model.visual", prefix),
+            mapping=mapping,
+        )
+        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+        # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
+        self.vision_embedder = VisionEmbedder()
+        self.image_encoder = self.get_image_feature
+        self.video_encoder = self.get_video_feature
+
+    def separate_deepstack_embeds(self, embedding: torch.Tensor):
+        assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
+            f"hidden_state of {embedding.shape} should be divisible by "
+            f"{1 + self.num_deepstack_embeddings}"
+        )
+        separate_index = self.config.hidden_size
+        input_embeds = embedding[:, :separate_index]
+        input_deepstack_embeds = embedding[:, separate_index:]
+        return input_embeds, input_deepstack_embeds
+
+    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+        return pad_input_tokens(input_ids, mm_inputs)
+
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        """Eager image encode via the ``pre_encode`` / ``forward_blocks`` /
+        ``post_encode`` decomposition the cudagraph wrapper uses, so eager
+        and captured paths share a single source of truth."""
+        tokens, grid = self.pre_encode(items, grid_attr="image_grid_thw")
+        metadata = self.visual.prepare_metadata(grid)
+        encoded = self.visual.forward_blocks(tokens, metadata)
+        return self.post_encode([encoded], grid)
+
+    def get_video_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        """Eager video encode; videos never go through the cudagraph wrapper."""
+        tokens, grid = self.pre_encode(items, grid_attr="video_grid_thw")
+        metadata = self.visual.prepare_metadata(grid)
+        encoded = self.visual.forward_blocks(tokens, metadata)
+        return self.post_encode([encoded], grid)
+
+    def pre_encode(
+        self,
+        items: list[MultimodalDataItem],
+        grid_attr: str = "image_grid_thw",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Eager patch-embed before the captured region; returns ``(tokens, grid)``.
+
+        ``grid_attr`` selects which grid field on each item to read --
+        ``image_grid_thw`` (default, used by the wrapper) or ``video_grid_thw``.
+        """
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
+        grid = torch.concat([getattr(item, grid_attr) for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert grid.dim() == 2, grid.dim()
+        x = self.visual.prepare_patch_embed(pixel_values, grid)
+        return x, grid
+
+    def post_encode(
+        self, encoder_outs: list[torch.Tensor], grid: torch.Tensor
+    ) -> torch.Tensor:
+        """Eager step after the captured region; returns features."""
+        return torch.cat(encoder_outs, dim=0)
+
+    def make_encoder_cudagraph_wrapper(self, mapping):
+        # Captured region is ``Qwen3VLMoeVisionModel.forward_blocks`` (blocks +
+        # deepstack mergers + merger); the merger applies a
+        # ``spatial_merge_size ** 2`` token reduction, so budgets count
+        # post-merge tokens while the capture input buffer holds
+        # ``spatial_merge_size ** 2 * budget`` patches.
+        return EncoderCudaGraphWrapper(
+            mapping=mapping,
+            tower=self.visual,
+            pre_encode=self.pre_encode,
+            post_encode=self.post_encode,
+            out_div=self.visual.spatial_merge_size**2,
+            merge=self.visual.spatial_merge_size,
+            budget_range=(64, 4096),
+            input_feature_shape=(1, self.visual.hidden_size),
+        )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    @torch.no_grad()
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        input_lengths: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        multimodal_context = kwargs.pop("multimodal_context", None)
+        if (
+            multimodal_context is None
+            or not multimodal_context.has_extend_inputs()
+            or ctx.forward_mode.is_decode_or_idle()
+        ):
+            return super().forward(
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                input_lengths,
+                **kwargs,
+            )
+
+        input_embeds, model_kwargs = self.vision_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self.model.get_input_embeddings(),
+            ctx=multimodal_context,
+            encoders={
+                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
+                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
+            },
+            multimodal_model=self,
+            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
+        )
+        hidden_states, aux_hidden_states = self.model(
+            input_ids,
+            positions,
+            ctx,
+            out_cache_loc,
+            input_embeds=input_embeds,
+            **model_kwargs,
+        )
+        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states,
+        )
 
     def resolve_model(
         self,
@@ -1172,6 +1319,9 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if "visual" in name:
+                name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                name = name.replace(r"model.visual.", r"visual.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1283,6 +1433,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if "visual" in name:
+                name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                name = name.replace(r"model.visual.", r"visual.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1309,10 +1462,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     mapped_name = moe_loader.load(name, loaded_weight)
                     loaded_params.add(mapped_name)
                     continue
-
-                if "visual" in name:
-                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                    name = name.replace(r"model.visual.", r"visual.")
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:

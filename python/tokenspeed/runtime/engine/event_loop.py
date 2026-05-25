@@ -566,6 +566,7 @@ class EventLoop:
         dp_all_decode_or_idle = (
             dp_metadata.all_decode_or_idle if dp_metadata is not None else False
         )
+        multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
         self.model_executor.update_block_table(forward_op)
 
@@ -580,6 +581,7 @@ class EventLoop:
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
                     grammar_inputs=grammar_inputs,
+                    multimodal_context=multimodal_context,
                     **stats,
                 ),
                 None,
@@ -607,6 +609,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        multimodal_context=multimodal_context,
                         **stats,
                     ),
                     None,
@@ -631,10 +634,36 @@ class EventLoop:
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         grammar_inputs=grammar_inputs,
+                        multimodal_context=multimodal_context,
                         **stats,
                     ),
                     self.pd_kv_transfer.store_prefill_token,
                 )
+
+    def _get_multimodal_context_for_forward(self, forward_op):
+        if not self.model_config.is_multimodal:
+            return None
+
+        num_extends = forward_op.num_extends()
+        mm_inputs = []
+        has_mm = False
+        for index, rid in enumerate(forward_op.request_ids):
+            state = self.output_processor.rid_to_state.get(rid)
+            if state is not None and index < num_extends:
+                state.maybe_extend_multimodal_mrope_positions()
+            item = getattr(state, "multimodal_inputs", None) if state else None
+            mm_inputs.append(item)
+            has_mm = has_mm or item is not None
+        if not has_mm:
+            return None
+
+        from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
+
+        return MultimodalForwardContext(
+            mm_inputs=mm_inputs,
+            extend_prefix_lens=list(forward_op.extend_prefix_lens),
+            extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
+        )
 
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:

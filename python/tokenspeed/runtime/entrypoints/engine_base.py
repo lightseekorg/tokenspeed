@@ -44,7 +44,6 @@ class EngineBase(ABC):
         prompt: list[str] | str | None = None,
         sampling_params: list[dict] | dict | None = None,
         input_ids: list[list[int]] | list[int] | None = None,
-        image_data: list[str] | str | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,

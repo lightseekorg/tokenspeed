@@ -72,9 +72,17 @@ class RequestState:
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] | None = None,
+        multimodal_inputs=None,
+        prompt_input_ids_unpadded: list[int] | None = None,
     ) -> None:
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
+        self.prompt_input_ids_unpadded: list[int] = (
+            prompt_input_ids_unpadded
+            if prompt_input_ids_unpadded is not None
+            else prompt_input_ids
+        )
+        self.multimodal_inputs = multimodal_inputs
         self.sampling_params = sampling_params
         self.stream = stream
         self.eos_token_ids = eos_token_ids
@@ -145,6 +153,8 @@ class RequestState:
             return_logprob=getattr(recv_req, "return_logprob", False),
             top_logprobs_num=getattr(recv_req, "top_logprobs_num", 0),
             token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
+            multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
+            prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
         )
 
     @property
@@ -166,14 +176,32 @@ class RequestState:
     def add_computed_length(self, incr: int):
         self.computed_length += incr
 
+    def maybe_extend_multimodal_mrope_positions(self) -> None:
+        mm = self.multimodal_inputs
+        if mm is None or mm.mrope_positions is None:
+            return
+
+        target_len = self.input_length + self.output_length
+        current_len = mm.mrope_positions.shape[-1]
+        if current_len >= target_len:
+            return
+
+        from tokenspeed.runtime.multimodal.mrope import (
+            extend_mrope_positions_for_retracted_request,
+        )
+
+        mm.mrope_positions = extend_mrope_positions_for_retracted_request(
+            mm.mrope_positions, target_len - current_len
+        )
+
     def init_incremental_detokenize(self):
         """Return (all_ids_from_surr_offset, read_offset_relative_to_surr)."""
         if self._surr_offset is None or self._read_offset is None:
-            self._read_offset = self.input_length
+            self._read_offset = len(self.prompt_input_ids_unpadded)
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        all_ids = self.prompt_input_ids + self.output_ids
+        all_ids = self.prompt_input_ids_unpadded + self.output_ids
         return (
             all_ids[self._surr_offset :],
             self._read_offset - self._surr_offset,
