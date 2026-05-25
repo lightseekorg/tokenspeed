@@ -165,7 +165,7 @@ def _deepseek_v4_forward_metadata(ctx: ForwardContext):
             ctx.input_num_tokens,
         ):
             return prefill_metadata
-        return prefill_metadata or metadata
+        return metadata or prefill_metadata
     if ctx.forward_mode is not None and ctx.forward_mode.is_decode_or_idle():
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         if _deepseek_v4_metadata_matches_tokens(

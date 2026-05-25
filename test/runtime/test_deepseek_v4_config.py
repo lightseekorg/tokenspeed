@@ -85,6 +85,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4MLP,
     DeepseekV4MoE,
     DeepseekV4MoEGate,
+    _deepseek_v4_forward_metadata,
     _deepseek_v4_fused_select_experts,
     _deepseek_v4_indexer_decode_max_len,
     _deepseek_v4_indexer_decode_plan,
@@ -2785,6 +2786,24 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.advance_draft_forward_metadata()
         self.assertIs(backend.forward_metadata, first_decode_metadata)
         self.assertIs(backend.forward_metadata.attention.decode_swa_indices, cached_swa)
+
+    def test_deepseek_v4_draft_metadata_fallback_prefers_current_shape(self):
+        prefill_metadata = SimpleNamespace(
+            token_to_req_indices=torch.arange(4, dtype=torch.int32)
+        )
+        decode_metadata = SimpleNamespace(
+            token_to_req_indices=torch.arange(1, dtype=torch.int32)
+        )
+        ctx = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            input_num_tokens=1,
+            attn_backend=SimpleNamespace(
+                forward_metadata=decode_metadata,
+                forward_prefill_metadata=prefill_metadata,
+            ),
+        )
+
+        self.assertIs(_deepseek_v4_forward_metadata(ctx), decode_metadata)
 
     def test_deepseek_v4_eager_draft_decode_refreshes_stale_graph_metadata(self):
         backend = DeepseekV4AttentionBackend(
