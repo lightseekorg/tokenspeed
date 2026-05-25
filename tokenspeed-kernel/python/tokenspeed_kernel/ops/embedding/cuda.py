@@ -22,6 +22,7 @@ from typing import Any
 import torch
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
