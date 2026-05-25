@@ -1,0 +1,220 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Triton activation helper kernels."""
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel._triton import tl, triton
+
+__all__ = ["fused_gate_sigmoid_mul_add", "sigmoid_mul"]
+
+
+@triton.jit
+def _fused_gate_sigmoid_mul_add_kernel(
+    hidden_states_ptr,
+    gate_weight_ptr,
+    shared_output_ptr,
+    final_ptr,
+    hidden_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_id = tl.program_id(0).to(tl.int64)
+    row_offset = token_id * hidden_dim
+
+    # Phase 1: gate = dot(hidden_states[token_id], gate_weight)
+    # BLOCK >= hidden_dim so this loop is single-iteration (unrolled away).
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for k_offset in range(0, hidden_dim, BLOCK):
+        cols = k_offset + tl.arange(0, BLOCK)
+        mask = cols < hidden_dim
+        h = tl.load(hidden_states_ptr + row_offset + cols, mask=mask, other=0.0)
+        w = tl.load(gate_weight_ptr + cols, mask=mask, other=0.0)
+        acc += h.to(tl.float32) * w.to(tl.float32)
+    gate_val = tl.sigmoid(tl.sum(acc, axis=0))
+
+    # Phase 2: final[token_id] += gate_val * shared_output[token_id]
+    for n_offset in range(0, hidden_dim, BLOCK):
+        cols = n_offset + tl.arange(0, BLOCK)
+        mask = cols < hidden_dim
+        s = tl.load(shared_output_ptr + row_offset + cols, mask=mask)
+        f = tl.load(final_ptr + row_offset + cols, mask=mask)
+        out = f.to(tl.float32) + gate_val * s.to(tl.float32)
+        tl.store(final_ptr + row_offset + cols, out.to(f.dtype), mask=mask)
+
+
+def fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Fused ``final_hidden_states += sigmoid(hidden_states @ gate_weight) * shared_output``.
+
+    Computes the gate dot-product (reduction over hidden_dim), applies sigmoid,
+    multiplies by ``shared_output``, and adds to ``final_hidden_states`` in-place.
+
+    Args:
+        hidden_states: ``[num_tokens, hidden_dim]`` contiguous input.
+        gate_weight: ``[hidden_dim]`` contiguous 1-D weight vector.
+        shared_output: ``[num_tokens, hidden_dim]`` contiguous shared expert output.
+        final_hidden_states: ``[num_tokens, hidden_dim]`` contiguous MoE output,
+            modified in-place.
+
+    Returns:
+        ``final_hidden_states`` (same storage, mutated in-place).
+    """
+    if hidden_states.ndim != 2:
+        raise ValueError(f"hidden_states must be 2D, got {hidden_states.ndim}D")
+    if not hidden_states.is_contiguous():
+        raise ValueError("hidden_states must be contiguous")
+    if gate_weight.ndim != 1:
+        raise ValueError(f"gate_weight must be 1D, got {gate_weight.ndim}D")
+    if not gate_weight.is_contiguous():
+        raise ValueError("gate_weight must be contiguous")
+    if not shared_output.is_contiguous():
+        raise ValueError("shared_output must be contiguous")
+    if not final_hidden_states.is_contiguous():
+        raise ValueError("final_hidden_states must be contiguous")
+
+    num_tokens, hidden_dim = hidden_states.shape
+    if gate_weight.shape[0] != hidden_dim:
+        raise ValueError(
+            f"gate_weight dim mismatch: expected {hidden_dim}, got {gate_weight.shape[0]}"
+        )
+    if shared_output.shape != (num_tokens, hidden_dim):
+        raise ValueError(
+            f"shared_output shape mismatch: expected {(num_tokens, hidden_dim)}, "
+            f"got {shared_output.shape}"
+        )
+    if final_hidden_states.shape != (num_tokens, hidden_dim):
+        raise ValueError(
+            f"final_hidden_states shape mismatch: expected {(num_tokens, hidden_dim)}, "
+            f"got {final_hidden_states.shape}"
+        )
+
+    if num_tokens == 0:
+        return final_hidden_states
+
+    BLOCK = triton.next_power_of_2(hidden_dim)
+    num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
+    grid = (num_tokens,)
+    _fused_gate_sigmoid_mul_add_kernel[grid](
+        hidden_states,
+        gate_weight,
+        shared_output,
+        final_hidden_states,
+        hidden_dim=hidden_dim,
+        BLOCK=BLOCK,
+        num_warps=num_warps,
+    )
+    return final_hidden_states
+
+
+@triton.jit
+def _sigmoid_mul_kernel(
+    x_ptr,
+    gate_ptr,
+    n_elements,
+    hidden_dim: tl.constexpr,
+    head_dim: tl.constexpr,
+    gate_row_stride: tl.constexpr,
+    gate_head_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    row = offsets // hidden_dim
+    col = offsets % hidden_dim
+    head = col // head_dim
+    d = col % head_dim
+    gate_addrs = gate_ptr + row * gate_row_stride + head * gate_head_stride + d
+
+    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
+    g = tl.load(gate_addrs, mask=mask).to(tl.float32)
+    out = x * tl.sigmoid(g)
+    tl.store(x_ptr + offsets, out, mask=mask)
+
+
+def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """In-place ``x *= sigmoid(gate)``.
+
+    ``x`` must be contiguous 2D ``[num_tokens, hidden_dim]`` and is mutated.
+    ``gate`` may be either
+
+    - 2D contiguous ``[num_tokens, hidden_dim]``, or
+    - 3D ``[num_tokens, num_heads, head_dim]`` with ``stride(-1) == 1`` —
+      the strided view that ``torch.chunk(q_gate, 2, dim=-1)`` produces from
+      a packed ``[num_tokens, num_heads, 2 * head_dim]`` tensor.
+
+    The strided form lets callers skip the ``.reshape(-1)`` copy after the
+    chunk; both layouts share the same kernel via the explicit gate strides.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"x must be 2D, got {x.ndim}D")
+    if not x.is_contiguous():
+        raise ValueError("x must be contiguous")
+    if gate.stride(-1) != 1:
+        raise ValueError(f"gate must have stride(-1) == 1, got {gate.stride()}")
+    if x.dtype != gate.dtype:
+        raise ValueError(f"dtype mismatch: x={x.dtype} gate={gate.dtype}")
+
+    num_tokens, hidden_dim = x.shape
+
+    if gate.ndim == 2:
+        if gate.shape != x.shape:
+            raise ValueError(f"shape mismatch: x={x.shape} gate={gate.shape}")
+        head_dim = hidden_dim
+        gate_row_stride = gate.stride(0)
+        gate_head_stride = hidden_dim
+    elif gate.ndim == 3:
+        gate_tokens, num_heads, head_dim = gate.shape
+        if gate_tokens != num_tokens:
+            raise ValueError(f"num_tokens mismatch: x={num_tokens} gate={gate_tokens}")
+        if num_heads * head_dim != hidden_dim:
+            raise ValueError(
+                f"hidden_dim mismatch: x={hidden_dim} gate={num_heads}*{head_dim}"
+            )
+        gate_row_stride = gate.stride(0)
+        gate_head_stride = gate.stride(1)
+    else:
+        raise ValueError(f"gate must be 2D or 3D, got {gate.ndim}D")
+
+    n = x.numel()
+    if n == 0:
+        return x
+
+    BLOCK_SIZE = 1024
+    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    _sigmoid_mul_kernel[grid](
+        x,
+        gate,
+        n,
+        hidden_dim=hidden_dim,
+        head_dim=head_dim,
+        gate_row_stride=gate_row_stride,
+        gate_head_stride=gate_head_stride,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return x

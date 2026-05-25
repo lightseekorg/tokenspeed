@@ -27,6 +27,7 @@ Uses fused kernels optimized for SM100 (Blackwell) GPUs.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -99,6 +100,7 @@ class TRTLLMMLAChunkedPrefillMetadata:
 
 @dataclass
 class TRTLLMMLADecodeMetadata:
+    num_extends: int = 0
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
@@ -180,7 +182,7 @@ class TRTLLMMLABackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -190,27 +192,44 @@ class TRTLLMMLABackend(AttentionBackend):
     ):
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
-                seq_lens,
-                req_pool_indices=req_pool_indices,
+                seq_lens[:num_extends],
+                req_pool_indices=req_pool_indices[:num_extends],
                 req_to_page=req_to_page,
                 extend_prefix_lens=kwargs.pop("extend_prefix_lens"),
                 extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
             )
-        else:
+        # Under is_draft, also fill decode_metadata under any forward_mode so
+        # the drafter's multi-step loop has metadata. Wrapper pre-writes
+        # draft_seq_lens before calling here, so `seq_lens` aliases the
+        # drafter's live buffer for step-1+ advances.
+        if (
+            forward_mode.is_decode()
+            or forward_mode.is_mixed()
+            or (forward_mode.is_extend() and self.is_draft)
+        ):
             self._init_decode_metadata(
-                bs, req_pool_indices, seq_lens, forward_mode, req_to_page, spec_info
+                bs, num_extends, req_pool_indices, seq_lens, req_to_page
             )
+
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        assert self.forward_decode_metadata is not None
+        prev = self.forward_decode_metadata.num_extends
+        self.forward_decode_metadata.num_extends = num_extends
+        try:
+            yield
+        finally:
+            self.forward_decode_metadata.num_extends = prev
 
     def _init_decode_metadata(
         self,
         bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
-        spec_info=None,
     ):
         # For target_verify, the draft tokens have already been written to the KV
         # cache. The seq_lens passed in should already reflect the full context.
@@ -225,9 +244,10 @@ class TRTLLMMLABackend(AttentionBackend):
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
         self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
+            num_extends=num_extends,
             block_kv_indices=block_kv_indices,
             max_seq_len_k=self.max_context_len,
-            seq_lens_k=seq_lens[:bs],
+            seq_lens_k=seq_lens,
         )
 
     def _init_prefill_metadata(
@@ -309,7 +329,6 @@ class TRTLLMMLABackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -319,16 +338,18 @@ class TRTLLMMLABackend(AttentionBackend):
                 f"trtllm_mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        metadata = TRTLLMMLADecodeMetadata()
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
 
         # For capture we don't have req_to_page yet; just zero-fill the block indices.
-        # The actual indices will be filled on replay.
-        metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
-        # seq_lens_k aliases seq_lens_buf (set in init_cuda_graph_state).
-        metadata.seq_lens_k = self.cuda_graph_seq_lens_buf[:bs]
+        # The actual indices will be filled on replay. seq_lens_k aliases
+        # seq_lens_buf (set in init_cuda_graph_state).
+        metadata = TRTLLMMLADecodeMetadata(
+            num_extends=0,
+            block_kv_indices=block_kv_indices,
+            max_seq_len_k=self.max_context_len,
+            seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
+        )
 
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
@@ -336,7 +357,6 @@ class TRTLLMMLABackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -391,26 +411,29 @@ class TRTLLMMLABackend(AttentionBackend):
             )
 
         metadata = self.forward_decode_metadata
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        num_extends = metadata.num_extends
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        if spec_num_tokens > 1 and self.is_draft:
+        if q_len_per_req > 1 and self.is_draft:
             # First draft step catching up its KV after verify: one query entry per token;
             # per-token seq_lens advance by 1 so each successive token sees its own KV write.
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
-            block_tables = metadata.block_kv_indices.repeat_interleave(
-                spec_num_tokens, dim=0
+            block_tables = metadata.block_kv_indices[num_extends:].repeat_interleave(
+                q_len_per_req, dim=0
             )
-            base_lens = metadata.seq_lens_k.repeat_interleave(spec_num_tokens)
+            base_lens = metadata.seq_lens_k[num_extends:].repeat_interleave(
+                q_len_per_req
+            )
             offsets = torch.arange(
-                spec_num_tokens, device=base_lens.device, dtype=base_lens.dtype
+                q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
             ).repeat(bs)
             seq_lens = base_lens + offsets
-            max_seq_len = metadata.max_seq_len_k + spec_num_tokens
+            max_seq_len = metadata.max_seq_len_k + q_len_per_req
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-            block_tables = metadata.block_kv_indices
-            seq_lens = metadata.seq_lens_k
+            block_tables = metadata.block_kv_indices[num_extends:]
+            seq_lens = metadata.seq_lens_k[num_extends:]
             max_seq_len = metadata.max_seq_len_k
 
         if self.data_type == torch.float8_e4m3fn:
@@ -459,6 +482,7 @@ class TRTLLMMLABackend(AttentionBackend):
         seq_lens,
         batch_size,
         causal,
+        out: torch.Tensor | None = None,
     ):
         if causal:
             step_counter = getattr(self, "step_counter", None)
@@ -476,18 +500,19 @@ class TRTLLMMLABackend(AttentionBackend):
             k = k.to(torch.float8_e4m3fn)
             v = v.to(torch.float8_e4m3fn)
 
-        # The ragged path does not support FP8 output.
-        out_dtype = self.q_data_type
-        if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            out_dtype = torch.bfloat16
+        if out is None:
+            # The ragged path does not support FP8 output.
+            out_dtype = self.q_data_type
+            if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                out_dtype = torch.bfloat16
 
-        out = torch.empty(
-            q.shape[0],
-            q.shape[1],
-            v.shape[2],
-            device=q.device,
-            dtype=out_dtype,
-        )
+            out = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=out_dtype,
+            )
 
         result = trtllm_ragged_attention_deepseek(
             query=q,

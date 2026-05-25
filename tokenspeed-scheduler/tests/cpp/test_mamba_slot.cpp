@@ -22,6 +22,7 @@
 #include <memory>
 #include <numeric>
 #include "resource/allocator/mamba_chunk_allocator.h"
+#include "resource/allocator/mamba_host_allocator.h"
 #include "resource/radix_tree/mamba_slot.h"
 #include "resource/allocator/local_mamba_allocator.h"
 #include "resource/radix_tree/tree_node.h"
@@ -49,6 +50,31 @@ TEST(MambaChunkAllocatorTest, ExhaustedPoolReturnsNullopt) {
     auto s1 = allocator.Allocate();
     auto s2 = allocator.Allocate();
     EXPECT_FALSE(s2.has_value());
+}
+
+TEST(MambaHostAllocatorTest, AllocateFreeAndDrainReleased) {
+    tokenspeed::MambaHostAllocator allocator(3);
+    auto slot = allocator.Allocate();
+    ASSERT_TRUE(slot.has_value());
+    std::int32_t idx = slot->Index();
+    EXPECT_EQ(allocator.AvailableSlots(), 2);
+
+    slot.reset();
+    EXPECT_EQ(allocator.AvailableSlots(), 3);
+    auto released = allocator.DrainReleased();
+    ASSERT_EQ(released.size(), 1);
+    EXPECT_EQ(released[0], idx);
+    EXPECT_TRUE(allocator.DrainReleased().empty());
+}
+
+TEST(MambaSlotTest, CustomReleaserRunsOnDestruction) {
+    std::vector<std::int32_t> released;
+    {
+        tokenspeed::MambaSlot slot(7, [&released](std::int32_t idx) { released.push_back(idx); });
+        EXPECT_EQ(slot.Index(), 7);
+    }
+    ASSERT_EQ(released.size(), 1);
+    EXPECT_EQ(released[0], 7);
 }
 
 TEST(MambaSlotTest, RAIIFreesOnDestruction) {
@@ -114,6 +140,36 @@ TEST(TreeNodeMambaTest, DestructorFreesMambaSlot) {
         EXPECT_EQ(allocator.AvailableSlots(), 3);
     }
     EXPECT_EQ(allocator.AvailableSlots(), 4);
+}
+
+TEST(TreeNodeMambaTest, AttachAndDetachMambaHost) {
+    tokenspeed::MambaHostAllocator allocator(4);
+    tokenspeed::TreeNode node;
+
+    auto slot = allocator.Allocate();
+    ASSERT_TRUE(slot.has_value());
+    std::int32_t idx = slot->Index();
+
+    node.AttachMambaHost(std::make_unique<tokenspeed::MambaSlot>(std::move(*slot)));
+    EXPECT_TRUE(node.HasMambaOnHost());
+    EXPECT_EQ(node.MambaHostSlotIndex(), idx);
+
+    auto detached = node.DetachMambaHost();
+    EXPECT_FALSE(node.HasMambaOnHost());
+    EXPECT_EQ(detached->Index(), idx);
+    EXPECT_EQ(allocator.AvailableSlots(), 3);
+}
+
+TEST(TreeNodeMambaTest, DestructorFreesMambaHostSlot) {
+    tokenspeed::MambaHostAllocator allocator(4);
+    {
+        tokenspeed::TreeNode node;
+        auto slot = allocator.Allocate();
+        node.AttachMambaHost(std::make_unique<tokenspeed::MambaSlot>(std::move(*slot)));
+        EXPECT_EQ(allocator.AvailableSlots(), 3);
+    }
+    EXPECT_EQ(allocator.AvailableSlots(), 4);
+    EXPECT_EQ(allocator.DrainReleased().size(), 1);
 }
 
 TEST(TreeNodeMambaTest, SplitKeepsMambaOnSuffix) {

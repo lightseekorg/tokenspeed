@@ -45,10 +45,12 @@ from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
+from tokenspeed.runtime.utils.env import envs, get_global_server_args
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -86,6 +88,7 @@ class ModelExecutorConfig:
     cudagraph_capture_sizes: list[int] | None
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
+    model_is_mrope: bool
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -121,6 +124,11 @@ class ModelExecutorConfig:
             if server_args.speculative_algorithm
             else 1
         )
+        rope_scaling = getattr(
+            model_config.hf_text_config, "rope_parameters", None
+        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
+        model_is_mrope = bool(rope_scaling and "mrope_section" in rope_scaling)
+
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
@@ -138,6 +146,7 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
+            model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -273,6 +282,9 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+        self._active_multimodal_context = None
+        self._active_positions_override = None
+
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
@@ -287,6 +299,21 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
         )
+
+        # Encoder CUDA graph: install the model-built wrapper by overriding
+        # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
+        # ``CudaGraphWrapper``.
+        self.encoder_graph_wrapper = None
+        _mm_model = self.model_runner.model
+        if (
+            hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
+            and get_global_server_args().mm_attention_backend != "flashinfer_cudnn"
+        ):
+            self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
+                _mm_model.mapping
+            )
+            _mm_model.image_encoder = self.encoder_graph_wrapper
 
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
@@ -335,10 +362,18 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+        positions = self._active_positions_override
+        if positions is None:
+            if self.config.model_is_mrope:
+                positions = self.input_buffers.mrope_positions_buf[
+                    :, : ctx.input_num_tokens
+                ]
+            else:
+                positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
         return self.model_runner.forward(
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
-            self.input_buffers.positions_buf[: ctx.input_num_tokens],
+            positions,
             self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
             self.input_buffers.input_lengths_buf[:bs],
             req_pool_indices=req_pool_indices,
@@ -346,21 +381,51 @@ class ModelExecutor:
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                 : ctx.num_extends
             ],
+            multimodal_context=self._active_multimodal_context,
         )
 
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
-        logits_output,
+        logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
-        candidates,
+        candidates: torch.Tensor | None = None,
     ):
-        if self.drafter is not None and ctx.forward_mode.is_decode():
+        if self.drafter is None:
+            return self.sampling_backend.sample(logits_output, sampling_info)
+
+        num_extends = ctx.num_extends
+        num_decodes = ctx.bs - num_extends
+
+        if num_decodes == 0:
+            return self.sampling_backend.sample(logits_output, sampling_info)
+
+        if num_extends == 0:
             return self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
-        return self.sampling_backend.sample(logits_output, sampling_info)
+
+        logits = logits_output.next_token_logits
+        prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
+        prefill_tokens, prefill_accept = self.sampling_backend.sample(
+            prefill_out, sampling_info[:num_extends]
+        )
+        decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
+        decode_tokens, decode_accept = self.sampling_backend.verify(
+            decode_out, sampling_info[num_extends:], candidates
+        )
+        if (
+            prefill_out.next_token_logprobs is not None
+            and decode_out.next_token_logprobs is not None
+        ):
+            logits_output.next_token_logprobs = torch.cat(
+                [prefill_out.next_token_logprobs, decode_out.next_token_logprobs]
+            )
+        return (
+            torch.cat([prefill_tokens, decode_tokens]),
+            torch.cat([prefill_accept, decode_accept]),
+        )
 
     @maybe_inference_mode()
     def _forward_step(
@@ -423,7 +488,7 @@ class ModelExecutor:
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
         input_lengths: torch.Tensor,
-        is_extend: bool,
+        num_extends: int,
     ):
         """Write output tokens to future_input_map and update cache lengths.
 
@@ -435,21 +500,24 @@ class ModelExecutor:
             # Without drafter, store output tokens for next round.
             # With drafter, _forward_step already wrote the drafter's
             # next-round input (verified + draft tokens) to future_input_map.
-            tokens_per_req = self.config.output_length if not is_extend else 1
+            tokens_per_req = self.config.output_length if num_extends == 0 else 1
             next_round_input_ids = output_tokens.to(torch.int32).reshape(
                 -1, tokens_per_req
             )
             self.runtime_states.future_input_map[req_pool_indices, :tokens_per_req] = (
                 next_round_input_ids
             )
-        if is_extend:
-            self.runtime_states.update_valid_cache_length(
-                req_pool_indices, input_lengths
-            )
+
+        bs = req_pool_indices.shape[0]
+        if num_extends == 0:
+            deltas = accept_lengths
+        elif num_extends == bs:
+            deltas = input_lengths
         else:
-            self.runtime_states.update_valid_cache_length(
-                req_pool_indices, accept_lengths
+            deltas = torch.cat(
+                [input_lengths[:num_extends], accept_lengths[num_extends:]]
             )
+        self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
     def _build_sampling_info(
         self,
@@ -468,6 +536,47 @@ class ModelExecutor:
         """Accumulate decode stats from already-synced results. No GPU sync."""
         self.num_generated_tokens += int(results.output_lengths.sum().item())
         self.num_decode_steps += bs
+
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _compute_mtp_snapshot_indices(
+        valid_cache_lengths: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        accept_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        track_indices: torch.Tensor,
+        sentinel: torch.Tensor,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused elementwise pipeline computing snapshot src/dst for MTP.
+
+        All operations are batched and fused by torch.compile into a single
+        Triton kernel (plus the two gathers), eliminating the ~14 individual
+        elementwise kernel launches of the eager implementation.
+        """
+        new_cl = valid_cache_lengths[req_pool_indices]
+        old_cl = new_cl - accept_lengths.to(new_cl.dtype)
+        first_boundary = ((old_cl // page_size) + 1) * page_size
+
+        step_raw = first_boundary - old_cl - 1
+        max_col = output_indices.shape[1] - 1
+        step = step_raw.clamp(min=0, max=max_col).to(torch.int64)
+
+        bs = req_pool_indices.shape[0]
+        req_range = torch.arange(bs, device=req_pool_indices.device)
+        src_raw = output_indices[req_range, step].to(torch.int64)
+        dst_raw = track_indices.to(torch.int64)
+
+        invalid = (
+            (first_boundary > new_cl)
+            | (dst_raw < 0)
+            | (src_raw < 0)
+            | (src_raw == dst_raw)
+            | (step_raw < 0)
+        )
+        src = torch.where(invalid, sentinel, src_raw)
+        dst = torch.where(invalid, sentinel, dst_raw)
+        return src, dst
 
     def _snapshot_mamba_checkpoints(
         self,
@@ -516,27 +625,15 @@ class ModelExecutor:
             if output_indices is None:
                 return
 
-            new_cl = self.runtime_states.valid_cache_lengths[req_pool_indices]
-            old_cl = new_cl - accept_lengths[:bs].to(device=dev, dtype=new_cl.dtype)
-            first_boundary = ((old_cl // page_size) + 1) * page_size
-
-            step_raw = first_boundary - old_cl - 1
-            max_col = output_indices.shape[1] - 1
-            step = step_raw.clamp(min=0, max=max_col).to(torch.int64)
-
-            req_range = torch.arange(bs, device=dev)
-            src_raw = output_indices[req_range, step].to(torch.int64)
-            dst_raw = track_indices.to(device=dev, dtype=torch.int64)
-
-            invalid = (
-                (first_boundary > new_cl)
-                | (dst_raw < 0)
-                | (src_raw < 0)
-                | (src_raw == dst_raw)
-                | (step_raw < 0)
+            src, dst = self._compute_mtp_snapshot_indices(
+                self.runtime_states.valid_cache_lengths,
+                req_pool_indices,
+                accept_lengths[:bs].to(device=dev),
+                output_indices,
+                track_indices,
+                sentinel,
+                page_size,
             )
-            src = torch.where(invalid, sentinel, src_raw)
-            dst = torch.where(invalid, sentinel, dst_raw)
 
             self.runtime_states.snapshot_mamba_checkpoints(
                 src,
@@ -616,6 +713,7 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
+        multimodal_context=None,
     ) -> ModelExecutionResult:
         self.log_step += 1
 
@@ -653,6 +751,7 @@ class ModelExecutor:
             dp_global_bs,
             dp_all_decode_or_idle,
             grammar_inputs=grammar_inputs,
+            multimodal_context=multimodal_context,
         )
 
         if is_decode and (
@@ -892,11 +991,14 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
+        multimodal_context=None,
     ) -> ModelExecutionResult:
+        num_extends = forward_op.num_extends()
+        total_tokens = sum(forward_op.input_lengths)
+        self._active_multimodal_context = multimodal_context
+        self._active_positions_override = None
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            num_extends = forward_op.num_extends()
-            total_tokens = sum(forward_op.input_lengths)
             has_retract = num_extends <= 0 and any(
                 x != -1 for x in getattr(forward_op, "hist_token_lens", [])
             )
@@ -911,6 +1013,11 @@ class ModelExecutor:
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
+                total_tokens=total_tokens,
+            )
+            self._active_positions_override = self._build_mrope_positions_override(
+                forward_op=forward_op,
+                multimodal_context=multimodal_context,
                 total_tokens=total_tokens,
             )
 
@@ -956,6 +1063,42 @@ class ModelExecutor:
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
             else:
+                gather_ids = None
+                if num_extends > 0:
+                    num_decodes = bs - num_extends
+                    if self.drafter is not None and num_decodes > 0:
+                        # MIXED + spec: prefill rows pruned to last token,
+                        # decode block kept full at verify width.
+                        num_decode_tokens = num_decodes * self.config.spec_num_tokens
+                        num_prefill_tokens = total_tokens - num_decode_tokens
+                        gather_ids = torch.empty(
+                            num_extends + num_decode_tokens,
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        gather_ids[:num_extends] = (
+                            torch.cumsum(
+                                self.input_buffers.input_lengths_buf[:num_extends],
+                                dim=0,
+                            )
+                            - 1
+                        )
+                        gather_ids[num_extends:] = torch.arange(
+                            num_prefill_tokens,
+                            total_tokens,
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                    else:
+                        # EXTEND, MIXED non-spec, or EXTEND + spec: last token
+                        # per request via cumsum.
+                        gather_ids = (
+                            torch.cumsum(
+                                self.input_buffers.input_lengths_buf[:bs], dim=0
+                            )
+                            - 1
+                        )
+
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -969,8 +1112,7 @@ class ModelExecutor:
                         if self.drafter is not None
                         else CaptureHiddenMode.NULL
                     ),
-                    padded_static_len=-1,
-                    keep_full_logits=forward_mode.is_decode_or_idle(),
+                    gather_ids=gather_ids,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -987,7 +1129,7 @@ class ModelExecutor:
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends <= 0,
+                        is_spec_decode=self.drafter is not None and num_extends < bs,
                         spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
@@ -1075,7 +1217,7 @@ class ModelExecutor:
                     output_tokens=output_tokens,
                     accept_lengths=output_lengths,
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],
-                    is_extend=num_extends > 0,
+                    num_extends=num_extends,
                 )
                 self._snapshot_mamba_checkpoints(
                     output_lengths,
@@ -1100,3 +1242,67 @@ class ModelExecutor:
             copy_event=copy_event,
             grammar_completion=grammar_completion,
         )
+
+    def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
+        # Cache delta expansion for retracted/chunked requests.
+        if mm_input.mrope_position_delta_repeated_cache is None:
+            mm_input.mrope_position_delta_repeated_cache = (
+                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
+            )
+        return mm_input.mrope_position_delta_repeated_cache + seq_len
+
+    def _build_mrope_positions_override(
+        self,
+        forward_op,
+        multimodal_context,
+        total_tokens: int,
+    ) -> torch.Tensor | None:
+        if not self.config.model_is_mrope or total_tokens == 0:
+            return None
+
+        is_prefill = forward_op.num_extends() > 0
+        base_positions = self.input_buffers.positions_buf[:total_tokens]
+        pos_chunks = torch.split(base_positions, list(forward_op.input_lengths), dim=0)
+        mrope_chunks = []
+        mm_inputs = (
+            multimodal_context.mm_inputs
+            if multimodal_context is not None and multimodal_context.has_inputs()
+            else []
+        )
+
+        for batch_idx, base_chunk in enumerate(pos_chunks):
+            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
+            if mm_input is None or mm_input.mrope_positions is None:
+                mrope_chunks.append(base_chunk.unsqueeze(0).expand(3, -1))
+                continue
+
+            if is_prefill and batch_idx < len(forward_op.extend_prefix_lens):
+                start = int(forward_op.extend_prefix_lens[batch_idx])
+                end = start + int(forward_op.input_lengths[batch_idx])
+                positions = mm_input.mrope_positions[:, start:end]
+                if positions.numel() != 0:
+                    mrope_chunks.append(
+                        positions.to(device=self.device, dtype=torch.int64)
+                    )
+                    continue
+                if base_chunk.numel() == 1:
+                    seq_len = int(base_chunk[-1].item()) + 1
+                    mrope_chunks.append(
+                        self._expand_mrope_from_input(mm_input, seq_len).to(
+                            device=self.device, dtype=torch.int64
+                        )
+                    )
+                    continue
+
+            delta = mm_input.mrope_position_delta
+            if delta is None:
+                delta = torch.zeros(1, dtype=torch.int64)
+            delta = delta.flatten()[0].to(device=self.device, dtype=torch.int64)
+            # Decode positions need (mrope_delta - 1) + seq_len. positions_buf
+            # already stores the per-token zero-based position (seq_len - 1 for
+            # decode), so this is the same value without a GPU-to-CPU sync.
+            mrope_chunks.append((base_chunk + delta).unsqueeze(0).expand(3, -1))
+
+        mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()
+        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(mrope_positions)
+        return self.input_buffers.mrope_positions_buf[:, :total_tokens]

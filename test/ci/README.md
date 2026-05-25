@@ -21,7 +21,30 @@ Currently configured task directories:
 - `eval`
 - `ut`
 
-Each task expands into one matrix entry per runner label.
+Each task expands into one matrix entry per runner label. Add a top-level
+`priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
+jobs in include-list order, so `high` entries reach a contended runner pool
+before `normal` (the default) and `low`. Tasks that omit `priority` keep their
+original ordering.
+
+`priority` accepts either a scalar (applies to every label of the task) or a
+per-label mapping (only the listed labels are overridden; every other label
+stays at `normal`):
+
+```yaml
+# whole task at high
+priority: high
+
+# only the b300-1gpu instance drops to low; h100-1gpu / b200-1gpu / ...
+# of the same task keep the default normal
+priority:
+  b300-1gpu: low
+```
+
+Typical use: lower a 1gpu kernel unit-test on `b300-1gpu` so the heavier
+b300-4gpu evals that share the same box claim the runner first, without
+disturbing the same task's ordering on the other GPU families.
+
 `b200-<Ngpu>` labels are the default B200 runners. Set the
 `TOKENSPEED_B200_RUNNER_LABEL` repository variable in GitHub Actions
 (`Settings` -> `Secrets and variables` -> `Actions` -> `Variables`) to a

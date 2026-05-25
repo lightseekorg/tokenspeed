@@ -300,6 +300,27 @@ class TestPrefillFirst:
         assert len(op.input_ids) + len(op.decode_input_ids) == sum(op.input_lengths)
         assert op.sizes == [1, 0]
 
+    def test_mixed_prefill_decode_decode_not_starved_by_long_prefill(self):
+        """Decode-first priority: active decode is scheduled even when a long prefill would consume the full budget."""
+        cfg = make_config(max_scheduled_tokens=16, max_batch_size=8)
+        cfg.enable_mixed_prefill_decode = True
+        s = Scheduler(cfg)
+
+        submit(s, "r0", list(range(8)))
+        s.next_execution_plan()  # r0 → PrefillDone
+        s.next_execution_plan()  # r0 → Decoding
+        advance_forward(s, "r0", tokens=[99])
+
+        submit(s, "r1", list(range(32)))  # 32 > budget=16
+        plan = s.next_execution_plan()
+        op = plan.forward[0]
+
+        # Layout is prefill-first/decode-second (FlatForwardOperation::stable_partition).
+        assert op.request_ids == ["r1", "r0"]
+        assert op.num_extends() == 1
+        # r0 decode = 1 token; r1 prefill chunk takes the remaining 15.
+        assert op.input_lengths == [15, 1]
+
     def test_max_batch_size_limits_scheduled_requests(self):
         """max_batch_size caps the number of requests per plan."""
         s = Scheduler(make_config(max_scheduled_tokens=512, max_batch_size=2))

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
@@ -36,6 +38,9 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
+    DeepseekV4ForwardMetadata,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
@@ -45,7 +50,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_dequantize_and_gather_k_cache,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-    DeepseekV4ForwardMetadata,
+    DeepseekV4CacheMetadata,
     _split_paged_cache_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
@@ -81,10 +86,11 @@ def _refresh_decode_indexer_plan_cache(
     This keeps per-layer indexer calls read-only with respect to cached plan
     buffers while compressor work may run on an auxiliary stream.
     """
-    cache = metadata.decode_indexer_plan_cache
+    indexer_metadata = metadata.indexer
+    cache = indexer_metadata.decode_plan_cache
     if not cache:
         return
-    refreshed_keys = metadata.decode_indexer_plan_refreshed_keys
+    refreshed_keys = indexer_metadata.decode_plan_refreshed_keys
     refreshed_keys.clear()
     for (
         compress_ratio,
@@ -99,7 +105,7 @@ def _refresh_decode_indexer_plan_cache(
             continue
         positions = _decode_positions_from_metadata(metadata, num_tokens)
         token_to_req_indices = metadata.token_to_req_indices[:num_tokens]
-        block_table = metadata.compressed_block_table(
+        block_table = metadata.cache.compressed_block_table(
             compress_ratio,
             cache_block_size,
         )
@@ -152,7 +158,8 @@ def _refresh_decode_indexer_plan_cache(
 def _refresh_decode_indexer_schedule_metadata(
     metadata: DeepseekV4ForwardMetadata,
 ) -> None:
-    if not metadata.decode_indexer_schedule_metadata:
+    indexer_metadata = metadata.indexer
+    if not indexer_metadata.decode_schedule_metadata_cache:
         return
     if deep_gemm is None:
         return
@@ -163,11 +170,13 @@ def _refresh_decode_indexer_schedule_metadata(
         compress_ratio,
         cache_block_size,
         num_tokens,
-    ), schedule_metadata in list(metadata.decode_indexer_schedule_metadata.items()):
+    ), schedule_metadata in list(
+        indexer_metadata.decode_schedule_metadata_cache.items()
+    ):
         if num_tokens <= 0:
             continue
         key = (compress_ratio, cache_block_size, num_tokens)
-        decode_plan = metadata.decode_indexer_plan_cache.get(key)
+        decode_plan = indexer_metadata.decode_plan_cache.get(key)
         context_lens = getattr(decode_plan, "context_lens", None)
         if (
             context_lens is not None
@@ -206,7 +215,7 @@ def _refresh_decode_indexer_schedule_metadata(
             with torch.inference_mode():
                 schedule_metadata.copy_(refreshed)
         else:
-            metadata.decode_indexer_schedule_metadata[key] = refreshed
+            indexer_metadata.decode_schedule_metadata_cache[key] = refreshed
 
 
 class DeepseekV4AttentionBackend(AttentionBackend):
@@ -358,7 +367,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -374,7 +382,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         num_extends_arg = kwargs.pop("num_extends", None)
         num_extends = bs if num_extends_arg is None else int(num_extends_arg)
-        del num_tokens, kwargs
+        del kwargs
         device = seq_lens.device
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
@@ -472,19 +480,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
         )
-        self.forward_metadata = DeepseekV4ForwardMetadata(
+        cache_metadata = DeepseekV4CacheMetadata(
             page_size=self.page_size,
-            req_pool_indices=req_pool_indices,
             block_table=block_table,
-            seq_lens=seq_lens,
-            query_lens=query_lens,
-            query_start_loc=query_start_loc,
-            token_to_req_indices=token_to_req,
-            seq_lens_cpu=seq_lens_cpu,
-            query_lens_cpu=query_lens_cpu,
-            num_prefill_reqs=num_prefill_reqs,
-            num_prefill_tokens=num_prefill_tokens,
-            forward_mode=forward_mode,
             paged_cache_block_tables=paged_cache_block_tables,
             paged_cache_block_table_base_offsets=base_offsets_on_device,
             swa_block_table=swa_block_table,
@@ -493,6 +491,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressor_state_base_logical_pages=compressor_state_base,
             indexer_state_block_table=indexer_state_block_table,
             indexer_state_base_logical_page=indexer_state_base,
+        )
+        self.forward_metadata = DeepseekV4ForwardMetadata(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            query_lens=query_lens,
+            query_start_loc=query_start_loc,
+            token_to_req_indices=token_to_req,
+            cache=cache_metadata,
+            seq_lens_cpu=seq_lens_cpu,
+            query_lens_cpu=query_lens_cpu,
+            num_prefill_reqs=num_prefill_reqs,
+            num_prefill_tokens=num_prefill_tokens,
         )
         self._decode_tile_metadata = {}
 
@@ -503,13 +513,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         window_size: int,
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        attention_metadata = metadata.attention
         num_tokens = metadata.token_to_req_indices.shape[0]
         needs_alloc = (
-            metadata.decode_swa_indices is None
-            or metadata.decode_swa_lens is None
-            or metadata.decode_swa_indices.shape != (num_tokens, window_size)
-            or metadata.decode_swa_lens.shape != (num_tokens,)
-            or metadata.decode_swa_indices.device != metadata.seq_lens.device
+            attention_metadata.decode_swa_indices is None
+            or attention_metadata.decode_swa_lens is None
+            or attention_metadata.decode_swa_indices.shape
+            != (
+                num_tokens,
+                window_size,
+            )
+            or attention_metadata.decode_swa_lens.shape != (num_tokens,)
+            or attention_metadata.decode_swa_indices.device != metadata.seq_lens.device
         )
         if needs_alloc:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -518,38 +533,39 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     "CUDA graph capture"
                 )
             with torch.inference_mode(False):
-                metadata.decode_swa_indices = torch.empty(
+                attention_metadata.decode_swa_indices = torch.empty(
                     (num_tokens, window_size),
                     dtype=torch.int32,
                     device=metadata.seq_lens.device,
                 )
-                metadata.decode_swa_lens = torch.empty(
+                attention_metadata.decode_swa_lens = torch.empty(
                     (num_tokens,),
                     dtype=torch.int32,
                     device=metadata.seq_lens.device,
                 )
 
+        cache_metadata = metadata.cache
         swa_block_table = (
-            metadata.swa_block_table
-            if metadata.swa_block_table is not None
-            else metadata.block_table
+            cache_metadata.swa_block_table
+            if cache_metadata.swa_block_table is not None
+            else cache_metadata.block_table
         )
         indices, lens = deepseek_v4_decode_swa_indices_and_lens(
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
             block_table=swa_block_table,
-            block_table_base_offsets=metadata.swa_base_logical_page,
+            block_table_base_offsets=cache_metadata.swa_base_logical_page,
             window_size=window_size,
             block_size=block_size,
             is_valid_token=metadata.is_valid_token,
-            out_indices=metadata.decode_swa_indices,
-            out_lens=metadata.decode_swa_lens,
+            out_indices=attention_metadata.decode_swa_indices,
+            out_lens=attention_metadata.decode_swa_lens,
         )
-        metadata.decode_swa_indices = indices
-        metadata.decode_swa_lens = lens
-        metadata.decode_swa_window_size = window_size
-        metadata.decode_swa_block_size = block_size
+        attention_metadata.decode_swa_indices = indices
+        attention_metadata.decode_swa_lens = lens
+        attention_metadata.decode_swa_window_size = window_size
+        attention_metadata.decode_swa_block_size = block_size
         self._decode_swa_window_size = window_size
         self._decode_swa_block_size = block_size
         return indices, lens
@@ -569,7 +585,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
         num_tokens = positions.numel()
         req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
-        block_table = metadata.compressed_block_table(compress_ratio, block_size)
+        block_table = metadata.cache.compressed_block_table(compress_ratio, block_size)
         is_valid_token = (
             metadata.is_valid_token[:num_tokens]
             if metadata.is_valid_token is not None
@@ -594,8 +610,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             int(num_tokens),
             int(positions.data_ptr()) if positions.numel() else 0,
         )
-        dense_indices_cache = metadata.decode_dense_compressed_indices_cache
-        capture_safe_keys = metadata.decode_dense_compressed_indices_capture_safe_keys
+        attention_metadata = metadata.attention
+        dense_indices_cache = attention_metadata.decode_dense_compressed_indices_cache
+        capture_safe_keys = (
+            attention_metadata.decode_dense_compressed_indices_capture_safe_keys
+        )
         cached = dense_indices_cache.get(cache_key)
         capture_cached = cache_key in capture_safe_keys
         if cached is not None and (not capturing or capture_cached):
@@ -623,7 +642,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         safe_local = torch.where(valid, local, torch.zeros_like(local))
         pages = torch.div(safe_local, block_size, rounding_mode="floor")
         page_offsets = safe_local % block_size
-        page_ids = metadata.safe_page_ids(block_table, req_idx[:, None], pages.long())
+        page_ids = metadata.cache.safe_page_ids(
+            block_table,
+            req_idx[:, None],
+            pages.long(),
+        )
         slots = page_ids * block_size + page_offsets
         indices_2d = torch.where(
             valid & (page_ids >= 0),
@@ -732,10 +755,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
-        if metadata.forward_mode is None or not metadata.forward_mode.is_decode():
-            raise RuntimeError(
-                "forward_deepseek_v4_decode only supports ForwardMode.DECODE"
-            )
         if flash_mla_with_kvcache is error_fn:
             raise RuntimeError(
                 "DeepSeek V4 decode requires FlashMLA latent attention. "
@@ -752,15 +771,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             q_padded[:, : q.shape[1]].copy_(q)
         swa_block_size = token_to_kv_pool.swa_block_size
+        attention_metadata = metadata.attention
         if (
-            metadata.decode_swa_indices is not None
-            and metadata.decode_swa_lens is not None
-            and metadata.decode_swa_window_size == window_size
-            and metadata.decode_swa_block_size == swa_block_size
-            and metadata.decode_swa_indices.shape[0] == positions.numel()
+            attention_metadata.decode_swa_indices is not None
+            and attention_metadata.decode_swa_lens is not None
+            and attention_metadata.decode_swa_window_size == window_size
+            and attention_metadata.decode_swa_block_size == swa_block_size
+            and attention_metadata.decode_swa_indices.shape[0] == positions.numel()
         ):
-            swa_indices = metadata.decode_swa_indices
-            swa_lens = metadata.decode_swa_lens
+            swa_indices = attention_metadata.decode_swa_indices
+            swa_lens = attention_metadata.decode_swa_lens
         else:
             swa_indices, swa_lens = self._update_decode_swa_metadata(
                 metadata,
@@ -829,10 +849,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 mixed attention requires forward metadata")
-        if metadata.forward_mode is None or not metadata.forward_mode.is_mixed():
-            raise RuntimeError(
-                "forward_deepseek_v4_mixed only supports ForwardMode.MIXED"
-            )
 
         num_prefill_reqs = metadata.num_prefill_reqs
         num_prefill_tokens = metadata.num_prefill_tokens
@@ -920,6 +936,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
+        cache_metadata = metadata.cache
         num_reqs = metadata.seq_lens.numel()
         prefix_lens = metadata.seq_lens - metadata.query_lens
         gather_lens = metadata.query_lens + torch.minimum(
@@ -927,9 +944,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.full_like(prefix_lens, max(window_size - 1, 0)),
         )
         swa_block_table = (
-            metadata.swa_block_table
-            if metadata.swa_block_table is not None
-            else metadata.block_table
+            cache_metadata.swa_block_table
+            if cache_metadata.swa_block_table is not None
+            else cache_metadata.block_table
         )
         max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
@@ -951,7 +968,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio == 4 and topk_indices is not None:
             compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
             compressed_cache = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
-            compressed_block_table = metadata.compressed_block_table(
+            compressed_block_table = cache_metadata.compressed_block_table(
                 compress_ratio,
                 compressed_block_size,
             )
@@ -970,7 +987,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 seq_lens=metadata.seq_lens,
                 gather_lens=gather_lens,
                 block_table=swa_block_table,
-                block_table_base_offsets=metadata.swa_base_logical_page,
+                block_table_base_offsets=cache_metadata.swa_base_logical_page,
                 block_size=token_to_kv_pool.swa_block_size,
                 offset=compressed_base,
             )
@@ -999,7 +1016,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio > 1:
             assert compressed_cache is not None
             compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
-            compressed_block_table = metadata.compressed_block_table(
+            compressed_block_table = cache_metadata.compressed_block_table(
                 compress_ratio,
                 compressed_block_size,
             )
@@ -1018,7 +1035,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             seq_lens=metadata.seq_lens,
             gather_lens=gather_lens,
             block_table=swa_block_table,
-            block_table_base_offsets=metadata.swa_base_logical_page,
+            block_table_base_offsets=cache_metadata.swa_base_logical_page,
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
         )
@@ -1067,21 +1084,26 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         token_to_req = metadata.token_to_req_indices[token_start:token_end].to(
             torch.int32
         ) - int(req_start)
+        cache_metadata = metadata.cache
         paged_cache_block_tables = {
             key: table[req_start:req_end]
-            for key, table in metadata.paged_cache_block_tables.items()
+            for key, table in cache_metadata.paged_cache_block_tables.items()
         }
         paged_cache_block_table_base_offsets = {
             key: offsets[req_start:req_end]
-            for key, offsets in metadata.paged_cache_block_table_base_offsets.items()
+            for key, offsets in (
+                cache_metadata.paged_cache_block_table_base_offsets.items()
+            )
         }
         compressor_state_block_tables = {
             key: table[req_start:req_end]
-            for key, table in metadata.compressor_state_block_tables.items()
+            for key, table in cache_metadata.compressor_state_block_tables.items()
         }
         compressor_state_base_logical_pages = {
             key: offsets[req_start:req_end]
-            for key, offsets in metadata.compressor_state_base_logical_pages.items()
+            for key, offsets in (
+                cache_metadata.compressor_state_base_logical_pages.items()
+            )
         }
         query_lens = metadata.query_lens[req_start:req_end]
         req_count = max(0, req_end - req_start)
@@ -1092,14 +1114,41 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
         )
+        sliced_cache = DeepseekV4CacheMetadata(
+            page_size=cache_metadata.page_size,
+            block_table=cache_metadata.block_table[req_start:req_end],
+            paged_cache_block_tables=paged_cache_block_tables,
+            paged_cache_block_table_base_offsets=paged_cache_block_table_base_offsets,
+            swa_block_table=(
+                cache_metadata.swa_block_table[req_start:req_end]
+                if cache_metadata.swa_block_table is not None
+                else None
+            ),
+            swa_base_logical_page=(
+                cache_metadata.swa_base_logical_page[req_start:req_end]
+                if cache_metadata.swa_base_logical_page is not None
+                else None
+            ),
+            compressor_state_block_tables=compressor_state_block_tables,
+            compressor_state_base_logical_pages=compressor_state_base_logical_pages,
+            indexer_state_block_table=(
+                cache_metadata.indexer_state_block_table[req_start:req_end]
+                if cache_metadata.indexer_state_block_table is not None
+                else None
+            ),
+            indexer_state_base_logical_page=(
+                cache_metadata.indexer_state_base_logical_page[req_start:req_end]
+                if cache_metadata.indexer_state_base_logical_page is not None
+                else None
+            ),
+        )
         return DeepseekV4ForwardMetadata(
-            page_size=metadata.page_size,
             req_pool_indices=metadata.req_pool_indices[req_start:req_end],
-            block_table=metadata.block_table[req_start:req_end],
             seq_lens=metadata.seq_lens[req_start:req_end],
             query_lens=query_lens,
             query_start_loc=query_start_loc,
             token_to_req_indices=token_to_req,
+            cache=sliced_cache,
             is_valid_token=(
                 metadata.is_valid_token[token_start:token_end]
                 if metadata.is_valid_token is not None
@@ -1117,31 +1166,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
-            forward_mode=forward_mode,
-            paged_cache_block_tables=paged_cache_block_tables,
-            paged_cache_block_table_base_offsets=paged_cache_block_table_base_offsets,
-            swa_block_table=(
-                metadata.swa_block_table[req_start:req_end]
-                if metadata.swa_block_table is not None
-                else None
-            ),
-            swa_base_logical_page=(
-                metadata.swa_base_logical_page[req_start:req_end]
-                if metadata.swa_base_logical_page is not None
-                else None
-            ),
-            compressor_state_block_tables=compressor_state_block_tables,
-            compressor_state_base_logical_pages=compressor_state_base_logical_pages,
-            indexer_state_block_table=(
-                metadata.indexer_state_block_table[req_start:req_end]
-                if metadata.indexer_state_block_table is not None
-                else None
-            ),
-            indexer_state_base_logical_page=(
-                metadata.indexer_state_base_logical_page[req_start:req_end]
-                if metadata.indexer_state_base_logical_page is not None
-                else None
-            ),
         )
 
     def _forward_deepseek_v4_prefill_chunk(
@@ -1164,13 +1188,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if (
-            metadata.forward_mode is None
-            or not metadata.forward_mode.is_extend_or_mixed()
-        ):
-            raise RuntimeError(
-                "forward_deepseek_v4_prefill only supports extend/prefill modes"
-            )
         if flash_mla_sparse_fwd is error_fn:
             raise RuntimeError(
                 "DeepSeek V4 prefill requires FlashMLA sparse attention. "
@@ -1228,13 +1245,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if (
-            metadata.forward_mode is None
-            or not metadata.forward_mode.is_extend_or_mixed()
-        ):
-            raise RuntimeError(
-                "forward_deepseek_v4_prefill only supports extend/prefill modes"
-            )
 
         num_reqs = int(metadata.seq_lens.numel())
         if num_reqs <= self.prefill_chunk_size:
@@ -1435,7 +1445,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -1445,7 +1454,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
-        del num_tokens, kwargs
+        del kwargs
         if forward_mode is not None and not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph capture not supported for {forward_mode}"
@@ -1486,18 +1495,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata_paged,
             metadata_base_offsets,
         )
-        metadata = DeepseekV4ForwardMetadata(
+        cache_metadata = DeepseekV4CacheMetadata(
             page_size=self.page_size,
-            req_pool_indices=self._cuda_graph_req_pool_indices[:bs],
             block_table=self._cuda_graph_block_table[:bs, : self.max_num_pages],
-            seq_lens=self._cuda_graph_seq_lens[:bs],
-            query_lens=self._cuda_graph_query_lens[:bs],
-            query_start_loc=self._cuda_graph_query_start_loc[: bs + 1],
-            token_to_req_indices=self._cuda_graph_token_to_req[:bs],
-            is_valid_token=self._cuda_graph_is_valid_token[:bs],
-            seq_lens_cpu=None,
-            query_lens_cpu=None,
-            forward_mode=forward_mode,
             paged_cache_block_tables=metadata_paged,
             paged_cache_block_table_base_offsets=metadata_base_offsets,
             swa_block_table=swa_block_table,
@@ -1507,13 +1507,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             indexer_state_block_table=indexer_state_block_table,
             indexer_state_base_logical_page=indexer_state_base,
         )
+        metadata = DeepseekV4ForwardMetadata(
+            req_pool_indices=self._cuda_graph_req_pool_indices[:bs],
+            seq_lens=self._cuda_graph_seq_lens[:bs],
+            query_lens=self._cuda_graph_query_lens[:bs],
+            query_start_loc=self._cuda_graph_query_start_loc[: bs + 1],
+            token_to_req_indices=self._cuda_graph_token_to_req[:bs],
+            cache=cache_metadata,
+            is_valid_token=self._cuda_graph_is_valid_token[:bs],
+            seq_lens_cpu=None,
+            query_lens_cpu=None,
+        )
         self._cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -1574,15 +1584,21 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata_paged,
             metadata_base_offsets,
         )
-        metadata.forward_mode = forward_mode
-        metadata.paged_cache_block_tables = metadata_paged
-        metadata.paged_cache_block_table_base_offsets = metadata_base_offsets
-        metadata.swa_block_table = swa_block_table
-        metadata.swa_base_logical_page = swa_base
-        metadata.compressor_state_block_tables = compressor_state_block_tables
-        metadata.compressor_state_base_logical_pages = compressor_state_base
-        metadata.indexer_state_block_table = indexer_state_block_table
-        metadata.indexer_state_base_logical_page = indexer_state_base
+        metadata.cache = DeepseekV4CacheMetadata(
+            page_size=self.page_size,
+            block_table=self._cuda_graph_block_table[:bs, : self.max_num_pages],
+            paged_cache_block_tables=metadata_paged,
+            paged_cache_block_table_base_offsets=metadata_base_offsets,
+            swa_block_table=swa_block_table,
+            swa_base_logical_page=swa_base,
+            compressor_state_block_tables=compressor_state_block_tables,
+            compressor_state_base_logical_pages=compressor_state_base,
+            indexer_state_block_table=indexer_state_block_table,
+            indexer_state_base_logical_page=indexer_state_base,
+            decode_compressed_slot_mappings=(
+                metadata.cache.decode_compressed_slot_mappings
+            ),
+        )
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
         if (
@@ -1596,7 +1612,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 window_size=self._decode_swa_window_size,
                 block_size=self._decode_swa_block_size,
             )
-            metadata.refresh_decode_compressed_slot_mappings()
+            metadata.cache.refresh_decode_compressed_slot_mappings(
+                token_to_req_indices=metadata.token_to_req_indices,
+                query_start_loc=metadata.query_start_loc,
+                seq_lens=metadata.seq_lens,
+            )
             _refresh_decode_indexer_plan_cache(
                 metadata,
                 max_context_len=self.context_len,

@@ -154,7 +154,8 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 
     if (!spec.request_id.empty()) {
         if (auto* req = find_request(spec.request_id)) {
-            req->Apply(fsm::WriteBackDoneEvent{});
+            req->Apply(
+                fsm::WriteBackDoneEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
         }
     }
 }

@@ -95,6 +95,12 @@ class ServerArgs:
     mamba_track_interval: int = 256
     max_mamba_cache_size: int | None = None
     mamba_full_memory_ratio: float = 0.9
+    enable_mamba_l2: bool = False
+    mamba_l2_host_slots: int = 0
+    mamba_l2_ratio: float = 2.0
+    mamba_l2_layout: str = "layer_first"
+    mamba_l2_io_backend: str = "kernel"
+    mamba_l2_host_gb: int = 0
 
     # Other runtime options
     stream_interval: int = 1
@@ -260,7 +266,7 @@ class ServerArgs:
     mapping: Mapping | None = None
 
     mla_chunk_multiplier: int = 4
-    mm_mode: str = "none"
+    mm_attention_backend: str | None = None
 
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
@@ -922,6 +928,43 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
+        parser.add_argument(
+            "--enable-mamba-l2",
+            action="store_true",
+            help="Enable host-memory L2 cache for Mamba state slots.",
+        )
+        parser.add_argument(
+            "--mamba-l2-host-slots",
+            type=int,
+            default=ServerArgs.mamba_l2_host_slots,
+            help="Number of host Mamba L2 slots. If 0, derive from --mamba-l2-host-gb or --mamba-l2-ratio.",
+        )
+        parser.add_argument(
+            "--mamba-l2-ratio",
+            type=float,
+            default=ServerArgs.mamba_l2_ratio,
+            help="Mamba host L2 slot ratio relative to device Mamba slots when host slots are not explicit.",
+        )
+        parser.add_argument(
+            "--mamba-l2-layout",
+            type=str,
+            choices=["layer_first"],
+            default=ServerArgs.mamba_l2_layout,
+            help="Mamba host L2 memory layout.",
+        )
+        parser.add_argument(
+            "--mamba-l2-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.mamba_l2_io_backend,
+            help="IO backend for Mamba L2 host/device transfers.",
+        )
+        parser.add_argument(
+            "--mamba-l2-host-gb",
+            type=int,
+            default=ServerArgs.mamba_l2_host_gb,
+            help="Mamba L2 host memory budget in GiB. Overrides --mamba-l2-ratio when host slots are not explicit.",
         )
 
         parser.add_argument(
@@ -1642,6 +1685,20 @@ class ServerArgs:
             ),
         )
 
+        # Multimodal
+        mm_attention_backend_choices = [
+            "fa3",
+            "fa4",
+            "triton_attn",
+            "flashinfer_cudnn",
+        ]
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=mm_attention_backend_choices,
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
+        )
         # Disaggregation
         parser.add_argument(
             "--disaggregation-mode",
@@ -1694,9 +1751,6 @@ class ServerArgs:
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
-
-        # Multi-modal inference mode
-        parser.add_argument("--mm-mode", type=str, default=ServerArgs.mm_mode)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

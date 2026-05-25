@@ -257,6 +257,34 @@ class MoeLayerMapping(MappingBase):
         )
 
 
+class VisionTowerMapping(MappingBase):
+    """Parallel mapping for vision encoders. Vision layers run colocated and
+    share the attention TP group; non-colocated deployments should run the
+    encoder out-of-engine (EPD-style workers + gateway dispatch).
+    """
+
+    def __init__(
+        self,
+        rank: int | None = None,
+        world_size: int = 1,
+        tp_size: int | None = None,
+    ):
+        super().__init__(rank, world_size)
+        (self.tp_size,) = _resolve_parallelism_sizes(self.world_size, tp_size)
+
+    @cached_property
+    def has_tp(self) -> bool:
+        return self.tp_size > 1
+
+    @cached_property
+    def tp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def tp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.tp_size, stride=1)
+
+
 class Mapping(MappingBase):
 
     def __init__(
@@ -298,6 +326,12 @@ class Mapping(MappingBase):
             ep_size=moe_ep_size,
             dp_size=moe_dp_size,
         )
+        # Vision tower runs colocated on the attention TP group.
+        self.vision = VisionTowerMapping(
+            rank=rank,
+            world_size=self.attn.tp_size,
+            tp_size=self.attn.tp_size,
+        )
         self.nprocs_per_node, self.nnodes = _resolve_parallelism_sizes(
             self.world_size, nprocs_per_node, nnodes
         )
@@ -310,6 +344,7 @@ class Mapping(MappingBase):
         self.attn.rank = rank
         self.dense.rank = rank
         self.moe.rank = rank
+        self.vision.rank = rank
 
     @cached_property
     def has_attn_tp(self) -> bool:
@@ -341,6 +376,7 @@ class Mapping(MappingBase):
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Attention: tp={self.attn.tp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
+            f"    Vision: tp={self.vision.tp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
             f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",
         ]

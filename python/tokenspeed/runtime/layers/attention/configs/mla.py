@@ -46,6 +46,12 @@ class MLAConfig(BaseAttnConfig):
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
     ):
+        kwargs = {}
+        if server_args.speculative_algorithm is not None:
+            kwargs.update(
+                speculative_num_steps=server_args.speculative_num_steps,
+                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            )
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -65,8 +71,6 @@ class MLAConfig(BaseAttnConfig):
             max_bs=server_args.max_num_seqs
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             kv_cache_quant_method=server_args.kv_cache_quant_method,
-            speculative_num_steps=server_args.speculative_num_steps,
-            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             is_draft=is_draft,
             kv_lora_rank=model_config.kv_lora_rank,
             qk_nope_head_dim=model_config.qk_nope_head_dim,
@@ -74,6 +78,7 @@ class MLAConfig(BaseAttnConfig):
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            **kwargs,
         )
 
     def cache_cell_size(self) -> int:

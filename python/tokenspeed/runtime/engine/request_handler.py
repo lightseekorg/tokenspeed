@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
+from tokenspeed.runtime.multimodal.shm_transport import sync_shm_features
 from tokenspeed.runtime.pd.base import BootstrapInfo
 from tokenspeed.runtime.utils import broadcast_pyobj
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
@@ -140,6 +141,10 @@ class RequestHandler:
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_src_rank,
             )
+
+        if recv_reqs:
+            sync_shm_features(recv_reqs, self.attn_tp_cpu_group, self.attn_tp_size)
+
         return recv_reqs
 
     def process_requests(self, recv_reqs: list):

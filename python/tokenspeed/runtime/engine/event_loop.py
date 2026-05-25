@@ -35,6 +35,7 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
     MemoryExecutorConfig,
 )
+from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -224,6 +225,26 @@ class EventLoop:
                 "KVStore L2 cache will not be used during normal execution, but it will still be used when retraction happens."
             )
 
+        mamba_l2_host_slots = 0
+        if has_mamba and server_args.enable_mamba_l2:
+            if server_args.mamba_l2_host_slots > 0:
+                mamba_l2_host_slots = server_args.mamba_l2_host_slots
+            elif server_args.mamba_l2_host_gb > 0 and mamba_pool is not None:
+                slot_bytes = int(
+                    mamba_pool.conv_state.shape[0]
+                    * (
+                        mamba_pool.conv_state[0, 0].nbytes
+                        + mamba_pool.ssm_state[0, 0].nbytes
+                    )
+                )
+                mamba_l2_host_slots = int(
+                    server_args.mamba_l2_host_gb * (1024**3) // max(slot_bytes, 1)
+                )
+            else:
+                mamba_l2_host_slots = max(
+                    int(mamba_pool_total_chunks * server_args.mamba_l2_ratio), 1
+                )
+
         mem_cfg = MemoryExecutorConfig(
             layer_num=self.model_config.num_hidden_layers,
             page_size=server_args.block_size,
@@ -234,6 +255,10 @@ class EventLoop:
             storage_backend=server_args.kvstore_storage_backend,
             storage_backend_extra_config=server_args.kvstore_storage_backend_extra_config,
             model_name=server_args.model,
+            enable_mamba_l2=server_args.enable_mamba_l2,
+            mamba_l2_host_slots=mamba_l2_host_slots,
+            mamba_l2_layout=server_args.mamba_l2_layout,
+            mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
         is_deepseek_v4_pool = (
             type(token_to_kv_pool).__name__ == "DeepseekV4TokenToKVPool"
@@ -253,6 +278,7 @@ class EventLoop:
                 is_dp_attention_enabled=self.has_dp,
                 tp_group=self.attn_tp_cpu_group,
                 draft_device_pool=draft_token_to_kv_pool,
+                mamba_pool=mamba_pool,
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
@@ -273,10 +299,8 @@ class EventLoop:
                 f"(ratio={server_args.mamba_full_memory_ratio})."
             )
 
-        enable_mixed_prefill_decode = (
-            server_args.enable_mixed_batch and server_args.speculative_algorithm is None
-        )
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
+
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
@@ -302,8 +326,10 @@ class EventLoop:
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            enable_mamba_l2=server_args.enable_mamba_l2,
+            mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
-            enable_mixed_prefill_decode=enable_mixed_prefill_decode,
+            enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(
@@ -540,6 +566,7 @@ class EventLoop:
         dp_all_decode_or_idle = (
             dp_metadata.all_decode_or_idle if dp_metadata is not None else False
         )
+        multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
         self.model_executor.update_block_table(forward_op)
 
@@ -554,6 +581,7 @@ class EventLoop:
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
                     grammar_inputs=grammar_inputs,
+                    multimodal_context=multimodal_context,
                     **stats,
                 ),
                 None,
@@ -581,6 +609,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        multimodal_context=multimodal_context,
                         **stats,
                     ),
                     None,
@@ -605,15 +634,43 @@ class EventLoop:
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         grammar_inputs=grammar_inputs,
+                        multimodal_context=multimodal_context,
                         **stats,
                     ),
                     self.pd_kv_transfer.store_prefill_token,
                 )
 
+    def _get_multimodal_context_for_forward(self, forward_op):
+        if not self.model_config.is_multimodal:
+            return None
+
+        num_extends = forward_op.num_extends()
+        mm_inputs = []
+        has_mm = False
+        for index, rid in enumerate(forward_op.request_ids):
+            state = self.output_processor.rid_to_state.get(rid)
+            if state is not None and index < num_extends:
+                state.maybe_extend_multimodal_mrope_positions()
+            item = getattr(state, "multimodal_inputs", None) if state else None
+            mm_inputs.append(item)
+            has_mm = has_mm or item is not None
+        if not has_mm:
+            return None
+
+        from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
+
+        return MultimodalForwardContext(
+            mm_inputs=mm_inputs,
+            extend_prefix_lens=list(forward_op.extend_prefix_lens),
+            extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
+        )
+
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
-        self.memory_executor.submit_plan(execution_plan)
+        self.memory_executor.submit_plan(
+            execution_plan, producer_stream=self.model_executor.execution_stream
+        )
         for op in execution_plan.cache:
             if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
                 self._num_inflight_cache_ops += len(op.op_ids)
@@ -624,29 +681,44 @@ class EventLoop:
         self._setup_layerwise_loadback(execution_plan)
 
     def _setup_layerwise_loadback(self, execution_plan) -> None:
-        consumer_indices = []
+        host_exec = getattr(self.memory_executor, "host_exec", None)
+        available_pools = (
+            getattr(host_exec, "pools", {}) if host_exec is not None else {}
+        )
+        consumer_indices_by_kind: dict[CacheKind, list[int]] = {
+            kind: [] for kind in available_pools
+        }
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
                 for op_id in cache_op.op_ids:
-                    producer_idx = self.memory_executor.get_producer_index(op_id)
-                    if (
-                        producer_idx is not None
-                        and producer_idx not in consumer_indices
-                    ):
-                        consumer_indices.append(producer_idx)
-        self.memory_executor.set_consumer(consumer_indices if consumer_indices else -1)
+                    for kind in consumer_indices_by_kind:
+                        producer_idx = self.memory_executor.get_producer_index(
+                            kind, op_id
+                        )
+                        if (
+                            producer_idx is not None
+                            and producer_idx not in consumer_indices_by_kind[kind]
+                        ):
+                            consumer_indices_by_kind[kind].append(producer_idx)
+        for kind, consumer_indices in consumer_indices_by_kind.items():
+            self.memory_executor.set_consumer(
+                kind, consumer_indices if consumer_indices else -1
+            )
+        has_mamba_loadback = bool(consumer_indices_by_kind.get(CacheKind.MAMBA))
         # Fence WriteBack against this iter's ``set_kv_buffer``: the
         # scheduler can re-allocate a freed-but-not-yet-written-back slot
         # to a new prefill / decode within the same iter. ``set_kv_buffer``
         # runs before any ``wait_until`` in attention, so nothing else
         # orders writeback's reads against the new writes. Cheap when
         # write_stream is idle.
-        # LoadBack does not need fencing here: it only fires on admission
-        # iters (eager prefill), whose per-layer ``wait_until`` drains
-        # ``load_stream`` before the iter ends.
         host_exec = getattr(self.memory_executor, "host_exec", None)
         if host_exec is not None:
             self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
+            if has_mamba_loadback:
+                # Mamba COW runs before the layerwise waits in mamba forward and
+                # reads the freshly loaded tree slot into the request-local
+                # working slot. Fence load_stream here so COW cannot race H->D.
+                self.model_executor.execution_stream.wait_stream(host_exec.load_stream)
 
     def _flush_mamba_retract_states(self, forward_op) -> None:
         """Copy draft->working mamba states when retract occurred (no forward scheduled)."""

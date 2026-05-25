@@ -46,6 +46,10 @@ from tokenspeed.runtime.cache.kv_cache_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
+from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
+from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
+from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -64,6 +68,10 @@ class MemoryExecutorConfig:
     storage_backend: Optional[str] = "mooncake"
     storage_backend_extra_config: Optional[str] = None
     model_name: Optional[str] = None
+    enable_mamba_l2: bool = False
+    mamba_l2_host_slots: int = 0
+    mamba_l2_layout: str = "layer_first"
+    mamba_l2_io_backend: str = "kernel"
 
 
 class MemoryExecutor:
@@ -76,6 +84,7 @@ class MemoryExecutor:
         is_dp_attention_enabled: bool,
         tp_group=None,
         draft_device_pool=None,
+        mamba_pool=None,
     ):
         self.page_size = config.page_size
 
@@ -164,18 +173,61 @@ class MemoryExecutor:
             self.draft_host_pool = None
             draft_layer_num = 0
 
-        self.host_exec = HostExecutor(
-            page_size=config.page_size,
-            device_pool=device_pool,
-            host_pool=self.host_pool,
-            io_backend=config.io_backend,
-            layer_num=actual_pool.layer_num,
-            draft_device_pool=(
-                actual_draft_pool if draft_device_pool is not None else None
-            ),
-            draft_host_pool=self.draft_host_pool,
-            draft_layer_num=draft_layer_num,
-        )
+        pools = None
+        self.mamba_host_pool = None
+        if (
+            config.enable_mamba_l2
+            and mamba_pool is not None
+            and config.mamba_l2_host_slots > 0
+        ):
+            self.mamba_host_pool = MambaPoolHost(
+                mamba_pool,
+                host_size_slots=config.mamba_l2_host_slots,
+                layout=config.mamba_l2_layout,
+            )
+            pools = [
+                KVCachePool(
+                    device_pool=device_pool,
+                    host_pool=self.host_pool,
+                    io_backend=config.io_backend,
+                    layer_num=actual_pool.layer_num,
+                    draft_device_pool=(
+                        actual_draft_pool if draft_device_pool is not None else None
+                    ),
+                    draft_host_pool=self.draft_host_pool,
+                    draft_layer_num=draft_layer_num,
+                ),
+                MambaCachePool(
+                    device_pool=mamba_pool,
+                    host_pool=self.mamba_host_pool,
+                    io_backend=config.mamba_l2_io_backend,
+                ),
+            ]
+            logger.debug(
+                "[cache_op] MemoryExecutor init pools=%s host_pools=%s draft=%s mamba=%s io_backend=%s host_layout=%s",
+                [pool.kind.value for pool in pools],
+                [type(self.host_pool).__name__, type(self.mamba_host_pool).__name__],
+                self.draft_host_pool is not None,
+                True,
+                config.io_backend,
+                config.host_layout,
+            )
+
+        if pools is not None:
+            self.host_exec = HostExecutor(pools=pools, io_backend=config.io_backend)
+        else:
+            self.host_exec = HostExecutor(
+                page_size=config.page_size,
+                device_pool=device_pool,
+                host_pool=self.host_pool,
+                io_backend=config.io_backend,
+                layer_num=actual_pool.layer_num,
+                draft_device_pool=(
+                    actual_draft_pool if draft_device_pool is not None else None
+                ),
+                draft_host_pool=self.draft_host_pool,
+                draft_layer_num=draft_layer_num,
+            )
         self.storage_exec = StorageExecutor(
             page_size=config.page_size,
             device_pool=device_pool,
@@ -187,9 +239,23 @@ class MemoryExecutor:
             tp_group=tp_group,
         )
 
-    def submit_plan(self, plan) -> None:
+    @staticmethod
+    def _page_groups_by_kind(op) -> dict[CacheKind, tuple[list, list]]:
+        src_by_kind = getattr(op, "src_pages_by_kind", None)
+        dst_by_kind = getattr(op, "dst_pages_by_kind", None)
+        if src_by_kind is None or dst_by_kind is None:
+            return {CacheKind.KV: (op.src_pages, op.dst_pages)}
+        groups: dict[CacheKind, tuple[list, list]] = {}
+        for kind in CacheKind:
+            src_pages = src_by_kind.get(kind.value, [])
+            dst_pages = dst_by_kind.get(kind.value, [])
+            groups[kind] = (src_pages, dst_pages)
+        return groups
+
+    def submit_plan(self, plan, producer_stream=None) -> None:
         if plan.cache:
             logger.debug("[cache_op] submit_plan: %s cache ops", len(plan.cache))
+        self.host_exec.fence_writeback_after(producer_stream)
         for op in plan.cache:
             self.submit(op)
         self.host_exec.flush()
@@ -202,14 +268,41 @@ class MemoryExecutor:
                 len(op.src_pages),
                 len(op.dst_pages),
             )
+            groups = self._page_groups_by_kind(op)
             for i in range(len(op.op_ids)):
                 op_id = op.op_ids[i]
-                src_pages = op.src_pages[i]
-                dst_pages = op.dst_pages[i]
                 is_retract = bool(getattr(op, "is_retract", [False])[i])
-                self.host_exec.enqueue_writeback(
-                    op_id, src_pages, dst_pages, is_retract=is_retract
-                )
+                for kind, (src_groups, dst_groups) in groups.items():
+                    if kind not in self.host_exec.pools:
+                        continue
+                    src_pages = src_groups[i] if i < len(src_groups) else []
+                    dst_pages = dst_groups[i] if i < len(dst_groups) else []
+                    if not src_pages:
+                        continue
+                    if kind == CacheKind.MAMBA:
+                        logger.debug(
+                            "[cache_op][mamba_l2] writeback schedule "
+                            "op_id=%s slots=%s device_slots=%s host_slots=%s "
+                            "is_retract=%s",
+                            op_id,
+                            len(src_pages),
+                            src_pages[:8],
+                            dst_pages[:8],
+                            is_retract,
+                        )
+                    self.host_exec.enqueue_writeback(
+                        op_id,
+                        src_pages,
+                        dst_pages,
+                        is_retract=is_retract,
+                        kind=kind,
+                    )
+                if all(
+                    i >= len(src_groups) or not src_groups[i]
+                    for kind, (src_groups, _) in groups.items()
+                    if kind in self.host_exec.pools
+                ):
+                    self.host_exec.completed_writebacks.append(op_id)
         elif isinstance(op, Cache.LoadBackOp):
             logger.debug(
                 "[cache_op] loadback op_id=%s src_pages=%s dst_pages=%s",
@@ -217,11 +310,29 @@ class MemoryExecutor:
                 len(op.src_pages),
                 len(op.dst_pages),
             )
+            groups = self._page_groups_by_kind(op)
             for i in range(len(op.op_ids)):
                 op_id = op.op_ids[i]
-                src_pages = op.src_pages[i]
-                dst_pages = op.dst_pages[i]
-                self.host_exec.enqueue_loadback(op_id, src_pages, dst_pages)
+                for kind, (src_groups, dst_groups) in groups.items():
+                    if kind not in self.host_exec.pools:
+                        continue
+                    src_pages = src_groups[i] if i < len(src_groups) else []
+                    dst_pages = dst_groups[i] if i < len(dst_groups) else []
+                    if not src_pages:
+                        continue
+                    if kind == CacheKind.MAMBA:
+                        logger.debug(
+                            "[cache_op][mamba_l2] loadback schedule "
+                            "op_id=%s slots=%s host_slots=%s device_slots=%s",
+                            op_id,
+                            len(src_pages),
+                            src_pages[:8],
+                            dst_pages[:8],
+                        )
+                    self.host_exec.enqueue_loadback(
+                        op_id, src_pages, dst_pages, kind=kind
+                    )
+
         elif isinstance(op, Cache.PrefetchOp):
             logger.debug(
                 "[cache_op] prefetch op_id=%s dst_pages=%s", op.op_id, len(op.dst_pages)
@@ -249,11 +360,17 @@ class MemoryExecutor:
                 )
         return results
 
-    def get_producer_index(self, op_id: int) -> Optional[int]:
-        return self.host_exec.get_producer_index(op_id)
+    def get_producer_index(
+        self, kind_or_op_id: CacheKind | str | int, op_id: int | None = None
+    ) -> Optional[int]:
+        return self.host_exec.get_producer_index(kind_or_op_id, op_id)
 
-    def set_consumer(self, producer_index: int | Iterable[int]) -> None:
-        self.host_exec.set_consumer(producer_index)
+    def set_consumer(
+        self,
+        kind_or_producer_index: CacheKind | str | int | Iterable[int],
+        producer_index: int | Iterable[int] | None = None,
+    ) -> None:
+        self.host_exec.set_consumer(kind_or_producer_index, producer_index)
 
     def query_l3_pages(self, hashes: list[str]) -> int:
         return self.storage_exec.query_exists(hashes)

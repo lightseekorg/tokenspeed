@@ -140,4 +140,9 @@ std::int32_t TreeNode::MambaSlotIndex() const {
     return mamba_slot_->Index();
 }
 
+std::int32_t TreeNode::MambaHostSlotIndex() const {
+    _assert(mamba_host_slot_ != nullptr, "MambaHostSlotIndex called on node without mamba host slot");
+    return mamba_host_slot_->Index();
+}
+
 }  // namespace tokenspeed

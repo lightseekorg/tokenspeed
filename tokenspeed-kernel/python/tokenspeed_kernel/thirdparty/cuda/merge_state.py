@@ -60,6 +60,7 @@ def merge_state(
     v_b: torch.Tensor,
     s_b: torch.Tensor,
     *,
+    inplace: bool = False,
     lse_scale_log2: float = LSE_LN,
     enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -81,6 +82,9 @@ def merge_state(
     ----------
     v_a, v_b : ``[seq_len, num_heads, head_dim]``, ``bfloat16`` or ``float16``.
     s_a, s_b : ``[seq_len, num_heads]``, must be ``float32``.
+    inplace : when ``True``, the merged output is written back into ``v_a`` and
+        ``s_a`` (mutated) and the same tensors are returned. When ``False``,
+        fresh buffers are allocated.
     lse_scale_log2 : multiplier mapping caller's LSE basis to log2.
     enable_pdl : opt into Programmatic Dependent Launch (Hopper+). Caller must
         also enable PDL on the upstream / downstream kernels for the overlap
@@ -105,9 +109,12 @@ def merge_state(
         s_a.dtype == torch.float32 and s_b.dtype == torch.float32
     ), f"merge_state expects fp32 LSE, got s_a={s_a.dtype} s_b={s_b.dtype}"
 
-    seq_len, num_heads, _ = v_a.shape
-    v_merged = torch.empty_like(v_a)
-    s_merged = torch.empty(seq_len, num_heads, dtype=torch.float32, device=v_a.device)
+    if inplace:
+        v_merged = v_a
+        s_merged = s_a
+    else:
+        v_merged = torch.empty_like(v_a)
+        s_merged = torch.empty_like(s_a)
     _load_merge_state_module().merge_state(
         v_a,
         s_a,

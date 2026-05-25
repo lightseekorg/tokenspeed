@@ -65,7 +65,6 @@ from tokenspeed.runtime.engine.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
-    MultimodalDataInputFormat,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -156,9 +155,6 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        image_data: MultimodalDataInputFormat | None = None,
-        audio_data: MultimodalDataInputFormat | None = None,
-        video_data: MultimodalDataInputFormat | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -196,9 +192,6 @@ class Engine(EngineBase):
             text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
-            image_data=image_data,
-            audio_data=audio_data,
-            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -231,9 +224,6 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        image_data: MultimodalDataInputFormat | None = None,
-        audio_data: MultimodalDataInputFormat | None = None,
-        video_data: MultimodalDataInputFormat | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -265,9 +255,6 @@ class Engine(EngineBase):
             input_multi_ids=input_multi_ids,
             input_extra_infos=input_extra_infos,
             sampling_params=sampling_params,
-            image_data=image_data,
-            audio_data=audio_data,
-            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,

@@ -36,9 +36,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
     deepseek_v4_hca_compress_kv_cache_insert,
-    deepseek_v4_indexer_topk_reference,
     deepseek_v4_prepare_indexer_q_mxfp4,
-    deepseek_v4_prepare_indexer_q_reference,
     dequantize_deepseek_v4_fp8_ds_mla_cache,
     fused_qnorm_rope_kv_insert,
     read_deepseek_v4_indexer_fp8_cache,
@@ -182,6 +180,71 @@ def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
         row.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),
         scale=shape[-1] ** -0.5,
     ).reshape(shape)
+
+
+def _prepare_indexer_q_reference(
+    index_q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    head_scale: float,
+    use_fp4: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rope_dim = int(cos_sin_cache.shape[-1])
+    rotated = _apply_gptj_rope_with_nope(
+        index_q,
+        positions,
+        cos_sin_cache,
+        nope_dim=index_q.shape[-1] - rope_dim,
+    )
+    rotated = _hadamard_rotate(rotated).float()
+    weights_out = weights.float().clone()
+    if weights_out.dim() == 3:
+        weights_out = weights_out.squeeze(-1)
+
+    if use_fp4:
+        q_out = torch.empty_like(rotated, dtype=torch.float32)
+        for token_idx in range(rotated.shape[0]):
+            for head_idx in range(rotated.shape[1]):
+                _, _, dequant = _mxfp4_bytes_and_scales(rotated[token_idx, head_idx])
+                q_out[token_idx, head_idx].copy_(dequant)
+        weights_out *= softmax_scale * head_scale
+    else:
+        q_out = torch.empty_like(rotated, dtype=torch.float32)
+        q_scales = torch.empty_like(weights_out, dtype=torch.float32)
+        for token_idx in range(rotated.shape[0]):
+            for head_idx in range(rotated.shape[1]):
+                q_bytes, scale = _fp8_pow2_bytes_and_scale(rotated[token_idx, head_idx])
+                q_out[token_idx, head_idx].copy_(
+                    q_bytes.view(torch.float8_e4m3fn).float() * scale
+                )
+                q_scales[token_idx, head_idx] = scale
+        weights_out *= q_scales * softmax_scale * head_scale
+    return q_out.to(index_q.dtype), weights_out
+
+
+def _indexer_topk_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    top_k: int,
+    lengths: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if weights.dim() == 3:
+        weights = weights.squeeze(-1)
+    logits = torch.einsum("thd,kd->thk", q.float(), k.float()).relu()
+    logits = (logits * weights.float().unsqueeze(-1)).sum(dim=1)
+    if lengths is not None:
+        if row_starts is None:
+            row_starts = torch.zeros_like(lengths)
+        cols = torch.arange(k.shape[0], device=k.device)
+        valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
+            cols.unsqueeze(0) < (row_starts + lengths).unsqueeze(1)
+        )
+        logits = logits.masked_fill(~valid, -float("inf"))
+    return torch.topk(logits, k=top_k, dim=-1, sorted=False).indices.to(torch.int32)
 
 
 def _expected_overlap_normed(
@@ -682,7 +745,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         lengths = torch.tensor([3, 3, 2, 2], device=device, dtype=torch.int64)
         row_starts = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int64)
 
-        topk = deepseek_v4_indexer_topk_reference(
+        topk = _indexer_topk_reference(
             q, k, weights, top_k=2, lengths=lengths, row_starts=row_starts
         )
 
@@ -1090,7 +1153,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         cos_sin = torch.randn(16, ROPE_DIM, device=device, dtype=torch.float32) * 0.05
         q = torch.randn(2, 3, 128, device=device, dtype=dtype)
         weights = torch.randn(2, 3, device=device, dtype=torch.float32)
-        q_fp4, weights_fp4 = deepseek_v4_prepare_indexer_q_reference(
+        q_fp4, weights_fp4 = _prepare_indexer_q_reference(
             q, positions, cos_sin, weights, 0.25, 3**-0.5, use_fp4=True
         )
         self.assertEqual(q_fp4.shape, q.shape)
@@ -1118,7 +1181,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             atol=1.0e-6,
             rtol=1.0e-6,
         )
-        q_fp8, weights_fp8 = deepseek_v4_prepare_indexer_q_reference(
+        q_fp8, weights_fp8 = _prepare_indexer_q_reference(
             q, positions, cos_sin, weights, 0.25, 3**-0.5, use_fp4=False
         )
         self.assertEqual(q_fp8.shape, q.shape)
