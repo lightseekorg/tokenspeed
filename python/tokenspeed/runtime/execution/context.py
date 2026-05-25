@@ -60,5 +60,6 @@ class ForwardContext:
     gather_ids: torch.Tensor | None = None
     keep_full_logits: bool = False
     last_index_offsets: torch.Tensor | None = None
+    padded_static_len: int = -1
 
     dp_sampling: bool = False
