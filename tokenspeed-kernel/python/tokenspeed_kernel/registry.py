@@ -24,7 +24,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
     import torch
@@ -44,6 +44,16 @@ __all__ = [
     "register_kernel",
     "describe_kernel",
 ]
+
+
+def _normalize_roles(roles: str | Iterable[str]) -> tuple[str, ...]:
+    if isinstance(roles, str):
+        role_names = (roles,)
+    else:
+        role_names = tuple(roles)
+    if not role_names:
+        raise ValueError("at least one dtype filter role is required")
+    return role_names
 
 
 # Hard upper bound on priority values; selection scoring clamps to this range.
@@ -162,22 +172,55 @@ class KernelSpec:
     def supports_format_signature(self, format_signature: FormatSignature) -> bool:
         return format_signature in self.format_signatures
 
-    def format_signature_for_primary_storage_dtype(
+    def format_signatures_for_storage_dtype(
         self,
-        primary_storage_dtype: torch.dtype,
-    ) -> FormatSignature | None:
-        """Return the first signature matching a dtype-oriented filter."""
-        for signature in sorted(self.format_signatures, key=str):
-            if signature.primary_storage_dtype() == primary_storage_dtype:
-                return signature
-        return None
+        storage_dtype: torch.dtype,
+        roles: str | Iterable[str],
+    ) -> tuple[FormatSignature, ...]:
+        """Return signatures whose selected role has storage_dtype.
 
-    def primary_storage_dtypes(self) -> frozenset[torch.dtype]:
+        ``roles`` is explicit because the meaningful dtype role is an operator
+        property, not a property of ``FormatSignature`` itself. Multiple roles
+        are treated as alternatives, which is useful for operators whose dtype
+        filter role depends on the concrete signature.
+        """
+        role_names = _normalize_roles(roles)
+        return tuple(
+            signature
+            for signature in sorted(self.format_signatures, key=str)
+            if any(
+                signature.storage_dtype_for(role) == storage_dtype
+                for role in role_names
+            )
+        )
+
+    def format_signature_for_storage_dtype(
+        self,
+        storage_dtype: torch.dtype,
+        roles: str | Iterable[str],
+    ) -> FormatSignature | None:
+        """Return the single matching signature, or raise if ambiguous."""
+        matches = self.format_signatures_for_storage_dtype(storage_dtype, roles)
+        if len(matches) > 1:
+            role_list = ", ".join(_normalize_roles(roles)) or "none"
+            raise ValueError(
+                f"Kernel {self.name!r} has multiple format signatures for "
+                f"storage dtype={storage_dtype} on role(s) {role_list}; "
+                "use a full format signature"
+            )
+        return matches[0] if matches else None
+
+    def storage_dtypes_for_role(
+        self,
+        roles: str | Iterable[str],
+    ) -> frozenset[torch.dtype]:
+        role_names = _normalize_roles(roles)
         return frozenset(
             dtype
             for dtype in (
-                signature.primary_storage_dtype()
+                signature.storage_dtype_for(role)
                 for signature in self.format_signatures
+                for role in role_names
             )
             if dtype is not None
         )

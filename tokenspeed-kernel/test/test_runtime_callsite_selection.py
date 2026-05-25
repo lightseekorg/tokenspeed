@@ -302,10 +302,32 @@ _DTYPE_PREFERENCE = [
 ]
 
 
+def _all_storage_dtypes(spec) -> frozenset[torch.dtype]:
+    return frozenset(
+        tensor_format.storage_dtype
+        for signature in spec.format_signatures
+        for _role, tensor_format in signature.roles
+    )
+
+
+def _format_signature_for_any_role(spec, dtype: torch.dtype) -> FormatSignature | None:
+    matches = tuple(
+        signature
+        for signature in sorted(spec.format_signatures, key=str)
+        if any(
+            tensor_format.storage_dtype == dtype
+            for _role, tensor_format in signature.roles
+        )
+    )
+    if len(matches) > 1:
+        pytest.skip(f"Kernel {spec.name!r} has multiple signatures for {dtype}")
+    return matches[0] if matches else None
+
+
 def _infer_dtype(expected_name: str) -> torch.dtype:
     spec = KernelRegistry.get().get_by_name(expected_name)
     if spec is not None:
-        storage_dtypes = spec.primary_storage_dtypes()
+        storage_dtypes = _all_storage_dtypes(spec)
         for dt in _DTYPE_PREFERENCE:
             if dt in storage_dtypes:
                 return dt
@@ -323,7 +345,7 @@ def _infer_format_signature(
 ) -> FormatSignature:
     if family == "moe" and mode == "fused":
         return _moe_pkg._moe_fused_format_signature(dtype, weight_format or "bf16")
-    signature = spec.format_signature_for_primary_storage_dtype(dtype)
+    signature = _format_signature_for_any_role(spec, dtype)
     if signature is None:
         pytest.skip(f"Kernel {spec.name!r} has no signature for {dtype}")
     return signature

@@ -260,7 +260,7 @@ def mm(
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
     )
-    select_dtype = signature.primary_storage_dtype() or A.dtype
+    select_dtype = signature.storage_dtype_for("a") or A.dtype
 
     kernel = select_kernel(
         "gemm",

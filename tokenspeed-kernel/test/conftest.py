@@ -45,12 +45,13 @@ from utils import make_sample_specs
 
 
 @pytest.fixture
-def require() -> Callable[[str, str, str, torch.dtype], None]:
+def require() -> Callable[[str, str, str, torch.dtype, str], None]:
     def _require(
         family: str,
         mode: str,
         solution: str,
         dtype: torch.dtype,
+        dtype_role: str,
     ) -> None:
         from tokenspeed_kernel.platform import current_platform
 
@@ -62,7 +63,7 @@ def require() -> Callable[[str, str, str, torch.dtype], None]:
                 platform=current_platform(),
                 solution=solution,
             )
-            if spec.format_signature_for_primary_storage_dtype(dtype) is not None
+            if spec.format_signatures_for_storage_dtype(dtype, dtype_role)
         ]
         if not specs:
             pytest.skip(f"{family}.{mode} solution {solution!r} is not registered")

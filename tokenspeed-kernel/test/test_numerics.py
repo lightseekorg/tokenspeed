@@ -153,7 +153,7 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
     registry.register(test_spec, lambda **_kwargs: None)
 
     signature, reference = _verification_signature_and_reference(
-        registry, test_spec, _fp8_dtype
+        registry, test_spec, _fp8_dtype, "a"
     )
 
     assert signature == tensor_signature
@@ -162,7 +162,7 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
 
 class TestNumericsVerification:
     def _get_verifiable_specs(
-        dtype: torch.dtype, family: str | None = None
+        dtype: torch.dtype, dtype_role: str, family: str | None = None
     ) -> list[KernelSpec]:
         load_builtin_kernels()
         registry = KernelRegistry.get()
@@ -177,7 +177,7 @@ class TestNumericsVerification:
             dtype_specs = [
                 s
                 for s in op_specs
-                if s.format_signature_for_primary_storage_dtype(dtype) is not None
+                if s.format_signatures_for_storage_dtype(dtype, dtype_role)
             ]
             has_reference = any(s.solution == "reference" for s in dtype_specs)
             if not has_reference:
@@ -193,12 +193,14 @@ class TestNumericsVerification:
         specs.sort(key=lambda s: (s.family, s.mode, s.name))
         return specs
 
-    def _verify(self, spec: KernelSpec, dtype: torch.dtype) -> None:
+    def _verify(self, spec: KernelSpec, dtype: torch.dtype, dtype_role: str) -> None:
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required for numerics verification")
 
         try:
-            results = verify_kernel(spec.name, dtype=dtype, verbose=False)
+            results = verify_kernel(
+                spec.name, dtype=dtype, dtype_role=dtype_role, verbose=False
+            )
         except Exception as exc:
             pytest.fail(
                 f"Kernel {spec.name} raised an exception during verification: {exc}"
@@ -213,32 +215,32 @@ class TestNumericsVerification:
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(_fp8_dtype, family="gemm"),
+        _get_verifiable_specs(_fp8_dtype, "a", family="gemm"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_gemm_fp8(self, spec: KernelSpec):
-        self._verify(spec, _fp8_dtype)
+        self._verify(spec, _fp8_dtype, "a")
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(torch.bfloat16, family="gemm"),
+        _get_verifiable_specs(torch.bfloat16, "a", family="gemm"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_gemm_bf16(self, spec: KernelSpec):
-        self._verify(spec, torch.bfloat16)
+        self._verify(spec, torch.bfloat16, "a")
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(torch.bfloat16, family="quantize"),
+        _get_verifiable_specs(torch.bfloat16, "x", family="quantize"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_quantize_bf16(self, spec: KernelSpec):
-        self._verify(spec, torch.bfloat16)
+        self._verify(spec, torch.bfloat16, "x")
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(torch.int32, family="moe"),
+        _get_verifiable_specs(torch.int32, "indices", family="moe"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_moe_int32(self, spec: KernelSpec):
-        self._verify(spec, torch.int32)
+        self._verify(spec, torch.int32, "indices")

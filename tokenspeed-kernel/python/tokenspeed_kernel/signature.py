@@ -151,27 +151,12 @@ class FormatSignature:
                 return tensor_format
         return None
 
-    def primary_storage_dtype(self) -> torch.dtype | None:
-        """Return the dtype used by dtype-oriented tooling and filters.
-
-        The registry and selection path use the full signature. This helper is
-        only for compatibility with user-facing commands that still ask for a
-        single dtype filter, such as numerics and benchmark CLIs.
-        """
-        preferred_roles = (
-            "q",
-            "a",
-            "x",
-            "input",
-            "logits",
-            "out_a",
-            "hidden",
-        )
-        for role in preferred_roles:
-            tensor_format = self.format_for(role)
-            if tensor_format is not None:
-                return tensor_format.storage_dtype
-        return self.roles[0][1].storage_dtype if self.roles else None
+    def storage_dtype_for(self, role: str) -> torch.dtype | None:
+        """Return the main tensor storage dtype for role, or None if absent."""
+        tensor_format = self.format_for(role)
+        if tensor_format is None:
+            return None
+        return tensor_format.storage_dtype
 
     def __str__(self) -> str:
         return (

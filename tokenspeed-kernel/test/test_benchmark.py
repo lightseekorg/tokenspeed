@@ -105,6 +105,7 @@ def test_benchmark_kernel_returns_result(setup_gemm_case):
         "test_gemm_fast",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     assert len(results) == 1
@@ -129,6 +130,7 @@ def test_benchmark_kernel_supports_cpu_wall_time(setup_gemm_case):
         "test_gemm_fast",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     assert len(results) == 1
@@ -151,6 +153,7 @@ def test_benchmark_kernel_can_disable_verification(setup_gemm_case):
         "test_gemm_fast",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     assert len(results) == 1
@@ -172,6 +175,7 @@ def test_benchmark_op_includes_reference(setup_gemm_case):
         "mm",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     names = {result.kernel_name for result in results}
@@ -190,6 +194,7 @@ def test_report_format_contains_expected_columns(setup_gemm_case):
         "mm",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
     report = format_report(results)
 
@@ -212,6 +217,7 @@ def test_export_import_roundtrip(tmp_path, setup_gemm_case):
         "mm",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     export_path = tmp_path / "bench_results.json"
@@ -329,6 +335,7 @@ def test_benchmark_kernel_uses_profiling_context_when_enabled(
         "test_gemm_fast",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     assert len(results) == 1
@@ -370,6 +377,7 @@ def test_benchmark_op_profiles_once_when_enabled(setup_gemm_case, monkeypatch):
         "mm",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     assert {result.kernel_name for result in results} == {
@@ -419,6 +427,7 @@ def test_benchmark_kernel_uses_explicit_proton_config(setup_gemm_case, monkeypat
         "test_gemm_fast",
         shapes=_TEST_SHAPES,
         dtype=torch.float32,
+        dtype_role="a",
     )
 
     assert len(configs) == 1
@@ -450,7 +459,7 @@ def test_benchmark_cli_proton_flag_sets_profile_mode(monkeypatch):
     monkeypatch.setattr(benchmark_cli, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(benchmark_cli, "format_report", lambda _results: "ok")
 
-    rc = benchmark_cli.main(["--op", "gemm.mm", "--proton"])
+    rc = benchmark_cli.main(["--op", "gemm.mm", "--dtype-role", "a", "--proton"])
 
     assert rc == 0
     assert _FakeRunner.last_config is not None
@@ -488,6 +497,8 @@ def test_benchmark_cli_builds_proton_config_from_flags(monkeypatch):
         [
             "--op",
             "gemm.mm",
+            "--dtype-role",
+            "a",
             "--proton-output",
             "bench_cli",
             "--proton-data",
