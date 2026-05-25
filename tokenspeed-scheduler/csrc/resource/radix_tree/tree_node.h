@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "resource/radix_tree/mamba_slot.h"
+#include "resource/radix_tree/paged_cache_snapshot.h"
 #include "resource/radix_tree/tree_resource.h"
 #include "resource/types.h"
 
@@ -102,9 +103,18 @@ public:
     const HostResource& Host() const { return *host_resource_; }
 
     bool HasMamba() const { return mamba_slot_ != nullptr; }
+    bool HasMambaOnHost() const { return mamba_host_slot_ != nullptr; }
     std::int32_t MambaSlotIndex() const;
+    std::int32_t MambaHostSlotIndex() const;
     void AttachMamba(std::unique_ptr<MambaSlot> slot) { mamba_slot_ = std::move(slot); }
+    void AttachMambaHost(std::unique_ptr<MambaSlot> slot) { mamba_host_slot_ = std::move(slot); }
     std::unique_ptr<MambaSlot> DetachMamba() { return std::move(mamba_slot_); }
+    std::unique_ptr<MambaSlot> DetachMambaHost() { return std::move(mamba_host_slot_); }
+
+    // Paged-cache snapshot adjunct. Completeness is now per-family on the
+    // snapshot itself (see `PagedCacheSnapshot::IsCompleteFor`).
+    bool HasPagedCacheSnapshot() const { return paged_cache_snapshot_ != nullptr; }
+    const PagedCacheSnapshot* GetPagedCacheSnapshot() const { return paged_cache_snapshot_.get(); }
 
     std::optional<cache_op_id> CacheOpId() const;
 
@@ -118,6 +128,14 @@ public:
     void SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::int32_t page_size);
 
 private:
+    // Private so all attach/detach routes through HybridPrefixCache and keeps
+    // its `paged_cache_snapshot_nodes_` membership set in sync.
+    friend class HybridPrefixCache;
+    void AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot);
+    std::unique_ptr<PagedCacheSnapshot> DetachPagedCacheSnapshot();
+    PagedCacheSnapshot* GetPagedCacheSnapshotMut() { return paged_cache_snapshot_.get(); }
+
+private:
     TreeNode* parent_{};
     children_map_t children_{};
     token_vec_t tokens_{};
@@ -129,6 +147,8 @@ private:
     std::unique_ptr<DeviceResource> device_resource_{};
     std::unique_ptr<HostResource> host_resource_{};
     std::unique_ptr<MambaSlot> mamba_slot_{};
+    std::unique_ptr<MambaSlot> mamba_host_slot_{};
+    std::unique_ptr<PagedCacheSnapshot> paged_cache_snapshot_{};
 };
 
 template <ResourceType RType>

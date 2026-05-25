@@ -73,6 +73,7 @@ class LogitsProcessorOutput:
 class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    gather_ids: torch.Tensor | None = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -104,10 +105,6 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_cpu: torch.Tensor | None = None
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
-    # for padding
-    padded_static_len: int = -1
-    last_index_offsets: torch.Tensor | None = None
-
     @classmethod
     def from_forward_context(
         cls,
@@ -117,9 +114,8 @@ class LogitsMetadata:
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
+            gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
-            padded_static_len=ctx.padded_static_len,
-            last_index_offsets=ctx.last_index_offsets,
         )
 
 
@@ -213,30 +209,15 @@ class LogitsProcessor(nn.Module):
     ) -> LogitsProcessorOutput:
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
-            if logits_metadata.forward_mode.is_extend_or_mixed():
-                # Prefill: last token of each request via cumulative seq lens.
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-                pruned_states = hidden_states[last_index]
-                if aux_hidden_states is not None:
-                    aux_pruned_states = [
-                        hidden[last_index] for hidden in aux_hidden_states
-                    ]
-            elif logits_metadata.padded_static_len > 0:
-                # Padded per-request layout: pick the last valid token per
-                # request using the precomputed offsets.
-                last_index = (
-                    logits_metadata.last_index_offsets + logits_metadata.extend_seq_lens
-                )
-                pruned_states = hidden_states[last_index]
-                if aux_hidden_states is not None:
-                    aux_pruned_states = [
-                        hidden[last_index] for hidden in aux_hidden_states
-                    ]
-            else:
-                # One row per request already — no indexing needed.
+            gather_ids = logits_metadata.gather_ids
+            if gather_ids is None:
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
-                    aux_pruned_states = [hidden for hidden in aux_hidden_states]
+                    aux_pruned_states = list(aux_hidden_states)
+            else:
+                pruned_states = hidden_states[gather_ids]
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
 
             sample_indices = None
             input_logprob_indices = None

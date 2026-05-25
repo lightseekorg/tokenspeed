@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -60,19 +61,10 @@ if TYPE_CHECKING:
 
 @dataclass
 class FlashMLADecodeMetadata:
+    num_extends: int = 0
     flashmla_metadata: tuple | None = None
     num_splits: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
-
-    def __init__(
-        self,
-        flashmla_metadata=None,
-        num_splits=None,
-        block_table=None,
-    ):
-        self.flashmla_metadata = flashmla_metadata
-        self.num_splits = num_splits
-        self.block_table = block_table
 
 
 @dataclass
@@ -170,8 +162,11 @@ class FlashMLABackend(AttentionBackend):
         )
         self.indices_updater_prefill = _PrefillIndicesUpdater(config, self)
 
-        # Metadata state
-        self.forward_metadata: FlashMLADecodeMetadata | _PrefillMetadata | None = None
+        # Metadata state. Decode and prefill metadata are split so MIXED batches
+        # can carry both simultaneously (decode-half + prefill-half sub-contexts
+        # dispatch to their respective metadata).
+        self.forward_decode_metadata: FlashMLADecodeMetadata | None = None
+        self.forward_prefill_metadata: _PrefillMetadata | None = None
         self.chunked_prefill_metadata: _ChunkedPrefillMetadata | None = None
         self.last_seq_lens_sum: int | None = None
 
@@ -182,7 +177,7 @@ class FlashMLABackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -192,109 +187,147 @@ class FlashMLABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
+        if forward_mode.is_extend_or_mixed():
+            self._init_prefill_metadata(
+                req_pool_indices=req_pool_indices[:num_extends],
+                seq_lens=seq_lens[:num_extends],
+                req_to_page=req_to_page,
+                extend_with_prefix=extend_with_prefix,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
+                extend_seq_lens=kwargs.pop("extend_seq_lens"),
+                extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
+            )
+        # Under is_draft, also fill decode_metadata under any forward_mode so
+        # the drafter's multi-step loop has metadata. Wrapper pre-writes
+        # draft_seq_lens before calling here, so `seq_lens` aliases the
+        # drafter's live buffer for step-1+ advances.
+        if (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_mixed()
+            or (forward_mode.is_extend() and self.is_draft)
+        ):
+            self._init_decode_metadata(
+                bs, num_extends, req_pool_indices, seq_lens, req_to_page
+            )
+
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        assert self.forward_decode_metadata is not None
+        prev = self.forward_decode_metadata.num_extends
+        self.forward_decode_metadata.num_extends = num_extends
+        try:
+            yield
+        finally:
+            self.forward_decode_metadata.num_extends = prev
+
+    def _init_decode_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_to_page: torch.Tensor,
+    ):
         if req_to_page is not None:
             block_table = req_to_page[req_pool_indices]
         else:
             block_table = None
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
-        is_target_verify = (
-            forward_mode.is_decode_or_idle()
-            and not self.is_draft
-            and spec_num_tokens > 1
-        )
-        is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
-        )
-
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
-            )
-            self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata,
-                num_splits,
-                block_table,
-            )
-        elif is_target_verify or is_draft_extend:
-            seq_lens = seq_lens + self.draft_token_num
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.draft_token_num * self.num_q_heads,
-                1,
-            )
-            self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata,
-                num_splits,
-                block_table,
-            )
+        # When spec-dec is active (self.spec_num_tokens > 1), advance per-row
+        # seq_lens by the worst-case verify width so the tile planner covers
+        # the longest path.
+        if self.spec_num_tokens > 1:
+            plan_seq_lens = seq_lens + self.draft_token_num
+            num_heads_plan = self.draft_token_num * self.num_q_heads
         else:
-            # EXTEND path — flashinfer ragged/paged prefill.
-            if extend_prefix_lens is None:
-                raise RuntimeError(
-                    "FlashMLABackend.init_forward_metadata requires "
-                    "extend_prefix_lens in extend mode."
-                )
-            seq_lens_cpu = seq_lens.cpu()
-            seq_lens_sum = seq_lens_cpu.sum().item()
-            self.last_seq_lens_sum = seq_lens_sum
+            plan_seq_lens = seq_lens
+            num_heads_plan = self.num_q_heads
 
-            extend_no_prefix = not extend_with_prefix
-            use_ragged = (
-                not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
-            )
+        mla_metadata, num_splits = get_mla_metadata(
+            plan_seq_lens.to(torch.int32),
+            num_heads_plan,
+            1,
+        )
+        self.forward_decode_metadata = FlashMLADecodeMetadata(
+            num_extends=num_extends,
+            flashmla_metadata=mla_metadata,
+            num_splits=num_splits,
+            block_table=block_table,
+        )
 
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                extend_prefix_lens,
-                req_to_page=req_to_page,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=use_ragged,
+    def _init_prefill_metadata(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_to_page: torch.Tensor,
+        extend_with_prefix: bool,
+        extend_prefix_lens: torch.Tensor | None,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+    ):
+        # EXTEND path — flashinfer ragged/paged prefill.
+        if extend_prefix_lens is None:
+            raise RuntimeError(
+                "FlashMLABackend.init_forward_metadata requires "
+                "extend_prefix_lens in extend mode."
             )
-            self.forward_metadata = _PrefillMetadata(
-                self.prefill_wrapper_paged, use_ragged
-            )
+        seq_lens_cpu = seq_lens.cpu()
+        seq_lens_sum = seq_lens_cpu.sum().item()
+        self.last_seq_lens_sum = seq_lens_sum
 
-            extend_seq_lens = kwargs.pop("extend_seq_lens")
-            extend_seq_lens_cpu = kwargs.pop("extend_seq_lens_cpu")
-            extend_prefix_lens_cpu = kwargs.pop("extend_prefix_lens_cpu")
-            num_extends = extend_seq_lens.shape[0]
-            cum_extend_seq_lens = torch.zeros(
-                num_extends + 1, device=self.device, dtype=torch.int32
-            )
-            torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
-            max_extend_seq_len = extend_seq_lens_cpu.max().item()
-            (
-                chunked_loop_num,
-                chunk_kv_indices_list,
-                chunked_seq_len,
-                cu_chunked_seq_len,
-                max_chunk_len_per_loop,
-            ) = build_chunked_prefill_metadata_arrays(
-                extend_prefix_lens,
-                extend_prefix_lens_cpu,
-                req_to_page,
-                req_pool_indices,
-                PAGE_SIZE,
-            )
-            self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
-                extend_prefix_lens=extend_prefix_lens,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                extend_seq_lens=extend_seq_lens,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                req_pool_indices=req_pool_indices,
-                cum_extend_seq_lens=cum_extend_seq_lens,
-                max_extend_seq_len=max_extend_seq_len,
-                chunked_loop_num=chunked_loop_num,
-                chunk_kv_indices_list=chunk_kv_indices_list,
-                chunked_seq_len=chunked_seq_len,
-                cu_chunked_seq_len=cu_chunked_seq_len,
-                max_chunk_len_per_loop=max_chunk_len_per_loop,
-            )
+        extend_no_prefix = not extend_with_prefix
+        use_ragged = (
+            not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
+        )
+
+        self.indices_updater_prefill.update(
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            extend_prefix_lens,
+            req_to_page=req_to_page,
+            prefill_wrapper_paged=self.prefill_wrapper_paged,
+            use_ragged=use_ragged,
+        )
+        self.forward_prefill_metadata = _PrefillMetadata(
+            self.prefill_wrapper_paged, use_ragged
+        )
+
+        num_extends = extend_seq_lens.shape[0]
+        cum_extend_seq_lens = torch.zeros(
+            num_extends + 1, device=self.device, dtype=torch.int32
+        )
+        torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
+        max_extend_seq_len = extend_seq_lens_cpu.max().item()
+        (
+            chunked_loop_num,
+            chunk_kv_indices_list,
+            chunked_seq_len,
+            cu_chunked_seq_len,
+            max_chunk_len_per_loop,
+        ) = build_chunked_prefill_metadata_arrays(
+            extend_prefix_lens,
+            extend_prefix_lens_cpu,
+            req_to_page,
+            req_pool_indices,
+            PAGE_SIZE,
+        )
+        self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            req_pool_indices=req_pool_indices,
+            cum_extend_seq_lens=cum_extend_seq_lens,
+            max_extend_seq_len=max_extend_seq_len,
+            chunked_loop_num=chunked_loop_num,
+            chunk_kv_indices_list=chunk_kv_indices_list,
+            chunked_seq_len=chunked_seq_len,
+            cu_chunked_seq_len=cu_chunked_seq_len,
+            max_chunk_len_per_loop=max_chunk_len_per_loop,
+        )
 
     # ------------------------------------------------------------------
     # CUDA graph (decode only, any q_len)
@@ -338,23 +371,23 @@ class FlashMLABackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
         block_table = self.cuda_graph_kv_indices[:bs]
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
@@ -363,10 +396,11 @@ class FlashMLABackend(AttentionBackend):
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.cuda_graph_kv_indices[:bs].copy_(block_table)
-            self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits[: bs + 1],
-                self.cuda_graph_kv_indices[:bs, :],
+            self.forward_decode_metadata = FlashMLADecodeMetadata(
+                num_extends=0,
+                flashmla_metadata=self.cuda_graph_mla_metadata,
+                num_splits=self.cuda_graph_num_splits[: bs + 1],
+                block_table=self.cuda_graph_kv_indices[:bs, :],
             )
         elif is_target_verify or is_draft_extend:
             seq_lens = seq_lens + self.draft_token_num
@@ -378,10 +412,11 @@ class FlashMLABackend(AttentionBackend):
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.cuda_graph_kv_indices[:bs].copy_(block_table)
-            self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits[: bs + 1],
-                self.cuda_graph_kv_indices[:bs],
+            self.forward_decode_metadata = FlashMLADecodeMetadata(
+                num_extends=0,
+                flashmla_metadata=self.cuda_graph_mla_metadata,
+                num_splits=self.cuda_graph_num_splits[: bs + 1],
+                block_table=self.cuda_graph_kv_indices[:bs],
             )
         else:
             raise RuntimeError(f"Not supported forward mode: {forward_mode}")
@@ -389,7 +424,6 @@ class FlashMLABackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -406,11 +440,10 @@ class FlashMLABackend(AttentionBackend):
             block_table = self.cuda_graph_kv_indices[:bs]
         seq_lens = seq_lens[:bs]
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
-        is_target_verify = not self.is_draft and spec_num_tokens > 1
-        is_draft_extend = self.is_draft and spec_num_tokens > 1
+        is_target_verify = not self.is_draft and self.spec_num_tokens > 1
+        is_draft_extend = self.is_draft and self.spec_num_tokens > 1
 
-        if spec_num_tokens == 1:
+        if self.spec_num_tokens == 1:
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
@@ -429,9 +462,10 @@ class FlashMLABackend(AttentionBackend):
         self.cuda_graph_mla_metadata.copy_(mla_metadata)
         self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
         self.cuda_graph_kv_indices[:bs].copy_(block_table)
-        self.forward_metadata.flashmla_metadata = self.cuda_graph_mla_metadata
-        self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
-        self.forward_metadata.block_table = self.cuda_graph_kv_indices[:bs]
+        self.forward_decode_metadata.num_extends = 0
+        self.forward_decode_metadata.flashmla_metadata = self.cuda_graph_mla_metadata
+        self.forward_decode_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+        self.forward_decode_metadata.block_table = self.cuda_graph_kv_indices[:bs]
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -454,23 +488,23 @@ class FlashMLABackend(AttentionBackend):
         forward_mode: ForwardMode | None = None,
         **kwargs,
     ):
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and q_len_per_req > 1
         )
         is_draft_extend = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and self.is_draft
-            and spec_num_tokens > 1
+            and q_len_per_req > 1
         )
 
         if forward_mode is None or forward_mode.is_extend():
             # Prefill: dispatch to ragged (MHA-style) or absorbed (MQA) path.
-            if self.forward_metadata.use_ragged:
+            if self.forward_prefill_metadata.use_ragged:
                 return self._forward_normal_extend(q, k, v, layer, save_kv_cache)
             else:
                 return self._forward_absorbed_extend(
@@ -489,10 +523,12 @@ class FlashMLABackend(AttentionBackend):
             if save_kv_cache:
                 token_to_kv_pool.set_kv_buffer(layer, out_cache_loc, k, v)
 
+        metadata = self.forward_decode_metadata
+        num_extends = metadata.num_extends
         bs = (
             q.shape[0]
             if is_draft_extend
-            else self.forward_metadata.block_table.shape[0]
+            else metadata.block_table.shape[0] - num_extends
         )
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
@@ -504,11 +540,11 @@ class FlashMLABackend(AttentionBackend):
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=self.forward_metadata.block_table[:bs],
+            block_table=metadata.block_table[num_extends : num_extends + bs],
             cache_seqlens=seq_lens.to(torch.int32) + self.draft_token_num,
             head_dim_v=self.kv_lora_rank,
-            tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-            num_splits=self.forward_metadata.num_splits,
+            tile_scheduler_metadata=metadata.flashmla_metadata,
+            num_splits=metadata.num_splits,
             softmax_scale=layer.scaling,
             causal=True,
         )
@@ -529,12 +565,15 @@ class FlashMLABackend(AttentionBackend):
         seq_lens,
         batch_size,
         causal,
+        out: torch.Tensor | None = None,
     ):
         if causal:
             step_counter = getattr(self, "step_counter", None)
             if step_counter is not None:
                 step_counter.record_cache()
         head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # flash_attn_varlen_func has no `out=` parameter; copy into the
+        # caller-provided buffer at the end when requested.
         output, lse, *_ = flash_attn_varlen_func(
             q=q.view(-1, self.num_local_heads, head_dim),
             k=k.view(-1, self.num_local_heads, head_dim).to(q.dtype),
@@ -547,6 +586,9 @@ class FlashMLABackend(AttentionBackend):
             causal=causal,
             return_attn_probs=True,
         )
+        if out is not None:
+            out.copy_(output.view(out.shape))
+            output = out
         # lse must be transposed when using fa3.
         return output, lse.T.contiguous()
 
@@ -565,8 +607,8 @@ class FlashMLABackend(AttentionBackend):
     ) -> torch.Tensor:
         # Multi-token decode (target verify or drafter compound) reuses
         # the multi-token kernel path in forward_extend.
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        if q_len_per_req > 1:
             return self.forward_extend(
                 q,
                 k,
@@ -591,6 +633,8 @@ class FlashMLABackend(AttentionBackend):
                     v,
                 )
         bs = q.shape[0]
+        metadata = self.forward_decode_metadata
+        num_extends = metadata.num_extends
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         assert (
             layer.tp_q_head_num == self.num_q_heads
@@ -601,11 +645,11 @@ class FlashMLABackend(AttentionBackend):
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=self.forward_metadata.block_table[:bs],
+            block_table=metadata.block_table[num_extends : num_extends + bs],
             cache_seqlens=cache_lens.to(torch.int32),
             head_dim_v=self.kv_lora_rank,
-            tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-            num_splits=self.forward_metadata.num_splits,
+            tile_scheduler_metadata=metadata.flashmla_metadata,
+            num_splits=metadata.num_splits,
             softmax_scale=layer.scaling,
             causal=True,
         )
@@ -665,7 +709,7 @@ class FlashMLABackend(AttentionBackend):
         o = q_nope.new_empty(q_nope.shape)
 
         k_buf = token_to_kv_pool.get_key_buffer(layer.layer_id).to(q_nope.dtype)
-        o = self.forward_metadata.prefill_wrapper.run(
+        o = self.forward_prefill_metadata.prefill_wrapper.run(
             q_nope,
             q_pe,
             k_buf[:, :, : layer.v_head_dim],

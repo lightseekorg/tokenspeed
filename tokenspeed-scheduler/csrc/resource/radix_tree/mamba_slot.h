@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <utility>
 
 namespace tokenspeed {
@@ -29,18 +30,21 @@ class MambaChunkAllocator;
 
 class MambaSlot {
 public:
-    MambaSlot(std::int32_t index, MambaChunkAllocator* allocator) : index_{index}, allocator_{allocator} {}
+    using Releaser = std::function<void(std::int32_t)>;
+
+    MambaSlot(std::int32_t index, MambaChunkAllocator* allocator);
+    MambaSlot(std::int32_t index, Releaser releaser) : index_{index}, releaser_{std::move(releaser)} {}
 
     ~MambaSlot();
 
     MambaSlot(MambaSlot&& other) noexcept
-        : index_{std::exchange(other.index_, -1)}, allocator_{std::exchange(other.allocator_, nullptr)} {}
+        : index_{std::exchange(other.index_, -1)}, releaser_{std::move(other.releaser_)} {}
 
     MambaSlot& operator=(MambaSlot&& other) noexcept {
         if (this != &other) {
             release();
             index_ = std::exchange(other.index_, -1);
-            allocator_ = std::exchange(other.allocator_, nullptr);
+            releaser_ = std::move(other.releaser_);
         }
         return *this;
     }
@@ -54,7 +58,7 @@ private:
     void release();
 
     std::int32_t index_{-1};
-    MambaChunkAllocator* allocator_{};
+    Releaser releaser_{};
 };
 
 }  // namespace tokenspeed

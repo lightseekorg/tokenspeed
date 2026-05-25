@@ -33,8 +33,20 @@ except ImportError:
     fp32_router_gemm = error_fn
 
 try:
-    from tokenspeed_kernel.thirdparty.cuda.routing import routing_flash
+    from tokenspeed_kernel.thirdparty.cuda.routing import (
+        hash_softplus_sqrt_topk_flash,
+        routing_flash,
+        softplus_sqrt_topk_flash,
+    )
 except ImportError:
+    hash_softplus_sqrt_topk_flash = error_fn
     routing_flash = error_fn
+    softplus_sqrt_topk_flash = error_fn
 
-__all__ = ["dsv3_router_gemm", "fp32_router_gemm", "routing_flash"]
+__all__ = [
+    "dsv3_router_gemm",
+    "fp32_router_gemm",
+    "hash_softplus_sqrt_topk_flash",
+    "routing_flash",
+    "softplus_sqrt_topk_flash",
+]

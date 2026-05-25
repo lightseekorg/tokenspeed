@@ -43,6 +43,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/resource/hybrid_prefix_cache/hybrid_prefix_cache.cpp
     csrc/resource/hybrid_prefix_cache/mamba_eviction_manager.cpp
     csrc/resource/allocator/mamba_chunk_allocator.cpp
+    csrc/resource/allocator/mamba_host_allocator.cpp
     csrc/resource/allocator/local_mamba_allocator.cpp
 
     csrc/fsm/forward_events.cpp
@@ -102,6 +103,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_write_back.cpp
         tests/cpp/test_load_back.cpp
+        tests/cpp/test_cache_operation_kinds.cpp
         tests/cpp/test_retract.cpp
         tests/cpp/test_prefix_cache_host_match.cpp
         tests/cpp/test_abort.cpp
@@ -110,7 +112,13 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_batch_scheduling.cpp
         tests/cpp/test_prefetch.cpp
         tests/cpp/test_owned_pages.cpp
+        tests/cpp/test_paged_cache_prefix_match.cpp
+        tests/cpp/test_paged_cache_attach_loop.cpp
+        tests/cpp/test_paged_cache_eviction.cpp
+        tests/cpp/test_paged_cache_family_split.cpp
+        tests/cpp/test_paged_cache_prefix_hit_commit.cpp
         tests/cpp/test_retract_abort_pages.cpp
+        tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_mamba_slot.cpp
         tests/cpp/test_mamba_eviction.cpp
         tests/cpp/test_mamba_cache.cpp

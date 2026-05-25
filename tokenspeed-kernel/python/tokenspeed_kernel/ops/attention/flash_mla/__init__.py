@@ -27,7 +27,7 @@ flash_mla_with_kvcache = error_fn
 flash_mla_sparse_fwd = error_fn
 get_mla_metadata = error_fn
 
-if platform.is_nvidia and platform.is_hopper:
+if platform.is_nvidia and platform.is_hopper_plus:
     try:
         from flash_mla import (
             flash_mla_sparse_fwd,

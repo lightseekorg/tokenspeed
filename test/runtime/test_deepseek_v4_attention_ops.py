@@ -15,11 +15,18 @@ import math
 import unittest
 
 import torch
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+    has_indexer_mxfp4_paged_gather,
+    has_persistent_topk,
+    indexer_mxfp4_paged_gather,
+    persistent_topk,
+)
 
+from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+    deepseek_v4_swa_scale_dim,
+    deepseek_v4_swa_token_stride,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    DEEPSEEK_V4_SWA_SCALE_DIM,
-    DEEPSEEK_V4_SWA_TOKEN_STRIDE,
-    DeepseekV4AttentionOpUnavailable,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
     deepseek_v4_compressed_slot_mapping,
@@ -29,9 +36,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
     deepseek_v4_hca_compress_kv_cache_insert,
-    deepseek_v4_indexer_topk_reference,
     deepseek_v4_prepare_indexer_q_mxfp4,
-    deepseek_v4_prepare_indexer_q_reference,
     dequantize_deepseek_v4_fp8_ds_mla_cache,
     fused_qnorm_rope_kv_insert,
     read_deepseek_v4_indexer_fp8_cache,
@@ -45,6 +50,8 @@ HEAD_DIM = 512
 NOPE_DIM = 448
 ROPE_DIM = 64
 FP8_MAX = 448.0
+SWA_TOKEN_STRIDE = deepseek_v4_swa_token_stride(HEAD_DIM, ROPE_DIM)
+SWA_SCALE_DIM = deepseek_v4_swa_scale_dim(HEAD_DIM, ROPE_DIM)
 
 
 def _apply_gptj_rope_with_nope(
@@ -175,6 +182,71 @@ def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
     ).reshape(shape)
 
 
+def _prepare_indexer_q_reference(
+    index_q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    head_scale: float,
+    use_fp4: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rope_dim = int(cos_sin_cache.shape[-1])
+    rotated = _apply_gptj_rope_with_nope(
+        index_q,
+        positions,
+        cos_sin_cache,
+        nope_dim=index_q.shape[-1] - rope_dim,
+    )
+    rotated = _hadamard_rotate(rotated).float()
+    weights_out = weights.float().clone()
+    if weights_out.dim() == 3:
+        weights_out = weights_out.squeeze(-1)
+
+    if use_fp4:
+        q_out = torch.empty_like(rotated, dtype=torch.float32)
+        for token_idx in range(rotated.shape[0]):
+            for head_idx in range(rotated.shape[1]):
+                _, _, dequant = _mxfp4_bytes_and_scales(rotated[token_idx, head_idx])
+                q_out[token_idx, head_idx].copy_(dequant)
+        weights_out *= softmax_scale * head_scale
+    else:
+        q_out = torch.empty_like(rotated, dtype=torch.float32)
+        q_scales = torch.empty_like(weights_out, dtype=torch.float32)
+        for token_idx in range(rotated.shape[0]):
+            for head_idx in range(rotated.shape[1]):
+                q_bytes, scale = _fp8_pow2_bytes_and_scale(rotated[token_idx, head_idx])
+                q_out[token_idx, head_idx].copy_(
+                    q_bytes.view(torch.float8_e4m3fn).float() * scale
+                )
+                q_scales[token_idx, head_idx] = scale
+        weights_out *= q_scales * softmax_scale * head_scale
+    return q_out.to(index_q.dtype), weights_out
+
+
+def _indexer_topk_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    top_k: int,
+    lengths: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if weights.dim() == 3:
+        weights = weights.squeeze(-1)
+    logits = torch.einsum("thd,kd->thk", q.float(), k.float()).relu()
+    logits = (logits * weights.float().unsqueeze(-1)).sum(dim=1)
+    if lengths is not None:
+        if row_starts is None:
+            row_starts = torch.zeros_like(lengths)
+        cols = torch.arange(k.shape[0], device=k.device)
+        valid = (cols.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
+            cols.unsqueeze(0) < (row_starts + lengths).unsqueeze(1)
+        )
+        logits = logits.masked_fill(~valid, -float("inf"))
+    return torch.topk(logits, k=top_k, dim=-1, sorted=False).indices.to(torch.int32)
+
+
 def _expected_overlap_normed(
     kv: torch.Tensor,
     score: torch.Tensor,
@@ -209,6 +281,113 @@ def _expected_overlap_normed(
     return compressed * torch.rsqrt(variance + eps) * rms_weight
 
 
+class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
+    def test_indexer_q_mxfp4_requires_cuda(self):
+        q = torch.zeros(1, 1, 128, dtype=torch.bfloat16)
+        positions = torch.zeros(1, dtype=torch.int64)
+        cos_sin = torch.zeros(1, ROPE_DIM, dtype=torch.float32)
+        weights = torch.ones(1, 1, dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+            deepseek_v4_prepare_indexer_q_mxfp4(
+                q,
+                positions,
+                cos_sin,
+                weights,
+                1.0,
+                1.0,
+            )
+
+    def test_indexer_mxfp4_cache_writer_requires_cuda(self):
+        index_k = torch.zeros(1, 128, dtype=torch.bfloat16)
+        cache = torch.zeros(1, 64 * 68, dtype=torch.uint8)
+        slots = torch.zeros(1, dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+            write_deepseek_v4_indexer_mxfp4_cache(index_k, cache, slots, 64)
+
+    def test_compressor_state_writer_requires_cuda(self):
+        kv = torch.zeros(1, HEAD_DIM, dtype=torch.bfloat16)
+        score = torch.zeros_like(kv)
+        ape = torch.zeros(128, HEAD_DIM, dtype=torch.float32)
+        state_cache = torch.zeros(1, 128, HEAD_DIM * 2, dtype=torch.float32)
+        slots = torch.zeros(1, dtype=torch.int64)
+        positions = torch.zeros(1, dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+            save_deepseek_v4_compressor_state(
+                kv=kv,
+                score=score,
+                ape=ape,
+                state_cache=state_cache,
+                slot_mapping=slots,
+                positions=positions,
+                block_size=128,
+                compress_ratio=128,
+            )
+
+    def test_compress_cache_insert_requires_cuda(self):
+        state_cache = torch.zeros(1, 128, HEAD_DIM * 2, dtype=torch.float32)
+        token_to_req_indices = torch.zeros(1, dtype=torch.int32)
+        positions = torch.zeros(1, dtype=torch.int64)
+        compressor_slots = torch.zeros(1, dtype=torch.int64)
+        block_table = torch.zeros(1, 1, dtype=torch.int32)
+        rms_weight = torch.ones(HEAD_DIM, dtype=torch.float32)
+        cos_sin = torch.zeros(1, ROPE_DIM, dtype=torch.float32)
+        kv_cache = torch.zeros(
+            1,
+            64 * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
+            dtype=torch.uint8,
+        )
+        kv_slots = torch.zeros(1, dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+            deepseek_v4_hca_compress_kv_cache_insert(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                compressor_slot_mapping=compressor_slots,
+                block_table=block_table,
+                compressor_block_size=128,
+                rms_norm_weight=rms_weight,
+                rms_norm_eps=1.0e-6,
+                cos_sin_cache=cos_sin,
+                kv_cache_2d=kv_cache,
+                kv_slot_mapping=kv_slots,
+                kv_cache_block_size=64,
+                compress_ratio=128,
+            )
+
+    def test_csa_indexer_cache_insert_requires_cuda(self):
+        state_cache = torch.zeros(1, 4, 128 * 4, dtype=torch.float32)
+        token_to_req_indices = torch.zeros(1, dtype=torch.int32)
+        positions = torch.zeros(1, dtype=torch.int64)
+        compressor_slots = torch.zeros(1, dtype=torch.int64)
+        block_table = torch.zeros(1, 1, dtype=torch.int32)
+        rms_weight = torch.ones(128, dtype=torch.float32)
+        cos_sin = torch.zeros(1, ROPE_DIM, dtype=torch.float32)
+        kv_cache = torch.zeros(1, 64 * 68, dtype=torch.uint8)
+        kv_slots = torch.zeros(1, dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+            deepseek_v4_csa_indexer_cache_insert(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                compressor_slot_mapping=compressor_slots,
+                block_table=block_table,
+                compressor_block_size=4,
+                rms_norm_weight=rms_weight,
+                rms_norm_eps=1.0e-6,
+                cos_sin_cache=cos_sin,
+                kv_cache_2d=kv_cache,
+                kv_slot_mapping=kv_slots,
+                kv_cache_block_size=64,
+                use_fp4_cache=True,
+                compress_ratio=4,
+            )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class DeepseekV4AttentionOpsTest(unittest.TestCase):
     def test_fused_qnorm_rope_kv_insert_matches_reference(self):
@@ -241,8 +420,10 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 rms_norm_eps=eps,
                 block_size=block_size,
             )
-        except DeepseekV4AttentionOpUnavailable as exc:
-            self.skipTest(str(exc))
+        except RuntimeError as exc:
+            if "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert" in str(exc):
+                self.skipTest(str(exc))
+            raise
         torch.cuda.synchronize()
 
         expected_q = _q_reference(q_before, positions, cos_sin, eps)
@@ -349,8 +530,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         cache = torch.zeros(
             1,
-            kv_cache_block_size
-            * (DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM),
+            kv_cache_block_size * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
             device=device,
             dtype=torch.uint8,
         )
@@ -387,7 +567,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
 
         flat_cache = cache.view(-1)
-        scale_base = kv_cache_block_size * DEEPSEEK_V4_SWA_TOKEN_STRIDE
+        scale_base = kv_cache_block_size * SWA_TOKEN_STRIDE
         for qblock in range(7):
             start = qblock * 64
             expected_bytes, expected_scale = _fp8_bytes_and_scale(
@@ -402,17 +582,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             self.assertEqual(int(flat_cache[scale_base + qblock]), expected_scale)
         self.assertEqual(int(flat_cache[scale_base + 7]), 0)
         torch.testing.assert_close(
-            flat_cache[NOPE_DIM:DEEPSEEK_V4_SWA_TOKEN_STRIDE].cpu(),
+            flat_cache[NOPE_DIM:SWA_TOKEN_STRIDE].cpu(),
             expected_rope.cpu(),
             atol=0,
             rtol=0,
         )
         self.assertEqual(
-            int(
-                flat_cache[
-                    DEEPSEEK_V4_SWA_TOKEN_STRIDE : 2 * DEEPSEEK_V4_SWA_TOKEN_STRIDE
-                ].sum()
-            ),
+            int(flat_cache[SWA_TOKEN_STRIDE : 2 * SWA_TOKEN_STRIDE].sum()),
             0,
         )
 
@@ -465,8 +641,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         cache = torch.zeros(
             1,
-            kv_cache_block_size
-            * (DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM),
+            kv_cache_block_size * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
             device=device,
             dtype=torch.uint8,
         )
@@ -506,9 +681,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 .to(torch.bfloat16)
                 .view(torch.uint8)
             )
-            base = slot * DEEPSEEK_V4_SWA_TOKEN_STRIDE
-            scale_base = kv_cache_block_size * DEEPSEEK_V4_SWA_TOKEN_STRIDE
-            scale_base += slot * DEEPSEEK_V4_SWA_SCALE_DIM
+            base = slot * SWA_TOKEN_STRIDE
+            scale_base = kv_cache_block_size * SWA_TOKEN_STRIDE
+            scale_base += slot * SWA_SCALE_DIM
             for qblock in range(7):
                 start = qblock * 64
                 expected_bytes, expected_scale = _fp8_bytes_and_scale(
@@ -523,7 +698,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 self.assertEqual(int(flat_cache[scale_base + qblock]), expected_scale)
             self.assertEqual(int(flat_cache[scale_base + 7]), 0)
             torch.testing.assert_close(
-                flat_cache[base + NOPE_DIM : base + DEEPSEEK_V4_SWA_TOKEN_STRIDE].cpu(),
+                flat_cache[base + NOPE_DIM : base + SWA_TOKEN_STRIDE].cpu(),
                 expected_rope.cpu(),
                 atol=0,
                 rtol=0,
@@ -570,7 +745,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         lengths = torch.tensor([3, 3, 2, 2], device=device, dtype=torch.int64)
         row_starts = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int64)
 
-        topk = deepseek_v4_indexer_topk_reference(
+        topk = _indexer_topk_reference(
             q, k, weights, top_k=2, lengths=lengths, row_starts=row_starts
         )
 
@@ -614,11 +789,6 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             self.assertTrue(torch.equal(row_output.sort().values, expected))
 
     def test_persistent_topk_matches_torch_across_decode_medium_large_paths(self):
-        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
-            has_persistent_topk,
-            persistent_topk,
-        )
-
         if not has_persistent_topk():
             self.skipTest("DeepSeek V4 persistent top-k op is not available")
 
@@ -653,11 +823,6 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
 
     def test_persistent_topk_matches_torch_for_batch_gt_32(self):
-        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
-            has_persistent_topk,
-            persistent_topk,
-        )
-
         if not has_persistent_topk():
             self.skipTest("DeepSeek V4 persistent top-k op is not available")
 
@@ -735,11 +900,6 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         self.assertEqual(int(flat_cache[64:128].sum()), 0)
 
     def test_indexer_mxfp4_paged_gather_matches_paged_layout(self):
-        from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
-            has_indexer_mxfp4_paged_gather,
-            indexer_mxfp4_paged_gather,
-        )
-
         if not has_indexer_mxfp4_paged_gather():
             self.skipTest("DeepSeek V4 paged MXFP4 gather op is not available")
 
@@ -949,7 +1109,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         rows = torch.randn(3, HEAD_DIM, device=device, dtype=dtype)
         cache = torch.zeros(
             1,
-            block_size * (DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM),
+            block_size * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
             device=device,
             dtype=torch.uint8,
         )
@@ -957,11 +1117,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             if slot < 0:
                 continue
             flat = cache.view(-1)
-            token_base = slot * DEEPSEEK_V4_SWA_TOKEN_STRIDE
-            scale_base = (
-                block_size * DEEPSEEK_V4_SWA_TOKEN_STRIDE
-                + slot * DEEPSEEK_V4_SWA_SCALE_DIM
-            )
+            token_base = slot * SWA_TOKEN_STRIDE
+            scale_base = block_size * SWA_TOKEN_STRIDE + slot * SWA_SCALE_DIM
             rotated = _apply_gptj_rope(
                 rows[token_idx : token_idx + 1],
                 positions[token_idx : token_idx + 1],
@@ -974,11 +1131,17 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 )
                 flat[token_base + start : token_base + start + 64].copy_(fp8_bytes)
                 flat[scale_base + qblock] = scale
-            flat[
-                token_base + NOPE_DIM : token_base + DEEPSEEK_V4_SWA_TOKEN_STRIDE
-            ].copy_(rotated[NOPE_DIM:].to(torch.bfloat16).view(torch.uint8))
+            flat[token_base + NOPE_DIM : token_base + SWA_TOKEN_STRIDE].copy_(
+                rotated[NOPE_DIM:].to(torch.bfloat16).view(torch.uint8)
+            )
 
-        dequant = dequantize_deepseek_v4_fp8_ds_mla_cache(cache, slots, block_size)
+        dequant = dequantize_deepseek_v4_fp8_ds_mla_cache(
+            cache,
+            slots,
+            block_size,
+            head_dim=HEAD_DIM,
+            rope_dim=ROPE_DIM,
+        )
         self.assertEqual(float(dequant[2].abs().sum()), 0.0)
         self.assertGreater(float(dequant[:2].abs().sum()), 0.0)
 
@@ -990,7 +1153,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         cos_sin = torch.randn(16, ROPE_DIM, device=device, dtype=torch.float32) * 0.05
         q = torch.randn(2, 3, 128, device=device, dtype=dtype)
         weights = torch.randn(2, 3, device=device, dtype=torch.float32)
-        q_fp4, weights_fp4 = deepseek_v4_prepare_indexer_q_reference(
+        q_fp4, weights_fp4 = _prepare_indexer_q_reference(
             q, positions, cos_sin, weights, 0.25, 3**-0.5, use_fp4=True
         )
         self.assertEqual(q_fp4.shape, q.shape)
@@ -1018,7 +1181,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             atol=1.0e-6,
             rtol=1.0e-6,
         )
-        q_fp8, weights_fp8 = deepseek_v4_prepare_indexer_q_reference(
+        q_fp8, weights_fp8 = _prepare_indexer_q_reference(
             q, positions, cos_sin, weights, 0.25, 3**-0.5, use_fp4=False
         )
         self.assertEqual(q_fp8.shape, q.shape)
@@ -1446,7 +1609,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         num_blocks = 3
         cache = torch.zeros(
             num_blocks,
-            block_size * (DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM),
+            block_size * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
             device=device,
             dtype=torch.uint8,
         )
@@ -1456,12 +1619,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             page = slot // block_size
             pos = slot % block_size
             page_base = page * cache.stride(0)
-            token_base = page_base + pos * DEEPSEEK_V4_SWA_TOKEN_STRIDE
-            scale_base = (
-                page_base
-                + block_size * DEEPSEEK_V4_SWA_TOKEN_STRIDE
-                + pos * DEEPSEEK_V4_SWA_SCALE_DIM
-            )
+            token_base = page_base + pos * SWA_TOKEN_STRIDE
+            scale_base = page_base + block_size * SWA_TOKEN_STRIDE + pos * SWA_SCALE_DIM
             for qblock in range(7):
                 start = qblock * 64
                 fp8_bytes, scale = _fp8_bytes_and_scale(rows[slot, start : start + 64])
@@ -1470,9 +1629,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 )
                 flat_cache[scale_base + qblock] = scale
             flat_cache[scale_base + 7] = 0
-            flat_cache[
-                token_base + NOPE_DIM : token_base + DEEPSEEK_V4_SWA_TOKEN_STRIDE
-            ].copy_(rows[slot, NOPE_DIM:].to(torch.bfloat16).view(torch.uint8))
+            flat_cache[token_base + NOPE_DIM : token_base + SWA_TOKEN_STRIDE].copy_(
+                rows[slot, NOPE_DIM:].to(torch.bfloat16).view(torch.uint8)
+            )
 
         seq_lens = torch.tensor([9, 8], device=device, dtype=torch.int32)
         gather_lens = torch.tensor([3, 2], device=device, dtype=torch.int32)
@@ -1511,7 +1670,11 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         for req_idx, slots in enumerate(expected_slots):
             expected_rows = dequantize_deepseek_v4_fp8_ds_mla_cache(
-                cache, slots, block_size
+                cache,
+                slots,
+                block_size,
+                head_dim=HEAD_DIM,
+                rope_dim=ROPE_DIM,
             )
             gathered = out[req_idx, 1 : 1 + slots.numel()]
             torch.testing.assert_close(

@@ -4,16 +4,17 @@
 
 from __future__ import annotations
 
-import glob
-import importlib
 import math
-import os
-import site
-import sys
 from functools import cache
-from typing import Any
 
 import torch
+
+from tokenspeed.runtime.utils import ceil_div
+
+try:
+    from tokenspeed_kernel.thirdparty import deep_gemm
+except Exception:
+    deep_gemm = None  # type: ignore[assignment]
 
 try:
     import tilelang
@@ -23,92 +24,14 @@ except Exception:  # pragma: no cover - availability depends on deployment image
     T = None
 
 
-def _cdiv(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-
 @cache
 def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     device_props = torch.cuda.get_device_properties(0)
     split_k = device_props.multi_processor_count // grid_size
     if k is not None:
-        num_block_k = _cdiv(k, block_k)
+        num_block_k = ceil_div(k, block_k)
         split_k = min(split_k, num_block_k // 4)
     return max(split_k, 1)
-
-
-def _prepare_deep_gemm_jit_env() -> None:
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if not cuda_home and os.path.exists("/usr/local/cuda/include/cuda_runtime.h"):
-        cuda_home = "/usr/local/cuda"
-        os.environ["CUDA_HOME"] = cuda_home
-    if not cuda_home:
-        return
-
-    include_dir = os.path.join(cuda_home, "include")
-    if os.path.exists(os.path.join(include_dir, "cuda_runtime.h")):
-        cpath = os.environ.get("CPATH", "")
-        paths = [path for path in cpath.split(os.pathsep) if path]
-        if include_dir not in paths:
-            os.environ["CPATH"] = os.pathsep.join([include_dir] + paths)
-
-    path_entries = [
-        entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry
-    ]
-    candidates = []
-    site_paths = []
-    try:
-        site_paths.extend(site.getsitepackages())
-    except Exception:
-        pass
-    site_paths.extend(sys.path)
-    for base in site_paths:
-        candidates.extend(
-            sorted(glob.glob(os.path.join(base, "nvidia", "cu*", "bin")), reverse=True)
-        )
-    candidates.extend(
-        [
-            os.path.join(os.path.dirname(torch.__file__), "bin"),
-            os.path.join(
-                os.path.dirname(torch.__file__),
-                "..",
-                "triton",
-                "backends",
-                "nvidia",
-                "bin",
-            ),
-        ]
-    )
-
-    ptxas_dirs: list[str] = []
-    for candidate in candidates:
-        candidate = os.path.abspath(candidate)
-        if (
-            os.path.exists(os.path.join(candidate, "ptxas"))
-            and candidate not in ptxas_dirs
-        ):
-            ptxas_dirs.append(candidate)
-    for candidate in reversed(ptxas_dirs):
-        if candidate not in path_entries:
-            path_entries.insert(0, candidate)
-    if path_entries:
-        os.environ["PATH"] = os.pathsep.join(path_entries)
-
-
-@cache
-def _get_deep_gemm() -> Any | None:
-    _prepare_deep_gemm_jit_env()
-    for module_name in (
-        "deep_gemm",
-        "tokenspeed_kernel.thirdparty.deep_gemm",
-    ):
-        try:
-            module = importlib.import_module(module_name)
-        except Exception:
-            continue
-        if hasattr(module, "tf32_hc_prenorm_gemm"):
-            return module
-    return None
 
 
 if tilelang is not None:
@@ -306,7 +229,6 @@ def mhc_pre(
     if not residual.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
 
-    deep_gemm = _get_deep_gemm()
     if deep_gemm is None:
         raise RuntimeError("deep_gemm.tf32_hc_prenorm_gemm is unavailable")
 
@@ -339,7 +261,9 @@ def mhc_pre(
 
     block_k = 64
     block_m = 64
-    n_splits = _compute_num_split(block_k, hc_hidden_size, _cdiv(num_tokens, block_m))
+    n_splits = _compute_num_split(
+        block_k, hc_hidden_size, ceil_div(num_tokens, block_m)
+    )
 
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device

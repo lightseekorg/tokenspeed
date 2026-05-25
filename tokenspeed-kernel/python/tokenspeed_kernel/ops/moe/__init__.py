@@ -28,7 +28,6 @@ import tokenspeed_kernel.numerics.reference.moe  # noqa: F401
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
 import tokenspeed_kernel.ops.moe.deepep  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.moe.reference  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton_kernels  # noqa: F401
 import tokenspeed_kernel.ops.moe.trtllm  # noqa: F401

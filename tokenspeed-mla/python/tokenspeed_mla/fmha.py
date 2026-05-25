@@ -25,7 +25,7 @@ import os
 import sys
 import time
 from functools import partial
-from typing import Callable, Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -305,6 +305,14 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # Tunable parameters
         self.rescale_threshold = 8.0 if self.enable_skip_correction else 0.0
+        # FP8 P pre-scale: offset added to exp2 exponent so that P*2^offset fills
+        # more of E4M3's [0, 448] range, improving quantization precision.
+        # Derived from rescale_threshold to guarantee P*2^offset <= 448.
+        self.p_fp8_prescale_log2 = max(
+            0.0, math.floor(math.log2(448) - self.rescale_threshold)
+        )
+        # ln(2) * offset correction for LSE when pre-scale is active
+        self.p_fp8_prescale_lse_correction = self.p_fp8_prescale_log2 * math.log(2)
         # For most cases, seq barrier is needed to help keep the pipeline stable
         # But sometimes, compiler will schedule the barrier at an unexpected place
         # if it hurts perf a lot, try to quickly fix it by disabling seq barrier
@@ -1729,134 +1737,94 @@ class BlackwellFusedMultiHeadAttentionForward:
         return skip_softmax, row_max
 
     @cute.jit
-    def compute_row_sum(self, tTMEM_LOADrS, scale, old_row_max, row_max_safe, row_sum):
-        """Compute the row sum.
-
-        :param tTMEM_LOADrS: The tTMEM_LOADrS tensor.
-        :type tTMEM_LOADrS: cute.Tensor
-        :param scale: The scale.
-        :type scale: float
-        :param old_row_max: The old row maximum.
-        :type old_row_max: float
-        :param row_max_safe: The row maximum safe.
-        :type row_max_safe: float
-        :param row_sum: The row sum.
-        :type row_sum: float
-        :return: The row sum.
-        :rtype: float
-        """
-        acc_scale_ = scale * (old_row_max - row_max_safe)
-        acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
-        row_sum *= acc_scale
-        local_row_sum_0 = (row_sum, row_sum)
-        local_row_sum_1 = (0.0, 0.0)
-        local_row_sum_2 = (0.0, 0.0)
-        local_row_sum_3 = (0.0, 0.0)
-
-        reduction_unroll = 4
-        frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll
-        tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
-
-        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
-            local_row_sum_0 = cute.arch.add_packed_f32x2(
-                local_row_sum_0,
-                (tTMEM_LOADrS_frg[j, 0], tTMEM_LOADrS_frg[j + 1, 0]),
-            )
-            local_row_sum_1 = cute.arch.add_packed_f32x2(
-                local_row_sum_1,
-                (tTMEM_LOADrS_frg[j, 1], tTMEM_LOADrS_frg[j + 1, 1]),
-            )
-            local_row_sum_2 = cute.arch.add_packed_f32x2(
-                local_row_sum_2,
-                (tTMEM_LOADrS_frg[j, 2], tTMEM_LOADrS_frg[j + 1, 2]),
-            )
-            local_row_sum_3 = cute.arch.add_packed_f32x2(
-                local_row_sum_3,
-                (tTMEM_LOADrS_frg[j, 3], tTMEM_LOADrS_frg[j + 1, 3]),
-            )
-
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
-        local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
-        row_sum = local_row_sum_0[0] + local_row_sum_0[1]
-
-        return row_sum
-
-    @cute.jit
-    def apply_exp_and_cvt(
+    def apply_exp_and_cvt_new(
         self,
-        tTMEM_STORErS_x4,
-        tTMEM_STOREtS_x4,
         tTMEM_LOADrS,
-        tiled_tmem_store,
-        row_max_safe,
+        tTMEM_LOADrS_cvt,
+        tTMEM_STORErS_x4_e_cvt,
         stage,
-        whether_apply_mask,
-        scale_softmax_log2,
-        enable_skip_softmax,
+        scale,
+        minus_row_max_scale,
+        local_row_sum,
+        inplace_consumer,
+        EXP2_EMULATION_OFFSET,
+        EXP2_EMULATION_COUNT,
+        CVT_COUNT,
+        CVT_PER_STEP,
+        FMA_COUNT,
+        ARV_COUNT,
     ):
-        """Apply the exp and conversion to the P data type on fragment.
-
-        :param tTMEM_STORErS_x4: The tTMEM_STORErS_x4 tensor.
-        :type tTMEM_STORErS_x4: cute.Tensor
-        :param tTMEM_STOREtS_x4: The tTMEM_STOREtS_x4 tensor.
-        :type tTMEM_STOREtS_x4: cute.Tensor
-        :param tTMEM_LOADrS: The tTMEM_LOADrS tensor.
-        :type tTMEM_LOADrS: cute.Tensor
-        :param tiled_tmem_store: The tiled tmem store.
-        :type tiled_tmem_store: cute.Tensor
-        :param row_max_safe: The row maximum safe.
-        :type row_max_safe: float
-        :param stage: The stage.
-        :type stage: int
-        :param whether_apply_mask: Whether to apply the mask.
-        :type whether_apply_mask: bool
-        :param scale_softmax_log2: The scale softmax log2.
-        :type scale_softmax_log2: float
-        :param enable_skip_softmax: Whether to enable skip softmax.
-        :type enable_skip_softmax: bool
-        :return: None
-        :rtype: None
-        """
-        tTMEM_STORErS_x4_e = cute.make_tensor(
-            cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.q_dtype),
-            tTMEM_LOADrS.layout,
-        )
-        scale = scale_softmax_log2
-        minus_row_max_scale = (0.0 - row_max_safe) * scale
-
-        EXP2_EMULATION_COUNT = (
-            20 if self.enable_ex2_emulation and not whether_apply_mask else 0
-        )
-        EXP2_EMULATION_OFFSET = cute.size(tTMEM_LOADrS) - EXP2_EMULATION_COUNT
-        CVT_PER_STEP = 4 if self.q_dtype.width == 8 else 2
-        assert (
-            EXP2_EMULATION_OFFSET % CVT_PER_STEP == 0
-        ), "EXP2_EMULATION_OFFSET must be divisible by CVT_PER_STEP"
-        tTMEM_LOADrS_cvt = cute.logical_divide(
-            tTMEM_LOADrS, cute.make_layout(CVT_PER_STEP)
-        )
-        tTMEM_STORErS_x4_e_cvt = cute.logical_divide(
-            tTMEM_STORErS_x4_e, cute.make_layout(CVT_PER_STEP)
-        )
-        # XU Part
-        for i in cutlass.range(EXP2_EMULATION_OFFSET, vectorize=True):
-            tTMEM_LOADrS[i] = tTMEM_LOADrS[i] * scale + minus_row_max_scale
+        """Pipelined exp/cvt path used by softmax_step."""
+        for i in cutlass.range_constexpr(0, EXP2_EMULATION_OFFSET, 2):
+            if cutlass.const_expr(i >= CVT_COUNT):
+                if cutlass.const_expr(i % CVT_PER_STEP == 0):
+                    if cutlass.const_expr(self.q_dtype.width == 8):
+                        fmha_utils.cvt_f32x4_to_f8x4(
+                            tTMEM_LOADrS_cvt[None, (i - CVT_COUNT) // CVT_PER_STEP],
+                            tTMEM_STORErS_x4_e_cvt[
+                                None, (i - CVT_COUNT) // CVT_PER_STEP
+                            ],
+                        )
+                    else:
+                        s_vec = tTMEM_LOADrS_cvt[
+                            None, (i - CVT_COUNT) // CVT_PER_STEP
+                        ].load()
+                        tTMEM_STORErS_x4_e_cvt[
+                            None, (i - CVT_COUNT) // CVT_PER_STEP
+                        ].store(s_vec.to(self.q_dtype))
+                local_row_sum = cute.arch.add_packed_f32x2(
+                    local_row_sum,
+                    (
+                        tTMEM_LOADrS[i - CVT_COUNT],
+                        tTMEM_LOADrS[i - CVT_COUNT + 1],
+                    ),
+                )
             tTMEM_LOADrS[i] = cute.math.exp2(tTMEM_LOADrS[i], fastmath=True)
-        for i in cutlass.range(0, EXP2_EMULATION_OFFSET, CVT_PER_STEP):
-            s_vec = tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP].load()
-            tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP].store(
-                s_vec.to(self.q_dtype)
+            if cutlass.const_expr(i + FMA_COUNT < EXP2_EMULATION_OFFSET):
+                (
+                    tTMEM_LOADrS[i + FMA_COUNT],
+                    tTMEM_LOADrS[i + FMA_COUNT + 1],
+                ) = cute.arch.fma_packed_f32x2(
+                    (
+                        tTMEM_LOADrS[i + FMA_COUNT],
+                        tTMEM_LOADrS[i + FMA_COUNT + 1],
+                    ),
+                    (scale, scale),
+                    (minus_row_max_scale, minus_row_max_scale),
+                )
+            tTMEM_LOADrS[i + 1] = cute.math.exp2(tTMEM_LOADrS[i + 1], fastmath=True)
+            if cutlass.const_expr(i == EXP2_EMULATION_OFFSET - ARV_COUNT):
+                if cutlass.const_expr(self.enable_sequence_barrier):
+                    if cutlass.const_expr(stage == 0):
+                        self.sequence_s1_s0_barrier.arrive()
+                    else:
+                        self.sequence_s0_s1_barrier.arrive()
+
+        for i in cutlass.range_constexpr(
+            EXP2_EMULATION_OFFSET - CVT_COUNT,
+            EXP2_EMULATION_OFFSET,
+            2,
+        ):
+            if cutlass.const_expr(i % CVT_PER_STEP == 0):
+                if cutlass.const_expr(self.q_dtype.width == 8):
+                    fmha_utils.cvt_f32x4_to_f8x4(
+                        tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP],
+                        tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP],
+                    )
+                else:
+                    s_vec = tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP].load()
+                    tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP].store(
+                        s_vec.to(self.q_dtype)
+                    )
+            local_row_sum = cute.arch.add_packed_f32x2(
+                local_row_sum, (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1])
             )
 
-        if cutlass.const_expr(self.enable_sequence_barrier):
-            if cutlass.const_expr(stage == 0):
-                self.sequence_s1_s0_barrier.arrive()
-            else:
-                self.sequence_s0_s1_barrier.arrive()
-
-        # Emulation Part
-        for i in cutlass.range(EXP2_EMULATION_OFFSET, cute.size(tTMEM_LOADrS), 2):
+        for i in cutlass.range_constexpr(
+            EXP2_EMULATION_OFFSET,
+            EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT // 2,
+            2,
+        ):
             tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = cute.arch.fma_packed_f32x2(
                 (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]),
                 (scale, scale),
@@ -1867,14 +1835,47 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]
                 )
             )
-        for i in cutlass.range(
-            EXP2_EMULATION_OFFSET, cute.size(tTMEM_LOADrS), CVT_PER_STEP
+            if cutlass.const_expr((i + 2) % CVT_PER_STEP == 0):
+                if cutlass.const_expr(self.q_dtype.width == 8):
+                    fmha_utils.cvt_f32x4_to_f8x4(
+                        tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP],
+                        tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP],
+                    )
+                else:
+                    s_vec = tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP].load()
+                    tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP].store(
+                        s_vec.to(self.q_dtype)
+                    )
+
+        inplace_peek_status = inplace_consumer.try_wait()
+        for i in cutlass.range_constexpr(
+            EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT // 2,
+            EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT,
+            2,
         ):
-            s_vec = tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP].load()
-            tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP].store(
-                s_vec.to(self.q_dtype)
+            tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = cute.arch.fma_packed_f32x2(
+                (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]),
+                (scale, scale),
+                (minus_row_max_scale, minus_row_max_scale),
             )
-        return
+            tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = (
+                fmha_utils.ex2_emulation_packed_f32x2(
+                    tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]
+                )
+            )
+            if cutlass.const_expr((i + 2) % CVT_PER_STEP == 0):
+                if cutlass.const_expr(self.q_dtype.width == 8):
+                    fmha_utils.cvt_f32x4_to_f8x4(
+                        tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP],
+                        tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP],
+                    )
+                else:
+                    s_vec = tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP].load()
+                    tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP].store(
+                        s_vec.to(self.q_dtype)
+                    )
+        inplace_consumer.wait_and_advance(inplace_peek_status)
+        return local_row_sum, inplace_consumer
 
     @cute.jit
     def softmax_step(
@@ -1924,7 +1925,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         :return: Updated stats_args and pipeline_args
         :rtype: Tuple[Tuple, Tuple]
         """
-
         row_sum, row_max = stats_args
         cS, is_last_iter = iter_args
         (
@@ -1963,7 +1963,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             skip_softmax_count,
             total_softmax_count,
         ) = tensor_args
-
         tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS)
         enable_skip_softmax = skip_softmax_threshold_log2 is not None
@@ -1976,13 +1975,27 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_LOADcS = thr_tmem_load.partition_D(tScS)
         tTMEM_STORE_VECcS = thr_tmem_store_vec.partition_S(tScS_vec)
         tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P)
-
         # Wait for Si
         si_handle = mma_si_consumer.wait_and_advance(si_peek_status)
         tTMEM_LOADrS = cute.make_rmem_tensor(tTMEM_LOADcS.shape, self.qk_acc_dtype)
         old_row_max = row_max
-        cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
+        skip_softmax = cutlass.Boolean(False)
         if whether_apply_mask:
+            if cutlass.const_expr(
+                self.arch >= Arch.sm_100 and self.arch <= Arch.sm_100f
+            ):
+                cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
+            else:
+                tTMEM_LOADrMax = cute.make_rmem_tensor(
+                    cute.make_layout((1, cute.size(tTMEM_LOADrS, mode=[1]))),
+                    self.qk_acc_dtype,
+                )
+                for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS, mode=[1])):
+                    cute.copy_atom_call(
+                        tiled_tmem_load,
+                        tTMEM_LOADtS[None, i, 0, 0],
+                        (tTMEM_LOADrS[None, i, 0, 0], tTMEM_LOADrMax[None, i]),
+                    )
             fmha_utils.FusedMask.apply_mask(
                 self.mask_type,
                 tTMEM_LOADrS,
@@ -1992,32 +2005,172 @@ class BlackwellFusedMultiHeadAttentionForward:
                 window_size_left,
                 window_size_right,
             )
-
-        old_row_max = row_max
-        if cutlass.const_expr(not enable_skip_softmax):
-            row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
-        else:
             tile_row_max = tTMEM_LOADrS.load().reduce(
                 cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
             )
-            skip_softmax, row_max = self.calculate_skip_softmax_flag(
-                row_max,
-                tile_row_max,
-                scale_softmax_log2,
-                skip_softmax_threshold_log2,
-                seqlen_q,
-                thread_idx,
-                logical_offset,
-                warp_wants_skip_softmax_exchange,
-                stage,
-                skip_softmax_count,
-                total_softmax_count,
-            )
-
-        si_handle.release()
-        # S0 -> P1 / S1 -> P0
-        inplace_producer.commit()
-        inplace_producer.advance()
+            if cutlass.const_expr(not enable_skip_softmax):
+                row_max = cute.arch.fmax(row_max, tile_row_max)
+            else:
+                skip_softmax, row_max = self.calculate_skip_softmax_flag(
+                    row_max,
+                    tile_row_max,
+                    scale_softmax_log2,
+                    skip_softmax_threshold_log2,
+                    seqlen_q,
+                    thread_idx,
+                    logical_offset,
+                    warp_wants_skip_softmax_exchange,
+                    stage,
+                    skip_softmax_count,
+                    total_softmax_count,
+                )
+            si_handle.release()
+            # S0 -> P1 / S1 -> P0
+            inplace_producer.commit()
+            inplace_producer.advance()
+        else:
+            if cutlass.const_expr(
+                self.arch >= Arch.sm_100 and self.arch <= Arch.sm_100f
+            ):
+                cute.copy(
+                    tiled_tmem_load,
+                    tTMEM_LOADtS[None, 0, None, None],
+                    tTMEM_LOADrS[None, 0, None, None],
+                )
+                cute.copy(
+                    tiled_tmem_load,
+                    tTMEM_LOADtS[None, 1, None, None],
+                    tTMEM_LOADrS[None, 1, None, None],
+                )
+                tile_row_max = -cutlass.Float32.inf
+                tile_row_max_ = tile_row_max
+                for i in cutlass.range_constexpr(
+                    0, cute.size(tTMEM_LOADrS, mode=[0]), 4
+                ):
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i, 0, 0, 0]
+                    )
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i + 1, 0, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 2, 0, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 3, 0, 0, 0]
+                    )
+                cute.copy(
+                    tiled_tmem_load,
+                    tTMEM_LOADtS[None, 2, None, None],
+                    tTMEM_LOADrS[None, 2, None, None],
+                )
+                for i in cutlass.range_constexpr(
+                    0, cute.size(tTMEM_LOADrS, mode=[0]), 4
+                ):
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i, 1, 0, 0]
+                    )
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i + 1, 1, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 2, 1, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 3, 1, 0, 0]
+                    )
+                cute.copy(
+                    tiled_tmem_load,
+                    tTMEM_LOADtS[None, 3, None, None],
+                    tTMEM_LOADrS[None, 3, None, None],
+                )
+                for i in cutlass.range_constexpr(
+                    0, cute.size(tTMEM_LOADrS, mode=[0]), 4
+                ):
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i, 2, 0, 0]
+                    )
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i + 1, 2, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 2, 2, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 3, 2, 0, 0]
+                    )
+                cute.arch.fence_view_async_tmem_store()
+                si_handle.release()
+                # S0 -> P1 / S1 -> P0
+                inplace_producer.commit()
+                inplace_producer.advance()
+                for i in cutlass.range_constexpr(
+                    0, cute.size(tTMEM_LOADrS, mode=[0]), 4
+                ):
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i, 3, 0, 0]
+                    )
+                    tile_row_max = cute.arch.fmax(
+                        tile_row_max, tTMEM_LOADrS[i + 1, 3, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 2, 3, 0, 0]
+                    )
+                    tile_row_max_ = cute.arch.fmax(
+                        tile_row_max_, tTMEM_LOADrS[i + 3, 3, 0, 0]
+                    )
+                tile_row_max = cute.arch.fmax(tile_row_max, tile_row_max_)
+                if cutlass.const_expr(not enable_skip_softmax):
+                    row_max = cute.arch.fmax(tile_row_max, row_max)
+                else:
+                    skip_softmax, row_max = self.calculate_skip_softmax_flag(
+                        row_max,
+                        tile_row_max,
+                        scale_softmax_log2,
+                        skip_softmax_threshold_log2,
+                        seqlen_q,
+                        thread_idx,
+                        logical_offset,
+                        warp_wants_skip_softmax_exchange,
+                        stage,
+                        skip_softmax_count,
+                        total_softmax_count,
+                    )
+            else:
+                tTMEM_LOADrMax = cute.make_rmem_tensor(
+                    cute.make_layout((1, cute.size(tTMEM_LOADrS, mode=[1]))),
+                    self.qk_acc_dtype,
+                )
+                for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS, mode=[1])):
+                    cute.copy_atom_call(
+                        tiled_tmem_load,
+                        tTMEM_LOADtS[None, i, 0, 0],
+                        (tTMEM_LOADrS[None, i, 0, 0], tTMEM_LOADrMax[None, i]),
+                    )
+                cute.arch.fence_view_async_tmem_store()
+                tile_row_max = tTMEM_LOADrMax.load().reduce(
+                    cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
+                )
+                if cutlass.const_expr(not enable_skip_softmax):
+                    row_max = cute.arch.fmax(tile_row_max, row_max)
+                else:
+                    skip_softmax, row_max = self.calculate_skip_softmax_flag(
+                        row_max,
+                        tile_row_max,
+                        scale_softmax_log2,
+                        skip_softmax_threshold_log2,
+                        seqlen_q,
+                        thread_idx,
+                        logical_offset,
+                        warp_wants_skip_softmax_exchange,
+                        stage,
+                        skip_softmax_count,
+                        total_softmax_count,
+                    )
+                si_handle.release()
+                # S0 -> P1 / S1 -> P0
+                inplace_producer.commit()
+                inplace_producer.advance()
 
         row_max_safe = row_max
         if row_max == -cutlass.Float32.inf:
@@ -2032,35 +2185,72 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         tTMEM_STORE_VECrS[0] = old_row_max
         tTMEM_STORE_VECrS[1] = row_max_safe
-        vec_i_handle = si_corr_producer.acquire_and_advance()
+        vec_i_peek_status = si_corr_producer.try_acquire()
+        tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
+        tTMEM_STORErS_x4_e = cute.make_tensor(
+            cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.q_dtype),
+            tTMEM_LOADrS.layout,
+        )
+        scale = scale_softmax_log2
+        minus_row_max_scale = (0.0 - row_max_safe) * scale
+        if cutlass.const_expr(self.q_dtype.width == 8 and self.p_fp8_prescale_log2 > 0):
+            minus_row_max_scale = minus_row_max_scale + self.p_fp8_prescale_log2
+
+        ARV_COUNT = 4
+        FMA_COUNT = 8
+        CVT_COUNT = 8 if self.q_dtype.width == 8 else 4
+        CVT_PER_STEP = 4 if self.q_dtype.width == 8 else 2
+        assert (
+            CVT_COUNT % CVT_PER_STEP == 0
+        ), f"CVT_COUNT {CVT_COUNT} must be divisible by CVT_PER_STEP {CVT_PER_STEP}"
+        tTMEM_LOADrS_cvt = cute.logical_divide(
+            tTMEM_LOADrS, cute.make_layout(CVT_PER_STEP)
+        )
+        tTMEM_STORErS_x4_e_cvt = cute.logical_divide(
+            tTMEM_STORErS_x4_e, cute.make_layout(CVT_PER_STEP)
+        )
+        for i in cutlass.range_constexpr(0, FMA_COUNT, 2):
+            tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = cute.arch.fma_packed_f32x2(
+                (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]),
+                (scale, scale),
+                (minus_row_max_scale, minus_row_max_scale),
+            )
+        vec_i_handle = si_corr_producer.acquire_and_advance(vec_i_peek_status)
         cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
         cute.arch.fence_view_async_tmem_store()
+        # Notify correction wg that row_max is ready
+        vec_i_handle.commit()
+
+        EXP2_EMULATION_COUNT = (
+            20 if self.enable_ex2_emulation and not whether_apply_mask else 0
+        )
+        EXP2_EMULATION_OFFSET = cute.size(tTMEM_LOADrS) - EXP2_EMULATION_COUNT
+        acc_scale_ = scale * (old_row_max - row_max_safe)
+        acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
         if cutlass.const_expr(self.enable_sequence_barrier):
             if cutlass.const_expr(stage == 0):
                 self.sequence_s0_s1_barrier.arrive_and_wait()
             else:
                 self.sequence_s1_s0_barrier.arrive_and_wait()
-        # Notify correction wg that row_max is ready
-        vec_i_handle.commit()
-
-        tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
         if cutlass.const_expr(enable_skip_softmax):
             if not skip_softmax:
-                self.apply_exp_and_cvt(
-                    tTMEM_STORErS_x4,
-                    tTMEM_STOREtS_x4,
+                row_sum *= acc_scale
+                local_row_sum = (row_sum, row_sum)
+                local_row_sum, inplace_consumer = self.apply_exp_and_cvt_new(
                     tTMEM_LOADrS,
-                    tiled_tmem_store,
-                    row_max_safe,
+                    tTMEM_LOADrS_cvt,
+                    tTMEM_STORErS_x4_e_cvt,
                     stage,
-                    whether_apply_mask,
-                    scale_softmax_log2,
-                    enable_skip_softmax,
-                )
-                inplace_peek_status = inplace_consumer.try_wait()
-                inplace_consumer.wait_and_advance(inplace_peek_status)
-                tTMEM_STORE_VECrS = cute.make_rmem_tensor(
-                    tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
+                    scale,
+                    minus_row_max_scale,
+                    local_row_sum,
+                    inplace_consumer,
+                    EXP2_EMULATION_OFFSET,
+                    EXP2_EMULATION_COUNT,
+                    CVT_COUNT,
+                    CVT_PER_STEP,
+                    FMA_COUNT,
+                    ARV_COUNT,
                 )
                 tTMEM_STORE_VECrS_i32 = cute.recast_tensor(
                     tTMEM_STORE_VECrS, dtype=cutlass.Int32
@@ -2069,16 +2259,25 @@ class BlackwellFusedMultiHeadAttentionForward:
                 pi_handle = pi_mma_producer.acquire_and_advance()
                 # store skip softmax flag
                 cute.copy(
-                    tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_SKIP_SOFTMAX
+                    tiled_tmem_store_vec,
+                    tTMEM_STORE_VECrS_i32,
+                    tTMEM_STORE_SKIP_SOFTMAX,
                 )
                 # store P
                 cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
                 cute.arch.fence_view_async_tmem_store()
-                # Notify tensor core warp that softmax(S->P) is ready
                 pi_handle.commit()
-                row_sum = self.compute_row_sum(
-                    tTMEM_LOADrS, scale_softmax_log2, old_row_max, row_max_safe, row_sum
-                )
+                for j in cutlass.range_constexpr(
+                    EXP2_EMULATION_OFFSET,
+                    EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT,
+                    2,
+                ):
+                    local_row_sum = cute.arch.add_packed_f32x2(
+                        (tTMEM_LOADrS[j], tTMEM_LOADrS[j + 1]),
+                        local_row_sum,
+                    )
+                row_sum = local_row_sum[0] + local_row_sum[1]
+                cute.arch.fence_view_async_tmem_store()
             else:
                 if cutlass.const_expr(self.enable_sequence_barrier):
                     if cutlass.const_expr(stage == 0):
@@ -2087,9 +2286,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         self.sequence_s0_s1_barrier.arrive()
                 inplace_peek_status = inplace_consumer.try_wait()
                 inplace_consumer.wait_and_advance(inplace_peek_status)
-                tTMEM_STORE_VECrS = cute.make_rmem_tensor(
-                    tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
-                )
                 tTMEM_STORE_VECrS_i32 = cute.recast_tensor(
                     tTMEM_STORE_VECrS, dtype=cutlass.Int32
                 )
@@ -2097,39 +2293,51 @@ class BlackwellFusedMultiHeadAttentionForward:
                 pi_handle = pi_mma_producer.acquire_and_advance()
                 # store skip softmax flag
                 cute.copy(
-                    tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_SKIP_SOFTMAX
+                    tiled_tmem_store_vec,
+                    tTMEM_STORE_VECrS_i32,
+                    tTMEM_STORE_SKIP_SOFTMAX,
                 )
                 cute.arch.fence_view_async_tmem_store()
-                # No P store here as the mma pv will be skipped.
-                # Notify tensor core warp that softmax(S->P) is ready
                 pi_handle.commit()
         else:
-            self.apply_exp_and_cvt(
-                tTMEM_STORErS_x4,
-                tTMEM_STOREtS_x4,
+            row_sum *= acc_scale
+            local_row_sum = (row_sum, row_sum)
+            local_row_sum, inplace_consumer = self.apply_exp_and_cvt_new(
                 tTMEM_LOADrS,
-                tiled_tmem_store,
-                row_max_safe,
+                tTMEM_LOADrS_cvt,
+                tTMEM_STORErS_x4_e_cvt,
                 stage,
-                whether_apply_mask,
-                scale_softmax_log2,
-                False,
+                scale,
+                minus_row_max_scale,
+                local_row_sum,
+                inplace_consumer,
+                EXP2_EMULATION_OFFSET,
+                EXP2_EMULATION_COUNT,
+                CVT_COUNT,
+                CVT_PER_STEP,
+                FMA_COUNT,
+                ARV_COUNT,
             )
-            inplace_peek_status = inplace_consumer.try_wait()
-            inplace_consumer.wait_and_advance(inplace_peek_status)
-
             pi_handle = pi_mma_producer.acquire_and_advance()
             # store P
             cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
             cute.arch.fence_view_async_tmem_store()
+            for j in cutlass.range_constexpr(
+                EXP2_EMULATION_OFFSET,
+                EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT,
+                2,
+            ):
+                local_row_sum = cute.arch.add_packed_f32x2(
+                    (tTMEM_LOADrS[j], tTMEM_LOADrS[j + 1]),
+                    local_row_sum,
+                )
+            row_sum = local_row_sum[0] + local_row_sum[1]
+            cute.arch.fence_view_async_tmem_store()
             # Notify tensor core warp that softmax(S->P) is ready
             pi_handle.commit()
-            row_sum = self.compute_row_sum(
-                tTMEM_LOADrS, scale_softmax_log2, old_row_max, row_max_safe, row_sum
-            )
-
         if not is_last_iter:
             si_peek_status = mma_si_consumer.try_wait()
+
         stats_args = (row_sum, row_max_safe)
         pipeline_args = (
             si_peek_status,
@@ -2244,14 +2452,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         tmem_p_offset = self.tmem_p0_offset if stage == 0 else self.tmem_p1_offset
         tStS_P = cute.make_tensor(tStS.iterator + tmem_p_offset, tStS_P_layout)
-        # Keep this as a plain TMEM load on both SM100 and SM103.  The SM103
-        # reduction-load variant produces an extra reduction result, while
-        # softmax_step() expects only the score payload and must apply masks
-        # before reducing row maxima.
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-            self.qk_acc_dtype,
-        )
+        if cutlass.const_expr(self.arch >= Arch.sm_100 and self.arch <= Arch.sm_100f):
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                self.qk_acc_dtype,
+            )
+        else:
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.LdRed32x32bOp(
+                    tcgen05.copy.Repetition(32), redOp=tcgen05.TmemLoadRedOp.MAX
+                ),
+                self.qk_acc_dtype,
+            )
 
         tiled_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi)
         thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
@@ -2351,7 +2563,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     loop_args: Tuple,
                     stats_args: Tuple,
                     pipeline_args: Tuple,
-                    inner_fn: Callable,
                     value_args: Tuple,
                     atom_args: Tuple,
                     tensor_args: Tuple,
@@ -2363,7 +2574,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     ):
                         cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
                         iter_args = (cS_iter, i == upper_bound - 1)
-                        stats_args, pipeline_args = inner_fn(
+                        stats_args, pipeline_args = self.softmax_step(
                             stage,
                             whether_apply_mask,
                             iter_args,
@@ -2375,10 +2586,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                         )
                     return stats_args, pipeline_args
 
-                softmax_step_fn = self.softmax_step
                 softmax_loop_fn = partial(
                     softmax_loop,
-                    inner_fn=softmax_step_fn,
                     value_args=value_args_,
                     atom_args=atom_args,
                     tensor_args=tensor_args_,

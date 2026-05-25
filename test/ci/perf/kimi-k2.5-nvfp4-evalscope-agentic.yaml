@@ -4,9 +4,12 @@ type: perf
 triggers:
   - per-commit
   - manual
+# Agentic perf claims the b300-4gpu box ahead of the b300-4gpu evals so
+# the long-running sweep starts on the freshest runner state.
+priority: high
 runner:
   labels:
-    - b200-4gpu
+    - b300-4gpu
 env:
   CI: "true"
 install:
@@ -90,11 +93,11 @@ perf:
     exit "$PARSE_STATUS"
 report:
   github_step_summary: true
-perf_threshold: 0.9
+perf_threshold: 0.95
 # Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
 perf_reference:
-  1:  [367.65, 8742.12]
-  2:  [284.90, 13280.12]
-  4:  [182.48, 17276.27]
-  8:  [112.49, 20944.40]
-  16: [67.61,  25181.19]
+  1:  [423.21, 9679.21]
+  2:  [312.51, 14635.51]
+  4:  [208.92, 19687.55]
+  8:  [130.45, 24363.26]
+  16: [78.31,  30845.64]

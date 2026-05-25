@@ -66,5 +66,4 @@ class UnquantizedLinearMethod(LinearMethodBase):
             x,
             layer.weight,
             bias=bias,
-            expected_kernel_name="torch_mm",
         )

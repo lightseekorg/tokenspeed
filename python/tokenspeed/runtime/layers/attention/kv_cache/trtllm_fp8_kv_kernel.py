@@ -144,7 +144,7 @@ def _fused_fp8_set_kv_buffer_kernel(
     kv_idx = tl.program_id(2)  # 0 for K, 1 for V
 
     # Get cache location for this token
-    cache_loc = tl.load(cache_loc_ptr + token_id)
+    cache_loc = tl.load(cache_loc_ptr + token_id).to(tl.int64)
 
     # Compute page_id and offset within page
     page_id = cache_loc // page_size

@@ -61,7 +61,6 @@ from tokenspeed.runtime.engine.detokenizer import (  # noqa: E402
 )
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     BatchEmbeddingOut,
-    BatchMultimodalDecodeReq,
     BatchStrOut,
     BatchTokenIDOut,
 )
@@ -106,9 +105,6 @@ class _StubDetokenizerManager:
 
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
         return recv_obj
-
-    def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
-        raise NotImplementedError()
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
         output_strs = incremental_decode_batch(
@@ -1255,18 +1251,6 @@ class TestDetokenizerLifecycle(unittest.TestCase):
         self.assertEqual(out.input_token_ids_logprobs_idx, [])
         self.assertEqual(out.output_token_ids_logprobs_val, [])
         self.assertEqual(out.output_token_ids_logprobs_idx, [])
-
-    def test_multimodal_decode_req_raises_not_implemented(self):
-        # Gap 6. handle_multimodal_decode_req is currently a
-        # placeholder that raises NotImplementedError. Lock this so a
-        # future contributor cannot silently add a stub that succeeds
-        # without actually implementing the multimodal detokenization
-        # path.
-        manager = _StubDetokenizerManager(self.tokenizer)
-        recv = BatchMultimodalDecodeReq(rids=["req-1"])
-
-        with self.assertRaises(NotImplementedError):
-            manager.handle_multimodal_decode_req(recv)
 
     def test_limited_capacity_dict_update_does_not_evict(self):
         # Regression for the update-at-capacity eviction bug caught by

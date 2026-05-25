@@ -380,7 +380,6 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = ForwardMode.DECODE,
@@ -403,14 +402,15 @@ class FlashAttentionBackend(AttentionBackend):
 
         assert req_to_page is not None, "req_to_page must be provided"
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
         # Use max_context_len as worst-case max_seq_len_k — avoids GPU sync (.item()).
@@ -419,7 +419,7 @@ class FlashAttentionBackend(AttentionBackend):
             req_pool_indices, req_to_page, self.page_size, max_context_len
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             # Draft Decode
             if spec_info is not None:
                 if self.topk <= 1:
@@ -579,21 +579,21 @@ class FlashAttentionBackend(AttentionBackend):
 
             if extend_with_prefix and extend_prefix_lens is not None:
                 extend_seq_lens = seq_lens - extend_prefix_lens
-                # The FA3 workspace is sized from max_seq_len_q.  For prefix
-                # chunks, num_tokens is only the sum over the batch and can be
-                # much larger than any single query sequence.
+                # The FA3 workspace is sized from max_seq_len_q. The wrapper's
+                # padded upper bound is bs * spec_num_tokens; tighter is the
+                # actual extend_seq_lens_cpu.max() when available.
                 extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
                 if extend_seq_lens_cpu is not None:
                     metadata.max_seq_len_q = int(
                         extend_seq_lens_cpu[:batch_size].max().item()
                     )
                 else:
-                    metadata.max_seq_len_q = num_tokens
+                    metadata.max_seq_len_q = batch_size * self.spec_num_tokens
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             elif is_draft_extend and kwargs.get("extend_seq_lens") is not None:
-                metadata.max_seq_len_q = num_tokens
+                metadata.max_seq_len_q = batch_size * self.spec_num_tokens
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(kwargs["extend_seq_lens"], dim=0, dtype=torch.int32),
                     (1, 0),
@@ -619,9 +619,12 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Route to prefill/decode slot. Drafter's first multi-token step uses
         # the prefill slot; follow-up single-token steps use the decode slot.
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             self.forward_decode_metadata = metadata
-        elif is_draft_extend:
+        elif is_draft_extend or (self.is_draft and forward_mode.is_extend_or_mixed()):
+            # Drafter: also fill decode slot so step 1+ multi-step has metadata
+            # under EXTEND/MIXED target. seqlens_in_batch aliases the drafter's
+            # live buffer (wrapper pre-writes it).
             self.forward_prefill_metadata = metadata
             decode_metadata = FlashAttentionMetadata()
             decode_metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -630,6 +633,15 @@ class FlashAttentionBackend(AttentionBackend):
                 0, batch_size + 1, dtype=torch.int32, device=device
             )
             decode_metadata.page_table = page_table
+            # Match the pre-cleanup "Normal Decode" path which always called
+            # _init_local_attn_metadata; required for chunked-attention models.
+            self._init_local_attn_metadata(
+                decode_metadata,
+                device,
+                cu_seqlens_q=decode_metadata.cu_seqlens_q,
+                cache_seqlens_int32=decode_metadata.cache_seqlens_int32,
+                page_table=page_table,
+            )
             self.forward_decode_metadata = decode_metadata
         else:
             self.forward_prefill_metadata = metadata
@@ -676,18 +688,18 @@ class FlashAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_prefill_metadata
 
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and q_len_per_req > 1
         )
         is_draft_extend = (
             forward_mode is not None
             and forward_mode.is_decode_or_idle()
             and self.is_draft
-            and spec_num_tokens > 1
+            and q_len_per_req > 1
         )
 
         # Calculate window size
@@ -966,8 +978,8 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         # Multi-token decode (target verify or drafter's first post-verify
         # step) reuses the multi-token prefill path.
-        spec_num_tokens = q.shape[0] // bs if bs > 0 else 1
-        if spec_num_tokens > 1:
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        if q_len_per_req > 1:
             return self.forward_extend(
                 q,
                 k,
@@ -1434,7 +1446,6 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -1447,17 +1458,18 @@ class FlashAttentionBackend(AttentionBackend):
         metadata_expand = FlashAttentionMetadata()
 
         device = seq_lens.device
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             if spec_info is not None:
                 # Draft Decode
                 if self.topk <= 1:
@@ -1600,7 +1612,7 @@ class FlashAttentionBackend(AttentionBackend):
                 :bs
             ]
 
-            num_tokens_per_bs = num_tokens // bs
+            num_tokens_per_bs = self.spec_num_tokens
             metadata.max_seq_len_q = num_tokens_per_bs
             metadata.max_seq_len_k = self.max_context_len
 
@@ -1631,7 +1643,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.decode_cuda_graph_metadata[bs] = decode_metadata
 
         # Route to prefill/decode slots. Drafter's compound case populates both.
-        if forward_mode.is_decode_or_idle() and spec_num_tokens == 1:
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             self.forward_decode_metadata = metadata
         elif is_target_verify:
             self.forward_prefill_metadata = metadata
@@ -1643,7 +1655,6 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
@@ -1662,14 +1673,15 @@ class FlashAttentionBackend(AttentionBackend):
         assert req_to_page is not None, "req_to_page must be provided"
         max_context_len = self.max_context_len
 
-        spec_num_tokens = num_tokens // bs if bs > 0 else 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
-            and spec_num_tokens > 1
+            and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode.is_decode_or_idle() and self.is_draft and spec_num_tokens > 1
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
         )
 
         if (

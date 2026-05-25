@@ -26,7 +26,7 @@ Hosts:
   its ``rid_to_state`` map.
 * ``OutputProcessor`` — owns the hot-path translation from scheduler
   output frames (``BatchStrOut`` / ``BatchTokenIDOut`` /
-  ``BatchEmbeddingOut`` / ``BatchMultimodalOut``) into the dict-
+  ``BatchEmbeddingOut``) into the dict-
   shaped payload the per-request ``RequestOutputCollector`` merges.
   Also owns logprob detokenization, per-request streaming metrics,
   and request dumping. Stop authority stays with the scheduler —
@@ -47,7 +47,6 @@ from tokenspeed.runtime.engine.collector import RequestOutputCollector
 from tokenspeed.runtime.engine.detokenizer import IncrementalDetokenizer
 from tokenspeed.runtime.engine.io_struct import (
     BatchEmbeddingOut,
-    BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
 )
@@ -110,9 +109,7 @@ class OutputProcessor:
 
     def handle_batch_output(
         self,
-        recv_obj: (
-            BatchStrOut | BatchEmbeddingOut | BatchMultimodalOut | BatchTokenIDOut
-        ),
+        recv_obj: BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut,
     ):
         for i, rid in enumerate(recv_obj.rids):
             state: ReqState = self.engine.rid_to_state.get(rid, None)
@@ -234,8 +231,8 @@ class OutputProcessor:
                     if len(recv_obj.output_extra_infos):
                         out_dict["output_extra_info"] = recv_obj.output_extra_infos[i]
                 else:
-                    # Raw-token path: skip_tokenizer_init, mm_mode=multi_ids,
-                    # or ``enable_inline_detokenizer`` is on but
+                    # Raw-token path: skip_tokenizer_init, or
+                    # ``enable_inline_detokenizer`` is on but
                     # ``self.tokenizer is None`` unexpectedly. Keep the
                     # response shape aligned with the BatchStrOut path by
                     # always populating ``text`` from the accumulated state.
@@ -286,8 +283,6 @@ class OutputProcessor:
                         out_dict["output_extra_info"] = recv_obj.output_extra_infos[i]
                     if output_multi_ids is not None:
                         out_dict["output_multi_ids"] = output_multi_ids
-            elif isinstance(recv_obj, BatchMultimodalOut):
-                raise NotImplementedError()
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOut)
                 out_dict = {

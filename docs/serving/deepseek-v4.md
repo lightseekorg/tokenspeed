@@ -30,8 +30,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
 | `--kv-cache-dtype fp8_e4m3` | V4 SWA cache rows are uint8-packed FP8 NoPE + BF16 RoPE + UE8M0 scale; FP8 e4m3 is the only supported KV dtype. |
 | `--moe-backend mega_moe` | Activates the DeepGEMM `fp8_fp4_mega_moe` fused experts. Requires `tokenspeed-deepgemm>=2.5.0.post20260424`. |
 | `--attention-use-fp4-indexer-cache` | Stores indexer keys as MXFP4 (`[values \| ue8m0 scales]`); the FP8 fallback path is reference-only. |
-| `--enable-mixed-batch` | Enables mixed prefill/decode scheduling for V4 sparse attention. It is off by default globally because other backend paths do not all support mixed batches yet. |
+| `--enable-mixed-batch` | Lets the scheduler issue prefill and decode requests in the same iteration. Off by default globally; opt in per workload. |
 | `--trust-remote-code` | The HF config uses model-class architectures registered via remote code. |
+
+## Parser defaults
+
+`tokenspeed serve deepseek-ai/DeepSeek-V4-Flash` automatically selects
+`--reasoning-parser deepseek_v31` and `--tool-call-parser deepseek_v4`.
+Pass explicit parser flags to override these defaults.
 
 ## Block size
 
@@ -44,9 +50,6 @@ also be bumped to 256.)
 
 ## Optional flags
 
-- `--disable-deepseek-v4-fast-mhc`: disables the tilelang+DeepGEMM fused mHC
-  path; falls back to the PyTorch reference. Use when tilelang or DeepGEMM JIT
-  is unavailable.
 - `--deepseek-v4-mega-moe-max-num-tokens N`: caps the DeepGEMM mega_moe
   workspace (`0` lets the kernel pick).
 - `--deepseek-v4-indexer-prefill-max-logits-mb N`: caps the FP4 indexer

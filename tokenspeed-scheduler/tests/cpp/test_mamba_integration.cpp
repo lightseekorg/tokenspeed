@@ -127,6 +127,188 @@ TEST_F(MambaIntegrationTest, AbortFreesMambaSlots) {
     PlanOnce();
 }
 
+class MambaDecodeCapacityTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 2;
+        cfg.max_batch_size = 1;
+        return cfg;
+    }
+};
+
+TEST_F(MambaDecodeCapacityTest, PrefillDoneDecodeCapacityMissRetractsInsteadOfThrowing) {
+    Submit(MakeRequestSpec("r1", 1));
+
+    auto prefill = PlanOnce();
+    ASSERT_FALSE(prefill.Operations().empty());
+    SendForwardDone("r1", {100});
+
+    ExecutionPlan plan;
+    EXPECT_NO_THROW(plan = PlanOnce());
+
+    auto writebacks = ExtractCacheOpsOfKind<FlatWriteBackOperation>(plan);
+    ASSERT_EQ(writebacks.size(), 1u);
+}
+
+class MambaUnalignedCheckpointTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 16;
+        cfg.mamba_cache_chunk_size = 4;
+        cfg.max_scheduled_tokens = 3;
+        cfg.enable_l3_storage = false;
+        return cfg;
+    }
+
+    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) return fwd;
+        }
+        return nullptr;
+    }
+};
+
+TEST_F(MambaUnalignedCheckpointTest, ChunkBoundaryNotAlignedToMambaChunkDoesNotPublishCheckpoint) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4, 5}});
+
+    auto first_chunk = PlanOnce();
+    const auto* first_forward = GetForward(first_chunk);
+    ASSERT_NE(first_forward, nullptr);
+    ASSERT_EQ(first_forward->input_lengths[0], 3);
+
+    auto second_chunk = PlanOnce();
+    const auto* second_forward = GetForward(second_chunk);
+    ASSERT_NE(second_forward, nullptr);
+
+    SendFinish("r1");
+    PlanOnce();
+
+    Submit(RequestSpec{.request_id = "r2", .tokens = {1, 2, 9}});
+    auto prefix_probe = PlanOnce();
+    const auto* probe_forward = GetForward(prefix_probe);
+    ASSERT_NE(probe_forward, nullptr);
+    ASSERT_EQ(probe_forward->request_ids.size(), 1u);
+    EXPECT_EQ(probe_forward->request_ids[0], "r2");
+    EXPECT_EQ(probe_forward->extend_prefix_lens[0], 0);
+    EXPECT_EQ(probe_forward->mamba_cow_src_indices[0], -1)
+        << "C++ must not publish a checkpoint that Python skipped at an unaligned boundary";
+}
+
+class MambaL2IntegrationTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 16;
+        cfg.enable_mamba_l2 = true;
+        cfg.mamba_l2_host_slots = 16;
+        cfg.host_allocator.total_pages = 32;
+        return cfg;
+    }
+
+    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cop = std::get_if<CacheOperation>(&op)) {
+                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
+                    return wb;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static const FlatLoadBackOperation* GetLoadBack(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cop = std::get_if<CacheOperation>(&op)) {
+                if (auto* lb = std::get_if<FlatLoadBackOperation>(cop)) {
+                    return lb;
+                }
+            }
+        }
+        return nullptr;
+    }
+};
+
+TEST_F(MambaL2IntegrationTest, FinishWriteBackCarriesMambaPair) {
+    Submit(MakeRequestSpec("r1", 2));
+    PlanOnce();
+    SendForwardDone("r1", {100});
+    PlanOnce();
+
+    SendFinish("r1");
+    auto plan = PlanOnce();
+    const auto* wb = GetWriteBack(plan);
+    ASSERT_NE(wb, nullptr);
+    ASSERT_FALSE(wb->op_ids.empty());
+    ASSERT_TRUE(wb->src_pages_by_kind.contains("mamba"));
+    bool has_mamba_pair = false;
+    for (const auto& pages : wb->src_pages_by_kind.at("mamba")) {
+        has_mamba_pair = has_mamba_pair || !pages.empty();
+    }
+    EXPECT_TRUE(has_mamba_pair);
+}
+
+TEST_F(MambaL2IntegrationTest, WriteBackDoneDemotesDeviceAndNextRequestLoadsBackMamba) {
+    Submit(MakeRequestSpec("r1", 2));
+    PlanOnce();
+    SendForwardDone("r1", {100});
+    PlanOnce();
+
+    SendFinish("r1");
+    auto writeback_plan = PlanOnce();
+    const auto* wb = GetWriteBack(writeback_plan);
+    ASSERT_NE(wb, nullptr);
+    ASSERT_FALSE(wb->op_ids.empty());
+
+    SendWriteBackDone(wb->op_ids[0]);
+    PlanOnce();
+
+    Submit(MakeRequestSpec("r2", 3));
+    auto loadback_plan = PlanOnce();
+    const auto* lb = GetLoadBack(loadback_plan);
+    ASSERT_NE(lb, nullptr) << "written-back Mamba+KV cache must be host-only and require loadback";
+    ASSERT_TRUE(lb->src_pages_by_kind.contains("kv"));
+    ASSERT_TRUE(lb->src_pages_by_kind.contains("mamba"));
+    EXPECT_FALSE(lb->src_pages_by_kind.at("mamba").empty());
+}
+
+TEST_F(MambaL2IntegrationTest, HostOnlyMambaLoadsBackAfterPinnedWriteBackReleases) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4}});
+    PlanOnce();
+    SendForwardDone("r1", {100});
+    PlanOnce();
+
+    SendFinish("r1");
+    auto writeback_plan = PlanOnce();
+    const auto* wb = GetWriteBack(writeback_plan);
+    ASSERT_NE(wb, nullptr);
+    ASSERT_FALSE(wb->op_ids.empty());
+
+    Submit(RequestSpec{.request_id = "child", .tokens = {1, 2, 3, 4, 5, 6}});
+    PlanOnce();
+    SendForwardDone("child", {200});
+    PlanOnce();
+
+    SendWriteBackDone(wb->op_ids[0]);
+    PlanOnce();
+
+    ExecutionEvent abort_child;
+    abort_child.With(ForwardEvent{forward::Abort{.request_id = "child"}});
+    scheduler_->Advance(std::move(abort_child));
+    PlanOnce();
+
+    Submit(RequestSpec{.request_id = "probe", .tokens = {1, 2, 3, 4, 9}});
+    auto loadback_plan = PlanOnce();
+    const auto* lb = GetLoadBack(loadback_plan);
+    ASSERT_NE(lb, nullptr) << "host-only Mamba must load back after the pinning request releases";
+    ASSERT_TRUE(lb->src_pages_by_kind.contains("mamba"));
+    EXPECT_FALSE(lb->src_pages_by_kind.at("mamba").empty());
+}
+
 class DisablePrefixCacheMambaRetractTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

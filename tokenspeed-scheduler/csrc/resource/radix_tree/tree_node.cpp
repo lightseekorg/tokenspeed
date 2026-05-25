@@ -92,7 +92,20 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
         std::int32_t ref_count = host_resource_->RefCount();
         prefix.AttachResource(std::make_unique<HostResource>(host_resource_->SplitFirst(prefix_pages), ref_count));
     }
-    // Mamba resources stay in suffix node, no special handling needed
+    // Mamba stays in suffix.
+    // Invariant: snapshot-bearing nodes are never split (RadixTree refuses).
+    // A split here would dangle borrowed ids in active requests.
+    _assert(paged_cache_snapshot_ == nullptr,
+            "TreeNode::SplitSelfInto called on a node with an attached paged-cache snapshot; "
+            "splitting would invalidate borrowed page id references in active requests");
+}
+
+void TreeNode::AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot) {
+    paged_cache_snapshot_ = std::move(snapshot);
+}
+
+std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCacheSnapshot() {
+    return std::move(paged_cache_snapshot_);
 }
 
 void TreeNode::SetPersisted(bool persisted) {
@@ -125,6 +138,11 @@ std::optional<cache_op_id> TreeNode::CacheOpId() const {
 std::int32_t TreeNode::MambaSlotIndex() const {
     _assert(mamba_slot_ != nullptr, "MambaSlotIndex called on node without mamba");
     return mamba_slot_->Index();
+}
+
+std::int32_t TreeNode::MambaHostSlotIndex() const {
+    _assert(mamba_host_slot_ != nullptr, "MambaHostSlotIndex called on node without mamba host slot");
+    return mamba_host_slot_->Index();
 }
 
 }  // namespace tokenspeed

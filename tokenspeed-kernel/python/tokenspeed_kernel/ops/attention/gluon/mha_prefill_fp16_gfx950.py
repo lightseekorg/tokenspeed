@@ -26,47 +26,24 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, tl
+from tokenspeed_kernel._triton import gl, gluon
+from tokenspeed_kernel.ops.attention.gluon.utils import (
+    _INV_LN2,
+    _INV_LN2_VALUE,
+    InputStrides,
+    max,
+    maximum,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
-_INV_LN2_VALUE = 1.4426950408889634
-_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Utilities
-# ===-----------------------------------------------------------------------===#
-
-
-@gluon.jit
-def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
-    return gl.maximum(a, b, propagate_nan=propagate_nan)
-
-
-@gluon.jit
-def max(input, axis=None, keep_dims=False):
-    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
-
 
 # ===-----------------------------------------------------------------------===#
 # Kernel Config
 # ===-----------------------------------------------------------------------===#
-
-
-@gluon.aggregate
-class InputLayout:
-    stride_t: gl.constexpr
-    stride_h: gl.constexpr
-    stride_d: gl.constexpr
-
-    @gluon.jit
-    def offsets(self, token, head, dim):
-        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
-            gl.int32
-        )
 
 
 @gluon.aggregate
@@ -85,9 +62,9 @@ class AttentionConfig:
     WINDOW_LEFT: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
-    q_input_layout: InputLayout
-    k_input_layout: InputLayout
-    v_input_layout: InputLayout
+    q_strides: InputStrides
+    k_strides: InputStrides
+    v_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
     q_layout: gl.constexpr
@@ -114,9 +91,9 @@ class AttentionConfig:
         HAS_LSE,
         IS_SLIDING,
         WINDOW_LEFT,
-        q_input_layout,
-        k_input_layout,
-        v_input_layout,
+        q_strides,
+        k_strides,
+        v_strides,
     ):
         assert HEAD_DIM == 64
         assert NUM_WARPS == 4
@@ -137,10 +114,8 @@ class AttentionConfig:
             transposed=True,
             warps_per_cta=[NUM_WARPS, 1],
         )
-
         load_layout = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
         store_layout = load_layout
-
         k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
             [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
@@ -161,15 +136,19 @@ class AttentionConfig:
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
-        self.q_input_layout = q_input_layout
-        self.k_input_layout = k_input_layout
-        self.v_input_layout = v_input_layout
+        self.q_strides = q_strides
+        self.k_strides = k_strides
+        self.v_strides = v_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, qk_layout, k_width=8))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, qk_layout, k_width=8))
-        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, pv_layout, k_width=4))
-        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, pv_layout, k_width=4))
+        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=8)
+        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=8)
+        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=4)
+        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
+        self.q_layout = gl.constexpr(q_layout)
+        self.k_layout = gl.constexpr(k_layout)
+        self.p_layout = gl.constexpr(p_layout)
+        self.v_layout = gl.constexpr(v_layout)
         self.load_layout = gl.constexpr(load_layout)
         self.store_layout = gl.constexpr(store_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
@@ -263,7 +242,7 @@ class AttentionProgram:
             0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
-        offsets = cfg.q_input_layout.offsets(
+        offsets = cfg.q_strides.offsets(
             self.seq_base + offs_m[:, None], self.q_head, offs_d[None, :]
         )
         mask = offs_m[:, None] < self.seq_len
@@ -278,7 +257,7 @@ class AttentionProgram:
             0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        offsets = cfg.k_input_layout.offsets(
+        offsets = cfg.k_strides.offsets(
             self.seq_base + offs_n[:, None], self.kv_head, offs_d[None, :]
         )
         return offsets, offs_n
@@ -290,7 +269,7 @@ class AttentionProgram:
             0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        offsets = cfg.v_input_layout.offsets(
+        offsets = cfg.v_strides.offsets(
             self.seq_base + offs_n[:, None], self.kv_head, offs_d[None, :]
         )
         return offsets
@@ -298,12 +277,12 @@ class AttentionProgram:
     @gluon.jit
     def update_k_offsets(self, offsets):
         cfg = self.cfg
-        return offsets + cfg.BLOCK_N * cfg.k_input_layout.stride_t
+        return offsets + cfg.BLOCK_N * cfg.k_strides.stride_t
 
     @gluon.jit
     def update_v_offsets(self, offsets):
         cfg = self.cfg
-        return offsets + cfg.BLOCK_N * cfg.v_input_layout.stride_t
+        return offsets + cfg.BLOCK_N * cfg.v_strides.stride_t
 
     @gluon.jit
     def issue_buffer_load_k(self, offsets, k_smem, mask=None, other=None):
@@ -670,7 +649,7 @@ def process_single_attention_tile(
 
     k_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(1, cfg.k_layout))
     k_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.k_layout))
-    k_offsets = cfg.k_input_layout.offsets(
+    k_offsets = cfg.k_strides.offsets(
         program.seq_base + k_offs_n[None, :], program.kv_head, k_offs_d[:, None]
     )
     k_mask = k_offs_n[None, :] < program.seq_len
@@ -678,7 +657,7 @@ def process_single_attention_tile(
 
     v_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout))
     v_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
-    v_offsets = cfg.v_input_layout.offsets(
+    v_offsets = cfg.v_strides.offsets(
         program.seq_base + v_offs_n[:, None], program.kv_head, v_offs_d[None, :]
     )
     v_mask = v_offs_n[:, None] < program.seq_len
@@ -823,8 +802,13 @@ def process_attention_tile(
     program.store_output(output)
 
 
+# ===-----------------------------------------------------------------------===#
+# Entry Point
+# ===-----------------------------------------------------------------------===#
+
+
 @gluon.jit
-def attention_kernel(
+def _mha_prefill_fp16(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -868,9 +852,9 @@ def attention_kernel(
         HAS_LSE,
         IS_SLIDING,
         WINDOW_LEFT,
-        InputLayout(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
-        InputLayout(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
-        InputLayout(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
+        InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
+        InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
+        InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
     )
     k_smem = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty,
@@ -930,11 +914,6 @@ def attention_kernel(
                         program, k_smem, v_smem, boundary_mask0, boundary_mask1
                     )
             q_round += 1
-
-
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
 
 
 class LaunchConfig(NamedTuple):
@@ -1000,7 +979,6 @@ def get_config(
     priority=Priority.SPECIALIZED,
     traits={
         "head_dim": frozenset({64}),
-        "is_causal": frozenset({True}),
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False}),
@@ -1015,7 +993,6 @@ def gluon_mha_prefill_fp16_gfx950(
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
-    is_causal: bool = True,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -1040,7 +1017,7 @@ def gluon_mha_prefill_fp16_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    attention_kernel[config.grid](
+    _mha_prefill_fp16[config.grid](
         q,
         k,
         v,

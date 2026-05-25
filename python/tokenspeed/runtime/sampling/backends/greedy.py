@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
+from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -137,6 +138,13 @@ class GreedySamplingBackend(SamplingBackend):
         self._ones_buf = torch.ones(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
+        # Pre-allocated int32 buffer for ``sample``'s argmax output: lets the
+        # cute_dsl kernel write int32 token ids directly, skipping the
+        # ``.to(torch.int32)`` cast and its elementwise launch in the
+        # CUDA-graph-captured hot path.
+        self._sample_token_buf = torch.empty(
+            (config.max_bs,), dtype=torch.int32, device=config.device
+        )
         self._predict_buf = torch.zeros(
             (config.max_bs * config.max_draft_tokens_per_req,),
             dtype=torch.int32,
@@ -170,14 +178,12 @@ class GreedySamplingBackend(SamplingBackend):
             sampling_info.apply_vocab_mask(
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
-        tokens = torch.argmax(logits, -1).to(torch.int32)
+        bs = logits.shape[0]
+        tokens = cute_argmax(logits, out=self._sample_token_buf[:bs])
 
         if self.config.enable_output_logprobs:
 
             write_output_logprobs(logits_output, logits, tokens)
-
-        # Greedy backend allocates no sampling buffers — derive bs from logits.
-        bs = logits.shape[0]
 
         return tokens, self._ones_buf[:bs]
 
@@ -207,7 +213,7 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits_output.next_token_logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).reshape(
+        target_predict = cute_argmax(logits_output.next_token_logits).reshape(
             bs, num_tokens_per_req
         )
 

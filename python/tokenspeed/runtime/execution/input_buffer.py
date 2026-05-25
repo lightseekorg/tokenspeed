@@ -67,6 +67,9 @@ class InputBuffers:
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             self.positions_buf = torch.arange(0, max_num_tokens, dtype=torch.int64)
+            self.mrope_positions_buf = torch.zeros(
+                (3, max_num_tokens), dtype=torch.int64
+            )
             self.req_pool_indices_buf = torch.zeros((max_bs,), dtype=torch.int64)
             self.seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
             # Initialise to dummy_kv_slot so that padding positions (never
@@ -237,7 +240,7 @@ class InputBuffers:
                         torch.where(mask, decode_input_ids_tensor.unsqueeze(1), slot)
                     )
                 decode_ids = runtime_states.future_input_map[
-                    decode_req_pool_indices, :1
+                    decode_req_pool_indices
                 ].flatten()
                 self.input_ids_buf[prefill_token_count:total_tokens].copy_(
                     decode_ids,
@@ -281,6 +284,7 @@ class InputBuffers:
             self.req_pool_indices_buf[batch_size:].fill_(0)
             self.seq_lens_buf[batch_size:].fill_(1)
             self.positions_buf[total_tokens:].fill_(0)
+            self.mrope_positions_buf[:, total_tokens:].zero_()
 
         if (
             self.has_mamba
@@ -324,6 +328,7 @@ class InputBuffers:
             self.input_ids_buf[:total_tokens].fill_(1)
             self.out_cache_loc_buf[:total_tokens].fill_(self.dummy_kv_slot)
             self.positions_buf[:total_tokens].fill_(0)
+            self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:
             self.req_pool_indices_buf[:batch_size].fill_(0)
             self.seq_lens_buf[:batch_size].fill_(1)

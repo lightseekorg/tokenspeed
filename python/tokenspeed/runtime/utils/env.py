@@ -21,16 +21,19 @@
 import os
 import warnings
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
+global_server_args: ServerArgs | None = None
+
 global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
+    "mha_extend_mode": ServerArgs.mha_extend_mode,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
-    "disable_deepseek_v4_fast_mhc": ServerArgs.disable_deepseek_v4_fast_mhc,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
     "deepseek_v4_prefill_chunk_size": ServerArgs.deepseek_v4_prefill_chunk_size,
@@ -51,7 +54,7 @@ global_server_args_dict: dict = {
     "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
     "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "enable_eplb": ServerArgs.enable_eplb,
-    "mm_mode": ServerArgs.mm_mode,
+    "mm_attention_backend": ServerArgs.mm_attention_backend,
     "comm_fusion_max_num_tokens": ServerArgs.comm_fusion_max_num_tokens,
     "enable_allreduce_fusion": ServerArgs.enable_allreduce_fusion,
     "max_prefill_tokens": ServerArgs.max_prefill_tokens,
@@ -70,12 +73,14 @@ global_server_args_dict: dict = {
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
+    global global_server_args
+    global_server_args = server_args
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
+            "mha_extend_mode": server_args.mha_extend_mode,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
-            "disable_deepseek_v4_fast_mhc": server_args.disable_deepseek_v4_fast_mhc,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
             "deepseek_v4_prefill_chunk_size": server_args.deepseek_v4_prefill_chunk_size,
@@ -97,7 +102,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
             "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
             "enable_eplb": server_args.enable_eplb,
-            "mm_mode": server_args.mm_mode,
+            "mm_attention_backend": server_args.mm_attention_backend,
             "comm_fusion_max_num_tokens": server_args.comm_fusion_max_num_tokens,
             "enable_allreduce_fusion": server_args.enable_allreduce_fusion,
             "max_prefill_tokens": server_args.max_prefill_tokens,
@@ -114,6 +119,18 @@ def global_server_args_dict_update(server_args: ServerArgs):
         }
     )
     pdl_enabled.cache_clear()
+
+
+def get_global_server_args():
+    if global_server_args is not None:
+        return global_server_args
+
+    defaults = dict(global_server_args_dict)
+    defaults.setdefault("mm_attention_backend", None)
+    defaults.setdefault("skip_tokenizer_init", False)
+    defaults.setdefault("chunked_prefill_size", None)
+    defaults.setdefault("tp_size", 1)
+    return SimpleNamespace(**defaults)
 
 
 class EnvField:
@@ -284,6 +301,10 @@ class Envs:
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
+
+    # Multimodal / VLM
+    TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
+    TOKENSPEED_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
     # fmt: on
 

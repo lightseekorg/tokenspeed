@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.ops.activation.triton import fused_gate_sigmoid_mul_add
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
@@ -263,14 +263,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             with fork.branch():
                 if self.shared_expert is not None:
                     shared_output = self.shared_expert(hidden_states)
-                    if (
-                        hidden_states.shape[0] > 0
-                        and self.shared_expert_gate is not None
-                    ):
-                        shared_output = (
-                            F.sigmoid(self.shared_expert_gate(hidden_states))
-                            * shared_output
-                        )
 
             if hidden_states.shape[0] > 0:
                 topk_output = self.topk(hidden_states, router_logits)
@@ -289,7 +281,15 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             )
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(0),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states = final_hidden_states + shared_output
 
         # Reduce-scatter / all-reduce expert output back to local token count
         final_hidden_states, _ = self.comm_manager.post_mlp_fused(
@@ -316,10 +316,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
-            if hidden_states.shape[0] > 0 and self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
             if self.mapping.dense.has_tp:
                 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 
@@ -348,6 +344,14 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         )
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(0),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states.view(num_tokens, hidden_dim)

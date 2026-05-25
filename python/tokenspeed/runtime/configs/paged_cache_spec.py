@@ -22,6 +22,7 @@ from typing import Dict, Literal, Optional, Sequence
 from tokenspeed.runtime.utils.common import ceil_div
 
 Retention = Literal["full_history", "sliding_window"]
+Family = Literal["history", "state"]
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,8 @@ class PagedCacheGroupSpec:
     rows_per_page: int
     entry_stride_tokens: int
     sliding_window_tokens: Optional[int]
+    # History groups form a chain; State groups only need the trailing window.
+    family: Family = "history"
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
@@ -81,10 +84,16 @@ def compute_paged_cache_group_page_counts(
                     f"PagedCacheGroupSpec {spec.group_id}: sliding group missing "
                     "positive sliding_window_tokens"
                 )
-            per_req_tokens = min(window - 1 + max_scheduled_tokens, max_context_len)
-            per_req_pages = ceil_div(per_req_tokens, raw_per_page) + 1
+            resident_tokens_per_req = min(max(window - 1, 0), max_context_len)
+            resident_pages = max_live_requests * ceil_div(
+                resident_tokens_per_req, raw_per_page
+            )
+            scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
+            scheduled_pages = ceil_div(scheduled_tokens, raw_per_page)
             total = (
-                max_live_requests * per_req_pages
+                resident_pages
+                + scheduled_pages
+                + max_live_requests
                 + _PAGED_CACHE_GROUP_DUMMY_PAGES
                 + safety_margin
             )

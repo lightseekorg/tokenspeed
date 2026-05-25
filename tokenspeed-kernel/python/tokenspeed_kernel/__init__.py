@@ -23,9 +23,11 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
+    mha_decode_scheduler_metadata,
     mha_decode_with_kvcache,
+    mha_extend_with_kvcache,
+    mha_merge_state,
     mha_prefill,
-    mha_prefill_with_kvcache,
 )
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import (
@@ -35,15 +37,33 @@ from tokenspeed_kernel.ops.moe import (
     moe_fused,
     moe_route,
 )
+from tokenspeed_kernel.ops.quantization import (
+    quantize_fp8,
+    quantize_fp8_with_scale,
+    quantize_mxfp4,
+    quantize_mxfp8,
+    quantize_nvfp4,
+)
 
 __all__ = [
+    # gemm
     "mm",
+    # moe
     "moe_route",
     "moe_dispatch",
     "moe_experts",
     "moe_combine",
     "moe_fused",
+    # attention
     "mha_prefill",
-    "mha_prefill_with_kvcache",
+    "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "mha_merge_state",
+    "mha_decode_scheduler_metadata",
+    # quantization
+    "quantize_fp8",
+    "quantize_fp8_with_scale",
+    "quantize_mxfp8",
+    "quantize_nvfp4",
+    "quantize_mxfp4",
 ]

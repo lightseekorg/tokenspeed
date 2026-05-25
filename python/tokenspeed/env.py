@@ -72,6 +72,9 @@ PACKAGE_LIST = [
     "requests",
     "setproctitle",
     "tiktoken",
+    "tokenspeed-smg",
+    "tokenspeed-smg-grpc-proto",
+    "tokenspeed-smg-grpc-servicer",
     "torch",
     "torchvision",
     "tqdm",
@@ -79,6 +82,7 @@ PACKAGE_LIST = [
     "uv",
     "uvicorn",
     "uvloop",
+    "viztracer",
     "xgrammar",
 ]
 

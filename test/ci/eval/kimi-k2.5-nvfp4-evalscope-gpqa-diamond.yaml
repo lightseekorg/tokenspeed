@@ -17,6 +17,7 @@ server:
     --model nvidia/Kimi-K2.5-NVFP4
     --tp 4
     --max-model-len 80000
+    --enable-mixed-batch
     --trust-remote-code
     --attention-backend tokenspeed_mla
     --moe-backend flashinfer_trtllm
@@ -24,9 +25,9 @@ server:
     --kv-cache-dtype fp8
     --weight-loader-prefetch-checkpoints
     --speculative-algorithm EAGLE3
-    --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3
+    --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla
     --speculative-num-steps 1
-    --drafter-attention-backend trtllm
+    --drafter-attention-backend tokenspeed_mla
     --enable-cache-report
     --host 127.0.0.1
     --port 8000

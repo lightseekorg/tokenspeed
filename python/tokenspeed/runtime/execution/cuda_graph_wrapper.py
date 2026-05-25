@@ -224,9 +224,7 @@ class CudaGraphWrapper:
         self.world_size = config.world_size
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        paged_cache_group_specs = tuple(
-            getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
-        )
+        paged_cache_group_specs = tuple(token_to_kv_pool.paged_cache_group_specs)
         try:
             attn_backend.init_cuda_graph_state(
                 self.max_bs,
@@ -241,7 +239,7 @@ class CudaGraphWrapper:
             )
         if draft_attn_backend is not None:
             draft_paged_cache_group_specs = tuple(
-                getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+                draft_token_to_kv_pool.paged_cache_group_specs
             )
             try:
                 draft_attn_backend.init_cuda_graph_state(
@@ -308,7 +306,6 @@ class CudaGraphWrapper:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
-            keep_full_logits=True,
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -416,7 +413,7 @@ class CudaGraphWrapper:
         return graph, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
-        specs = tuple(getattr(pool, "paged_cache_group_specs", ()) or ())
+        specs = tuple(pool.paged_cache_group_specs)
         if not specs:
             return None
         out = {}
@@ -447,15 +444,13 @@ class CudaGraphWrapper:
             bs,
             self.token_to_kv_pool,
         )
-        if paged_cache_block_tables is not None and getattr(
-            self.attn_backend,
-            "uses_paged_cache_groups",
-            False,
+        if (
+            paged_cache_block_tables is not None
+            and self.attn_backend.uses_paged_cache_groups
         ):
             capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
-            bs * self.max_tokens_per_req,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
             ForwardMode.DECODE,
@@ -468,10 +463,9 @@ class CudaGraphWrapper:
                     bs,
                     self.draft_token_to_kv_pool,
                 )
-                if draft_paged_cache_block_tables is not None and getattr(
-                    self.draft_attn_backend,
-                    "uses_paged_cache_groups",
-                    False,
+                if (
+                    draft_paged_cache_block_tables is not None
+                    and self.draft_attn_backend.uses_paged_cache_groups
                 ):
                     draft_kwargs["paged_cache_block_tables"] = (
                         draft_paged_cache_block_tables
@@ -479,7 +473,6 @@ class CudaGraphWrapper:
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
-                bs * self.max_tokens_per_req,
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
                 ForwardMode.DECODE,
@@ -581,11 +574,10 @@ class CudaGraphWrapper:
                 kwargs["paged_cache_block_table_base_offsets"] = (
                     paged_cache_block_table_base_offsets
                 )
-        if getattr(self.attn_backend, "uses_padded_decode_token_mask", False):
+        if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
-            padded_bs * self.max_tokens_per_req,
             req_pool_indices,
             seq_lens,
             req_to_page=req_to_page,
@@ -595,7 +587,6 @@ class CudaGraphWrapper:
         if self.draft_attn_backend is not None:
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
-                padded_bs * self.max_tokens_per_req,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,
@@ -607,6 +598,7 @@ class CudaGraphWrapper:
     def _init_forward_metadata(
         self,
         padded_bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
@@ -615,10 +607,10 @@ class CudaGraphWrapper:
     ):
         """Eager path — allocate/refresh metadata for the upcoming forward."""
         self.attn_backend.init_forward_metadata(
-            padded_bs,
-            padded_bs * self.max_tokens_per_req,
-            req_pool_indices,
-            seq_lens,
+            bs=padded_bs,
+            num_extends=num_extends,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
             req_to_page=req_to_page,
             forward_mode=forward_mode,
             **kwargs,
@@ -637,9 +629,11 @@ class CudaGraphWrapper:
             #     ``seq_lens_k=seq_lens[:bs]``).
             # So the kernel sees the value the drafter just wrote, without
             # rebuilding metadata per step.
-            # The EXTEND-mode prefill init still uses the controller's
-            # ``seq_lens`` because that path computes ``cu_seqlens_k`` from it
-            # eagerly (cumsum at init time), not via aliasing.
+            # Pre-write the buffer with the controller's seq_lens so the
+            # prefill-side eager work (cumsum at init) and the live-aliased
+            # decode side both see correct values from step 0 onward. Each
+            # is_draft backend fills both prefill+decode metadata in this
+            # one call.
             #
             # TODO: relying on aliasing for correctness is fragile — a stray
             # copy or a misrouted buffer silently produces wrong outputs.
@@ -647,36 +641,16 @@ class CudaGraphWrapper:
             # so each kernel invocation carries its own value rather than
             # reading through a tensor registered at init.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
-            if forward_mode.is_extend_or_mixed():
-                # Step 0 uses the caller's prefix kwargs; subsequent decode
-                # steps use one-token-per-request metadata. Populate each
-                # slot with its own init call.
-                self.draft_attn_backend.init_forward_metadata(
-                    padded_bs,
-                    padded_bs * self.max_tokens_per_req,
-                    req_pool_indices,
-                    seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=forward_mode,
-                    **kwargs,
-                )
-                self.draft_attn_backend.init_forward_metadata(
-                    padded_bs,
-                    padded_bs,
-                    req_pool_indices,
-                    draft_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=ForwardMode.DECODE,
-                )
-            else:
-                self.draft_attn_backend.init_forward_metadata(
-                    padded_bs,
-                    padded_bs * self.max_tokens_per_req,
-                    req_pool_indices,
-                    draft_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=ForwardMode.DECODE,
-                )
+            draft_seq_lens.copy_(seq_lens)
+            self.draft_attn_backend.init_forward_metadata(
+                bs=padded_bs,
+                num_extends=num_extends,
+                req_pool_indices=req_pool_indices,
+                seq_lens=draft_seq_lens,
+                req_to_page=self.drafter.req_to_page,
+                forward_mode=forward_mode,
+                **kwargs,
+            )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
@@ -790,7 +764,7 @@ class CudaGraphWrapper:
             if (
                 bs == 0
                 and paged_cache_block_tables is None
-                and getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                and self.attn_backend.uses_paged_cache_groups
             ):
                 paged_cache_block_tables = self._capture_paged_cache_block_tables(
                     padded_bs,
@@ -836,6 +810,7 @@ class CudaGraphWrapper:
         else:
             self._init_forward_metadata(
                 padded_bs,
+                ctx.num_extends,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=req_to_page,
@@ -845,22 +820,20 @@ class CudaGraphWrapper:
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
-                num_extends=ctx.num_extends,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
-                padded_static_len=ctx.padded_static_len,
                 spec_info=spec_info,
                 paged_cache_block_tables=(
                     paged_cache_block_tables
-                    if getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                    if self.attn_backend.uses_paged_cache_groups
                     else None
                 ),
                 paged_cache_block_table_base_offsets=(
                     paged_cache_block_table_base_offsets
-                    if getattr(self.attn_backend, "uses_paged_cache_groups", False)
+                    if self.attn_backend.uses_paged_cache_groups
                     else None
                 ),
                 **mamba_kwargs,

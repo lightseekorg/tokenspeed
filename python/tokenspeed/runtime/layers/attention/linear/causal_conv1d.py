@@ -465,7 +465,11 @@ def causal_conv1d_fn(
         batch_ptr = metadata.batch_ptr
         token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
     else:
-        seqlens = np.diff(query_start_loc.to("cpu"))
+        seq_lens_cpu = kwargs.get("seq_lens_cpu")
+        if seq_lens_cpu is not None:
+            seqlens = np.asarray(seq_lens_cpu)
+        else:
+            seqlens = np.diff(query_start_loc.to("cpu"))
         args = seqlens
         MAX_NUM_PROGRAMS = 1024
 
@@ -538,32 +542,25 @@ def causal_conv1d_fn(
     if metadata is None:
 
         def num_program(META, seqlens):
-            tot = 0
+            nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
+            tot = int(nums.sum())
 
-            mlist = []
-            offsetlist = []  # type: ignore
-
-            nums = -(-seqlens // META["BLOCK_M"])
-
-            tot = nums.sum().item()
             mlist = np.repeat(np.arange(len(nums)), nums)
-            for idx, num in enumerate(nums):
-                offsetlist.extend(
-                    range(num)
-                )  # chunk-idx if a sequence is split into multiple chunks
+            # offsetlist[i] = local chunk index within its sequence
+            offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
+            mlist_len = mlist.shape[0]
 
-            if META["batch_ptr"].nelement() < len(mlist):
-                newlen = len(mlist) + 1
+            if META["batch_ptr"].nelement() < mlist_len:
+                newlen = mlist_len + 1
                 META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
                 META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
 
-            if META["batch_ptr"].nelement() >= len(mlist):
-                META["batch_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(mlist))
-                )
-                META["token_chunk_offset_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(offsetlist))
-                )
+            combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
+            combined_cpu = torch.from_numpy(combined_np).pin_memory()
+            META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
+            META["token_chunk_offset_ptr"][:mlist_len].copy_(
+                combined_cpu[1], non_blocking=True
+            )
 
             META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
             META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
@@ -665,6 +662,7 @@ def _causal_conv1d_update_kernel(
     conv_state_indices_ptr,
     num_accepted_tokens_ptr,
     intermediate_conv_window_ptr,
+    output_state_indices_ptr,
     o_ptr,  # (batch, dim, seqlen)
     # Matrix dimensions
     batch: int,
@@ -686,6 +684,8 @@ def _causal_conv1d_update_kernel(
     stride_inter_step: tl.constexpr,
     stride_inter_dim: tl.constexpr,
     stride_inter_win: tl.constexpr,
+    stride_output_state_indices_seq: tl.constexpr,
+    stride_output_state_indices_step: tl.constexpr,
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
@@ -701,6 +701,7 @@ def _causal_conv1d_update_kernel(
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
+    HAS_OUTPUT_STATE_INDICES: tl.constexpr,
 ):
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
@@ -763,7 +764,7 @@ def _causal_conv1d_update_kernel(
 
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
 
-    if not SAVE_INTERMEDIATE:
+    if not SAVE_INTERMEDIATE and not HAS_OUTPUT_STATE_INDICES:
         # STEP 2: update conv_state in place.  Speculative verify uses
         # SAVE_INTERMEDIATE and scatters the accepted intermediate window after
         # verification, so writing the real conv_state here is both wrong and
@@ -919,6 +920,24 @@ def _causal_conv1d_update_kernel(
                 tl.store(base_ptr + 1 * stride_inter_win, col1, mask=mask_w)
             if KERNEL_WIDTH >= 4:
                 tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
+        if HAS_OUTPUT_STATE_INDICES:
+            output_state_idx = tl.load(
+                output_state_indices_ptr
+                + idx_seq * stride_output_state_indices_seq
+                + idx_token * stride_output_state_indices_step
+            ).to(tl.int64)
+            if output_state_idx >= 0:
+                output_base = (
+                    conv_state_ptr
+                    + output_state_idx * stride_conv_state_seq
+                    + idx_feats * stride_conv_state_dim
+                )
+                if KERNEL_WIDTH >= 2:
+                    tl.store(output_base + 0 * stride_conv_state_tok, col0, mask=mask_w)
+                if KERNEL_WIDTH >= 3:
+                    tl.store(output_base + 1 * stride_conv_state_tok, col1, mask=mask_w)
+                if KERNEL_WIDTH >= 4:
+                    tl.store(output_base + 2 * stride_conv_state_tok, col2, mask=mask_w)
 
 
 def causal_conv1d_update(
@@ -931,6 +950,7 @@ def causal_conv1d_update(
     conv_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     intermediate_conv_window: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
@@ -1003,7 +1023,10 @@ def causal_conv1d_update(
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
     )
-    state_len = width - 1 + (seqlen - 1)  # effective state_len needed
+    if output_state_indices is not None or intermediate_conv_window is not None:
+        state_len = width - 1
+    else:
+        state_len = width - 1 + (seqlen - 1)  # effective state_len needed
     np2_statelen = triton.next_power_of_2(state_len)
 
     def grid(META):
@@ -1022,6 +1045,13 @@ def causal_conv1d_update(
         )
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+    if output_state_indices is not None:
+        stride_output_state_indices_seq, stride_output_state_indices_step = (
+            output_state_indices.stride(0),
+            output_state_indices.stride(1),
+        )
+    else:
+        stride_output_state_indices_seq = stride_output_state_indices_step = 0
 
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
@@ -1033,6 +1063,7 @@ def causal_conv1d_update(
         conv_state_indices,
         num_accepted_tokens,
         intermediate_conv_window if intermediate_conv_window is not None else x,
+        output_state_indices if output_state_indices is not None else x,
         out,
         # Matrix dimensions
         batch,
@@ -1054,6 +1085,8 @@ def causal_conv1d_update(
         stride_inter_step,
         stride_inter_dim,
         stride_inter_win,
+        stride_output_state_indices_seq,
+        stride_output_state_indices_step,
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
@@ -1069,6 +1102,7 @@ def causal_conv1d_update(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
     )
     if unsqueeze:
         out = out.squeeze(-1)

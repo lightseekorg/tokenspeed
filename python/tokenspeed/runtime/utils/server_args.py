@@ -95,6 +95,12 @@ class ServerArgs:
     mamba_track_interval: int = 256
     max_mamba_cache_size: int | None = None
     mamba_full_memory_ratio: float = 0.9
+    enable_mamba_l2: bool = False
+    mamba_l2_host_slots: int = 0
+    mamba_l2_ratio: float = 2.0
+    mamba_l2_layout: str = "layer_first"
+    mamba_l2_io_backend: str = "kernel"
+    mamba_l2_host_gb: int = 0
 
     # Other runtime options
     stream_interval: int = 1
@@ -185,9 +191,9 @@ class ServerArgs:
     sampling_backend: str | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
+    mha_extend_mode: Literal["paged", "ragged"] = "paged"
 
     # DeepSeek V4
-    disable_deepseek_v4_fast_mhc: bool = False
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -260,7 +266,7 @@ class ServerArgs:
     mapping: Mapping | None = None
 
     mla_chunk_multiplier: int = 4
-    mm_mode: str = "none"
+    mm_attention_backend: str | None = None
 
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
@@ -355,7 +361,7 @@ class ServerArgs:
             elif self.mapping.world_size >= 8:
                 self.gpu_memory_utilization = 0.81
             elif self.mapping.world_size >= 4:
-                self.gpu_memory_utilization = 0.85
+                self.gpu_memory_utilization = 0.95
             elif self.mapping.world_size >= 2:
                 self.gpu_memory_utilization = 0.87
             else:
@@ -923,6 +929,43 @@ class ServerArgs:
             default=ServerArgs.mamba_full_memory_ratio,
             help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
         )
+        parser.add_argument(
+            "--enable-mamba-l2",
+            action="store_true",
+            help="Enable host-memory L2 cache for Mamba state slots.",
+        )
+        parser.add_argument(
+            "--mamba-l2-host-slots",
+            type=int,
+            default=ServerArgs.mamba_l2_host_slots,
+            help="Number of host Mamba L2 slots. If 0, derive from --mamba-l2-host-gb or --mamba-l2-ratio.",
+        )
+        parser.add_argument(
+            "--mamba-l2-ratio",
+            type=float,
+            default=ServerArgs.mamba_l2_ratio,
+            help="Mamba host L2 slot ratio relative to device Mamba slots when host slots are not explicit.",
+        )
+        parser.add_argument(
+            "--mamba-l2-layout",
+            type=str,
+            choices=["layer_first"],
+            default=ServerArgs.mamba_l2_layout,
+            help="Mamba host L2 memory layout.",
+        )
+        parser.add_argument(
+            "--mamba-l2-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.mamba_l2_io_backend,
+            help="IO backend for Mamba L2 host/device transfers.",
+        )
+        parser.add_argument(
+            "--mamba-l2-host-gb",
+            type=int,
+            default=ServerArgs.mamba_l2_host_gb,
+            help="Mamba L2 host memory budget in GiB. Overrides --mamba-l2-ratio when host slots are not explicit.",
+        )
 
         parser.add_argument(
             "--max-prefill-tokens",
@@ -1230,6 +1273,18 @@ class ServerArgs:
             "If not specified, uses the same backend as the main model (attention_backend).",
         )
         parser.add_argument(
+            "--mha-extend-mode",
+            type=str,
+            choices=["paged", "ragged"],
+            default=ServerArgs.mha_extend_mode,
+            help=(
+                "MHA extend strategy for prefix-cache/chunked-prefill batches. "
+                "'paged' uses one paged KV-cache attention kernel over full visible KV; "
+                "'ragged' uses ragged current-chunk prefill plus paged cached-prefix "
+                "attention and merges with mha_merge_state."
+            ),
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=["greedy", "flashinfer", "flashinfer_full"],
@@ -1241,7 +1296,8 @@ class ServerArgs:
             "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "
-            "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory).",
+            "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
+            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",
@@ -1263,16 +1319,6 @@ class ServerArgs:
             const=True,
             default=ServerArgs.use_trtllm_ragged_deepseek_prefill,
             help="Use ragged prefill for DeepSeek MLA attention.",
-        )
-        parser.add_argument(
-            "--disable-deepseek-v4-fast-mhc",
-            action="store_true",
-            default=ServerArgs.disable_deepseek_v4_fast_mhc,
-            help=(
-                "Disable the DeepSeek V4 fast multi-head capture (mHC) layer. "
-                "Falls back to the PyTorch reference when set or when nvcc is "
-                "not available."
-            ),
         )
         parser.add_argument(
             "--deepseek-v4-mega-moe-max-num-tokens",
@@ -1639,6 +1685,20 @@ class ServerArgs:
             ),
         )
 
+        # Multimodal
+        mm_attention_backend_choices = [
+            "fa3",
+            "fa4",
+            "triton_attn",
+            "flashinfer_cudnn",
+        ]
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=mm_attention_backend_choices,
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
+        )
         # Disaggregation
         parser.add_argument(
             "--disaggregation-mode",
@@ -1691,9 +1751,6 @@ class ServerArgs:
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
-
-        # Multi-modal inference mode
-        parser.add_argument("--mm-mode", type=str, default=ServerArgs.mm_mode)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
