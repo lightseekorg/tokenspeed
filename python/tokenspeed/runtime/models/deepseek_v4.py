@@ -3070,7 +3070,7 @@ class DeepseekV4Indexer(nn.Module):
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
-            indexer_block_table = cache_metadata.cache.compressed_block_table(
+            indexer_block_table = cache_metadata.compressed_block_table(
                 self.compress_ratio,
                 indexer_block_size,
             )
@@ -3680,13 +3680,13 @@ class DeepseekV4Attention(nn.Module):
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
         cache_metadata = metadata.cache
-        if cache_metadata.cache.swa_block_table is not None:
+        if cache_metadata.swa_block_table is not None:
             swa_slot_mapping = _group_slot_mapping_from_raw(
                 positions,
                 metadata.token_to_req_indices[: positions.numel()],
                 cache_metadata.swa_block_table,
                 pool.swa_block_size,
-                base_offsets=cache_metadata.cache.swa_base_logical_page,
+                base_offsets=cache_metadata.swa_base_logical_page,
             )
         else:
             swa_slot_mapping = out_cache_loc
