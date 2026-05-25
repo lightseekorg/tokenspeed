@@ -556,8 +556,25 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
+        num_tokens_arg = kwargs.pop("num_tokens", None)
+        positions = kwargs.get("positions")
         num_extends_arg = kwargs.pop("num_extends", None)
         num_extends = bs if num_extends_arg is None else int(num_extends_arg)
+        if num_tokens_arg is not None:
+            num_tokens = int(num_tokens_arg)
+        elif isinstance(positions, torch.Tensor):
+            num_tokens = int(positions.numel())
+        elif forward_mode is not None and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+        ):
+            num_tokens = bs * max(
+                1,
+                int(
+                    self.speculative_num_draft_tokens or self.speculative_num_steps or 1
+                ),
+            )
+        else:
+            num_tokens = bs
         del kwargs
         device = seq_lens.device
         req_pool_indices = req_pool_indices[:bs]
@@ -1800,6 +1817,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
+        num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
         if forward_mode is not None and not (
             forward_mode.is_decode_or_idle()
@@ -1809,6 +1827,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph capture not supported for {forward_mode}"
             )
+        if num_tokens_arg is None:
+            if forward_mode is not None and (
+                forward_mode.is_target_verify() or forward_mode.is_draft_extend()
+            ):
+                num_tokens = bs * self._cuda_graph_max_tokens_per_req
+            else:
+                num_tokens = bs
+        else:
+            num_tokens = int(num_tokens_arg)
         tokens_per_req = self._cuda_graph_tokens_per_req(bs, num_tokens, forward_mode)
         total_tokens = self._refresh_cuda_graph_packed_metadata(
             bs=bs,
