@@ -219,6 +219,17 @@ class Eagle(BaseDrafter):
             self.draft_model_runner.model, LlamaForCausalLMEagle3
         )
 
+        if draft_reduce_to_last:
+            # draft_seq_lens_buf aliases the backend's cache_seqlens_int32 at
+            # valid_cache_len + spec_num_tokens. After Q is sliced to one row
+            # per request, the decode kernel takes seq_lens as the attention
+            # upper bound, so trim by the rejected-draft count to keep the live
+            # query from reading them.
+            correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
+                self.draft_seq_lens_buf.dtype
+            )
+            self.draft_seq_lens_buf[:bs].sub_(correction)
+
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
