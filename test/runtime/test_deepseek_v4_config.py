@@ -44,6 +44,7 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
     _draft_decode_forward_mode,
+    _should_update_mamba_state_after_mtp_verify,
 )
 from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
@@ -751,6 +752,82 @@ class TestDeepseekV4Config(unittest.TestCase):
             [1, 2, 0, 0],
         )
         self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DRAFT_EXTEND)
+
+    def test_cuda_graph_mamba_verify_state_update_keeps_decode_mode_speculation(self):
+        class BackendWithMambaUpdate:
+            def update_mamba_state_after_mtp_verify(self, accepted_length, model):
+                pass
+
+        backend = BackendWithMambaUpdate()
+        drafter = object()
+
+        self.assertTrue(
+            _should_update_mamba_state_after_mtp_verify(
+                drafter, backend, ForwardMode.DECODE
+            )
+        )
+        self.assertTrue(
+            _should_update_mamba_state_after_mtp_verify(
+                drafter, backend, ForwardMode.TARGET_VERIFY
+            )
+        )
+        self.assertFalse(
+            _should_update_mamba_state_after_mtp_verify(
+                drafter, backend, ForwardMode.EXTEND
+            )
+        )
+        self.assertFalse(
+            _should_update_mamba_state_after_mtp_verify(
+                None, backend, ForwardMode.DECODE
+            )
+        )
+        self.assertFalse(
+            _should_update_mamba_state_after_mtp_verify(
+                drafter, object(), ForwardMode.DECODE
+            )
+        )
+
+    def test_cuda_graph_eager_draft_extend_uses_single_non_v4_metadata_init(self):
+        captured = {"target": [], "draft": []}
+
+        class FakeBackend:
+            uses_paged_cache_groups = False
+
+            def __init__(self, key):
+                self.key = key
+
+            def init_forward_metadata(self, *args, **kwargs):
+                captured[self.key].append((args, kwargs))
+
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.attn_backend = FakeBackend("target")
+        wrapper.draft_attn_backend = FakeBackend("draft")
+        wrapper.max_tokens_per_req = 4
+        wrapper.drafter = SimpleNamespace(
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
+        )
+        wrapper.use_target_verify_forward_mode = False
+
+        seq_lens = torch.tensor([21, 22], dtype=torch.int32)
+        wrapper._init_forward_metadata(
+            padded_bs=2,
+            num_extends=2,
+            req_pool_indices=torch.zeros(2, dtype=torch.int32),
+            seq_lens=seq_lens,
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
+        )
+
+        self.assertEqual(len(captured["draft"]), 1)
+        _, draft_kwargs = captured["draft"][0]
+        self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.EXTEND)
+        self.assertEqual(
+            draft_kwargs["seq_lens"].data_ptr(),
+            wrapper.drafter.draft_seq_lens_buf.data_ptr(),
+        )
+        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
 
     def test_cuda_graph_eager_draft_decode_preserves_non_v4_seq_lens_alias(self):
         captured = {"target": [], "draft": []}

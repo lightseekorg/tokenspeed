@@ -65,6 +65,16 @@ def _draft_decode_forward_mode(use_draft_extend: bool) -> ForwardMode:
     return ForwardMode.DRAFT_EXTEND if use_draft_extend else ForwardMode.DECODE
 
 
+def _should_update_mamba_state_after_mtp_verify(
+    drafter, attn_backend, forward_mode: ForwardMode
+) -> bool:
+    return (
+        drafter is not None
+        and (forward_mode.is_decode() or forward_mode.is_target_verify())
+        and hasattr(attn_backend, "update_mamba_state_after_mtp_verify")
+    )
+
+
 def compute_max_logical_pages_for_capture(
     spec,
     *,
@@ -660,29 +670,39 @@ class CudaGraphWrapper:
                         draft_kwargs[key] = value
 
             # The drafter mutates draft_seq_lens_buf between MTP draft steps;
-            # decode metadata must alias that buffer, while the first
-            # prefill/verify step uses the caller's accepted prefix lengths.
+            # decode metadata must alias that buffer.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
             if forward_mode == ForwardMode.EXTEND or forward_mode.is_mixed():
+                # Non-V4 draft backends follow the legacy contract: a single
+                # EXTEND/MIXED metadata init fills both first-step prefill
+                # metadata and step 1+ decode metadata, with seq_lens aliased
+                # to the drafter-owned mutable buffer. V4 additionally needs
+                # the accepted-prefix view for first-step grouped-cache
+                # metadata, then a separate decode init to prepare the draft
+                # decode metadata from that first-step state.
+                draft_prefill_seq_lens = (
+                    seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
+                )
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
                     num_extends=num_extends,
                     req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
+                    seq_lens=draft_prefill_seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=forward_mode,
                     **kwargs,
                 )
-                self.draft_attn_backend.init_forward_metadata(
-                    bs=padded_bs,
-                    num_extends=0,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=draft_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=ForwardMode.DECODE,
-                    **draft_kwargs,
-                )
+                if self.use_target_verify_forward_mode:
+                    self.draft_attn_backend.init_forward_metadata(
+                        bs=padded_bs,
+                        num_extends=0,
+                        req_pool_indices=req_pool_indices,
+                        seq_lens=draft_seq_lens,
+                        req_to_page=self.drafter.req_to_page,
+                        forward_mode=ForwardMode.DECODE,
+                        **draft_kwargs,
+                    )
             else:
                 draft_metadata_seq_lens = (
                     seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
@@ -889,10 +909,8 @@ class CudaGraphWrapper:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         # Update mamba/GDN state after speculative verify
-        if (
-            self.drafter is not None
-            and ctx.forward_mode.is_target_verify()
-            and hasattr(self.attn_backend, "update_mamba_state_after_mtp_verify")
+        if _should_update_mamba_state_after_mtp_verify(
+            self.drafter, self.attn_backend, ctx.forward_mode
         ):
             accept_lengths = result[1]
             self.attn_backend.update_mamba_state_after_mtp_verify(accept_lengths, None)
