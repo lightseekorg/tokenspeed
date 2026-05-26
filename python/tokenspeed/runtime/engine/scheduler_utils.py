@@ -30,23 +30,12 @@ from tokenspeed_scheduler import (
     ExecutionEvent,
     ForwardEvent,
     PagedCacheGroupConfig,
+    PagedCacheGroupFamily,
     PagedCacheRetention,
+    PrefixCacheAdjunctSpec,
     RequestSpec,
     SchedulerConfig,
 )
-
-# PagedCacheGroupFamily and PrefixCacheAdjunctSpec were added to the C++
-# bindings alongside the paged-cache adjunct feature.  Guard the import so
-# that servers running against an older pre-built tokenspeed_scheduler binary
-# still start; V4 paged-cache adjunct will be unavailable in that case.
-try:
-    from tokenspeed_scheduler import PagedCacheGroupFamily, PrefixCacheAdjunctSpec
-
-    _PAGED_CACHE_ADJUNCT_AVAILABLE = True
-except ImportError:
-    PagedCacheGroupFamily = None  # type: ignore[assignment,misc]
-    PrefixCacheAdjunctSpec = None  # type: ignore[assignment,misc]
-    _PAGED_CACHE_ADJUNCT_AVAILABLE = False
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -114,11 +103,12 @@ def make_config(
     cfg.enable_mamba_l2 = enable_mamba_l2
     cfg.mamba_l2_host_slots = mamba_l2_host_slots
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
-    cfg.max_loras = max_loras
-    if prefix_cache_adjunct is not None:
-        cfg.prefix_cache_adjunct = prefix_cache_adjunct
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
+    # Opt-in; unset means paged-cache groups are transport-only.
+    if prefix_cache_adjunct is not None:
+        cfg.prefix_cache_adjunct = prefix_cache_adjunct
+    cfg.max_loras = max_loras
     return cfg
 
 
@@ -146,17 +136,16 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             total_pages=int(counts[spec.group_id]),
             retention=retention,
         )
-        if _PAGED_CACHE_ADJUNCT_AVAILABLE and PagedCacheGroupFamily is not None:
-            family_str = getattr(spec, "family", "history")
-            if family_str == "history":
-                kwargs["family"] = PagedCacheGroupFamily.History
-            elif family_str == "state":
-                kwargs["family"] = PagedCacheGroupFamily.State
-            else:
-                raise ValueError(
-                    f"pool_to_paged_cache_groups: unsupported family "
-                    f"{family_str!r} for group {spec.group_id!r}"
-                )
+        family_str = getattr(spec, "family", "history")
+        if family_str == "history":
+            kwargs["family"] = PagedCacheGroupFamily.History
+        elif family_str == "state":
+            kwargs["family"] = PagedCacheGroupFamily.State
+        else:
+            raise ValueError(
+                f"pool_to_paged_cache_groups: unsupported family "
+                f"{family_str!r} for group {spec.group_id!r}"
+            )
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
         out.append(PagedCacheGroupConfig(**kwargs))
@@ -167,12 +156,6 @@ def pool_to_prefix_cache_adjunct_spec(
     required_group_ids: Sequence[str],
 ) -> "PrefixCacheAdjunctSpec":
     """Build a PrefixCacheAdjunctSpec from a non-empty required-group-id list."""
-    if not _PAGED_CACHE_ADJUNCT_AVAILABLE or PrefixCacheAdjunctSpec is None:
-        raise RuntimeError(
-            "PrefixCacheAdjunctSpec is not available in the installed "
-            "tokenspeed_scheduler binary; upgrade to a version that includes "
-            "paged-cache adjunct support."
-        )
     if not required_group_ids:
         raise ValueError(
             "pool_to_prefix_cache_adjunct_spec: required_group_ids must be non-empty"
