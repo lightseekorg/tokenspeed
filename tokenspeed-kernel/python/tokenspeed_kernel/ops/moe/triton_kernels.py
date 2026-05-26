@@ -23,13 +23,26 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-# Trigger the redirect that aliases ``triton`` -> ``tokenspeed_triton`` for
-# upstream ``triton_kernels`` imports.
-import tokenspeed_kernel.thirdparty.triton_kernels  # noqa: F401
 import torch
-import triton_kernels.matmul_details.opt_flags as opt_flags
+from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+
+# Trigger the redirect that aliases ``triton`` -> ``tokenspeed_triton`` for
+# upstream ``triton_kernels`` imports.
+with redirect_triton_to_tokenspeed_triton():
+    import triton_kernels  # noqa: F401
+    import triton_kernels.matmul  # noqa: F401
+    import triton_kernels.matmul_details  # noqa: F401
+    import triton_kernels.matmul_details.opt_flags  # noqa: F401
+    import triton_kernels.numerics  # noqa: F401
+    import triton_kernels.swiglu  # noqa: F401
+    import triton_kernels.tensor  # noqa: F401
+    import triton_kernels.tensor_details  # noqa: F401
+    import triton_kernels.tensor_details.layout  # noqa: F401
+    import triton_kernels.topk  # noqa: F401
+
+import triton_kernels.matmul_details.opt_flags as opt_flags
 from triton_kernels.matmul import (
     FlexCtx,
     FnSpecs,
