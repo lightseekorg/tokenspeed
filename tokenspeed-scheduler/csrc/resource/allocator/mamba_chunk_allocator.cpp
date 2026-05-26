@@ -28,9 +28,8 @@ MambaSlot::MambaSlot(std::int32_t index, MambaChunkAllocator* allocator)
       }) {}
 
 MambaChunkAllocator::MambaChunkAllocator(std::int32_t num_slots) : total_slots_{num_slots} {
-    free_list_.reserve(num_slots);
-    for (std::int32_t i = num_slots - 1; i >= 0; --i) {
-        free_list_.push_back(i);
+    for (std::int32_t i = 0; i < num_slots; ++i) {
+        free_list_.push(i);
     }
 }
 
@@ -38,13 +37,13 @@ std::optional<MambaSlot> MambaChunkAllocator::Allocate() {
     if (free_list_.empty()) {
         return std::nullopt;
     }
-    std::int32_t index = free_list_.back();
-    free_list_.pop_back();
+    std::int32_t index = free_list_.top();
+    free_list_.pop();
     return MambaSlot{index, this};
 }
 
 void MambaChunkAllocator::Free(std::int32_t index) {
-    free_list_.push_back(index);
+    free_list_.push(index);
 }
 
 MambaSlot::~MambaSlot() {

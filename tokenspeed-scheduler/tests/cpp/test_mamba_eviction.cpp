@@ -122,4 +122,52 @@ TEST_F(MambaEvictionTest, LeafPromotion) {
     EXPECT_FALSE(a->HasMamba());
 }
 
+// ---------------------------------------------------------------------------
+// TP-determinism: on Time() ties, smaller-SeqId leaf must be evicted first
+// regardless of pointer ordering. Guards against pointer-randomized
+// unordered_set iteration causing different TP ranks to evict different
+// leaves and wedging the next NCCL collective.
+// ---------------------------------------------------------------------------
+
+TEST_F(MambaEvictionTest, EvictDeterministicOnTimeTies) {
+    auto ts = std::chrono::steady_clock::now();
+
+    auto t1 = token_vec_t{1, 2};
+    auto first = std::make_unique<TreeNode>(t1, ts);
+    first->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(page_alloc_->Allocate(1)));
+    auto slot1 = mamba_alloc_->Allocate();
+    ASSERT_TRUE(slot1.has_value());
+    first->AttachMamba(std::make_unique<MambaSlot>(std::move(*slot1)));
+    TreeNode* first_raw = first.get();
+    root_.AddChild(t1, std::move(first));
+    eviction_->TrackNode(first_raw);
+
+    auto t2 = token_vec_t{3, 4};
+    auto second = std::make_unique<TreeNode>(t2, ts);
+    second->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(page_alloc_->Allocate(1)));
+    auto slot2 = mamba_alloc_->Allocate();
+    ASSERT_TRUE(slot2.has_value());
+    second->AttachMamba(std::make_unique<MambaSlot>(std::move(*slot2)));
+    TreeNode* second_raw = second.get();
+    root_.AddChild(t2, std::move(second));
+    eviction_->TrackNode(second_raw);
+
+    ASSERT_EQ(first_raw->Time(), second_raw->Time());
+    ASSERT_LT(first_raw->SeqId(), second_raw->SeqId());
+
+    std::int32_t freed = eviction_->Evict(1);
+    EXPECT_EQ(freed, 1);
+    // Older-by-SeqId is evicted first; tie-breaker must be deterministic.
+    EXPECT_FALSE(first_raw->HasMamba());
+    EXPECT_TRUE(second_raw->HasMamba());
+}
+
+TEST(TreeNodeSeqId, IsMonotonicAcrossConstruction) {
+    TreeNode a;
+    TreeNode b;
+    TreeNode c;
+    EXPECT_LT(a.SeqId(), b.SeqId());
+    EXPECT_LT(b.SeqId(), c.SeqId());
+}
+
 }  // namespace tokenspeed::test

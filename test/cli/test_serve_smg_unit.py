@@ -82,10 +82,10 @@ def test_gateway_args_preserve_user_port():
     assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
 
 
-def test_gateway_args_default_reasoning_parser_is_none():
+def test_gateway_args_default_reasoning_parser_is_passthrough():
     gateway_args = _gateway_args_with_default_reasoning_parser(["--model", "/tmp/x"])
 
-    assert gateway_args == ["--model", "/tmp/x", "--reasoning-parser", "none"]
+    assert gateway_args == ["--model", "/tmp/x", "--reasoning-parser", "passthrough"]
 
 
 def test_gateway_args_preserve_user_reasoning_parser():
@@ -105,7 +105,7 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--port",
         "8000",
         "--reasoning-parser",
-        "none",
+        "passthrough",
         "--disable-circuit-breaker",
         "--disable-retries",
         "--tokenizer-cache-enable-l0",
