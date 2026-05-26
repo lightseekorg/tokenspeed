@@ -85,16 +85,17 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
-    AdmissionRequest admission_request{
-        .request_id = request->Id(),
-        .kind = AdmissionRequestKind::kPrefillFirstChunk,
-        .device_pages_needed = device_pages_needed,
-        .tokens_this_round = tokens_this_round,
-        .first_raw_position_of_op = first_pos,
-        .target_raw_tokens_exclusive = target,
-        .recovery_plan = &recovery_plan,
-    };
-    AdmissionVerdict admission = hybrid_prefix_cache_.Admit(admission_request, simulated_free);
+    const std::string request_id = request->Id();
+    AdmissionVerdict admission = hybrid_prefix_cache_.Apply(
+        cache::admit::PrefillFirstChunk{
+            .request_id = request_id,
+            .match_result = match_result,
+            .device_pages_needed = device_pages_needed,
+            .tokens_this_round = tokens_this_round,
+            .first_raw_position_of_op = first_pos,
+            .target_raw_tokens_exclusive = target,
+        },
+        simulated_free);
     if (!admission.admitted) {
         return {};
     }
@@ -122,14 +123,17 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
-    AdmissionRequest admission_request{
-        .request_id = request->Id(),
-        .kind = AdmissionRequestKind::kPrefillChunk,
-        .device_pages_needed = pages_needed,
-        .first_raw_position_of_op = first_pos,
-        .target_raw_tokens_exclusive = target,
-    };
-    if (!hybrid_prefix_cache_.Admit(admission_request, simulated_free).admitted) {
+    const std::string request_id = request->Id();
+    if (!hybrid_prefix_cache_
+             .Apply(
+                 cache::admit::PrefillChunk{
+                     .request_id = request_id,
+                     .device_pages_needed = pages_needed,
+                     .first_raw_position_of_op = first_pos,
+                     .target_raw_tokens_exclusive = target,
+                 },
+                 simulated_free)
+             .admitted) {
         return {};
     }
 
@@ -145,15 +149,18 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
 
     const std::int32_t first_pos = request->TokenSize();
     const std::int32_t target = first_pos + config_.decode_input_tokens;
-    AdmissionRequest admission_request{
-        .request_id = request->Id(),
-        .kind = AdmissionRequestKind::kDecodeChunk,
-        .device_pages_needed = pages_needed,
-        .first_raw_position_of_op = first_pos,
-        .target_raw_tokens_exclusive = target,
-        .refresh_mamba_checkpoint = request->Is<fsm::PrefillDone>(),
-    };
-    if (!hybrid_prefix_cache_.Admit(admission_request, simulated_free).admitted) {
+    const std::string request_id = request->Id();
+    if (!hybrid_prefix_cache_
+             .Apply(
+                 cache::admit::Decode{
+                     .request_id = request_id,
+                     .device_pages_needed = pages_needed,
+                     .first_raw_position_of_op = first_pos,
+                     .target_raw_tokens_exclusive = target,
+                     .refresh_mamba_checkpoint = request->Is<fsm::PrefillDone>(),
+                 },
+                 simulated_free)
+             .admitted) {
         return {};
     }
 
@@ -188,15 +195,16 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     std::int32_t device_pages_needed = (num_tokens + config_.page_size - 1) / config_.page_size;
 
     const std::int32_t target = request->TokenSize();
-    AdmissionRequest admission_request{
-        .request_id = request->Id(),
-        .kind = AdmissionRequestKind::kDecodeFromRetracted,
-        .device_pages_needed = device_pages_needed,
-        .target_raw_tokens_exclusive = target,
-        .compat_match = &match_result,
-        .protected_recovery_node = mamba_recovery_node,
-    };
-    AdmissionVerdict admission = hybrid_prefix_cache_.Admit(admission_request, simulated_free);
+    const std::string request_id = request->Id();
+    AdmissionVerdict admission = hybrid_prefix_cache_.Apply(
+        cache::admit::DecodeFromRetracted{
+            .request_id = request_id,
+            .match_result = match_result,
+            .device_pages_needed = device_pages_needed,
+            .target_raw_tokens_exclusive = target,
+            .protected_recovery_node = mamba_recovery_node,
+        },
+        simulated_free);
     if (!admission.admitted) {
         return {};
     }
@@ -225,24 +233,19 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
 
     RequestCacheMutation cache_mutation(*request);
     TreeNode* terminal_device_node = cache_mutation.MutableTerminalDeviceNode();
-    StepCommitRequest insert_count_request{
-        .plan_device_prefix_insertion =
-            DevicePrefixInsertionPlanRequest{
-                .full_paged_tokens = &full_paged_tokens,
-                .current_device_node = terminal_device_node,
-            },
-    };
-    const std::int32_t alloc_count =
-        hybrid_prefix_cache_.StepCommit(std::move(insert_count_request)).device_insert_page_count;
-    StepCommitRequest publication_request{
-        .publish_device_prefix_insertion =
-            DevicePrefixInsertionRequest{
-                .full_paged_tokens = &full_paged_tokens,
-                .current_device_node = terminal_device_node,
-                .pages_to_insert = cache_mutation.TakeFirstLocalKVPages(alloc_count),
-            },
-    };
-    MatchResult match_result = hybrid_prefix_cache_.StepCommit(std::move(publication_request)).match_result;
+    const std::int32_t alloc_count = hybrid_prefix_cache_
+                                         .StepCommit(cache::publish::RetractPrefixPlan{
+                                             .full_paged_tokens = full_paged_tokens,
+                                             .current_device_node = *terminal_device_node,
+                                         })
+                                         .device_insert_page_count;
+    MatchResult match_result = hybrid_prefix_cache_
+                                   .StepCommit(cache::publish::RetractPrefixCommit{
+                                       .full_paged_tokens = full_paged_tokens,
+                                       .current_device_node = *terminal_device_node,
+                                       .pages_to_insert = cache_mutation.TakeFirstLocalKVPages(alloc_count),
+                                   })
+                                   .match_result;
 
     const std::int32_t device_matched3 = match_result.device.DepthInPage();
     const std::int32_t host_matched3 = match_result.host.DepthInPage();
@@ -251,13 +254,15 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
         host_pages_needed = device_matched3 - host_matched3;
     }
 
-    AdmissionRequest admission_request{
-        .kind = AdmissionRequestKind::kRetract,
-        .host_pages_needed = host_pages_needed,
-        .compat_match = &match_result,
-    };
     std::map<std::string, std::int32_t> simulated_free;
-    if (!hybrid_prefix_cache_.Admit(admission_request, simulated_free).admitted) {
+    if (!hybrid_prefix_cache_
+             .Apply(
+                 cache::admit::Retract{
+                     .match_result = match_result,
+                     .host_pages_needed = host_pages_needed,
+                 },
+                 simulated_free)
+             .admitted) {
         return {};
     }
     return fsm::ScheduleRetractEvent{match_result, hybrid_prefix_cache_};
@@ -346,20 +351,14 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
     auto op = applyPrefillEvent(request, std::move(event));
     RequestCacheContext cache_context(*request);
     RequestCacheMutation cache_mutation(*request);
-    StepCommitRequest prepare_request{
-        .worker_metadata =
-            WorkerCompatibilityCommitRequest{
-                .op_base = &op,
-                .kind = WorkerCompatibilityCommitKind::kPrefillFirstChunk,
-                .terminal = cache_mutation.MutableTerminalDeviceNode(),
-                .compat_match = &match,
-                .local_mamba_allocator_view = cache_context.LocalMambaAllocatorView(),
-                .first_raw_position_of_op = op.extend_prefix_len,
-                .target_raw_tokens_exclusive = op.extend_prefix_len + op.input_length,
-                .commit_tree_prefix_before_acquire = true,
-            },
-    };
-    (void)hybrid_prefix_cache_.StepCommit(std::move(prepare_request));
+    (void)hybrid_prefix_cache_.StepCommit(cache::worker::CommitPrefillFirstChunkMetadata{
+        .op_base = op,
+        .first_raw_position_of_op = op.extend_prefix_len,
+        .target_raw_tokens_exclusive = op.extend_prefix_len + op.input_length,
+        .tree_prefix_to_commit = *cache_mutation.MutableTerminalDeviceNode(),
+        .match_result = match,
+        .local_mamba_allocator = cache_context.LocalMambaAllocatorView(),
+    });
     return op;
 }
 
@@ -367,19 +366,13 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
     auto op = applyPrefillEvent(request, std::move(event));
     RequestCacheContext cache_context(*request);
     RequestCacheMutation cache_mutation(*request);
-    StepCommitRequest prepare_request{
-        .worker_metadata =
-            WorkerCompatibilityCommitRequest{
-                .op_base = &op,
-                .kind = WorkerCompatibilityCommitKind::kPrefillChunk,
-                .terminal = cache_mutation.MutableTerminalDeviceNode(),
-                .local_mamba_allocator_view = cache_context.LocalMambaAllocatorView(),
-                .first_raw_position_of_op = op.extend_prefix_len,
-                .target_raw_tokens_exclusive = op.extend_prefix_len + op.input_length,
-                .commit_tree_prefix_before_acquire = true,
-            },
-    };
-    (void)hybrid_prefix_cache_.StepCommit(std::move(prepare_request));
+    (void)hybrid_prefix_cache_.StepCommit(cache::worker::CommitPrefillMetadata{
+        .op_base = op,
+        .first_raw_position_of_op = op.extend_prefix_len,
+        .target_raw_tokens_exclusive = op.extend_prefix_len + op.input_length,
+        .tree_prefix_to_commit = *cache_mutation.MutableTerminalDeviceNode(),
+        .local_mamba_allocator = cache_context.LocalMambaAllocatorView(),
+    });
     return op;
 }
 
@@ -419,19 +412,22 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     }
     RequestCacheMutation cache_mutation(*request);
     RequestCacheContext cache_context(*request);
-    StepCommitRequest prepare_request{
-        .worker_metadata =
-            WorkerCompatibilityCommitRequest{
-                .op_base = &op,
-                .kind = WorkerCompatibilityCommitKind::kDecodeChunk,
-                .terminal = cache_mutation.MutableTerminalDeviceNode(),
-                .local_mamba_allocator_view = cache_context.LocalMambaAllocatorView(),
-                .first_raw_position_of_op = first_pos,
-                .target_raw_tokens_exclusive = first_pos + op.input_length,
-                .commit_tree_prefix_before_acquire = came_from_prefill_done,
-            },
-    };
-    (void)hybrid_prefix_cache_.StepCommit(std::move(prepare_request));
+    if (came_from_prefill_done) {
+        (void)hybrid_prefix_cache_.StepCommit(cache::worker::CommitDecodeAfterPrefillMetadata{
+            .op_base = op,
+            .first_raw_position_of_op = first_pos,
+            .target_raw_tokens_exclusive = first_pos + op.input_length,
+            .tree_prefix_to_commit = *cache_mutation.MutableTerminalDeviceNode(),
+            .local_mamba_allocator = cache_context.LocalMambaAllocatorView(),
+        });
+    } else {
+        (void)hybrid_prefix_cache_.StepCommit(cache::worker::CommitDecodeMetadata{
+            .op_base = op,
+            .first_raw_position_of_op = first_pos,
+            .target_raw_tokens_exclusive = first_pos + op.input_length,
+            .local_mamba_allocator = cache_context.LocalMambaAllocatorView(),
+        });
+    }
     return op;
 }
 
@@ -457,17 +453,12 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     op.decode_input_id = request->GetLastToken();
     op.hist_token_len = request->TokenSize() - 1;
 
-    StepCommitRequest prepare_request{
-        .worker_metadata =
-            WorkerCompatibilityCommitRequest{
-                .op_base = &op,
-                .kind = WorkerCompatibilityCommitKind::kDecodeFromRetracted,
-                .compat_match = &match,
-                .local_mamba_allocator_view = cache_context.LocalMambaAllocatorView(),
-                .target_raw_tokens_exclusive = request->TokenSize(),
-            },
-    };
-    (void)hybrid_prefix_cache_.StepCommit(std::move(prepare_request));
+    (void)hybrid_prefix_cache_.StepCommit(cache::worker::CommitDecodeRecoveryMetadata{
+        .op_base = op,
+        .target_raw_tokens_exclusive = request->TokenSize(),
+        .match_result = match,
+        .local_mamba_allocator = cache_context.LocalMambaAllocatorView(),
+    });
     return op;
 }
 

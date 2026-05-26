@@ -82,32 +82,23 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     const std::int32_t checkpoint_raw_position = window_begin + tokens_this_round_;
     if (!disable_l2_cache_ && (match_result_.host.DepthInPage() > match_result_.device.DepthInPage())) {
         host_node_ref = std::make_unique<HostNodeRef>(match_result_.host.last_node);
-        StepCommitRequest materialization_request{
-            .materialize_prefix =
-                PrefixMaterializationRequest{
-                    .compat_match = &match_result_,
-                    .require_all_pages = false,
-                },
-        };
-        (void)hybrid_prefix_cache_.StepCommit(std::move(materialization_request));
+        (void)hybrid_prefix_cache_.StepCommit(cache::materialize::PrefixOnDevice{
+            .compat_match = match_result_,
+            .require_all_pages = false,
+        });
         device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.host.last_node);
     } else {
         device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
     }
 
-    auto step_result = hybrid_prefix_cache_.StepCommit({
-        .request_local_kv =
-            RequestLocalKVStateRequest{
-                .create_allocator = true,
-                .initial_tokens = tokens_this_round_,
-                .acquire_tokens = decode_input_tokens_,
-            },
-        .request_local_mamba =
-            RequestLocalMambaStateRequest{
-                .create_allocator = true,
-                .checkpoint_raw_position = checkpoint_raw_position,
-            },
-    });
+    auto step_result = hybrid_prefix_cache_.StepCommit(
+        cache::state::CreateRequestLocalKV{
+            .initial_tokens = tokens_this_round_,
+            .acquire_tokens = decode_input_tokens_,
+        },
+        cache::state::CreateRequestLocalMamba{
+            .checkpoint_raw_position = checkpoint_raw_position,
+        });
     auto local_kv_allocator = std::move(step_result.local_kv_allocator);
 
     // Allocate req_pool_idx when first-time scheduled
@@ -156,27 +147,22 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
         paged_tokens.resize(end_of_window_pages);
     }
-    StepCommitRequest publication_request{
-        .publish_device_prefix =
-            DevicePrefixPublicationRequest{
-                .full_paged_tokens = &paged_tokens,
-                .device_node_ref = &device_node_ref,
-                .local_kv_allocator = local_kv_allocator.get(),
-                .local_mamba_allocator = local_mamba_allocator.get(),
-                .chunk_begin = state.window.begin,
-            },
-        .request_local_kv =
-            RequestLocalKVStateRequest{
-                .allocator = local_kv_allocator.get(),
-                .acquire_tokens = tokens_this_round_,
-            },
-        .request_local_mamba =
-            RequestLocalMambaStateRequest{
-                .refresh_checkpoint_allocator = local_mamba_allocator.get(),
-                .checkpoint_raw_position = state.window.begin + state.window.size + tokens_this_round_,
-            },
-    };
-    (void)hybrid_prefix_cache_.StepCommit(std::move(publication_request));
+    (void)hybrid_prefix_cache_.StepCommit(
+        cache::publish::DevicePrefix{
+            .full_paged_tokens = paged_tokens,
+            .device_node_ref = device_node_ref,
+            .local_kv_allocator = *local_kv_allocator,
+            .local_mamba_allocator = local_mamba_allocator.get(),
+            .chunk_begin = state.window.begin,
+        },
+        cache::state::AcquireRequestLocalKV{
+            .allocator = *local_kv_allocator,
+            .tokens = tokens_this_round_,
+        },
+        cache::state::RefreshMambaCheckpoint{
+            .allocator = local_mamba_allocator.get(),
+            .checkpoint_raw_position = state.window.begin + state.window.size + tokens_this_round_,
+        });
 
     TokenContainer::Window window{.begin = state.window.begin + state.window.size, .size = tokens_this_round_};
 
@@ -216,27 +202,22 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
         paged_tokens.resize(end_of_window_pages);
     }
-    StepCommitRequest publication_request{
-        .publish_device_prefix =
-            DevicePrefixPublicationRequest{
-                .full_paged_tokens = &paged_tokens,
-                .device_node_ref = &device_node_ref,
-                .local_kv_allocator = local_kv_allocator.get(),
-                .local_mamba_allocator = local_mamba_allocator.get(),
-                .chunk_begin = state.window.begin,
-            },
-        .request_local_kv =
-            RequestLocalKVStateRequest{
-                .allocator = local_kv_allocator.get(),
-                .acquire_tokens = state.GetReserveNumTokensInNextScheduleEvent(),
-            },
-        .request_local_mamba =
-            RequestLocalMambaStateRequest{
-                .refresh_checkpoint_allocator = local_mamba_allocator.get(),
-                .checkpoint_raw_position = state.GetTokenContainer()->Size() + decode_input_tokens_,
-            },
-    };
-    (void)hybrid_prefix_cache_.StepCommit(std::move(publication_request));
+    (void)hybrid_prefix_cache_.StepCommit(
+        cache::publish::DevicePrefix{
+            .full_paged_tokens = paged_tokens,
+            .device_node_ref = device_node_ref,
+            .local_kv_allocator = *local_kv_allocator,
+            .local_mamba_allocator = local_mamba_allocator.get(),
+            .chunk_begin = state.window.begin,
+        },
+        cache::state::AcquireRequestLocalKV{
+            .allocator = *local_kv_allocator,
+            .tokens = state.GetReserveNumTokensInNextScheduleEvent(),
+        },
+        cache::state::RefreshMambaCheckpoint{
+            .allocator = local_mamba_allocator.get(),
+            .checkpoint_raw_position = state.GetTokenContainer()->Size() + decode_input_tokens_,
+        });
 
     return Decoding{state.GetTokenContainer(),     state.GetPageSize(),
                     std::move(host_node_ref),      std::move(device_node_ref),
@@ -252,12 +233,9 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     auto host_node_ref = std::move(state).TakeHostNodeRef();
 
     std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    (void)hybrid_prefix_cache_.StepCommit({
-        .request_local_kv =
-            RequestLocalKVStateRequest{
-                .allocator = local_kv_allocator.get(),
-                .acquire_tokens = reserve,
-            },
+    (void)hybrid_prefix_cache_.StepCommit(cache::state::AcquireRequestLocalKV{
+        .allocator = *local_kv_allocator,
+        .tokens = reserve,
     });
 
     return Decoding{state.GetTokenContainer(),     state.GetPageSize(),
@@ -273,14 +251,12 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
     if (match_result_.host.DepthInPage() > match_result_.device.DepthInPage()) {
         host_node_ref = std::make_unique<HostNodeRef>(match_result_.host.last_node);
-        StepCommitRequest materialization_request{
-            .materialize_prefix =
-                PrefixMaterializationRequest{
-                    .compat_match = &match_result_,
-                    .require_all_pages = true,
-                },
-        };
-        if (!hybrid_prefix_cache_.StepCommit(std::move(materialization_request)).ok) {
+        if (!hybrid_prefix_cache_
+                 .StepCommit(cache::materialize::PrefixOnDevice{
+                     .compat_match = match_result_,
+                     .require_all_pages = true,
+                 })
+                 .ok) {
             // Device allocation failed (race between capacity check and actual alloc).
             throw std::logic_error(
                 "ScheduleDecodeFromRetractedEvent: failed to allocate device pages for host cache recovery");
@@ -296,18 +272,14 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
     auto old_mamba_allocator = std::move(state).TakeMambaAllocator();
     old_mamba_allocator.reset();
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
-    auto step_result = hybrid_prefix_cache_.StepCommit({
-        .request_local_kv =
-            RequestLocalKVStateRequest{
-                .allocator = local_kv_allocator.get(),
-                .acquire_tokens = decode_input_tokens_,
-            },
-        .request_local_mamba =
-            RequestLocalMambaStateRequest{
-                .create_allocator = true,
-                .require_allocator = true,
-            },
-    });
+    auto step_result = hybrid_prefix_cache_.StepCommit(
+        cache::state::CreateRequestLocalMamba{
+            .require_allocator = true,
+        },
+        cache::state::AcquireRequestLocalKV{
+            .allocator = *local_kv_allocator,
+            .tokens = decode_input_tokens_,
+        });
     auto local_mamba_allocator = std::move(step_result.local_mamba_allocator);
     return Decoding{token_container,
                     page_size,
@@ -328,30 +300,25 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
 
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto local_allocator = std::move(state).TakeLocalKVAllocator();
-    StepCommitRequest publication_request{
-        .publish_finished_request =
-            FinishedRequestPublicationRequest{
-                .full_paged_tokens = &full_paged_tokens,
-                .current_device_node = current_device_node,
-                .local_kv_allocator = local_allocator.get(),
-                .local_mamba_allocator = local_mamba_allocator.get(),
-                .page_hashes = &page_hashes_,
-            },
-    };
-    MatchResult match = hybrid_prefix_cache_.StepCommit(std::move(publication_request)).match_result;
+    MatchResult match = hybrid_prefix_cache_
+                            .StepCommit(cache::publish::FinishedRequest{
+                                .full_paged_tokens = full_paged_tokens,
+                                .current_device_node = *current_device_node,
+                                .local_kv_allocator = *local_allocator,
+                                .page_hashes = page_hashes_,
+                                .local_mamba_allocator = local_mamba_allocator.get(),
+                            })
+                            .match_result;
     // local_mamba_allocator dropped here — destructor frees remaining slots
 
     if (!disable_l2_cache_ && (match.device.DepthInPage() > match.host.DepthInPage())) {
         std::vector<TreeNode*> write_diff = match.NodesWithout<ResourceType::Host>();
         std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match.host.last_node);
-        StepCommitRequest materialization_request{
-            .materialize_host_writeback =
-                HostWritebackMaterializationRequest{
-                    .write_diff = &write_diff,
-                    .ensure_capacity_before_allocate = true,
-                },
-        };
-        StepCommitResult materialization_result = hybrid_prefix_cache_.StepCommit(std::move(materialization_request));
+        StepCommitResult materialization_result =
+            hybrid_prefix_cache_.StepCommit(cache::materialize::HostWritebackPages{
+                .write_diff = write_diff,
+                .ensure_capacity_before_allocate = true,
+            });
         if (!materialization_result.ok) {
             return Finished{};
         }
@@ -482,14 +449,11 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     if (match_result_.device.DepthInPage() > match_result_.host.DepthInPage()) {
         std::vector<TreeNode*> write_diff = match_result_.NodesWithout<ResourceType::Host>();
         device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
-        StepCommitRequest materialization_request{
-            .materialize_host_writeback =
-                HostWritebackMaterializationRequest{
-                    .write_diff = &write_diff,
-                    .ensure_capacity_before_allocate = false,
-                },
-        };
-        StepCommitResult materialization_result = hybrid_prefix_cache_.StepCommit(std::move(materialization_request));
+        StepCommitResult materialization_result =
+            hybrid_prefix_cache_.StepCommit(cache::materialize::HostWritebackPages{
+                .write_diff = write_diff,
+                .ensure_capacity_before_allocate = false,
+            });
         if (!materialization_result.ok) {
             throw std::logic_error("ScheduleRetractEvent: failed to allocate host pages for device cache writeback");
         }
@@ -509,12 +473,9 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     auto local_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
 
-    (void)hybrid_prefix_cache_.StepCommit({
-        .publish_tree_owned_request_state =
-            TreeOwnedRequestStatePublicationRequest{
-                .terminal = match_result_.device.last_node,
-                .local_mamba_allocator_owner = &local_mamba_allocator,
-            },
+    (void)hybrid_prefix_cache_.StepCommit(cache::state::PublishTreeOwnedRequestState{
+        .terminal = *match_result_.device.last_node,
+        .local_mamba_allocator_owner = local_mamba_allocator,
     });
 
     return Retracting{token_container,

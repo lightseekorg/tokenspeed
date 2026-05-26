@@ -28,6 +28,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "resource/allocator/owned_pages.h"
@@ -57,9 +58,50 @@ public:
 
     RecoveryPlan MatchPrefix(const std::vector<std::span<const std::int32_t>>& token_pages,
                              MatchIntent intent = MatchIntent::PrefixReuse);
-    [[nodiscard]] AdmissionVerdict Admit(const AdmissionRequest& request,
-                                         std::map<std::string, std::int32_t>& simulated_free);
-    StepCommitResult StepCommit(StepCommitRequest request);
+    [[nodiscard]] cache::admit::PrefillFirstChunk::Result Apply(const cache::admit::PrefillFirstChunk& op,
+                                                                std::map<std::string, std::int32_t>& simulated_free);
+    [[nodiscard]] cache::admit::PrefillChunk::Result Apply(const cache::admit::PrefillChunk& op,
+                                                           std::map<std::string, std::int32_t>& simulated_free);
+    [[nodiscard]] cache::admit::Decode::Result Apply(const cache::admit::Decode& op,
+                                                     std::map<std::string, std::int32_t>& simulated_free);
+    [[nodiscard]] cache::admit::DecodeFromRetracted::Result Apply(const cache::admit::DecodeFromRetracted& op,
+                                                                  std::map<std::string, std::int32_t>& simulated_free);
+    [[nodiscard]] cache::admit::Retract::Result Apply(const cache::admit::Retract& op,
+                                                      std::map<std::string, std::int32_t>& simulated_free);
+    [[nodiscard]] cache::publish::DevicePrefix::Result Apply(const cache::publish::DevicePrefix& op);
+    [[nodiscard]] cache::publish::FinishedRequest::Result Apply(const cache::publish::FinishedRequest& op);
+    [[nodiscard]] cache::publish::RetractPrefixPlan::Result Apply(const cache::publish::RetractPrefixPlan& op);
+    [[nodiscard]] cache::publish::RetractPrefixCommit::Result Apply(cache::publish::RetractPrefixCommit&& op);
+    [[nodiscard]] cache::materialize::PrefixOnDevice::Result Apply(const cache::materialize::PrefixOnDevice& op);
+    [[nodiscard]] cache::materialize::HostWritebackPages::Result Apply(
+        const cache::materialize::HostWritebackPages& op);
+    [[nodiscard]] cache::state::CreateRequestLocalKV::Result Apply(const cache::state::CreateRequestLocalKV& op);
+    [[nodiscard]] cache::state::AcquireRequestLocalKV::Result Apply(const cache::state::AcquireRequestLocalKV& op);
+    [[nodiscard]] cache::state::CreateRequestLocalMamba::Result Apply(const cache::state::CreateRequestLocalMamba& op);
+    [[nodiscard]] cache::state::RefreshMambaCheckpoint::Result Apply(const cache::state::RefreshMambaCheckpoint& op);
+    [[nodiscard]] cache::state::PublishTreeOwnedRequestState::Result Apply(
+        const cache::state::PublishTreeOwnedRequestState& op);
+    [[nodiscard]] cache::worker::CommitPrefillFirstChunkMetadata::Result Apply(
+        const cache::worker::CommitPrefillFirstChunkMetadata& op);
+    [[nodiscard]] cache::worker::CommitPrefillMetadata::Result Apply(const cache::worker::CommitPrefillMetadata& op);
+    [[nodiscard]] cache::worker::CommitDecodeAfterPrefillMetadata::Result Apply(
+        const cache::worker::CommitDecodeAfterPrefillMetadata& op);
+    [[nodiscard]] cache::worker::CommitDecodeMetadata::Result Apply(const cache::worker::CommitDecodeMetadata& op);
+    [[nodiscard]] cache::worker::CommitDecodeRecoveryMetadata::Result Apply(
+        const cache::worker::CommitDecodeRecoveryMetadata& op);
+
+    template <cache::StepOp... Ops>
+    StepCommitResult StepCommit(Ops&&... ops) {
+        StepCommitResult result{};
+        auto apply = [this, &result](auto&& op) {
+            if (!result.ok) return;
+            auto op_result = Apply(std::forward<decltype(op)>(op));
+            AccumulateStepResult(result, std::move(op_result));
+        };
+        (apply(std::forward<Ops>(ops)), ...);
+        return result;
+    }
+
     [[nodiscard]] CacheStatsSnapshot Stats(const StatsRequest& request = {}) const;
 
     struct RawHostStorageHashSeed {
@@ -105,119 +147,21 @@ private:
         TreeNode* protected_source_node{nullptr};
     };
 
-    struct CacheAdmissionRequest {
-        AdmissionRequestKind kind{AdmissionRequestKind::kDecodeChunk};
-        std::string request_id{};
-        std::int32_t device_pages_needed{0};
-        std::int32_t host_pages_needed{0};
-        std::int32_t tokens_this_round{0};
-        std::int32_t first_raw_position_of_op{0};
-        std::int32_t target_raw_tokens_exclusive{0};
-        const MatchResult* match_result{nullptr};
-        TreeNode* mamba_recovery_node{nullptr};
-        bool refresh_mamba_checkpoint{false};
-    };
-
-    struct CacheAdmissionResult {
-        bool admitted{false};
-        std::optional<std::int32_t> mamba_branching_seqlen{};
-        std::optional<std::int32_t> mamba_cow_src_index{};
-        std::vector<TransferPair> cache_transfer_pairs{};
-    };
-
-    enum class RequestLocalKVKind {
-        kPrefillFirstChunk,
-        kPrefillChunk,
-    };
-
-    struct RequestLocalKVRequest {
-        RequestLocalKVKind kind{RequestLocalKVKind::kPrefillChunk};
-        LocalKVAllocator* local_kv_allocator{nullptr};
-        std::int32_t tokens_this_round{0};
-        std::int32_t decode_input_tokens{0};
-    };
-
-    struct RequestLocalKVResult {
-        std::unique_ptr<LocalKVAllocator> local_kv_allocator{};
-    };
-
-    enum class RequestLocalMambaKind {
-        kPrefillFirstChunk,
-        kDecodeFromRetracted,
-        kNextCheckpoint,
-    };
-
-    struct RequestLocalMambaRequest {
-        RequestLocalMambaKind kind{RequestLocalMambaKind::kNextCheckpoint};
-        LocalMambaAllocator* local_mamba_allocator{nullptr};
-        std::optional<std::int32_t> checkpoint_raw_position{};
-    };
-
-    struct RequestLocalMambaResult {
-        std::unique_ptr<LocalMambaAllocator> local_mamba_allocator{};
-    };
-
-    enum class CachePublicationKind {
-        kForwardChunk,
-        kFinishChunk,
-        kRetractDeviceInsertPageCount,
-        kRetractChunk,
-    };
-
-    struct CachePublicationRequest {
-        CachePublicationKind kind{CachePublicationKind::kForwardChunk};
-        const std::vector<std::span<const std::int32_t>>* full_paged_tokens{nullptr};
-        std::optional<std::int32_t> chunk_begin{};
-        std::unique_ptr<DeviceNodeRef>* device_node_ref{nullptr};
-        const TreeNode* current_device_node{nullptr};
-        LocalKVAllocator* local_kv_allocator{nullptr};
-        LocalMambaAllocator* local_mamba_allocator{nullptr};
-        const std::vector<std::string>* page_hashes{nullptr};
-        OwnedPages pages_to_insert{};
-    };
-
-    struct CachePublicationResult {
-        MatchResult match_result{};
-        std::int32_t device_insert_page_count{0};
-    };
-
-    enum class CacheMaterializationKind {
-        kPrefillHostPrefixOnDevice,
-        kDecodeRecoveryHostPrefixOnDevice,
-        kFinishWritebackHostPages,
-        kRetractWritebackHostPages,
-    };
-
-    struct CacheMaterializationRequest {
-        CacheMaterializationKind kind{CacheMaterializationKind::kPrefillHostPrefixOnDevice};
-        const MatchResult* match_result{nullptr};
-        const std::vector<TreeNode*>* write_diff{nullptr};
-    };
-
-    struct CacheMaterializationResult {
-        bool ok{true};
-    };
-
-    struct CacheOpPrepareRequest {
-        WorkerCompatibilityCommitKind kind{WorkerCompatibilityCommitKind::kDecodeChunk};
-        TreeNode* terminal{nullptr};
-        std::int32_t first_raw_position_of_op{0};
-        std::int32_t target_raw_tokens_exclusive{0};
-        const MatchResult* match_result{nullptr};
-        const LocalMambaAllocator* local_mamba_allocator{nullptr};
-        MatchResult::PagedCache paged_cache_hit{};
-        bool commit_prior_chunk{false};
-    };
-
-    [[nodiscard]] CacheAdmissionResult Admit(const CacheAdmissionRequest& request,
-                                             std::map<std::string, std::int32_t>& simulated_free);
     DecodeFromRetractedRecovery PrepareDecodeFromRetractedRecovery(MatchResult& match_result) const;
-    [[nodiscard]] RequestLocalKVResult PrepareRequestLocalKV(const RequestLocalKVRequest& request) const;
-    [[nodiscard]] RequestLocalMambaResult PrepareRequestLocalMamba(const RequestLocalMambaRequest& request) const;
-    CachePublicationResult Publish(CachePublicationRequest request);
-    [[nodiscard]] CacheMaterializationResult Materialize(const CacheMaterializationRequest& request);
     void PublishRetractMambaState(TreeNode* terminal, std::unique_ptr<LocalMambaAllocator>& local_mamba_allocator);
-    void PrepareForwardOp(ForwardOperationBase& op_base, const CacheOpPrepareRequest& request);
+    [[nodiscard]] std::vector<TreeNode*> MambaDeviceLoadbackNodes(const MatchResult& match_result,
+                                                                  TreeNode* preferred_source = nullptr) const;
+    static void AccumulateStepResult(StepCommitResult& result, cache::EmptyResult);
+    static void AccumulateStepResult(StepCommitResult& result, cache::publish::DevicePrefix::Result op_result);
+    static void AccumulateStepResult(StepCommitResult& result, cache::publish::FinishedRequest::Result&& op_result);
+    static void AccumulateStepResult(StepCommitResult& result, cache::publish::RetractPrefixPlan::Result op_result);
+    static void AccumulateStepResult(StepCommitResult& result, cache::publish::RetractPrefixCommit::Result&& op_result);
+    static void AccumulateStepResult(StepCommitResult& result, cache::materialize::PrefixOnDevice::Result op_result);
+    static void AccumulateStepResult(StepCommitResult& result,
+                                     cache::materialize::HostWritebackPages::Result&& op_result);
+    static void AccumulateStepResult(StepCommitResult& result, cache::state::CreateRequestLocalKV::Result&& op_result);
+    static void AccumulateStepResult(StepCommitResult& result,
+                                     cache::state::CreateRequestLocalMamba::Result&& op_result);
 
     bool HasMambaAdjunct() const { return mamba_allocator_ != nullptr; }
     bool HasPagedCacheAdjunct() const { return paged_cache_history_alignment_tokens_ > 0; }
@@ -370,7 +314,7 @@ private:
     std::unordered_set<std::string> paged_cache_state_group_set_;
     StateRestorePolicy paged_cache_state_policy_{StateRestorePolicy::kSnapshotRequired};
 
-    // TODO(snapshot-lru-perf): O(N log N) per prune; swap in LRU index if profiling shows it matters.
+    // Snapshot pruning currently rebuilds an age-ordered candidate list per prune.
     std::unordered_set<TreeNode*> paged_cache_snapshot_nodes_;
 };
 

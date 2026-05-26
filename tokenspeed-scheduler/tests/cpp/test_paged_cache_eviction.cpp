@@ -16,6 +16,8 @@
 
 // Coverage: passive snapshot detach on KV LRU eviction returns pages via RAII.
 
+#include <string>
+
 #include "paged_cache_test_fixture.h"
 
 namespace tokenspeed::test {
@@ -94,17 +96,17 @@ TEST_F(PagedCacheEvictionTest, StatePressurePrunesOnlyStateWhenHistoryHasCapacit
 
     auto simulated_free = hybrid_->InitialSimulatedFree();
     MatchResult match = kv_cache_->Match(token_vec_t{});
-    AdmissionRequest request{
-        .request_id = "state-pressure",
-        .kind = AdmissionRequestKind::kPrefillFirstChunk,
-        .device_pages_needed = 0,
-        .tokens_this_round = kLcm,
-        .first_raw_position_of_op = 0,
-        .target_raw_tokens_exclusive = kLcm,
-        .compat_match = &match,
-    };
-
-    auto result = hybrid_->Admit(request, simulated_free);
+    const std::string request_id = "state-pressure";
+    auto result = hybrid_->Apply(
+        cache::admit::PrefillFirstChunk{
+            .request_id = request_id,
+            .match_result = match,
+            .device_pages_needed = 0,
+            .tokens_this_round = kLcm,
+            .first_raw_position_of_op = 0,
+            .target_raw_tokens_exclusive = kLcm,
+        },
+        simulated_free);
 
     ASSERT_TRUE(result.admitted);
     ASSERT_TRUE(attach->HasPagedCacheSnapshot())

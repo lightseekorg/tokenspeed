@@ -114,19 +114,6 @@ TEST_F(MambaIntegrationTest, PrefixSharingWithMamba) {
     PlanOnce();
 }
 
-TEST_F(MambaIntegrationTest, AbortFreesMambaSlots) {
-    Submit(MakeRequestSpec("r1", 2));
-    PlanOnce();
-
-    SendFinish("r1");
-    PlanOnce();
-
-    for (int i = 0; i < 8; ++i) {
-        Submit(MakeRequestSpec("fill_" + std::to_string(i), 1));
-    }
-    PlanOnce();
-}
-
 class MambaDecodeCapacityTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

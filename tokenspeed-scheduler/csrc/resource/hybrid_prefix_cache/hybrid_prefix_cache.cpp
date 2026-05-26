@@ -109,217 +109,153 @@ void HybridPrefixCache::SetKvEventSink(KvEventSink sink) {
     has_facade_kv_event_sink_ = true;
 }
 
-HybridPrefixCache::RequestLocalKVResult HybridPrefixCache::PrepareRequestLocalKV(
-    const RequestLocalKVRequest& request) const {
-    RequestLocalKVResult result{};
-    auto require_allocator = [&]() -> LocalKVAllocator& {
-        if (request.local_kv_allocator == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::PrepareRequestLocalKV requires local_kv_allocator");
-        }
-        return *request.local_kv_allocator;
-    };
-
-    switch (request.kind) {
-        case RequestLocalKVKind::kPrefillFirstChunk:
-            result.local_kv_allocator =
-                std::make_unique<LocalKVAllocator>(&device_allocator_, request.tokens_this_round);
-            result.local_kv_allocator->Acquire(request.decode_input_tokens);
-            return result;
-        case RequestLocalKVKind::kPrefillChunk:
-            require_allocator().Acquire(request.tokens_this_round);
-            return result;
-    }
+cache::state::CreateRequestLocalKV::Result HybridPrefixCache::Apply(const cache::state::CreateRequestLocalKV& op) {
+    cache::state::CreateRequestLocalKV::Result result{};
+    result.local_kv_allocator = std::make_unique<LocalKVAllocator>(&device_allocator_, op.initial_tokens);
+    result.local_kv_allocator->Acquire(op.acquire_tokens);
     return result;
 }
 
-HybridPrefixCache::CachePublicationResult HybridPrefixCache::Publish(CachePublicationRequest request) {
-    CachePublicationResult result{};
-    auto require_tokens = [&]() -> const std::vector<std::span<const std::int32_t>>& {
-        if (request.full_paged_tokens == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Publish requires full_paged_tokens");
+cache::state::AcquireRequestLocalKV::Result HybridPrefixCache::Apply(const cache::state::AcquireRequestLocalKV& op) {
+    op.allocator.Acquire(op.tokens);
+    return {};
+}
+
+cache::publish::DevicePrefix::Result HybridPrefixCache::Apply(const cache::publish::DevicePrefix& op) {
+    cache::publish::DevicePrefix::Result result{};
+    if (op.device_node_ref == nullptr) {
+        throw std::invalid_argument("HybridPrefixCache::Apply(DevicePrefix) requires device_node_ref");
+    }
+    std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(op.device_node_ref->Node());
+    const std::int32_t new_page_count =
+        static_cast<std::int32_t>(op.full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
+    const std::int32_t page_size = kv_prefix_cache_.PageSize();
+    const std::int32_t last_inserted_len = static_cast<std::int32_t>(op.full_paged_tokens.size()) * page_size;
+    auto should_publish_mamba_checkpoint = [&]() {
+        if (op.local_mamba_allocator == nullptr || !op.local_mamba_allocator->HasCheckpoint()) {
+            return false;
         }
-        return *request.full_paged_tokens;
+        const std::int32_t checkpoint_position = op.local_mamba_allocator->CheckpointPosition();
+        if (checkpoint_position < 0 || checkpoint_position == last_inserted_len) {
+            return true;
+        }
+        if (!op.chunk_begin.has_value() || page_size <= 0) {
+            return false;
+        }
+        const std::int32_t chunk_begin = *op.chunk_begin;
+        if (last_inserted_len <= chunk_begin || last_inserted_len >= checkpoint_position) {
+            return false;
+        }
+        const std::int32_t track_len = last_inserted_len - chunk_begin;
+        return AlignMambaCacheSeqlen(track_len) == track_len;
     };
-    auto require_device_ref = [&]() -> std::unique_ptr<DeviceNodeRef>& {
-        if (request.device_node_ref == nullptr || *request.device_node_ref == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Publish requires device_node_ref");
+    const bool publish_mamba_checkpoint = should_publish_mamba_checkpoint();
+    if (new_page_count <= 0) {
+        if (op.local_mamba_allocator != nullptr && op.local_mamba_allocator->HasCheckpoint()) {
+            (void)op.local_mamba_allocator->DetachCheckpoint();
         }
-        return *request.device_node_ref;
-    };
-    auto require_current_device_node = [&]() -> const TreeNode* {
-        if (request.current_device_node == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Publish requires current_device_node");
-        }
-        return request.current_device_node;
-    };
-    auto require_local_kv_allocator = [&]() -> LocalKVAllocator& {
-        if (request.local_kv_allocator == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Publish requires local_kv_allocator");
-        }
-        return *request.local_kv_allocator;
-    };
-    auto require_page_hashes = [&]() -> const std::vector<std::string>& {
-        if (request.page_hashes == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Publish requires page_hashes");
-        }
-        return *request.page_hashes;
-    };
+        return result;
+    }
 
-    switch (request.kind) {
-        case CachePublicationKind::kForwardChunk: {
-            const auto& full_paged_tokens = require_tokens();
-            auto& device_node_ref = require_device_ref();
-            LocalKVAllocator& local_kv_allocator = require_local_kv_allocator();
-            std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
-            const std::int32_t new_page_count =
-                static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
-            const std::int32_t page_size = kv_prefix_cache_.PageSize();
-            const std::int32_t last_inserted_len = static_cast<std::int32_t>(full_paged_tokens.size()) * page_size;
-            auto should_publish_mamba_checkpoint = [&]() {
-                if (request.local_mamba_allocator == nullptr || !request.local_mamba_allocator->HasCheckpoint()) {
-                    return false;
-                }
-                const std::int32_t checkpoint_position = request.local_mamba_allocator->CheckpointPosition();
-                if (checkpoint_position < 0 || checkpoint_position == last_inserted_len) {
-                    return true;
-                }
-                if (!request.chunk_begin.has_value() || page_size <= 0) {
-                    return false;
-                }
-                const std::int32_t chunk_begin = *request.chunk_begin;
-                if (last_inserted_len <= chunk_begin || last_inserted_len >= checkpoint_position) {
-                    return false;
-                }
-                const std::int32_t track_len = last_inserted_len - chunk_begin;
-                return AlignMambaCacheSeqlen(track_len) == track_len;
-            };
-            const bool publish_mamba_checkpoint = should_publish_mamba_checkpoint();
-            if (new_page_count <= 0) {
-                if (request.local_mamba_allocator != nullptr && request.local_mamba_allocator->HasCheckpoint()) {
-                    (void)request.local_mamba_allocator->DetachCheckpoint();
-                }
-                return result;
-            }
+    OwnedPages pages_to_insert = op.local_kv_allocator.TakeFirst(new_page_count);
+    auto insert_result =
+        kv_prefix_cache_.Insert<ResourceType::Device>(op.full_paged_tokens, prefix_pages, std::move(pages_to_insert));
 
-            OwnedPages pages_to_insert = local_kv_allocator.TakeFirst(new_page_count);
-            auto insert_result = kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages,
-                                                                               std::move(pages_to_insert));
-
-            if (request.local_mamba_allocator != nullptr && request.local_mamba_allocator->HasCheckpoint()) {
-                std::unique_ptr<MambaSlot> checkpoint = request.local_mamba_allocator->DetachCheckpoint();
-                if (publish_mamba_checkpoint) {
-                    InsertMamba(insert_result.last_node, std::move(checkpoint));
-                }
-            }
-            device_node_ref = std::make_unique<DeviceNodeRef>(insert_result.last_node);
-            result.device_insert_page_count = new_page_count;
-            return result;
-        }
-        case CachePublicationKind::kFinishChunk: {
-            const auto& full_paged_tokens = require_tokens();
-            const TreeNode* current_device_node = require_current_device_node();
-            LocalKVAllocator& local_kv_allocator = require_local_kv_allocator();
-            const std::vector<std::string>& page_hashes = require_page_hashes();
-            std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(current_device_node);
-            const std::int32_t alloc_count =
-                static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
-
-            if (alloc_count > 0) {
-                OwnedPages alloc_pages = local_kv_allocator.TakeFirst(alloc_count);
-                kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
-                                                              page_hashes);
-                PublishFinishMambaState(full_paged_tokens, request.local_mamba_allocator);
-            }
-
-            result.device_insert_page_count = std::max(0, alloc_count);
-            result.match_result = kv_prefix_cache_.Match(full_paged_tokens);
-            return result;
-        }
-        case CachePublicationKind::kRetractDeviceInsertPageCount: {
-            const auto& full_paged_tokens = require_tokens();
-            const TreeNode* current_device_node = require_current_device_node();
-            std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(current_device_node);
-            const std::int32_t full_page_count = static_cast<std::int32_t>(full_paged_tokens.size());
-            const std::int32_t prefix_page_count = static_cast<std::int32_t>(prefix_pages.size());
-            if (full_page_count < prefix_page_count) {
-                throw std::logic_error(
-                    "HybridPrefixCache::Publish retract plan: current device prefix exceeds "
-                    "available full token pages");
-            }
-            result.device_insert_page_count = full_page_count - prefix_page_count;
-            return result;
-        }
-        case CachePublicationKind::kRetractChunk: {
-            const auto& full_paged_tokens = require_tokens();
-            const TreeNode* current_device_node = require_current_device_node();
-            std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(current_device_node);
-            const std::int32_t alloc_count =
-                static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
-            if (alloc_count < 0) {
-                throw std::logic_error(
-                    "HybridPrefixCache::Publish retract chunk: current device prefix exceeds "
-                    "available full token pages");
-            }
-            if (request.pages_to_insert.Size() != alloc_count) {
-                throw std::logic_error("HybridPrefixCache::Publish retract chunk: request-local page count mismatch");
-            }
-
-            kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages,
-                                                          std::move(request.pages_to_insert));
-            result.device_insert_page_count = alloc_count;
-            result.match_result = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
-            return result;
+    if (op.local_mamba_allocator != nullptr && op.local_mamba_allocator->HasCheckpoint()) {
+        std::unique_ptr<MambaSlot> checkpoint = op.local_mamba_allocator->DetachCheckpoint();
+        if (publish_mamba_checkpoint) {
+            InsertMamba(insert_result.last_node, std::move(checkpoint));
         }
     }
+    op.device_node_ref = std::make_unique<DeviceNodeRef>(insert_result.last_node);
+    result.device_insert_page_count = new_page_count;
     return result;
 }
 
-HybridPrefixCache::CacheMaterializationResult HybridPrefixCache::Materialize(
-    const CacheMaterializationRequest& request) {
-    CacheMaterializationResult result{};
-    auto require_match = [&]() -> const MatchResult& {
-        if (request.match_result == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Materialize requires match_result");
-        }
-        return *request.match_result;
-    };
-    auto require_write_diff = [&]() -> const std::vector<TreeNode*>& {
-        if (request.write_diff == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Materialize requires write_diff");
-        }
-        return *request.write_diff;
-    };
+cache::publish::FinishedRequest::Result HybridPrefixCache::Apply(const cache::publish::FinishedRequest& op) {
+    cache::publish::FinishedRequest::Result result{};
+    std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(&op.current_device_node);
+    const std::int32_t alloc_count =
+        static_cast<std::int32_t>(op.full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
 
-    switch (request.kind) {
-        case CacheMaterializationKind::kPrefillHostPrefixOnDevice: {
-            const MatchResult& match_result = require_match();
-            (void)kv_prefix_cache_.AllocateResourceOfType<ResourceType::Device>(
-                match_result.NodesWithout<ResourceType::Device>());
+    if (alloc_count > 0) {
+        OwnedPages alloc_pages = op.local_kv_allocator.TakeFirst(alloc_count);
+        kv_prefix_cache_.Insert<ResourceType::Device>(op.full_paged_tokens, prefix_pages, std::move(alloc_pages),
+                                                      op.page_hashes);
+        PublishFinishMambaState(op.full_paged_tokens, op.local_mamba_allocator);
+    }
+
+    result.device_insert_page_count = std::max(0, alloc_count);
+    result.match_result = kv_prefix_cache_.Match(op.full_paged_tokens);
+    return result;
+}
+
+cache::publish::RetractPrefixPlan::Result HybridPrefixCache::Apply(const cache::publish::RetractPrefixPlan& op) {
+    cache::publish::RetractPrefixPlan::Result result{};
+    std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(&op.current_device_node);
+    const std::int32_t full_page_count = static_cast<std::int32_t>(op.full_paged_tokens.size());
+    const std::int32_t prefix_page_count = static_cast<std::int32_t>(prefix_pages.size());
+    if (full_page_count < prefix_page_count) {
+        throw std::logic_error(
+            "HybridPrefixCache::Apply(RetractPrefixPlan): current device prefix exceeds available full token pages");
+    }
+    result.device_insert_page_count = full_page_count - prefix_page_count;
+    return result;
+}
+
+cache::publish::RetractPrefixCommit::Result HybridPrefixCache::Apply(cache::publish::RetractPrefixCommit&& op) {
+    cache::publish::RetractPrefixCommit::Result result{};
+    std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(&op.current_device_node);
+    const std::int32_t alloc_count =
+        static_cast<std::int32_t>(op.full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
+    if (alloc_count < 0) {
+        throw std::logic_error(
+            "HybridPrefixCache::Apply(RetractPrefixCommit): current device prefix exceeds available full token pages");
+    }
+    if (op.pages_to_insert.Size() != alloc_count) {
+        throw std::logic_error("HybridPrefixCache::Apply(RetractPrefixCommit): request-local page count mismatch");
+    }
+
+    kv_prefix_cache_.Insert<ResourceType::Device>(op.full_paged_tokens, prefix_pages, std::move(op.pages_to_insert));
+    result.device_insert_page_count = alloc_count;
+    result.match_result = kv_prefix_cache_.Match(op.full_paged_tokens, MatchIntent::StateRecovery);
+    return result;
+}
+
+cache::materialize::PrefixOnDevice::Result HybridPrefixCache::Apply(const cache::materialize::PrefixOnDevice& op) {
+    cache::materialize::PrefixOnDevice::Result result{};
+    const std::vector<TreeNode*> nodes = op.compat_match.NodesWithout<ResourceType::Device>();
+    if (op.require_all_pages) {
+        result.ok = kv_prefix_cache_.AllocateResourceOfType<ResourceType::Device>(nodes);
+        return result;
+    }
+    (void)kv_prefix_cache_.AllocateResourceOfType<ResourceType::Device>(nodes);
+    return result;
+}
+
+cache::materialize::HostWritebackPages::Result HybridPrefixCache::Apply(
+    const cache::materialize::HostWritebackPages& op) {
+    cache::materialize::HostWritebackPages::Result result{};
+    if (op.ensure_capacity_before_allocate) {
+        std::int32_t host_pages_num = 0;
+        for (TreeNode* node : op.write_diff) {
+            host_pages_num += node->Device().NumPages();
+        }
+        if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(host_pages_num)) {
+            result.ok = false;
             return result;
         }
-        case CacheMaterializationKind::kDecodeRecoveryHostPrefixOnDevice: {
-            const MatchResult& match_result = require_match();
-            result.ok = kv_prefix_cache_.AllocateResourceOfType<ResourceType::Device>(
-                match_result.NodesWithout<ResourceType::Device>());
-            return result;
-        }
-        case CacheMaterializationKind::kFinishWritebackHostPages: {
-            const std::vector<TreeNode*>& write_diff = require_write_diff();
-            std::int32_t host_pages_num = 0;
-            for (TreeNode* node : write_diff) {
-                host_pages_num += node->Device().NumPages();
+    }
+    result.ok = kv_prefix_cache_.AllocateResourceOfType<ResourceType::Host>(op.write_diff);
+    if (!result.ok) return result;
+    result.cache_transfer_pairs = PrepareMambaHostWriteBack(op.write_diff);
+    for (const TransferPair& transfer : result.cache_transfer_pairs) {
+        if (transfer.kind != CacheKind::kMamba) continue;
+        for (TreeNode* node : op.write_diff) {
+            if (node != nullptr && node->HasMamba() && node->MambaSlotIndex() == transfer.src) {
+                result.mamba_writeback_nodes.push_back(node);
+                break;
             }
-            if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(host_pages_num)) {
-                result.ok = false;
-                return result;
-            }
-            (void)kv_prefix_cache_.AllocateResourceOfType<ResourceType::Host>(write_diff);
-            return result;
-        }
-        case CacheMaterializationKind::kRetractWritebackHostPages: {
-            const std::vector<TreeNode*>& write_diff = require_write_diff();
-            result.ok = kv_prefix_cache_.AllocateResourceOfType<ResourceType::Host>(write_diff);
-            return result;
         }
     }
     return result;
@@ -475,363 +411,209 @@ CacheStatsSnapshot HybridPrefixCache::Stats(const StatsRequest& request) const {
     return snapshot;
 }
 
-void HybridPrefixCache::PrepareForwardOp(ForwardOperationBase& op_base, const CacheOpPrepareRequest& request) {
-    auto require_match = [&]() -> const MatchResult& {
-        if (request.match_result == nullptr) {
-            throw std::invalid_argument(
-                "HybridPrefixCache::PrepareForwardOp requires match_result for this prepare kind");
-        }
-        return *request.match_result;
-    };
-
-    PopulateMambaRequestLocalCompatibilityFields(op_base, request.local_mamba_allocator);
-
-    switch (request.kind) {
-        case WorkerCompatibilityCommitKind::kPrefillFirstChunk: {
-            const MatchResult& match_result = require_match();
-            PopulateMambaMatchCompatibilityFields(op_base, match_result);
-            CommitChunk(op_base.request_id, request.terminal);
-            acquireAndPopulateOp(op_base, request.first_raw_position_of_op, request.target_raw_tokens_exclusive,
-                                 match_result.paged_cache);
-            return;
-        }
-        case WorkerCompatibilityCommitKind::kPrefillChunk:
-            CommitChunk(op_base.request_id, request.terminal);
-            acquireAndPopulateOp(op_base, request.first_raw_position_of_op, request.target_raw_tokens_exclusive,
-                                 request.paged_cache_hit);
-            return;
-        case WorkerCompatibilityCommitKind::kDecodeChunk:
-            if (request.commit_prior_chunk) {
-                CommitChunk(op_base.request_id, request.terminal);
-            }
-            acquireAndPopulateOp(op_base, request.first_raw_position_of_op, request.target_raw_tokens_exclusive, {});
-            return;
-        case WorkerCompatibilityCommitKind::kDecodeFromRetracted: {
-            const MatchResult& match_result = require_match();
-            PopulateMambaRecoveryCompatibilityFields(op_base, match_result);
-            ReleaseRequest(op_base.request_id);
-            acquireAndPopulateOp(op_base, 0, request.target_raw_tokens_exclusive, match_result.paged_cache);
-            return;
-        }
-    }
+cache::worker::CommitPrefillFirstChunkMetadata::Result HybridPrefixCache::Apply(
+    const cache::worker::CommitPrefillFirstChunkMetadata& op) {
+    PopulateMambaRequestLocalCompatibilityFields(op.op_base, op.local_mamba_allocator);
+    PopulateMambaMatchCompatibilityFields(op.op_base, op.match_result);
+    CommitChunk(op.op_base.request_id, &op.tree_prefix_to_commit);
+    acquireAndPopulateOp(op.op_base, op.first_raw_position_of_op, op.target_raw_tokens_exclusive,
+                         op.match_result.paged_cache);
+    return {};
 }
 
-AdmissionVerdict HybridPrefixCache::Admit(const AdmissionRequest& request,
-                                          std::map<std::string, std::int32_t>& simulated_free) {
-    const MatchResult* match = request.compat_match;
-    if (match == nullptr && request.recovery_plan != nullptr) {
-        match = &request.recovery_plan->compat_match;
-    }
-
-    CacheAdmissionRequest compat_request{
-        .kind = request.kind,
-        .request_id = request.request_id,
-        .device_pages_needed = request.device_pages_needed,
-        .host_pages_needed = request.host_pages_needed,
-        .tokens_this_round = request.tokens_this_round,
-        .first_raw_position_of_op = request.first_raw_position_of_op,
-        .target_raw_tokens_exclusive = request.target_raw_tokens_exclusive,
-        .match_result = match,
-        .mamba_recovery_node = request.protected_recovery_node,
-        .refresh_mamba_checkpoint = request.refresh_mamba_checkpoint,
-    };
-    CacheAdmissionResult compat_result = Admit(compat_request, simulated_free);
-    return AdmissionVerdict{
-        .admitted = compat_result.admitted,
-        .mamba_branching_seqlen = compat_result.mamba_branching_seqlen,
-        .mamba_cow_src_index = compat_result.mamba_cow_src_index,
-        .cache_transfer_pairs = std::move(compat_result.cache_transfer_pairs),
-    };
+cache::worker::CommitPrefillMetadata::Result HybridPrefixCache::Apply(const cache::worker::CommitPrefillMetadata& op) {
+    PopulateMambaRequestLocalCompatibilityFields(op.op_base, op.local_mamba_allocator);
+    CommitChunk(op.op_base.request_id, &op.tree_prefix_to_commit);
+    acquireAndPopulateOp(op.op_base, op.first_raw_position_of_op, op.target_raw_tokens_exclusive,
+                         MatchResult::PagedCache{});
+    return {};
 }
 
-StepCommitResult HybridPrefixCache::StepCommit(StepCommitRequest request) {
-    StepCommitResult result{};
-
-    if (request.materialize_prefix.has_value()) {
-        const auto& materialize = *request.materialize_prefix;
-        const CacheMaterializationKind kind = materialize.require_all_pages
-                                                  ? CacheMaterializationKind::kDecodeRecoveryHostPrefixOnDevice
-                                                  : CacheMaterializationKind::kPrefillHostPrefixOnDevice;
-        result.ok = Materialize({
-                                    .kind = kind,
-                                    .match_result = materialize.compat_match,
-                                })
-                        .ok;
-        if (!result.ok) return result;
-    }
-
-    if (request.publish_device_prefix.has_value()) {
-        const auto& publish = *request.publish_device_prefix;
-        (void)Publish({
-            .kind = CachePublicationKind::kForwardChunk,
-            .full_paged_tokens = publish.full_paged_tokens,
-            .chunk_begin = publish.chunk_begin,
-            .device_node_ref = publish.device_node_ref,
-            .local_kv_allocator = publish.local_kv_allocator,
-            .local_mamba_allocator = publish.local_mamba_allocator,
-        });
-    }
-
-    if (request.publish_finished_request.has_value()) {
-        const auto& publish = *request.publish_finished_request;
-        auto publish_result = Publish({
-            .kind = CachePublicationKind::kFinishChunk,
-            .full_paged_tokens = publish.full_paged_tokens,
-            .current_device_node = publish.current_device_node,
-            .local_kv_allocator = publish.local_kv_allocator,
-            .local_mamba_allocator = publish.local_mamba_allocator,
-            .page_hashes = publish.page_hashes,
-        });
-        result.match_result = std::move(publish_result.match_result);
-        result.device_insert_page_count = publish_result.device_insert_page_count;
-    }
-
-    if (request.plan_device_prefix_insertion.has_value()) {
-        const auto& plan = *request.plan_device_prefix_insertion;
-        auto publish_result = Publish({
-            .kind = CachePublicationKind::kRetractDeviceInsertPageCount,
-            .full_paged_tokens = plan.full_paged_tokens,
-            .current_device_node = plan.current_device_node,
-        });
-        result.device_insert_page_count = publish_result.device_insert_page_count;
-    }
-
-    if (request.publish_device_prefix_insertion.has_value()) {
-        auto& publish = *request.publish_device_prefix_insertion;
-        auto publish_result = Publish({
-            .kind = CachePublicationKind::kRetractChunk,
-            .full_paged_tokens = publish.full_paged_tokens,
-            .current_device_node = publish.current_device_node,
-            .pages_to_insert = std::move(publish.pages_to_insert),
-        });
-        result.match_result = std::move(publish_result.match_result);
-        result.device_insert_page_count = publish_result.device_insert_page_count;
-    }
-
-    if (request.materialize_host_writeback.has_value()) {
-        const auto& materialize = *request.materialize_host_writeback;
-        const CacheMaterializationKind kind = materialize.ensure_capacity_before_allocate
-                                                  ? CacheMaterializationKind::kFinishWritebackHostPages
-                                                  : CacheMaterializationKind::kRetractWritebackHostPages;
-        result.ok = Materialize({
-                                    .kind = kind,
-                                    .write_diff = materialize.write_diff,
-                                })
-                        .ok;
-        if (!result.ok) return result;
-        if (materialize.write_diff != nullptr) {
-            result.cache_transfer_pairs = PrepareMambaHostWriteBack(*materialize.write_diff);
-            for (const TransferPair& transfer : result.cache_transfer_pairs) {
-                if (transfer.kind != CacheKind::kMamba) continue;
-                for (TreeNode* node : *materialize.write_diff) {
-                    if (node != nullptr && node->HasMamba() && node->MambaSlotIndex() == transfer.src) {
-                        result.mamba_writeback_nodes.push_back(node);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (request.publish_tree_owned_request_state.has_value()) {
-        const auto& publish = *request.publish_tree_owned_request_state;
-        if (publish.local_mamba_allocator_owner == nullptr) {
-            throw std::invalid_argument(
-                "HybridPrefixCache::StepCommit publish_tree_owned_request_state requires "
-                "local_mamba_allocator_owner");
-        }
-        PublishRetractMambaState(publish.terminal, *publish.local_mamba_allocator_owner);
-    }
-
-    const bool strict_mamba_create = request.request_local_mamba.has_value() &&
-                                     request.request_local_mamba->create_allocator &&
-                                     request.request_local_mamba->require_allocator;
-
-    auto apply_request_local_mamba = [&]() {
-        if (!request.request_local_mamba.has_value()) return;
-        const auto& mamba = *request.request_local_mamba;
-        if (mamba.create_allocator) {
-            auto mamba_result = PrepareRequestLocalMamba({
-                .kind = mamba.require_allocator ? RequestLocalMambaKind::kDecodeFromRetracted
-                                                : RequestLocalMambaKind::kPrefillFirstChunk,
-                .checkpoint_raw_position = mamba.checkpoint_raw_position,
-            });
-            result.local_mamba_allocator = std::move(mamba_result.local_mamba_allocator);
-        }
-        if (mamba.refresh_checkpoint_allocator != nullptr) {
-            (void)PrepareRequestLocalMamba({
-                .kind = RequestLocalMambaKind::kNextCheckpoint,
-                .local_mamba_allocator = mamba.refresh_checkpoint_allocator,
-                .checkpoint_raw_position = mamba.checkpoint_raw_position,
-            });
-        }
-    };
-
-    auto apply_request_local_kv = [&]() {
-        if (!request.request_local_kv.has_value()) return;
-        const auto& kv = *request.request_local_kv;
-        if (kv.create_allocator) {
-            auto kv_result = PrepareRequestLocalKV({
-                .kind = RequestLocalKVKind::kPrefillFirstChunk,
-                .tokens_this_round = kv.initial_tokens,
-                .decode_input_tokens = kv.acquire_tokens,
-            });
-            result.local_kv_allocator = std::move(kv_result.local_kv_allocator);
-            return;
-        }
-        if (kv.allocator != nullptr || kv.acquire_tokens > 0) {
-            (void)PrepareRequestLocalKV({
-                .kind = RequestLocalKVKind::kPrefillChunk,
-                .local_kv_allocator = kv.allocator,
-                .tokens_this_round = kv.acquire_tokens,
-            });
-        }
-    };
-
-    if (strict_mamba_create) {
-        apply_request_local_mamba();
-        apply_request_local_kv();
-    } else {
-        apply_request_local_kv();
-        apply_request_local_mamba();
-    }
-
-    if (request.worker_metadata.has_value()) {
-        const auto& worker = *request.worker_metadata;
-        if (worker.op_base == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::StepCommit PrepareWorkerOp requires op_base");
-        }
-        PrepareForwardOp(*worker.op_base,
-                         {
-                             .kind = worker.kind,
-                             .terminal = worker.terminal,
-                             .first_raw_position_of_op = worker.first_raw_position_of_op,
-                             .target_raw_tokens_exclusive = worker.target_raw_tokens_exclusive,
-                             .match_result = worker.compat_match,
-                             .local_mamba_allocator = worker.local_mamba_allocator_view,
-                             .paged_cache_hit = worker.compat_match == nullptr ? worker.paged_cache_hit
-                                                                               : worker.compat_match->paged_cache,
-                             .commit_prior_chunk = worker.commit_tree_prefix_before_acquire,
-                         });
-    }
-
-    return result;
+cache::worker::CommitDecodeAfterPrefillMetadata::Result HybridPrefixCache::Apply(
+    const cache::worker::CommitDecodeAfterPrefillMetadata& op) {
+    PopulateMambaRequestLocalCompatibilityFields(op.op_base, op.local_mamba_allocator);
+    CommitChunk(op.op_base.request_id, &op.tree_prefix_to_commit);
+    acquireAndPopulateOp(op.op_base, op.first_raw_position_of_op, op.target_raw_tokens_exclusive,
+                         MatchResult::PagedCache{});
+    return {};
 }
 
-HybridPrefixCache::CacheAdmissionResult HybridPrefixCache::Admit(const CacheAdmissionRequest& request,
-                                                                 std::map<std::string, std::int32_t>& simulated_free) {
-    CacheAdmissionResult result{};
-    auto require_match = [&]() -> const MatchResult& {
-        if (request.match_result == nullptr) {
-            throw std::invalid_argument("HybridPrefixCache::Admit requires match_result for this admission kind");
-        }
-        return *request.match_result;
-    };
-    auto mamba_device_loadback_nodes = [this](const MatchResult& match_result, TreeNode* preferred_source = nullptr) {
-        std::vector<TreeNode*> nodes;
-        if (mamba_host_allocator_ == nullptr || match_result.mamba_host_src_index < 0 ||
-            match_result.mamba_cow_src_index >= 0) {
-            return nodes;
-        }
-        TreeNode* host_mamba_node =
-            preferred_source != nullptr ? preferred_source : FindLastMambaHostNode(match_result.host.last_node);
-        if (host_mamba_node != nullptr && host_mamba_node->HasMambaOnHost() && !host_mamba_node->HasMamba()) {
-            nodes.push_back(host_mamba_node);
-        }
+cache::worker::CommitDecodeMetadata::Result HybridPrefixCache::Apply(const cache::worker::CommitDecodeMetadata& op) {
+    PopulateMambaRequestLocalCompatibilityFields(op.op_base, op.local_mamba_allocator);
+    acquireAndPopulateOp(op.op_base, op.first_raw_position_of_op, op.target_raw_tokens_exclusive,
+                         MatchResult::PagedCache{});
+    return {};
+}
+
+cache::worker::CommitDecodeRecoveryMetadata::Result HybridPrefixCache::Apply(
+    const cache::worker::CommitDecodeRecoveryMetadata& op) {
+    PopulateMambaRequestLocalCompatibilityFields(op.op_base, op.local_mamba_allocator);
+    PopulateMambaRecoveryCompatibilityFields(op.op_base, op.match_result);
+    ReleaseRequest(op.op_base.request_id);
+    acquireAndPopulateOp(op.op_base, 0, op.target_raw_tokens_exclusive, op.match_result.paged_cache);
+    return {};
+}
+
+std::vector<TreeNode*> HybridPrefixCache::MambaDeviceLoadbackNodes(const MatchResult& match_result,
+                                                                   TreeNode* preferred_source) const {
+    std::vector<TreeNode*> nodes;
+    if (mamba_host_allocator_ == nullptr || match_result.mamba_host_src_index < 0 ||
+        match_result.mamba_cow_src_index >= 0) {
         return nodes;
-    };
+    }
+    TreeNode* host_mamba_node =
+        preferred_source != nullptr ? preferred_source : FindLastMambaHostNode(match_result.host.last_node);
+    if (host_mamba_node != nullptr && host_mamba_node->HasMambaOnHost() && !host_mamba_node->HasMamba()) {
+        nodes.push_back(host_mamba_node);
+    }
+    return nodes;
+}
 
-    switch (request.kind) {
-        case AdmissionRequestKind::kPrefillFirstChunk: {
-            const MatchResult& match_result = require_match();
-            std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
-            if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(request.device_pages_needed)) {
-                return result;
+cache::admit::PrefillFirstChunk::Result HybridPrefixCache::Apply(const cache::admit::PrefillFirstChunk& op,
+                                                                 std::map<std::string, std::int32_t>& simulated_free) {
+    cache::admit::PrefillFirstChunk::Result result{};
+    std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(op.match_result.device.last_node);
+    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(op.device_pages_needed)) {
+        return result;
+    }
+    std::vector<TreeNode*> loadback_nodes = MambaDeviceLoadbackNodes(op.match_result);
+    std::optional<std::int32_t> mamba_branching_seqlen;
+    if (HasMambaAdjunct()) {
+        if (op.match_result.mamba_branching_seqlen == -1) {
+            const std::int32_t aligned = AlignMambaCacheSeqlen(op.tokens_this_round);
+            if (aligned > 0) {
+                mamba_branching_seqlen = aligned;
             }
-            std::vector<TreeNode*> loadback_nodes = mamba_device_loadback_nodes(match_result);
-            std::optional<std::int32_t> mamba_branching_seqlen;
-            if (HasMambaAdjunct()) {
-                if (match_result.mamba_branching_seqlen == -1) {
-                    const std::int32_t aligned = AlignMambaCacheSeqlen(request.tokens_this_round);
-                    if (aligned > 0) {
-                        mamba_branching_seqlen = aligned;
-                    }
-                }
-                const std::int32_t slots_needed = 2 + static_cast<std::int32_t>(loadback_nodes.size());
-                if (!EnsureMambaCapacityByEvict(slots_needed)) {
-                    return result;
-                }
-            }
-            result.admitted = AdmitChunk(request.request_id, request.first_raw_position_of_op,
-                                         request.target_raw_tokens_exclusive, simulated_free, match_result.paged_cache);
-            if (result.admitted) {
-                result.mamba_branching_seqlen = mamba_branching_seqlen;
-                result.cache_transfer_pairs = PrepareMambaDeviceLoadBack(loadback_nodes);
-                if (!loadback_nodes.empty() && loadback_nodes.front()->HasMamba()) {
-                    result.mamba_cow_src_index = loadback_nodes.front()->MambaSlotIndex();
-                }
-            }
-            return result;
         }
-        case AdmissionRequestKind::kPrefillChunk:
-            if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(request.device_pages_needed)) {
-                return result;
-            }
-            if (HasMambaAdjunct() && !EnsureMambaCapacityByEvict(1)) {
-                return result;
-            }
-            result.admitted = AdmitChunk(request.request_id, request.first_raw_position_of_op,
-                                         request.target_raw_tokens_exclusive, simulated_free);
-            return result;
-        case AdmissionRequestKind::kDecodeChunk:
-            if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(request.device_pages_needed)) {
-                return result;
-            }
-            if (request.refresh_mamba_checkpoint && HasMambaAdjunct() && !EnsureMambaCapacityByEvict(1)) {
-                return result;
-            }
-            result.admitted = AdmitChunk(request.request_id, request.first_raw_position_of_op,
-                                         request.target_raw_tokens_exclusive, simulated_free);
-            return result;
-        case AdmissionRequestKind::kDecodeFromRetracted: {
-            const MatchResult& match_result = require_match();
-            std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
-            if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(request.device_pages_needed)) {
-                return result;
-            }
-            std::vector<TreeNode*> loadback_nodes =
-                mamba_device_loadback_nodes(match_result, request.mamba_recovery_node);
-            if (HasMambaAdjunct()) {
-                if (request.mamba_recovery_node == nullptr) {
-                    return result;
-                }
-                // Recovery COWs the tree-owned Mamba state into fresh
-                // request-local working/checkpoint slots. Protect the source
-                // node only for this allocation; retracted Mamba states are
-                // otherwise normal evictable tree-owned cache entries.
-                const std::int32_t slots_needed = 2 + static_cast<std::int32_t>(loadback_nodes.size());
-                if (!EnsureMambaCapacityByEvict(slots_needed, request.mamba_recovery_node)) {
-                    return result;
-                }
-            }
-            result.admitted = AdmitChunkFromRetracted(request.request_id, request.target_raw_tokens_exclusive,
-                                                      simulated_free, match_result.paged_cache);
-            if (result.admitted) {
-                result.cache_transfer_pairs = PrepareMambaDeviceLoadBack(loadback_nodes);
-                if (!loadback_nodes.empty() && loadback_nodes.front()->HasMamba()) {
-                    result.mamba_cow_src_index = loadback_nodes.front()->MambaSlotIndex();
-                }
-            }
-            return result;
-        }
-        case AdmissionRequestKind::kRetract: {
-            const MatchResult& match_result = require_match();
-            std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
-            result.admitted = kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(request.host_pages_needed);
+        const std::int32_t slots_needed = 2 + static_cast<std::int32_t>(loadback_nodes.size());
+        if (!EnsureMambaCapacityByEvict(slots_needed)) {
             return result;
         }
     }
+    result.admitted = AdmitChunk(op.request_id, op.first_raw_position_of_op, op.target_raw_tokens_exclusive,
+                                 simulated_free, op.match_result.paged_cache);
+    if (result.admitted) {
+        result.mamba_branching_seqlen = mamba_branching_seqlen;
+        result.cache_transfer_pairs = PrepareMambaDeviceLoadBack(loadback_nodes);
+        if (!loadback_nodes.empty() && loadback_nodes.front()->HasMamba()) {
+            result.mamba_cow_src_index = loadback_nodes.front()->MambaSlotIndex();
+        }
+    }
     return result;
+}
+
+cache::admit::PrefillChunk::Result HybridPrefixCache::Apply(const cache::admit::PrefillChunk& op,
+                                                            std::map<std::string, std::int32_t>& simulated_free) {
+    cache::admit::PrefillChunk::Result result{};
+    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(op.device_pages_needed)) {
+        return result;
+    }
+    if (HasMambaAdjunct() && !EnsureMambaCapacityByEvict(1)) {
+        return result;
+    }
+    result.admitted =
+        AdmitChunk(op.request_id, op.first_raw_position_of_op, op.target_raw_tokens_exclusive, simulated_free);
+    return result;
+}
+
+cache::admit::Decode::Result HybridPrefixCache::Apply(const cache::admit::Decode& op,
+                                                      std::map<std::string, std::int32_t>& simulated_free) {
+    cache::admit::Decode::Result result{};
+    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(op.device_pages_needed)) {
+        return result;
+    }
+    if (op.refresh_mamba_checkpoint && HasMambaAdjunct() && !EnsureMambaCapacityByEvict(1)) {
+        return result;
+    }
+    result.admitted =
+        AdmitChunk(op.request_id, op.first_raw_position_of_op, op.target_raw_tokens_exclusive, simulated_free);
+    return result;
+}
+
+cache::admit::DecodeFromRetracted::Result HybridPrefixCache::Apply(
+    const cache::admit::DecodeFromRetracted& op, std::map<std::string, std::int32_t>& simulated_free) {
+    cache::admit::DecodeFromRetracted::Result result{};
+    std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(op.match_result.device.last_node);
+    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(op.device_pages_needed)) {
+        return result;
+    }
+    std::vector<TreeNode*> loadback_nodes = MambaDeviceLoadbackNodes(op.match_result, op.protected_recovery_node);
+    if (HasMambaAdjunct()) {
+        if (op.protected_recovery_node == nullptr) {
+            return result;
+        }
+        // Recovery COWs the tree-owned Mamba state into fresh request-local
+        // working/checkpoint slots. Protect the source node only for this
+        // allocation; retracted Mamba states are otherwise normal evictable
+        // tree-owned cache entries.
+        const std::int32_t slots_needed = 2 + static_cast<std::int32_t>(loadback_nodes.size());
+        if (!EnsureMambaCapacityByEvict(slots_needed, op.protected_recovery_node)) {
+            return result;
+        }
+    }
+    result.admitted = AdmitChunkFromRetracted(op.request_id, op.target_raw_tokens_exclusive, simulated_free,
+                                              op.match_result.paged_cache);
+    if (result.admitted) {
+        result.cache_transfer_pairs = PrepareMambaDeviceLoadBack(loadback_nodes);
+        if (!loadback_nodes.empty() && loadback_nodes.front()->HasMamba()) {
+            result.mamba_cow_src_index = loadback_nodes.front()->MambaSlotIndex();
+        }
+    }
+    return result;
+}
+
+cache::admit::Retract::Result HybridPrefixCache::Apply(const cache::admit::Retract& op,
+                                                       std::map<std::string, std::int32_t>&) {
+    cache::admit::Retract::Result result{};
+    std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(op.match_result.host.last_node);
+    result.admitted = kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(op.host_pages_needed);
+    return result;
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult&, cache::EmptyResult) {}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result, cache::publish::DevicePrefix::Result op_result) {
+    result.device_insert_page_count = op_result.device_insert_page_count;
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result,
+                                             cache::publish::FinishedRequest::Result&& op_result) {
+    result.match_result = std::move(op_result.match_result);
+    result.device_insert_page_count = op_result.device_insert_page_count;
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result,
+                                             cache::publish::RetractPrefixPlan::Result op_result) {
+    result.device_insert_page_count = op_result.device_insert_page_count;
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result,
+                                             cache::publish::RetractPrefixCommit::Result&& op_result) {
+    result.match_result = std::move(op_result.match_result);
+    result.device_insert_page_count = op_result.device_insert_page_count;
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result,
+                                             cache::materialize::PrefixOnDevice::Result op_result) {
+    result.ok = op_result.ok;
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result,
+                                             cache::materialize::HostWritebackPages::Result&& op_result) {
+    result.ok = op_result.ok;
+    if (!result.ok) return;
+    result.cache_transfer_pairs = std::move(op_result.cache_transfer_pairs);
+    result.mamba_writeback_nodes = std::move(op_result.mamba_writeback_nodes);
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result,
+                                             cache::state::CreateRequestLocalKV::Result&& op_result) {
+    result.local_kv_allocator = std::move(op_result.local_kv_allocator);
+}
+
+void HybridPrefixCache::AccumulateStepResult(StepCommitResult& result,
+                                             cache::state::CreateRequestLocalMamba::Result&& op_result) {
+    result.local_mamba_allocator = std::move(op_result.local_mamba_allocator);
 }
 
 }  // namespace tokenspeed
