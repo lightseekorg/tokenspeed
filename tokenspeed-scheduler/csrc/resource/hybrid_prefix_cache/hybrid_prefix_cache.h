@@ -55,7 +55,6 @@ public:
                       std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator = nullptr);
     ~HybridPrefixCache();
 
-    RecoveryPlan MatchPrefix(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
     RecoveryPlan MatchPrefix(const std::vector<std::span<const std::int32_t>>& token_pages,
                              MatchIntent intent = MatchIntent::PrefixReuse);
     [[nodiscard]] AdmissionVerdict Admit(const AdmissionRequest& request,
@@ -168,6 +167,7 @@ private:
     struct CachePublicationRequest {
         CachePublicationKind kind{CachePublicationKind::kForwardChunk};
         const std::vector<std::span<const std::int32_t>>* full_paged_tokens{nullptr};
+        std::optional<std::int32_t> chunk_begin{};
         std::unique_ptr<DeviceNodeRef>* device_node_ref{nullptr};
         const TreeNode* current_device_node{nullptr};
         LocalKVAllocator* local_kv_allocator{nullptr};

@@ -48,7 +48,7 @@ TEST_F(PagedCachePrefixHitCommitTest, PrefixHitFollowedByCheckpointDoesNotOverfl
     const auto tokens = MakeAlignedTokens(num_pages, kPageSize, /*start=*/1);
 
     // The second request: prefix-cache match returns the depth-256 hit.
-    auto pre_match = hybrid_->MatchPrefix(tokens).compat_match;
+    auto pre_match = MatchPrefix(*hybrid_, tokens, kPageSize).compat_match;
     ASSERT_NE(pre_match.paged_cache.last_node, nullptr);
     EXPECT_EQ(pre_match.paged_cache.last_node, n256);
     EXPECT_EQ(pre_match.paged_cache.prefix_len_tokens, 256);
@@ -75,7 +75,7 @@ TEST_F(PagedCachePrefixHitCommitTest, PrefixHitFollowedByCheckpointDoesNotOverfl
     // Observable: a fresh Match now reconstructs the full trailing window
     // (state_span = [n256, n512]) and exposes window/raw_per_page page ids
     // for the sliding "swa" group.
-    auto post_match = hybrid_->MatchPrefix(tokens).compat_match;
+    auto post_match = MatchPrefix(*hybrid_, tokens, kPageSize).compat_match;
     ASSERT_NE(post_match.paged_cache.last_node, nullptr);
     EXPECT_EQ(post_match.paged_cache.prefix_len_tokens, 512);
 

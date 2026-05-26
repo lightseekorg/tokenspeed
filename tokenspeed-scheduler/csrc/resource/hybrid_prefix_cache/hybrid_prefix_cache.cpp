@@ -62,11 +62,6 @@ HybridPrefixCache::~HybridPrefixCache() {
     kv_prefix_cache_.GetHostManager().SetEvictionCallback({});
 }
 
-RecoveryPlan HybridPrefixCache::MatchPrefix(const token_vec_t& token_ids, MatchIntent intent) {
-    DemoteIdleMambaDeviceCopiesPresentOnHost();
-    return BuildRecoveryPlan(kv_prefix_cache_.Match(token_ids, intent), intent);
-}
-
 RecoveryPlan HybridPrefixCache::MatchPrefix(const std::vector<std::span<const std::int32_t>>& token_pages,
                                             MatchIntent intent) {
     DemoteIdleMambaDeviceCopiesPresentOnHost();
@@ -178,21 +173,43 @@ HybridPrefixCache::CachePublicationResult HybridPrefixCache::Publish(CachePublic
             std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
             const std::int32_t new_page_count =
                 static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
-            if (new_page_count <= 0) return result;
+            const std::int32_t page_size = kv_prefix_cache_.PageSize();
+            const std::int32_t last_inserted_len = static_cast<std::int32_t>(full_paged_tokens.size()) * page_size;
+            auto should_publish_mamba_checkpoint = [&]() {
+                if (request.local_mamba_allocator == nullptr || !request.local_mamba_allocator->HasCheckpoint()) {
+                    return false;
+                }
+                const std::int32_t checkpoint_position = request.local_mamba_allocator->CheckpointPosition();
+                if (checkpoint_position < 0 || checkpoint_position == last_inserted_len) {
+                    return true;
+                }
+                if (!request.chunk_begin.has_value() || page_size <= 0) {
+                    return false;
+                }
+                const std::int32_t chunk_begin = *request.chunk_begin;
+                if (last_inserted_len <= chunk_begin || last_inserted_len >= checkpoint_position) {
+                    return false;
+                }
+                const std::int32_t track_len = last_inserted_len - chunk_begin;
+                return AlignMambaCacheSeqlen(track_len) == track_len;
+            };
+            const bool publish_mamba_checkpoint = should_publish_mamba_checkpoint();
+            if (new_page_count <= 0) {
+                if (request.local_mamba_allocator != nullptr && request.local_mamba_allocator->HasCheckpoint()) {
+                    (void)request.local_mamba_allocator->DetachCheckpoint();
+                }
+                return result;
+            }
 
             OwnedPages pages_to_insert = local_kv_allocator.TakeFirst(new_page_count);
             auto insert_result = kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages,
                                                                                std::move(pages_to_insert));
 
             if (request.local_mamba_allocator != nullptr && request.local_mamba_allocator->HasCheckpoint()) {
-                const std::int32_t checkpoint_position = request.local_mamba_allocator->CheckpointPosition();
-                if (checkpoint_position >= 0 &&
-                    checkpoint_position != static_cast<std::int32_t>(insert_result.last_node->DepthInTokens())) {
-                    device_node_ref = std::make_unique<DeviceNodeRef>(insert_result.last_node);
-                    result.device_insert_page_count = new_page_count;
-                    return result;
+                std::unique_ptr<MambaSlot> checkpoint = request.local_mamba_allocator->DetachCheckpoint();
+                if (publish_mamba_checkpoint) {
+                    InsertMamba(insert_result.last_node, std::move(checkpoint));
                 }
-                InsertMamba(insert_result.last_node, request.local_mamba_allocator->DetachCheckpoint());
             }
             device_node_ref = std::make_unique<DeviceNodeRef>(insert_result.last_node);
             result.device_insert_page_count = new_page_count;
@@ -548,6 +565,7 @@ StepCommitResult HybridPrefixCache::StepCommit(StepCommitRequest request) {
         (void)Publish({
             .kind = CachePublicationKind::kForwardChunk,
             .full_paged_tokens = publish.full_paged_tokens,
+            .chunk_begin = publish.chunk_begin,
             .device_node_ref = publish.device_node_ref,
             .local_kv_allocator = publish.local_kv_allocator,
             .local_mamba_allocator = publish.local_mamba_allocator,

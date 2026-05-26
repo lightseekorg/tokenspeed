@@ -163,6 +163,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                 .device_node_ref = &device_node_ref,
                 .local_kv_allocator = local_kv_allocator.get(),
                 .local_mamba_allocator = local_mamba_allocator.get(),
+                .chunk_begin = state.window.begin,
             },
         .request_local_kv =
             RequestLocalKVStateRequest{
@@ -222,6 +223,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
                 .device_node_ref = &device_node_ref,
                 .local_kv_allocator = local_kv_allocator.get(),
                 .local_mamba_allocator = local_mamba_allocator.get(),
+                .chunk_begin = state.window.begin,
             },
         .request_local_kv =
             RequestLocalKVStateRequest{
@@ -360,8 +362,8 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
         pages_to_transfer.insert(pages_to_transfer.end(),
                                  std::make_move_iterator(materialization_result.cache_transfer_pairs.begin()),
                                  std::make_move_iterator(materialization_result.cache_transfer_pairs.end()));
-        return Draining{std::move(pages_to_transfer), std::move(device_node_ref), std::move(host_node_ref),
-                        std::move(materialization_result.mamba_writeback_nodes)};
+        return Draining{std::move(pages_to_transfer), std::move(write_diff), std::move(device_node_ref),
+                        std::move(host_node_ref), std::move(materialization_result.mamba_writeback_nodes)};
     }
     return Finished{};
 }
@@ -474,6 +476,7 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     std::unique_ptr<DeviceNodeRef> device_node_ref = nullptr;
     std::unique_ptr<HostNodeRef> host_node_ref = nullptr;
     std::vector<Retracting::PagePair> pages_to_transfer;
+    std::vector<TreeNode*> writeback_nodes;
     std::vector<TreeNode*> mamba_writeback_nodes;
 
     if (match_result_.device.DepthInPage() > match_result_.host.DepthInPage()) {
@@ -494,6 +497,7 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
         pages_to_transfer.insert(pages_to_transfer.end(),
                                  std::make_move_iterator(materialization_result.cache_transfer_pairs.begin()),
                                  std::make_move_iterator(materialization_result.cache_transfer_pairs.end()));
+        writeback_nodes = std::move(write_diff);
         mamba_writeback_nodes = std::move(materialization_result.mamba_writeback_nodes);
         host_node_ref = std::make_unique<HostNodeRef>(match_result_.device.last_node);
     } else {
@@ -519,6 +523,7 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                       std::move(device_node_ref),
                       std::move(local_allocator),
                       std::move(pages_to_transfer),
+                      std::move(writeback_nodes),
                       std::move(mamba_writeback_nodes),
                       std::move(local_mamba_allocator)};
 }

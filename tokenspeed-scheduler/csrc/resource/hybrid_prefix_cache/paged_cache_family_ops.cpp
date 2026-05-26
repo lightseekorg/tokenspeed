@@ -482,6 +482,8 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
         std::int32_t borrowed_in_table = 0;
         std::int32_t owned_in_table = 0;
         std::int32_t already_released = 0;
+        std::int32_t committed_prefix = 0;
+        std::int32_t raw_cursor = 0;
         bool table_exists = false;
         if (req_it != request_paged_cache_tables_.end()) {
             auto t_it = req_it->second.find(gid);
@@ -492,6 +494,8 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
                 borrowed_in_table = t_it->second.BorrowedPagesCount();
                 owned_in_table = t_it->second.OwnedPagesCount();
                 already_released = t_it->second.ReleasedPagesCount();
+                committed_prefix = t_it->second.CommittedPrefixLenTokens();
+                raw_cursor = t_it->second.RawTokenCursor();
             }
         }
 
@@ -523,6 +527,24 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
             releasable_owned = releasable_total - std::min(releasable_total, borrowed_present_total);
             if (table_exists) {
                 releasable_owned = std::min(releasable_owned, owned_in_table);
+            }
+
+            // State-family: CommitChunk converts all owned pages to borrowed
+            // before ReleaseSkipped runs, so owned pages do not return to the
+            // pool via release. The only pool credit comes from
+            // CheckpointStateToSnapshot's stale-owned drop below the live
+            // lower bound at the first commit step.
+            const std::int32_t lcm = paged_cache_history_alignment_tokens_;
+            if (cfg.family == PagedCacheGroupFamily::State && table_exists && lcm > 0 &&
+                committed_prefix + lcm <= raw_cursor) {
+                const std::int32_t commit_target = committed_prefix + lcm;
+                const std::int32_t live_lower_raw = std::max(0, commit_target - *cfg.sliding_window_tokens);
+                const std::int32_t live_lower_page = live_lower_raw / raw_per_page;
+                std::int32_t base = already_released;
+                if (live_lower_page > base) {
+                    base += std::min(live_lower_page - base, borrowed_in_table);
+                }
+                releasable_owned = (live_lower_page > base) ? std::min(live_lower_page - base, owned_in_table) : 0;
             }
         }
 

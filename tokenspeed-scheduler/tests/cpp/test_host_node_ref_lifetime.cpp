@@ -87,6 +87,7 @@ TEST_F(HostNodeRefLifetimeTest, Draining_HoldsHostLockAfterCallerExits) {
 
     fsm::Draining drain{
         /*pages_to_transfer=*/{},
+        /*writeback_nodes=*/{},
         /*device_node_ref=*/std::unique_ptr<DeviceNodeRef>{},
         /*host_node_ref=*/std::move(host_ref),
     };

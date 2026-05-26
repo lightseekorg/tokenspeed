@@ -105,6 +105,7 @@ struct WalkResult {
 
 struct CacheOpSpec {
     std::string request_id;
+    std::vector<TreeNode*> writeback_nodes;
 
     CacheOpSpec() = default;
     ~CacheOpSpec() = default;

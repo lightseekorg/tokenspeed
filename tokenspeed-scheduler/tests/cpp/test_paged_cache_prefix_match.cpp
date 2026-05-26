@@ -32,7 +32,7 @@ TEST_F(PagedCachePrefixMatchTest, CapVsNoCap320) {
     const auto tokens = MakeAlignedTokens(num_pages, kPageSize, /*start=*/1);
 
     // No snapshot: paged_cache empty; device/host capped to root.
-    auto match = hybrid_->MatchPrefix(tokens).compat_match;
+    auto match = MatchPrefix(*hybrid_, tokens, kPageSize).compat_match;
     EXPECT_EQ(match.paged_cache.last_node, nullptr);
     EXPECT_EQ(match.paged_cache.prefix_len_tokens, 0);
     ASSERT_NE(match.device.last_node, nullptr);
@@ -51,7 +51,7 @@ TEST_F(PagedCachePrefixMatchTest, CapVsNoCap320) {
     EXPECT_TRUE(boundary_256->GetPagedCacheSnapshot()->IsCompleteFor(PagedCacheGroupFamily::History));
     EXPECT_TRUE(boundary_256->GetPagedCacheSnapshot()->IsCompleteFor(PagedCacheGroupFamily::State));
 
-    match = hybrid_->MatchPrefix(tokens).compat_match;
+    match = MatchPrefix(*hybrid_, tokens, kPageSize).compat_match;
     ASSERT_NE(match.paged_cache.last_node, nullptr);
     EXPECT_EQ(match.paged_cache.last_node, boundary_256);
     EXPECT_EQ(match.paged_cache.prefix_len_tokens, 256);
@@ -84,7 +84,7 @@ TEST_F(PagedCachePrefixMatchTest, ContiguousChainBreakMid) {
     ASSERT_TRUE(n768->HasPagedCacheSnapshot());
     EXPECT_TRUE(n768->GetPagedCacheSnapshot()->IsCompleteFor(PagedCacheGroupFamily::History));
 
-    auto match = hybrid_->MatchPrefix(MakeAlignedTokens(num_pages, kPageSize, /*start=*/1)).compat_match;
+    auto match = MatchPrefix(*hybrid_, MakeAlignedTokens(num_pages, kPageSize, /*start=*/1), kPageSize).compat_match;
     ASSERT_NE(match.paged_cache.last_node, nullptr);
     EXPECT_EQ(match.paged_cache.last_node, n256);
     EXPECT_EQ(match.paged_cache.prefix_len_tokens, 256);

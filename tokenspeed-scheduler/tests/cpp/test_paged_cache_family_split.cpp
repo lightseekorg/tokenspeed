@@ -51,7 +51,7 @@ TEST_F(PagedCacheFamilySplitTest, HistoryCompleteStateMissingFallback) {
     EXPECT_TRUE(n768->GetPagedCacheSnapshot()->IsCompleteFor(PagedCacheGroupFamily::History));
     EXPECT_FALSE(n768->GetPagedCacheSnapshot()->IsCompleteFor(PagedCacheGroupFamily::State));
 
-    auto match = hybrid_->MatchPrefix(MakeAlignedTokens(num_pages, kPageSize, /*start=*/1)).compat_match;
+    auto match = MatchPrefix(*hybrid_, MakeAlignedTokens(num_pages, kPageSize, /*start=*/1), kPageSize).compat_match;
     ASSERT_NE(match.paged_cache.last_node, nullptr);
     // History chain reaches 768 but state at 768 is missing; segments_needed=1
     // forces fallback to 512.
@@ -80,7 +80,7 @@ TEST_F(PagedCacheFamilyWideWindowTest, StateWindowDiscontinuityFallback) {
 
     DowngradeSnapshotToHistoryOnly(n512);
 
-    auto match = hybrid_->MatchPrefix(MakeAlignedTokens(num_pages, kPageSize, /*start=*/1)).compat_match;
+    auto match = MatchPrefix(*hybrid_, MakeAlignedTokens(num_pages, kPageSize, /*start=*/1), kPageSize).compat_match;
     ASSERT_NE(match.paged_cache.last_node, nullptr);
     EXPECT_EQ(match.paged_cache.last_node, n256);
     EXPECT_EQ(match.paged_cache.prefix_len_tokens, 256);
@@ -110,7 +110,7 @@ TEST_F(PagedCacheFamilySplitTest, StateDetachDoesNotBreakHistoryChain) {
     EXPECT_FALSE(n512->GetPagedCacheSnapshot()->IsCompleteFor(PagedCacheGroupFamily::State));
     EXPECT_TRUE(n768->GetPagedCacheSnapshot()->IsCompleteFor(PagedCacheGroupFamily::State));
 
-    auto match = hybrid_->MatchPrefix(MakeAlignedTokens(num_pages, kPageSize, /*start=*/1)).compat_match;
+    auto match = MatchPrefix(*hybrid_, MakeAlignedTokens(num_pages, kPageSize, /*start=*/1), kPageSize).compat_match;
     ASSERT_NE(match.paged_cache.last_node, nullptr);
     // History chain unbroken; state at 768 (only the trailing segment) is fine.
     EXPECT_EQ(match.paged_cache.last_node, n768);

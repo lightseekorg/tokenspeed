@@ -127,7 +127,10 @@ HybridPrefixCache::RequestLocalMambaResult HybridPrefixCache::PrepareRequestLoca
                 (void)request.local_mamba_allocator->DetachCheckpoint();
                 return result;
             }
-            (void)request.local_mamba_allocator->AllocateCheckpoint(request.checkpoint_raw_position.value_or(-1));
+            (void)request.local_mamba_allocator->DetachCheckpoint();
+            if (!request.local_mamba_allocator->AllocateCheckpoint(request.checkpoint_raw_position.value_or(-1))) {
+                throw std::logic_error("SchedulePrefillEvent: failed to allocate Mamba checkpoint slot");
+            }
             return result;
     }
     return result;
@@ -147,17 +150,26 @@ std::unique_ptr<LocalMambaAllocator> HybridPrefixCache::allocateRequestLocalMamb
 
 void HybridPrefixCache::PublishFinishMambaState(const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                                                 LocalMambaAllocator* local_mamba_allocator) {
-    if (!HasMambaAdjunct() || local_mamba_allocator == nullptr || !local_mamba_allocator->HasCheckpoint()) {
+    if (!HasMambaAdjunct() || local_mamba_allocator == nullptr ||
+        (!local_mamba_allocator->HasCheckpoint() && !local_mamba_allocator->HasWorking())) {
         return;
     }
     MatchResult post_match = kv_prefix_cache_.Match(full_paged_tokens);
     TreeNode* terminal = post_match.device.last_node;
     if (terminal == nullptr || terminal->HasMamba()) return;
-    const std::int32_t checkpoint_position = local_mamba_allocator->CheckpointPosition();
-    if (checkpoint_position >= 0 && checkpoint_position != static_cast<std::int32_t>(terminal->DepthInTokens())) {
-        return;
+
+    std::unique_ptr<MambaSlot> slot_to_publish;
+    if (local_mamba_allocator->HasCheckpoint()) {
+        const std::int32_t checkpoint_position = local_mamba_allocator->CheckpointPosition();
+        if (checkpoint_position < 0 || checkpoint_position == static_cast<std::int32_t>(terminal->DepthInTokens())) {
+            slot_to_publish = local_mamba_allocator->DetachCheckpoint();
+        }
     }
-    InsertMamba(terminal, local_mamba_allocator->DetachCheckpoint());
+    if (slot_to_publish == nullptr && local_mamba_allocator->HasWorking()) {
+        slot_to_publish = local_mamba_allocator->DetachWorking();
+    }
+    if (slot_to_publish == nullptr) return;
+    InsertMamba(terminal, std::move(slot_to_publish));
 }
 
 void HybridPrefixCache::PublishRetractMambaState(TreeNode* terminal,

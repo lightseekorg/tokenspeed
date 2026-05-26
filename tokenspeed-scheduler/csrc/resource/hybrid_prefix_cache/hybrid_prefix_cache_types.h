@@ -100,6 +100,7 @@ struct DevicePrefixPublicationRequest {
     std::unique_ptr<DeviceNodeRef>* device_node_ref{nullptr};
     LocalKVAllocator* local_kv_allocator{nullptr};
     LocalMambaAllocator* local_mamba_allocator{nullptr};
+    std::optional<std::int32_t> chunk_begin{};
 };
 
 struct FinishedRequestPublicationRequest {

@@ -23,12 +23,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/types.h"
 #include "resource/allocator/page_allocator.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
@@ -45,6 +47,23 @@ inline token_vec_t MakeTokens(int32_t count, token_t start = 1) {
 // Generate a token sequence aligned to page_size.
 inline token_vec_t MakeAlignedTokens(int32_t num_pages, int32_t page_size, token_t start = 1) {
     return MakeTokens(num_pages * page_size, start);
+}
+
+inline std::vector<std::span<const std::int32_t>> MakePagedTokenSpans(const token_vec_t& tokens,
+                                                                      std::int32_t page_size) {
+    std::vector<std::span<const std::int32_t>> pages;
+    const auto page_count = static_cast<std::int32_t>(tokens.size()) / page_size;
+    pages.reserve(static_cast<std::size_t>(page_count));
+    for (std::int32_t page = 0; page < page_count; ++page) {
+        pages.emplace_back(tokens.data() + page * page_size, static_cast<std::size_t>(page_size));
+    }
+    return pages;
+}
+
+inline RecoveryPlan MatchPrefix(HybridPrefixCache& cache, const token_vec_t& tokens, std::int32_t page_size,
+                                MatchIntent intent = MatchIntent::PrefixReuse) {
+    auto pages = MakePagedTokenSpans(tokens, page_size);
+    return cache.MatchPrefix(pages, intent);
 }
 
 // Generate page hashes of the requested length.

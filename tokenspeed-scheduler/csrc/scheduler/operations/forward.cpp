@@ -294,6 +294,7 @@ std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* re
     cache_op_id op_id = hybrid_prefix_cache_.AllocateCacheOpId();
     CacheOpSpec spec;
     spec.request_id = request->Id();
+    spec.writeback_nodes = request->GetWriteBackNodes<fsm::Retracting>();
     cache_op_tracker_[op_id] = std::move(spec);
     return WriteBackOperation{op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end()),
                               true};

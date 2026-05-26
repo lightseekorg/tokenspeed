@@ -18,9 +18,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <chrono>
 #include <stdexcept>
 
 #include "resource/allocator/owned_pages.h"
+#include "resource/radix_tree/tree_node.h"
 #include "fsm/states.h"
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/page_hasher.h"
@@ -148,6 +150,13 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 
     auto spec = std::move(it->second);
     cache_op_tracker_.erase(it);
+
+    auto access_time = std::chrono::steady_clock::now();
+    for (TreeNode* node : spec.writeback_nodes) {
+        if (node != nullptr) {
+            node->Touch(access_time);
+        }
+    }
 
     if (!spec.request_id.empty()) {
         if (auto* req = find_request(spec.request_id)) {

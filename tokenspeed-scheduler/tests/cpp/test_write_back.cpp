@@ -18,7 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <chrono>
 #include <set>
+#include <thread>
 #include "integration_test_helper.h"
 
 namespace tokenspeed::test {
@@ -81,6 +83,44 @@ protected:
             }
         }
         return false;
+    }
+};
+
+class WriteBackLRUTestSuite : public WriteBackTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = WriteBackTestSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 5;  // 4 usable host pages.
+        return cfg;
+    }
+
+    cache_op_id FinishAndPlanWriteBack(const std::string& id) {
+        SendFinish(id);
+        auto plan = PlanOnce();
+        const auto* wb = GetWriteBack(plan);
+        EXPECT_NE(wb, nullptr);
+        if (wb == nullptr || wb->op_ids.empty()) {
+            return 0;
+        }
+        return wb->op_ids[0];
+    }
+
+    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+                return fwd;
+            }
+        }
+        return nullptr;
+    }
+
+    static std::int32_t FindRequestIndex(const FlatForwardOperation& fwd, const std::string& id) {
+        for (std::size_t i = 0; i < fwd.request_ids.size(); ++i) {
+            if (fwd.request_ids[i] == id) {
+                return static_cast<std::int32_t>(i);
+            }
+        }
+        return -1;
     }
 };
 
@@ -209,6 +249,37 @@ TEST_F(WriteBackTestSuite, WriteBack_SharedDevicePath_BothGetSeparateOps) {
     PlanOnce();
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+}
+
+TEST_F(WriteBackLRUTestSuite, WriteBackDone_RefreshesHostLRUUnderPressure) {
+    BringToDecoding("recent", /*num_pages=*/2, /*start=*/1);
+    const cache_op_id recent_op_id = FinishAndPlanWriteBack("recent");
+    ASSERT_NE(recent_op_id, 0u);
+
+    BringToDecoding("older", /*num_pages=*/2, /*start=*/100);
+    const cache_op_id older_op_id = FinishAndPlanWriteBack("older");
+    ASSERT_NE(older_op_id, 0u);
+    SendWriteBackDone(older_op_id);
+    PlanOnce();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    SendWriteBackDone(recent_op_id);
+    PlanOnce();
+
+    BringToDecoding("pressure", /*num_pages=*/2, /*start=*/200);
+    const cache_op_id pressure_op_id = FinishAndPlanWriteBack("pressure");
+    ASSERT_NE(pressure_op_id, 0u);
+
+    Submit(MakeRequestSpec("probe_recent", /*num_pages=*/2, /*start=*/1));
+    auto probe_plan = PlanOnce();
+    const auto* fwd = GetForward(probe_plan);
+    ASSERT_NE(fwd, nullptr);
+    const std::int32_t probe_index = FindRequestIndex(*fwd, "probe_recent");
+    ASSERT_GE(probe_index, 0);
+    ASSERT_LT(static_cast<std::size_t>(probe_index), fwd->input_lengths.size());
+
+    EXPECT_EQ(fwd->input_lengths[probe_index], PageSize())
+        << "the writeback completed most recently, so host pressure should evict the older host page first";
 }
 
 }  // namespace tokenspeed::test

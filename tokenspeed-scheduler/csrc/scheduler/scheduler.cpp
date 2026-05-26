@@ -331,6 +331,7 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
             cache_op_id op_id = hybrid_prefix_cache_.AllocateCacheOpId();
             CacheOpSpec spec;
             spec.request_id = id;
+            spec.writeback_nodes = req->GetWriteBackNodes<fsm::Draining>();
             cache_op_tracker_[op_id] = std::move(spec);
             ops.push_back(WriteBackOperation{
                 op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
