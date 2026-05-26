@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -135,6 +136,12 @@ class Eagle(BaseDrafter):
             - 1
         )
 
+        # VLM placeholder id plumbed by ModelExecutor; None for text-only targets.
+        self.mm_pad_substitute_id: int | None = None
+
+    def set_mm_pad_substitute_id(self, token_id: int) -> None:
+        self.mm_pad_substitute_id = token_id
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -211,6 +218,7 @@ class Eagle(BaseDrafter):
         input_ids, unpadded_input_lengths, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
+        input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,

@@ -43,6 +43,24 @@ _MM_PAD_BASE = 1_000_000
 _MM_PAD_HASH_MASK = (1 << 30) - 1
 
 
+def is_mm_pad_value(token_ids: torch.Tensor) -> torch.Tensor:
+    """Bool mask of positions rewritten to a hash-derived multimodal pad id."""
+    return (token_ids >= _MM_PAD_BASE) & (token_ids <= _MM_PAD_BASE + _MM_PAD_HASH_MASK)
+
+
+def maybe_substitute_mm_pad(
+    input_ids: torch.Tensor, substitute_id: int | None
+) -> torch.Tensor:
+    """Replace hash mm-pad positions with ``substitute_id``; no-op if None."""
+    if substitute_id is None:
+        return input_ids
+    return torch.where(
+        is_mm_pad_value(input_ids),
+        torch.tensor(substitute_id, dtype=input_ids.dtype, device=input_ids.device),
+        input_ids,
+    )
+
+
 class Modality(Enum):
     IMAGE = auto()
     VIDEO = auto()

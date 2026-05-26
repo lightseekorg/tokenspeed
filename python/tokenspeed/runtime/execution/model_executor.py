@@ -234,6 +234,12 @@ class ModelExecutor:
             )
             embed, head = self.model_runner.model.get_embed_and_head()
             draft_model_runner.model.set_embed_and_head(embed, head)
+            target_hf = self.model_runner.model_config.hf_config
+            mm_pad_substitute_id = getattr(
+                target_hf, "image_token_id", None
+            ) or getattr(target_hf, "media_placeholder_token_id", None)
+            if mm_pad_substitute_id is not None:
+                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
