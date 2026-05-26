@@ -518,9 +518,8 @@ def fused_softcap_kernel(
     # Perform operations in-place
     x = x / softcapping_value
 
-    # Manual tanh implementation using exp
-    exp2x = tl.exp(2 * x)
-    x = (exp2x - 1) / (exp2x + 1)
+    # Stable tanh form; the exp ratio overflows to inf/inf for large logits.
+    x = 2 * tl.sigmoid(2 * x) - 1
 
     x = x * softcapping_value
 
