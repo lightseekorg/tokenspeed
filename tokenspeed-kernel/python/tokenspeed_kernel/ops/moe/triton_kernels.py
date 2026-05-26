@@ -27,79 +27,28 @@ from contextlib import contextmanager
 # upstream ``triton_kernels`` imports.
 import tokenspeed_kernel.thirdparty.triton_kernels  # noqa: F401
 import torch
+import triton_kernels.matmul_details.opt_flags as opt_flags
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-
-try:
-    import triton_kernels.matmul_details.opt_flags as opt_flags
-except ImportError:
-    opt_flags = None
-
-try:
-    from triton_kernels.matmul_details.opt_flags import (
-        scoped_opt_flags_constraints,
-    )
-except ImportError:
-    scoped_opt_flags_constraints = None
-
-try:
-    from tokenspeed_kernel.thirdparty.triton_kernels.routing import (
-        routing as _routing_impl,
-    )
-    from triton_kernels.matmul import (
-        FlexCtx,
-        FnSpecs,
-        FusedActivation,
-        PrecisionConfig,
-        matmul,
-    )
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.swiglu import swiglu_fn
-    from triton_kernels.tensor import (
-        FP4,
-        RaggedTensorMetadata,
-        convert_layout,
-        make_ragged_tensor_metadata,
-        wrap_torch_tensor,
-    )
-    from triton_kernels.tensor_details import layout
-except ImportError:
-    FlexCtx = None
-    FnSpecs = None
-    FusedActivation = None
-    PrecisionConfig = None
-    RaggedTensorMetadata = None
-    make_ragged_tensor_metadata = None
-    matmul = None
-    InFlexData = None
-    _routing_impl = None
-    swiglu_fn = None
-    FP4 = None
-    convert_layout = None
-    wrap_torch_tensor = None
-    layout = None
-
-
-if _routing_impl is not None:
-
-    def _triton_kernels_routing(logits, n_expts_act, sm_first=False, dtype=None):
-        if dtype is None:
-            dtype = logits.dtype
-        return _routing_impl(logits, n_expts_act, sm_first=sm_first, dtype=dtype)
-
-    register_kernel(
-        "moe",
-        "route",
-        name="triton_kernels_routing",
-        solution="triton",
-        dtypes={torch.float16, torch.bfloat16, torch.float32},
-        traits={"output_type": frozenset({"ragged_metadata"})},
-        priority=Priority.PERFORMANT + 2,
-        tags={"portability"},
-    )(_triton_kernels_routing)
-
-
-_AMD_BF16_MXFP4_TILE = {"block_m": 64, "block_n": 128, "block_k": 256}
+from tokenspeed_kernel.thirdparty.triton_kernels.routing import routing as _routing_impl
+from triton_kernels.matmul import (
+    FlexCtx,
+    FnSpecs,
+    FusedActivation,
+    PrecisionConfig,
+    matmul,
+)
+from triton_kernels.matmul_details.opt_flags import (
+    scoped_opt_flags_constraints,
+)
+from triton_kernels.numerics import InFlexData
+from triton_kernels.swiglu import swiglu_fn
+from triton_kernels.tensor import (
+    FP4,
+    convert_layout,
+    wrap_torch_tensor,
+)
+from triton_kernels.tensor_details import layout
 
 
 def _is_bf16_mxfp4(x, w, precision_config):
@@ -127,79 +76,109 @@ def _maybe_lds_guard(x, w, precision_config):
     if not _lds_guard_should_apply(x, w, precision_config):
         yield
         return
-    with scoped_opt_flags_constraints(_AMD_BF16_MXFP4_TILE):
+    with scoped_opt_flags_constraints({"block_m": 64, "block_n": 128, "block_k": 256}):
         yield
 
 
-if matmul is not None:
+def _matmul(
+    x,
+    w,
+    bias=None,
+    a_ragged_metadata=None,
+    gather_indx=None,
+    scatter_indx=None,
+    precision_config=None,
+    fused_activation=None,
+    epilogue=None,
+    betas=None,
+    gammas=None,
+    out_alpha=None,
+    y=None,
+    n_tokens=None,
+    n_expts_act=None,
+):
+    with _maybe_lds_guard(x, w, precision_config):
+        out = matmul(
+            x,
+            w,
+            bias,
+            a_ragged_metadata=a_ragged_metadata,
+            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+            precision_config=precision_config,
+            fused_activation=fused_activation,
+            epilogue=epilogue,
+            betas=betas,
+            gammas=gammas,
+            out_alpha=out_alpha,
+            c=y,
+        )
+    if scatter_indx is not None and n_expts_act is not None and n_expts_act > 1:
+        assert (
+            n_tokens is not None
+        ), "n_tokens required when n_expts_act > 1 for top-k reduction"
+        return out.view(n_tokens, n_expts_act, out.shape[-1]).sum(dim=1)
+    return out
 
-    def _matmul(
-        x,
-        w,
-        bias=None,
-        a_ragged_metadata=None,
-        gather_indx=None,
-        scatter_indx=None,
-        precision_config=None,
-        fused_activation=None,
-        epilogue=None,
-        betas=None,
-        gammas=None,
-        out_alpha=None,
-        y=None,
-        n_tokens=None,
-        n_expts_act=None,
-    ):
-        with _maybe_lds_guard(x, w, precision_config):
-            out = matmul(
-                x,
-                w,
-                bias,
-                a_ragged_metadata=a_ragged_metadata,
-                gather_indx=gather_indx,
-                scatter_indx=scatter_indx,
-                precision_config=precision_config,
-                fused_activation=fused_activation,
-                epilogue=epilogue,
-                betas=betas,
-                gammas=gammas,
-                out_alpha=out_alpha,
-                c=y,
-            )
-        if scatter_indx is not None and n_expts_act is not None and n_expts_act > 1:
-            assert (
-                n_tokens is not None
-            ), "n_tokens required when n_expts_act > 1 for top-k reduction"
-            return out.view(n_tokens, n_expts_act, out.shape[-1]).sum(dim=1)
-        return out
 
-    _matmul_common = dict(
-        solution="triton",
-        dtypes={torch.float16, torch.bfloat16, torch.uint8},
-        priority=Priority.PERFORMANT + 2,
-        tags={"portability"},
-    )
+_matmul_common = dict(
+    solution="triton",
+    dtypes={torch.float16, torch.bfloat16, torch.uint8},
+    priority=Priority.PERFORMANT + 2,
+    tags={"portability"},
+)
 
-    register_kernel(
-        "moe",
-        "experts",
-        name="triton_kernels_matmul_ogs",
-        features={"ragged_metadata"},
-        **_matmul_common,
-    )(_matmul)
+register_kernel(
+    "moe",
+    "experts",
+    name="triton_kernels_matmul_ogs",
+    features={"ragged_metadata"},
+    **_matmul_common,
+)(_matmul)
 
-    register_kernel(
-        "moe",
-        "experts",
-        name="triton_kernels_dispatch_gemm",
-        features={"ragged_metadata", "dispatch_gemm"},
-        **_matmul_common,
-    )(_matmul)
+register_kernel(
+    "moe",
+    "experts",
+    name="triton_kernels_dispatch_gemm",
+    features={"ragged_metadata", "dispatch_gemm"},
+    **_matmul_common,
+)(_matmul)
 
-    register_kernel(
-        "moe",
-        "experts",
-        name="triton_kernels_gemm_combine",
-        features={"ragged_metadata", "gemm_combine"},
-        **_matmul_common,
-    )(_matmul)
+register_kernel(
+    "moe",
+    "experts",
+    name="triton_kernels_gemm_combine",
+    features={"ragged_metadata", "gemm_combine"},
+    **_matmul_common,
+)(_matmul)
+
+
+@register_kernel(
+    "moe",
+    "route",
+    name="triton_kernels_routing",
+    solution="triton",
+    dtypes={torch.float16, torch.bfloat16, torch.float32},
+    traits={"output_type": frozenset({"ragged_metadata"})},
+    priority=Priority.PERFORMANT + 2,
+    tags={"portability"},
+)
+def triton_kernels_routing(logits, n_expts_act, sm_first=False, dtype=None):
+    if dtype is None:
+        dtype = logits.dtype
+    return _routing_impl(logits, n_expts_act, sm_first=sm_first, dtype=dtype)
+
+
+__all__ = [
+    "FP4",
+    "FlexCtx",
+    "FnSpecs",
+    "FusedActivation",
+    "InFlexData",
+    "PrecisionConfig",
+    "convert_layout",
+    "layout",
+    "opt_flags",
+    "swiglu_fn",
+    "wrap_torch_tensor",
+]
