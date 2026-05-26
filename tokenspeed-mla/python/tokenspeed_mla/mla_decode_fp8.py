@@ -3875,7 +3875,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         (1, 1, 1),
                     )
                     if cutlass.const_expr(self.use_m64_ws):
-                        if tidx < cta_pv_tiler[0]:
+                        if cute.elem_less(cLSE[tidx][0], common_params.H):
                             gLSE[tidx] = lse
                     elif cutlass.const_expr(self.warps_in_n == 2):
                         if cute.elem_less(cLSE[tidx][0], common_params.H):
@@ -3912,7 +3912,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     (1, 1, 1),
                 )
                 if cutlass.const_expr(self.use_m64_ws):
-                    if tidx < cta_pv_tiler[0]:
+                    if cute.elem_less(cLSE[tidx][0], common_params.H):
                         gLSE[tidx] = lse
                 elif cutlass.const_expr(self.warps_in_n == 2):
                     if cute.elem_less(cLSE[tidx][0], common_params.H):
