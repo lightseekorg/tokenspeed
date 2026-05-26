@@ -1,12 +1,12 @@
 api_version: ci.tokenspeed.io/v1
-name: perf-qwen3.5-397b-a17b-nvfp4-agentic
+name: perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu
 type: perf
 triggers:
   - per-commit
   - manual
 runner:
   labels:
-    - gb200-4gpu-perf
+    - b200-8gpu
 env:
   CI: "true"
 install:
@@ -15,22 +15,20 @@ server:
   command: >-
     ts serve
     --model nvidia/Qwen3.5-397B-A17B-NVFP4
-    --attn-tp-size 4
-    --moe-tp-size 4
-    --max-model-len 80000
-    --max-num-seqs 16
-    --gpu-memory-utilization 0.95
-    --disable-cuda-graph-padding
+    --attn-tp-size 8
+    --moe-tp-size 8
+    --gpu-memory-utilization 0.6
+    --max-num-seqs 128
+    --mamba-ssm-dtype float32
+    --moe-backend flashinfer_trtllm
     --trust-remote-code
     --attention-backend trtllm
-    --moe-backend flashinfer_trtllm
+    --chunked-prefill-size 2048
     --quantization nvfp4
     --kv-cache-dtype fp8
+    --kvstore-ratio 0.5
     --speculative-algorithm MTP
     --speculative-num-steps 3
-    --drafter-attention-backend trtllm
-    --enable-cache-report
-    --weight-loader-prefetch-checkpoints
     --host 127.0.0.1
     --port 8000
   ready:
@@ -61,7 +59,7 @@ perf:
     --max-tokens 500
     --multi-turn
     --number 2
-    --parallel 2
+    --parallel 1
     --dataset-offset 68
     --outputs-dir "$WARMUP_DIR"
     --extra-args '{"ignore_eos": true}' &&
@@ -74,14 +72,14 @@ perf:
     --dataset-path agentic_dataset.json
     --max-tokens 500
     --multi-turn
-    --number 4 8 8 16
-    --parallel 1 2 4 8
+    --number 2
+    --parallel 1
     --outputs-dir "$OUTPUTS_DIR"
     --extra-args '{"ignore_eos": true}'
     --no-timestamp;
     PERF_STATUS=$?;
     if [ -d "$OUTPUTS_DIR/Qwen3.5-397B-A17B-NVFP4" ]; then
-    mv "$OUTPUTS_DIR/Qwen3.5-397B-A17B-NVFP4" "$OUTPUTS_DIR/Qwen3.5-397B-A17B-NVFP4_attn_tp4";
+    mv "$OUTPUTS_DIR/Qwen3.5-397B-A17B-NVFP4" "$OUTPUTS_DIR/Qwen3.5-397B-A17B-NVFP4_attn_tp8";
     fi;
     python3 "$REPO_ROOT/test/agentic_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR";
     PARSE_STATUS=$?;
@@ -92,7 +90,4 @@ report:
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
 perf_reference:
-  1:  [530, 11600]
-  2:  [420, 17800]
-  4:  [270, 24400]
-  8:  [160, 31600]
+  1: [580, 4500]

@@ -53,6 +53,7 @@ from typing import (
     Protocol,
     TypeVar,
 )
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import psutil
@@ -222,38 +223,158 @@ class ImageData:
     detail: Literal["auto", "low", "high"] | None = "auto"
 
 
+image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+    """
+    Check three conditions:
+    1. whether CUDA is available.
+    2. whether input is recognized as JPEG.
+    3. whether GPU image decode is enabled.
+    """
+    if not current_platform().is_nvidia or not gpu_image_decode:
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
+
+
+def _load_image(
+    image_bytes: bytes = b"",
+    image_file: str = "",
+    gpu_image_decode: bool = True,
+) -> torch.Tensor | Image.Image:
+    """
+    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    otherwise fallback to decode with PIL on CPU and return a PIL Image.
+    """
+    if image_file != "":
+        image_bytes = get_image_bytes(image_file)
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+        try:
+            from torchvision.io import decode_jpeg
+
+            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            return image_tensor
+        except Exception as e:
+            logger.warning(
+                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
+            )
+    return Image.open(BytesIO(image_bytes))
+
+
 def load_image(
     image_file: Image.Image | str | ImageData | bytes,
-) -> tuple[Image.Image, tuple[int, int]]:
+    gpu_image_decode: bool = True,
+) -> tuple[torch.Tensor | Image.Image, tuple[int, int] | None]:
+    """
+    Load image from multiple input formats, including:
+    ImageData, PIL Image, bytes, URL, file path, file:// URL, data URL, or base64.
+    """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
-    image = image_size = None
+    image = None
+    image_size: tuple[int, int] | None = None
     if isinstance(image_file, Image.Image):
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = Image.open(BytesIO(image_file))
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
-        try:
-            response.raise_for_status()
-            image = Image.open(response.raw)
-            image.load()  # Force loading to avoid issues after closing the stream
-        finally:
-            response.close()
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        image = Image.open(image_file)
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("file://"):
+        image = _load_image(
+            image_file=unquote(urlparse(image_file).path),
+            gpu_image_decode=gpu_image_decode,
+        )
+    elif isinstance(image_file, str) and image_file.lower().endswith(
+        image_extension_names
+    ):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("data:"):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str):
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
+
+
+def get_image_bytes(image_file: str | bytes) -> bytes:
+    """Normalize various image inputs into raw bytes."""
+    if isinstance(image_file, bytes):
+        return image_file
+    if image_file.startswith(("http://", "https://")):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, timeout=timeout)
+        try:
+            response.raise_for_status()
+            result = response.content
+        finally:
+            response.close()
+        return result
+    if image_file.startswith("file://"):
+        with open(unquote(urlparse(image_file).path), "rb") as f:
+            return f.read()
+    if image_file.startswith("/"):
+        with open(image_file, "rb") as f:
+            return f.read()
+    if image_file.lower().endswith(image_extension_names):
+        with open(image_file, "rb") as f:
+            return f.read()
+    if isinstance(image_file, str) and image_file.startswith("data:"):
+        _, encoded = image_file.split(",", 1)
+        return pybase64.b64decode(encoded, validate=True)
+    if isinstance(image_file, str):
+        return pybase64.b64decode(image_file, validate=True)
+    raise NotImplementedError(f"Invalid image: {image_file}")
+
+
+def load_audio(
+    audio_file: str | bytes,
+    sr: int | None = None,
+    mono: bool = True,
+) -> np.ndarray:
+    # Use soundfile directly; librosa delegates to it and is moving away from
+    # audio loading support.
+    import soundfile as sf
+    from scipy.signal import resample
+
+    if sr is None:
+        sr = 16000
+
+    if isinstance(audio_file, bytes):
+        audio, original_sr = sf.read(BytesIO(audio_file))
+    elif audio_file.startswith("data:"):
+        _, encoded = audio_file.split(",", 1)
+        audio, original_sr = sf.read(
+            BytesIO(pybase64.b64decode(encoded, validate=True))
+        )
+    elif audio_file.startswith(("http://", "https://")):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            audio, original_sr = sf.read(BytesIO(response.content))
+        finally:
+            response.close()
+    elif isinstance(audio_file, str):
+        audio, original_sr = sf.read(audio_file)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    if original_sr != sr:
+        num_samples = int(len(audio) * float(sr) / original_sr)
+        audio = resample(audio, num_samples)
+
+    if mono and len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    return audio
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -1031,6 +1152,15 @@ def maybe_model_redirect(model: str) -> str:
 
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
+
+
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
 
 
 def convert_json_schema_to_str(json_schema: dict | str | type[BaseModel]) -> str:

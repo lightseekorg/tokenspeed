@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = get_colorful_logger(__name__)
@@ -123,6 +124,7 @@ class ModelRunner:
         seq_lens: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
+        multimodal_context: MultimodalForwardContext | None = None,
     ) -> LogitsProcessorOutput:
         kwargs = {}
         if req_pool_indices is not None:
@@ -135,6 +137,8 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         if captured_hidden_states is not None:
             kwargs["captured_hidden_states"] = captured_hidden_states
+        if multimodal_context is not None:
+            kwargs["multimodal_context"] = multimodal_context
 
         return self.model.forward(
             ctx,

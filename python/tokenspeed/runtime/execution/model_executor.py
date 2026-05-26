@@ -50,6 +50,7 @@ from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
+from tokenspeed.runtime.utils.env import envs, get_global_server_args
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -87,6 +88,7 @@ class ModelExecutorConfig:
     cudagraph_capture_sizes: list[int] | None
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
+    model_is_mrope: bool
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -122,6 +124,11 @@ class ModelExecutorConfig:
             if server_args.speculative_algorithm
             else 1
         )
+        rope_scaling = getattr(
+            model_config.hf_text_config, "rope_parameters", None
+        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
+        model_is_mrope = bool(rope_scaling and "mrope_section" in rope_scaling)
+
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
@@ -139,6 +146,7 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
+            model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -274,6 +282,9 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+        self._active_multimodal_context = None
+        self._active_positions_override = None
+
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
@@ -288,6 +299,21 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
         )
+
+        # Encoder CUDA graph: install the model-built wrapper by overriding
+        # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
+        # ``CudaGraphWrapper``.
+        self.encoder_graph_wrapper = None
+        _mm_model = self.model_runner.model
+        if (
+            hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
+            and get_global_server_args().mm_attention_backend != "flashinfer_cudnn"
+        ):
+            self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
+                _mm_model.mapping
+            )
+            _mm_model.image_encoder = self.encoder_graph_wrapper
 
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
@@ -336,10 +362,18 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+        positions = self._active_positions_override
+        if positions is None:
+            if self.config.model_is_mrope:
+                positions = self.input_buffers.mrope_positions_buf[
+                    :, : ctx.input_num_tokens
+                ]
+            else:
+                positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
         return self.model_runner.forward(
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
-            self.input_buffers.positions_buf[: ctx.input_num_tokens],
+            positions,
             self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
             self.input_buffers.input_lengths_buf[:bs],
             req_pool_indices=req_pool_indices,
@@ -347,6 +381,7 @@ class ModelExecutor:
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                 : ctx.num_extends
             ],
+            multimodal_context=self._active_multimodal_context,
         )
 
     @nvtx_range("sampling", color="yellow")
@@ -678,6 +713,7 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
+        multimodal_context=None,
     ) -> ModelExecutionResult:
         self.log_step += 1
 
@@ -715,6 +751,7 @@ class ModelExecutor:
             dp_global_bs,
             dp_all_decode_or_idle,
             grammar_inputs=grammar_inputs,
+            multimodal_context=multimodal_context,
         )
 
         if is_decode and (
@@ -954,11 +991,14 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
+        multimodal_context=None,
     ) -> ModelExecutionResult:
+        num_extends = forward_op.num_extends()
+        total_tokens = sum(forward_op.input_lengths)
+        self._active_multimodal_context = multimodal_context
+        self._active_positions_override = None
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            num_extends = forward_op.num_extends()
-            total_tokens = sum(forward_op.input_lengths)
             has_retract = num_extends <= 0 and any(
                 x != -1 for x in getattr(forward_op, "hist_token_lens", [])
             )
@@ -973,6 +1013,11 @@ class ModelExecutor:
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
+                total_tokens=total_tokens,
+            )
+            self._active_positions_override = self._build_mrope_positions_override(
+                forward_op=forward_op,
+                multimodal_context=multimodal_context,
                 total_tokens=total_tokens,
             )
 
@@ -1197,3 +1242,67 @@ class ModelExecutor:
             copy_event=copy_event,
             grammar_completion=grammar_completion,
         )
+
+    def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
+        # Cache delta expansion for retracted/chunked requests.
+        if mm_input.mrope_position_delta_repeated_cache is None:
+            mm_input.mrope_position_delta_repeated_cache = (
+                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
+            )
+        return mm_input.mrope_position_delta_repeated_cache + seq_len
+
+    def _build_mrope_positions_override(
+        self,
+        forward_op,
+        multimodal_context,
+        total_tokens: int,
+    ) -> torch.Tensor | None:
+        if not self.config.model_is_mrope or total_tokens == 0:
+            return None
+
+        is_prefill = forward_op.num_extends() > 0
+        base_positions = self.input_buffers.positions_buf[:total_tokens]
+        pos_chunks = torch.split(base_positions, list(forward_op.input_lengths), dim=0)
+        mrope_chunks = []
+        mm_inputs = (
+            multimodal_context.mm_inputs
+            if multimodal_context is not None and multimodal_context.has_inputs()
+            else []
+        )
+
+        for batch_idx, base_chunk in enumerate(pos_chunks):
+            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
+            if mm_input is None or mm_input.mrope_positions is None:
+                mrope_chunks.append(base_chunk.unsqueeze(0).expand(3, -1))
+                continue
+
+            if is_prefill and batch_idx < len(forward_op.extend_prefix_lens):
+                start = int(forward_op.extend_prefix_lens[batch_idx])
+                end = start + int(forward_op.input_lengths[batch_idx])
+                positions = mm_input.mrope_positions[:, start:end]
+                if positions.numel() != 0:
+                    mrope_chunks.append(
+                        positions.to(device=self.device, dtype=torch.int64)
+                    )
+                    continue
+                if base_chunk.numel() == 1:
+                    seq_len = int(base_chunk[-1].item()) + 1
+                    mrope_chunks.append(
+                        self._expand_mrope_from_input(mm_input, seq_len).to(
+                            device=self.device, dtype=torch.int64
+                        )
+                    )
+                    continue
+
+            delta = mm_input.mrope_position_delta
+            if delta is None:
+                delta = torch.zeros(1, dtype=torch.int64)
+            delta = delta.flatten()[0].to(device=self.device, dtype=torch.int64)
+            # Decode positions need (mrope_delta - 1) + seq_len. positions_buf
+            # already stores the per-token zero-based position (seq_len - 1 for
+            # decode), so this is the same value without a GPU-to-CPU sync.
+            mrope_chunks.append((base_chunk + delta).unsqueeze(0).expand(3, -1))
+
+        mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()
+        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(mrope_positions)
+        return self.input_buffers.mrope_positions_buf[:, :total_tokens]

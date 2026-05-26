@@ -37,6 +37,7 @@ BatchDecodeWithPagedKVCacheWrapper = ErrorClass
 BatchMLAPagedAttentionWrapper = ErrorClass
 BatchPrefillWithPagedKVCacheWrapper = ErrorClass
 BatchPrefillWithRaggedKVCacheWrapper = ErrorClass
+cudnn_batch_prefill_with_kv_cache = error_fn
 trtllm_batch_context_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
@@ -49,6 +50,11 @@ if platform.is_nvidia:
             trtllm_batch_decode_with_kv_cache,
             trtllm_batch_decode_with_kv_cache_mla,
         )
+    except ImportError:
+        pass
+
+    try:
+        from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
     except ImportError:
         pass
 
@@ -479,6 +485,7 @@ __all__ = [
     "BatchMLAPagedAttentionWrapper",
     "BatchPrefillWithPagedKVCacheWrapper",
     "BatchPrefillWithRaggedKVCacheWrapper",
+    "cudnn_batch_prefill_with_kv_cache",
     "trtllm_batch_context_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",
