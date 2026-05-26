@@ -36,7 +36,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -213,19 +212,18 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
 
-        # Only LlamaForCausalLMEagle3 implements the midlayer slice today; MLA
-        # / NextN draft heads fall back to the standard path.
-        draft_reduce_to_last = forward_mode.is_decode() and isinstance(
-            self.draft_model_runner.model, LlamaForCausalLMEagle3
+        # Models declare ``supports_draft_first_step_reduce`` to opt in; MLA /
+        # NextN heads that don't declare it fall back to the standard path.
+        draft_first_step_reduce = forward_mode.is_decode() and getattr(
+            self.draft_model_runner.model, "supports_draft_first_step_reduce", False
         )
 
-        if draft_reduce_to_last and self.attn_backend.support_kv_cache_prewrite:
-            # On the prewrite path, Q is sliced to one row per request before
-            # the decode kernel, which takes seq_lens as the attention upper
-            # bound. Trim by the rejected-draft count so the live query does
-            # not read the dead positions. The non-prewrite path runs full
-            # multi-token attention with per-position causal masking, so
-            # seq_lens must stay at valid_cache_len + spec_num_tokens there.
+        if draft_first_step_reduce and self.attn_backend.support_kv_cache_prewrite:
+            # Prewrite path slices Q to one row per request and uses the decode
+            # kernel, which reads seq_lens as the attention upper bound. Trim
+            # by the rejected-draft count so the live query does not read dead
+            # positions. Non-prewrite runs full multi-token attention with
+            # per-position causal masking, so seq_lens must stay unchanged.
             correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
                 self.draft_seq_lens_buf.dtype
             )
@@ -244,7 +242,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
-            draft_reduce_to_last=draft_reduce_to_last,
+            draft_first_step_reduce=draft_first_step_reduce,
         )
 
         return self.draft_model_runner.forward(

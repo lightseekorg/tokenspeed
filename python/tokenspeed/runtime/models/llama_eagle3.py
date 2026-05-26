@@ -186,7 +186,7 @@ class LlamaAttention(nn.Module):
                 output_q_rope=q_rope,
                 enable_pdl=pdl_enabled(),
             )
-            if ctx.draft_reduce_to_last:
+            if ctx.draft_first_step_reduce:
                 # KV already written via fused_set_kv_buffer_arg above; slice Q
                 # to one query per request and route attn as decode.
                 q_rope = q_rope.index_select(0, ctx.gather_ids)
@@ -213,7 +213,7 @@ class LlamaAttention(nn.Module):
         else:
             q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
-            if ctx.draft_reduce_to_last:
+            if ctx.draft_first_step_reduce:
                 # KV written by self.attn above; slice attn_output so o_proj
                 # and the rest of the layer only run on the live rows.
                 attn_output = attn_output.index_select(0, ctx.gather_ids)
@@ -382,7 +382,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        if ctx.draft_reduce_to_last:
+        if ctx.draft_first_step_reduce:
             # self_attn returned [bs, H]; gather residual to match before the
             # fused allreduce+norm.
             residual = residual.index_select(0, ctx.gather_ids)
@@ -451,7 +451,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        if ctx.draft_reduce_to_last:
+        if ctx.draft_first_step_reduce:
             # self_attn returned [bs, H]; gather residual to match before the
             # post-attn norm+comm.
             residual = residual.index_select(0, ctx.gather_ids)
@@ -572,6 +572,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
 class LlamaForCausalLMEagle3(BaseCausalLM):
 
     model_cls = Eagle3LlamaModel
+    supports_draft_first_step_reduce = True
 
     def __init__(
         self,

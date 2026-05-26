@@ -111,14 +111,10 @@ class LogitsMetadata:
         ctx: ForwardContext,
         input_lengths: torch.Tensor,
     ):
-        # When the midlayer already pruned to one row per request (EAGLE draft
-        # first-step reduce), drop gather_ids so LogitsProcessor passes through
-        # instead of re-indexing.
-        gather_ids = None if ctx.draft_reduce_to_last else ctx.gather_ids
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
-            gather_ids=gather_ids,
+            gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
         )
 
@@ -214,7 +210,9 @@ class LogitsProcessor(nn.Module):
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
             gather_ids = logits_metadata.gather_ids
-            if gather_ids is None:
+            # Shapes align iff midlayer already pruned to one row per request
+            # (EAGLE draft first-step reduce). Other paths emit [N, H] with N > bs.
+            if gather_ids is None or gather_ids.shape[0] == hidden_states.shape[0]:
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)

@@ -63,7 +63,7 @@ class CommManager:
         # Under draft first-step reduce, comm operates on bs / global_bs since
         # the midlayer pruned activations to one row per request.
         global_counts = (
-            ctx.global_bs if ctx.draft_reduce_to_last else ctx.global_num_tokens
+            ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
         )
         if global_counts is not None:
             scattered = []
@@ -73,7 +73,7 @@ class CommManager:
                     self._scatter_count(num_tokens, self.mapping.attn.tp_size)
                 )
             return scattered
-        num_tokens = ctx.bs if ctx.draft_reduce_to_last else ctx.input_num_tokens
+        num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
         return self._scatter_count(num_tokens, self.mapping.attn.tp_size)
 
     def attn_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:

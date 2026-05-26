@@ -50,6 +50,8 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
+    # EAGLE draft head's first step prunes to one live row per request.
+    draft_first_step_reduce: bool = False
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
@@ -58,8 +60,3 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
-
-    # When True, the draft head's first step prunes attn/MLP/post-norms to the
-    # one live position per request using ctx.gather_ids. LogitsProcessor
-    # bypasses its own slicing (gather_ids set to None on LogitsMetadata).
-    draft_reduce_to_last: bool = False
