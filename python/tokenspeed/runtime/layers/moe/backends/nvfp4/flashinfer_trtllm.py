@@ -95,7 +95,10 @@ def _record_self_routing_topk_for_eplb(
 
     recorder = get_global_expert_distribution_recorder()
     capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    if not (getattr(recorder, "recording", False) or capturing):
+    capture_hooks_enabled = getattr(recorder, "capture_hooks_enabled", False)
+    if not (
+        getattr(recorder, "recording", False) or (capture_hooks_enabled and capturing)
+    ):
         return
     top_k = int(getattr(topk_config, "top_k", 0))
     top_k -= int(getattr(topk_config, "num_fused_shared_experts", 0) or 0)

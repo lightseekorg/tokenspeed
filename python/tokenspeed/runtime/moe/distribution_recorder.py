@@ -114,6 +114,10 @@ class ExpertDistributionRecorder(ABC):
     def recording(self):
         return False
 
+    @property
+    def capture_hooks_enabled(self):
+        return False
+
     def _on_not_implemented(self):
         raise Exception(
             "Please set ServerArgs.expert_distribution_recorder_mode to use ExpertDistributionRecorder."
@@ -265,6 +269,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     @property
     def recording(self):
         return self._recording
+
+    @property
+    def capture_hooks_enabled(self):
+        return True
 
 
 _global_expert_distribution_recorder: ExpertDistributionRecorder | None = (
