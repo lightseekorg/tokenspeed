@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -31,6 +31,8 @@ from tokenspeed_kernel.signature import (
 )
 
 platform = current_platform()
+
+_NVIDIA_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia"}))
 
 
 _FP8_SCALE = ScaleFormat(
@@ -71,6 +73,14 @@ _CUTLASS_FUSED_FORMAT_SIGNATURES = frozenset(
         format_signature(
             x=dense_tensor_format(torch.float16),
             weight=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
+        ),
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=tensor_format("fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
+        ),
+        format_signature(
+            x=dense_tensor_format(torch.float16),
+            weight=tensor_format("fp8", torch.float8_e4m3fn, scale=_FP8_SCALE),
         ),
         format_signature(
             x=tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE),
@@ -186,6 +196,7 @@ if trtllm_bf16_moe is not error_fn:
         name="flashinfer_trtllm_bf16_fused_moe",
         features={"self_routing"},
         solution="trtllm",
+        capability=_NVIDIA_CAPABILITY,
         signatures=_BF16_FUSED_FORMAT_SIGNATURES,
         traits={},
         priority=Priority.SPECIALIZED,
@@ -199,6 +210,7 @@ if cutlass_fused_moe is not error_fn:
         name="flashinfer_cutlass_fused_moe",
         features={"pre_routed"},
         solution="flashinfer",
+        capability=_NVIDIA_CAPABILITY,
         signatures=_CUTLASS_FUSED_FORMAT_SIGNATURES,
         traits={
             "tp": frozenset({True, False}),
@@ -216,6 +228,7 @@ if trtllm_fp4_block_scale_moe is not error_fn:
         name="flashinfer_trtllm_fp4_fused_moe",
         features={"self_routing"},
         solution="trtllm",
+        capability=_NVIDIA_CAPABILITY,
         signatures=_FP4_FUSED_FORMAT_SIGNATURES,
         traits={},
         priority=Priority.SPECIALIZED,
@@ -250,6 +263,7 @@ try:
         name="flashinfer_cutedsl_nvfp4_fused_moe",
         features={"pre_routed"},
         solution="cutedsl",
+        capability=_NVIDIA_CAPABILITY,
         signatures=_CUTEDSL_NVFP4_FORMAT_SIGNATURES,
         traits={
             "tp": frozenset({False}),
