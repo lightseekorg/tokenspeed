@@ -119,6 +119,12 @@ ALL_OTHER_MODELS = [
 
 TORCH_DTYPES = [torch.bfloat16]
 
+EXPECTED_OUTPUT_SUBSTRINGS = {
+    "The capital of the United Kingdom is": "London",
+    "Today is a sunny day and I like": "walk",
+    "AI is a field of computer science focused on": "intelligence",
+}
+
 
 class TestGenerationModels(unittest.TestCase):
 
@@ -196,6 +202,16 @@ class TestGenerationModels(unittest.TestCase):
                         flush=True,
                     )
                 print(f"{'='*60}\n", flush=True)
+
+            for prompt, output in zip(prompts, rt_outputs.output_strs):
+                expected = EXPECTED_OUTPUT_SUBSTRINGS.get(prompt)
+                if expected is None:
+                    continue
+                self.assertIn(
+                    expected,
+                    output,
+                    f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}",
+                )
 
     def test_ci_models(self):
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
