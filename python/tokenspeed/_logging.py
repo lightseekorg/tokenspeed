@@ -18,8 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import atexit
 import logging
 import os
+import re
+import threading
 import warnings
 from importlib import import_module
 
@@ -87,8 +90,9 @@ def _suppress_flash_attn_jit_cache_debug_log():
 
 def _suppress_misc_runtime_warnings():
     # tvm-ffi: every tilelang import re-warns about subclass fields that
-    # shadow ancestor fields. Emitted via PyErr_WarnEx from
-    # tvm_ffi/registry.py.
+    # shadow ancestor fields. The Python path (PyErr_WarnEx from
+    # tvm_ffi/registry.py) is muted here; the sibling C++ std::cerr path
+    # from libtvm_ffi.so::object.cc is handled by the FD 2 line filter.
     warnings.filterwarnings(
         "ignore",
         message=r"Field .* duplicates an ancestor field.*",
@@ -117,11 +121,108 @@ def _suppress_misc_runtime_warnings():
     )
 
 
+_TVM_FFI_CERR_PATTERN = re.compile(
+    r'\[WARNING\] Field ".*?" in type ".*?" duplicates an ancestor field'
+)
+
+_stderr_filter_installed = False
+
+
+def _stderr_line_should_drop(line: bytes) -> bool:
+    try:
+        text = line.decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    return _TVM_FFI_CERR_PATTERN.search(text) is not None
+
+
+def _stderr_filter_reader(read_fd: int, forward_fd: int) -> None:
+    buf = b""
+    try:
+        with os.fdopen(read_fd, "rb", buffering=0) as pipe:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    idx = buf.find(b"\n")
+                    if idx == -1:
+                        break
+                    line, buf = buf[: idx + 1], buf[idx + 1 :]
+                    if _stderr_line_should_drop(line):
+                        continue
+                    try:
+                        os.write(forward_fd, line)
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    finally:
+        if buf and not _stderr_line_should_drop(buf):
+            try:
+                os.write(forward_fd, buf)
+            except OSError:
+                pass
+
+
+def _install_tvm_ffi_cerr_filter() -> None:
+    # tvm-ffi's libtvm_ffi.so::object.cc emits "[WARNING] Field ... duplicates
+    # an ancestor field ..." directly to std::cerr (FD 2), bypassing Python's
+    # warnings system. Splice a line-filter onto FD 2 so these lines are
+    # dropped before reaching the inherited stderr.
+    global _stderr_filter_installed
+    if _stderr_filter_installed:
+        return
+
+    try:
+        saved_stderr_fd = os.dup(2)
+    except OSError:
+        return
+
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError:
+        os.close(saved_stderr_fd)
+        return
+
+    try:
+        os.dup2(write_fd, 2)
+    except OSError:
+        os.close(saved_stderr_fd)
+        os.close(read_fd)
+        os.close(write_fd)
+        return
+    finally:
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+
+    _stderr_filter_installed = True
+
+    threading.Thread(
+        target=_stderr_filter_reader,
+        args=(read_fd, saved_stderr_fd),
+        name="tokenspeed-stderr-filter",
+        daemon=True,
+    ).start()
+
+    def _restore() -> None:
+        try:
+            os.dup2(saved_stderr_fd, 2)
+        except OSError:
+            pass
+
+    atexit.register(_restore)
+
+
 def suppress_noisy_third_party_logs():
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TLLM_LOG_LEVEL", "WARNING")
     _suppress_cutlass_dsl_warnings()
     _suppress_misc_runtime_warnings()
+    _install_tvm_ffi_cerr_filter()
 
     for logger_name in (
         "transformers",
