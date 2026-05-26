@@ -72,11 +72,11 @@ class EngineBase(ABC):
         """Update model weights with in-memory tensor data."""
 
     @abstractmethod
-    def release_memory_occupation(self) -> None:
+    def release_memory_occupation(self, tags: list[str] | None = None) -> None:
         """Release GPU memory occupation temporarily."""
 
     @abstractmethod
-    def resume_memory_occupation(self) -> None:
+    def resume_memory_occupation(self, tags: list[str] | None = None) -> None:
         """Resume GPU memory occupation which is previously released."""
 
     @abstractmethod

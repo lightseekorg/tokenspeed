@@ -446,6 +446,45 @@ async def flush_cache():
     return Response(status_code=200)
 
 
+async def _broadcast_memory_control(endpoint: str, body: dict | None = None):
+    """POST ``endpoint`` to all prefill and decode servers in parallel."""
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            session.post(f"{server}{endpoint}", json=body)
+            for server in chain(prefill_servers, decode_servers)
+        ]
+        for coro in asyncio.as_completed(tasks):
+            await coro
+
+
+@app.post("/release_memory_occupation")
+async def release_memory_occupation(request: Request):
+    """Offload weights/KV cache/CUDA graphs to CPU on all prefill and decode nodes."""
+    body = (
+        await request.json()
+        if request.headers.get("content-length", "0") != "0"
+        else None
+    )
+    await _broadcast_memory_control("/release_memory_occupation", body)
+    return Response(status_code=200)
+
+
+@app.post("/resume_memory_occupation")
+async def resume_memory_occupation(request: Request):
+    """Restore previously offloaded memory regions to GPU on all prefill and decode nodes."""
+    body = (
+        await request.json()
+        if request.headers.get("content-length", "0") != "0"
+        else None
+    )
+    await _broadcast_memory_control("/resume_memory_occupation", body)
+    return Response(status_code=200)
+
+
 @app.get("/get_server_info")
 async def get_server_info():
     prefill_servers, decode_servers = (

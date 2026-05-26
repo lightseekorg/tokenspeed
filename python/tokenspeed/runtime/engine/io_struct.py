@@ -693,7 +693,7 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    pass
+    tags: list[str] | None = None
 
 
 @dataclass
@@ -703,7 +703,7 @@ class ReleaseMemoryOccupationReqOutput:
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    pass
+    tags: list[str] | None = None
 
 
 @dataclass

@@ -44,6 +44,10 @@ from tokenspeed.runtime.engine.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
@@ -58,6 +62,7 @@ from tokenspeed.runtime.utils import broadcast_pyobj
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -81,10 +86,14 @@ class RequestHandler:
         send_func,
         get_load_fn=None,
         architectures: list[str] | None = None,
+        memory_saver: TorchMemorySaverAdapter | None = None,
     ) -> None:
 
         self.forward_ct = 0
         self.server_args = server_args
+        self.memory_saver = memory_saver or TorchMemorySaverAdapter.create(
+            server_args.enable_memory_saver
+        )
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -170,6 +179,12 @@ class RequestHandler:
                 # Prefix cache is owned by the scheduler path; acknowledge the
                 # control request here so API callers still get a typed reply.
                 self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
+            elif isinstance(recv_req, ReleaseMemoryOccupationReqInput):
+                self.memory_saver.pause()
+                self.send_func.send_pyobj(ReleaseMemoryOccupationReqOutput())
+            elif isinstance(recv_req, ResumeMemoryOccupationReqInput):
+                self.memory_saver.resume()
+                self.send_func.send_pyobj(ResumeMemoryOccupationReqOutput())
             elif isinstance(recv_req, GetInternalStateReq):
                 self.send_func.send_pyobj(GetInternalStateReqOutput(internal_state={}))
             elif isinstance(recv_req, SetInternalStateReq):
