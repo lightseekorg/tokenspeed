@@ -349,6 +349,38 @@ class CudaGraphWrapper:
             grammar_backend=self.grammar_backend,
         )
 
+        # Spec-decode capture runs a synthetic multi-token decode. Keep the
+        # dummy cache lengths internally consistent with that token count so
+        # attention warmup does not read an impossible q_len > seq_len state.
+        tokens_per_req = self.max_tokens_per_req
+        self.input_buffers.seq_lens_buf[:bs].fill_(tokens_per_req)
+
+        # Capture block tables use the reserved padding page for all synthetic
+        # rows. Keep dummy KV writes on the same bounded page so capture never
+        # depends on extra KV capacity beyond the padding page.
+        page_size = self.input_buffers.page_size
+        dummy_slot = int(self.input_buffers.dummy_kv_slot)
+        dummy_page = dummy_slot // page_size
+        for backend in (self.attn_backend, self.draft_attn_backend):
+            if backend is not None:
+                backend.cuda_graph_capture_dummy_page = dummy_page
+        self.input_buffers.out_cache_loc_buf[: bs * tokens_per_req].fill_(dummy_slot)
+
+        # Some fused decode kernels may read full page vectors during capture
+        # even when seq_lens bounds the logical context. Clear the synthetic
+        # pages so any padding read is deterministic zero, not allocator noise.
+        dummy_page_start = (dummy_slot // page_size) * page_size
+        dummy_page_end = dummy_page_start + page_size
+        for pool in (self.token_to_kv_pool, self.draft_token_to_kv_pool):
+            if pool is None or not hasattr(pool, "kv_buffer"):
+                continue
+            for layer_buf in pool.kv_buffer:
+                if isinstance(layer_buf, (tuple, list)):
+                    for sub_buf in layer_buf:
+                        sub_buf[dummy_page_start:dummy_page_end].zero_()
+                else:
+                    layer_buf[dummy_page_start:dummy_page_end].zero_()
+
         self._init_capture_metadata(bs)
 
         def run_once():
