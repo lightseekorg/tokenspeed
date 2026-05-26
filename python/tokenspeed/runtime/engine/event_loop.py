@@ -51,6 +51,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_sync_debug_enabled,
     make_config,
     pool_to_paged_cache_groups,
+    pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
