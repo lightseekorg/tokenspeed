@@ -3186,11 +3186,15 @@ class DeepseekV4Attention(nn.Module):
             torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
         )
-        set_weight_attrs(self.attn_sink, {
-            "weight_loader": lambda param, loaded_weight: param.data.__setitem__(
-                slice(num_local), loaded_weight[tp_rank * num_local:(tp_rank + 1) * num_local],
-            ),
-        })
+        set_weight_attrs(
+            self.attn_sink,
+            {
+                "weight_loader": lambda param, loaded_weight: param.data.__setitem__(
+                    slice(num_local),
+                    loaded_weight[tp_rank * num_local : (tp_rank + 1) * num_local],
+                ),
+            },
+        )
         rope_base, rope_scaling = deepseek_v4_rope_config(config, self.compress_ratio)
         self.rotary_emb = get_rope(
             self.qk_rope_head_dim,
