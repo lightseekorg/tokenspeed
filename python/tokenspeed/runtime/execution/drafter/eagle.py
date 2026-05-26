@@ -264,6 +264,7 @@ class Eagle(BaseDrafter):
             out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
             input_lengths=unpadded_input_lengths,  # Used in logits processor
             captured_hidden_states=draft_input.base_out_hidden_states,
+            spec_step_idx=0,
         )
 
     @nvtx_range("draft_multi_step", color="purple")
@@ -350,6 +351,7 @@ class Eagle(BaseDrafter):
                     out_cache_loc=out_cache_loc,
                     input_lengths=input_lengths,
                     captured_hidden_states=logits_output.hidden_states,
+                    spec_step_idx=i,
                 )
 
             with nvtx_range("draft_sample", color="yellow"):

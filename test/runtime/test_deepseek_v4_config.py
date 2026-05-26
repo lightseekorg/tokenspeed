@@ -49,6 +49,7 @@ from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.attention.backends import (
     deepseek_v4 as deepseek_v4_backend,
 )
@@ -270,6 +271,111 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
             ForwardMode.TARGET_VERIFY,
         )
+
+    def test_model_runner_forwards_supported_spec_step_idx(self):
+        class ModelWithSpecStep:
+            def __init__(self):
+                self.received_spec_step_idx = None
+
+            def forward(
+                self,
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                input_lengths,
+                spec_step_idx=0,
+            ):
+                self.received_spec_step_idx = spec_step_idx
+                return spec_step_idx
+
+        runner = object.__new__(ModelRunner)
+        runner.model = ModelWithSpecStep()
+        runner.is_generation = True
+        runner._model_forward_accepts_spec_step_idx = (
+            ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
+        )
+
+        empty = torch.empty(0, dtype=torch.int32)
+        result = runner.forward(
+            ctx=None,
+            input_ids=empty,
+            positions=empty,
+            out_cache_loc=empty,
+            input_lengths=empty,
+            spec_step_idx=2,
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(runner.model.received_spec_step_idx, 2)
+
+    def test_model_runner_omits_unsupported_spec_step_idx(self):
+        class ModelWithoutSpecStep:
+            def forward(
+                self,
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                input_lengths,
+            ):
+                return "ok"
+
+        runner = object.__new__(ModelRunner)
+        runner.model = ModelWithoutSpecStep()
+        runner.is_generation = True
+        runner._model_forward_accepts_spec_step_idx = (
+            ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
+        )
+
+        empty = torch.empty(0, dtype=torch.int32)
+        result = runner.forward(
+            ctx=None,
+            input_ids=empty,
+            positions=empty,
+            out_cache_loc=empty,
+            input_lengths=empty,
+            spec_step_idx=2,
+        )
+
+        self.assertEqual(result, "ok")
+
+    def test_model_runner_does_not_forward_spec_step_idx_to_var_kwargs(self):
+        class ModelWithKwargs:
+            def __init__(self):
+                self.received_kwargs = None
+
+            def forward(
+                self,
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                input_lengths,
+                **kwargs,
+            ):
+                self.received_kwargs = kwargs
+                return "ok"
+
+        runner = object.__new__(ModelRunner)
+        runner.model = ModelWithKwargs()
+        runner.is_generation = True
+        runner._model_forward_accepts_spec_step_idx = (
+            ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
+        )
+
+        empty = torch.empty(0, dtype=torch.int32)
+        result = runner.forward(
+            ctx=None,
+            input_ids=empty,
+            positions=empty,
+            out_cache_loc=empty,
+            input_lengths=empty,
+            spec_step_idx=2,
+        )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(runner.model.received_kwargs, {})
 
     def test_deepseek_v4_indexer_token_split_treats_spec_modes_as_decode(self):
         metadata = SimpleNamespace(num_prefill_tokens=2)

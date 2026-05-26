@@ -923,6 +923,7 @@ class ModelExecutor:
                     positions=empty,
                     out_cache_loc=empty,
                     input_lengths=empty,
+                    spec_step_idx=step_idx,
                 )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
