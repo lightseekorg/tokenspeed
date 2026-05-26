@@ -1305,7 +1305,19 @@ class ModelExecutor:
                 )
 
             with nvtx_range("output_d2h", color="green"):
-                output_tokens = output_tokens.to("cpu", non_blocking=True)
+                # Defensive clamp into the valid vocab range. An out-of-range
+                # token id (e.g. a stale/corrupt value surfaced by the
+                # intermittent spec-decode decode-state race) would otherwise
+                # reach the detokenizer, whose HF tokenizer.decode raises
+                # OverflowError on ids outside [0, vocab) -- and that exception
+                # is fatal: the asyncio handler (async_llm.print_exception_wrapper)
+                # kills the whole server process tree. Clamping degrades a rare
+                # corrupt token to at most one wrong token in one request
+                # instead of taking the server (and the entire eval) down.
+                vocab_size = self.runtime_states.vocab_size
+                output_tokens = output_tokens.clamp(0, vocab_size - 1).to(
+                    "cpu", non_blocking=True
+                )
                 output_lengths = output_lengths.to("cpu", non_blocking=True)
 
                 if output_logprobs is not None:

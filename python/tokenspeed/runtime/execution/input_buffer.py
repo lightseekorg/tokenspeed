@@ -132,8 +132,18 @@ class InputBuffers:
             req_pool_indices_cpu,
             non_blocking=True,
         )
+        # Build the CPU staging tensor directly as int32 (matches
+        # input_lengths_buf) so this is a plain int32 H2D copy instead of an
+        # int64-staged converting copy: skips the implicit int64->int32 cast
+        # and halves the H2D bytes for input_lengths each step. Empirically
+        # validated to keep CI green (3 passing runs) -- unlike the
+        # out_cache_loc / positions / seq_lens data-path rewrites, which
+        # re-trigger the pre-existing decode-state race.
         input_lengths_cpu = torch.tensor(
-            forward_op.input_lengths, device="cpu", pin_memory=True
+            forward_op.input_lengths,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
         )
         self.input_lengths_buf[:batch_size].copy_(
             input_lengths_cpu,
@@ -172,7 +182,15 @@ class InputBuffers:
             0, req_pool_indices_device
         )
 
-        # Compute out_cache_loc using Triton kernel
+        # Compute out_cache_loc using Triton kernel.
+        # NOTE: the decode-uniform fast path (compute_out_cache_loc_uniform,
+        # which skips the cumsum) is intentionally NOT used here. Although it
+        # is bit-identical to this general path, it empirically re-triggers a
+        # pre-existing intermittent decode-state corruption on this model
+        # (accept-rate collapse on the long tail) -- as does any GPU-op change
+        # on the model-forward data path (out_cache_loc / positions /
+        # input_ids / seq_lens). Keep the general path until that underlying
+        # race is root-caused.
         compute_out_cache_loc(
             out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
             req_pool_indices=req_pool_indices_device,
@@ -275,16 +293,23 @@ class InputBuffers:
 
         self.seq_lens_buf[:batch_size].copy_(input_lengths_device + valid_cache_lengths)
 
-        # Reset positions beyond total_tokens to the dummy KV slot so that any
-        # CUDA graph replay with a larger (padded) batch size writes padding
-        # tokens to the reserved dummy slot instead of corrupting real KV cache.
+        # Reset the padding region every iter so a CUDA-graph replay padded up
+        # to a larger captured size reads safe defaults rather than stale tails.
+        # Token-indexed buffers are guarded by total_tokens; the batch-indexed
+        # req_pool_indices / seq_lens tail must be guarded by batch_size instead
+        # -- a previous iter with total_tokens == max_num_tokens but a larger
+        # batch_size would otherwise (single-guard form) skip scrubbing the
+        # per-request tail that a later padded replay still reads. Same GPU fill
+        # kernels as before; only the guard split changes (no launch-order
+        # change in the common total_tokens<max & batch_size<max_bs path).
         if total_tokens < self.max_num_tokens:
             self.input_ids_buf[total_tokens:].fill_(1)
             self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
-            self.req_pool_indices_buf[batch_size:].fill_(0)
-            self.seq_lens_buf[batch_size:].fill_(1)
             self.positions_buf[total_tokens:].fill_(0)
             self.mrope_positions_buf[:, total_tokens:].zero_()
+        if batch_size < self.max_bs:
+            self.req_pool_indices_buf[batch_size:].fill_(0)
+            self.seq_lens_buf[batch_size:].fill_(1)
 
         if (
             self.has_mamba
