@@ -85,10 +85,43 @@ def _suppress_flash_attn_jit_cache_debug_log():
         handler.setLevel(logging.WARNING)
 
 
+def _suppress_misc_runtime_warnings():
+    # tvm-ffi: every tilelang import re-warns about subclass fields that
+    # shadow ancestor fields. Emitted via PyErr_WarnEx from
+    # tvm_ffi/registry.py.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Field .* duplicates an ancestor field.*",
+        category=UserWarning,
+    )
+    # torch: HF tokenizer / dataset paths convert non-writable numpy
+    # arrays. Self-rate-limited but each TP rank still emits it once.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The given NumPy array is not writable.*",
+        category=UserWarning,
+    )
+    # torch.distributed.barrier: device_id is set later in our init
+    # path, but barrier() runs first and nags every rank.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"barrier\(\): using the device under current context\..*",
+        category=UserWarning,
+    )
+    # transformers: some chat templates only ship a slow tokenizer; the
+    # nag offers no actionable advice.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Using a slow tokenizer\..*",
+        category=UserWarning,
+    )
+
+
 def suppress_noisy_third_party_logs():
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TLLM_LOG_LEVEL", "WARNING")
     _suppress_cutlass_dsl_warnings()
+    _suppress_misc_runtime_warnings()
 
     for logger_name in (
         "transformers",
