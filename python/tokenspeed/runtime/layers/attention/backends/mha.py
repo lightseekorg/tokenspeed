@@ -426,7 +426,10 @@ class MHAAttnBackend(AttentionBackend):
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=self.max_context_len,
-            is_causal=True,
+            # DFLASH marks its draft attention non-causal so the draft block's
+            # query positions attend bidirectionally. Every other layer leaves
+            # the attribute unset, so this stays causal by default.
+            is_causal=not bool(getattr(layer, "non_causal", False)),
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
