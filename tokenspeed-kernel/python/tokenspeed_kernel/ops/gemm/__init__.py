@@ -114,13 +114,17 @@ def _gemm_format_signature(
             b=tensor_format("fp8", B.dtype, scale=scale),
         )
     if quant == "nvfp4":
-        scale = ScaleFormat(
-            storage_dtype=_scale_storage_dtype(A_scales, B_scales),
+        a_scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(A_scales),
+            granularity="block",
+        )
+        b_scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(B_scales),
             granularity="block",
         )
         return format_signature(
-            a=tensor_format("nvfp4", A.dtype, scale=scale),
-            b=tensor_format("nvfp4", B.dtype, scale=scale),
+            a=tensor_format("nvfp4", A.dtype, scale=a_scale),
+            b=tensor_format("nvfp4", B.dtype, scale=b_scale),
         )
     return format_signature(
         a=dense_tensor_format(A.dtype), b=dense_tensor_format(B.dtype)
