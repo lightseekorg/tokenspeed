@@ -201,18 +201,25 @@ def _install_tvm_ffi_cerr_filter() -> None:
 
     _stderr_filter_installed = True
 
-    threading.Thread(
+    reader_thread = threading.Thread(
         target=_stderr_filter_reader,
         args=(read_fd, saved_stderr_fd),
         name="tokenspeed-stderr-filter",
         daemon=True,
-    ).start()
+    )
+    reader_thread.start()
 
     def _restore() -> None:
+        # Closing the pipe write end (via dup2 onto FD 2) signals EOF to the
+        # reader, which then drains any buffered bytes in its `finally` block.
+        # Join with a bounded timeout so a fail-fast process still surfaces
+        # the diagnostics written to stderr just before exit, without blocking
+        # interpreter shutdown if the reader is stuck.
         try:
             os.dup2(saved_stderr_fd, 2)
         except OSError:
             pass
+        reader_thread.join(timeout=1.0)
 
     atexit.register(_restore)
 
