@@ -243,6 +243,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128, 256}),
+            "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
@@ -260,6 +261,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
+        is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -313,7 +315,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             q.shape[-1],
             page_size,
             head_dim_vo=v_cache.shape[-1],
-            causal=False,
+            causal=is_causal,
             sm_scale=(
                 softmax_scale
                 if softmax_scale is not None
@@ -367,6 +369,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
+        is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
