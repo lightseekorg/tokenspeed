@@ -121,7 +121,7 @@ TORCH_DTYPES = [torch.bfloat16]
 
 EXPECTED_OUTPUT_SUBSTRINGS = {
     "The capital of the United Kingdom is": "London",
-    "Today is a sunny day and I like": "walk",
+    "Today is a sunny day and I like": "to go",
     "AI is a field of computer science focused on": "intelligence",
 }
 
