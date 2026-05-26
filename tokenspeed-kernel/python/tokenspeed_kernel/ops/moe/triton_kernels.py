@@ -30,7 +30,6 @@ import torch
 import triton_kernels.matmul_details.opt_flags as opt_flags
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.thirdparty.triton_kernels.routing import routing as _routing_impl
 from triton_kernels.matmul import (
     FlexCtx,
     FnSpecs,
@@ -45,10 +44,13 @@ from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import (
     FP4,
+    RaggedTensorMetadata,
     convert_layout,
+    make_ragged_tensor_metadata,
     wrap_torch_tensor,
 )
 from triton_kernels.tensor_details import layout
+from triton_kernels.topk import topk
 
 
 def _is_bf16_mxfp4(x, w, precision_config):
@@ -163,10 +165,35 @@ register_kernel(
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
 )
-def triton_kernels_routing(logits, n_expts_act, sm_first=False, dtype=None):
+def triton_kernels_routing(
+    logits: torch.Tensor,
+    n_expts_act: int,
+    sm_first: bool = False,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
     if dtype is None:
         dtype = logits.dtype
-    return _routing_impl(logits, n_expts_act, sm_first=sm_first, dtype=dtype)
+
+    assert logits.ndim == 2, "router_logits must be (n_tokens, n_expts_tot)"
+    n_tokens, _ = logits.shape
+
+    assert sm_first is False, "sm_first=True not supported for triton_kernels_routing"
+    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
+    mask_metadata = sparse.mask_metadata
+
+    col_sorted = mask_metadata.col_sorted_indx
+    gather_indx = col_sorted // n_expts_act
+    scatter_indx = col_sorted
+
+    vals_flat = sparse.vals.reshape(-1)
+    if dtype is not None and vals_flat.dtype != dtype:
+        vals_flat = vals_flat.to(dtype)
+    gate_scal = vals_flat[scatter_indx]
+
+    n_total_rows = n_tokens * n_expts_act
+    ragged_metadata = make_ragged_tensor_metadata(mask_metadata.col_sum, n_total_rows)
+
+    return ragged_metadata, gather_indx, scatter_indx, gate_scal
 
 
 __all__ = [
