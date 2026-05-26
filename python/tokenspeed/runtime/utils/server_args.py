@@ -1292,7 +1292,7 @@ class ServerArgs:
             help="Sampling backend. "
             "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
-            "'flashinfer': temperature/top_k/top_p via one fused kernel (top_k_top_p_sampling_from_logits); "
+            "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "

@@ -273,7 +273,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
-        )
+        ).float()
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
@@ -374,26 +374,30 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
+        logits = nan_guard_logits(
+            logits_output.next_token_logits, self.config.enable_nan_detection
+        ).float()
+
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
         # Applied before raw_logprobs capture so constrained logprobs reflect
         # the grammar-masked distribution.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
-                logits=logits_output.next_token_logits,
+                logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
 
         # Raw (pre-penalty) logprobs captured before penalty application to
         # match sample()'s semantics.
         raw_logprobs = (
-            torch.log_softmax(logits_output.next_token_logits, dim=-1)
+            torch.log_softmax(logits, dim=-1)
             if self.config.enable_output_logprobs
             else None
         )
 
         logits = self._apply_penalties_and_bias(
-            logits_output.next_token_logits,
+            logits,
             sampling_info,
             num_tokens_per_req=num_tokens_per_req,
         )
