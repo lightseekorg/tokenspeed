@@ -45,6 +45,10 @@ class MHAConfig(BaseAttnConfig):
                 speculative_num_steps=server_args.speculative_num_steps,
                 speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             )
+        kv_cache_dtype = server_args.kv_cache_dtype
+        if is_draft and server_args.speculative_algorithm == "DFLASH":
+            kv_cache_dtype = "bfloat16"
+
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -58,7 +62,7 @@ class MHAConfig(BaseAttnConfig):
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             dtype=model_config.dtype,
-            kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
+            kv_cache_dtype=resolve_dtype(kv_cache_dtype),
             page_size=server_args.block_size,
             max_bs=server_args.max_num_seqs
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
