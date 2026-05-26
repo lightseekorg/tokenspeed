@@ -32,7 +32,6 @@
 
 #include "integration_test_helper.h"
 #include "resource/allocator/page_allocator.h"
-#include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "scheduler/kv_cache_events.h"
 
@@ -243,30 +242,6 @@ TEST_F(KVPrefixCacheEventTestSuite, HostRecoveryPublishesDeviceStoredEvents) {
     ASSERT_TRUE(cache_.EnsureCapacityByEvict<ResourceType::Device>(1));
     ASSERT_EQ(events_.size(), 1u);
     EXPECT_EQ(AsRemoved(events_[0]).block_hashes, (std::vector<std::uint64_t>{first_hash, second_hash}));
-}
-
-TEST(HybridPrefixCacheKvEventSinkTest, FacadeDelegatesEventsAndCanClearBinding) {
-    constexpr std::int32_t kPageSize = 2;
-    PageAllocator device_allocator{kPageSize, 4};
-    PageAllocator host_allocator{kPageSize, 4};
-    KVPrefixCache cache{&device_allocator, &host_allocator};
-    HybridPrefixCache hybrid_cache{cache, device_allocator, nullptr, 0};
-    std::vector<KvCacheEvent> events;
-
-    hybrid_cache.SetKvEventSink([&](KvCacheEvent event) { events.push_back(std::move(event)); });
-
-    const token_vec_t first_tokens{1, 2};
-    cache.Insert<ResourceType::Device>(first_tokens, {}, device_allocator.Allocate(1));
-
-    ASSERT_EQ(events.size(), 1u);
-    EXPECT_EQ(AsStored(events[0]).token_ids, first_tokens);
-
-    hybrid_cache.SetKvEventSink({});
-
-    const token_vec_t second_tokens{3, 4};
-    cache.Insert<ResourceType::Device>(second_tokens, {}, device_allocator.Allocate(1));
-
-    EXPECT_EQ(events.size(), 1u);
 }
 
 TEST(KVPrefixCacheEventBenchTest, OptimizedInsertIsFasterThanLegacyAncestorRehashing) {

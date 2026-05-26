@@ -55,19 +55,7 @@ PagedCacheGroupConfig MakePagedGroup(std::string group_id, PagedCacheGroupFamily
 
 }  // namespace
 
-TEST(HybridPrefixCacheStatsTest, KVOnlyStatsReportDevicePagesAndNoPagedGroups) {
-    PageAllocator device_allocator{kPageSize, /*total_pages=*/8};
-    PageAllocator host_allocator{kPageSize, /*total_pages=*/0};
-    KVPrefixCache prefix_cache{&device_allocator, &host_allocator};
-    HybridPrefixCache hybrid_prefix_cache{prefix_cache, device_allocator, /*allocator=*/nullptr, kMambaChunkSize};
-
-    const CacheStatsSnapshot stats = hybrid_prefix_cache.Stats();
-
-    EXPECT_EQ(stats.available_device_pages, 7u);
-    EXPECT_TRUE(stats.paged_cache_group_ids.empty());
-}
-
-TEST(HybridPrefixCacheStatsTest, PagedGroupsReportAllocatorAndMissingRequestState) {
+TEST(HybridPrefixCacheStatsTest, PagedGroupsReportPublicStatsAndMissingRequestState) {
     PageAllocator device_allocator{kPageSize, /*total_pages=*/8};
     PageAllocator host_allocator{kPageSize, /*total_pages=*/0};
     KVPrefixCache prefix_cache{&device_allocator, &host_allocator};
@@ -81,6 +69,7 @@ TEST(HybridPrefixCacheStatsTest, PagedGroupsReportAllocatorAndMissingRequestStat
     hybrid_prefix_cache.ConfigurePagedCacheAdjunct(std::span<const PagedCacheGroupConfig>{groups}, std::nullopt);
 
     const CacheStatsSnapshot all_stats = hybrid_prefix_cache.Stats();
+    EXPECT_EQ(all_stats.available_device_pages, 7u);
     EXPECT_EQ(all_stats.paged_cache_group_ids, std::vector<std::string>({"v4.history", "v4.swa"}));
 
     const CacheStatsSnapshot history_stats =

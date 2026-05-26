@@ -24,6 +24,7 @@
 #include "fsm/states.h"
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/page_hasher.h"
+#include "scheduler/request.h"
 #include "scheduler/scheduler.h"
 
 #include "fsm/cache_events.h"

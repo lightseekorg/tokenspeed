@@ -34,6 +34,7 @@
 #include "fsm/forward_states.h"
 #include "resource/allocator/kv_allocator.h"
 #include "resource/allocator/req_pool_allocator.h"
+#include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/radix_tree/tree_node.h"
 #include "resource/types.h"
 #include "scheduler/operations/cache.h"

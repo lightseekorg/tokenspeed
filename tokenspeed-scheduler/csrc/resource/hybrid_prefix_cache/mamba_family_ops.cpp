@@ -30,8 +30,11 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace tokenspeed {
 namespace {

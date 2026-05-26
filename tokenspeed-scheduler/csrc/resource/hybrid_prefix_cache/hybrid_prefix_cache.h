@@ -20,7 +20,6 @@
 
 #pragma once
 
-#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -29,16 +28,14 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/paged_cache_group.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache_types.h"
 #include "resource/hybrid_prefix_cache/mamba_eviction_manager.h"
-#include "resource/radix_tree/mamba_slot.h"
-#include "scheduler/operations/cache.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
+#include "scheduler/operations/cache.h"
 #include "resource/types.h"
 
 namespace tokenspeed {
@@ -47,6 +44,7 @@ class MambaChunkAllocator;
 class MambaHostAllocator;
 class LocalKVAllocator;
 class LocalMambaAllocator;
+class MambaSlot;
 class PageAllocator;
 class ForwardOperationBase;
 
@@ -78,21 +76,11 @@ public:
     cache_op_id AllocateCacheOpId();
     void SetKvEventSink(KvEventSink sink);
 
-    // Takes ownership. Duplicate group_id throws std::invalid_argument.
-    void RegisterPagedCacheGroup(std::unique_ptr<PagedCacheGroupAllocator> allocator);
-
     // Startup-only scheduler configuration facade. Copies and validates group
     // configs, registers concrete paged-cache group allocators, and optionally
     // enables prefix-cache adjunct state for the required groups.
     void ConfigurePagedCacheAdjunct(std::span<const PagedCacheGroupConfig> group_configs,
                                     std::optional<std::span<const std::string>> required_groups);
-
-    // History alignment is the LCM of RawTokensPerPage() over the History-family
-    // groups; state groups only need the trailing window. Sliding groups must
-    // have a window entry; full-history groups must not.
-    void EnablePagedCacheAdjunct(std::vector<std::string> required_groups,
-                                 std::unordered_map<std::string, std::int32_t> sliding_window_per_group,
-                                 StateRestorePolicy policy = StateRestorePolicy::kSnapshotRequired);
 
     // Unified paged-cache lifecycle surface used by the Scheduler. All methods
     // below are no-ops when no paged-cache groups are registered.
@@ -105,8 +93,6 @@ public:
     // prefix-cache refcount/LRU/eviction paths.
     void FinishRequest(const std::string& request_id);
 
-    // Callback from KV prefix-cache eviction.
-    void OnKVEvict(TreeNode* node);
     void OnKVDeviceDemote(TreeNode* node);
     void OnMambaHostWriteBackDone(TreeNode* last_node);
     void OnMambaHostWriteBackDone(const std::vector<TreeNode*>& nodes);
@@ -236,6 +222,17 @@ private:
     bool HasMambaAdjunct() const { return mamba_allocator_ != nullptr; }
     bool HasPagedCacheAdjunct() const { return paged_cache_history_alignment_tokens_ > 0; }
     RecoveryPlan BuildRecoveryPlan(MatchResult raw_match, MatchIntent intent) const;
+
+    // Takes ownership. Duplicate group_id throws std::invalid_argument.
+    void RegisterPagedCacheGroup(std::unique_ptr<PagedCacheGroupAllocator> allocator);
+
+    // History alignment is the LCM of RawTokensPerPage() over the History-family
+    // groups; state groups only need the trailing window. Sliding groups must
+    // have a window entry; full-history groups must not.
+    void EnablePagedCacheAdjunct(std::vector<std::string> required_groups,
+                                 std::unordered_map<std::string, std::int32_t> sliding_window_per_group,
+                                 StateRestorePolicy policy = StateRestorePolicy::kSnapshotRequired);
+
     void PopulateMambaMatchCompatibilityFields(ForwardOperationBase& op_base, const MatchResult& match_result) const;
     void PopulateMambaRecoveryCompatibilityFields(ForwardOperationBase& op_base, const MatchResult& match_result) const;
     void PopulateMambaRequestLocalCompatibilityFields(ForwardOperationBase& op_base,
@@ -248,6 +245,8 @@ private:
     TreeNode* FindLastMambaHostNode(TreeNode* from) const;
     std::vector<TransferPair> PrepareMambaHostWriteBack(const std::vector<TreeNode*>& nodes);
     std::vector<TransferPair> PrepareMambaDeviceLoadBack(const std::vector<TreeNode*>& nodes);
+    // Callback from KV prefix-cache eviction.
+    void OnKVEvict(TreeNode* node);
     void OnKVHostEvict(TreeNode* node);
     // Publish request-local Mamba state for finish after the caller has inserted
     // new terminal KV pages. The caller owns the "new KV pages were inserted"

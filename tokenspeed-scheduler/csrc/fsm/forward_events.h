@@ -23,7 +23,6 @@
 // Put transitions and resource ownership transfer into each particular event
 // Put resource allocation into function call operators of events
 
-#include <algorithm>
 #include <concepts>
 #include <cstdint>
 #include <string>
@@ -35,10 +34,12 @@
 #include "fsm/base_event.h"
 #include "fsm/forward_states.h"
 #include "resource/types.h"
-#include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
-#include "utils.h"
+#include "scheduler/operations/cache.h"
+#include "scheduler/request_spec.h"
 
 namespace tokenspeed {
+class HybridPrefixCache;
+class KVPrefixCache;
 class ReqPoolAllocator;
 class TreeNode;
 }  // namespace tokenspeed

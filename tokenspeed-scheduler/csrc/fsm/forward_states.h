@@ -21,13 +21,14 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
-#include <variant>
+#include <vector>
 
 #include "core/token_container.h"
-#include "resource/allocator/page_allocator.h"
 #include "resource/radix_tree/tree_node.h"
 #include "resource/allocator/kv_allocator.h"
 #include "resource/allocator/owned_pages.h"

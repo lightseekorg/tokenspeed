@@ -44,7 +44,6 @@
 #include "fsm/forward_states.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/radix_tree/radix_tree.h"
-#include "scheduler/device_memory_diagnostics.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/operations/cache.h"
 #include "scheduler/page_hasher.h"
@@ -86,13 +85,17 @@ MambaHostAllocator* MambaHostAdjunctAllocator(std::optional<MambaHostAllocator>&
     return has_mamba_adjunct && host_allocator.has_value() ? &*host_allocator : nullptr;
 }
 
-}  // namespace
+struct RequestLocalKVPagesSnapshot {
+    std::string request_id;
+    std::string state_name;
+    std::vector<std::int32_t> pages;
+};
 
 bool ValidateDeviceMemoryDiagnostics(const std::vector<RequestLocalKVPagesSnapshot>& request_pages,
                                      const CacheDeviceMemoryDiagnosticsSnapshot& device_snapshot) {
     bool ok = true;
     const std::int32_t total_device = device_snapshot.total_device_pages;
-    // page_id → (owner_req_id, state_name) for duplicate tail-page reporting
+    // page_id -> (owner_req_id, state_name) for duplicate tail-page reporting
     std::unordered_map<std::int32_t, std::pair<std::string, std::string>> page_owner;
 
     for (const auto& snapshot : request_pages) {
@@ -106,7 +109,7 @@ bool ValidateDeviceMemoryDiagnostics(const std::vector<RequestLocalKVPagesSnapsh
         }
     }
 
-    // ── 2a. Check for duplicate page_ids inside the tree itself ─────────────
+    // Check for duplicate page_ids inside the tree itself.
     for (auto& [page, cnt] : device_snapshot.tree_device_pages) {
         if (cnt > 1) {
             spdlog::error("[check_mem] DEVICE TREE DUPLICATE: page={} appears {} times in radix tree", page, cnt);
@@ -130,8 +133,7 @@ bool ValidateDeviceMemoryDiagnostics(const std::vector<RequestLocalKVPagesSnapsh
         ok = false;
     }
 
-    // ── 4. Per-request: page ids must be in [1, total] ────────────────────
-    // PageAllocator starts from page id 1 (0 is reserved as invalid/null).
+    // PageAllocator starts from page id 1; 0 is reserved as invalid/null.
     for (const auto& snapshot : request_pages) {
         for (std::int32_t p : snapshot.pages) {
             if (p <= 0 || p > total_device) {
@@ -151,6 +153,8 @@ bool ValidateDeviceMemoryDiagnostics(const std::vector<RequestLocalKVPagesSnapsh
 
     return ok;
 }
+
+}  // namespace
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},

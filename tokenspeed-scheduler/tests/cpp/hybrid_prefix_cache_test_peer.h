@@ -20,14 +20,14 @@
 // inspect internals while production callers use the scheduler-facing facades.
 
 #include <cstdint>
-#include <map>
 #include <memory>
-#include <span>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
+#include "resource/radix_tree/mamba_slot.h"
 #include "resource/radix_tree/tree_node.h"
 
 namespace tokenspeed {
@@ -48,10 +48,14 @@ public:
         return cache.PrepareMambaDeviceLoadBack(nodes);
     }
 
-    static void PublishFinishMambaState(HybridPrefixCache& cache,
-                                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
-                                        LocalMambaAllocator* local_mamba_allocator) {
-        cache.PublishFinishMambaState(full_paged_tokens, local_mamba_allocator);
+    static void RegisterPagedCacheGroup(HybridPrefixCache& cache, std::unique_ptr<PagedCacheGroupAllocator> allocator) {
+        cache.RegisterPagedCacheGroup(std::move(allocator));
+    }
+
+    static void EnablePagedCacheAdjunct(HybridPrefixCache& cache, std::vector<std::string> required_groups,
+                                        std::unordered_map<std::string, std::int32_t> sliding_window_per_group,
+                                        StateRestorePolicy policy = StateRestorePolicy::kSnapshotRequired) {
+        cache.EnablePagedCacheAdjunct(std::move(required_groups), std::move(sliding_window_per_group), policy);
     }
 
     static void AcquireForRequest(HybridPrefixCache& cache, const std::string& request_id,

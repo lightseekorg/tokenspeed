@@ -75,10 +75,10 @@ protected:
 
         hybrid_ = std::make_unique<HybridPrefixCache>(*kv_cache_, *device_alloc_, /*mamba=*/nullptr,
                                                       /*mamba_chunk_size=*/0);
-        hybrid_->RegisterPagedCacheGroup(std::move(fh_owner));
-        hybrid_->RegisterPagedCacheGroup(std::move(swa_owner));
+        HybridPrefixCacheTestPeer::RegisterPagedCacheGroup(*hybrid_, std::move(fh_owner));
+        HybridPrefixCacheTestPeer::RegisterPagedCacheGroup(*hybrid_, std::move(swa_owner));
         std::unordered_map<std::string, std::int32_t> sliding{{"swa", kSlidingWindow}};
-        hybrid_->EnablePagedCacheAdjunct(/*required=*/{"fh", "swa"}, std::move(sliding));
+        HybridPrefixCacheTestPeer::EnablePagedCacheAdjunct(*hybrid_, /*required=*/{"fh", "swa"}, std::move(sliding));
     }
 
     // Insert pages from `start_node` (nullptr=root); returns terminal node.

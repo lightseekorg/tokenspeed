@@ -26,12 +26,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "resource/types.h"
 #include "scheduler/types.h"
-#include "scheduler/request.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/kv_cache_events.h"
@@ -46,6 +47,8 @@
 
 #include "fsm/forward_events.h"
 namespace tokenspeed {
+
+class Request;
 
 class Scheduler {
 public:
