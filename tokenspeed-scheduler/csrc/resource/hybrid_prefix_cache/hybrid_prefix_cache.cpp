@@ -863,8 +863,8 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
             // via release.  The only pool credit is from CheckpointStateToSnapshot's
             // stale-owned drop (pages below live_lower at the first commit step).
             const std::int32_t lcm = paged_cache_history_alignment_tokens_;
-            if (cfg.family == PagedCacheGroupFamily::State && table_exists &&
-                lcm > 0 && committed_prefix + lcm <= raw_cursor) {
+            if (cfg.family == PagedCacheGroupFamily::State && table_exists && lcm > 0 &&
+                committed_prefix + lcm <= raw_cursor) {
                 const std::int32_t commit_target = committed_prefix + lcm;
                 const std::int32_t live_lower_raw = std::max(0, commit_target - *cfg.sliding_window_tokens);
                 const std::int32_t live_lower_page = live_lower_raw / raw_per_page;
@@ -872,9 +872,7 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
                 if (live_lower_page > base) {
                     base += std::min(live_lower_page - base, borrowed_in_table);
                 }
-                releasable_owned = (live_lower_page > base)
-                                       ? std::min(live_lower_page - base, owned_in_table)
-                                       : 0;
+                releasable_owned = (live_lower_page > base) ? std::min(live_lower_page - base, owned_in_table) : 0;
             }
         }
 
