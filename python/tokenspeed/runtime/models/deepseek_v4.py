@@ -3159,12 +3159,15 @@ class DeepseekV4Attention(nn.Module):
                 "expected 1, 4, or 128."
             )
         self.num_heads = int(config.num_attention_heads)
-        if self.num_heads % mapping.attn.tp_size != 0:
+        tp_rank = mapping.attn.tp_rank
+        tp_size = mapping.attn.tp_size
+        tp_group = mapping.attn.tp_group
+        if self.num_heads % tp_size != 0:
             raise ValueError(
                 f"num_attention_heads={self.num_heads} must be divisible "
-                f"by attn_tp_size={mapping.attn.tp_size}"
+                f"by attn_tp_size={tp_size}"
             )
-        self.num_local_heads = self.num_heads // mapping.attn.tp_size
+        self.num_local_heads = self.num_heads // tp_size
         self.padded_heads = _deepseek_v4_padded_heads(self.num_local_heads)
         self.head_dim = int(config.head_dim)
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
@@ -3177,10 +3180,20 @@ class DeepseekV4Attention(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.o_groups = config.o_groups
-        self.num_local_groups = self.o_groups // mapping.attn.tp_size
+        self.num_local_groups = self.o_groups // tp_size
+        num_local = self.num_local_heads
         self.attn_sink = nn.Parameter(
             torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
+        )
+        set_weight_attrs(
+            self.attn_sink,
+            {
+                "weight_loader": lambda param, loaded_weight: param.data.__setitem__(
+                    slice(num_local),
+                    loaded_weight[tp_rank * num_local : (tp_rank + 1) * num_local],
+                ),
+            },
         )
         rope_base, rope_scaling = deepseek_v4_rope_config(config, self.compress_ratio)
         self.rotary_emb = get_rope(
@@ -3208,9 +3221,9 @@ class DeepseekV4Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.fused_qkv_norm = FusedRMSNorm(self.q_norm, self.kv_norm)
@@ -3223,9 +3236,9 @@ class DeepseekV4Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wo_a", prefix),
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.num_local_groups
@@ -3235,9 +3248,9 @@ class DeepseekV4Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wo_b", prefix),
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
         )
         if self.compress_ratio > 1:
             self.compressor = DeepseekV4Compressor(

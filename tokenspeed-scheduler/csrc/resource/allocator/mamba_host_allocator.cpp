@@ -25,10 +25,9 @@
 namespace tokenspeed {
 
 MambaHostAllocator::MambaHostAllocator(std::int32_t num_slots) : total_slots_{num_slots} {
-    free_list_.reserve(num_slots);
     released_idx_queue_.reserve(num_slots);
-    for (std::int32_t i = num_slots - 1; i >= 0; --i) {
-        free_list_.push_back(i);
+    for (std::int32_t i = 0; i < num_slots; ++i) {
+        free_list_.push(i);
     }
 }
 
@@ -36,8 +35,8 @@ std::optional<MambaSlot> MambaHostAllocator::Allocate() {
     if (free_list_.empty()) {
         return std::nullopt;
     }
-    std::int32_t index = free_list_.back();
-    free_list_.pop_back();
+    std::int32_t index = free_list_.top();
+    free_list_.pop();
     return MambaSlot{index, [this](std::int32_t i) { Free(i); }};
 }
 
@@ -45,7 +44,7 @@ void MambaHostAllocator::Free(std::int32_t index) {
     if (index < 0 || index >= total_slots_) {
         return;
     }
-    free_list_.push_back(index);
+    free_list_.push(index);
     released_idx_queue_.push_back(index);
 }
 
@@ -53,6 +52,10 @@ std::vector<std::int32_t> MambaHostAllocator::DrainReleased(std::size_t max) {
     std::size_t n = std::min(max, released_idx_queue_.size());
     std::vector<std::int32_t> released(released_idx_queue_.begin(), released_idx_queue_.begin() + n);
     released_idx_queue_.erase(released_idx_queue_.begin(), released_idx_queue_.begin() + n);
+    // Sort so the drained set is order-independent across TP ranks (Free()
+    // callbacks may fire in different orders per rank). Consumers only need
+    // the SET of released indices.
+    std::sort(released.begin(), released.end());
     return released;
 }
 
