@@ -60,7 +60,7 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
         """Like supports() but without the ep_size > 1 requirement.
 
         Used when the backend is explicitly requested by the user rather than
-        auto-selected.  The kernel handles ep_size=1 correctly via the
+        auto-selected. The kernel handles ep_size=1 correctly via the
         ``traits={"ep": False}`` path; the ep_size guard in supports() exists
         only to keep Triton (faster at small batches in a CUDA graph) as the
         auto default for single-GPU deployments.
