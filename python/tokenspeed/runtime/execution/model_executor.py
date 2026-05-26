@@ -35,6 +35,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -61,7 +62,7 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 
 
 @dataclass
@@ -232,12 +233,24 @@ class ModelExecutor:
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
             )
-            embed, head = self.model_runner.model.get_embed_and_head()
-            draft_model_runner.model.set_embed_and_head(embed, head)
+            if hasattr(self.drafter, "bind_target_model"):
+                self.drafter.bind_target_model(self.model_runner.model)
+            if config.spec_algo in ("EAGLE3", "MTP"):
+                embed, head = self.model_runner.model.get_embed_and_head()
+                draft_model_runner.model.set_embed_and_head(embed, head)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
                 self.model_runner.model.set_eagle3_layers_to_capture()
+            if config.spec_algo == "DFLASH":
+                if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+                    raise ValueError(
+                        "DFLASH requires the target model to support "
+                        "set_dflash_layers_to_capture."
+                    )
+                self.model_runner.model.set_dflash_layers_to_capture(
+                    self.drafter.target_layer_ids
+                )
         else:
             self.drafter = None
 
@@ -894,7 +907,10 @@ class ModelExecutor:
                 global_bs=global_bs,
                 all_decode_or_idle=all_decode_or_idle,
             )
-            for _ in range(self.drafter.spec_num_steps):
+            idle_forward_steps = getattr(
+                self.drafter, "idle_forward_steps", self.drafter.spec_num_steps
+            )
+            for _ in range(idle_forward_steps or 0):
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
                     input_ids=empty,

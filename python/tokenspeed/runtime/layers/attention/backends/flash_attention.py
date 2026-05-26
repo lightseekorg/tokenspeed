@@ -729,6 +729,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         use_cascade_attn = is_target_verify and self.topk > 1 and not is_swa
+        non_causal = bool(getattr(layer, "non_causal", False))
 
         # Only pass ``ver`` when talking to a non-default FlashAttention
         # interface version.
@@ -782,7 +783,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=not use_cascade_attn,
+                causal=not (use_cascade_attn or non_causal),
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
@@ -1189,7 +1190,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=not use_cascade_attn,
+                causal=not (use_cascade_attn or non_causal),
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
