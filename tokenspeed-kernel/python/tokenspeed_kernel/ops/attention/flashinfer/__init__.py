@@ -412,6 +412,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             window_left=window_left,
             sinks=sinks,
             out_dtype=q.dtype,
+            causal=is_causal,
         )
 
     @register_kernel(
