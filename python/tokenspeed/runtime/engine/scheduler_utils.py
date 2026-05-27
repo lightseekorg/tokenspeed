@@ -103,11 +103,12 @@ def make_config(
     cfg.enable_mamba_l2 = enable_mamba_l2
     cfg.mamba_l2_host_slots = mamba_l2_host_slots
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
-    cfg.max_loras = max_loras
-    if prefix_cache_adjunct is not None:
-        cfg.prefix_cache_adjunct = prefix_cache_adjunct
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
+    # Opt-in; unset means paged-cache groups are transport-only.
+    if prefix_cache_adjunct is not None:
+        cfg.prefix_cache_adjunct = prefix_cache_adjunct
+    cfg.max_loras = max_loras
     return cfg
 
 
