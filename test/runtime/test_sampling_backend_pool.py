@@ -524,6 +524,9 @@ class TestTritonSamplingDefault(unittest.TestCase):
             backend.sample(logits_output, self._sampling_info([1]))
 
     def test_verify_nan_guard_keeps_greedy_tokens_valid(self):
+        if torch.version.hip is not None:
+            self.skipTest("verify_chain_greedy is only available on NVIDIA")
+
         vocab_size = 151936
         backend = TritonSamplingBackend(_make_config(vocab_size=vocab_size))
         backend.prepare_step(
