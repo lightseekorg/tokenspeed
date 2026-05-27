@@ -351,6 +351,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED,
         traits={
+            "is_causal": frozenset({False, True}),
             "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),

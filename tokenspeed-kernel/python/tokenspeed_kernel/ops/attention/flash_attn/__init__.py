@@ -250,7 +250,6 @@ elif platform.is_nvidia and platform.is_hopper:
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 3,
         traits={
-            "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
@@ -300,6 +299,7 @@ elif platform.is_nvidia and platform.is_hopper:
         dtypes={torch.float16, torch.bfloat16},
         priority=Priority.SPECIALIZED + 3,
         traits={
+            "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
