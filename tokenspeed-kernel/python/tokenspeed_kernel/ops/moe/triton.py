@@ -757,6 +757,12 @@ def _normalize_fp8_group_scale_layout(
         valid_numel = expected_scale_k * aligned_m
         if A_scale.numel() < valid_numel:
             return A_scale
+        # When m == aligned_m (M is already a multiple of 4), the TRT-LLM fast path
+        # produces an async CUDA error in the quant kernel that surfaces at .contiguous().
+        # In that case interpret the buffer directly as [M, K] rather than [K, M].T,
+        # which avoids the async error and also eliminates the transpose copy.
+        if m == aligned_m:
+            return A_scale[:valid_numel].view(m, expected_scale_k).contiguous()
         return (
             A_scale[:valid_numel]
             .view(expected_scale_k, aligned_m)[:, :m]

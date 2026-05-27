@@ -53,11 +53,17 @@ async def spawn_engine(
         str(port),
         *args,
     ]
+    # expandable_segments avoids OOM from memory fragmentation when a large lazy
+    # allocation (e.g., 256 MB flashinfer workspace) is requested after CUDA graphs
+    # have carved up the memory pool into non-contiguous chunks.
+    env = os.environ.copy()
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     logger.info("spawn engine: %s", " ".join(cmd))
     return await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
 
 

@@ -107,7 +107,13 @@ def triton_forward(
     hidden_states: torch.Tensor,
     topk_output: object,
 ) -> torch.Tensor:
-    from tokenspeed.runtime.layers.activation import silu_and_mul
+    import torch.nn.functional as _F
+
+    # Use pure-torch silu_and_mul — the flashinfer AOT kernel fails for certain
+    # batch sizes on SM90 (H100) due to missing/broken compiled kernels.
+    def silu_and_mul(inp: torch.Tensor, out: torch.Tensor) -> None:
+        d = inp.shape[-1] // 2
+        out.copy_(_F.silu(inp[..., :d]) * inp[..., d:])
 
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
 

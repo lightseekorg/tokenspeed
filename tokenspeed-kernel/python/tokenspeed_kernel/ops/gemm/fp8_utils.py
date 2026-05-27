@@ -397,6 +397,33 @@ def _flashinfer_sm90_per_token_group_quant_fp8(
     return x_q, x_s
 
 
+def _per_token_group_quant_fp8_torch(
+    x: torch.Tensor,
+    group_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch block-wise FP8 quantization.
+
+    Returns (x_q, scale) where:
+      x_q:   same shape as x, dtype float8_e4m3fn
+      scale: shape [*x.shape[:-1], x.shape[-1] // group_size], dtype float32
+
+    No Triton/TRT-LLM kernels — safe for any M on any SM version.
+    Intended for small decode/extend batches where CUDA kernel compatibility
+    issues with block-wise FP8 quant exist on SM90.
+    """
+    assert x.ndim == 2 and x.shape[-1] % group_size == 0
+    M, K = x.shape
+    num_groups = K // group_size
+    fp8_max = torch.finfo(fp8_dtype).max  # 448.0 for e4m3fn
+    fp8_min = -fp8_max
+
+    x_f32 = x.to(torch.float32).view(M, num_groups, group_size)
+    amax = x_f32.abs().amax(dim=-1).clamp(min=1e-10)  # [M, num_groups]
+    scale = amax / fp8_max  # [M, num_groups]
+    x_q = (x_f32 / scale.unsqueeze(-1)).clamp(fp8_min, fp8_max).to(fp8_dtype).view(M, K)
+    return x_q, scale  # scale shape matches [M, num_groups] = [M, K // group_size]
+
+
 def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -413,6 +440,20 @@ def per_token_group_quant_fp8(
     )
     if flashinfer_quantized is not None:
         return flashinfer_quantized
+
+    # Small-M guard: both the TRT-LLM kernel (fp8_quantize_1x128) and the Triton fallback
+    # (_per_token_group_quant_8bit) have CUDA errors on SM90 when M (number of tokens) is
+    # small and a multiple of 4 (decode/extend batches). Use pure-PyTorch quantization
+    # for M <= 32 to avoid all kernel compatibility issues; performance impact is negligible
+    # because decode is memory-bandwidth-bound, not compute-bound.
+    _SMALL_M_THRESHOLD = 32
+    if (
+        not column_major_scales
+        and not scale_tma_aligned
+        and not scale_ue8m0
+        and x.shape[0] <= _SMALL_M_THRESHOLD
+    ):
+        return _per_token_group_quant_fp8_torch(x, group_size)
 
     if (
         _is_nvidia
