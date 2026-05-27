@@ -19,16 +19,16 @@ server:
     --max-model-len 1048576
     --hf-overrides '{"max_position_embeddings": 1048576}'
     --max-num-seqs 4
-    --gpu-memory-utilization 0.85
-    --disable-cuda-graph-padding
+    --gpu-memory-utilization 0.8
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
-    --quantization nvfp4
-    --kv-cache-dtype fp8
+    --kv-cache-dtype fp8_e4m3
+    --comm-fusion-max-num-tokens 4096
+    --kvstore-ratio 0.5
+    --disable-kvstore
     --speculative-algorithm MTP
     --speculative-num-steps 3
-    --drafter-attention-backend trtllm
     --enable-cache-report
     --weight-loader-prefetch-checkpoints
     --host 127.0.0.1
