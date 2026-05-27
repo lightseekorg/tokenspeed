@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +54,11 @@ class TreeNode {
 public:
     using children_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, TokenVecHash>;
     using timestamp_t = std::chrono::steady_clock::time_point;
+    // Monotonically increasing identifier assigned at construction. Used as a
+    // deterministic tiebreaker in eviction orderings whose primary key (Time())
+    // can repeat. Pointer values are not usable as a tiebreaker because they
+    // are randomized per-process and would diverge across TP ranks.
+    using seq_id_t = std::int64_t;
 
     explicit TreeNode(token_vec_t tokens = {}, timestamp_t access_time = std::chrono::steady_clock::now());
     ~TreeNode() = default;
@@ -77,6 +83,7 @@ public:
     const std::size_t NumChildren() const { return children_.size(); }
     const children_map_t& Children() const { return children_; }
     timestamp_t Time() const { return last_access_time_; }
+    seq_id_t SeqId() const { return seq_id_; }
 
     template <ResourceType RType>
     void AttachResource(std::unique_ptr<NodeResource<RType>>&& resource) {
@@ -143,12 +150,15 @@ private:
     std::vector<std::string> page_hashes_{};
     std::vector<std::uint64_t> block_hashes_{};
     timestamp_t last_access_time_{std::chrono::steady_clock::now()};
+    seq_id_t seq_id_{};
     bool storage_persisted_{false};
     std::unique_ptr<DeviceResource> device_resource_{};
     std::unique_ptr<HostResource> host_resource_{};
     std::unique_ptr<MambaSlot> mamba_slot_{};
     std::unique_ptr<MambaSlot> mamba_host_slot_{};
     std::unique_ptr<PagedCacheSnapshot> paged_cache_snapshot_{};
+
+    static std::atomic<seq_id_t> next_seq_id_;
 };
 
 template <ResourceType RType>

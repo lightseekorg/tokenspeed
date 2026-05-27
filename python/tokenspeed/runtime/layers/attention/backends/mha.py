@@ -330,16 +330,16 @@ class MHAAttnBackend(AttentionBackend):
         # uniform-stride prefill slot; plain decode uses the single-token slot.
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
         if q_len_per_req > 1:
-            return self.forward_extend(
+            return self._forward_extend(
                 q,
                 k,
                 v,
                 layer,
                 out_cache_loc,
                 token_to_kv_pool,
-                bs,
+                self.forward_prefill_metadata,
                 save_kv_cache=save_kv_cache,
-                **kwargs,
+                sinks=kwargs.get("sinks"),
             )
 
         has_kv = k is not None
@@ -405,11 +405,6 @@ class MHAAttnBackend(AttentionBackend):
             raise NotImplementedError("mha backend requires qk_head_dim == v_head_dim")
 
         metadata = self.forward_prefill_metadata
-        cu_seqlens_q = metadata.cu_seqlens_q
-        assert cu_seqlens_q is not None
-        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k = None if k is None else k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        v = None if v is None else v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         has_kv = k is not None
         if has_kv != (v is not None):
             raise ValueError("mha extend requires k and v to both be present or absent")
@@ -425,7 +420,6 @@ class MHAAttnBackend(AttentionBackend):
                         out_cache_loc,
                         token_to_kv_pool,
                         metadata,
-                        cu_seqlens_q,
                         save_kv_cache,
                         kwargs.get("sinks"),
                     )
@@ -438,7 +432,6 @@ class MHAAttnBackend(AttentionBackend):
                         out_cache_loc,
                         token_to_kv_pool,
                         metadata,
-                        cu_seqlens_q,
                         save_kv_cache,
                         kwargs.get("sinks"),
                     )
@@ -450,7 +443,6 @@ class MHAAttnBackend(AttentionBackend):
                 out_cache_loc,
                 token_to_kv_pool,
                 metadata,
-                cu_seqlens_q,
                 save_kv_cache,
                 kwargs.get("sinks"),
             )
@@ -463,7 +455,6 @@ class MHAAttnBackend(AttentionBackend):
                 out_cache_loc,
                 token_to_kv_pool,
                 metadata,
-                cu_seqlens_q,
                 save_kv_cache,
                 kwargs.get("sinks"),
             )
@@ -477,10 +468,14 @@ class MHAAttnBackend(AttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         metadata: MHAMetadata,
-        cu_seqlens_q: torch.Tensor,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        cu_seqlens_q = metadata.cu_seqlens_q
+        assert cu_seqlens_q is not None
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         result = mha_prefill(
             q=q,
             k=k,
@@ -517,12 +512,16 @@ class MHAAttnBackend(AttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         metadata: MHAMetadata,
-        cu_seqlens_q: torch.Tensor,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         assert metadata.prefix_seqlens_int32 is not None
         assert metadata.max_prefix_seq_len is not None
+        cu_seqlens_q = metadata.cu_seqlens_q
+        assert cu_seqlens_q is not None
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         chunk_result = mha_prefill(
             q=q,
@@ -584,10 +583,14 @@ class MHAAttnBackend(AttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         metadata: MHAMetadata,
-        cu_seqlens_q: torch.Tensor,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        cu_seqlens_q = metadata.cu_seqlens_q
+        assert cu_seqlens_q is not None
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = None if k is None else k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = None if v is None else v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         has_kv = k is not None
         if save_kv_cache and has_kv:
             token_to_kv_pool.set_kv_buffer(
@@ -598,6 +601,8 @@ class MHAAttnBackend(AttentionBackend):
                 layer.k_scale,
                 layer.v_scale,
             )
+        elif save_kv_cache:
+            raise ValueError("mha extend requires KV when save_kv_cache=True")
         elif has_kv:
             raise ValueError("mha_extend_with_kvcache requires KV to be prewritten")
 
@@ -610,6 +615,7 @@ class MHAAttnBackend(AttentionBackend):
             page_table=metadata.page_table,
             cache_seqlens=metadata.cache_seqlens_int32,
             softmax_scale=layer.scaling,
+            is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,

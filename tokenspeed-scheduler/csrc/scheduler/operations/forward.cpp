@@ -558,8 +558,17 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         if (req->Is<fsm::Retracted>()) return 4;
         return 9;
     };
-    std::sort(candidates.begin(), candidates.end(),
-              [&](const auto& a, const auto& b) { return priority(a) < priority(b); });
+    // TP-determinism: tie-break on Request::Id() so the relative order within a
+    // priority class is identical across ranks. requests_ is an unordered_map
+    // keyed by string id; libstdc++ randomizes string hashing per process, so
+    // without the tiebreaker each rank visits candidates in a different order
+    // and — when token_budget / page / mamba-slot constraints are tight — picks
+    // a different subset to schedule. That made forward_op None on some ranks
+    // and non-None on others, deadlocking the next NCCL collective.
+    std::sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
+        int pa = priority(a), pb = priority(b);
+        return pa != pb ? pa < pb : a->Id() < b->Id();
+    });
 
     std::vector<ForwardOperation> ops;
     std::int32_t token_budget = config_.max_scheduled_tokens;

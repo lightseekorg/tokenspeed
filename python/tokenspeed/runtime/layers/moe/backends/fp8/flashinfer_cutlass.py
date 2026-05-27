@@ -55,6 +55,25 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
             and spec.activation == "silu"
         )
 
+    @classmethod
+    def supports_single_gpu(cls, spec: MoELayerSpec, quant_config: object) -> bool:
+        """Like supports() but without the ep_size > 1 requirement.
+
+        Used when the backend is explicitly requested by the user rather than
+        auto-selected. The kernel handles ep_size=1 correctly via the
+        ``traits={"ep": False}`` path; the ep_size guard in supports() exists
+        only to keep Triton (faster at small batches in a CUDA graph) as the
+        auto default for single-GPU deployments.
+        """
+        platform = current_platform()
+        return (
+            platform.is_nvidia
+            and platform.arch_version.major >= 9
+            and isinstance(quant_config, Fp8Config)
+            and tuple(quant_config.weight_block_size or ()) == (128, 128)
+            and spec.activation == "silu"
+        )
+
     def create_layer_weights(
         self, layer: nn.Module, *, with_bias: bool = False
     ) -> None:
