@@ -333,7 +333,6 @@ class TestTritonSamplingDefault(unittest.TestCase):
 
         cases = (
             (None, 42, None),
-            ("greedy", 42, None),
             ("no_filter", 47, None),
             ("top_k_top_p", 17, set_top_k_top_p),
         )
@@ -378,7 +377,7 @@ class TestTritonSamplingDefault(unittest.TestCase):
             request_pool_indices=[1],
             sampling_params_list=[_sp("g", top_k=1, top_p=1.0)],
         )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "greedy")
+        self.assertEqual(backend.cuda_graph_replay_variant(), "top_k_top_p")
 
         backend.prepare_step(
             request_ids=["gv"],
@@ -428,7 +427,7 @@ class TestTritonSamplingDefault(unittest.TestCase):
         compact_backend = TritonSamplingBackend(_make_config())
         self.assertEqual(
             compact_backend.cuda_graph_capture_variants(num_tokens_per_req=1),
-            ("default", "greedy", "no_filter", "top_k_top_p"),
+            ("default", "no_filter", "top_k_top_p"),
         )
         self.assertEqual(
             compact_backend.cuda_graph_capture_variants(num_tokens_per_req=4),
@@ -448,7 +447,7 @@ class TestTritonSamplingDefault(unittest.TestCase):
         backend = TritonSamplingBackend(_make_config(vocab_size=151936))
         self.assertEqual(
             backend.cuda_graph_capture_variants(num_tokens_per_req=1),
-            ("default", "greedy", "no_filter", "top_k_top_p"),
+            ("default", "no_filter", "top_k_top_p"),
         )
         backend.prepare_step(
             request_ids=["p"],
