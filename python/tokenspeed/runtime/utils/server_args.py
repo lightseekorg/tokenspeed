@@ -356,6 +356,7 @@ class ServerArgs:
             gpu_mem = None
 
         # Set GPU memory utilization, which depends on the tensor parallelism size.
+        self._gpu_memory_utilization_defaulted = False
         if self.gpu_memory_utilization is None:
             if self.mapping.world_size >= 16:
                 self.gpu_memory_utilization = 0.79
@@ -367,6 +368,7 @@ class ServerArgs:
                 self.gpu_memory_utilization = 0.87
             else:
                 self.gpu_memory_utilization = 0.88
+            self._gpu_memory_utilization_defaulted = True
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:

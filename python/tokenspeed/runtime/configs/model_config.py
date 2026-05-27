@@ -160,7 +160,9 @@ class ModelConfig:
         self.is_audio_model = is_audio_model(self.hf_config.architectures)
 
         language_model_only = bool(getattr(server_args, "language_model_only", False))
-        if language_model_only:
+        # Target-only flag; never apply to draft / auxiliary checkpoints.
+        apply_language_model_only = language_model_only and not is_draft_worker
+        if apply_language_model_only:
             if not self.is_multimodal:
                 raise ValueError(
                     "--language-model-only requires a multimodal model checkpoint."
@@ -170,17 +172,21 @@ class ModelConfig:
                 "be skipped; requests with multimodal inputs will be rejected."
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
-        self.is_multimodal_active = self.is_multimodal and not language_model_only
-        self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
+        self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
         # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
         # needs headroom that the global default doesn't account for.
-        if self.is_multimodal_active and server_args.gpu_memory_utilization > 0.9:
+        if (
+            self.is_multimodal_active
+            and getattr(server_args, "_gpu_memory_utilization_defaulted", False)
+            and server_args.gpu_memory_utilization > 0.9
+        ):
             logger.info(
                 "Clamping gpu_memory_utilization %.2f -> 0.9 to leave headroom "
                 "for the vision encoder.",
                 server_args.gpu_memory_utilization,
             )
             server_args.gpu_memory_utilization = 0.9
+        self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
