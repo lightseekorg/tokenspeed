@@ -65,7 +65,6 @@ perf:
     --prompt "@${PROMPTS_DIR}/prompt_${len}.txt"
     --max-tokens 1024
     --min-tokens 1024
-    --tokenizer-path "$MODEL"
     --outputs-dir "$OUTPUTS_DIR/run${run}/${len}"
     --no-timestamp
     --extra-args '{"ignore_eos": true, "temperature": 0.0}';
