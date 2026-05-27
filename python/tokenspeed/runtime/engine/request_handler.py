@@ -192,10 +192,20 @@ class RequestHandler:
                     # Deferred: EventLoop kicks off bulk_retract_running() and
                     # sends PauseGenerationReqOutput when all requests are retracted.
                     self.retract_pending = True
-                else:
+                elif recv_req.mode in ("abort", "in_place"):
                     self.is_paused = True
                     self.send_func.send_pyobj(
                         PauseGenerationReqOutput(success=True, message="")
+                    )
+                else:
+                    self.send_func.send_pyobj(
+                        PauseGenerationReqOutput(
+                            success=False,
+                            message=(
+                                f"unknown pause mode {recv_req.mode!r}; "
+                                "expected one of 'abort', 'retract', 'in_place'"
+                            ),
+                        )
                     )
             elif isinstance(recv_req, ContinueGenerationReqInput):
                 self.is_paused = False

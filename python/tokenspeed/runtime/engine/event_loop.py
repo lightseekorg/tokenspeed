@@ -29,7 +29,7 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
-from tokenspeed_scheduler import PD, Cache, ExecutionEvent, Scheduler
+from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
@@ -808,6 +808,20 @@ class EventLoop:
             self.output_processor.mark_abort(rid)
             grammar_manager.mark_abort(rid)
 
+        # Eagerly push forward::Abort events to the C++ scheduler so KV pages
+        # are released even when a pause request in the same batch will
+        # suppress the next forward pass. In the unpaused path this is a
+        # small optimization (saves one wasted forward iteration for the
+        # aborted request); the scheduler treats Abort on an unknown rid as
+        # a no-op so double-firing via post_process_forward_op is safe.
+        if abort_rids:
+            ec = ExecutionEvent()
+            for rid in abort_rids:
+                ev = ForwardEvent.Abort()
+                ev.request_id = rid
+                ec.add_event(ev)
+            self.scheduler.advance(ec)
+
         # Partition new requests by grammar readiness. Compile-bound requests
         # are queued in GrammarManager and admitted in a later iteration when
         # their futures resolve (see _drain_ready_grammar_requests below).
@@ -1041,7 +1055,12 @@ class EventLoop:
                 self.scheduler.bulk_retract_running()
                 self._retracting = True
 
-            if self.request_handler.is_paused:
+            # Skip the iteration only when fully paused. While _retracting we
+            # must keep driving the loop so in-flight Prefilling requests can
+            # finish (their next_execution_plan-allocated pages need a real
+            # forward to be filled with valid KV), and so their PrefillDone
+            # transition flushes through _commit_forward_results → advance_forward.
+            if self.request_handler.is_paused and not self._retracting:
                 continue
 
             if self._retract_needs_clear:
@@ -1059,15 +1078,6 @@ class EventLoop:
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
-
-            if self._retracting:
-                # Re-run on each iteration to catch requests that completed prefill
-                # after the initial bulk_retract_running() call.
-                self.scheduler.bulk_retract_running()
-                if self._check_retract_complete():
-                    self._finish_retract()
-                self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
-                continue
 
             # DP sync: all ranks must participate even when idle.
             dp_metadata = None
@@ -1109,6 +1119,14 @@ class EventLoop:
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
                 self._publish_scheduler_kv_events()
+
+            # After commit_forward_results + advance_forward, any Prefilling
+            # request whose final chunk just landed is now PrefillDone. Catch
+            # it here before next_execution_plan could schedule it for decode.
+            if self._retracting:
+                self.scheduler.bulk_retract_running()
+                if self._check_retract_complete():
+                    self._finish_retract()
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
@@ -1187,7 +1205,11 @@ class EventLoop:
                 self.scheduler.bulk_retract_running()
                 self._retracting = True
 
-            if self.request_handler.is_paused:
+            # Skip only when fully paused. While _retracting we must keep
+            # driving forward passes so in-flight Prefilling requests can
+            # complete (their pages are already allocated; without forward
+            # they'd advance state without filling KV).
+            if self.request_handler.is_paused and not self._retracting:
                 if prev_results is not None:
                     request_changes = self._commit_forward_results(
                         prev_forward_op, prev_results
@@ -1215,14 +1237,6 @@ class EventLoop:
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
-
-            if self._retracting:
-                self.scheduler.bulk_retract_running()
-                if self._check_retract_complete():
-                    self._finish_retract()
-                self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
-                # prev_results cleared when retract_pending fired; nothing to dispatch.
-                continue
 
             grammar_inputs = None
             if forward_op is not None:
@@ -1309,6 +1323,14 @@ class EventLoop:
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
                 self._publish_scheduler_kv_events()
+
+            # After commit + advance, any Prefilling request that finished its
+            # last chunk is now PrefillDone. Catch it for retract before the
+            # next plan could schedule it for decode.
+            if self._retracting:
+                self.scheduler.bulk_retract_running()
+                if self._check_retract_complete():
+                    self._finish_retract()
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
