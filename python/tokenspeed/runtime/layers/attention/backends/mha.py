@@ -212,6 +212,11 @@ class MHAAttnBackend(AttentionBackend):
         scheduler metadata (only FA3 on Hopper does); the kernel then falls
         back to its internal prepare_varlen_num_blocks launch.
         """
+        # Only FA3 consumes the pre-computed metadata; triton/fa4/flashinfer
+        # reject it as an unknown kwarg. ``None`` solution means auto-select,
+        # which may land on FA3, so we still compute in that case.
+        if self.kernel_solution not in (None, "fa3"):
+            return None
         return mha_decode_scheduler_metadata(
             batch_size=bs,
             max_seqlen_q=1,
