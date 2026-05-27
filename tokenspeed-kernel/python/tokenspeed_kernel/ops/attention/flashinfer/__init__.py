@@ -247,9 +247,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset(
-                {True, False}
-            ),  # False: discard LSE, return tensor only
+            "return_lse": frozenset({True}),
         },
         tags={"throughput"},
     )
@@ -333,15 +331,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
         result = wrapper.run(
             q,
             (k_cache, v_cache),
-            return_lse=True,  # always compute LSE; caller discards if return_lse=False
+            return_lse=return_lse,
             window_left=window_left,
             sinks=sinks,
         )
 
         out, lse = result
-        if return_lse:
-            return out, lse / _FLASHINFER_LOG2_E
-        return out
+        return out, lse / _FLASHINFER_LOG2_E
 
     @register_kernel(
         "attention",
@@ -349,9 +345,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         name="flashinfer_trtllm_mha_extend_with_kvcache",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(
-                10, 0
-            ),  # TRTLLM FMHA runner requires Blackwell (SM100+)
+            min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={torch.float16, torch.bfloat16},
@@ -419,6 +413,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             window_left=window_left,
             sinks=sinks,
             out_dtype=q.dtype,
+            causal=is_causal,
         )
 
     @register_kernel(
