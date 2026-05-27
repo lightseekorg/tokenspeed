@@ -252,9 +252,7 @@ class MemoryExecutor:
             groups[kind] = (src_pages, dst_pages)
         return groups
 
-    def submit_plan(
-        self, plan, producer_stream=None, mamba_layerwise_cow=None
-    ) -> None:
+    def submit_plan(self, plan, producer_stream=None, mamba_layerwise_cow=None) -> None:
         if plan.cache:
             logger.debug("[cache_op] submit_plan: %s cache ops", len(plan.cache))
         for op in plan.cache:
