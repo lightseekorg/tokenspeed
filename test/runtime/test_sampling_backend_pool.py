@@ -333,7 +333,7 @@ class TestTritonSamplingDefault(unittest.TestCase):
 
         cases = (
             (None, 42, None),
-            ("greedy", 43, None),
+            ("greedy", 42, None),
             ("no_filter", 47, None),
             ("top_k_top_p", 17, set_top_k_top_p),
         )

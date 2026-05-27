@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.sampling.probability import (
 )
 from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
+    greedy_sample_from_pools,
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     sample_rejection_from_pools,
@@ -197,6 +198,11 @@ class TritonSamplingBackend(SamplingBackend):
             device=config.device,
         )
         self._gumbel_local_scores = torch.empty(
+            (config.max_bs, gumbel_blocks),
+            dtype=torch.float32,
+            device=config.device,
+        )
+        self._greedy_local_maxes = torch.empty(
             (config.max_bs, gumbel_blocks),
             dtype=torch.float32,
             device=config.device,
@@ -416,7 +422,17 @@ class TritonSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            batch_next_token_ids = cute_argmax(logits)
+            bs = logits.shape[0]
+            batch_next_token_ids = greedy_sample_from_pools(
+                logits,
+                sampling_info.req_pool_indices,
+                self._seed_pool,
+                sampling_info.valid_cache_lengths,
+                self._gumbel_local_ids[:bs],
+                self._greedy_local_maxes[:bs],
+                self._gumbel_local_scores[:bs],
+                self._gumbel_out[:bs],
+            )
 
         else:
 
