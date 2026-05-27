@@ -181,6 +181,12 @@ class RequestHandler:
                 self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
             elif isinstance(recv_req, ReleaseMemoryOccupationReqInput):
                 self.memory_saver.pause()
+                # Return cached-but-unused blocks held by the PyTorch caching
+                # allocator and release NCCL/IPC handles. Without these the
+                # driver still sees those pages as ours, so co-tenants can't
+                # use the headroom that pause() just freed.
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
                 self.send_func.send_pyobj(ReleaseMemoryOccupationReqOutput())
             elif isinstance(recv_req, ResumeMemoryOccupationReqInput):
                 self.memory_saver.resume()
