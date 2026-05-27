@@ -34,7 +34,7 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
+from tokenspeed.runtime.sampling.utils import nan_guard_logits, write_output_logprobs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -185,9 +185,8 @@ class GreedySamplingBackend(SamplingBackend):
         self.maybe_broadcast(tokens)
 
         if self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, tokens
-            )
+
+            write_output_logprobs(logits_output, logits, tokens)
 
         return tokens, self._ones_buf[:bs]
 
@@ -209,8 +208,9 @@ class GreedySamplingBackend(SamplingBackend):
             .fill_(-1)
         )
         accept_length = self._accept_length_buf[:bs]
-
-        logits = logits_output.next_token_logits
+        logits = nan_guard_logits(
+            logits_output.next_token_logits, self.config.enable_nan_detection
+        )
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
@@ -242,9 +242,8 @@ class GreedySamplingBackend(SamplingBackend):
         self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, predict
-            )
+
+            write_output_logprobs(logits_output, logits, predict)
 
         return predict, accept_length
 

@@ -523,6 +523,39 @@ class TestTritonSamplingDefault(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not select a sampling mode"):
             backend.sample(logits_output, self._sampling_info([1]))
 
+    def test_verify_nan_guard_keeps_greedy_tokens_valid(self):
+        vocab_size = 151936
+        backend = TritonSamplingBackend(_make_config(vocab_size=vocab_size))
+        backend.prepare_step(
+            request_ids=["mtp"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("mtp", top_k=1, top_p=1.0)],
+            num_tokens_per_req=4,
+        )
+        logits = torch.full(
+            (4, vocab_size),
+            float("nan"),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+        candidates = torch.zeros((1, 4), dtype=torch.int32, device="cuda")
+
+        predict, accept_lengths = backend.verify(
+            logits_output,
+            self._sampling_info([1], is_all_greedy=True),
+            candidates,
+        )
+
+        self.assertEqual(accept_lengths.tolist(), [4])
+        accepted = predict[: accept_lengths.item()]
+        self.assertTrue(torch.all(accepted >= 0).item())
+        self.assertTrue(torch.all(accepted < vocab_size).item())
+        self.assertFalse(torch.isnan(logits).any().item())
+
 
 class TestTritonFullFlipExtended(unittest.TestCase):
     """Full backend extends flip behavior with penalty scalars, count rows,

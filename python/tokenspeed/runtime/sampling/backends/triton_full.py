@@ -360,6 +360,9 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             .fill_(-1)
         )
         accept_length = self._accept_length_buf[:bs]
+        logits = nan_guard_logits(
+            logits_output.next_token_logits, self.config.enable_nan_detection
+        )
 
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection

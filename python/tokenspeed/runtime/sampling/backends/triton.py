@@ -533,20 +533,21 @@ class TritonSamplingBackend(SamplingBackend):
             .fill_(-1)
         )
         accept_length = self._accept_length_buf[:bs]
+        logits = nan_guard_logits(
+            logits_output.next_token_logits, self.config.enable_nan_detection
+        )
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
-                logits=logits_output.next_token_logits,
+                logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
 
         if sampling_info.is_all_greedy:
 
-            target_predict = cute_argmax(logits_output.next_token_logits).reshape(
-                bs, num_tokens_per_req
-            )
+            target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
 
             verify_chain_greedy(
                 predicts=predict,
@@ -574,7 +575,7 @@ class TritonSamplingBackend(SamplingBackend):
             )
 
             target_probs = build_top_k_top_p_probs_from_logits(
-                logits_output.next_token_logits,
+                logits,
                 temperatures,
                 top_ks,
                 top_ps,
@@ -604,9 +605,7 @@ class TritonSamplingBackend(SamplingBackend):
 
         if self.config.enable_output_logprobs:
 
-            write_output_logprobs(
-                logits_output, logits_output.next_token_logits, predict
-            )
+            write_output_logprobs(logits_output, logits, predict)
 
         return predict, accept_length
 
