@@ -446,16 +446,24 @@ async def flush_cache():
     return Response(status_code=200)
 
 
+# Per-call timeout for the release/resume fan-out. release_memory_occupation
+# with stage_to_cpu=true on a 72B-class model takes ~6-10 s of host-side
+# memcpy, so we want a generous-but-bounded ceiling — a wedged backend must
+# not hang the orchestrator forever. Override at import time for tests.
+_FANOUT_TIMEOUT_SECONDS: float = 120.0
+
+
 async def _broadcast_memory_control(endpoint: str, body: dict | None = None):
     """POST ``endpoint`` to every prefill + decode server in parallel.
 
-    Raises ``HTTPException(502)`` when any backend errors out or replies
-    non-2xx — otherwise the orchestrator would see ``200`` even though some
-    nodes (e.g. an older server without the new endpoint) silently skipped
-    the release/resume.
+    Raises ``HTTPException(502)`` when any backend errors out, times out, or
+    replies non-2xx — otherwise the orchestrator would see ``200`` even
+    though some nodes (e.g. an older server without the new endpoint, or a
+    wedged one that never finishes) silently skipped the release/resume.
     """
     targets = list(chain(load_balancer.prefill_servers, load_balancer.decode_servers))
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=_FANOUT_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         results = await asyncio.gather(
             *(session.post(f"{srv}{endpoint}", json=body) for srv in targets),
             return_exceptions=True,
@@ -469,8 +477,11 @@ async def _broadcast_memory_control(endpoint: str, body: dict | None = None):
             try:
                 if result.status >= 400:
                     # Cap the body so a misbehaving node can't dump megabytes
-                    # into our response.
-                    detail = (await result.text())[:500]
+                    # into our response, and decode defensively so a backend
+                    # that returns binary / non-UTF-8 bytes on error doesn't
+                    # propagate a UnicodeDecodeError out of the helper.
+                    raw = await result.read()
+                    detail = raw[:500].decode("utf-8", errors="replace")
                     failures.append(
                         {"server": srv, "status": result.status, "detail": detail}
                     )
