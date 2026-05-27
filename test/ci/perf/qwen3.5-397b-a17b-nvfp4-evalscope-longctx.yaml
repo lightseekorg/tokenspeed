@@ -1,3 +1,6 @@
+# NOTE: For the current version, the model's config.json must have
+#       max_position_embeddings set to 1048576 to prevent a potential
+#       index error in RoPE computation.
 api_version: ci.tokenspeed.io/v1
 name: perf-qwen3.5-397b-a17b-nvfp4-longctx
 type: perf
@@ -16,7 +19,7 @@ server:
     --model nvidia/Qwen3.5-397B-A17B-NVFP4
     --attn-tp-size 8
     --moe-tp-size 8
-    --max-model-len 1100000
+    --max-model-len 1048576
     --max-num-seqs 4
     --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
