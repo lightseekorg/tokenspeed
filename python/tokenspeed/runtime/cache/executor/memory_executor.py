@@ -252,15 +252,16 @@ class MemoryExecutor:
             groups[kind] = (src_pages, dst_pages)
         return groups
 
-    def submit_plan(self, plan, producer_stream=None) -> None:
+    def submit_plan(
+        self, plan, producer_stream=None, mamba_layerwise_cow=None
+    ) -> None:
         if plan.cache:
             logger.debug("[cache_op] submit_plan: %s cache ops", len(plan.cache))
-        self.host_exec.fence_writeback_after(producer_stream)
         for op in plan.cache:
-            self.submit(op)
+            self.submit(op, mamba_layerwise_cow=mamba_layerwise_cow)
         self.host_exec.flush()
 
-    def submit(self, op) -> None:
+    def submit(self, op, mamba_layerwise_cow=None) -> None:
         if isinstance(op, Cache.WriteBackOp):
             logger.debug(
                 "[cache_op] writeback op_id=%s src_pages=%s dst_pages=%s",
@@ -329,8 +330,13 @@ class MemoryExecutor:
                             src_pages[:8],
                             dst_pages[:8],
                         )
+                    loadback_kwargs = {}
+                    if kind == CacheKind.MAMBA and mamba_layerwise_cow:
+                        loadback_kwargs["layerwise_cow_dst_pages_by_src"] = (
+                            mamba_layerwise_cow
+                        )
                     self.host_exec.enqueue_loadback(
-                        op_id, src_pages, dst_pages, kind=kind
+                        op_id, src_pages, dst_pages, kind=kind, **loadback_kwargs
                     )
 
         elif isinstance(op, Cache.PrefetchOp):
