@@ -39,22 +39,7 @@ __all__ = [
     "triton_forward",
 ]
 
-try:
-    __import__("triton.tools.tensor_descriptor")
-    _support_tensor_descriptor = True
-except Exception:
-    _support_tensor_descriptor = False
-
 padding_size = 128 if envs.TOKENSPEED_MOE_PADDING.get() else 0
-
-
-def support_tensor_descriptor():
-    return _support_tensor_descriptor
-
-
-@functools.lru_cache
-def _moe_use_tma():
-    return _support_tensor_descriptor
 
 
 def build_triton_gemms(
@@ -156,12 +141,8 @@ def triton_forward(
 
     config, (down_config, _max_block_m) = get_config_func(M=m_tokens)
 
-    gate_up_moe_use_tma = (
-        _moe_use_tma() and config is not None and config.pop("USE_TMA", False)
-    )
-    down_moe_use_tma = (
-        _moe_use_tma() and down_config is not None and down_config.pop("USE_TMA", False)
-    )
+    gate_up_moe_use_tma = config is not None and config.pop("USE_TMA", False)
+    down_moe_use_tma = down_config is not None and down_config.pop("USE_TMA", False)
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = (
         tokenspeed_kernel.moe_dispatch(
