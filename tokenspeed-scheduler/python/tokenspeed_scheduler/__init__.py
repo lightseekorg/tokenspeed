@@ -27,22 +27,15 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
     ExecutionPlan,
     PagedCacheGroupAllocator,
     PagedCacheGroupConfig,
+    PagedCacheGroupFamily,
     PagedCacheGroupTable,
     PagedCacheRetention,
+    PrefixCacheAdjunctSpec,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
     SchedulerStats,
 )
-
-try:
-    from tokenspeed_scheduler.tokenspeed_scheduler_ext import (
-        PagedCacheGroupFamily,
-        PrefixCacheAdjunctSpec,
-    )
-except ImportError:
-    PagedCacheGroupFamily = None  # type: ignore[assignment,misc]
-    PrefixCacheAdjunctSpec = None  # type: ignore[assignment,misc]
 
 PD = _ext.PD
 Cache = _ext.Cache
