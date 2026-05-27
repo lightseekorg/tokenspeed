@@ -72,9 +72,14 @@ class MHAMetadata:
 class MHAAttnBackend(AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
-    @property
-    def support_kv_cache_prewrite(self) -> bool:
-        return False
+    def support_kv_cache_prewrite(
+        self, forward_mode: ForwardMode | None = None
+    ) -> bool:
+        return (
+            forward_mode is not None
+            and forward_mode.is_decode()
+            and self.mha_extend_mode == "ragged"
+        )
 
     def __init__(self, config: MHAConfig):
         super().__init__(config)
@@ -83,6 +88,8 @@ class MHAAttnBackend(AttentionBackend):
             raise ValueError(f"Unsupported MHA backend: {backend_name!r}")
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
         self.mha_extend_mode = global_server_args_dict.get("mha_extend_mode", "paged")
+        if not global_server_args_dict.get("enable_prefix_caching", True):
+            self.mha_extend_mode = "ragged"
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = (

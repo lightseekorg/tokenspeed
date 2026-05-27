@@ -60,8 +60,9 @@ class AttentionBackend(ABC):
         """
         yield
 
-    @property
-    def support_kv_cache_prewrite(self) -> bool:
+    def support_kv_cache_prewrite(
+        self, forward_mode: ForwardMode | None = None
+    ) -> bool:
         return False
 
     @property
