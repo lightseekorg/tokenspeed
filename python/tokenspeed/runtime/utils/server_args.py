@@ -1315,8 +1315,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dp_sampling_min_bs,
             help="Minimum effective decode batch for Batch-DP spec-verify. "
-            "Defaults to 2 * TP size. "
-            "Override at runtime with TOKENSPEED_DP_SAMPLING_MIN_BS.",
+            "Defaults to 2 * TP size.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",

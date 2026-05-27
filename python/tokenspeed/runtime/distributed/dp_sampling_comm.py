@@ -37,7 +37,6 @@ accept_length_full[pad_bs].
 
 from __future__ import annotations
 
-import os
 from typing import Literal
 
 import torch
@@ -55,6 +54,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import envs
 
 try:
     from tokenspeed_kernel.ops.communication.dp_sampling import (
@@ -80,7 +80,7 @@ ENV_VAR = "TOKENSPEED_DP_SAMPLING_BACKEND"
 
 
 def _env_override() -> DpSamplingBackend | None:
-    val = os.environ.get(ENV_VAR)
+    val = envs.TOKENSPEED_DP_SAMPLING_BACKEND.get()
     if val in ("auto", "nccl", "onesided"):
         return val  # type: ignore[return-value]
     if val is not None:
@@ -245,6 +245,8 @@ class DpSamplingComm:
     def prepare_verify_outputs(self, logits_dtype: torch.dtype) -> None:
         """Initialize one-sided state for verify-only DP sampling routes."""
         if self._backend == "onesided":
+            if self._state is not None:
+                return
             self._ensure_onesided_state(logits_dtype)
 
     def swap_batch_vocab(

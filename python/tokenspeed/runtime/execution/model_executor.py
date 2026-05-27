@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -291,46 +290,40 @@ class ModelExecutor:
             )
 
         processor = self.model_runner.model.logits_processor
-        lm_head = getattr(self.model_runner.model, "lm_head", None)
         backend_supports_dp = bool(
             getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
         )
-        lm_head_supports_dp = processor.supports_dp_sampling_lm_head(lm_head)
         self.dp_sampling_min_bs = resolve_dp_sampling_min_bs(
             processor.tp_size, self.config.dp_sampling_min_bs
         )
         infra_supports_dp = (
             self.drafter is not None
             and backend_supports_dp
-            and lm_head_supports_dp
             and processor.tp_size > 1
             and processor.tp_group is not None
         )
 
-        dp_mode = os.environ.get(
-            "TOKENSPEED_DP_SAMPLING",
-            "on" if self.config.dp_sampling else "off",
-        ).lower()
-        if dp_mode not in {"auto", "on", "off"}:
-            raise ValueError(
-                f"TOKENSPEED_DP_SAMPLING must be one of "
-                f"{{auto, on, off}}, got {dp_mode!r}"
-            )
-        if dp_mode == "on" and not infra_supports_dp:
+        if self.config.dp_sampling and not infra_supports_dp:
             raise RuntimeError(
-                "TOKENSPEED_DP_SAMPLING=on but Batch-DP spec-verify "
+                "--dp-sampling was set but Batch-DP spec-verify "
                 "preconditions are not met: "
                 f"drafter={self.drafter is not None}, "
                 f"backend_supports_dp_verify={backend_supports_dp}, "
-                f"lm_head_supports_dp={lm_head_supports_dp}, "
                 f"processor.tp_size={processor.tp_size}, "
                 f"processor.tp_group_set={processor.tp_group is not None}"
             )
 
-        self.dp_sampling_enabled = infra_supports_dp and dp_mode in {"auto", "on"}
+        self.dp_sampling_enabled = infra_supports_dp and self.config.dp_sampling
         if self.dp_sampling_enabled:
-            dp_vocab_size = processor.dp_sampling_lm_head_vocab_size(
-                lm_head, processor.tp_size
+            lm_head = self.model_runner.model.lm_head
+            weight = lm_head.weight
+            if weight.ndim < 1:
+                raise RuntimeError(
+                    f"dp_sampling LM head weight must be at least 1D, "
+                    f"got {weight.ndim}D"
+                )
+            dp_vocab_size = int(weight.shape[0]) * (
+                1 if processor.skip_all_gather else processor.tp_size
             )
             configure_dp_vocab = getattr(
                 self.sampling_backend, "configure_dp_sampling_vocab_size", None
@@ -338,21 +331,19 @@ class ModelExecutor:
             if configure_dp_vocab is not None:
                 configure_dp_vocab(dp_vocab_size)
             processor.configure_dp_sampling(
-                lm_head=lm_head,
                 dp_num_tokens_per_req=spec_num_tokens,
                 dp_comm=self.sampling_backend._dp_comm,
             )
         logger.info(
-            "Batch-DP spec-verify: mode=%s, infra_supports=%s, enabled=%s "
+            "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
             "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
-            "lm_head_supports_dp=%s, tp_size=%s, tp_group=%s)",
-            dp_mode,
+            "tp_size=%s, tp_group=%s)",
+            self.config.dp_sampling,
             infra_supports_dp,
             self.dp_sampling_enabled,
             self.dp_sampling_min_bs,
             self.drafter is not None,
             backend_supports_dp,
-            lm_head_supports_dp,
             processor.tp_size,
             processor.tp_group is not None,
         )

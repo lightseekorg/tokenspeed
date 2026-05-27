@@ -182,6 +182,7 @@ def _test_verify_dp_matches_today(
     is_all_greedy: bool,
     dtype,
     enable_output_logprobs: bool = False,
+    forbid_global_logprob_writer: bool = False,
 ):
     tp_size = world_size
     pad_bs = ((bs + tp_size - 1) // tp_size) * tp_size
@@ -240,7 +241,25 @@ def _test_verify_dp_matches_today(
     ].clone()
     dp_in = _StubOutput()
     dp_in.next_token_logits = local_logits
-    predict_dp, accept_length_dp = backend.verify(dp_in, sampling_info_dp, candidates)
+    if forbid_global_logprob_writer:
+        import tokenspeed.runtime.sampling.backends.flashinfer as flashinfer_backend
+
+        original_writer = flashinfer_backend.write_output_logprobs
+
+        def _fail_global_writer(*args, **kwargs):
+            raise AssertionError("DP verify must not call write_output_logprobs")
+
+        flashinfer_backend.write_output_logprobs = _fail_global_writer
+        try:
+            predict_dp, accept_length_dp = backend.verify(
+                dp_in, sampling_info_dp, candidates
+            )
+        finally:
+            flashinfer_backend.write_output_logprobs = original_writer
+    else:
+        predict_dp, accept_length_dp = backend.verify(
+            dp_in, sampling_info_dp, candidates
+        )
 
     torch.testing.assert_close(predict_dp, predict_full, rtol=0, atol=0)
     torch.testing.assert_close(accept_length_dp, accept_length_full, rtol=0, atol=0)
@@ -340,4 +359,5 @@ class TestFlashInferVerifyDP:
             is_all_greedy=True,
             dtype=torch.float32,
             enable_output_logprobs=True,
+            forbid_global_logprob_writer=True,
         )

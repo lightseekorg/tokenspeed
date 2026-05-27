@@ -213,36 +213,12 @@ class LogitsProcessor(nn.Module):
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
 
-    @staticmethod
-    def supports_dp_sampling_lm_head(lm_head) -> bool:
-        return hasattr(lm_head, "weight")
-
-    @staticmethod
-    def dp_sampling_lm_head_vocab_size(lm_head, tp_size: int) -> int:
-        LogitsProcessor.validate_dp_sampling_lm_head(lm_head)
-        weight = lm_head.weight
-        if weight.ndim < 1:
-            raise RuntimeError(
-                f"dp_sampling LM head weight must be at least 1D, got {weight.ndim}D"
-            )
-        return int(weight.shape[0]) * tp_size
-
-    @staticmethod
-    def validate_dp_sampling_lm_head(lm_head) -> None:
-        if not LogitsProcessor.supports_dp_sampling_lm_head(lm_head):
-            raise RuntimeError(
-                "dp_sampling requires a standard LM head with .weight; "
-                "GGUF linear_method is not supported on this path"
-            )
-
     def configure_dp_sampling(
         self,
         *,
-        lm_head,
         dp_num_tokens_per_req: int,
         dp_comm,
     ) -> None:
-        self.validate_dp_sampling_lm_head(lm_head)
         self.dp_sampling_enabled = True
         self.dp_num_tokens_per_req = dp_num_tokens_per_req
         self._dp_comm = dp_comm

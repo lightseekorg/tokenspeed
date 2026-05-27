@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import bisect
 import gc
-import os
 import queue
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -56,17 +55,16 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _is_capture_mode = False
-_DP_SAMPLING_MIN_BS_ENV = "TOKENSPEED_DP_SAMPLING_MIN_BS"
 
 
-def resolve_dp_sampling_min_bs(tp_size: int, configured_min_bs: int | None) -> int:
-    env_value = os.environ.get(_DP_SAMPLING_MIN_BS_ENV)
-    if env_value is not None:
-        try:
-            min_bs = int(env_value)
-        except ValueError as exc:
-            raise ValueError(f"{_DP_SAMPLING_MIN_BS_ENV} must be an integer") from exc
-    elif configured_min_bs is not None:
+def resolve_dp_sampling_min_bs(
+    tp_size: int,
+    configured_min_bs: int | None,
+    *,
+    num_tokens_per_req: int | None = None,
+    pdl_enabled: bool | None = None,
+) -> int:
+    if configured_min_bs is not None:
         min_bs = int(configured_min_bs)
     else:
         min_bs = 2 * tp_size

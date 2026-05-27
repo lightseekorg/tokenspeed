@@ -542,6 +542,71 @@ def _test_onesided_gather_lazy_init_without_swap(
         torch.testing.assert_close(actual, expected)
 
 
+def _test_onesided_prepare_after_swap_keeps_comm_dtype(
+    rank, world_size, device, group, *, pad_bs, n, vocab, dtype
+):
+    tp = world_size
+    v_local = vocab // tp
+    reqs_per_rank = pad_bs // tp
+
+    full = _ground_truth_full_logits(pad_bs, n, vocab, dtype=dtype, device=device)
+    local_logits = full[:, rank * v_local : (rank + 1) * v_local].contiguous()
+
+    nccl_comm = _build_comm(
+        rank,
+        world_size,
+        group,
+        pad_bs=pad_bs,
+        n=n,
+        vocab=vocab,
+        dtype=dtype,
+        backend="nccl",
+    )
+    onesided_comm = _build_comm(
+        rank,
+        world_size,
+        group,
+        pad_bs=pad_bs,
+        n=n,
+        vocab=vocab,
+        dtype=None,
+        backend="onesided",
+    )
+
+    torch.testing.assert_close(
+        onesided_comm.swap_batch_vocab(local_logits, pad_bs=pad_bs),
+        nccl_comm.swap_batch_vocab(local_logits, pad_bs=pad_bs),
+    )
+
+    # LogitsProcessor converts sampled logits to fp32 after the DP swap. Verify
+    # gather should reuse the existing one-sided state instead of re-preparing it
+    # with that post-conversion dtype.
+    onesided_comm.prepare_verify_outputs(torch.float32)
+
+    predict_local = torch.arange(
+        rank * reqs_per_rank * n,
+        (rank + 1) * reqs_per_rank * n,
+        dtype=torch.int32,
+        device=device,
+    ).view(reqs_per_rank, n)
+    accept_index_local = (predict_local * 5 + 13).contiguous()
+    accept_length_local = torch.arange(
+        rank * reqs_per_rank,
+        (rank + 1) * reqs_per_rank,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    onesided_outputs = onesided_comm.gather_verify_outputs(
+        predict_local, accept_index_local, accept_length_local, pad_bs=pad_bs
+    )
+    nccl_outputs = nccl_comm.gather_verify_outputs(
+        predict_local, accept_index_local, accept_length_local, pad_bs=pad_bs
+    )
+    for actual, expected in zip(onesided_outputs, nccl_outputs, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
 WORLD_SIZES = [
     pytest.param(2, id="tp2"),
 ]
@@ -690,5 +755,30 @@ class TestDpSamplingComm:
             _test_onesided_gather_lazy_init_without_swap,
             pad_bs=pad_bs,
             n=n,
+            dtype=dtype,
+        )
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    @pytest.mark.parametrize("pad_bs,n,vocab", SHAPES)
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            pytest.param(torch.bfloat16, id="bf16"),
+            pytest.param(torch.float16, id="fp16"),
+        ],
+    )
+    def test_onesided_prepare_after_swap_keeps_comm_dtype(
+        self, world_size, pad_bs, n, vocab, dtype
+    ):
+        if pad_bs % world_size != 0 or vocab % world_size != 0:
+            pytest.skip("shape not divisible by tp")
+        if not _onesided_available_for_test(tuple(range(world_size))):
+            pytest.skip("one-sided dp-sampling backend is not available")
+        _run(
+            world_size,
+            _test_onesided_prepare_after_swap_keeps_comm_dtype,
+            pad_bs=pad_bs,
+            n=n,
+            vocab=vocab,
             dtype=dtype,
         )

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
@@ -58,22 +57,14 @@ def test_dp_sampling_default_threshold_covers_two_local_requests():
     )
 
 
-def test_dp_sampling_lm_head_capability_check():
-    assert LogitsProcessor.supports_dp_sampling_lm_head(
-        SimpleNamespace(weight=torch.empty(1, 1))
-    )
-    assert not LogitsProcessor.supports_dp_sampling_lm_head(
-        SimpleNamespace(linear_method=object())
-    )
+def test_dp_sampling_min_bs_ignores_env_override(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_DP_SAMPLING_MIN_BS", "16")
+
+    assert resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=None) == 8
+    assert resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=12) == 12
 
 
-def test_dp_sampling_lm_head_vocab_size_uses_padded_local_weight():
-    lm_head = SimpleNamespace(weight=torch.empty(16032, 16))
-
-    assert LogitsProcessor.dp_sampling_lm_head_vocab_size(lm_head, tp_size=2) == 32064
-
-
-def test_configure_dp_sampling_validates_lm_head_before_runtime():
+def test_configure_dp_sampling_sets_state():
     processor = LogitsProcessor(
         SimpleNamespace(vocab_size=7, model_type="unit_test"),
         tp_rank=0,
@@ -81,16 +72,7 @@ def test_configure_dp_sampling_validates_lm_head_before_runtime():
         tp_group=(0, 1, 2, 3),
     )
 
-    with pytest.raises(RuntimeError, match="standard LM head"):
-        processor.configure_dp_sampling(
-            lm_head=SimpleNamespace(linear_method=object()),
-            dp_num_tokens_per_req=6,
-            dp_comm=None,
-        )
-    assert not processor.dp_sampling_enabled
-
     processor.configure_dp_sampling(
-        lm_head=SimpleNamespace(weight=torch.empty(7, 3)),
         dp_num_tokens_per_req=6,
         dp_comm=None,
     )
