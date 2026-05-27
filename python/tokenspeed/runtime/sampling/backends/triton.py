@@ -51,8 +51,10 @@ _TRITON_GUMBEL_MODE_NONE = 0
 _TRITON_GUMBEL_MODE_NO_FILTER = 1
 _TRITON_GUMBEL_MODE_TOP_K_TOP_P = 2
 _TRITON_GUMBEL_MODE_GENERIC_REJECTION = 3
+_TRITON_GUMBEL_MODE_GREEDY = 4
 _TOP_P_REJECTION_TRIES = 4
 _CUDA_GRAPH_VARIANT_DEFAULT = "default"
+_CUDA_GRAPH_VARIANT_GREEDY = "greedy"
 _CUDA_GRAPH_VARIANT_NO_FILTER = "no_filter"
 _CUDA_GRAPH_VARIANT_TOP_K_TOP_P = "top_k_top_p"
 
@@ -266,9 +268,13 @@ class TritonSamplingBackend(SamplingBackend):
         sampling_params_list: list[SamplingParams],
         num_tokens_per_req: int,
     ) -> int:
-        if num_tokens_per_req != 1 or len(sampling_params_list) == 0:
+        if len(sampling_params_list) == 0:
             return _TRITON_GUMBEL_MODE_NONE
         top_ks = [int(sp.top_k) for sp in sampling_params_list]
+        if all(top_k <= 1 for top_k in top_ks):
+            return _TRITON_GUMBEL_MODE_GREEDY
+        if num_tokens_per_req != 1:
+            return _TRITON_GUMBEL_MODE_NONE
         top_ps = [float(sp.top_p) for sp in sampling_params_list]
         if all(top_k == _TOP_K_DISABLED for top_k in top_ks):
             if all(abs(top_p - 1.0) <= _SAMPLING_EPS for top_p in top_ps):
@@ -306,18 +312,29 @@ class TritonSamplingBackend(SamplingBackend):
         if not self.config.enable_output_logprobs and num_tokens_per_req == 1:
             variants = (
                 _CUDA_GRAPH_VARIANT_DEFAULT,
+                _CUDA_GRAPH_VARIANT_GREEDY,
                 _CUDA_GRAPH_VARIANT_NO_FILTER,
                 _CUDA_GRAPH_VARIANT_TOP_K_TOP_P,
             )
             return variants
-        return (_CUDA_GRAPH_VARIANT_DEFAULT,)
+        return (_CUDA_GRAPH_VARIANT_DEFAULT, _CUDA_GRAPH_VARIANT_GREEDY)
 
     def cuda_graph_replay_variant(self) -> str:
+        if self._step_triton_gumbel_mode == _TRITON_GUMBEL_MODE_GREEDY:
+            return _CUDA_GRAPH_VARIANT_GREEDY
         if self._step_triton_gumbel_mode == _TRITON_GUMBEL_MODE_NO_FILTER:
             return _CUDA_GRAPH_VARIANT_NO_FILTER
         if self._step_triton_gumbel_mode == _TRITON_GUMBEL_MODE_TOP_K_TOP_P:
             return _CUDA_GRAPH_VARIANT_TOP_K_TOP_P
         return _CUDA_GRAPH_VARIANT_DEFAULT
+
+    def cuda_graph_capture_is_all_greedy(
+        self,
+        capture_variant: str,
+        num_tokens_per_req: int = 1,
+    ) -> bool:
+        _ = num_tokens_per_req
+        return capture_variant == _CUDA_GRAPH_VARIANT_GREEDY
 
     def prepare_capture(
         self,
@@ -325,7 +342,9 @@ class TritonSamplingBackend(SamplingBackend):
         num_tokens_per_req: int = 1,
         capture_variant: str | None = None,
     ) -> None:
-        if num_tokens_per_req == 1:
+        if capture_variant == _CUDA_GRAPH_VARIANT_GREEDY:
+            self._step_triton_gumbel_mode = _TRITON_GUMBEL_MODE_GREEDY
+        elif num_tokens_per_req == 1:
             if capture_variant == _CUDA_GRAPH_VARIANT_NO_FILTER:
                 self._step_triton_gumbel_mode = _TRITON_GUMBEL_MODE_NO_FILTER
             elif capture_variant == _CUDA_GRAPH_VARIANT_TOP_K_TOP_P:

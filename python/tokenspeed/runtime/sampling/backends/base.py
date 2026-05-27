@@ -233,6 +233,20 @@ class SamplingBackend(ABC):
         """CUDA graph sampler variant to replay for the already-prepared step."""
         return "default"
 
+    def cuda_graph_capture_is_all_greedy(
+        self,
+        capture_variant: str,
+        num_tokens_per_req: int = 1,
+    ) -> bool:
+        """Whether a capture variant should record the greedy sampler path.
+
+        Most backends only capture stochastic/default graphs. Backends with a
+        dedicated greedy graph override this so CudaGraphWrapper can bind
+        SamplingBatchInfo.is_all_greedy=True during capture.
+        """
+        _ = capture_variant, num_tokens_per_req
+        return False
+
     def _prepare_step_hook(
         self,
         num_tokens_per_req: int,

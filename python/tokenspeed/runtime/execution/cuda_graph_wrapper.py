@@ -367,9 +367,19 @@ class CudaGraphWrapper:
             # NaN draft logits -> accept_rate 0. Set the matching uniform dummy.
             ctx.global_bs = [bs] * self.world_size
 
-        # Capture with is_all_greedy=False so sampler variants record their
-        # stochastic logits-to-token path. is_all_greedy=True at capture would
-        # freeze the graph into argmax and bypass per-request seeding at replay.
+        capture_is_all_greedy = (
+            self.sampling_backend.cuda_graph_capture_is_all_greedy(
+                graph_variant,
+                self.max_tokens_per_req,
+            )
+            if self.sampling_backend is not None
+            else False
+        )
+
+        # Most variants capture with is_all_greedy=False so they record the
+        # stochastic logits-to-token path. Dedicated greedy variants opt in to
+        # is_all_greedy=True so CUDA graph replay stays on argmax /
+        # verify_chain_greedy instead of materializing stochastic probabilities.
         ibd = self.input_buffers
         sampling_info = SamplingBatchInfo(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
@@ -378,7 +388,7 @@ class CudaGraphWrapper:
                 if self.runtime_states is not None
                 else None
             ),
-            is_all_greedy=False,
+            is_all_greedy=capture_is_all_greedy,
             vocab_size=self.vocab_size,
             device=self.device,
         )
