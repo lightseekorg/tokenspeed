@@ -54,11 +54,7 @@ def maybe_substitute_mm_pad(
     """Replace hash mm-pad positions with ``substitute_id``; no-op if None."""
     if substitute_id is None:
         return input_ids
-    return torch.where(
-        is_mm_pad_value(input_ids),
-        torch.tensor(substitute_id, dtype=input_ids.dtype, device=input_ids.device),
-        input_ids,
-    )
+    return input_ids.masked_fill(is_mm_pad_value(input_ids), substitute_id)
 
 
 class Modality(Enum):
