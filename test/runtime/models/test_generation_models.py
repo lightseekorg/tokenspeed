@@ -119,12 +119,6 @@ ALL_OTHER_MODELS = [
 
 TORCH_DTYPES = [torch.bfloat16]
 
-EXPECTED_OUTPUT_SUBSTRINGS = {
-    "The capital of the United Kingdom is": "London",
-    "Today is a sunny day and I like": "to go",
-    "AI is a field of computer science focused on": "intelligence",
-}
-
 
 class TestGenerationModels(unittest.TestCase):
 
@@ -146,30 +140,31 @@ class TestGenerationModels(unittest.TestCase):
         )
         max_new_tokens = 32
 
-        # with HFRunner(
-        #     model_path,
-        #     torch_dtype=torch_dtype,
-        #     model_type="generation",
-        #     trust_remote_code=model_case.trust_remote_code,
-        #     tp_size=model_case.tp_size,
-        #     max_model_len=model_case.max_model_len,
-        # ) as hf_runner:
-        #     hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
-        #     if torch.cuda.current_device() == 0:
-        #         print(f"\n{'='*60}", flush=True)
-        #         print(f"[HFRunner] model={model_path}", flush=True)
-        #         for i, (prompt, output) in enumerate(
-        #             zip(prompts, hf_outputs.output_strs)
-        #         ):
-        #             print(
-        #                 f"  [{i}] prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}",
-        #                 flush=True,
-        #             )
-        #             print(
-        #                 f"  [{i}] output: {output[:100]}{'...' if len(output) > 100 else ''}",
-        #                 flush=True,
-        #             )
-        #         print(f"{'='*60}\n", flush=True)
+        with HFRunner(
+            model_path,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            output_str_only=True,
+            trust_remote_code=model_case.trust_remote_code,
+            tp_size=model_case.tp_size,
+            max_model_len=model_case.max_model_len,
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
+            if torch.cuda.current_device() == 0:
+                print(f"\n{'='*60}", flush=True)
+                print(f"[HFRunner] model={model_path}", flush=True)
+                for i, (prompt, output) in enumerate(
+                    zip(prompts, hf_outputs.output_strs)
+                ):
+                    print(
+                        f"  [{i}] prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}",
+                        flush=True,
+                    )
+                    print(
+                        f"  [{i}] output: {output[:100]}{'...' if len(output) > 100 else ''}",
+                        flush=True,
+                    )
+                print(f"{'='*60}\n", flush=True)
 
         with RTRunner(
             model_path,
@@ -203,15 +198,15 @@ class TestGenerationModels(unittest.TestCase):
                     )
                 print(f"{'='*60}\n", flush=True)
 
-            for prompt, output in zip(prompts, rt_outputs.output_strs):
-                expected = EXPECTED_OUTPUT_SUBSTRINGS.get(prompt)
-                if expected is None:
-                    continue
-                self.assertIn(
-                    expected,
-                    output,
-                    f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}",
-                )
+        check_close_model_outputs(
+            hf_outputs=hf_outputs,
+            rt_outputs=rt_outputs,
+            prefill_tolerance=prefill_tolerance,
+            decode_tolerance=decode_tolerance,
+            rouge_l_tolerance=rouge_l_tolerance,
+            debug_text=f"model_path={model_path} prompts={prompts}",
+            check_logprobs=False,
+        )
 
     def test_ci_models(self):
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
