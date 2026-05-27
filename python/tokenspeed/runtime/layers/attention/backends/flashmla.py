@@ -136,13 +136,22 @@ class FlashMLABackend(AttentionBackend):
             )
 
         # Workspace buffer + flashinfer prefill wrappers (EXTEND path only).
+        # When enable_memory_saver is on, allocate inside saver.region().
         global _global_workspace_buffer
         if _global_workspace_buffer is None:
-            _global_workspace_buffer = torch.empty(
-                get_flashinfer_workspace_size(),
-                dtype=torch.uint8,
-                device=config.device,
+            from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+                TorchMemorySaverAdapter,
             )
+
+            _saver = TorchMemorySaverAdapter.create(
+                enable=getattr(config, "enable_memory_saver", False)
+            )
+            with _saver.region():
+                _global_workspace_buffer = torch.empty(
+                    get_flashinfer_workspace_size(),
+                    dtype=torch.uint8,
+                    device=config.device,
+                )
         self.workspace_buffer = _global_workspace_buffer
 
         max_bs = config.max_bs

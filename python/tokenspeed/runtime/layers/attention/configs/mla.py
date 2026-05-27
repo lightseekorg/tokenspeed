@@ -72,6 +72,7 @@ class MLAConfig(BaseAttnConfig):
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             is_draft=is_draft,
+            enable_memory_saver=server_args.enable_memory_saver,
             kv_lora_rank=model_config.kv_lora_rank,
             qk_nope_head_dim=model_config.qk_nope_head_dim,
             qk_rope_head_dim=model_config.qk_rope_head_dim,

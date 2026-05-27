@@ -110,6 +110,12 @@ class ModelExecutorConfig:
     disable_capturable_grammar: bool = False
     mamba_cache_chunk_size: int = 64
 
+    # Controls whether the CUDAGraph captures and their static buffers are
+    # allocated inside torch_memory_saver.region(). When True (and the
+    # engine was launched with --enable-memory-saver), the graph footprint
+    # is released by /release_memory_occupation alongside weights and KV.
+    enable_memory_saver: bool = False
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -156,6 +162,7 @@ class ModelExecutorConfig:
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
+            enable_memory_saver=server_args.enable_memory_saver,
         )
 
 
@@ -298,6 +305,7 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            memory_saver_adapter=getattr(model_runner, "memory_saver_adapter", None),
         )
 
         # Encoder CUDA graph: install the model-built wrapper by overriding

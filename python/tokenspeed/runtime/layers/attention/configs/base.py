@@ -58,6 +58,10 @@ class BaseAttnConfig:
     speculative_num_steps: int = 0
     speculative_num_draft_tokens: int = 1
     is_draft: bool = False
+    # When True, attention-backend scratch buffers (workspace, page tables,
+    # etc.) are allocated inside torch_memory_saver.region() so they're
+    # released by /release_memory_occupation.
+    enable_memory_saver: bool = False
 
     @classmethod
     def generate(

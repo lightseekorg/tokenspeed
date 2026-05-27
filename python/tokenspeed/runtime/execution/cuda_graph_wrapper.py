@@ -42,6 +42,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
@@ -194,8 +195,21 @@ class CudaGraphWrapper:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
+        memory_saver_adapter: TorchMemorySaverAdapter | None = None,
     ):
         self.config = config
+        # When enable_memory_saver is on, the captured CUDAGraph objects plus
+        # their static input/output tensors live inside saver.region() so
+        # /release_memory_occupation reclaims that footprint. Note: contents
+        # of the static tensors are zeroed across pause/resume, but callers
+        # overwrite them on every replay so this is benign.
+        self.memory_saver_adapter = (
+            memory_saver_adapter
+            if memory_saver_adapter is not None
+            else TorchMemorySaverAdapter.create(
+                enable=getattr(config, "enable_memory_saver", False)
+            )
+        )
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -260,7 +274,8 @@ class CudaGraphWrapper:
         self.disable = config.enforce_eager
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         if not self.disable:
-            self.capture()
+            with self.memory_saver_adapter.region():
+                self.capture()
 
     # ------------------------------------------------------------------
     # Graph capture

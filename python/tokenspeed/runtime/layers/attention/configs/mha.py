@@ -65,6 +65,7 @@ class MHAConfig(BaseAttnConfig):
             max_graph_bs=server_args.max_cudagraph_capture_size,
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             is_draft=is_draft,
+            enable_memory_saver=server_args.enable_memory_saver,
             **kwargs,
         )
 

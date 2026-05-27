@@ -114,13 +114,23 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         max_bs = config.max_bs
 
         # Shared workspace buffer (allocated once per process).
+        # When enable_memory_saver is on, allocate inside saver.region() so
+        # that the 512 MiB workspace gets released by /release_memory_occupation.
         global _global_workspace_buffer
         if _global_workspace_buffer is None:
-            _global_workspace_buffer = torch.zeros(
-                TRTLLM_MHA_WORKSPACE,
-                dtype=torch.uint8,
-                device=config.device,
+            from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+                TorchMemorySaverAdapter,
             )
+
+            _saver = TorchMemorySaverAdapter.create(
+                enable=getattr(config, "enable_memory_saver", False)
+            )
+            with _saver.region():
+                _global_workspace_buffer = torch.zeros(
+                    TRTLLM_MHA_WORKSPACE,
+                    dtype=torch.uint8,
+                    device=config.device,
+                )
         self.workspace_buffer = _global_workspace_buffer
 
         # Max pages per request.
