@@ -329,6 +329,14 @@ class ModelExecutor:
 
         self.dp_sampling_enabled = infra_supports_dp and dp_mode in {"auto", "on"}
         if self.dp_sampling_enabled:
+            dp_vocab_size = processor.dp_sampling_lm_head_vocab_size(
+                lm_head, processor.tp_size
+            )
+            configure_dp_vocab = getattr(
+                self.sampling_backend, "configure_dp_sampling_vocab_size", None
+            )
+            if configure_dp_vocab is not None:
+                configure_dp_vocab(dp_vocab_size)
             processor.configure_dp_sampling(
                 lm_head=lm_head,
                 dp_num_tokens_per_req=spec_num_tokens,

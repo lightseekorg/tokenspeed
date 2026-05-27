@@ -20,8 +20,10 @@
 
 """Communication helper for Batch-DP speculative verify.
 
-Here N is num_tokens_per_req, V is vocab_size, V/TP is the local vocab
-shard, and reqs_per_rank=pad_bs/TP.
+Here N is num_tokens_per_req, V is the LM-head padded communication
+vocab_size, V/TP is the local vocab shard, and reqs_per_rank=pad_bs/TP.
+Callers trim swapped logits back to the model config vocab size before
+sampling observes token ids.
 
 swap_batch_vocab maps each rank's full-batch vocab shard
 [pad_bs * N, V/TP] to its request shard with full vocab [reqs_per_rank * N, V].
@@ -235,6 +237,10 @@ class DpSamplingComm:
     @property
     def max_pad_bs(self) -> int:
         return self._max_pad_bs
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._state is not None
 
     def prepare_verify_outputs(self, logits_dtype: torch.dtype) -> None:
         """Initialize one-sided state for verify-only DP sampling routes."""

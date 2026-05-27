@@ -69,6 +69,12 @@ def test_dp_sampling_lm_head_capability_check():
     )
 
 
+def test_dp_sampling_lm_head_vocab_size_uses_padded_local_weight():
+    lm_head = SimpleNamespace(weight=torch.empty(16032, 16))
+
+    assert LogitsProcessor.dp_sampling_lm_head_vocab_size(lm_head, tp_size=2) == 32064
+
+
 def test_configure_dp_sampling_validates_lm_head_before_runtime():
     processor = LogitsProcessor(
         SimpleNamespace(vocab_size=7, model_type="unit_test"),

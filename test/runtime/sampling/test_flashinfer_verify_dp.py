@@ -133,6 +133,43 @@ def _build_backend(
     return FlashInferSamplingBackend(cfg)
 
 
+def test_configure_dp_sampling_vocab_size_rebuilds_comm_before_use():
+    class _FakeComm:
+        is_initialized = False
+
+    backend = object.__new__(FlashInferSamplingBackend)
+    backend._dp_comm = _FakeComm()
+    backend._dp_comm_vocab_size = 32002
+    backend._dp_tp_size = 2
+    backend.config = object()
+
+    made_vocab_sizes = []
+
+    def _make_dp_comm(vocab_size, config):
+        made_vocab_sizes.append(vocab_size)
+        return _FakeComm()
+
+    backend._make_dp_comm = _make_dp_comm
+
+    backend.configure_dp_sampling_vocab_size(32064)
+
+    assert made_vocab_sizes == [32064]
+    assert backend._dp_comm_vocab_size == 32064
+
+
+def test_configure_dp_sampling_vocab_size_rejects_unsharded_size():
+    class _FakeComm:
+        is_initialized = False
+
+    backend = object.__new__(FlashInferSamplingBackend)
+    backend._dp_comm = _FakeComm()
+    backend._dp_comm_vocab_size = 32002
+    backend._dp_tp_size = 2
+
+    with pytest.raises(RuntimeError, match="must be divisible"):
+        backend.configure_dp_sampling_vocab_size(32001)
+
+
 def _test_verify_dp_matches_today(
     rank,
     world_size,

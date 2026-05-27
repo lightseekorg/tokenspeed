@@ -120,6 +120,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._dp_pg = None
         self._dp_rank = 0
         self._dp_comm: DpSamplingComm | None = None
+        self._dp_comm_vocab_size = 0
 
         if tp_size > 1 and _dp_sampling_requested(config):
             self._dp_max_pad_bs = ((config.max_bs + tp_size - 1) // tp_size) * tp_size
@@ -129,22 +130,44 @@ class FlashInferSamplingBackend(SamplingBackend):
 
             self._dp_rank = dist.get_rank(group=self._dp_pg)
 
-            v_aligned = (
+            self._dp_comm_vocab_size = (
                 (max(config.vocab_size, tp_size) + tp_size - 1) // tp_size
             ) * tp_size
-            self._dp_comm = DpSamplingComm(
-                tp_size=tp_size,
-                rank=self._dp_rank,
-                group=tp_group,
-                max_pad_bs=self._dp_max_pad_bs,
-                num_tokens_per_req=config.max_draft_tokens_per_req,
-                vocab_size=v_aligned,
-                logits_dtype=None,
-                device=config.device,
-            )
+            self._dp_comm = self._make_dp_comm(self._dp_comm_vocab_size, config)
         else:
             self._dp_max_pad_bs = config.max_bs
             self._dp_max_reqs_per_rank = config.max_bs
+
+    def _make_dp_comm(
+        self, vocab_size: int, config: SamplingBackendConfig
+    ) -> DpSamplingComm:
+        assert self._dp_tp_group is not None
+        return DpSamplingComm(
+            tp_size=self._dp_tp_size,
+            rank=self._dp_rank,
+            group=self._dp_tp_group,
+            max_pad_bs=self._dp_max_pad_bs,
+            num_tokens_per_req=config.max_draft_tokens_per_req,
+            vocab_size=vocab_size,
+            logits_dtype=None,
+            device=config.device,
+        )
+
+    def configure_dp_sampling_vocab_size(self, vocab_size: int) -> None:
+        """Use the target LM-head padded vocab size for DP logits exchange."""
+        if self._dp_comm is None:
+            return
+        if vocab_size == self._dp_comm_vocab_size:
+            return
+        if vocab_size % self._dp_tp_size != 0:
+            raise RuntimeError(
+                f"DP sampling vocab_size={vocab_size} must be divisible by "
+                f"tp_size={self._dp_tp_size}"
+            )
+        if self._dp_comm.is_initialized:
+            raise RuntimeError("Cannot resize DP sampling comm after use")
+        self._dp_comm_vocab_size = vocab_size
+        self._dp_comm = self._make_dp_comm(vocab_size, self.config)
 
     @staticmethod
     def _slice_dp_vocab_mask(

@@ -218,6 +218,16 @@ class LogitsProcessor(nn.Module):
         return hasattr(lm_head, "weight")
 
     @staticmethod
+    def dp_sampling_lm_head_vocab_size(lm_head, tp_size: int) -> int:
+        LogitsProcessor.validate_dp_sampling_lm_head(lm_head)
+        weight = lm_head.weight
+        if weight.ndim < 1:
+            raise RuntimeError(
+                f"dp_sampling LM head weight must be at least 1D, got {weight.ndim}D"
+            )
+        return int(weight.shape[0]) * tp_size
+
+    @staticmethod
     def validate_dp_sampling_lm_head(lm_head) -> None:
         if not LogitsProcessor.supports_dp_sampling_lm_head(lm_head):
             raise RuntimeError(
