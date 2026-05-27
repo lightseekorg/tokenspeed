@@ -63,6 +63,7 @@ class ModelCase:
     trust_remote_code: bool = False
     enforce_eager: bool = False
     max_model_len: int = None
+    max_new_tokens: int = 32
     min_gpu_memory_gb: float = 0
     blackwell_only: bool = False
     extra_kwargs: dict = dataclasses.field(default_factory=dict)
@@ -95,6 +96,7 @@ CI_MODELS = [
         tp_size=_AVAILABLE_GPUS,
         skip_long_prompt=True,
         blackwell_only=True,
+        max_new_tokens=256,
         extra_kwargs={
             "disable_prefill_graph": True,
             "max_total_tokens": 32768,
@@ -164,7 +166,7 @@ class TestGenerationModels(unittest.TestCase):
         torch_dtype: torch.dtype,
     ) -> None:
         model_path = model_case.model_path
-        max_new_tokens = 32
+        max_new_tokens = model_case.max_new_tokens
 
         with RTRunner(
             model_path,
