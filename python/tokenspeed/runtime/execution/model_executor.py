@@ -997,34 +997,53 @@ class ModelExecutor:
             else None
         )
 
-    def _skip_completed_layerwise_mamba_cow(self, forward_op, bs: int) -> None:
+    def _skip_completed_layerwise_mamba_cow(
+        self, forward_op, bs: int
+    ) -> torch.Tensor | None:
         cow_done = self._layerwise_mamba_cow_done
         self._layerwise_mamba_cow_done = None
         if not cow_done or not getattr(self.input_buffers, "has_mamba", False):
-            return
+            return None
         cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
         working_indices = getattr(forward_op, "mamba_pool_indices", None)
         if cow_src_indices is None or working_indices is None:
-            return
+            return None
 
         cow_src_indices = list(cow_src_indices)[:bs]
         working_indices = list(working_indices)[:bs]
+        skipped_mask = [False] * bs
         changed = False
         for i, (cow_src, working) in enumerate(zip(cow_src_indices, working_indices)):
             cow_src = int(cow_src)
             working = int(working)
             if working in cow_done.get(cow_src, set()):
                 cow_src_indices[i] = -1
+                skipped_mask[i] = True
                 changed = True
         if not changed:
-            return
+            return None
 
         self.input_buffers._mamba_cow_src_indices_cpu[:bs].copy_(
             torch.as_tensor(cow_src_indices, dtype=torch.int32)
         )
-        self.input_buffers.mamba_cow_src_indices_buf[:bs].copy_(
+        cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
+        cow_src_buf[:bs].copy_(
             self.input_buffers._mamba_cow_src_indices_cpu[:bs], non_blocking=True
         )
+        return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
+
+    @staticmethod
+    def _mamba_retract_reset_mask(
+        mamba_cow_src: torch.Tensor,
+        bs: int,
+        skipped_layerwise_cow_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        reset_mask = mamba_cow_src[:bs] >= 0
+        if skipped_layerwise_cow_mask is not None:
+            reset_mask = reset_mask | skipped_layerwise_cow_mask[:bs].to(
+                device=reset_mask.device, dtype=torch.bool
+            )
+        return reset_mask
 
     def execute_forward_op(
         self,
@@ -1059,7 +1078,9 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
             )
-            self._skip_completed_layerwise_mamba_cow(forward_op, bs)
+            skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
+                forward_op, bs
+            )
             self._active_positions_override = self._build_mrope_positions_override(
                 forward_op=forward_op,
                 multimodal_context=multimodal_context,
@@ -1093,7 +1114,11 @@ class ModelExecutor:
                         )
                 elif has_retract:
                     if hasattr(self.attn_backend, "reset_current_inputs"):
-                        retract_mask = mamba_cow_src[:bs] >= 0
+                        retract_mask = self._mamba_retract_reset_mask(
+                            mamba_cow_src,
+                            bs,
+                            skipped_layerwise_cow_mask,
+                        )
                         self.attn_backend.reset_current_inputs(
                             self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
                             mamba_pool_indices[:bs][retract_mask],
