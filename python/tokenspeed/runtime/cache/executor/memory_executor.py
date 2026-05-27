@@ -238,6 +238,7 @@ class MemoryExecutor:
             is_dp_attention_enabled=is_dp_attention_enabled,
             tp_group=tp_group,
         )
+        self._pending_mamba_layerwise_cow: dict[int, list[int]] | None = None
 
     @staticmethod
     def _page_groups_by_kind(op) -> dict[CacheKind, tuple[list, list]]:
@@ -252,14 +253,22 @@ class MemoryExecutor:
             groups[kind] = (src_pages, dst_pages)
         return groups
 
-    def submit_plan(self, plan, producer_stream=None, mamba_layerwise_cow=None) -> None:
+    def set_mamba_layerwise_cow(
+        self, cow_dst_pages_by_src: dict[int, list[int]] | None
+    ) -> None:
+        self._pending_mamba_layerwise_cow = cow_dst_pages_by_src or None
+
+    def submit_plan(self, plan) -> None:
         if plan.cache:
             logger.debug("[cache_op] submit_plan: %s cache ops", len(plan.cache))
-        for op in plan.cache:
-            self.submit(op, mamba_layerwise_cow=mamba_layerwise_cow)
-        self.host_exec.flush()
+        try:
+            for op in plan.cache:
+                self.submit(op)
+            self.host_exec.flush()
+        finally:
+            self._pending_mamba_layerwise_cow = None
 
-    def submit(self, op, mamba_layerwise_cow=None) -> None:
+    def submit(self, op) -> None:
         if isinstance(op, Cache.WriteBackOp):
             logger.debug(
                 "[cache_op] writeback op_id=%s src_pages=%s dst_pages=%s",
@@ -329,6 +338,9 @@ class MemoryExecutor:
                             dst_pages[:8],
                         )
                     loadback_kwargs = {}
+                    mamba_layerwise_cow = getattr(
+                        self, "_pending_mamba_layerwise_cow", None
+                    )
                     if kind == CacheKind.MAMBA and mamba_layerwise_cow:
                         loadback_kwargs["layerwise_cow_dst_pages_by_src"] = (
                             mamba_layerwise_cow

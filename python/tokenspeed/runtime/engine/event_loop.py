@@ -709,9 +709,8 @@ class EventLoop:
         )
         if mamba_layerwise_cow:
             self.model_executor.set_layerwise_mamba_cow_done(mamba_layerwise_cow)
-        self.memory_executor.submit_plan(
-            execution_plan, mamba_layerwise_cow=mamba_layerwise_cow
-        )
+            self.memory_executor.set_mamba_layerwise_cow(mamba_layerwise_cow)
+        self.memory_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
