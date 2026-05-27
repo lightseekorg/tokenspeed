@@ -99,6 +99,7 @@ CI_MODELS = [
             "disable_prefill_graph": True,
             "max_total_tokens": 32768,
             "max_model_len": 16384,
+            "attention_backend": "trtllm",
             "moe_backend": "flashinfer_cutlass",
             "speculative_algorithm": "MTP",
             "speculative_num_steps": 3,
