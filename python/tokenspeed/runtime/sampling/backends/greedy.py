@@ -34,7 +34,11 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import nan_guard_logits, write_output_logprobs
+from tokenspeed.runtime.sampling.utils import (
+    force_reject_invalid_greedy_rows,
+    nan_guard_logits,
+    write_output_logprobs,
+)
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -208,6 +212,7 @@ class GreedySamplingBackend(SamplingBackend):
             .fill_(-1)
         )
         accept_length = self._accept_length_buf[:bs]
+        valid_rows = torch.isfinite(logits_output.next_token_logits).any(dim=-1)
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
         )
@@ -219,7 +224,13 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = force_reject_invalid_greedy_rows(
+            target_predict,
+            candidates,
+            valid_rows,
+            self.config.vocab_size,
+        )
 
         _verify_chain_greedy(
             predicts=predict,

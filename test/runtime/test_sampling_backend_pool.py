@@ -553,11 +553,32 @@ class TestTritonSamplingDefault(unittest.TestCase):
             candidates,
         )
 
-        self.assertEqual(accept_lengths.tolist(), [4])
+        self.assertEqual(accept_lengths.tolist(), [1])
         accepted = predict[: accept_lengths.item()]
         self.assertTrue(torch.all(accepted >= 0).item())
         self.assertTrue(torch.all(accepted < vocab_size).item())
+        self.assertTrue(torch.all(accepted != candidates[0, 0]).item())
         self.assertFalse(torch.isnan(logits).any().item())
+
+    def test_sample_nan_guard_does_not_promote_nan_logits(self):
+        backend = TritonSamplingBackend(_make_config())
+        logits = torch.tensor(
+            [[-2.0, float("nan"), -3.0]],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+
+        sampled, _ = backend.sample(
+            logits_output,
+            self._sampling_info([1], is_all_greedy=True),
+        )
+
+        self.assertEqual(sampled.tolist(), [0])
+        self.assertEqual(float(logits[0, 1].item()), -1e5)
 
 
 class TestTritonFullFlipExtended(unittest.TestCase):
