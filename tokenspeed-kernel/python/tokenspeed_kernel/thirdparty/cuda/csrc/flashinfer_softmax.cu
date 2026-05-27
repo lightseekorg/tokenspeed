@@ -40,11 +40,11 @@ __global__ void OnlineSoftmaxFusedKernel(DTypeIn* logits, DTypeOut* output,
   extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
   auto& temp_storage = reinterpret_cast<TempStorage&>(smem);
 
-  DTypeIn* smem_vec_base = nullptr;
+  float* smem_vec_base = nullptr;
   if constexpr (CACHE_INPUT) {
-    constexpr size_t vec_alignment = alignof(vec_t<DTypeIn, VEC_SIZE>);
+    constexpr size_t vec_alignment = alignof(vec_t<float, VEC_SIZE>);
     size_t aligned_offset = round_up(sizeof(TempStorage), vec_alignment);
-    smem_vec_base = reinterpret_cast<DTypeIn*>(smem + aligned_offset);
+    smem_vec_base = reinterpret_cast<float*>(smem + aligned_offset);
   }
 
   vec_t<DTypeIn, VEC_SIZE> in_vec;
@@ -73,11 +73,12 @@ __global__ void OnlineSoftmaxFusedKernel(DTypeIn* logits, DTypeOut* output,
 
     if constexpr (CACHE_INPUT) {
       if (in_bounds) {
+        vec_t<float, VEC_SIZE> cache_vec;
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          in_vec[j] = static_cast<DTypeIn>(scaled[j]);
+          cache_vec[j] = scaled[j];
         }
-        in_vec.store(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        cache_vec.store(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
     }
 
@@ -125,10 +126,11 @@ __global__ void OnlineSoftmaxFusedKernel(DTypeIn* logits, DTypeOut* output,
     bool in_bounds = (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
     if constexpr (CACHE_INPUT) {
       if (in_bounds) {
-        in_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        vec_t<float, VEC_SIZE> cache_vec;
+        cache_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          scaled[j] = static_cast<float>(in_vec[j]);
+          scaled[j] = cache_vec[j];
         }
       }
     } else {
@@ -379,7 +381,7 @@ cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size
           uint32_t cache_threshold = 0;
           if (smem_max > (int)sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>)) {
             cache_threshold =
-                (smem_max - sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>)) / sizeof(DTypeIn) -
+                (smem_max - sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>)) / sizeof(float) -
                 VEC_SIZE;
           }
           const bool cache_input = d <= cache_threshold;
@@ -387,7 +389,7 @@ cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size
           dim3 nblks(batch_size);
           dim3 nthrs(BLOCK_THREADS);
 
-          const size_t smem_logits_bytes = (round_up(d, VEC_SIZE) + VEC_SIZE) * sizeof(DTypeIn);
+          const size_t smem_logits_bytes = (round_up(d, VEC_SIZE) + VEC_SIZE) * sizeof(float);
           uint32_t smem_size = sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>) +
                                (cache_input ? smem_logits_bytes : 0);
 
