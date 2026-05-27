@@ -139,6 +139,7 @@ if (
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
+            "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False, True}),
@@ -156,6 +157,7 @@ if (
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
+        is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -173,7 +175,7 @@ if (
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=False,
+            causal=is_causal,
             return_lse=return_lse,
         )
         if return_lse:
@@ -308,6 +310,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED + 3,
         traits={
+            "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
@@ -325,6 +328,7 @@ elif platform.is_nvidia and platform.is_hopper:
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float | None = None,
+        is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -346,7 +350,7 @@ elif platform.is_nvidia and platform.is_hopper:
             cu_seqlens_k_new=cu_seqlens_k_new,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=softmax_scale,
-            causal=False,
+            causal=is_causal,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,

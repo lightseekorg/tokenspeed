@@ -22,6 +22,19 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.triton_kernels import (
+    FP4,
+    FlexCtx,
+    FnSpecs,
+    FusedActivation,
+    InFlexData,
+    PrecisionConfig,
+    convert_layout,
+    layout,
+    opt_flags,
+    swiglu_fn,
+    wrap_torch_tensor,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -36,6 +49,7 @@ from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 from tokenspeed.runtime.layers.quantization import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.utils import round_up
 
 _is_blackwell = current_platform().is_blackwell
 _is_hopper = current_platform().is_hopper
@@ -44,14 +58,6 @@ _is_amd = current_platform().is_amd
 
 def swizzle_mxfp4(quant_tensor, scale, num_warps):
     """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
-    from tokenspeed_kernel.ops.moe.triton_kernels import (
-        FP4,
-        InFlexData,
-        convert_layout,
-        layout,
-        opt_flags,
-        wrap_torch_tensor,
-    )
 
     if layout is None:
         raise RuntimeError("triton_kernels backend unavailable")
@@ -134,7 +140,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
     def create_layer_weights(
         self, layer: nn.Module, *, with_bias: bool = False
     ) -> None:
-        from tokenspeed.runtime.utils import round_up
 
         hidden = self.spec.hidden_size
         ispp = self.spec.intermediate_size // self.spec.tp_size
@@ -160,11 +165,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         self._swiglu_arg = getattr(layer, "swiglu_arg", None)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        from tokenspeed_kernel.ops.moe.triton_kernels import (
-            FlexCtx,
-            InFlexData,
-            PrecisionConfig,
-        )
 
         MXFP_BLOCK_SIZE = 32
 
@@ -244,13 +244,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
-        from tokenspeed_kernel.ops.moe.triton_kernels import (
-            FnSpecs,
-            FusedActivation,
-            swiglu_fn,
-        )
-
         router_logits = topk_output.router_logits
         top_k = topk_output.topk_config.top_k
         n_tokens = router_logits.shape[0]
