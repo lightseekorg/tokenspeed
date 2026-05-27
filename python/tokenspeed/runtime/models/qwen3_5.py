@@ -1123,6 +1123,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
     ):
         super().__init__(
             config=config.text_config,
@@ -1141,6 +1142,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("model.visual", prefix),
             mapping=mapping,
+            mm_attention_backend=mm_attention_backend,
         )
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
@@ -1366,12 +1368,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
     ) -> None:
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            mm_attention_backend=mm_attention_backend,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

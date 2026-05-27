@@ -50,7 +50,7 @@ from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
-from tokenspeed.runtime.utils.env import envs, get_global_server_args
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -309,7 +309,7 @@ class ModelExecutor:
         if (
             hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
             and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and get_global_server_args().mm_attention_backend != "flashinfer_cudnn"
+            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
         ):
             self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
                 _mm_model.mapping

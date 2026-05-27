@@ -210,6 +210,7 @@ class MoonViTEncoderLayer(nn.Module):
         attn_bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -234,6 +235,7 @@ class MoonViTEncoderLayer(nn.Module):
             prefix=add_prefix("attn", prefix),
             customized_position_embedding_applier=apply_rope,
             mapping=mapping,
+            mm_attention_backend=mm_attention_backend,
         )
 
     def forward(
@@ -623,6 +625,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         *inputs,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -649,6 +652,7 @@ class MoonViT3dPretrainedModel(nn.Module):
                 "activation": PytorchGELUTanh(),
                 "attn_bias": True,
                 "mapping": mapping,
+                "mm_attention_backend": mm_attention_backend,
             },
             video_attn_type=config.video_attn_type,
             quant_config=quant_config,
@@ -724,6 +728,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         mapping: Mapping,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
         **kwargs,  # fix init_tts argument error
     ) -> None:
         super().__init__()
@@ -737,6 +742,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             ),
             prefix="vision_tower",
             mapping=mapping,
+            mm_attention_backend=mm_attention_backend,
         )
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
