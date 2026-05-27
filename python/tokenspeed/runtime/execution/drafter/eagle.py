@@ -215,11 +215,8 @@ class Eagle(BaseDrafter):
         draft_first_step_reduce = forward_mode.is_decode()
 
         if draft_first_step_reduce and self.attn_backend.support_kv_cache_prewrite:
-            # Prewrite path slices Q to one row per request and uses the decode
-            # kernel, which reads seq_lens as the attention upper bound. Trim
-            # by the rejected-draft count so the live query does not read dead
-            # positions. Non-prewrite runs full multi-token attention with
-            # per-position causal masking, so seq_lens must stay unchanged.
+            # Trim seq_lens by rejected-draft count so the sliced decode
+            # query does not attend to dead positions.
             correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
                 self.draft_seq_lens_buf.dtype
             )

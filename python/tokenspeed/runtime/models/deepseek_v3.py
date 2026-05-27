@@ -1705,8 +1705,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             )
 
             if ctx.draft_first_step_reduce:
-                # self_attn returned [bs, H]; gather residual to match before
-                # the fused reduce+norm.
+                # Gather residual to self_attn's [bs, H].
                 residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
