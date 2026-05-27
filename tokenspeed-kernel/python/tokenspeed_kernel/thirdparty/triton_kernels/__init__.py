@@ -20,14 +20,31 @@
 
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
+# Different upstream triton_kernels versions ship different submodule names
+# (older releases used ``matmul`` / ``matmul_details``; newer ones rename
+# them to ``matmul_ogs`` / ``matmul_ogs_details``). Wrap each pre-import in
+# try/except so an installed-version mismatch doesn't break the whole
+# import chain — call sites in tokenspeed_kernel.ops already guard their
+# actual usages with ImportError fallbacks.
 with redirect_triton_to_tokenspeed_triton():
     import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
-    import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.swiglu  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-    import triton_kernels.tensor_details  # noqa: F401
-    import triton_kernels.tensor_details.layout  # noqa: F401
-    import triton_kernels.topk  # noqa: F401
+
+    for _mod in (
+        "triton_kernels.matmul",
+        "triton_kernels.matmul_details",
+        "triton_kernels.matmul_details.opt_flags",
+        "triton_kernels.matmul_ogs",
+        "triton_kernels.matmul_ogs_details",
+        "triton_kernels.matmul_ogs_details.opt_flags",
+        "triton_kernels.numerics",
+        "triton_kernels.swiglu",
+        "triton_kernels.tensor",
+        "triton_kernels.tensor_details",
+        "triton_kernels.tensor_details.layout",
+        "triton_kernels.topk",
+    ):
+        try:
+            __import__(_mod)
+        except ImportError:
+            pass
+    del _mod
