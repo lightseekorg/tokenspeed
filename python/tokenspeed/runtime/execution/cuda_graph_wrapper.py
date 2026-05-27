@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _is_capture_mode = False
+_CUDA_GRAPH_VARIANT_DEFAULT = "default"
 
 
 def get_is_capture_mode() -> bool:
@@ -285,8 +286,13 @@ class CudaGraphWrapper:
                 draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
                 draft_attn_backend._block_table_aliased = True
 
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self.output_buffers: dict[int, tuple] = {}
+        self.graph_variants = (
+            sampling_backend.cuda_graph_capture_variants(self.max_tokens_per_req)
+            if sampling_backend is not None
+            else (_CUDA_GRAPH_VARIANT_DEFAULT,)
+        )
+        self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
+        self.output_buffers: dict[tuple[str, int], tuple] = {}
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
@@ -308,22 +314,28 @@ class CudaGraphWrapper:
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             self.stream = torch.cuda.Stream()
-            capture_range = tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
             if rank == 0:
                 logger.info("Capturing batches: %s", self.capture_bs)
-            for bs in capture_range:
-                if rank == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.device, self.gpu_id, empty_cache=False
+            for graph_variant in self.graph_variants:
+                capture_range = (
+                    tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
+                )
+                for bs in capture_range:
+                    if rank == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.device, self.gpu_id, empty_cache=False
+                        )
+                        capture_range.set_description(
+                            "Capturing batches "
+                            f"({graph_variant=} {bs=} {avail_mem=:.2f} GB)"
+                        )
+                    graph, output_buffers = self._capture_one(
+                        bs, graph_variant=graph_variant
                     )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                    )
-                graph, output_buffers = self._capture_one(bs)
-                self.graphs[bs] = graph
-                self.output_buffers[bs] = output_buffers
+                    self.graphs[(graph_variant, bs)] = graph
+                    self.output_buffers[(graph_variant, bs)] = output_buffers
 
-    def _capture_one(self, bs: int):
+    def _capture_one(self, bs: int, graph_variant: str = _CUDA_GRAPH_VARIANT_DEFAULT):
         graph = torch.cuda.CUDAGraph()
 
         capture_forward_mode = ForwardMode.DECODE
@@ -355,11 +367,9 @@ class CudaGraphWrapper:
             # NaN draft logits -> accept_rate 0. Set the matching uniform dummy.
             ctx.global_bs = [bs] * self.world_size
 
-        # Capture with is_all_greedy=False so the graph records the full
-        # top_k_top_p_sampling path (greedy-only requests are served by the
-        # same path with top_k=1 in the buffer, which effectively argmaxes).
-        # is_all_greedy=True at capture would freeze the graph into
-        # argmax and bypass per-request seeding at replay.
+        # Capture with is_all_greedy=False so sampler variants record their
+        # stochastic logits-to-token path. is_all_greedy=True at capture would
+        # freeze the graph into argmax and bypass per-request seeding at replay.
         ibd = self.input_buffers
         sampling_info = SamplingBatchInfo(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
@@ -406,7 +416,9 @@ class CudaGraphWrapper:
             dist.barrier()
             if self.sampling_backend is not None:
                 self.sampling_backend.prepare_capture(
-                    bs=bs, num_tokens_per_req=self.max_tokens_per_req
+                    bs=bs,
+                    num_tokens_per_req=self.max_tokens_per_req,
+                    capture_variant=graph_variant,
                 )
             # Keep warmup seq_lens >= q_len_per_req so no query row gets an
             # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
@@ -430,7 +442,9 @@ class CudaGraphWrapper:
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         if self.sampling_backend is not None:
             self.sampling_backend.prepare_capture(
-                bs=bs, num_tokens_per_req=self.max_tokens_per_req
+                bs=bs,
+                num_tokens_per_req=self.max_tokens_per_req,
+                capture_variant=graph_variant,
             )
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
@@ -779,10 +793,10 @@ class CudaGraphWrapper:
             if global_bs is None or global_bs == 0:
                 return False
             if self.disable_padding:
-                return global_bs in self.graphs
+                return self._has_graph_for_bs(global_bs)
             return global_bs <= self.max_bs
         if self.disable_padding:
-            return bs in self.graphs
+            return self._has_graph_for_bs(bs)
         return bs <= self.max_bs
 
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
@@ -797,38 +811,19 @@ class CudaGraphWrapper:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
-    def _pad_graph_req_pool_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
-    ) -> torch.Tensor:
-        pad = padded_bs - active_req_pool_indices.shape[0]
-        if pad <= 0:
-            return active_req_pool_indices
-        # Route padding rows to the sentinel req-pool slot (max_req_pool_size),
-        # not slot 0. valid_cache_lengths / req_to_page are sized
-        # [max_req_pool_size + 1]; the sentinel row stays zero-init (length 0,
-        # dummy page 0) since _update_runtime_state only writes real rows. Slot 0
-        # would alias the live first request: harmless for verify (seq_len == 1),
-        # but the DFLASH draft derives each row's block seq_len from
-        # valid_cache_lengths[req_pool], so padding rows would grow unbounded with
-        # request 0's context and hang the draft block-decode kernel. The sentinel
-        # keeps that derived length inert for every drafter backend.
-        sentinel = int(self.config.max_req_pool_size)
-        return torch.cat(
-            [
-                active_req_pool_indices,
-                active_req_pool_indices.new_full((pad,), sentinel),
-            ]
-        )
+    def _has_graph_for_bs(self, bs: int) -> bool:
+        return any((variant, bs) in self.graphs for variant in self.graph_variants)
 
-    def _set_graph_state_write_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
-    ) -> None:
-        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
-        active_bs = active_req_pool_indices.shape[0]
-        if active_bs > 0:
-            state_indices[:active_bs].copy_(active_req_pool_indices)
-        if active_bs < padded_bs:
-            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
+    def _graph_key_for_replay(self, bs: int) -> tuple[str, int]:
+        variant = (
+            self.sampling_backend.cuda_graph_replay_variant()
+            if self.sampling_backend is not None
+            else _CUDA_GRAPH_VARIANT_DEFAULT
+        )
+        key = (variant, bs)
+        if key in self.graphs:
+            return key
+        return (_CUDA_GRAPH_VARIANT_DEFAULT, bs)
 
     def __call__(
         self,
@@ -941,11 +936,12 @@ class CudaGraphWrapper:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
+            graph_key = self._graph_key_for_replay(padded_bs)
             with nvtx_range("graph_replay", color="red"):
-                self.graphs[padded_bs].replay()
+                self.graphs[graph_key].replay()
 
             output_tokens, output_lengths, output_logprobs = self.output_buffers[
-                padded_bs
+                graph_key
             ]
 
             result = (

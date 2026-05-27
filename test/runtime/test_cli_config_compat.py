@@ -255,6 +255,26 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--moe-backend", "triton"])
         self.assertEqual(args.moe_backend, "triton")
 
+    def test_sampling_backend_arg(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--sampling-backend", "triton"]
+        )
+        self.assertEqual(args.sampling_backend, "triton")
+
+        args = self._parse_args(
+            ["--model", "test/model", "--sampling-backend", "triton_full"]
+        )
+        self.assertEqual(args.sampling_backend, "triton_full")
+
+    def test_removed_flashinfer_sampling_backend_rejected(self):
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self._parse_args(
+                ["--model", "test/model", "--sampling-backend", "flashinfer"]
+            )
+
     def test_all2all_backend_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--all2all-backend", "deepep"]

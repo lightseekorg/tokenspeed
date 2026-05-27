@@ -39,7 +39,7 @@ _BACKEND_REGISTRY: dict[str, type[SamplingBackend]] = {}
 
 def _get_default_backend_name() -> str:
     if current_platform().is_nvidia:
-        return "flashinfer"
+        return "triton"
     return "greedy"
 
 
@@ -63,11 +63,9 @@ def create_sampling_backend(
     tp_group: tuple[int, ...] | None = None,
 ) -> SamplingBackend:
     # Trigger concrete-backend registration on first use.
-    from tokenspeed.runtime.sampling.backends import flashinfer as _fi  # noqa: F401
-    from tokenspeed.runtime.sampling.backends import (  # noqa: F401
-        flashinfer_full as _ff,
-    )
     from tokenspeed.runtime.sampling.backends import greedy as _g  # noqa: F401
+    from tokenspeed.runtime.sampling.backends import triton as _triton  # noqa: F401
+    from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
 
     name = _resolve_backend_name(server_args)
     if name not in _BACKEND_REGISTRY:

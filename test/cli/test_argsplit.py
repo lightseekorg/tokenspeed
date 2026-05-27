@@ -100,8 +100,8 @@ def test_tensor_parallel_size_routes_to_engine():
 
 def test_engine_only_flag_routes_to_engine():
     """Anything prepare_server_args accepts but smg does not."""
-    r = _split(["--sampling-backend", "flashinfer"])
-    assert r.engine == ["--sampling-backend", "flashinfer"]
+    r = _split(["--sampling-backend", "triton"])
+    assert r.engine == ["--sampling-backend", "triton"]
     assert r.gateway == []
 
 
@@ -131,7 +131,7 @@ def test_combined_real_invocation():
         "--reasoning-parser",
         "qwen3",
         "--sampling-backend",
-        "flashinfer",
+        "triton",
         "--policy",
         "cache_aware",
     ]
@@ -146,7 +146,7 @@ def test_combined_real_invocation():
         "--reasoning-parser",
         "qwen3",
         "--sampling-backend",
-        "flashinfer",
+        "triton",
     ]
     # Gateway: --model (fan-out), --port, parsers, --policy.
     assert r.gateway == [

@@ -407,18 +407,18 @@ class ServerArgs:
         # AttnInitializer.modify_args where both hardware and model arch are known.
 
         if self.sampling_backend is None:
-            # ``flashinfer`` is the only built-in backend that respects per-request
-            # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
+            # ``triton`` respects per-request ``temperature`` / ``top_p`` /
+            # ``top_k``. ``greedy`` is argmax-only
             # (see ``GreedySamplingBackend.sample``: *"sampling_info is ignored
             # for single-step (always argmax)"*) — fast for hand-tuned greedy
             # decoding but silently wrong for any serving deployment where
             # requests carry sampling params, since the model collapses into
-            # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA where flashinfer is
-            # available, fall back to greedy elsewhere; users can still opt
+            # repetition-mode loops within a few hundred steps. Default to
+            # the sampling-respecting backend on NVIDIA, fall back to greedy
+            # elsewhere; users can still opt
             # into greedy explicitly via ``--sampling-backend greedy``.
             if current_platform().is_nvidia:
-                self.sampling_backend = "flashinfer"
+                self.sampling_backend = "triton"
             else:
                 self.sampling_backend = "greedy"
 
@@ -1311,17 +1311,17 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["greedy", "flashinfer", "flashinfer_full"],
+            choices=["greedy", "triton", "triton_full"],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
-            "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
+            "When unspecified, defaults to 'triton' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
-            "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
-            "min_p and penalties silently ignored. "
-            "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
-            "via the softmax+renorm+min_p kernel sequence. "
+            "'triton': temperature/top_k/top_p via TokenSpeed Triton logits-to-token kernels; "
+            "min_p and penalties are ignored. "
+            "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
+            "via TokenSpeed Triton logits-to-token sampling plus count accumulation. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
-            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+            "Both Triton sampling backends require top_k < 128 or -1.",
         )
         parser.add_argument(
             "--dp-sampling",

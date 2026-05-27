@@ -13,37 +13,42 @@ leaves a finished request's scalars live for its slot's next tenant.
 
 Tests below cover:
   * greedy backend opts out of pool state (prepare_step is a no-op).
-  * flashinfer backend scatters temperature/top_k/top_p/seed on flip.
+  * triton backend scatters temperature/top_k/top_p/seed on flip.
   * steady-state: same rid+slot across steps → no redundant _reset_slot.
   * slot recycle: slot reassigned to a new rid → _reset_slot fires.
-  * flashinfer_full additionally scatters penalty scalars, counts (zero),
+  * triton_full additionally scatters penalty scalars, counts (zero),
     and logit_bias (zero-then-scatter) on flip; out-of-vocab bias raises.
   * boundary asserts: misaligned rid/pool/sp lists, out-of-range pool_idx.
 
-Runs on CUDA because the backends allocate GPU tensors in ``__init__``;
-the test doesn't invoke any flashinfer kernels.
+Runs on CUDA because the backends allocate GPU tensors in ``__init__``.
 """
 
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+import torch  # noqa: E402
+
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     SamplingBackendConfig,
 )
-from tokenspeed.runtime.sampling.backends.flashinfer import (  # noqa: E402
-    FlashInferSamplingBackend,
-)
-from tokenspeed.runtime.sampling.backends.flashinfer_full import (  # noqa: E402
-    FlashInferFullSamplingBackend,
-)
 from tokenspeed.runtime.sampling.backends.greedy import (  # noqa: E402
     GreedySamplingBackend,
+)
+from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
+    TritonSamplingBackend,
+)
+from tokenspeed.runtime.sampling.backends.triton_full import (  # noqa: E402
+    TritonFullSamplingBackend,
+)
+from tokenspeed.runtime.sampling.sampling_batch_info import (  # noqa: E402
+    SamplingBatchInfo,
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
@@ -51,12 +56,17 @@ VOCAB = 1024
 POOL = 8  # max_req_pool_size → pool_rows == POOL + 1
 
 
-def _make_config() -> SamplingBackendConfig:
+def _make_config(
+    *,
+    enable_output_logprobs: bool = False,
+    vocab_size: int = VOCAB,
+) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_output_logprobs=enable_output_logprobs,
         max_bs=4,
         max_draft_tokens_per_req=4,
         max_req_pool_size=POOL,
-        vocab_size=VOCAB,
+        vocab_size=vocab_size,
         device="cuda",
     )
 
@@ -100,13 +110,13 @@ class TestGreedyNoPoolState(unittest.TestCase):
         )
 
 
-class TestFlashInferFlipDetection(unittest.TestCase):
-    """flashinfer's pool-indexed scalar buffers are core scheduler state.
+class TestTritonFlipDetection(unittest.TestCase):
+    """triton's pool-indexed scalar buffers are core scheduler state.
     These tests pin flip semantics down at the Python state-machine level
     (no kernel invocation needed)."""
 
     def setUp(self):
-        self.backend = FlashInferSamplingBackend(_make_config())
+        self.backend = TritonSamplingBackend(_make_config())
 
     def test_dp_verify_buffers_are_lazy(self):
         self.assertIsNone(self.backend._predict_local_buf)
@@ -177,13 +187,320 @@ class TestFlashInferFlipDetection(unittest.TestCase):
         self.assertIsNot(self.backend._cpu_generator_per_slot[2], gen_a)
 
 
-class TestFlashInferFullFlipExtended(unittest.TestCase):
+class TestTritonSamplingDefault(unittest.TestCase):
+    def _sampling_info(self, pool_indices, *, vocab_mask=None, apply_vocab_mask=None):
+        return SamplingBatchInfo(
+            is_all_greedy=False,
+            req_pool_indices=torch.tensor(
+                pool_indices, dtype=torch.int32, device="cuda"
+            ),
+            valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int64, device="cuda"),
+            vocab_mask=vocab_mask,
+            apply_vocab_mask=apply_vocab_mask,
+            device="cuda",
+        )
+
+    def test_no_filter_samples_batch_order(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["a", "b"],
+            request_pool_indices=[4, 2],
+            sampling_params_list=[
+                _sp("a", top_k=-1, top_p=1.0, seed=11),
+                _sp("b", top_k=-1, top_p=1.0, seed=22),
+            ],
+        )
+        logits = torch.full((2, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, VOCAB - 1] = 1.0e6
+        logits[1, VOCAB - 7] = 1.0e6
+        logits_output = SimpleNamespace(
+            next_token_logits=logits, next_token_logprobs=None
+        )
+
+        sampled, accept_lengths = backend.sample(
+            logits_output, self._sampling_info([4, 2])
+        )
+
+        self.assertEqual(sampled.tolist(), [VOCAB - 1, VOCAB - 7])
+        self.assertEqual(accept_lengths.tolist(), [1, 1])
+
+    def test_top_k_samples_allowed_candidate(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["top_k"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("top_k", top_k=2, top_p=1.0, seed=55)],
+        )
+        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, 17] = 5.0
+        logits[0, 23] = 4.0
+        logits[0, 99] = 3.0
+        logits_output = SimpleNamespace(
+            next_token_logits=logits, next_token_logprobs=None
+        )
+
+        sampled, accept_lengths = backend.sample(
+            logits_output, self._sampling_info([1])
+        )
+
+        self.assertIn(sampled.item(), {17, 23})
+        self.assertEqual(accept_lengths.tolist(), [1])
+
+    def test_top_k_top_p_samples_nucleus_candidate(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["top_k_top_p"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("top_k_top_p", top_k=3, top_p=0.6, seed=66)],
+        )
+        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, 17] = 10.0
+        logits[0, 23] = 9.0
+        logits[0, 99] = 8.0
+        logits_output = SimpleNamespace(
+            next_token_logits=logits, next_token_logprobs=None
+        )
+
+        sampled, accept_lengths = backend.sample(
+            logits_output, self._sampling_info([1])
+        )
+
+        self.assertEqual(sampled.item(), 17)
+        self.assertEqual(accept_lengths.tolist(), [1])
+
+    def test_top_p_samples_valid_candidate(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["top_p"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("top_p", top_k=-1, top_p=0.6, seed=33)],
+        )
+        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, 17] = 10.0
+        logits[0, 23] = 1.0
+        logits_output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+
+        sampled, _ = backend.sample(logits_output, self._sampling_info([1]))
+
+        self.assertEqual(sampled.item(), 17)
+
+    def test_grammar_mask_applies_before_sampling(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["grammar"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("grammar", top_k=-1, top_p=1.0, seed=44)],
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros(
+                (1, VOCAB), dtype=torch.float32, device="cuda"
+            ),
+            next_token_logprobs=None,
+        )
+        vocab_mask = torch.ones((1, 1), dtype=torch.int32, device="cuda")
+
+        def apply_mask(logits, vocab_mask):
+            logits.fill_(-float("inf"))
+            logits[:, 23] = 1.0e6
+
+        sampled, _ = backend.sample(
+            logits_output,
+            self._sampling_info(
+                [1],
+                vocab_mask=vocab_mask,
+                apply_vocab_mask=apply_mask,
+            ),
+        )
+
+        self.assertEqual(sampled.item(), 23)
+
+    def test_prepare_capture_variants_sample(self):
+        def set_top_k_top_p(backend):
+            backend._top_k_pool[0].fill_(3)
+            backend._top_p_pool[0].fill_(0.6)
+            backend._temperature_pool[0].fill_(1.0)
+            backend._seed_pool[0].fill_(66)
+
+        cases = (
+            (None, 42, None),
+            ("no_filter", 47, None),
+            ("top_k_top_p", 17, set_top_k_top_p),
+        )
+        for capture_variant, expected_token, configure in cases:
+            with self.subTest(capture_variant=capture_variant):
+                backend = TritonSamplingBackend(_make_config())
+                backend.prepare_capture(
+                    bs=1,
+                    num_tokens_per_req=1,
+                    capture_variant=capture_variant,
+                )
+                if configure is not None:
+                    configure(backend)
+
+                logits = torch.full(
+                    (1, VOCAB), -10.0, dtype=torch.float32, device="cuda"
+                )
+                if capture_variant == "top_k_top_p":
+                    logits[0, 17] = 10.0
+                    logits[0, 23] = 9.0
+                    logits[0, 99] = 8.0
+                else:
+                    logits[0, expected_token] = 1.0e6
+                logits_output = SimpleNamespace(
+                    next_token_logits=logits,
+                    next_token_logprobs=None,
+                )
+
+                sampled, _ = backend.sample(logits_output, self._sampling_info([0]))
+                self.assertEqual(sampled.item(), expected_token)
+
+    def test_cuda_graph_replay_variant_selects_no_filter_after_prepare_step(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
+        )
+        self.assertEqual(backend.cuda_graph_replay_variant(), "no_filter")
+
+        backend.prepare_step(
+            request_ids=["p"],
+            request_pool_indices=[3],
+            sampling_params_list=[_sp("p", top_k=-1, top_p=0.9)],
+        )
+        self.assertEqual(backend.cuda_graph_replay_variant(), "default")
+
+        backend.prepare_step(
+            request_ids=["b"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("b", top_k=50, top_p=0.9)],
+        )
+        self.assertEqual(backend.cuda_graph_replay_variant(), "top_k_top_p")
+
+        backend.prepare_step(
+            request_ids=["k"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("k", top_k=50, top_p=1.0)],
+        )
+        self.assertEqual(backend.cuda_graph_replay_variant(), "top_k_top_p")
+
+        large_backend = TritonSamplingBackend(_make_config(vocab_size=151936))
+        large_backend.prepare_step(
+            request_ids=["b"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("b", top_k=50, top_p=0.9)],
+        )
+        self.assertEqual(large_backend.cuda_graph_replay_variant(), "top_k_top_p")
+
+    def test_cuda_graph_capture_variants(self):
+        compact_backend = TritonSamplingBackend(_make_config())
+        self.assertEqual(
+            compact_backend.cuda_graph_capture_variants(num_tokens_per_req=1),
+            ("default", "no_filter", "top_k_top_p"),
+        )
+
+        backend = TritonSamplingBackend(_make_config(vocab_size=151936))
+        self.assertEqual(
+            backend.cuda_graph_capture_variants(num_tokens_per_req=1),
+            ("default", "no_filter", "top_k_top_p"),
+        )
+        backend.prepare_step(
+            request_ids=["p"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("p", top_k=-1, top_p=0.9)],
+        )
+        self.assertEqual(backend.cuda_graph_replay_variant(), "default")
+
+    def test_mixed_modes_sample_batch(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["a", "b"],
+            request_pool_indices=[1, 2],
+            sampling_params_list=[
+                _sp("a", top_k=-1, top_p=1.0, seed=11),
+                _sp("b", top_k=50, top_p=0.9, seed=22),
+            ],
+        )
+        logits = torch.full((2, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, 17] = 1.0e6
+        logits[1, 29] = 1.0e6
+        logits_output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+
+        sampled, _ = backend.sample(logits_output, self._sampling_info([1, 2]))
+
+        torch.testing.assert_close(
+            sampled.cpu(), torch.tensor([17, 29], dtype=torch.int32)
+        )
+
+    def test_output_logprobs_are_written(self):
+        backend = TritonSamplingBackend(_make_config(enable_output_logprobs=True))
+        backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0, seed=11)],
+        )
+        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, 7] = 1.0e6
+        logits_output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+
+        sampled, _ = backend.sample(logits_output, self._sampling_info([1]))
+
+        self.assertEqual(sampled.item(), 7)
+        self.assertIsNotNone(logits_output.next_token_logprobs)
+        torch.testing.assert_close(
+            logits_output.next_token_logprobs.cpu(),
+            torch.tensor([0.0], dtype=torch.float32),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_unresolved_mode_raises(self):
+        backend = TritonSamplingBackend(_make_config())
+        backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0, seed=11)],
+            num_tokens_per_req=2,
+        )
+        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, 7] = 1.0e6
+        logits_output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "did not select a sampling mode"):
+            backend.sample(logits_output, self._sampling_info([1]))
+
+
+class TestTritonFullFlipExtended(unittest.TestCase):
     """Full backend extends flip behavior with penalty scalars, count rows,
     and logit_bias scatter. Each of these must be cleared/scattered on
     flip or a new request inherits the previous occupant's state."""
 
     def setUp(self):
-        self.backend = FlashInferFullSamplingBackend(_make_config())
+        self.backend = TritonFullSamplingBackend(_make_config())
+
+    def _sampling_info(self, pool_indices):
+        return SamplingBatchInfo(
+            is_all_greedy=False,
+            req_pool_indices=torch.tensor(
+                pool_indices, dtype=torch.int32, device="cuda"
+            ),
+            valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int64, device="cuda"),
+            vocab_mask=None,
+            apply_vocab_mask=None,
+            device="cuda",
+        )
 
     def test_penalty_scalars_scattered(self):
         sp = _sp(
@@ -242,6 +559,30 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
                 sampling_params_list=[sp],
             )
 
+    def test_sample_applies_min_p_and_accumulates_counts(self):
+        backend = TritonFullSamplingBackend(_make_config())
+        sp = _sp("full", top_k=-1, top_p=1.0, min_p=0.5, seed=123)
+        backend.prepare_step(
+            request_ids=["full"],
+            request_pool_indices=[1],
+            sampling_params_list=[sp],
+        )
+
+        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
+        logits[0, 33] = 1.0e6
+        logits_output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+
+        sampled, accept_lengths = backend.sample(
+            logits_output, self._sampling_info([1])
+        )
+
+        self.assertEqual(sampled.item(), 33)
+        self.assertEqual(accept_lengths.tolist(), [1])
+        self.assertEqual(backend._counts[1, 33].item(), 1)
+
 
 class TestPrepareStepGuardRails(unittest.TestCase):
     """Cheap boundary asserts in base.prepare_step. Cost is negligible and
@@ -249,7 +590,7 @@ class TestPrepareStepGuardRails(unittest.TestCase):
     corruption if they slip through."""
 
     def setUp(self):
-        self.backend = FlashInferSamplingBackend(_make_config())
+        self.backend = TritonSamplingBackend(_make_config())
 
     def test_misaligned_lists_assert(self):
         with self.assertRaises(AssertionError):

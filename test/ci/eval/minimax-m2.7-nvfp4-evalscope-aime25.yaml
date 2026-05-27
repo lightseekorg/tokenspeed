@@ -22,7 +22,7 @@ server:
     --reasoning-parser base
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
-    --sampling-backend flashinfer
+    --sampling-backend triton
     --quantization nvfp4
     --kv-cache-dtype fp8
     --weight-loader-prefetch-checkpoints

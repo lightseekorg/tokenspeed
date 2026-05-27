@@ -122,14 +122,13 @@ def _verify_chain_greedy(
 
 class GreedySamplingBackend(SamplingBackend):
     """Greedy-only backend: argmax for single-step, chain-greedy verify for
-    multi-step verification. No flashinfer / min_p / penalty machinery, no
+    multi-step verification. No min_p / penalty machinery, no
     coin buffers. Verify uses the fused CUDA kernel when available; falls
     back to a pure-torch implementation otherwise (CPU, ROCm, etc.).
 
     sampling_info is ignored for single-step (always argmax). verify() also
     treats every request as greedy — stochastic verification is not
-    supported. Intended as the default backend and as a fallback when
-    flashinfer is unavailable."""
+    supported. Intended as a lightweight fallback backend."""
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 

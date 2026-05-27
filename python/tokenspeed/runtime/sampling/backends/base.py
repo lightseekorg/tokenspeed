@@ -54,7 +54,7 @@ class SamplingBackendConfig:
     max_draft_tokens_per_req: int = 1
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
-    # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
+    # for penalties in TritonFullSamplingBackend). Indexed by req_pool_idx, not
     # batch row, so the data survives batch membership changes.
     max_req_pool_size: int = 0
     vocab_size: int = 0
@@ -204,17 +204,34 @@ class SamplingBackend(ABC):
             request_pool_indices=request_pool_indices,
         )
 
-    def prepare_capture(self, bs: int, num_tokens_per_req: int = 1) -> None:
+    def prepare_capture(
+        self,
+        bs: int,
+        num_tokens_per_req: int = 1,
+        capture_variant: str | None = None,
+    ) -> None:
         """Per-step refill for the capture/warm-up path. No flip detection;
         the backend uses its stub generator for any RNG-fed buffers so the
         captured graph sees a fully-written state.
         Default: no-op.
         """
+        _ = capture_variant
         self._prepare_step_hook(
             num_tokens_per_req=num_tokens_per_req,
             bs=bs,
             request_pool_indices=None,
         )
+
+    def cuda_graph_capture_variants(
+        self, num_tokens_per_req: int = 1
+    ) -> tuple[str, ...]:
+        """CUDA graph sampler variants this backend wants captured."""
+        _ = num_tokens_per_req
+        return ("default",)
+
+    def cuda_graph_replay_variant(self) -> str:
+        """CUDA graph sampler variant to replay for the already-prepared step."""
+        return "default"
 
     def _prepare_step_hook(
         self,

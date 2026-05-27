@@ -16,12 +16,12 @@ from tokenspeed.runtime.sampling import registry  # noqa: E402
 
 
 class TestSamplingBackendRegistryDefaults(unittest.TestCase):
-    def test_unresolved_default_uses_flashinfer_on_nvidia(self):
+    def test_unresolved_default_uses_triton_on_nvidia(self):
         platform = SimpleNamespace(is_nvidia=True)
         server_args = SimpleNamespace(sampling_backend=None)
 
         with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(registry._resolve_backend_name(server_args), "flashinfer")
+            self.assertEqual(registry._resolve_backend_name(server_args), "triton")
 
     def test_unresolved_default_uses_greedy_on_non_nvidia(self):
         platform = SimpleNamespace(is_nvidia=False)
@@ -32,7 +32,7 @@ class TestSamplingBackendRegistryDefaults(unittest.TestCase):
 
     def test_explicit_backend_is_preserved(self):
         platform = SimpleNamespace(is_nvidia=False)
-        server_args = SimpleNamespace(sampling_backend="flashinfer")
+        server_args = SimpleNamespace(sampling_backend="triton")
 
         with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(registry._resolve_backend_name(server_args), "flashinfer")
+            self.assertEqual(registry._resolve_backend_name(server_args), "triton")
