@@ -77,6 +77,7 @@ class ServerArgs:
     device: str = "cuda"
     served_model_name: str | None = None
     revision: str | None = None
+    language_model_only: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -696,6 +697,13 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.skip_tokenizer_init,
             help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--language-model-only",
+            action="store_true",
+            default=ServerArgs.language_model_only,
+            help="Skip vision/audio encoders on a multimodal checkpoint and "
+            "run text-only. Multimodal requests are rejected.",
         )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(

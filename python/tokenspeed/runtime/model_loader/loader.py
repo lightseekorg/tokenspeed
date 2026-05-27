@@ -149,6 +149,7 @@ def _initialize_model(
     # Only VLM wrappers accept these kwargs.
     extra_kwargs: dict = {}
     if model_config.is_multimodal:
+        extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
     return model_class(
         config=model_config.hf_config,

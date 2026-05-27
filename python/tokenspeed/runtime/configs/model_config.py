@@ -159,7 +159,28 @@ class ModelConfig:
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
         self.is_audio_model = is_audio_model(self.hf_config.architectures)
 
+        language_model_only = bool(getattr(server_args, "language_model_only", False))
+        if language_model_only:
+            if not self.is_multimodal:
+                raise ValueError(
+                    "--language-model-only requires a multimodal model checkpoint."
+                )
+            logger.info(
+                "Running in language-model-only mode: vision/audio encoders will "
+                "be skipped; requests with multimodal inputs will be rejected."
+            )
+        # ``is_multimodal`` is the architectural fact; this is the runtime gate.
+        self.is_multimodal_active = self.is_multimodal and not language_model_only
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
+        # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
+        # needs headroom that the global default doesn't account for.
+        if self.is_multimodal_active and server_args.gpu_memory_utilization > 0.9:
+            logger.info(
+                "Clamping gpu_memory_utilization %.2f -> 0.9 to leave headroom "
+                "for the vision encoder.",
+                server_args.gpu_memory_utilization,
+            )
+            server_args.gpu_memory_utilization = 0.9
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length

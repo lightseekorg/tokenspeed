@@ -308,6 +308,7 @@ class ModelExecutor:
         _mm_model = self.model_runner.model
         if (
             hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            and getattr(_mm_model, "is_multimodal_active", True)
             and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
             and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
         ):
