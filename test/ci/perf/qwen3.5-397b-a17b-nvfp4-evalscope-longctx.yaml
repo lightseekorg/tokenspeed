@@ -19,7 +19,7 @@ server:
     --max-model-len 1048576
     --hf-overrides '{"max_position_embeddings": 1048576}'
     --max-num-seqs 4
-    --gpu-memory-utilization 0.95
+    --gpu-memory-utilization 0.85
     --disable-cuda-graph-padding
     --trust-remote-code
     --attention-backend trtllm
@@ -52,7 +52,7 @@ perf:
     set +e &&
     PERF_STATUS=0 &&
     for run in $(seq 1 $RUNS); do
-    for len in 32k 64k 128k 256k 512k 1024k; do
+    for len in 128k 256k 512k 1024k; do
     echo "==================================================";
     echo ">>> RUN ${run}/${RUNS}  |  prompt_len=${len}";
     echo "==================================================";
