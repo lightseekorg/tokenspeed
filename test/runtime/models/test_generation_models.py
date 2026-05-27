@@ -38,7 +38,7 @@ sys.path.insert(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ),
 )
-from test.runners import DEFAULT_PROMPTS, HFRunner, RTRunner, check_close_model_outputs
+from test.runners import DEFAULT_PROMPTS, RTRunner
 from test.test_utils import is_in_ci
 
 
@@ -63,6 +63,7 @@ class ModelCase:
     trust_remote_code: bool = False
     enforce_eager: bool = False
     max_model_len: int = None
+    max_new_tokens: int = 32
     min_gpu_memory_gb: float = 0
     blackwell_only: bool = False
     extra_kwargs: dict = dataclasses.field(default_factory=dict)
@@ -95,10 +96,12 @@ CI_MODELS = [
         tp_size=_AVAILABLE_GPUS,
         skip_long_prompt=True,
         blackwell_only=True,
+        max_new_tokens=256,
         extra_kwargs={
             "disable_prefill_graph": True,
             "max_total_tokens": 32768,
             "max_model_len": 16384,
+            "attention_backend": "trtllm",
             "moe_backend": "flashinfer_cutlass",
             "speculative_algorithm": "MTP",
             "speculative_num_steps": 3,
@@ -119,6 +122,36 @@ ALL_OTHER_MODELS = [
 
 TORCH_DTYPES = [torch.bfloat16]
 
+QUALITY_CHECKS = [
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is the capital of France? Reply in one word.",
+            }
+        ],
+        "expected": "Paris",
+        "max_tokens": 32,
+    },
+    {
+        "messages": [
+            {"role": "user", "content": "What is 2+2? Reply with just the number."}
+        ],
+        "expected": "4",
+        "max_tokens": 32,
+    },
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Name the largest planet in our solar system in one word.",
+            }
+        ],
+        "expected": "Jupiter",
+        "max_tokens": 32,
+    },
+]
+
 
 class TestGenerationModels(unittest.TestCase):
 
@@ -133,37 +166,7 @@ class TestGenerationModels(unittest.TestCase):
         torch_dtype: torch.dtype,
     ) -> None:
         model_path = model_case.model_path
-        prefill_tolerance, decode_tolerance, rouge_l_tolerance = (
-            model_case.prefill_tolerance,
-            model_case.decode_tolerance,
-            model_case.rouge_l_tolerance,
-        )
-        max_new_tokens = 32
-
-        # with HFRunner(
-        #     model_path,
-        #     torch_dtype=torch_dtype,
-        #     model_type="generation",
-        #     trust_remote_code=model_case.trust_remote_code,
-        #     tp_size=model_case.tp_size,
-        #     max_model_len=model_case.max_model_len,
-        # ) as hf_runner:
-        #     hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
-        #     if torch.cuda.current_device() == 0:
-        #         print(f"\n{'='*60}", flush=True)
-        #         print(f"[HFRunner] model={model_path}", flush=True)
-        #         for i, (prompt, output) in enumerate(
-        #             zip(prompts, hf_outputs.output_strs)
-        #         ):
-        #             print(
-        #                 f"  [{i}] prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}",
-        #                 flush=True,
-        #             )
-        #             print(
-        #                 f"  [{i}] output: {output[:100]}{'...' if len(output) > 100 else ''}",
-        #                 flush=True,
-        #             )
-        #         print(f"{'='*60}\n", flush=True)
+        max_new_tokens = model_case.max_new_tokens
 
         with RTRunner(
             model_path,
@@ -197,6 +200,19 @@ class TestGenerationModels(unittest.TestCase):
                     )
                 print(f"{'='*60}\n", flush=True)
 
+            expected_by_prompt = {
+                q["messages"][0]["content"]: q["expected"] for q in QUALITY_CHECKS
+            }
+            for prompt, output in zip(prompts, rt_outputs.output_strs):
+                expected = expected_by_prompt.get(prompt)
+                if expected is None:
+                    continue
+                self.assertIn(
+                    expected,
+                    output,
+                    f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}",
+                )
+
     def test_ci_models(self):
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         for model_case in CI_MODELS:
@@ -214,12 +230,9 @@ class TestGenerationModels(unittest.TestCase):
                 continue
             for torch_dtype in TORCH_DTYPES:
 
-                # Skip long prompts for models that do not have a long context
-                prompts = DEFAULT_PROMPTS
-                if model_case.skip_long_prompt:
-                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+                prompts = [q["messages"][0]["content"] for q in QUALITY_CHECKS]
 
-                # Assert the logits and output strs are close
+                # Assert generation contains expected content.
                 self.assert_close_logits_and_output_strs(
                     prompts, model_case, torch_dtype
                 )
