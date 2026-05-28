@@ -71,7 +71,9 @@ def _len_key(length: str) -> int:
 
 def _summary_files(sweep_dir: Path):
     """Yield (run_id, prompt_len, summary_json_path)."""
-    for run_dir in sorted(p for p in sweep_dir.iterdir() if p.is_dir() and p.name.startswith("run")):
+    for run_dir in sorted(
+        p for p in sweep_dir.iterdir() if p.is_dir() and p.name.startswith("run")
+    ):
         try:
             run_id = int(run_dir.name[3:])
         except ValueError:
@@ -145,48 +147,93 @@ def print_table(rows, summary):
 
     # Aggregated
     print("\n=== Long-context perf (aggregated, avg of N runs) ===")
-    print(f"  {'Prompt':<8} {'N':>3} "
-          f"{'avg TPS/user':>13} {'TPS range':>16} "
-          f"{'avg AR':>9} {'AR range':>14} "
-          f"{'avg Total TPS':>15}")
+    print(
+        f"  {'Prompt':<8} {'N':>3} "
+        f"{'avg TPS/user':>13} {'TPS range':>16} "
+        f"{'avg AR':>9} {'AR range':>14} "
+        f"{'avg Total TPS':>15}"
+    )
     print("  " + "-" * 80)
     for s in summary:
         tps_rng = f"{s['min_tps_per_user']:.1f}-{s['max_tps_per_user']:.1f}"
         ar_rng = f"{s['min_acceptance_rate']:.2f}-{s['max_acceptance_rate']:.2f}"
-        print(f"  {s['prompt_len']:<8} {s['n_runs']:>3} "
-              f"{s['avg_tps_per_user']:>13.2f} {tps_rng:>16} "
-              f"{s['avg_acceptance_rate']:>9.3f} {ar_rng:>14} "
-              f"{s['avg_total_throughput']:>15.2f}")
+        print(
+            f"  {s['prompt_len']:<8} {s['n_runs']:>3} "
+            f"{s['avg_tps_per_user']:>13.2f} {tps_rng:>16} "
+            f"{s['avg_acceptance_rate']:>9.3f} {ar_rng:>14} "
+            f"{s['avg_total_throughput']:>15.2f}"
+        )
     print()
 
 
 def write_csv(out_path: Path, rows, summary):
     with out_path.open("w", newline="") as fp:
         w = csv.writer(fp)
-        w.writerow(["section", "prompt_len", "run", "tps_per_user",
-                    "acceptance_rate", "total_throughput", "tpot_ms"])
+        w.writerow(
+            [
+                "section",
+                "prompt_len",
+                "run",
+                "tps_per_user",
+                "acceptance_rate",
+                "total_throughput",
+                "tpot_ms",
+            ]
+        )
         for r in rows:
-            w.writerow(["per_run", r["prompt_len"], r["run"],
-                        r["tps_per_user"], r["acceptance_rate"],
-                        r["total_throughput"], r["tpot_ms"]])
+            w.writerow(
+                [
+                    "per_run",
+                    r["prompt_len"],
+                    r["run"],
+                    r["tps_per_user"],
+                    r["acceptance_rate"],
+                    r["total_throughput"],
+                    r["tpot_ms"],
+                ]
+            )
         w.writerow([])
-        w.writerow(["section", "prompt_len", "n_runs",
-                    "avg_tps_per_user", "min_tps_per_user", "max_tps_per_user",
-                    "avg_acceptance_rate", "min_acceptance_rate", "max_acceptance_rate",
-                    "avg_total_throughput"])
+        w.writerow(
+            [
+                "section",
+                "prompt_len",
+                "n_runs",
+                "avg_tps_per_user",
+                "min_tps_per_user",
+                "max_tps_per_user",
+                "avg_acceptance_rate",
+                "min_acceptance_rate",
+                "max_acceptance_rate",
+                "avg_total_throughput",
+            ]
+        )
         for s in summary:
-            w.writerow(["agg", s["prompt_len"], s["n_runs"],
-                        s["avg_tps_per_user"], s["min_tps_per_user"], s["max_tps_per_user"],
-                        s["avg_acceptance_rate"], s["min_acceptance_rate"], s["max_acceptance_rate"],
-                        s["avg_total_throughput"]])
+            w.writerow(
+                [
+                    "agg",
+                    s["prompt_len"],
+                    s["n_runs"],
+                    s["avg_tps_per_user"],
+                    s["min_tps_per_user"],
+                    s["max_tps_per_user"],
+                    s["avg_acceptance_rate"],
+                    s["min_acceptance_rate"],
+                    s["max_acceptance_rate"],
+                    s["avg_total_throughput"],
+                ]
+            )
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("sweep_dir", type=Path,
-                    help="Top-level dir containing run<N>/<len>/<model>/benchmark_summary.json")
-    ap.add_argument("-o", "--output", type=Path, default=None,
-                    help="Optional CSV output path")
+    ap.add_argument(
+        "sweep_dir",
+        type=Path,
+        help="Top-level dir containing run<N>/<len>/<model>/benchmark_summary.json",
+    )
+    ap.add_argument(
+        "-o", "--output", type=Path, default=None, help="Optional CSV output path"
+    )
     args = ap.parse_args()
 
     if not args.sweep_dir.is_dir():
