@@ -197,7 +197,12 @@ class HostExecutor:
         )
 
     def enqueue_loadback(
-        self, op_id, src_pages, dst_pages, kind: CacheKind | str = CacheKind.KV
+        self,
+        op_id,
+        src_pages,
+        dst_pages,
+        kind: CacheKind | str = CacheKind.KV,
+        layerwise_cow_dst_pages_by_src: dict[int, list[int]] | None = None,
     ) -> None:
         kind = CacheKind(kind)
         pool = self.pools[kind]
@@ -206,6 +211,22 @@ class HostExecutor:
             return
         host_indices = page_ids_to_token_indices(src_pages, pool.page_size(), "cpu")
         device_indices = page_ids_to_token_indices(dst_pages, pool.page_size(), "cpu")
+        cow_src_indices = None
+        cow_dst_indices = None
+        if layerwise_cow_dst_pages_by_src:
+            cow_src_pages: list[int] = []
+            cow_dst_pages: list[int] = []
+            for dst_page in dst_pages:
+                for cow_dst in layerwise_cow_dst_pages_by_src.get(int(dst_page), []):
+                    cow_src_pages.append(int(dst_page))
+                    cow_dst_pages.append(int(cow_dst))
+            if cow_src_pages:
+                cow_src_indices = page_ids_to_token_indices(
+                    cow_src_pages, pool.page_size(), "cpu"
+                )
+                cow_dst_indices = page_ids_to_token_indices(
+                    cow_dst_pages, pool.page_size(), "cpu"
+                )
         self.load_queues[kind].append(
             TransferUnit(
                 kind=kind,
@@ -214,6 +235,8 @@ class HostExecutor:
                 src_indices=host_indices,
                 dst_indices=device_indices,
                 op_id=op_id,
+                layerwise_cow_src_indices=cow_src_indices,
+                layerwise_cow_dst_indices=cow_dst_indices,
             )
         )
 
@@ -231,10 +254,6 @@ class HostExecutor:
             self._start_writing()
         finally:
             self._writeback_block_quota = previous_writeback_block_quota
-
-    def fence_writeback_after(self, producer_stream) -> None:
-        if producer_stream is not None:
-            self.write_stream.wait_stream(producer_stream)
 
     def _start_writing(self) -> None:
         if not self._has_work(self.write_queues):
@@ -284,15 +303,32 @@ class HostExecutor:
 
                 unit = self._merge_units(units)
                 src_indices, dst_indices = self._prepare_indices(unit, pool)
+                layerwise_copy = getattr(pool, "copy_layer", None)
+                cow_src_indices = unit.layerwise_cow_src_indices
+                cow_dst_indices = unit.layerwise_cow_dst_indices
                 for layer_index in range(pool.num_layers()):
                     pool.loadback(
                         src_indices.to(torch.int64),
                         dst_indices.to(torch.int64),
                         layer_index,
                     )
+                    if (
+                        layerwise_copy is not None
+                        and cow_src_indices is not None
+                        and cow_dst_indices is not None
+                    ):
+                        layerwise_copy(
+                            cow_src_indices.to(torch.int64),
+                            cow_dst_indices.to(torch.int64),
+                            layer_index,
+                        )
                     producer_event.complete(layer_index)
                 self._record_if_cuda(src_indices, self.load_stream)
                 self._record_if_cuda(dst_indices, self.load_stream)
+                if cow_src_indices is not None:
+                    self._record_if_cuda(cow_src_indices, self.load_stream)
+                if cow_dst_indices is not None:
+                    self._record_if_cuda(cow_dst_indices, self.load_stream)
 
                 op_ids = _ordered_unique(unit.op_id for unit in units)
                 self.ack_load_queue.append(_Ack(producer_event.finish_event, op_ids))
@@ -319,6 +355,16 @@ class HostExecutor:
         if len(units) == 1:
             return units[0]
         first = units[0]
+        cow_src_indices = [
+            unit.layerwise_cow_src_indices
+            for unit in units
+            if unit.layerwise_cow_src_indices is not None
+        ]
+        cow_dst_indices = [
+            unit.layerwise_cow_dst_indices
+            for unit in units
+            if unit.layerwise_cow_dst_indices is not None
+        ]
         return TransferUnit(
             kind=first.kind,
             src_loc=first.src_loc,
@@ -327,6 +373,12 @@ class HostExecutor:
             dst_indices=torch.cat([unit.dst_indices for unit in units]),
             op_id=-1,
             is_retract=any(unit.is_retract for unit in units),
+            layerwise_cow_src_indices=(
+                torch.cat(cow_src_indices) if cow_src_indices else None
+            ),
+            layerwise_cow_dst_indices=(
+                torch.cat(cow_dst_indices) if cow_dst_indices else None
+            ),
         )
 
     def _prepare_indices(
