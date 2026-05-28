@@ -89,16 +89,15 @@ def triton_mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
     softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    batch_size = cu_seqlens_q.shape[0] - 1
     out = torch.empty_like(q)
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
@@ -118,11 +117,11 @@ def triton_mha_prefill(
         out,
         empty_k,
         empty_v,
-        cu_seqlens_q,
+        cu_seqlens,
         cache_seqlens,
         None,
         True,
-        max_seqlen_q,
+        max_seqlen,
         sm_scale=sm_scale,
         logit_cap=logit_cap,
         sliding_window_size=window_left,
