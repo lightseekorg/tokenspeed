@@ -290,12 +290,12 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
             CacheOpSpec spec;
             spec.request_id = id;
             // Capture L3 backup metadata while the host node-ref is still alive.
-            // write_diff pages correspond to the tail of the full root→leaf hash path.
+            // Collect hashes in leaf-to-root order to match pages_to_transfer ordering.
             if (config_.enable_l3_storage) {
                 TreeNode* host_node = req->GetHostNode<fsm::Draining>();
                 if (host_node) {
                     std::vector<std::string> all_hashes;
-                    for (TreeNode* n : RootToLeaf(host_node)) {
+                    for (TreeNode* n : LeafToRoot(host_node)) {
                         const auto& h = n->PageHashes();
                         all_hashes.insert(all_hashes.end(), h.begin(), h.end());
                     }
@@ -304,7 +304,7 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
                         if (p.kind == CacheKind::kKV) n_kv_pairs++;
                     }
                     if (n_kv_pairs > 0 && static_cast<std::int32_t>(all_hashes.size()) >= n_kv_pairs) {
-                        spec.backup_rolling_hashes.assign(all_hashes.end() - n_kv_pairs, all_hashes.end());
+                        spec.backup_rolling_hashes.assign(all_hashes.begin(), all_hashes.begin() + n_kv_pairs);
                         for (const auto& p : pages_to_transfer) {
                             if (p.kind == CacheKind::kKV) {
                                 spec.backup_host_pages.push_back(p.dst);

@@ -30,6 +30,7 @@
 #include "fsm/cache_events.h"
 #include "fsm/forward_states.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
+#include "resource/radix_tree/tree_node.h"
 #include "resource/types.h"
 #include "scheduler/request.h"
 #include "scheduler/request_spec.h"
@@ -46,6 +47,10 @@ std::optional<fsm::SchedulePrefetchEvent> Scheduler::schedulePrefetch(Request* r
     }
 
     const std::int32_t num_pages_to_fetch = storage.hit_pages;
+
+    // Lock the matched host node BEFORE eviction so it cannot be evicted.
+    auto host_node_ref = std::make_unique<HostNodeRef>(match.host.last_node);
+
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(num_pages_to_fetch)) {
         return {};
     }
@@ -53,7 +58,7 @@ std::optional<fsm::SchedulePrefetchEvent> Scheduler::schedulePrefetch(Request* r
     std::vector<std::string> hashes(storage.rolling_hashes.begin(),
                                     storage.rolling_hashes.begin() + num_pages_to_fetch);
 
-    return fsm::SchedulePrefetchEvent{num_pages_to_fetch, std::move(hashes), &host_allocator_, match.host.last_node};
+    return fsm::SchedulePrefetchEvent{num_pages_to_fetch, std::move(hashes), &host_allocator_, std::move(host_node_ref)};
 }
 
 PrefetchOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefetchEvent event) {

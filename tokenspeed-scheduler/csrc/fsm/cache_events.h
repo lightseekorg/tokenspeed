@@ -21,18 +21,18 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "fsm/base_event.h"
 #include "fsm/states.h"
+#include "resource/radix_tree/tree_node.h"
 
 namespace tokenspeed {
 
 class PageAllocator;
-class TreeNode;
-
 namespace fsm {
 
 struct Aborting;
@@ -44,11 +44,11 @@ struct SchedulePrefetchEvent : InvalidTransitionHandler<SchedulePrefetchEvent> {
 
     SchedulePrefetchEvent() = default;
     SchedulePrefetchEvent(std::int32_t num_pages_to_fetch, std::vector<std::string> rolling_page_hashes,
-                          PageAllocator* host_allocator, TreeNode* host_match_node)
+                          PageAllocator* host_allocator, std::unique_ptr<HostNodeRef> host_node_ref)
         : num_pages_to_fetch_{num_pages_to_fetch},
           rolling_page_hashes_{std::move(rolling_page_hashes)},
           host_allocator_{host_allocator},
-          host_match_node_{host_match_node} {}
+          host_node_ref_{std::move(host_node_ref)} {}
 
     State operator()(Submitted&& state);
 
@@ -57,7 +57,7 @@ struct SchedulePrefetchEvent : InvalidTransitionHandler<SchedulePrefetchEvent> {
 private:
     std::int32_t num_pages_to_fetch_{};
     PageAllocator* host_allocator_{};
-    TreeNode* host_match_node_{};
+    std::unique_ptr<HostNodeRef> host_node_ref_;
     std::vector<std::string> rolling_page_hashes_;
 };
 
