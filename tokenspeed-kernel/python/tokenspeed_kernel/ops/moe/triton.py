@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.trtllm import (
     moe_align_block_size as _moe_align_block_size,
 )
@@ -328,7 +329,7 @@ def _biased_grouped_topk_reference(
     "route",
     name="triton_minimax_biased_grouped_topk",
     solution="triton",
-    dtypes={torch.float32},
+    signatures=format_signatures("logits", "dense", {torch.float32}),
     traits={
         "output_type": frozenset({"topk"}),
         "biased": frozenset({True}),
@@ -776,7 +777,9 @@ def _normalize_fp8_group_scale_layout(
     name="triton_moe_fused_experts",
     features={"dispatch_sorted"},
     solution="triton",
-    dtypes={torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+    signatures=format_signatures(
+        "x", "dense", {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+    ),
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
 )
@@ -978,7 +981,7 @@ def _moe_sum_reduce_kernel(
     "combine",
     name="triton_moe_sum_reduce",
     solution="triton",
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={"comm_strategy": frozenset({None})},
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
@@ -1023,7 +1026,7 @@ def moe_sum_reduce_triton(
     "combine",
     name="torch_compile_moe_sum_reduce",
     solution="reference",
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={"comm_strategy": frozenset({None})},
     priority=Priority.PORTABLE + 1,
     tags={"portability"},
@@ -1044,7 +1047,7 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     "dispatch",
     name="triton_moe_align_block_size",
     solution="triton",
-    dtypes={torch.int32},
+    signatures=format_signatures("indices", "dense", {torch.int32}),
     traits={
         "comm_strategy": frozenset({"local"}),
     },

@@ -31,10 +31,30 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 logger = logging.getLogger(__name__)
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_MXFP8_BLOCK_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(128, 128),
+)
+_FP8_TENSOR_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="tensor",
+)
+_FP8_CHANNEL_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="channel",
+)
+_MXFP8_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE
+)
+_FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
+) | format_signatures(("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_CHANNEL_SCALE)
 
 
 def prepare_block_fp8_matmul_inputs(
@@ -697,10 +717,8 @@ def triton_scaled_mm(
         min_arch_version=ArchVersion(10, 0),
         vendors=frozenset({"nvidia"}),
     ),
-    dtypes={_fp8_dtype},
-    traits={
-        "quant": frozenset({"mxfp8"}),
-    },
+    signatures=_MXFP8_FORMAT_SIGNATURES,
+    traits={},
     priority=Priority.PERFORMANT + 3,
     tags={"portability"},
 )
@@ -740,7 +758,7 @@ def triton_mm_fp8_blockscale(
         min_arch_version=ArchVersion(10, 0),
         vendors=frozenset({"nvidia"}),
     ),
-    dtypes={_fp8_dtype},
+    signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
     },

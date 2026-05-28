@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 def _next_power_of_2(n: int) -> int:
@@ -361,7 +362,9 @@ def apply_rope_triton(
     name="triton_embedding_rope",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("query", "key"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={
         "partial_rotary": frozenset({True, False}),

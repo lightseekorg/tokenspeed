@@ -411,7 +411,7 @@ class LogitsProcessor(nn.Module):
                 .view(logits.size(0), -1)
             )
 
-        logits = logits[:, : self.config.vocab_size].float()
+        logits = logits[:, : self.config.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)
@@ -480,6 +480,7 @@ class LogitsProcessor(nn.Module):
         Returns:
             torch.Tensor: logprobs from logits
         """
+        last_logits = last_logits.float()
         # Scale logits if temperature scaling is enabled
         if logits_metadata.temp_scaled_logprobs:
             last_logits = last_logits / logits_metadata.temperature
@@ -513,7 +514,7 @@ def fused_softcap_kernel(
     mask = offsets < n_elements
 
     # Load values
-    x = tl.load(full_logits_ptr + offsets, mask=mask)
+    x = tl.load(full_logits_ptr + offsets, mask=mask).to(tl.float32)
 
     # Perform operations in-place
     x = x / softcapping_value

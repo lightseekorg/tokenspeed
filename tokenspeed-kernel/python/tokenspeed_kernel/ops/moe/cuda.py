@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.activation import (
@@ -52,7 +53,9 @@ try:
             "route",
             name="cuda_routing_flash",
             solution="cuda",
-            dtypes={torch.float16, torch.bfloat16, torch.float32},
+            signatures=format_signatures(
+                "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+            ),
             traits={
                 "output_type": frozenset({"topk"}),
                 "biased": frozenset({True}),

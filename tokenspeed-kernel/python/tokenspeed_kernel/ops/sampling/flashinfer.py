@@ -32,8 +32,8 @@ if current_platform().is_nvidia:
     try:
         from flashinfer.sampling import (
             min_p_sampling_from_probs,
-            softmax,
             top_k_renorm_prob,
+            top_k_top_p_sampling_from_logits,
             top_k_top_p_sampling_from_probs,
             top_p_renorm_prob,
             top_p_renorm_probs,
@@ -42,7 +42,7 @@ if current_platform().is_nvidia:
         pass
 
     try:
-        from flashinfer.sampling import top_k_top_p_sampling_from_logits
+        from tokenspeed_kernel.thirdparty.cuda.flashinfer_softmax import softmax
     except ImportError:
         pass
 

@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention.triton.mha_decode import decode_attention_f
 from tokenspeed_kernel.ops.attention.triton.mha_prefill import prefill_attention_fwd
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -72,7 +73,9 @@ def mha_merge_state_kernel(
     name="triton_mha_prefill",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={
         "sliding_window": frozenset({False, True}),
@@ -138,9 +141,12 @@ def triton_mha_prefill(
     name="triton_mha_extend_with_kvcache",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={
+        "is_causal": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False, True}),
@@ -158,6 +164,7 @@ def triton_mha_extend_with_kvcache(
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
+    is_causal: bool = False,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -193,7 +200,7 @@ def triton_mha_extend_with_kvcache(
         cu_seqlens_q,
         cache_seqlens,
         None,
-        False,
+        is_causal,
         max_seqlen_q,
         sm_scale=sm_scale,
         logit_cap=logit_cap,
@@ -216,7 +223,9 @@ def triton_mha_extend_with_kvcache(
     name="triton_mha_decode_with_kvcache_cached",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={
         "sliding_window": frozenset({False, True}),
@@ -289,7 +298,9 @@ def triton_mha_decode_with_kvcache(
     name="triton_mha_merge_state",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("out_a", "out_b"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={},
     tags={"portability"},

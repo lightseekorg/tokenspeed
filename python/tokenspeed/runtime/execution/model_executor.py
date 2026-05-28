@@ -50,7 +50,7 @@ from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
-from tokenspeed.runtime.utils.env import envs, get_global_server_args
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -184,6 +184,7 @@ class ModelExecutor:
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self._layerwise_mamba_cow_done = None
 
         if config.spec_algo is not None:
             max_num_pages_per_req = (
@@ -234,6 +235,12 @@ class ModelExecutor:
             )
             embed, head = self.model_runner.model.get_embed_and_head()
             draft_model_runner.model.set_embed_and_head(embed, head)
+            target_hf = self.model_runner.model_config.hf_config
+            mm_pad_substitute_id = getattr(
+                target_hf, "image_token_id", None
+            ) or getattr(target_hf, "media_placeholder_token_id", None)
+            if mm_pad_substitute_id is not None:
+                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
@@ -307,8 +314,9 @@ class ModelExecutor:
         _mm_model = self.model_runner.model
         if (
             hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            and getattr(_mm_model, "is_multimodal_active", True)
             and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and get_global_server_args().mm_attention_backend != "flashinfer_cudnn"
+            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
         ):
             self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
                 _mm_model.mapping
@@ -983,6 +991,67 @@ class ModelExecutor:
                     mask_1d, hist_dev, vcl
                 )
 
+    def set_layerwise_mamba_cow_done(
+        self, cow_by_src: dict[int, list[int]] | None
+    ) -> None:
+        self._layerwise_mamba_cow_done = (
+            {
+                int(src): {int(dst) for dst in dsts}
+                for src, dsts in cow_by_src.items()
+                if dsts
+            }
+            if cow_by_src
+            else None
+        )
+
+    def _skip_completed_layerwise_mamba_cow(
+        self, forward_op, bs: int
+    ) -> torch.Tensor | None:
+        cow_done = self._layerwise_mamba_cow_done
+        self._layerwise_mamba_cow_done = None
+        if not cow_done or not getattr(self.input_buffers, "has_mamba", False):
+            return None
+        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
+        working_indices = getattr(forward_op, "mamba_pool_indices", None)
+        if cow_src_indices is None or working_indices is None:
+            return None
+
+        cow_src_indices = list(cow_src_indices)[:bs]
+        working_indices = list(working_indices)[:bs]
+        skipped_mask = [False] * bs
+        changed = False
+        for i, (cow_src, working) in enumerate(zip(cow_src_indices, working_indices)):
+            cow_src = int(cow_src)
+            working = int(working)
+            if working in cow_done.get(cow_src, set()):
+                cow_src_indices[i] = -1
+                skipped_mask[i] = True
+                changed = True
+        if not changed:
+            return None
+
+        self.input_buffers._mamba_cow_src_indices_cpu[:bs].copy_(
+            torch.as_tensor(cow_src_indices, dtype=torch.int32)
+        )
+        cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
+        cow_src_buf[:bs].copy_(
+            self.input_buffers._mamba_cow_src_indices_cpu[:bs], non_blocking=True
+        )
+        return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
+
+    @staticmethod
+    def _mamba_retract_reset_mask(
+        mamba_cow_src: torch.Tensor,
+        bs: int,
+        skipped_layerwise_cow_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        reset_mask = mamba_cow_src[:bs] >= 0
+        if skipped_layerwise_cow_mask is not None:
+            reset_mask = reset_mask | skipped_layerwise_cow_mask[:bs].to(
+                device=reset_mask.device, dtype=torch.bool
+            )
+        return reset_mask
+
     def execute_forward_op(
         self,
         forward_op,
@@ -1009,11 +1078,15 @@ class ModelExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
+            bs = len(forward_op.request_ids)
             self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
+            )
+            skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
+                forward_op, bs
             )
             self._active_positions_override = self._build_mrope_positions_override(
                 forward_op=forward_op,
@@ -1021,7 +1094,6 @@ class ModelExecutor:
                 total_tokens=total_tokens,
             )
 
-            bs = len(forward_op.request_ids)
             forward_mode = ForwardMode.from_num_extends(num_extends, bs)
 
             if num_extends <= 0:
@@ -1049,7 +1121,11 @@ class ModelExecutor:
                         )
                 elif has_retract:
                     if hasattr(self.attn_backend, "reset_current_inputs"):
-                        retract_mask = mamba_cow_src[:bs] >= 0
+                        retract_mask = self._mamba_retract_reset_mask(
+                            mamba_cow_src,
+                            bs,
+                            skipped_layerwise_cow_mask,
+                        )
                         self.attn_backend.reset_current_inputs(
                             self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
                             mamba_pool_indices[:bs][retract_mask],

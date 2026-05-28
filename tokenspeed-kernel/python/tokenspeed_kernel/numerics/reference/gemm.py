@@ -26,8 +26,27 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_FP8_BLOCK_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(128, 128),
+)
+_FP8_TENSOR_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="tensor",
+)
+_MXFP8_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "mxfp8", {fp8_dtype}, scale=_FP8_BLOCK_SCALE
+)
+_FP8_TENSOR_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
+)
+_DENSE_GEMM_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "dense", {torch.bfloat16, torch.float16, torch.float32}
+)
 
 
 @register_kernel(
@@ -35,8 +54,8 @@ fp8_dtype = Platform.get().fp8e4m3fn.dtype
     "mm",
     name="torch_mm_fp8_blockscale",
     solution="reference",
-    dtypes={fp8_dtype},
-    traits={"quant": frozenset({"mxfp8"})},
+    signatures=_MXFP8_FORMAT_SIGNATURES,
+    traits={},
     priority=Priority.PORTABLE + 2,
     tags={"portability"},
 )
@@ -90,7 +109,7 @@ def torch_mm_fp8_blockscale(
     "mm",
     name="torch_mm_fp8_scaled_mnk",
     solution="reference",
-    dtypes={fp8_dtype},
+    signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"NK"}),
     },
@@ -132,7 +151,7 @@ def torch_mm_fp8_scaled_mnk(
     "mm",
     name="torch_mm_fp8_scaled_nkm",
     solution="reference",
-    dtypes={fp8_dtype},
+    signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
     },
@@ -172,7 +191,7 @@ def torch_mm_fp8_scaled_nkm(
     "mm",
     name="torch_mm",
     solution="reference",
-    dtypes={torch.bfloat16, torch.float16, torch.float32},
+    signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 3,
     tags={"determinism", "portability"},

@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -119,7 +120,7 @@ public:
     // O(N) scan — locked leaves are in lru_leaves_ but not evictable.
     std::int32_t EvictablePagesNum() const {
         std::int32_t total = 0;
-        for (const auto& [ts, node] : lru_leaves_) {
+        for (const auto& [ts, sid, node] : lru_leaves_) {
             const auto& res = GetResource<RType>(node);
             if (res.IsEvictable()) {
                 total += res.NumPages();
@@ -135,7 +136,13 @@ private:
     PageAllocator* allocator_;
     // Leaf nodes sorted by last-access time (oldest first = LRU eviction order).
     // node_time_ holds each node's sort key for O(1) keyed removal.
-    std::set<std::pair<timestamp_t, TreeNode*>> lru_leaves_;
+    // Tuple key: (Time, SeqId, TreeNode*). SeqId is the deterministic
+    // tiebreaker — pointer values would diverge across TP ranks (per-process
+    // ASLR), causing different ranks to evict different leaves on Time ties
+    // and eventually wedging the next NCCL collective. Stored as std::int64_t
+    // (not TreeNode::seq_id_t) to keep the include cycle broken — tree_node.h
+    // pulls in this header for NodeResource.
+    std::set<std::tuple<timestamp_t, std::int64_t, TreeNode*>> lru_leaves_;
     std::unordered_map<TreeNode*, timestamp_t> node_time_;
     EvictionCallback eviction_callback_{};
 };

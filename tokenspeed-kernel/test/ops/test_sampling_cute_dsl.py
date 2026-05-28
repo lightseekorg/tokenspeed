@@ -21,9 +21,11 @@
 """Tests for the CuTe DSL argmax kernel wrapper.
 
 These exercise:
-  * Parity with ``torch.argmax`` across vocab sizes used by real LLMs.
-  * Correct routing through the torch fallback for unsupported shapes/dtypes
-    (small N, unaligned N, fp16/bf16).
+  * Parity with ``torch.argmax`` across vocab sizes used by real LLMs and
+    dtypes (fp32 / bf16 / fp16). The kernel upcasts at load and reduces in
+    Float32, so low-precision inputs match torch bit-for-bit.
+  * Correct routing through the torch fallback for unsupported shapes
+    (small N, unaligned N, 1D, CPU).
   * CUDA-graph capture/replay — the kernel must stay in-place under graph
     capture, since the sampling backends run under captured graphs.
   * Pure-torch fallback path on non-NVIDIA hosts (AMD ROCm / CPU-only /
@@ -147,7 +149,7 @@ def test_argmax_falls_back_for_unaligned_N(N):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_argmax_falls_back_for_low_precision_dtypes(dtype):
+def test_argmax_matches_torch_for_low_precision_dtypes(dtype):
     _need_cuda()
     x = torch.randn(8, 4096, device="cuda", dtype=dtype)
     torch.testing.assert_close(cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)

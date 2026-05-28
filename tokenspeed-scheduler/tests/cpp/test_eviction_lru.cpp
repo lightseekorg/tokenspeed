@@ -26,6 +26,7 @@
 
 #include "unit_test_helper.h"
 #include "resource/allocator/page_allocator.h"
+#include "resource/kv_prefix_cache/eviction.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/radix_tree/tree_node.h"
 #include "resource/types.h"
@@ -179,6 +180,46 @@ TEST_F(EvictionLRUTest, EvictablePagesNumExcludesLockedLeaves) {
     // Release lock — node becomes evictable again via OnNodeEvictable callback.
     ref = DeviceNodeRef(nullptr);
     EXPECT_EQ(cache_->GetDeviceManager().EvictablePagesNum(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// TP-determinism: when two leaves share Time(), the LRU set must break ties
+// on SeqId (not on pointer value, which is ASLR-randomized per process).
+// Without this, different TP ranks evict different leaves on Time ties and
+// the next NCCL collective deadlocks on a shape mismatch.
+// ---------------------------------------------------------------------------
+
+TEST(EvictionLRUDeterminism, EvictionDeterministicOnTimeTies) {
+    constexpr int32_t kPageSize = 4;
+    constexpr int32_t kTotalPages = 32;
+    PageAllocator alloc(kPageSize, kTotalPages);
+
+    auto ts = std::chrono::steady_clock::now();
+    TreeNode root;
+
+    auto t1 = MakeAlignedTokens(1, kPageSize, 1);
+    auto first = std::make_unique<TreeNode>(t1, ts);
+    first->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(alloc.Allocate(1)));
+    TreeNode* first_raw = first.get();
+    root.AddChild(t1, std::move(first));
+
+    auto t2 = MakeAlignedTokens(1, kPageSize, 5);
+    auto second = std::make_unique<TreeNode>(t2, ts);
+    second->AttachResource<ResourceType::Device>(std::make_unique<DeviceResource>(alloc.Allocate(1)));
+    TreeNode* second_raw = second.get();
+    root.AddChild(t2, std::move(second));
+
+    ASSERT_EQ(first_raw->Time(), second_raw->Time());
+    ASSERT_LT(first_raw->SeqId(), second_raw->SeqId());
+
+    DeviceManager mgr(&alloc);
+    mgr.UpdateLeaves(first_raw);
+    mgr.UpdateLeaves(second_raw);
+
+    auto evicted = mgr.Evict(1);
+    ASSERT_EQ(evicted.size(), 1u);
+    // Smaller SeqId is older — must be evicted first under SeqId tiebreak.
+    EXPECT_EQ(evicted.front(), first_raw);
 }
 
 }  // namespace tokenspeed::test
