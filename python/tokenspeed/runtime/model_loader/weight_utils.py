@@ -511,7 +511,14 @@ def _multi_thread_safetensors_weights_iterator(
     """
 
     def _load_file(st_file: str) -> dict[str, torch.Tensor]:
-        return safetensors.torch.load_file(st_file, device="cpu")
+        # safetensors.torch.load_file returns mmap-backed tensors. When the
+        # consumer reads a tensor later (e.g. CPU->GPU copy in the per-expert
+        # loop), the mmap pages are faulted in via NFS — slow and serializes
+        # the parallel I/O we just did. Clone here so the data is fully
+        # materialized in this worker thread *before* the tensor is yielded;
+        # the downstream consumer then only touches RAM.
+        sd = safetensors.torch.load_file(st_file, device="cpu")
+        return {k: v.detach().clone() for k, v in sd.items()}
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     pending = set()
