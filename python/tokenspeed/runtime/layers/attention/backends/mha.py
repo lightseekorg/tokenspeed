@@ -630,8 +630,8 @@ class MHAAttnBackend(AttentionBackend):
         )
         return k_cache, v_cache
 
-    @staticmethod
     def _make_cu_extend_seq_lens(
+        self,
         lengths: torch.Tensor,
         extend_seq_lens_cpu: list[int],
     ) -> tuple[torch.Tensor, list[int]]:
@@ -644,8 +644,8 @@ class MHAAttnBackend(AttentionBackend):
             cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
         return cu_extend_seq_lens, cu_extend_seq_lens_cpu
 
-    @staticmethod
     def _make_uniform_cu_extend_seq_lens(
+        self,
         batch_size: int,
         tokens_per_req: int,
         device: torch.device,
@@ -660,8 +660,7 @@ class MHAAttnBackend(AttentionBackend):
         cu_extend_seq_lens_cpu = [i * tokens_per_req for i in range(batch_size + 1)]
         return cu_extend_seq_lens, cu_extend_seq_lens_cpu
 
-    @staticmethod
-    def _unwrap_output(result):
+    def _unwrap_output(self, result):
         if isinstance(result, tuple):
             return result[0]
         return result
