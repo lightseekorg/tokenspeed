@@ -41,6 +41,9 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4_nextn,
 )
 from tokenspeed.runtime.distributed import Mapping
+from tokenspeed.runtime.engine.scheduler_utils import (
+    should_enable_mixed_prefill_decode,
+)
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
     _draft_decode_forward_mode,
@@ -248,6 +251,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(ForwardMode.IDLE.is_decode_or_idle())
         self.assertFalse(ForwardMode.EXTEND.is_decode_or_idle())
         self.assertFalse(ForwardMode.TARGET_VERIFY.is_decode_or_idle())
+        self.assertTrue(ForwardMode.TARGET_VERIFY.is_speculative())
+        self.assertTrue(ForwardMode.DRAFT_EXTEND.is_speculative())
+        self.assertFalse(ForwardMode.DECODE.is_speculative())
+        self.assertFalse(ForwardMode.EXTEND.is_speculative())
+        self.assertFalse(ForwardMode.MIXED.is_speculative())
         self.assertEqual(ForwardMode.from_num_extends(0, 0), ForwardMode.IDLE)
         self.assertEqual(ForwardMode.from_num_extends(0, 2), ForwardMode.DECODE)
         self.assertEqual(
@@ -271,6 +279,29 @@ class TestDeepseekV4Config(unittest.TestCase):
                 has_drafter=True, use_target_verify=True
             ),
             ForwardMode.TARGET_VERIFY,
+        )
+
+    def test_mixed_prefill_decode_guard_is_v4_paged_cache_specific(self):
+        self.assertTrue(
+            should_enable_mixed_prefill_decode(
+                enable_mixed_batch=True,
+                speculative_algorithm="EAGLE3",
+                paged_cache_groups=[],
+            )
+        )
+        self.assertFalse(
+            should_enable_mixed_prefill_decode(
+                enable_mixed_batch=True,
+                speculative_algorithm="MTP",
+                paged_cache_groups=[object()],
+            )
+        )
+        self.assertFalse(
+            should_enable_mixed_prefill_decode(
+                enable_mixed_batch=False,
+                speculative_algorithm=None,
+                paged_cache_groups=[],
+            )
         )
 
     def test_model_runner_forwards_supported_spec_step_idx(self):
@@ -2353,6 +2384,108 @@ class TestDeepseekV4Config(unittest.TestCase):
                 seq_lens=torch.tensor([70, 3], dtype=torch.int32),
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            )
+
+    def test_deepseek_v4_spec_metadata_requires_explicit_token_count(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                head_dim=512,
+                context_len=4096,
+                speculative_num_draft_tokens=4,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires explicit num_tokens"):
+            backend.init_forward_metadata(
+                bs=2,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            )
+
+    def test_deepseek_v4_select_decode_metadata_ignores_prefill_fallback(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                head_dim=512,
+                context_len=4096,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        stale_prefill = _make_deepseek_v4_forward_metadata(
+            page_size=64,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+            block_table=torch.zeros((2, 1), dtype=torch.int32),
+            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+            query_lens=torch.tensor([4, 4], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
+            forward_mode=ForwardMode.DECODE,
+        )
+        decode_metadata = _make_deepseek_v4_forward_metadata(
+            page_size=64,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+            block_table=torch.zeros((2, 1), dtype=torch.int32),
+            seq_lens=torch.tensor([72, 5], dtype=torch.int32),
+            query_lens=torch.tensor([4, 4], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        backend.forward_prefill_metadata = stale_prefill
+        self.assertIsNone(backend._select_decode_metadata(8))
+        backend.forward_decode_metadata = stale_prefill
+        backend.forward_metadata = decode_metadata
+        self.assertIs(backend._select_decode_metadata(8), decode_metadata)
+        backend.forward_metadata = None
+        backend.forward_decode_metadata = decode_metadata
+        self.assertIs(backend._select_decode_metadata(8), decode_metadata)
+
+    def test_deepseek_v4_cuda_graph_replay_requires_explicit_spec_token_count(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                head_dim=512,
+                context_len=4096,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=2, max_tokens_per_req=4)
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=2,
+            num_tokens=8,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires explicit num_tokens"):
+            backend.init_forward_metadata_replay_cuda_graph(
+                bs=2,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+                seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+                forward_mode=ForwardMode.TARGET_VERIFY,
             )
 
     def test_deepseek_v4_decode_backend_maps_compressed_slots_batched(self):

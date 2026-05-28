@@ -403,6 +403,8 @@ class CudaGraphWrapper:
             self.sampling_backend.prepare_capture(
                 bs=bs, num_tokens_per_req=self.max_tokens_per_req
             )
+        # Warmup forwards can mutate aliased metadata buffers, so refresh
+        # them again immediately before graph capture records the final views.
         self._init_capture_metadata(bs)
 
         self.deepep_adapter.capture()
@@ -608,6 +610,8 @@ class CudaGraphWrapper:
                     )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
+        if target_uses_paged_groups and forward_mode.is_speculative():
+            kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
             req_pool_indices,
@@ -626,14 +630,17 @@ class CudaGraphWrapper:
                     )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
+            draft_forward_mode = _draft_decode_forward_mode(
+                self.use_target_verify_forward_mode
+            )
+            if draft_uses_paged_groups and draft_forward_mode.is_speculative():
+                draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
                 req_pool_indices,
                 seq_lens,
                 req_to_page=self.drafter.req_to_page,
-                forward_mode=_draft_decode_forward_mode(
-                    self.use_target_verify_forward_mode
-                ),
+                forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,
             )
 

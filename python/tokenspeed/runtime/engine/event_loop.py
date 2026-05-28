@@ -53,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
     should_disable_prefix_cache,
+    should_enable_mixed_prefill_decode,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -302,11 +303,13 @@ class EventLoop:
             )
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
-        enable_mixed_prefill_decode = (
-            server_args.enable_mixed_batch and server_args.speculative_algorithm is None
-        )
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         self._paged_cache_groups = paged_cache_groups
+        enable_mixed_prefill_decode = should_enable_mixed_prefill_decode(
+            enable_mixed_batch=server_args.enable_mixed_batch,
+            speculative_algorithm=server_args.speculative_algorithm,
+            paged_cache_groups=paged_cache_groups,
+        )
         disable_prefix_cache = should_disable_prefix_cache(
             server_args.enable_prefix_caching,
             paged_cache_groups,

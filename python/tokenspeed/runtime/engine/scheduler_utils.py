@@ -176,6 +176,23 @@ def should_disable_prefix_cache(
     return (not enable_prefix_caching) or bool(paged_cache_groups)
 
 
+def should_enable_mixed_prefill_decode(
+    *,
+    enable_mixed_batch: bool,
+    speculative_algorithm: Any | None,
+    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+) -> bool:
+    """Return whether mixed prefill/decode can be enabled safely.
+
+    V4 paged-cache groups are request-local and currently have no mixed-batch
+    speculative contract. Keep the guard scoped to that layout so non-V4
+    speculative backends retain their previous scheduler behavior.
+    """
+    return bool(enable_mixed_batch) and not (
+        speculative_algorithm is not None and bool(paged_cache_groups)
+    )
+
+
 def should_use_overlap_schedule(
     *,
     disable_overlap_schedule: bool,

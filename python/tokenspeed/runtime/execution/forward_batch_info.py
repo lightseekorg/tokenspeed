@@ -65,6 +65,9 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
+    def is_speculative(self):
+        return self == ForwardMode.TARGET_VERIFY or self == ForwardMode.DRAFT_EXTEND
+
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
