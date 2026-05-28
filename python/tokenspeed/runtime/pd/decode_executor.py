@@ -75,6 +75,32 @@ class DisaggDecodeExecutor:
             return None
         return np.array([slot], dtype=np.int64)
 
+    @staticmethod
+    def _mamba_checkpoint_indices(op, index: int):
+        indices = getattr(op, "mamba_checkpoint_dst_indices", None)
+        if indices is None or index >= len(indices):
+            return None
+        slot = int(indices[index])
+        if slot < 0:
+            return None
+        return np.array([slot], dtype=np.int64)
+
+    @classmethod
+    def _mamba_transfer_indices(cls, op, index: int):
+        working = cls._mamba_indices(op, index)
+        if working is None:
+            return None
+        checkpoint = cls._mamba_checkpoint_indices(op, index)
+        if checkpoint is None:
+            return working
+
+        slots = [int(x) for x in working.tolist()]
+        for slot in checkpoint.tolist():
+            slot = int(slot)
+            if slot >= 0 and slot not in slots:
+                slots.append(slot)
+        return np.array(slots, dtype=np.int64)
+
     def _prefill(self, op):
         logger.debug(
             "[decode][_prefill] op: request_ids=%s occupied_pages=%s "
@@ -94,7 +120,7 @@ class DisaggDecodeExecutor:
                 dtype=np.int64,
             )
             aux_index = op.request_pool_indices[i]
-            mamba_indices = self._mamba_indices(op, i)
+            mamba_indices = self._mamba_transfer_indices(op, i)
             self._request_pool_indices[request_id] = aux_index
             self.receivers[request_id].prefill(
                 kv_indices,

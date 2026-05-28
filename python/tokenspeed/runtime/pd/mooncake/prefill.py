@@ -96,8 +96,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.layerwise_interval = 1
         self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
         self.step_counter = None
-        self.bootstrap_tokens: Dict[int, int] = {}
-        self.spec_candidate_ids: Dict[int, list[int]] = {}
+        self.prefill_metadata: Dict[int, Tuple[int, Optional[list[int]]]] = {}
+        self.expired_prefill_metadata_rooms: set[int] = set()
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
         cpu_count = os.cpu_count()
@@ -130,39 +130,42 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
         return cache_step
 
-    def set_bootstrap_token(
-        self, aux_index: int, token: int, spec_candidate_ids: list[int] | None = None
+    def set_prefill_metadata(
+        self, room: int, token: int, spec_candidate_ids: list[int] | None = None
     ) -> None:
         with self.bootstrap_token_cond:
-            self.bootstrap_tokens[aux_index] = token
-            if spec_candidate_ids is not None:
-                self.spec_candidate_ids[aux_index] = spec_candidate_ids
+            if room in self.expired_prefill_metadata_rooms:
+                self.expired_prefill_metadata_rooms.discard(room)
+                logger.warning(
+                    "Dropping late prefill metadata for expired bootstrap_room=%s",
+                    room,
+                )
+                return
+            self.prefill_metadata[room] = (token, spec_candidate_ids)
             self.bootstrap_token_cond.notify_all()
 
     def _wait_prefill_metadata(
         self,
-        aux_index: Optional[int],
+        room: Optional[int],
         fallback_token: int,
         fallback_candidate_ids: Optional[list[int]],
     ) -> tuple[int, Optional[list[int]]]:
-        if aux_index is None or fallback_token != -1:
+        if room is None or fallback_token != -1:
             return fallback_token, fallback_candidate_ids
         deadline = time.monotonic() + 5.0
         with self.bootstrap_token_cond:
-            while aux_index not in self.bootstrap_tokens:
+            while room not in self.prefill_metadata:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self.expired_prefill_metadata_rooms.add(room)
                     logger.warning(
-                        "Timed out waiting for prefill metadata for aux_index=%s; using fallback=%s",
-                        aux_index,
+                        "Timed out waiting for prefill metadata for bootstrap_room=%s; using fallback=%s",
+                        room,
                         fallback_token,
                     )
                     return fallback_token, fallback_candidate_ids
                 self.bootstrap_token_cond.wait(timeout=min(0.01, remaining))
-            return (
-                self.bootstrap_tokens.pop(aux_index),
-                self.spec_candidate_ids.pop(aux_index, fallback_candidate_ids),
-            )
+            return self.prefill_metadata.pop(room)
 
     def _is_session_failed(self, mooncake_session_id: str) -> bool:
         if self.failed_session_ttl <= 0:
@@ -390,6 +393,21 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 len(dst_state_data_ptrs),
             )
             return -1
+
+        if prefill_mamba_indices.shape != dst_mamba_indices.shape:
+            if prefill_mamba_indices.size == 1 and dst_mamba_indices.size > 1:
+                prefill_mamba_indices = np.full(
+                    dst_mamba_indices.shape,
+                    int(prefill_mamba_indices[0]),
+                    dtype=np.int64,
+                )
+            else:
+                logger.error(
+                    "Mamba state slot count mismatch: prefill=%s decode=%s",
+                    prefill_mamba_indices.tolist(),
+                    dst_mamba_indices.tolist(),
+                )
+                return -1
 
         state_items = list(zip(state_ptrs, dst_state_data_ptrs, state_item_lens))
         if begin_layer_id is not None or end_layer_id is not None:
@@ -692,7 +710,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 # DisaggPrefillExecutor._decode after prefill forward).
                                 bootstrap_token, spec_candidate_ids = (
                                     self._wait_prefill_metadata(
-                                        kv_chunk.prefill_aux_index,
+                                        kv_chunk.room,
                                         kv_chunk.bootstrap_token,
                                         kv_chunk.spec_candidate_ids,
                                     )

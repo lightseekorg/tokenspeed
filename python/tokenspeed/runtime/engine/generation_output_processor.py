@@ -560,6 +560,7 @@ class OutputProcesser:
                         for x in model_execution_results.next_input_ids[i].tolist()
                     ]
                 on_first_token(
+                    rid,
                     forward_op.request_pool_indices[i],
                     model_output_ids[0],
                     spec_candidate_ids,

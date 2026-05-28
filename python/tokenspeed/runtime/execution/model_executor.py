@@ -916,6 +916,43 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+    def reset_remote_prefill_mamba_inputs(self, forward_op) -> None:
+        if self.runtime_states.mamba_pool is None:
+            return
+        if not hasattr(self.attn_backend, "reset_current_inputs"):
+            return
+
+        num_extends = forward_op.num_extends()
+        if num_extends <= 0:
+            return
+
+        mamba_indices = list(getattr(forward_op, "mamba_pool_indices", []))
+        if not mamba_indices:
+            return
+
+        req_pool_indices = list(forward_op.request_pool_indices[:num_extends])
+        pairs = [
+            (int(req_pool_idx), int(mamba_idx))
+            for req_pool_idx, mamba_idx in zip(
+                req_pool_indices, mamba_indices[:num_extends]
+            )
+            if int(mamba_idx) >= 0
+        ]
+        if not pairs:
+            return
+
+        req_pool_tensor = torch.tensor(
+            [req_pool_idx for req_pool_idx, _ in pairs],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        mamba_tensor = torch.tensor(
+            [mamba_idx for _, mamba_idx in pairs],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
+
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
 

@@ -598,6 +598,7 @@ class EventLoop:
                     self.model_executor.device,
                 )
                 self.pd_kv_transfer.execute(forward_op)
+                self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
             else:
                 # Path 3b: decode batch — normal forward
