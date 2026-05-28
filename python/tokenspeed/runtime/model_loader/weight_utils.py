@@ -505,29 +505,54 @@ def _multi_thread_safetensors_weights_iterator(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Concurrently load safetensors shards and yield their contents.
 
-    Submissions are produced lazily via a generator expression so that at most
-    ``max_workers`` files are resident in CPU memory simultaneously — important
-    for large MoE checkpoints (>500 GiB) that cannot all fit in RAM at once.
+    Submissions are gated by a sliding window so that at most ``max_workers``
+    files are resident in CPU memory simultaneously — important for large MoE
+    checkpoints (>500 GiB) that cannot all fit in RAM at once.
     """
 
     def _load_file(st_file: str) -> dict[str, torch.Tensor]:
         return safetensors.torch.load_file(st_file, device="cpu")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Lazy submission cap: only ``max_workers`` files in flight at once.
-        futures = (executor.submit(_load_file, st_file) for st_file in hf_weights_files)
-        futures_iter = tqdm(
-            concurrent.futures.as_completed(futures),
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    pending = set()
+    files_iter = iter(hf_weights_files)
+
+    def _submit_next() -> bool:
+        try:
+            st_file = next(files_iter)
+        except StopIteration:
+            return False
+        pending.add(executor.submit(_load_file, st_file))
+        return True
+
+    try:
+        for _ in range(min(max_workers, len(hf_weights_files))):
+            _submit_next()
+
+        with tqdm(
             total=len(hf_weights_files),
             desc=f"Multi-thread loading shards (workers={max_workers})",
             disable=not enable_tqdm,
             bar_format=_BAR_FORMAT,
-        )
-        for future in futures_iter:
-            state_dict = future.result()
-            del future
-            for key in list(state_dict):
-                yield key, state_dict.pop(key)
+        ) as progress:
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    state_dict = future.result()
+                    progress.update(1)
+                    del future
+                    for key in list(state_dict):
+                        yield key, state_dict.pop(key)
+                    del state_dict
+                    _submit_next()
+    except BaseException:
+        for future in pending:
+            future.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def pt_weights_iterator(

@@ -1,6 +1,9 @@
 import argparse
+import concurrent.futures
 import os
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -60,6 +63,71 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(sorted(seen), [files[1], files[4]])
+
+    def test_multi_thread_loader_limits_submitted_shards(self):
+        files = [f"/tmp/model-{idx}.safetensors" for idx in range(6)]
+        submit_calls = []
+        started_count = 0
+        started_lock = threading.Lock()
+        first_window_started = threading.Event()
+        release_loads = threading.Event()
+        results = []
+        errors = []
+
+        real_executor_cls = concurrent.futures.ThreadPoolExecutor
+
+        class TrackingThreadPoolExecutor(real_executor_cls):
+            def submit(self, fn, *args, **kwargs):
+                submit_calls.append(args[0])
+                return super().submit(fn, *args, **kwargs)
+
+        def fake_load_file(path, device="cpu"):
+            nonlocal started_count
+            with started_lock:
+                started_count += 1
+                if started_count == 2:
+                    first_window_started.set()
+            if not release_loads.wait(timeout=5):
+                raise TimeoutError("Timed out waiting to release fake shard load")
+            return {path: path}
+
+        def consume_iterator():
+            try:
+                results.extend(
+                    weight_utils._multi_thread_safetensors_weights_iterator(
+                        files,
+                        max_workers=2,
+                        enable_tqdm=False,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            mock.patch.object(
+                weight_utils.concurrent.futures,
+                "ThreadPoolExecutor",
+                TrackingThreadPoolExecutor,
+            ),
+            mock.patch.object(
+                weight_utils.safetensors.torch,
+                "load_file",
+                side_effect=fake_load_file,
+            ),
+        ):
+            thread = threading.Thread(target=consume_iterator)
+            thread.start()
+            try:
+                self.assertTrue(first_window_started.wait(timeout=5))
+                time.sleep(0.1)
+                self.assertEqual(submit_calls, files[:2])
+            finally:
+                release_loads.set()
+                thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertCountEqual(results, [(path, path) for path in files])
 
 
 if __name__ == "__main__":
