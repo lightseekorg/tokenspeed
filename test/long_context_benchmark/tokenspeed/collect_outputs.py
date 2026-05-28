@@ -23,6 +23,46 @@ from pathlib import Path
 # Order matters: shorter -> longer
 LEN_ORDER = ["32k", "64k", "128k", "256k", "512k", "1024k"]
 
+# Speculative-decoding acceptance keys produced by different evalscope versions.
+# Newer evalscope[perf] (>= the version installed by this CI job) reports
+# "Avg Decoded Tokens/Iter". Older evalscope used "Decoded Tok/Iter".
+# "Spec Decode Acceptance (%)" is a percent-form alternative on some builds.
+AR_KEYS = (
+    "Avg Decoded Tokens/Iter",
+    "Decoded Tok/Iter",
+    "Spec Decode Acceptance (%)",
+)
+
+
+def _extract_ar(summary: dict, source: str) -> float:
+    """Return MTP acceptance rate (avg decoded tokens per iter).
+
+    Prefers the new evalscope key, falls back to the old one. Treats the
+    percent-form acceptance as `1 + pct/100` only if it's the sole signal
+    available.  Warns (not silent zero) when no known key is present.
+    """
+    for key in ("Avg Decoded Tokens/Iter", "Decoded Tok/Iter"):
+        v = summary.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    pct = summary.get("Spec Decode Acceptance (%)")
+    if pct is not None:
+        try:
+            # acceptance% is the fraction of draft tokens accepted; convert to
+            # an avg-decoded-tokens-per-iter approximation only as a fallback.
+            return 1.0 + float(pct) / 100.0
+        except (TypeError, ValueError):
+            pass
+    print(
+        f"[warn] {source}: none of {AR_KEYS} found in benchmark_summary.json; "
+        f"acceptance rate will be reported as 0",
+        file=sys.stderr,
+    )
+    return 0.0
+
 
 def _len_key(length: str) -> int:
     m = re.match(r"(\d+)k", length)
@@ -53,7 +93,7 @@ def collect(sweep_dir: Path):
             continue
         tpot_ms = s.get("TPOT (ms)") or 0.0
         tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
-        ar = float(s.get("Decoded Tok/Iter") or 0.0)
+        ar = _extract_ar(s, str(summary_path))
         total_tps = float(s.get("Total Throughput (tok/s)") or 0.0)
         rows.append(
             {
