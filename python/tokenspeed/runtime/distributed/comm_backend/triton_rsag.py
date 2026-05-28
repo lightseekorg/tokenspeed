@@ -93,7 +93,7 @@ class TritonRSAGBackend:
                 state,
                 tensor,
                 tp_hidden_dim=hidden_size,
-                skip_entry_sync=True,
+                skip_entry_sync=False,
                 safe=False,
             )
 
