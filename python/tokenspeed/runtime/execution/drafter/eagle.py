@@ -220,9 +220,9 @@ class Eagle(BaseDrafter):
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
 
-        draft_first_step_reduce = forward_mode.is_decode()
+        early_slice = forward_mode.is_decode()
 
-        if draft_first_step_reduce and self.attn_backend.support_kv_cache_prewrite:
+        if early_slice and self.attn_backend.support_kv_cache_prewrite:
             # Trim seq_lens by rejected-draft count so the sliced decode
             # query does not attend to dead positions.
             correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
@@ -243,7 +243,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
-            draft_first_step_reduce=draft_first_step_reduce,
+            early_slice=early_slice,
         )
 
         return self.draft_model_runner.forward(

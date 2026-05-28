@@ -50,8 +50,9 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
-    # Spec decode draft head's first step prunes to one live row per request.
-    draft_first_step_reduce: bool = False
+    # When set, the layer applies an active-row slice and mutates ctx so
+    # downstream collectives see the post-slice row count.
+    early_slice: bool = False
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None

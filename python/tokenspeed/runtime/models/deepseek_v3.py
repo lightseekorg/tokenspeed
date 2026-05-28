@@ -67,6 +67,10 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.drafter.base import (
+    apply_active_slice,
+    apply_active_slice_post_attn,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.mla_fp8_utils import (
@@ -675,10 +679,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 attn_output[num_prefill_tokens:],
             )
 
-        if ctx.draft_first_step_reduce:
-            # KV already written; drop dead-position rows so o_proj / MLP /
-            # post-norms only run on one live row per request.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
+        attn_output = apply_active_slice(attn_output, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1157,9 +1158,9 @@ class DeepseekV3DecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
-            if ctx.draft_first_step_reduce:
-                # Gather residual to self_attn's [bs, H].
-                residual = residual.index_select(0, ctx.gather_ids)
+            hidden_states, residual = apply_active_slice_post_attn(
+                hidden_states, residual, ctx,
+            )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -1704,9 +1705,9 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
 
-            if ctx.draft_first_step_reduce:
-                # Gather residual to self_attn's [bs, H].
-                residual = residual.index_select(0, ctx.gather_ids)
+            hidden_states, residual = apply_active_slice_post_attn(
+                hidden_states, residual, ctx,
+            )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )

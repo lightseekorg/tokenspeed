@@ -81,3 +81,41 @@ class BaseDrafter:
     @abstractmethod
     def draft(self, *args, **kwargs) -> torch.Tensor | None:
         raise NotImplementedError
+
+
+def apply_active_slice(tensor: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
+    """Drop dead-position rows when drafter requested early_slice; no-op otherwise.
+
+    Called inside attention modules just before o_proj so o_proj only runs on
+    live rows. Idle ranks have ``gather_ids=None`` and pass through.
+    """
+    if not ctx.early_slice or ctx.gather_ids is None:
+        return tensor
+    return tensor.index_select(0, ctx.gather_ids)
+
+
+def apply_active_slice_post_attn(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    ctx: ForwardContext,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Finalize the active-row slice after the layer's self-attention.
+
+    The attention module already sliced its output via ``apply_active_slice``.
+    Here we gather residual to match and mutate ctx (``input_num_tokens``,
+    ``global_num_tokens``, clear ``gather_ids`` / ``early_slice``) so all
+    downstream collectives, layernorms, MLP, and final-norm see the post-slice
+    row count without flag-based override. Idle ranks and standard forwards
+    are no-ops.
+    """
+    if not ctx.early_slice or ctx.gather_ids is None:
+        return hidden_states, residual
+    gather_ids = ctx.gather_ids
+    if residual is not None and residual.size(0) != gather_ids.size(0):
+        residual = residual.index_select(0, gather_ids)
+    ctx.input_num_tokens = gather_ids.size(0)
+    if ctx.global_bs is not None:
+        ctx.global_num_tokens = ctx.global_bs
+    ctx.gather_ids = None
+    ctx.early_slice = False
+    return hidden_states, residual

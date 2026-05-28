@@ -904,7 +904,7 @@ class ModelExecutor:
                     global_num_tokens=global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
-                    draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
+                    early_slice=(step_idx == 0 and all_decode_or_idle),
                 )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,

@@ -35,6 +35,10 @@ from transformers import LlamaConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.drafter.base import (
+    apply_active_slice,
+    apply_active_slice_post_attn,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
@@ -186,40 +190,47 @@ class LlamaAttention(nn.Module):
                 output_q_rope=q_rope,
                 enable_pdl=pdl_enabled(),
             )
-            if ctx.draft_first_step_reduce:
-                # KV already written via fused_set_kv_buffer_arg above; slice Q
-                # to one query per request and route attn as decode.
-                q_rope = q_rope.index_select(0, ctx.gather_ids)
-                attn_output = ctx.attn_backend.forward(
-                    q_rope,
-                    None,
-                    None,
-                    self.attn,
-                    out_cache_loc,
-                    ctx.token_to_kv_pool,
-                    ForwardMode.DECODE,
-                    ctx.bs,
-                    save_kv_cache=False,
-                )
-            else:
-                attn_output = self.attn(
-                    q_rope,
-                    None,
-                    None,
-                    save_kv_cache=False,
-                    ctx=ctx,
-                    out_cache_loc=out_cache_loc,
-                )
+            attn_output = self._apply_attn_dispatch_with_prewritten_kv(
+                q_rope, ctx, out_cache_loc,
+            )
         else:
             q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
-            if ctx.draft_first_step_reduce:
-                # KV written by self.attn above; slice attn_output so o_proj
-                # and the rest of the layer only run on the live rows.
-                attn_output = attn_output.index_select(0, ctx.gather_ids)
+            attn_output = apply_active_slice(attn_output, ctx)
 
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _apply_attn_dispatch_with_prewritten_kv(
+        self,
+        q_rope: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """KV is already pre-written via fused_set_kv_buffer_arg before this call.
+
+        Under ``ctx.early_slice``: slice Q to one query per request and route
+        through the decode kernel (catch-up step Optimization B for prewrite
+        backends). Otherwise: standard extend kernel; layer-level
+        ``apply_active_slice_post_attn`` handles slicing afterwards.
+        """
+        if not ctx.early_slice:
+            return self.attn(
+                q_rope, None, None,
+                save_kv_cache=False, ctx=ctx, out_cache_loc=out_cache_loc,
+            )
+        q_rope = q_rope.index_select(0, ctx.gather_ids)
+        return ctx.attn_backend.forward(
+            q_rope,
+            None,
+            None,
+            self.attn,
+            out_cache_loc,
+            ctx.token_to_kv_pool,
+            ForwardMode.DECODE,
+            ctx.bs,
+            save_kv_cache=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -382,9 +393,9 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
-            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
-            residual = residual.index_select(0, ctx.gather_ids)
+        hidden_states, residual = apply_active_slice_post_attn(
+            hidden_states, residual, ctx,
+        )
 
         # Fused post-attn allreduce + norm (uses attn tp group)
         block_scale = None
@@ -450,9 +461,9 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
-            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
-            residual = residual.index_select(0, ctx.gather_ids)
+        hidden_states, residual = apply_active_slice_post_attn(
+            hidden_states, residual, ctx,
+        )
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
         )

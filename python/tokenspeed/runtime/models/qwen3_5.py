@@ -45,6 +45,10 @@ from tokenspeed.runtime.configs.qwen3_5_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.drafter.base import (
+    apply_active_slice,
+    apply_active_slice_post_attn,
+)
 
 # Layers - Attention
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
@@ -747,9 +751,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             sigmoid_mul(attn_output, gate)
 
-        if ctx.draft_first_step_reduce:
-            # Slice attn_output to [bs, H] so o_proj runs on live rows only.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
+        attn_output = apply_active_slice(attn_output, ctx)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -778,9 +780,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
             )
-            if ctx.draft_first_step_reduce:
-                # Gather residual to self_attention's [bs, H].
-                residual = residual.index_select(0, ctx.gather_ids)
+            hidden_states, residual = apply_active_slice_post_attn(
+                hidden_states, residual, ctx,
+            )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
