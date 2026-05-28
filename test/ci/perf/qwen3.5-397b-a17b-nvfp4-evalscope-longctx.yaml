@@ -44,7 +44,7 @@ perf:
       f=/tmp/long-context-prompts/prompt_${len}.txt;
       test -f "$f" ||
       curl -fL
-      https://huggingface.co/datasets/lightseekorg/long-context/tree/main/prompt_${len}.txt
+      https://huggingface.co/datasets/lightseekorg/long-context/resolve/main/prompt_${len}.txt
       -o "$f";
       done
   command: >-
