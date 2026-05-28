@@ -130,10 +130,6 @@ def _supports_cute(N: int, dtype: torch.dtype) -> bool:
         return False
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
-    # The current upstream wrapper only ships a float32 path. Honor that here so
-    # we don't surprise callers with reduced-precision argmax on bf16/fp16.
-    if dtype is not torch.float32:
-        return False
     if N < _MIN_VOCAB_SIZE:
         return False
     if N % _VOCAB_SIZE_ALIGNMENT != 0:
@@ -265,9 +261,10 @@ def _argmax_cute(
     """CuTe DSL fast path for argmax.
 
     Falls back per-call to :func:`_argmax_torch_fallback` when the input
-    isn't kernel-eligible (1D / non-CUDA / fp16 / bf16 / small N / unaligned N).
-    Only ever bound to the public ``argmax`` name on NVIDIA hosts with the
-    cute DSL Python packages available — see the module-level dispatch below.
+    isn't kernel-eligible (1D / non-CUDA / unsupported dtype / small N /
+    unaligned N). Only ever bound to the public ``argmax`` name on NVIDIA
+    hosts with the cute DSL Python packages available — see the module-level
+    dispatch below.
     """
     if out is not None:
         _validate_argmax_out(logits, out)
