@@ -97,6 +97,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
         self.step_counter = None
         self.bootstrap_tokens: Dict[int, int] = {}
+        self.spec_candidate_ids: Dict[int, list[int]] = {}
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
         cpu_count = os.cpu_count()
@@ -129,27 +130,39 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
         return cache_step
 
-    def set_bootstrap_token(self, aux_index: int, token: int) -> None:
+    def set_bootstrap_token(
+        self, aux_index: int, token: int, spec_candidate_ids: list[int] | None = None
+    ) -> None:
         with self.bootstrap_token_cond:
             self.bootstrap_tokens[aux_index] = token
+            if spec_candidate_ids is not None:
+                self.spec_candidate_ids[aux_index] = spec_candidate_ids
             self.bootstrap_token_cond.notify_all()
 
-    def _wait_bootstrap_token(self, aux_index: Optional[int], fallback: int) -> int:
-        if aux_index is None or fallback != -1:
-            return fallback
+    def _wait_prefill_metadata(
+        self,
+        aux_index: Optional[int],
+        fallback_token: int,
+        fallback_candidate_ids: Optional[list[int]],
+    ) -> tuple[int, Optional[list[int]]]:
+        if aux_index is None or fallback_token != -1:
+            return fallback_token, fallback_candidate_ids
         deadline = time.monotonic() + 5.0
         with self.bootstrap_token_cond:
             while aux_index not in self.bootstrap_tokens:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     logger.warning(
-                        "Timed out waiting for bootstrap token for aux_index=%s; using fallback=%s",
+                        "Timed out waiting for prefill metadata for aux_index=%s; using fallback=%s",
                         aux_index,
-                        fallback,
+                        fallback_token,
                     )
-                    return fallback
+                    return fallback_token, fallback_candidate_ids
                 self.bootstrap_token_cond.wait(timeout=min(0.01, remaining))
-            return self.bootstrap_tokens.pop(aux_index)
+            return (
+                self.bootstrap_tokens.pop(aux_index),
+                self.spec_candidate_ids.pop(aux_index, fallback_candidate_ids),
+            )
 
     def _is_session_failed(self, mooncake_session_id: str) -> bool:
         if self.failed_session_ttl <= 0:
@@ -524,15 +537,22 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         status: int,
         prefill_rank: int,
         bootstrap_token: int = -1,
+        spec_candidate_ids: Optional[list[int]] = None,
     ):
         if ":" in remote:
             remote = remote.split(":")[0]
+        spec_candidate_payload = (
+            np.asarray(spec_candidate_ids, dtype=np.int32).tobytes()
+            if spec_candidate_ids is not None
+            else b""
+        )
         self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
                 str(bootstrap_token).encode("ascii"),
+                spec_candidate_payload,
             ]
         )
 
@@ -670,13 +690,17 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 self.update_status(req.room, status)
                                 # bootstrap_token is carried directly in the chunk (set by
                                 # DisaggPrefillExecutor._decode after prefill forward).
-                                bootstrap_token = (
-                                    self._wait_bootstrap_token(
+                                bootstrap_token, spec_candidate_ids = (
+                                    self._wait_prefill_metadata(
                                         kv_chunk.prefill_aux_index,
                                         kv_chunk.bootstrap_token,
+                                        kv_chunk.spec_candidate_ids,
                                     )
                                     if kv_chunk.wait_for_bootstrap_token
-                                    else kv_chunk.bootstrap_token
+                                    else (
+                                        kv_chunk.bootstrap_token,
+                                        kv_chunk.spec_candidate_ids,
+                                    )
                                 )
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
@@ -686,6 +710,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                         status,
                                         self.attn_tp_rank,
                                         bootstrap_token=bootstrap_token,
+                                        spec_candidate_ids=spec_candidate_ids,
                                     )
                         elapsed_seconds = time.monotonic() - tm_start
                         if self.kv_transfer_metrics:
@@ -793,6 +818,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         layerwise_interval: int = 1,
         wait_for_bootstrap_token: bool = False,
         mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        spec_candidate_ids: Optional[list[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -831,6 +857,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 layerwise_interval=layerwise_interval,
                 wait_for_bootstrap_token=wait_for_bootstrap_token,
                 prefill_mamba_indices=mamba_indices,
+                spec_candidate_ids=spec_candidate_ids,
             )
         )
 

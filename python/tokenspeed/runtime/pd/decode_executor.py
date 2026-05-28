@@ -55,6 +55,8 @@ class DisaggDecodeExecutor:
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
+        self._request_pool_indices: Dict[str, int] = {}
+        self._remote_spec_candidate_ids: Dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
         self.receivers[request_id] = MooncakeKVReceiver(
@@ -93,6 +95,7 @@ class DisaggDecodeExecutor:
             )
             aux_index = op.request_pool_indices[i]
             mamba_indices = self._mamba_indices(op, i)
+            self._request_pool_indices[request_id] = aux_index
             self.receivers[request_id].prefill(
                 kv_indices,
                 aux_index,
@@ -141,7 +144,14 @@ class DisaggDecodeExecutor:
                 # message from the prefill side.  bootstrap_room == bootstrap_info.bootstrap_room,
                 # which is the key used in MooncakeKVReceiver.
                 bootstrap_room = self.receivers[req_id].bootstrap_room
-                bootstrap_token = self.kv_manager.pop_bootstrap_token(bootstrap_room)
+                bootstrap_token, spec_candidate_ids = self.kv_manager.pop_prefill_metadata(
+                    bootstrap_room
+                )
+                if spec_candidate_ids is not None and req_id in self._request_pool_indices:
+                    self._remote_spec_candidate_ids[req_id] = (
+                        self._request_pool_indices[req_id],
+                        spec_candidate_ids,
+                    )
                 logger.debug(
                     "[decode][generate_events] rid=%s -> RemotePrefillDoneEvent bootstrap_token=%s",
                     req_id,
@@ -159,8 +169,12 @@ class DisaggDecodeExecutor:
                 pass
         for req_id in to_remove:
             del self.receivers[req_id]
+            self._request_pool_indices.pop(req_id, None)
 
         return events
+
+    def pop_remote_spec_candidate_ids(self, request_id: str):
+        return self._remote_spec_candidate_ids.pop(request_id, None)
 
     def reset_valid_cache_length(
         self, forward_op, runtime_states, execution_stream, device

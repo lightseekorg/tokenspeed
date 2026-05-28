@@ -715,6 +715,7 @@ class ModelExecutor:
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
         self.log_step += 1
 
@@ -753,6 +754,7 @@ class ModelExecutor:
             dp_all_decode_or_idle,
             grammar_inputs=grammar_inputs,
             multimodal_context=multimodal_context,
+            capture_next_input_ids=capture_next_input_ids,
         )
 
         if is_decode and (
@@ -1054,6 +1056,7 @@ class ModelExecutor:
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
@@ -1295,6 +1298,12 @@ class ModelExecutor:
                 )
 
             with nvtx_range("output_d2h", color="green"):
+                next_input_ids = None
+                if capture_next_input_ids and self.drafter is not None and num_extends > 0:
+                    next_input_ids = self.runtime_states.future_input_map.index_select(
+                        0, self.input_buffers.req_pool_indices_buf[:num_extends]
+                    ).to("cpu", non_blocking=True)
+
                 output_tokens = output_tokens.to("cpu", non_blocking=True)
                 output_lengths = output_lengths.to("cpu", non_blocking=True)
 
@@ -1310,7 +1319,18 @@ class ModelExecutor:
             output_logprobs=output_logprobs,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
+            next_input_ids=next_input_ids,
         )
+
+    def write_remote_spec_candidate_ids(
+        self, req_pool_idx: int, candidate_ids: list[int]
+    ) -> None:
+        torch.cuda.current_stream().wait_stream(self.execution_stream)
+        self.execution_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.execution_stream):
+            self.runtime_states.write_remote_spec_candidate_ids(
+                req_pool_idx, candidate_ids
+            )
 
     def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
         # Cache delta expansion for retracted/chunked requests.

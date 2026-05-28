@@ -36,6 +36,18 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
+def _remote_spec_tail_seed_mask(
+    runtime_states: "RuntimeStates",
+    decode_req_pool_indices: torch.Tensor,
+    token_mask: torch.Tensor,
+) -> torch.Tensor:
+    remote_mask = getattr(runtime_states, "remote_spec_candidate_mask", None)
+    if remote_mask is None:
+        return token_mask
+    has_remote_candidates = remote_mask[decode_req_pool_indices].unsqueeze(1)
+    return token_mask & ~has_remote_candidates
+
+
 class InputBuffers:
     """
     ForwardContext tensor data source, read-only after fill. Holds only
@@ -168,6 +180,40 @@ class InputBuffers:
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
 
+        def write_decode_input_ids(
+            decode_req_pool_indices: torch.Tensor,
+            decode_input_ids: list[int],
+            expected_count: int,
+            context: str,
+        ) -> None:
+            if len(decode_input_ids) != expected_count:
+                raise RuntimeError(
+                    f"{context} decode_input_ids length mismatch: "
+                    f"got {len(decode_input_ids)}, expected {expected_count}"
+                )
+            decode_input_ids_tensor = torch.tensor(
+                decode_input_ids,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            ).to(req_pool_indices_device.device, non_blocking=True)
+            mask = (decode_input_ids_tensor != -1).unsqueeze(1)
+            ids = decode_input_ids_tensor.unsqueeze(1)
+
+            first_slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
+            runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
+                mask, ids, first_slot
+            )
+
+            if runtime_states.future_input_map.shape[1] > 1:
+                tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
+                tail_seed_mask = _remote_spec_tail_seed_mask(
+                    runtime_states, decode_req_pool_indices, mask
+                )
+                runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
+                    torch.where(tail_seed_mask, ids.expand(-1, tail.shape[1]), tail)
+                )
+
         valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
             0, req_pool_indices_device
         )
@@ -221,23 +267,11 @@ class InputBuffers:
                     num_extends:batch_size
                 ]
                 if forward_op.decode_input_ids is not None:
-                    decode_count = batch_size - num_extends
-                    if len(forward_op.decode_input_ids) != decode_count:
-                        raise RuntimeError(
-                            "mixed forward decode_input_ids length mismatch: "
-                            f"got {len(forward_op.decode_input_ids)}, "
-                            f"expected {decode_count}"
-                        )
-                    decode_input_ids_tensor = torch.tensor(
+                    write_decode_input_ids(
+                        decode_req_pool_indices,
                         forward_op.decode_input_ids,
-                        dtype=torch.int32,
-                        device="cpu",
-                        pin_memory=True,
-                    ).to(req_pool_indices_device.device, non_blocking=True)
-                    mask = (decode_input_ids_tensor != -1).unsqueeze(1)
-                    slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
-                    runtime_states.future_input_map[decode_req_pool_indices, :1] = (
-                        torch.where(mask, decode_input_ids_tensor.unsqueeze(1), slot)
+                        batch_size - num_extends,
+                        "mixed forward",
                     )
                 decode_ids = runtime_states.future_input_map[
                     decode_req_pool_indices
@@ -255,23 +289,27 @@ class InputBuffers:
             # them into future_input_map before reading, so that they take effect
             # as the input for this decode step.
             if forward_op.decode_input_ids is not None:
-                decode_input_ids_tensor = torch.tensor(
+                write_decode_input_ids(
+                    req_pool_indices_device,
                     forward_op.decode_input_ids,
-                    dtype=torch.int32,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(req_pool_indices_device.device, non_blocking=True)
-                mask = (decode_input_ids_tensor != -1).unsqueeze(1)  # (bs, 1)
-                slot = runtime_states.future_input_map[
-                    req_pool_indices_device, :1
-                ]  # (bs, 1)
-                runtime_states.future_input_map[req_pool_indices_device, :1] = (
-                    torch.where(mask, decode_input_ids_tensor.unsqueeze(1), slot)
+                    batch_size,
+                    "decode forward",
                 )
             self.input_ids_buf[:total_tokens].copy_(
                 runtime_states.future_input_map[req_pool_indices_device].flatten(),
                 non_blocking=True,
             )
+
+        remote_spec_candidate_mask = getattr(
+            runtime_states, "remote_spec_candidate_mask", None
+        )
+        if remote_spec_candidate_mask is not None:
+            if num_extends > 0 and num_extends < batch_size:
+                remote_spec_candidate_mask[
+                    req_pool_indices_device[num_extends:batch_size]
+                ] = False
+            elif num_extends == 0:
+                remote_spec_candidate_mask[req_pool_indices_device] = False
 
         self.seq_lens_buf[:batch_size].copy_(input_lengths_device + valid_cache_lengths)
 

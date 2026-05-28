@@ -62,13 +62,18 @@ class DisaggPrefillExecutor:
         # aux_index -> bootstrap_token, populated by store_prefill_token() after
         # the prefill forward pass, consumed by _decode() when sending KV.
         self._aux_token: Dict[int, int] = {}
+        self._aux_spec_candidate_ids: Dict[int, list[int]] = {}
         self._layerwise_token_published = set()
 
-    def store_prefill_token(self, aux_index: int, token: int) -> None:
+    def store_prefill_token(
+        self, aux_index: int, token: int, spec_candidate_ids: list[int] | None = None
+    ) -> None:
         """Called by event_loop after prefill forward to record the first output token."""
         self._aux_token[aux_index] = token
+        if spec_candidate_ids is not None:
+            self._aux_spec_candidate_ids[aux_index] = spec_candidate_ids
         if self._layerwise_enabled:
-            self.kv_manager.set_bootstrap_token(aux_index, token)
+            self.kv_manager.set_bootstrap_token(aux_index, token, spec_candidate_ids)
             self._layerwise_token_published.add(aux_index)
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
@@ -161,9 +166,12 @@ class DisaggPrefillExecutor:
         for i, request_id in enumerate(op.request_ids):
             aux_index = op.request_pool_indices[i]
             bootstrap_token = self._aux_token.pop(aux_index, -1)
+            spec_candidate_ids = self._aux_spec_candidate_ids.pop(aux_index, None)
             if self.senders[request_id].has_layerwise_transfer():
                 if aux_index not in self._layerwise_token_published:
-                    self.kv_manager.set_bootstrap_token(aux_index, bootstrap_token)
+                    self.kv_manager.set_bootstrap_token(
+                        aux_index, bootstrap_token, spec_candidate_ids
+                    )
                 self._layerwise_token_published.discard(aux_index)
                 continue
 
@@ -191,6 +199,7 @@ class DisaggPrefillExecutor:
                 aux_index,
                 is_last,
                 bootstrap_token=bootstrap_token,
+                spec_candidate_ids=spec_candidate_ids,
                 mamba_indices=mamba_indices,
             )
 
