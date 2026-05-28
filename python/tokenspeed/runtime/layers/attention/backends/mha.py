@@ -38,11 +38,11 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
+from tokenspeed.runtime.utils.common import ceil_div
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
-
 
 _KERNEL_SOLUTION_BY_BACKEND = {
     "mha": None,
@@ -54,18 +54,30 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 
 
 @dataclass
-class MHAMetadata:
-    cache_seqlens_int32: torch.Tensor
+class MHAPrefillMetadata:
+    # Device-side metadata:
+    # - seq_lens: total length after this step
+    # - extend_seq_lens: length of new tokens
+    #   cu_extend_seq_lens: the cumsum version of extend_seq_lens
+    # - extend_prefix_lens: length of the cached prefix tokens
+    # seq_lens[i] = extend_prefix_lens[i] + extend_seq_lens[i]
     page_table: torch.Tensor
-    cu_seqlens_q: torch.Tensor | None = None
-    max_seq_len_q: int | None = None
-    max_seq_len_k: int | None = None
-    prefix_seqlens_int32: torch.Tensor | None = None
-    max_prefix_seq_len: int | None = None
-    has_prefix: bool = False
-    # FA3 scheduler metadata pre-computed once per scheduler step. When set,
-    # the FA3 decode kernel skips its internal prepare_varlen_num_blocks
-    # launch.
+    seq_lens: torch.Tensor
+    extend_seq_lens: torch.Tensor
+    cu_extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor
+    # Host-side metadata:
+    extend_seq_lens_cpu: list[int]
+    cu_extend_seq_lens_cpu: list[int]
+    max_extend_seq_len: int
+    max_extend_prefix_len: int = 0
+
+
+@dataclass(kw_only=True)
+class MHADecodeMetadata:
+    # Device-side metadata.
+    page_table: torch.Tensor
+    seq_lens: torch.Tensor
     scheduler_metadata: torch.Tensor | None = None
 
 
@@ -79,38 +91,47 @@ class MHAAttnBackend(AttentionBackend):
 
     def __init__(self, config: MHAConfig):
         super().__init__(config)
+        # Map the selected backend to the corresponding kernel solution string.
         backend_name = config.backend_name or "mha"
-        if backend_name not in _KERNEL_SOLUTION_BY_BACKEND:
-            raise ValueError(f"Unsupported MHA backend: {backend_name!r}")
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
+
+        # Set the MHA extend mode:
+        # - "paged": write kv to cache first and use a single kernel for prefill
+        # - "ragged": split the cached prefix and the non-cached part into two
+        #             kernels and merge their outputs.
         self.mha_extend_mode = global_server_args_dict.get("mha_extend_mode", "paged")
+
+        # Static information needed for metadata construction and kernel dispatch
         self.max_context_len = config.context_len
         self.page_size = config.page_size
-        self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
-        ) // self.page_size
-        self.forward_decode_metadata: MHAMetadata | None = None
-        self.forward_prefill_metadata: MHAMetadata | None = None
+        self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
+        num_q_heads = config.num_attention_heads
+        num_kv_heads = config.num_kv_heads
+        self.tp_q_head_num = max(num_q_heads // config.attn_tp_size, 1)
+        self.tp_kv_head_num = max(num_kv_heads // config.attn_tp_size, 1)
+        self.head_dim = config.head_dim
+        self.qkv_dtype = config.dtype
 
-        # Constants for the FA3 scheduler-metadata pre-compute.
-        self._tp_q_head_num = max(config.num_attention_heads // config.attn_tp_size, 1)
-        self._tp_k_head_num = max(config.num_kv_heads // config.attn_tp_size, 1)
-        self._head_dim = config.head_dim
-        self._qkv_dtype = config.dtype
+        # Forward metadata is initialized in the runner per forward call
+        self.forward_decode_metadata: MHADecodeMetadata | None = None
+        self.forward_prefill_metadata: MHAPrefillMetadata | None = None
 
     def init_forward_metadata(
         self,
         bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
-        extend_prefix_lens: torch.Tensor | None = None,
+        forward_mode: ForwardMode,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
         **kwargs,
     ):
-        assert (
-            seq_lens.dtype == torch.int32
-        ), f"seq_lens must be int32, got {seq_lens.dtype}"
+        assert bs == num_extends, "mha backend does not support mixed batch"
+
         seq_lens = seq_lens[:bs]
         page_table = build_page_table(
             req_pool_indices[:bs],
@@ -120,111 +141,81 @@ class MHAAttnBackend(AttentionBackend):
         )
 
         if forward_mode.is_extend_or_mixed():
-            if extend_prefix_lens is None:
-                extend_seq_lens = seq_lens
-            else:
-                assert (
-                    extend_prefix_lens.dtype == torch.int32
-                ), f"extend_prefix_lens must be int32, got {extend_prefix_lens.dtype}"
-                extend_seq_lens = seq_lens - extend_prefix_lens[:bs]
-
-            extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
-            assert (
-                extend_seq_lens_cpu is not None
-            ), "mha extend requires extend_seq_lens_cpu"
-            max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
-            extend_prefix_lens_cpu = kwargs.get("extend_prefix_lens_cpu")
-            if not forward_mode.is_extend():
-                has_prefix = False
-            elif extend_prefix_lens is None:
-                has_prefix = False
-            elif extend_prefix_lens_cpu is not None:
-                has_prefix = bool(extend_prefix_lens_cpu[:bs].any().item())
-            else:
-                has_prefix = False
-
-            prefix_seqlens = None
-            max_prefix_seq_len = None
-            if extend_prefix_lens is not None:
-                prefix_seqlens = extend_prefix_lens[:bs]
-                if extend_prefix_lens_cpu is not None:
-                    max_prefix_seq_len = int(extend_prefix_lens_cpu[:bs].max().item())
-
-            self.forward_prefill_metadata = MHAMetadata(
-                cache_seqlens_int32=seq_lens,
-                cu_seqlens_q=self._make_cu_seqlens(extend_seq_lens),
-                page_table=page_table,
-                max_seq_len_q=max_seq_len_q,
-                max_seq_len_k=self.max_context_len,
-                prefix_seqlens_int32=prefix_seqlens,
-                max_prefix_seq_len=max_prefix_seq_len,
-                has_prefix=has_prefix,
+            extend_seq_lens = extend_seq_lens[:bs]
+            extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
+            cu_extend_seq_lens, cu_extend_seq_lens_cpu = self._make_cu_extend_seq_lens(
+                extend_seq_lens,
+                extend_seq_lens_cpu,
             )
-            if not self.is_draft:
-                return
+            extend_prefix_lens = extend_prefix_lens[:bs]
+            max_extend_seq_len = max(extend_seq_lens_cpu)
+            max_extend_prefix_len = int(extend_prefix_lens_cpu[:bs].max().item())
+
+            self.forward_prefill_metadata = MHAPrefillMetadata(
+                page_table=page_table,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                cu_extend_seq_lens=cu_extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+                max_extend_seq_len=max_extend_seq_len,
+                max_extend_prefix_len=max_extend_prefix_len,
+            )
+
             # Drafter: also fill decode_metadata so step 1+ multi-step has
             # metadata under EXTEND/MIXED target. seq_lens is the drafter's
             # live alias buffer (wrapper pre-writes it before this call).
-            self.forward_decode_metadata = MHAMetadata(
-                cache_seqlens_int32=seq_lens,
-                page_table=page_table,
-                max_seq_len_k=self.max_context_len,
-            )
-            return
-
-        if self.spec_num_tokens > 1:
-            self.forward_prefill_metadata = MHAMetadata(
-                cache_seqlens_int32=seq_lens,
-                cu_seqlens_q=self._make_uniform_cu_seqlens(
-                    bs,
-                    self.spec_num_tokens,
-                    seq_lens.device,
-                ),
-                page_table=page_table,
-                max_seq_len_q=self.spec_num_tokens,
-                max_seq_len_k=self.max_context_len,
-            )
             if self.is_draft:
-                # Drafter follow-up single-token steps after the first.
-                # cache_seqlens_int32 aliases seq_lens (drafter's live buffer)
-                # so multi-step in-place advances propagate to the kernel.
-                self.forward_decode_metadata = MHAMetadata(
-                    cache_seqlens_int32=seq_lens,
+                self.forward_decode_metadata = MHADecodeMetadata(
                     page_table=page_table,
-                    max_seq_len_k=self.max_context_len,
+                    seq_lens=seq_lens,
                 )
         else:
-            metadata = MHAMetadata(
-                cache_seqlens_int32=seq_lens,
-                page_table=page_table,
-                max_seq_len_k=self.max_context_len,
-            )
-            metadata.scheduler_metadata = self._maybe_compute_scheduler_metadata(
-                bs, seq_lens
-            )
-            self.forward_decode_metadata = metadata
-
-    def _maybe_compute_scheduler_metadata(
-        self, bs: int, cache_seqlens: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Pre-compute FA3 decode scheduler metadata once per step.
-
-        Returns ``None`` when the active backend does not consume pre-computed
-        scheduler metadata (only FA3 on Hopper does); the kernel then falls
-        back to its internal prepare_varlen_num_blocks launch.
-        """
-        return mha_decode_scheduler_metadata(
-            batch_size=bs,
-            max_seqlen_q=1,
-            max_seqlen_k=self.max_context_len,
-            num_heads_q=self._tp_q_head_num,
-            num_heads_kv=self._tp_k_head_num,
-            headdim=self._head_dim,
-            cache_seqlens=cache_seqlens,
-            qkv_dtype=self._qkv_dtype,
-            page_size=self.page_size,
-            causal=True,
-        )
+            if self.spec_num_tokens > 1:
+                extend_seq_lens = torch.full(
+                    (bs,),
+                    self.spec_num_tokens,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                extend_prefix_lens = seq_lens - extend_seq_lens
+                extend_seq_lens_cpu = [self.spec_num_tokens] * bs
+                cu_extend_seq_lens, cu_extend_seq_lens_cpu = (
+                    self._make_uniform_cu_extend_seq_lens(
+                        bs,
+                        self.spec_num_tokens,
+                        seq_lens.device,
+                    )
+                )
+                self.forward_prefill_metadata = MHAPrefillMetadata(
+                    page_table=page_table,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    cu_extend_seq_lens=cu_extend_seq_lens,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens_cpu=extend_seq_lens_cpu,
+                    cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+                    max_extend_seq_len=self.spec_num_tokens,
+                )
+                if self.is_draft:
+                    # Drafter follow-up single-token steps after the first.
+                    # seq_lens aliases the drafter's live buffer
+                    # so multi-step in-place advances propagate to the kernel.
+                    self.forward_decode_metadata = MHADecodeMetadata(
+                        page_table=page_table,
+                        seq_lens=seq_lens,
+                    )
+            else:
+                scheduler_metadata = self._maybe_compute_scheduler_metadata(
+                    bs,
+                    seq_lens,
+                )
+                self.forward_decode_metadata = MHADecodeMetadata(
+                    page_table=page_table,
+                    seq_lens=seq_lens,
+                    scheduler_metadata=scheduler_metadata,
+                )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         assert (
@@ -241,7 +232,7 @@ class MHAAttnBackend(AttentionBackend):
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_cache_seqlens = seq_lens_buf
+        self.cuda_graph_seq_lens = seq_lens_buf
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -250,39 +241,48 @@ class MHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        if forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"mha CUDA graph capture not supported for {forward_mode}"
-            )
+        assert not forward_mode.is_extend_or_mixed()
 
-        cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
+        seq_lens = self.cuda_graph_seq_lens[:bs]
         if self.spec_num_tokens > 1:
-            metadata = MHAMetadata(
-                cache_seqlens_int32=cache_seqlens,
-                cu_seqlens_q=self._make_uniform_cu_seqlens(
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.spec_num_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            extend_prefix_lens = seq_lens - extend_seq_lens
+            extend_seq_lens_cpu = [self.spec_num_tokens] * bs
+            cu_extend_seq_lens, cu_extend_seq_lens_cpu = (
+                self._make_uniform_cu_extend_seq_lens(
                     bs,
                     self.spec_num_tokens,
                     self.device,
-                ),
+                )
+            )
+            metadata = MHAPrefillMetadata(
                 page_table=self.cuda_graph_page_table[:bs, :],
-                max_seq_len_q=self.spec_num_tokens,
-                max_seq_len_k=self.max_context_len,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                cu_extend_seq_lens=cu_extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+                max_extend_seq_len=self.spec_num_tokens,
             )
             self.cuda_graph_prefill_metadata[bs] = metadata
             self.forward_prefill_metadata = metadata
             if self.is_draft:
-                metadata = MHAMetadata(
-                    cache_seqlens_int32=cache_seqlens,
+                metadata = MHADecodeMetadata(
                     page_table=self.cuda_graph_page_table[:bs, :],
-                    max_seq_len_k=self.max_context_len,
+                    seq_lens=seq_lens,
                 )
                 self.cuda_graph_decode_metadata[bs] = metadata
                 self.forward_decode_metadata = metadata
         else:
-            metadata = MHAMetadata(
-                cache_seqlens_int32=cache_seqlens,
+            metadata = MHADecodeMetadata(
                 page_table=self.cuda_graph_page_table[:bs, :],
-                max_seq_len_k=self.max_context_len,
+                seq_lens=seq_lens,
             )
             self.cuda_graph_decode_metadata[bs] = metadata
             self.forward_decode_metadata = metadata
@@ -296,15 +296,12 @@ class MHAAttnBackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
-        # cache_seqlens aliases seq_lens_buf; only page_table needs refresh.
+        assert not forward_mode.is_extend_or_mixed()
+
+        # seq_lens aliases seq_lens_buf; only page_table needs refresh.
         if req_to_page is not None:
             self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
                 req_to_page[req_pool_indices[:bs], : self.max_num_pages]
-            )
-
-        if forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"mha CUDA graph replay not supported for {forward_mode}"
             )
 
         if bs in self.cuda_graph_prefill_metadata:
@@ -377,12 +374,12 @@ class MHAAttnBackend(AttentionBackend):
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table,
-            cache_seqlens=metadata.cache_seqlens_int32,
+            cache_seqlens=metadata.seq_lens,
             softmax_scale=layer.scaling,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
-            max_seqlen_k=metadata.max_seq_len_k,
+            max_seqlen_k=self.max_context_len,
             scheduler_metadata=scheduler_metadata,
             solution=self.kernel_solution,
         )
@@ -411,9 +408,9 @@ class MHAAttnBackend(AttentionBackend):
             raise ValueError("mha extend requires k and v to both be present or absent")
 
         if has_kv:
-            if metadata.has_prefix:
+            if metadata.max_extend_prefix_len > 0:
                 if self.mha_extend_mode == "ragged":
-                    return self._forward_split_prefill(
+                    return self._forward_prefill_split(
                         q,
                         k,
                         v,
@@ -468,12 +465,10 @@ class MHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        metadata: MHAMetadata,
+        metadata: MHAPrefillMetadata,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        cu_seqlens_q = metadata.cu_seqlens_q
-        assert cu_seqlens_q is not None
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
@@ -481,9 +476,9 @@ class MHAAttnBackend(AttentionBackend):
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=metadata.max_seq_len_q,
-            max_seqlen_k=metadata.max_seq_len_q,
+            cu_seqlens=metadata.cu_extend_seq_lens,
+            cu_seqlens_cpu=metadata.cu_extend_seq_lens_cpu,
+            max_seqlen=metadata.max_extend_seq_len,
             softmax_scale=layer.scaling,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
@@ -504,7 +499,7 @@ class MHAAttnBackend(AttentionBackend):
             )
         return output
 
-    def _forward_split_prefill(
+    def _forward_prefill_split(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -512,14 +507,10 @@ class MHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        metadata: MHAMetadata,
+        metadata: MHAPrefillMetadata,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        assert metadata.prefix_seqlens_int32 is not None
-        assert metadata.max_prefix_seq_len is not None
-        cu_seqlens_q = metadata.cu_seqlens_q
-        assert cu_seqlens_q is not None
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
@@ -528,9 +519,9 @@ class MHAAttnBackend(AttentionBackend):
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=metadata.max_seq_len_q,
-            max_seqlen_k=metadata.max_seq_len_q,
+            cu_seqlens=metadata.cu_extend_seq_lens,
+            cu_seqlens_cpu=metadata.cu_extend_seq_lens_cpu,
+            max_seqlen=metadata.max_extend_seq_len,
             softmax_scale=layer.scaling,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
@@ -543,17 +534,17 @@ class MHAAttnBackend(AttentionBackend):
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         prefix_result = mha_extend_with_kvcache(
             q=q,
-            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q=metadata.cu_extend_seq_lens,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table,
-            cache_seqlens=metadata.prefix_seqlens_int32,
+            cache_seqlens=metadata.extend_prefix_lens,
             softmax_scale=layer.scaling,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             return_lse=True,
-            max_seqlen_q=metadata.max_seq_len_q,
-            max_seqlen_k=metadata.max_prefix_seq_len,
+            max_seqlen_q=metadata.max_extend_seq_len,
+            max_seqlen_k=metadata.max_extend_prefix_len,
             solution=self.kernel_solution,
         )
         prefix_out, prefix_lse = prefix_result
@@ -583,12 +574,10 @@ class MHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        metadata: MHAMetadata,
+        metadata: MHAPrefillMetadata,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        cu_seqlens_q = metadata.cu_seqlens_q
-        assert cu_seqlens_q is not None
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = None if k is None else k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = None if v is None else v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
@@ -610,18 +599,18 @@ class MHAAttnBackend(AttentionBackend):
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         result = mha_extend_with_kvcache(
             q=q,
-            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q=metadata.cu_extend_seq_lens,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table,
-            cache_seqlens=metadata.cache_seqlens_int32,
+            cache_seqlens=metadata.seq_lens,
             softmax_scale=layer.scaling,
             is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
-            max_seqlen_q=metadata.max_seq_len_q,
-            max_seqlen_k=metadata.max_seq_len_k,
+            max_seqlen_q=metadata.max_extend_seq_len,
+            max_seqlen_k=self.max_context_len,
             solution=self.kernel_solution,
         )
         return self._unwrap_output(result).reshape(
@@ -644,31 +633,62 @@ class MHAAttnBackend(AttentionBackend):
         return k_cache, v_cache
 
     @staticmethod
-    def _make_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.pad(
+    def _make_cu_extend_seq_lens(
+        lengths: torch.Tensor,
+        extend_seq_lens_cpu: list[int],
+    ) -> tuple[torch.Tensor, list[int]]:
+        cu_extend_seq_lens = torch.nn.functional.pad(
             torch.cumsum(lengths, dim=0, dtype=torch.int32),
             (1, 0),
         )
+        cu_extend_seq_lens_cpu = [0]
+        for length in extend_seq_lens_cpu:
+            cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
+        return cu_extend_seq_lens, cu_extend_seq_lens_cpu
 
     @staticmethod
-    def _make_uniform_cu_seqlens(
+    def _make_uniform_cu_extend_seq_lens(
         batch_size: int,
         tokens_per_req: int,
         device: torch.device,
-    ) -> torch.Tensor:
-        return torch.arange(
+    ) -> tuple[torch.Tensor, list[int]]:
+        cu_extend_seq_lens = torch.arange(
             0,
             batch_size * tokens_per_req + 1,
             tokens_per_req,
             dtype=torch.int32,
             device=device,
         )
+        cu_extend_seq_lens_cpu = [i * tokens_per_req for i in range(batch_size + 1)]
+        return cu_extend_seq_lens, cu_extend_seq_lens_cpu
 
     @staticmethod
     def _unwrap_output(result):
         if isinstance(result, tuple):
             return result[0]
         return result
+
+    def _maybe_compute_scheduler_metadata(
+        self, bs: int, seq_lens: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Pre-compute FA3 decode scheduler metadata once per step.
+
+        Returns ``None`` when the active backend does not consume pre-computed
+        scheduler metadata (only FA3 on Hopper does); the kernel then falls
+        back to its internal prepare_varlen_num_blocks launch.
+        """
+        return mha_decode_scheduler_metadata(
+            batch_size=bs,
+            max_seqlen_q=1,
+            max_seqlen_k=self.max_context_len,
+            num_heads_q=self.tp_q_head_num,
+            num_heads_kv=self.tp_kv_head_num,
+            headdim=self.head_dim,
+            cache_seqlens=seq_lens,
+            qkv_dtype=self.qkv_dtype,
+            page_size=self.page_size,
+            causal=True,
+        )
 
 
 for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:
