@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 import torch
 from tokenspeed_kernel.numerics.comparison import (
@@ -66,17 +66,6 @@ def _as_tolerance_fn(override: ToleranceOverride | None) -> ToleranceFn | None:
     )
 
 
-def _format_signatures_for_primary_storage_dtype(
-    spec: KernelSpec,
-    dtype: torch.dtype,
-) -> tuple[FormatSignature, ...]:
-    return tuple(
-        signature
-        for signature in sorted(spec.format_signatures, key=str)
-        if signature.primary_storage_dtype() == dtype
-    )
-
-
 def _compatible_reference_for_signature(
     registry: KernelRegistry,
     spec: KernelSpec,
@@ -100,8 +89,9 @@ def _verification_signature_and_reference(
     registry: KernelRegistry,
     spec: KernelSpec,
     dtype: torch.dtype,
+    dtype_role: str | Iterable[str],
 ) -> tuple[FormatSignature | None, KernelSpec | None]:
-    signatures = _format_signatures_for_primary_storage_dtype(spec, dtype)
+    signatures = spec.format_signatures_for_storage_dtype(dtype, dtype_role)
     for signature in signatures:
         ref_spec = _compatible_reference_for_signature(registry, spec, signature)
         if ref_spec is not None:
@@ -114,6 +104,7 @@ def verify_kernel(
     *,
     shapes: list[dict[str, Any]] | None = None,
     dtype: torch.dtype = torch.bfloat16,
+    dtype_role: str | Iterable[str],
     tolerance: ToleranceOverride | None = None,
     verbose: bool = False,
     device: str | None = None,
@@ -130,10 +121,13 @@ def verify_kernel(
     if kernel is None:
         raise ValueError(f"Kernel implementation for {kernel_name!r} is missing")
 
-    signature, ref_spec = _verification_signature_and_reference(registry, spec, dtype)
+    signature, ref_spec = _verification_signature_and_reference(
+        registry, spec, dtype, dtype_role
+    )
     if signature is None:
         raise ValueError(
-            f"Kernel {kernel_name!r} does not support primary storage dtype={dtype}"
+            f"Kernel {kernel_name!r} does not support storage dtype={dtype} "
+            f"on dtype filter role(s) {dtype_role}"
         )
     if ref_spec is None:
         raise ValueError(

@@ -172,7 +172,7 @@ def _online_quantize_mxfp8(
             block_k,
             column_major_scales=True,
             scale_tma_aligned=True,
-            scale_ue8m0=False,
+            scale_ue8m0=_platform.is_blackwell_plus,
         )
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -260,7 +260,7 @@ def mm(
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
     )
-    select_dtype = signature.primary_storage_dtype() or A.dtype
+    select_dtype = signature.storage_dtype_for("a") or A.dtype
 
     kernel = select_kernel(
         "gemm",

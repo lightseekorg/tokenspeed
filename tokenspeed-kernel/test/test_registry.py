@@ -121,6 +121,54 @@ class TestKernelSpec:
         with pytest.raises(ValueError, match="requires scale"):
             tensor_format("scaled-fp8", torch.float8_e4m3fn)
 
+    def test_format_signature_storage_dtype_for_role(self):
+        signature = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.float16),
+        )
+
+        assert signature.storage_dtype_for("a") == torch.bfloat16
+        assert signature.storage_dtype_for("b") == torch.float16
+        assert signature.storage_dtype_for("missing") is None
+
+    def test_format_signatures_for_storage_dtype_uses_explicit_roles(self):
+        mxfp4_scale = ScaleFormat(
+            storage_dtype=torch.uint8,
+            granularity="block",
+            block_shape=(32,),
+        )
+        nvfp4_scale = ScaleFormat(
+            storage_dtype=torch.float32,
+            granularity="block",
+            dynamic_block_shape=True,
+        )
+        bf16_mxfp4 = format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=tensor_format("mxfp4", torch.uint8, scale=mxfp4_scale),
+        )
+        bf16_nvfp4 = format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=tensor_format("nvfp4", torch.uint8, scale=nvfp4_scale),
+        )
+        fp16_mxfp4 = format_signature(
+            x=dense_tensor_format(torch.float16),
+            weight=tensor_format("mxfp4", torch.uint8, scale=mxfp4_scale),
+        )
+        spec = KernelSpec(
+            name="moe_fused",
+            family="moe",
+            mode="fused",
+            format_signatures=frozenset({bf16_mxfp4, bf16_nvfp4, fp16_mxfp4}),
+        )
+
+        matches = spec.format_signatures_for_storage_dtype(torch.bfloat16, "x")
+
+        assert set(matches) == {bf16_mxfp4, bf16_nvfp4}
+        assert spec.storage_dtypes_for_role("x") == {torch.bfloat16, torch.float16}
+        assert spec.format_signature_for_storage_dtype(torch.float16, "x") == fp16_mxfp4
+        with pytest.raises(ValueError, match="multiple format signatures"):
+            spec.format_signature_for_storage_dtype(torch.bfloat16, "x")
+
     def test_equality(self):
         spec1 = KernelSpec(name="k1", family="attention", mode="decode")
         spec2 = KernelSpec(name="k1", family="attention", mode="decode")

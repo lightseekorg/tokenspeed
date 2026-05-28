@@ -210,7 +210,9 @@ class LogitsProcessor(nn.Module):
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
             gather_ids = logits_metadata.gather_ids
-            if gather_ids is None:
+            # Shapes align iff midlayer already pruned to one row per request
+            # (draft first-step reduce). Other paths emit [N, H] with N > bs.
+            if gather_ids is None or gather_ids.shape[0] == hidden_states.shape[0]:
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
