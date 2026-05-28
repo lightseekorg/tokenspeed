@@ -131,9 +131,7 @@ class CommManager:
             return hidden_states, residual
 
         if self.use_all_reduce(self.is_moe):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.attn.tp_rank, self.mapping.attn.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
             # The output residual is expected to have attn_tp_num_tokens.
             # For first layer, the input residual has attn_tp_num_tokens.
             # Otherwise, if this layer experiences a RSAG -> AR switch, residual needs allgather.
@@ -206,9 +204,7 @@ class CommManager:
             return hidden_states, residual
 
         if self.use_all_reduce(is_moe=False):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.dense.tp_rank, self.mapping.dense.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
             hidden_states,
@@ -224,9 +220,7 @@ class CommManager:
             return hidden_states, residual
 
         if self.use_all_reduce(is_moe=True):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.moe.tp_ep_rank, self.mapping.moe.tp_ep_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.moe.tp_ep_group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
             hidden_states,

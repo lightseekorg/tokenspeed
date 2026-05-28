@@ -459,7 +459,7 @@ class ColumnParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            output = all_gather(output_parallel, self.tp_rank, self.tp_group, dim=-1)
+            output = all_gather(output_parallel, self.tp_group, dim=-1)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -1242,7 +1242,7 @@ class RowParallelLinear(LinearBase):
         else:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
         if self.reduce_results and self.tp_size > 1:
-            output = all_reduce(output_parallel, self.tp_rank, self.tp_group)
+            output = all_reduce(output_parallel, self.tp_group)
         else:
             output = output_parallel
 

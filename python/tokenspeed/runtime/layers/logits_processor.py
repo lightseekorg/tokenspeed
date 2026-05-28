@@ -452,9 +452,7 @@ class LogitsProcessor(nn.Module):
                     dtype=logits.dtype,
                     device=logits.device,
                 )
-                all_gather_into_tensor(
-                    gathered_logits, logits, self.tp_rank, self.tp_group
-                )
+                all_gather_into_tensor(gathered_logits, logits, self.tp_group)
                 logits = (
                     gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
                     .transpose(0, 1)

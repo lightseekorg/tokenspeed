@@ -115,7 +115,6 @@ class FusionParams:
 
 def all_reduce(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
@@ -128,7 +127,6 @@ def all_reduce(
 
 def all_gather(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     dim: int = -1,
     backend: CommBackend | None = None,
@@ -142,7 +140,6 @@ def all_gather(
 def all_gather_into_tensor(
     output: torch.Tensor,
     input: torch.Tensor,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
 ) -> None:
@@ -154,7 +151,6 @@ def all_gather_into_tensor(
 
 def reduce_scatter(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
 ) -> torch.Tensor:
