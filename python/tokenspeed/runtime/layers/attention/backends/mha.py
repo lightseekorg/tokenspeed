@@ -292,17 +292,15 @@ class MHAAttnBackend(AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
-        req_to_page: torch.Tensor = None,
         **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        # seq_lens aliases seq_lens_buf; only page_table needs refresh.
-        if req_to_page is not None:
-            self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
-                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
-            )
+        self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
+            req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+        )
 
         if bs in self.cuda_graph_prefill_metadata:
             self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
