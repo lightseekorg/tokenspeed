@@ -37,6 +37,7 @@ __all__ = [
     "gumbel_sample_from_pools_compact",
     "gumbel_sample_from_pools",
     "min_p_renorm_prob",
+    "sample_top_p_rejection_from_pools",
     "sample_rejection_from_pools",
     "sample_rejection_min_p_from_pools",
     "sample_top_k_top_p_from_pools_compact",
@@ -856,6 +857,118 @@ def _rejection_sample_stage3_pool_kernel(
 
 
 @triton.jit
+def _top_p_rejection_sample_stage3_pool_kernel(
+    logits_ptr,
+    req_pool_indices_ptr,
+    temperature_pool_ptr,
+    candidate_ids_ptr,
+    candidate_logits_ptr,
+    local_total_probs_ptr,
+    local_before_probs_ptr,
+    logits_row_stride: tl.constexpr,
+    candidate_row_stride: tl.constexpr,
+    local_total_row_stride: tl.constexpr,
+    local_before_row_stride: tl.constexpr,
+    local_before_try_stride: tl.constexpr,
+    local_before_block_stride: tl.constexpr,
+    vocab_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    RETRIES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    token_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = token_offsets < vocab_size
+    pool_idx = tl.load(req_pool_indices_ptr + row)
+
+    logits = tl.load(
+        logits_ptr + row * logits_row_stride + token_offsets,
+        mask=mask,
+        other=float("-inf"),
+    ).to(tl.float32)
+    temperature = tl.maximum(
+        tl.load(temperature_pool_ptr + pool_idx).to(tl.float32), 1.0e-20
+    )
+    scaled_logits = logits / temperature
+    global_max = tl.load(
+        candidate_logits_ptr + row * candidate_row_stride + RETRIES
+    ).to(tl.float32)
+    probs = tl.where(mask, tl.exp(scaled_logits - global_max), 0.0)
+    tl.store(
+        local_total_probs_ptr + row * local_total_row_stride + block_idx,
+        tl.sum(probs, axis=0),
+    )
+
+    for retry in tl.static_range(0, RETRIES):
+        candidate_id = tl.load(candidate_ids_ptr + row * candidate_row_stride + retry)
+        candidate_logit = tl.load(
+            candidate_logits_ptr + row * candidate_row_stride + retry
+        ).to(tl.float32)
+        before = mask & (
+            (scaled_logits > candidate_logit)
+            | ((scaled_logits == candidate_logit) & (token_offsets < candidate_id))
+        )
+        tl.store(
+            local_before_probs_ptr
+            + row * local_before_row_stride
+            + retry * local_before_try_stride
+            + block_idx * local_before_block_stride,
+            tl.sum(tl.where(before, probs, 0.0), axis=0),
+        )
+
+
+@triton.jit
+def _top_p_rejection_sample_stage4_pool_kernel(
+    req_pool_indices_ptr,
+    top_p_pool_ptr,
+    candidate_ids_ptr,
+    local_total_probs_ptr,
+    local_before_probs_ptr,
+    out_ptr,
+    candidate_row_stride: tl.constexpr,
+    local_total_row_stride: tl.constexpr,
+    local_before_row_stride: tl.constexpr,
+    local_before_try_stride: tl.constexpr,
+    local_before_block_stride: tl.constexpr,
+    num_blocks: tl.constexpr,
+    NUM_BLOCKS_PAD: tl.constexpr,
+    RETRIES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block_offsets = tl.arange(0, NUM_BLOCKS_PAD)
+    mask = block_offsets < num_blocks
+    pool_idx = tl.load(req_pool_indices_ptr + row)
+
+    total_probs = tl.load(
+        local_total_probs_ptr + row * local_total_row_stride + block_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    total_prob = tl.sum(total_probs, axis=0)
+    top_p = tl.load(top_p_pool_ptr + pool_idx).to(tl.float32)
+
+    selected = tl.load(candidate_ids_ptr + row * candidate_row_stride + RETRIES)
+    found = False
+    for retry in tl.static_range(0, RETRIES):
+        before_probs = tl.load(
+            local_before_probs_ptr
+            + row * local_before_row_stride
+            + retry * local_before_try_stride
+            + block_offsets * local_before_block_stride,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        before_prob = tl.sum(before_probs, axis=0)
+
+        ok = (top_p >= 1.0 - 1.0e-6) | (before_prob < top_p * total_prob)
+        candidate_id = tl.load(candidate_ids_ptr + row * candidate_row_stride + retry)
+        selected = tl.where(ok & ~found, candidate_id, selected)
+        found = found | ok
+
+    tl.store(out_ptr + row, selected)
+
+
+@triton.jit
 def _rejection_sample_stage4_pool_kernel(
     req_pool_indices_ptr,
     top_k_pool_ptr,
@@ -1394,14 +1507,16 @@ def _check_rejection_scratch(
     candidate_logits: torch.Tensor,
     local_total_probs: torch.Tensor,
     local_before_probs: torch.Tensor,
-    local_before_counts: torch.Tensor,
+    local_before_counts: torch.Tensor | None,
 ) -> None:
-    for name, tensor in (
+    tensors_3d = (
         ("local_ids", local_ids),
         ("local_scores", local_scores),
         ("local_before_probs", local_before_probs),
-        ("local_before_counts", local_before_counts),
-    ):
+    )
+    if local_before_counts is not None:
+        tensors_3d += (("local_before_counts", local_before_counts),)
+    for name, tensor in tensors_3d:
         if tensor.ndim != 3:
             raise ValueError(f"{name} must be a 3D scratch tensor")
         if tensor.device.type != "cuda":
@@ -1453,7 +1568,7 @@ def _check_rejection_scratch(
         )
     if candidate_ids.dtype != torch.int32:
         raise ValueError(f"candidate_ids must be int32, got {candidate_ids.dtype}")
-    if local_before_counts.dtype != torch.int32:
+    if local_before_counts is not None and local_before_counts.dtype != torch.int32:
         raise ValueError(
             "local_before_counts must be int32, " f"got {local_before_counts.dtype}"
         )
@@ -1563,6 +1678,137 @@ def _check_rejection_pool_inputs(
     if top_k_pool.dtype != torch.int32:
         raise ValueError(f"top_k_pool must be int32, got {top_k_pool.dtype}")
     return rows, vocab_size, num_blocks
+
+
+def sample_top_p_rejection_from_pools(
+    logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    local_ids: torch.Tensor,
+    local_scores: torch.Tensor,
+    local_argmax_ids: torch.Tensor,
+    local_argmax_scores: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    local_total_probs: torch.Tensor,
+    local_before_probs: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Top-p-only bounded rejection sampler.
+
+    This is the same pool-aware rejection algorithm as the generic sampler,
+    but it deliberately skips finite top-k scratch prep, top-k mass, and
+    rank-count bookkeeping. It is used only for ``top_k`` disabled rows.
+    """
+    rows, vocab_size, num_blocks = _check_top_p_pool_inputs(
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        top_p_pool,
+        seed_pool,
+        offsets_pool,
+        local_argmax_ids,
+        local_argmax_scores,
+        out,
+        fn_name="sample_top_p_rejection_from_pools",
+    )
+    _check_rejection_scratch(
+        rows,
+        num_blocks,
+        local_ids,
+        local_scores,
+        local_argmax_ids,
+        local_argmax_scores,
+        candidate_ids,
+        candidate_logits,
+        local_total_probs,
+        local_before_probs,
+        None,
+    )
+    if rows == 0:
+        return out[:0]
+
+    _top_p_rejection_sample_stage1_pool_kernel[(rows, num_blocks)](
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        seed_pool,
+        offsets_pool,
+        local_ids,
+        local_scores,
+        local_argmax_ids,
+        local_argmax_scores,
+        logits_row_stride=logits.stride(0),
+        local_ids_row_stride=local_ids.stride(0),
+        local_ids_try_stride=local_ids.stride(1),
+        local_ids_block_stride=local_ids.stride(2),
+        local_argmax_row_stride=local_argmax_ids.stride(0),
+        vocab_size=vocab_size,
+        BLOCK_SIZE=_GUMBEL_BLOCK_SIZE,
+        RETRIES=_TOP_P_REJECTION_TRIES,
+        num_warps=4,
+    )
+    _top_p_rejection_sample_stage2_pool_kernel[(rows,)](
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        local_ids,
+        local_scores,
+        local_argmax_ids,
+        local_argmax_scores,
+        candidate_ids,
+        candidate_logits,
+        logits_row_stride=logits.stride(0),
+        local_ids_row_stride=local_ids.stride(0),
+        local_ids_try_stride=local_ids.stride(1),
+        local_ids_block_stride=local_ids.stride(2),
+        local_argmax_row_stride=local_argmax_ids.stride(0),
+        candidate_row_stride=candidate_ids.stride(0),
+        num_blocks=num_blocks,
+        NUM_BLOCKS_PAD=triton.next_power_of_2(max(num_blocks, 1)),
+        RETRIES=_TOP_P_REJECTION_TRIES,
+        num_warps=8,
+    )
+    _top_p_rejection_sample_stage3_pool_kernel[(rows, num_blocks)](
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        candidate_ids,
+        candidate_logits,
+        local_total_probs,
+        local_before_probs,
+        logits_row_stride=logits.stride(0),
+        candidate_row_stride=candidate_ids.stride(0),
+        local_total_row_stride=local_total_probs.stride(0),
+        local_before_row_stride=local_before_probs.stride(0),
+        local_before_try_stride=local_before_probs.stride(1),
+        local_before_block_stride=local_before_probs.stride(2),
+        vocab_size=vocab_size,
+        BLOCK_SIZE=_GUMBEL_BLOCK_SIZE,
+        RETRIES=_TOP_P_REJECTION_TRIES,
+        num_warps=4,
+    )
+    _top_p_rejection_sample_stage4_pool_kernel[(rows,)](
+        req_pool_indices,
+        top_p_pool,
+        candidate_ids,
+        local_total_probs,
+        local_before_probs,
+        out,
+        candidate_row_stride=candidate_ids.stride(0),
+        local_total_row_stride=local_total_probs.stride(0),
+        local_before_row_stride=local_before_probs.stride(0),
+        local_before_try_stride=local_before_probs.stride(1),
+        local_before_block_stride=local_before_probs.stride(2),
+        num_blocks=num_blocks,
+        NUM_BLOCKS_PAD=triton.next_power_of_2(max(num_blocks, 1)),
+        RETRIES=_TOP_P_REJECTION_TRIES,
+        num_warps=8,
+    )
+    return out[:rows]
 
 
 def sample_rejection_from_pools(

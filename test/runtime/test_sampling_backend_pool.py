@@ -331,10 +331,16 @@ class TestTritonSamplingDefault(unittest.TestCase):
             backend._temperature_pool[0].fill_(1.0)
             backend._seed_pool[0].fill_(66)
 
+        def set_top_p(backend):
+            backend._top_p_pool[0].fill_(0.6)
+            backend._temperature_pool[0].fill_(1.0)
+            backend._seed_pool[0].fill_(33)
+
         cases = (
             (None, 42, None),
             ("no_filter", 47, None),
             ("top_k_top_p", 17, set_top_k_top_p),
+            ("top_p", 17, set_top_p),
         )
         for capture_variant, expected_token, configure in cases:
             with self.subTest(capture_variant=capture_variant):
@@ -350,7 +356,7 @@ class TestTritonSamplingDefault(unittest.TestCase):
                 logits = torch.full(
                     (1, VOCAB), -10.0, dtype=torch.float32, device="cuda"
                 )
-                if capture_variant == "top_k_top_p":
+                if capture_variant in ("top_k_top_p", "top_p"):
                     logits[0, 17] = 10.0
                     logits[0, 23] = 9.0
                     logits[0, 99] = 8.0
@@ -399,7 +405,7 @@ class TestTritonSamplingDefault(unittest.TestCase):
             request_pool_indices=[3],
             sampling_params_list=[_sp("p", top_k=-1, top_p=0.9)],
         )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "default")
+        self.assertEqual(backend.cuda_graph_replay_variant(), "top_p")
 
         backend.prepare_step(
             request_ids=["b"],
@@ -427,7 +433,7 @@ class TestTritonSamplingDefault(unittest.TestCase):
         compact_backend = TritonSamplingBackend(_make_config())
         self.assertEqual(
             compact_backend.cuda_graph_capture_variants(num_tokens_per_req=1),
-            ("default", "no_filter", "top_k_top_p"),
+            ("default", "no_filter", "top_k_top_p", "top_p"),
         )
         self.assertEqual(
             compact_backend.cuda_graph_capture_variants(num_tokens_per_req=4),
@@ -447,14 +453,14 @@ class TestTritonSamplingDefault(unittest.TestCase):
         backend = TritonSamplingBackend(_make_config(vocab_size=151936))
         self.assertEqual(
             backend.cuda_graph_capture_variants(num_tokens_per_req=1),
-            ("default", "no_filter", "top_k_top_p"),
+            ("default", "no_filter", "top_k_top_p", "top_p"),
         )
         backend.prepare_step(
             request_ids=["p"],
             request_pool_indices=[1],
             sampling_params_list=[_sp("p", top_k=-1, top_p=0.9)],
         )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "default")
+        self.assertEqual(backend.cuda_graph_replay_variant(), "top_p")
 
     def test_mixed_modes_sample_batch(self):
         backend = TritonSamplingBackend(_make_config())

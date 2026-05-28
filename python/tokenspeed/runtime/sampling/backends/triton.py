@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     sample_rejection_from_pools,
     sample_top_k_top_p_from_pools,
     sample_top_k_top_p_from_pools_compact,
+    sample_top_p_rejection_from_pools,
 )
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
@@ -52,11 +53,13 @@ _TRITON_GUMBEL_MODE_NO_FILTER = 1
 _TRITON_GUMBEL_MODE_TOP_K_TOP_P = 2
 _TRITON_GUMBEL_MODE_GENERIC_REJECTION = 3
 _TRITON_GUMBEL_MODE_GREEDY = 4
+_TRITON_GUMBEL_MODE_TOP_P_ONLY = 5
 _TOP_P_REJECTION_TRIES = 4
 _CUDA_GRAPH_VARIANT_DEFAULT = "default"
 _CUDA_GRAPH_VARIANT_GREEDY = "greedy"
 _CUDA_GRAPH_VARIANT_NO_FILTER = "no_filter"
 _CUDA_GRAPH_VARIANT_TOP_K_TOP_P = "top_k_top_p"
+_CUDA_GRAPH_VARIANT_TOP_P = "top_p"
 
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -280,7 +283,7 @@ class TritonSamplingBackend(SamplingBackend):
         if all(top_k == _TOP_K_DISABLED for top_k in top_ks):
             if all(abs(top_p - 1.0) <= _SAMPLING_EPS for top_p in top_ps):
                 return _TRITON_GUMBEL_MODE_NO_FILTER
-            return _TRITON_GUMBEL_MODE_GENERIC_REJECTION
+            return _TRITON_GUMBEL_MODE_TOP_P_ONLY
         if all(1 <= top_k < _TOP_K_FILTER_MAX_K for top_k in top_ks):
             can_use_direct_top_k_top_p = all(
                 top_k <= _TOP_K_TOP_P_DIRECT_MAX_K for top_k in top_ks
@@ -315,6 +318,7 @@ class TritonSamplingBackend(SamplingBackend):
                 _CUDA_GRAPH_VARIANT_DEFAULT,
                 _CUDA_GRAPH_VARIANT_NO_FILTER,
                 _CUDA_GRAPH_VARIANT_TOP_K_TOP_P,
+                _CUDA_GRAPH_VARIANT_TOP_P,
             )
             return variants
         return (_CUDA_GRAPH_VARIANT_DEFAULT, _CUDA_GRAPH_VARIANT_GREEDY)
@@ -326,6 +330,8 @@ class TritonSamplingBackend(SamplingBackend):
             return _CUDA_GRAPH_VARIANT_NO_FILTER
         if self._step_triton_gumbel_mode == _TRITON_GUMBEL_MODE_TOP_K_TOP_P:
             return _CUDA_GRAPH_VARIANT_TOP_K_TOP_P
+        if self._step_triton_gumbel_mode == _TRITON_GUMBEL_MODE_TOP_P_ONLY:
+            return _CUDA_GRAPH_VARIANT_TOP_P
         return _CUDA_GRAPH_VARIANT_DEFAULT
 
     def cuda_graph_capture_is_all_greedy(
@@ -348,6 +354,8 @@ class TritonSamplingBackend(SamplingBackend):
                 self._step_triton_gumbel_mode = _TRITON_GUMBEL_MODE_NO_FILTER
             elif capture_variant == _CUDA_GRAPH_VARIANT_TOP_K_TOP_P:
                 self._step_triton_gumbel_mode = _TRITON_GUMBEL_MODE_TOP_K_TOP_P
+            elif capture_variant == _CUDA_GRAPH_VARIANT_TOP_P:
+                self._step_triton_gumbel_mode = _TRITON_GUMBEL_MODE_TOP_P_ONLY
             else:
                 self._step_triton_gumbel_mode = _TRITON_GUMBEL_MODE_GENERIC_REJECTION
         else:
@@ -491,6 +499,24 @@ class TritonSamplingBackend(SamplingBackend):
                         self._rejection_local_total_probs[:bs],
                         self._rejection_local_before_probs[:bs],
                         self._rejection_local_before_counts[:bs],
+                        self._gumbel_out[:bs],
+                    )
+                elif triton_gumbel_mode == _TRITON_GUMBEL_MODE_TOP_P_ONLY:
+                    batch_next_token_ids = sample_top_p_rejection_from_pools(
+                        logits,
+                        sampling_info.req_pool_indices,
+                        self._temperature_pool,
+                        self._top_p_pool,
+                        self._seed_pool,
+                        sampling_info.valid_cache_lengths,
+                        self._rejection_local_ids[:bs],
+                        self._rejection_local_scores[:bs],
+                        self._rejection_argmax_ids[:bs],
+                        self._rejection_argmax_scores[:bs],
+                        self._rejection_candidate_ids[:bs],
+                        self._rejection_candidate_logits[:bs],
+                        self._rejection_local_total_probs[:bs],
+                        self._rejection_local_before_probs[:bs],
                         self._gumbel_out[:bs],
                     )
                 else:
