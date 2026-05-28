@@ -38,11 +38,12 @@ from tokenspeed_kernel.numerics.tolerance import (
     ToleranceOverride,
     get_family_tolerance,
 )
-from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.selection import (
     ref_compatible_with_spec,
     spec_matches_shape_traits,
 )
+from tokenspeed_kernel.signature import FormatSignature
 
 # isort: split
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
@@ -63,6 +64,49 @@ def _as_tolerance_fn(override: ToleranceOverride | None) -> ToleranceFn | None:
         "tolerance override must be Tolerance, callable, or None; "
         f"got {type(override)!r}"
     )
+
+
+def _format_signatures_for_primary_storage_dtype(
+    spec: KernelSpec,
+    dtype: torch.dtype,
+) -> tuple[FormatSignature, ...]:
+    return tuple(
+        signature
+        for signature in sorted(spec.format_signatures, key=str)
+        if signature.primary_storage_dtype() == dtype
+    )
+
+
+def _compatible_reference_for_signature(
+    registry: KernelRegistry,
+    spec: KernelSpec,
+    signature: FormatSignature,
+) -> KernelSpec | None:
+    ref_specs = registry.get_for_operator(
+        spec.family,
+        spec.mode,
+        format_signature=signature,
+        solution="reference",
+    )
+    for ref in ref_specs:
+        if ref.name == spec.name:
+            continue
+        if ref_compatible_with_spec(ref, spec):
+            return ref
+    return None
+
+
+def _verification_signature_and_reference(
+    registry: KernelRegistry,
+    spec: KernelSpec,
+    dtype: torch.dtype,
+) -> tuple[FormatSignature | None, KernelSpec | None]:
+    signatures = _format_signatures_for_primary_storage_dtype(spec, dtype)
+    for signature in signatures:
+        ref_spec = _compatible_reference_for_signature(registry, spec, signature)
+        if ref_spec is not None:
+            return signature, ref_spec
+    return (signatures[0], None) if signatures else (None, None)
 
 
 def verify_kernel(
@@ -86,24 +130,11 @@ def verify_kernel(
     if kernel is None:
         raise ValueError(f"Kernel implementation for {kernel_name!r} is missing")
 
-    ref_specs = registry.get_for_operator(
-        spec.family,
-        spec.mode,
-        dtype=dtype,
-        solution="reference",
-    )
-    if not ref_specs:
+    signature, ref_spec = _verification_signature_and_reference(registry, spec, dtype)
+    if signature is None:
         raise ValueError(
-            f"No reference kernel found for {spec.family}.{spec.mode} and dtype={dtype}"
+            f"Kernel {kernel_name!r} does not support primary storage dtype={dtype}"
         )
-
-    ref_spec = None
-    for ref in ref_specs:
-        if ref.name == spec.name:
-            continue
-        if ref_compatible_with_spec(ref, spec):
-            ref_spec = ref
-            break
     if ref_spec is None:
         raise ValueError(
             "No compatible reference kernel found for "
@@ -119,6 +150,7 @@ def verify_kernel(
         spec.mode,
         dtype=dtype,
         traits=spec.traits,
+        format_signature=signature,
         device=device,
         seed=seed,
     )

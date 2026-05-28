@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.selection import SelectedKernel
 
 from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
+from tokenspeed_kernel.signature import FormatSignature
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ class KernelSpec:
 
     # Capabilities
     capability: CapabilityRequirement = field(default_factory=CapabilityRequirement)
-    dtypes: frozenset[torch.dtype] = frozenset()  # Supported data types
+    format_signatures: frozenset[FormatSignature] = frozenset()
     # Op-specific traits, e.g. {"head_dim": frozenset({64, 128, 256}), "persistent": frozenset({True})}
     traits: dict[str, frozenset[Any]] = field(default_factory=dict)
 
@@ -157,6 +158,29 @@ class KernelSpec:
     tags: frozenset[str] = (
         frozenset()
     )  # Standard tags: "throughput", "latency", "determinism", "portability"
+
+    def supports_format_signature(self, format_signature: FormatSignature) -> bool:
+        return format_signature in self.format_signatures
+
+    def format_signature_for_primary_storage_dtype(
+        self,
+        primary_storage_dtype: torch.dtype,
+    ) -> FormatSignature | None:
+        """Return the first signature matching a dtype-oriented filter."""
+        for signature in sorted(self.format_signatures, key=str):
+            if signature.primary_storage_dtype() == primary_storage_dtype:
+                return signature
+        return None
+
+    def primary_storage_dtypes(self) -> frozenset[torch.dtype]:
+        return frozenset(
+            dtype
+            for dtype in (
+                signature.primary_storage_dtype()
+                for signature in self.format_signatures
+            )
+            if dtype is not None
+        )
 
 
 class KernelRegistry:
@@ -223,7 +247,7 @@ class KernelRegistry:
         *,
         features: frozenset[str] | None = None,
         platform: PlatformInfo | None = None,
-        dtype: torch.dtype | None = None,
+        format_signature: FormatSignature | None = None,
         tags: set[str] | None = None,
         solution: str | None = None,
     ) -> list[KernelSpec]:
@@ -234,8 +258,8 @@ class KernelRegistry:
             specs = [s for s in specs if features.issubset(s.features)]
         if platform:
             specs = [s for s in specs if s.capability.satisfied_by(platform)]
-        if dtype:
-            specs = [s for s in specs if dtype in s.dtypes]
+        if format_signature:
+            specs = [s for s in specs if s.supports_format_signature(format_signature)]
         if tags:
             specs = [s for s in specs if tags.issubset(s.tags)]
         if solution:
@@ -293,7 +317,7 @@ def register_kernel(
     features: set[str] | None = None,
     solution: str,
     capability: CapabilityRequirement | None = None,
-    dtypes: set[torch.dtype],
+    signatures: set[FormatSignature] | frozenset[FormatSignature],
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
     tags: set[str] | None = None,
@@ -307,6 +331,8 @@ def register_kernel(
 
     Example::
 
+        from tokenspeed_kernel.signature import format_signatures
+
         @register_kernel(
             "attention", "decode",
             features={"paged"},
@@ -315,7 +341,9 @@ def register_kernel(
                 min_arch_version=ArchVersion(10, 0),
                 required_features=frozenset({"tensor_core:f8"}),
             ),
-            dtypes={torch.float16, torch.bfloat16},
+            signatures=format_signatures(
+                ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+            ),
             # Narrowly gated on SM100 + tcgen05 → SPECIALIZED band.
             priority=Priority.SPECIALIZED + 1,
             tags={"latency", "determinism"},
@@ -334,7 +362,7 @@ def register_kernel(
             mode=mode,
             solution=solution,
             features=frozenset(features or set()),
-            dtypes=frozenset(dtypes),
+            format_signatures=frozenset(signatures),
             capability=capability or CapabilityRequirement(),
             traits=traits or {},
             priority=priority_int,
@@ -362,7 +390,8 @@ def describe_kernel(name: str) -> str:
         f"  Operator: {spec.family}.{spec.mode}",
         f"  Solution: {spec.solution}",
         f"  Priority: {spec.priority} ({band_str})",
-        f"  Dtypes: {', '.join(str(d) for d in spec.dtypes)}",
+        "  Format signatures: "
+        + ("; ".join(str(p) for p in spec.format_signatures) or "none"),
         f"  Platform: {spec.capability}",
         f"  Tags: {', '.join(spec.tags) or 'none'}",
     ]

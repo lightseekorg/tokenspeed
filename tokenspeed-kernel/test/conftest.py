@@ -54,13 +54,16 @@ def require() -> Callable[[str, str, str, torch.dtype], None]:
     ) -> None:
         from tokenspeed_kernel.platform import current_platform
 
-        specs = KernelRegistry.get().get_for_operator(
-            family,
-            mode,
-            platform=current_platform(),
-            dtype=dtype,
-            solution=solution,
-        )
+        specs = [
+            spec
+            for spec in KernelRegistry.get().get_for_operator(
+                family,
+                mode,
+                platform=current_platform(),
+                solution=solution,
+            )
+            if spec.format_signature_for_primary_storage_dtype(dtype) is not None
+        ]
         if not specs:
             pytest.skip(f"{family}.{mode} solution {solution!r} is not registered")
 

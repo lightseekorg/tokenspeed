@@ -378,6 +378,15 @@ KERNEL_GROUPS = [
         ["-O3", "-DNDEBUG", "-use_fast_math"],
     ),
     (
+        "flashinfer_softmax",
+        [
+            CUDA_CSRC_DIR / "flashinfer_softmax.cu",
+        ],
+        [],
+        # Match flashinfer's stock sampling.cuh build flags.
+        ["-O3", "-DNDEBUG", "-use_fast_math"],
+    ),
+    (
         "silu_fuse_block_quant",
         [
             CUDA_CSRC_DIR / "silu_and_mul_fuse_block_quant.cu",
@@ -520,13 +529,6 @@ class CudaKernelBuilder:
                     _add_dir(candidate)
                 if (candidate / "cccl").exists():
                     _add_dir(candidate / "cccl")
-            for rel in (
-                "tokenspeed_triton/backends/nvidia/include",
-                "triton/backends/nvidia/include",
-            ):
-                candidate = base_path / rel
-                if (candidate / "cuda_runtime.h").exists():
-                    _add_dir(candidate)
 
         try:
             tvm_ffi = importlib.import_module("tvm_ffi")

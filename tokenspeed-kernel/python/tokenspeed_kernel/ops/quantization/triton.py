@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -191,7 +192,7 @@ def fp8_quantize(
     "fp8",
     name="triton_quantize_fp8",
     solution="triton",
-    dtypes={torch.bfloat16, torch.float16},
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={"has_scale": frozenset({True, False})},
     priority=Priority.PORTABLE,
 )

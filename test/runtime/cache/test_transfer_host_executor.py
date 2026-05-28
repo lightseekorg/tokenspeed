@@ -251,9 +251,6 @@ def test_memory_executor_submit_dispatches_flat_op_by_cache_kind(monkeypatch):
             self.completed_writebacks = []
             self.order = []
 
-        def fence_writeback_after(self, producer_stream):
-            self.order.append(("fence", producer_stream))
-
         def enqueue_writeback(
             self, op_id, src_pages, dst_pages, is_retract=False, kind=CacheKind.KV
         ):
@@ -301,7 +298,41 @@ def test_memory_executor_submit_dispatches_flat_op_by_cache_kind(monkeypatch):
     ]
 
 
-def test_memory_executor_submit_plan_fences_writeback_before_enqueue(monkeypatch):
+def test_memory_executor_submit_plan_keeps_generic_submit_signature(monkeypatch):
+    import tokenspeed.runtime.cache.executor.memory_executor as memory_executor
+
+    class FakeCache:
+        class WriteBackOp:
+            pass
+
+        class LoadBackOp:
+            pass
+
+        class PrefetchOp:
+            pass
+
+        class BackUpOp:
+            pass
+
+    monkeypatch.setattr(memory_executor, "Cache", FakeCache)
+    executor = object.__new__(memory_executor.MemoryExecutor)
+    executor.seen = []
+
+    wb = FakeCache.WriteBackOp()
+    plan = type("Plan", (), {"cache": [wb]})()
+
+    def submit(self, op):
+        self.seen.append(op)
+
+    monkeypatch.setattr(memory_executor.MemoryExecutor, "submit", submit)
+    executor.host_exec = type("HostExec", (), {"flush": lambda self: None})()
+
+    executor.submit_plan(plan)
+
+    assert executor.seen == [wb]
+
+
+def test_memory_executor_mamba_layerwise_cow_uses_dedicated_context(monkeypatch):
     import tokenspeed.runtime.cache.executor.memory_executor as memory_executor
 
     class FakeCache:
@@ -319,43 +350,43 @@ def test_memory_executor_submit_plan_fences_writeback_before_enqueue(monkeypatch
 
     class FakeHostExec:
         def __init__(self):
-            self.pools = {CacheKind.MAMBA: object()}
+            self.pools = {CacheKind.KV: object(), CacheKind.MAMBA: object()}
             self.completed_writebacks = []
-            self.order = []
+            self.loadbacks = []
 
-        def fence_writeback_after(self, producer_stream):
-            self.order.append(("fence", producer_stream))
-
-        def enqueue_writeback(
-            self, op_id, src_pages, dst_pages, is_retract=False, kind=CacheKind.KV
+        def enqueue_loadback(
+            self,
+            op_id,
+            src_pages,
+            dst_pages,
+            kind=CacheKind.KV,
+            layerwise_cow_dst_pages_by_src=None,
         ):
-            self.order.append(("writeback", kind, op_id))
-
-        def enqueue_loadback(self, op_id, src_pages, dst_pages, kind=CacheKind.KV):
-            self.order.append(("loadback", kind, op_id))
+            self.loadbacks.append(
+                (kind, op_id, src_pages, dst_pages, layerwise_cow_dst_pages_by_src)
+            )
 
         def flush(self):
-            self.order.append(("flush",))
+            pass
 
     monkeypatch.setattr(memory_executor, "Cache", FakeCache)
     executor = object.__new__(memory_executor.MemoryExecutor)
     executor.host_exec = FakeHostExec()
     executor.storage_exec = None
-    producer_stream = object()
+    executor.set_mamba_layerwise_cow({40: [400]})
 
-    wb = FakeCache.WriteBackOp()
-    wb.op_ids = [11]
-    wb.src_pages = [[1]]
-    wb.dst_pages = [[2]]
-    wb.src_pages_by_kind = {"mamba": [[3]]}
-    wb.dst_pages_by_kind = {"mamba": [[4]]}
-    wb.is_retract = [False]
-    plan = type("Plan", (), {"cache": [wb]})()
+    lb = FakeCache.LoadBackOp()
+    lb.op_ids = [9]
+    lb.src_pages = [[10]]
+    lb.dst_pages = [[20]]
+    lb.src_pages_by_kind = {"kv": [[10]], "mamba": [[30]]}
+    lb.dst_pages_by_kind = {"kv": [[20]], "mamba": [[40]]}
+    plan = type("Plan", (), {"cache": [lb]})()
 
-    executor.submit_plan(plan, producer_stream=producer_stream)
+    executor.submit_plan(plan)
 
-    assert executor.host_exec.order == [
-        ("fence", producer_stream),
-        ("writeback", CacheKind.MAMBA, 11),
-        ("flush",),
+    assert executor.host_exec.loadbacks == [
+        (CacheKind.KV, 9, [10], [20], None),
+        (CacheKind.MAMBA, 9, [30], [40], {40: [400]}),
     ]
+    assert executor._pending_mamba_layerwise_cow is None

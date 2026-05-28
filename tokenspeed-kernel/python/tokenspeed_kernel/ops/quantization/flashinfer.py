@@ -23,6 +23,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
@@ -46,7 +47,7 @@ if platform.is_nvidia:
         "mxfp8",
         name="flashinfer_quantize_mxfp8",
         solution="flashinfer",
-        dtypes={torch.bfloat16, torch.float16},
+        signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         traits={},
         priority=Priority.PERFORMANT,
     )
@@ -72,7 +73,7 @@ if platform.is_nvidia and platform.is_blackwell:
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.bfloat16, torch.float16},
+        signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         traits={
             "has_scale": frozenset({True}),
         },

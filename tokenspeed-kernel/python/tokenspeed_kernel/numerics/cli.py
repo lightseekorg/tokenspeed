@@ -80,7 +80,11 @@ def _iter_candidate_specs(
         specs = [s for s in specs if s.family == family and s.mode == mode]
 
     if dtype_filter is not None:
-        specs = [s for s in specs if dtype_filter in s.dtypes]
+        specs = [
+            s
+            for s in specs
+            if s.format_signature_for_primary_storage_dtype(dtype_filter) is not None
+        ]
 
     specs.sort(key=lambda s: (s.family, s.mode, s.name))
     return specs
@@ -92,7 +96,7 @@ def _iter_dtypes(
 ) -> Iterable[torch.dtype]:
     if dtype_filter is not None:
         return (dtype_filter,)
-    return sorted(spec.dtypes, key=str)
+    return sorted(spec.primary_storage_dtypes(), key=str)
 
 
 def main(argv: list[str] | None = None) -> int:

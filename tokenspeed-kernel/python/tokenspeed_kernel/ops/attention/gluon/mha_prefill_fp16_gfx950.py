@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.gluon.utils import (
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
@@ -975,7 +976,9 @@ def get_config(
         max_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd"}),
     ),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.SPECIALIZED,
     traits={
         "head_dim": frozenset({64}),

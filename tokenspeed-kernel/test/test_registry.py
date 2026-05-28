@@ -29,6 +29,13 @@ from tokenspeed_kernel.registry import (
     describe_kernel,
     register_kernel,
 )
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 from utils import dummy_impl, register_all_samples
 
 pytestmark = pytest.mark.usefixtures("fresh_registry")
@@ -46,12 +53,73 @@ class TestKernelSpec:
         assert spec.solution == ""
         assert spec.priority == 10
         assert spec.tags == frozenset()
-        assert spec.dtypes == frozenset()
+        assert spec.format_signatures == frozenset()
 
     def test_hashable_without_dict_traits(self):
         spec = KernelSpec(name="k1", family="attention", mode="decode", traits={})
         with pytest.raises(TypeError):
             hash(spec)
+
+    def test_format_signature_bundles_scale_metadata(self):
+        scale = ScaleFormat(
+            storage_dtype=torch.float32,
+            granularity="block",
+            block_shape=(32,),
+        )
+        mixed = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=tensor_format("mxfp4", torch.uint8, scale=scale),
+        )
+        dense = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.uint8),
+        )
+
+        assert mixed != dense
+        assert mixed.format_for("b").scale == scale
+
+    def test_block_scale_requires_shape_or_dynamic_marker(self):
+        with pytest.raises(ValueError, match="requires block_shape"):
+            ScaleFormat(storage_dtype=torch.float32, granularity="block")
+
+        dynamic = ScaleFormat(
+            storage_dtype=torch.float32,
+            granularity="block",
+            dynamic_block_shape=True,
+        )
+        assert dynamic.block_shape is None
+        assert str(dynamic) == "scale(block, storage=torch.float32, block=dynamic)"
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ScaleFormat(
+                storage_dtype=torch.float32,
+                granularity="block",
+                block_shape=(16,),
+                dynamic_block_shape=True,
+            )
+
+        with pytest.raises(ValueError, match="only valid for block"):
+            ScaleFormat(
+                storage_dtype=torch.float32,
+                granularity="tensor",
+                block_shape=(16,),
+            )
+
+    def test_fp8_tensor_format_names_are_unambiguous(self):
+        dense = dense_tensor_format(torch.float8_e4m3fn)
+        assert dense.format == "dense"
+        assert dense.scale is None
+
+        scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+        scaled = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=scale)
+        assert scaled.format == "scaled-fp8"
+        assert scaled.scale == scale
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            tensor_format("fp8", torch.float8_e4m3fn)
+
+        with pytest.raises(ValueError, match="requires scale"):
+            tensor_format("scaled-fp8", torch.float8_e4m3fn)
 
     def test_equality(self):
         spec1 = KernelSpec(name="k1", family="attention", mode="decode")
@@ -167,11 +235,16 @@ class TestRegistryQueries:
         assert "aiter_decode" in mi350_names
         assert "triton_decode" in mi350_names
 
-    def test_filter_by_dtype(self, sample_specs):
+    def test_filter_by_signature(self, sample_specs):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
-        fp32 = reg.get_for_operator("attention", "decode", dtype=torch.float32)
+        signature = next(
+            iter(
+                format_signatures(("q", "k_cache", "v_cache"), "dense", {torch.float32})
+            )
+        )
+        fp32 = reg.get_for_operator("attention", "decode", format_signature=signature)
         names = {s.name for s in fp32}
         assert "reference_decode" in names
         assert "flashinfer_decode" not in names
@@ -287,7 +360,7 @@ class TestRegisterKernelDecorator:
             "gemm",
             "mm",
             solution="reference",
-            dtypes={torch.bfloat16},
+            signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
             priority=12,
         )
         def my_torch_gemm(a, b):
@@ -298,7 +371,10 @@ class TestRegisterKernelDecorator:
         assert spec is not None
         assert spec.solution == "reference"
         assert spec.priority == 12
-        assert torch.bfloat16 in spec.dtypes
+        assert (
+            next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
+            in spec.format_signatures
+        )
 
         impl = reg.get_impl("reference_gemm_mm")
         assert impl is my_torch_gemm
@@ -309,7 +385,9 @@ class TestRegisterKernelDecorator:
             "decode",
             name="my_custom_kernel",
             solution="custom",
-            dtypes={torch.float16},
+            signatures=format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16}
+            ),
         )
         def some_func():
             pass
@@ -326,7 +404,9 @@ class TestRegisterKernelDecorator:
             capability=CapabilityRequirement(
                 min_arch_version=ArchVersion(8, 0),
             ),
-            dtypes={torch.float16, torch.bfloat16},
+            signatures=format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ),
             tags={"determinism", "latency"},
         )
         def decorated_kernel():
@@ -344,7 +424,7 @@ class TestRegisterKernelDecorator:
             "gemm",
             "mm",
             solution="test",
-            dtypes={torch.float16},
+            signatures=format_signatures(("a", "b"), "dense", {torch.float16}),
         )
         def original(x):
             return x * 2

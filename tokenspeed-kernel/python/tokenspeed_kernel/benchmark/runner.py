@@ -139,11 +139,16 @@ class BenchmarkRunner:
         if not spec_matches_shape_traits(spec, shape):
             return None
 
+        signature = spec.format_signature_for_primary_storage_dtype(dtype)
+        if signature is None:
+            return None
+
         generator = get_input_generator(
             spec.family,
             spec.mode,
             dtype=dtype,
             traits=spec.traits,
+            format_signature=signature,
             device="cuda",
             seed=self.config.seed,
         )
@@ -224,10 +229,14 @@ class BenchmarkRunner:
             return None, None, None
 
         registry = KernelRegistry.get()
+        signature = spec.format_signature_for_primary_storage_dtype(dtype)
+        if signature is None:
+            return None, None, None
+
         ref_specs = registry.get_for_operator(
             spec.family,
             spec.mode,
-            dtype=dtype,
+            format_signature=signature,
             solution="reference",
         )
         if not ref_specs:
@@ -285,8 +294,10 @@ class BenchmarkRunner:
         if spec is None:
             raise ValueError(f"Kernel {kernel_name!r} is not registered")
 
-        if dtype not in spec.dtypes:
-            raise ValueError(f"Kernel {kernel_name!r} does not support dtype={dtype}")
+        if spec.format_signature_for_primary_storage_dtype(dtype) is None:
+            raise ValueError(
+                f"Kernel {kernel_name!r} does not support primary storage dtype={dtype}"
+            )
 
         platform = current_platform()
         if not spec.capability.satisfied_by(platform):
@@ -337,12 +348,15 @@ class BenchmarkRunner:
         """Benchmark all implementations of an op."""
         registry = KernelRegistry.get()
         platform = current_platform()
-        specs = registry.get_for_operator(
-            op_family,
-            op_mode,
-            platform=platform,
-            dtype=dtype,
-        )
+        specs = [
+            spec
+            for spec in registry.get_for_operator(
+                op_family,
+                op_mode,
+                platform=platform,
+            )
+            if spec.format_signature_for_primary_storage_dtype(dtype) is not None
+        ]
 
         results: list[BenchmarkResult] = []
         for spec in sorted(specs, key=lambda item: (item.solution, item.name)):
