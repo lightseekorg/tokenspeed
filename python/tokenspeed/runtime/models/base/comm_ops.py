@@ -152,7 +152,7 @@ class AllReduceOp(CommOp):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not self._has_parallel:
             return hidden_states, residual
-        hidden_states = all_reduce(hidden_states, self._rank, self._group)
+        hidden_states = all_reduce(hidden_states, self._group)
         return hidden_states, residual
 
 
@@ -296,7 +296,7 @@ class FusedReduceNormOp(CommOp):
             # the preceding compute module's output.  We must allreduce
             # before applying the norm.
             if self._has_parallel:
-                hidden_states = all_reduce(hidden_states, self._rank, self._group)
+                hidden_states = all_reduce(hidden_states, self._group)
             hidden_states, residual = self.norm_module(hidden_states, residual)
         return hidden_states, residual
 
@@ -379,7 +379,7 @@ class FinalNormOp(CommOp):
             # The preceding DeferredReduceOp always defers, so we must
             # perform the all-reduce here before applying the norm.
             if self._has_parallel and self.use_all_reduce_mode:
-                hidden_states = all_reduce(hidden_states, self._rank, self._group)
+                hidden_states = all_reduce(hidden_states, self._group)
             hidden_states, _ = self.norm_module(hidden_states, residual)
             # In RSAG mode, all-gather to restore tokens for the LM head.
             # Uses the LM head group (ATTN_TP) which may differ from the
