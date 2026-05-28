@@ -53,7 +53,7 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 }
 
 
-@dataclass
+@dataclass(kw_only=True)
 class MHAPrefillMetadata:
     # Device-side metadata:
     # - seq_lens: total length after this step
