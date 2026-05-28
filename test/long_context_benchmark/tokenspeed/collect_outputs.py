@@ -140,28 +140,39 @@ def aggregate(rows):
 
 
 def print_table(rows, summary):
-    """Pretty-print aggregated summary."""
+    """Pretty-print aggregated summary.
+
+    Uses the "Overall perf table:" marker so the CI pipeline
+    (pipeline.py extract_evalscope_table) auto-extracts it into
+    the GitHub Step Summary.
+    """
     if not rows:
         print("[long-ctx perf] no benchmark_summary.json found", file=sys.stderr)
         return
 
-    # Aggregated
-    print("\n=== Long-context perf (aggregated, avg of N runs) ===")
-    print(
-        f"  {'Prompt':<8} {'N':>3} "
-        f"{'avg TPS/user':>13} {'TPS range':>16} "
-        f"{'avg AR':>9} {'AR range':>14} "
-        f"{'avg Total TPS':>15}"
+    print("\nOverall perf table:")
+    header = (
+        f"{'Prompt':<8}  {'Runs':>4}  "
+        f"{'Avg TPS/user':>13}  {'TPS Range':>17}  "
+        f"{'Avg AR':>8}  {'AR Range':>15}  "
+        f"{'Avg Total TPS':>14}"
     )
-    print("  " + "-" * 80)
+    sep = (
+        f"{'--------':<8}  {'----':>4}  "
+        f"{'-------------':>13}  {'-----------------':>17}  "
+        f"{'--------':>8}  {'---------------':>15}  "
+        f"{'--------------':>14}"
+    )
+    print(header)
+    print(sep)
     for s in summary:
-        tps_rng = f"{s['min_tps_per_user']:.1f}-{s['max_tps_per_user']:.1f}"
-        ar_rng = f"{s['min_acceptance_rate']:.2f}-{s['max_acceptance_rate']:.2f}"
+        tps_rng = f"{s['min_tps_per_user']:.1f} - {s['max_tps_per_user']:.1f}"
+        ar_rng = f"{s['min_acceptance_rate']:.2f} - {s['max_acceptance_rate']:.2f}"
         print(
-            f"  {s['prompt_len']:<8} {s['n_runs']:>3} "
-            f"{s['avg_tps_per_user']:>13.2f} {tps_rng:>16} "
-            f"{s['avg_acceptance_rate']:>9.3f} {ar_rng:>14} "
-            f"{s['avg_total_throughput']:>15.2f}"
+            f"{s['prompt_len']:<8}  {s['n_runs']:>4}  "
+            f"{s['avg_tps_per_user']:>13.2f}  {tps_rng:>17}  "
+            f"{s['avg_acceptance_rate']:>8.3f}  {ar_rng:>15}  "
+            f"{s['avg_total_throughput']:>14.2f}"
         )
     print()
 
