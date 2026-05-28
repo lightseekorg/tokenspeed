@@ -665,15 +665,57 @@ class EventLoop:
             extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         )
 
+    def _build_mamba_layerwise_cow(
+        self, execution_plan, forward_op
+    ) -> dict[int, list[int]]:
+        if forward_op is None:
+            return {}
+        loaded_mamba_slots: set[int] = set()
+        for cache_op in execution_plan.cache:
+            if not isinstance(cache_op, Cache.LoadBackOp):
+                continue
+            dst_by_kind = getattr(cache_op, "dst_pages_by_kind", None)
+            if dst_by_kind is None:
+                dst_groups = getattr(cache_op, "dst_pages", [])
+            else:
+                dst_groups = dst_by_kind.get(CacheKind.MAMBA.value, [])
+            for dst_pages in dst_groups:
+                loaded_mamba_slots.update(int(page) for page in dst_pages)
+        if not loaded_mamba_slots:
+            return {}
+
+        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
+        working_indices = getattr(forward_op, "mamba_pool_indices", None)
+        if cow_src_indices is None or working_indices is None:
+            return {}
+
+        cow_by_src: dict[int, list[int]] = {}
+        for cow_src, working in zip(list(cow_src_indices), list(working_indices)):
+            cow_src = int(cow_src)
+            working = int(working)
+            if cow_src < 0 or working < 0 or cow_src not in loaded_mamba_slots:
+                continue
+            cow_dsts = cow_by_src.setdefault(cow_src, [])
+            if working not in cow_dsts:
+                cow_dsts.append(working)
+        return cow_by_src
+
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
-        self.memory_executor.submit_plan(
-            execution_plan, producer_stream=self.model_executor.execution_stream
+        forward_op = self._get_forward_op(execution_plan)
+        mamba_layerwise_cow = self._build_mamba_layerwise_cow(
+            execution_plan, forward_op
         )
+        if mamba_layerwise_cow:
+            self.model_executor.set_layerwise_mamba_cow_done(mamba_layerwise_cow)
+            self.memory_executor.set_mamba_layerwise_cow(mamba_layerwise_cow)
+        self.memory_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
-            if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
+            if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
+            elif isinstance(op, Cache.LoadBackOp):
+                continue
             elif isinstance(op, (Cache.PrefetchOp, Cache.BackUpOp)):
                 self._num_inflight_cache_ops += 1
             else:
@@ -704,21 +746,6 @@ class EventLoop:
             self.memory_executor.set_consumer(
                 kind, consumer_indices if consumer_indices else -1
             )
-        has_mamba_loadback = bool(consumer_indices_by_kind.get(CacheKind.MAMBA))
-        # Fence WriteBack against this iter's ``set_kv_buffer``: the
-        # scheduler can re-allocate a freed-but-not-yet-written-back slot
-        # to a new prefill / decode within the same iter. ``set_kv_buffer``
-        # runs before any ``wait_until`` in attention, so nothing else
-        # orders writeback's reads against the new writes. Cheap when
-        # write_stream is idle.
-        host_exec = getattr(self.memory_executor, "host_exec", None)
-        if host_exec is not None:
-            self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
-            if has_mamba_loadback:
-                # Mamba COW runs before the layerwise waits in mamba forward and
-                # reads the freshly loaded tree slot into the request-local
-                # working slot. Fence load_stream here so COW cannot race H->D.
-                self.model_executor.execution_stream.wait_stream(host_exec.load_stream)
 
     def _flush_mamba_retract_states(self, forward_op) -> None:
         """Copy draft->working mamba states when retract occurred (no forward scheduled)."""

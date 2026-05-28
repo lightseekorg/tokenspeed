@@ -73,6 +73,21 @@ class MambaCachePool:
             io_backend=self.io_backend,
         )
 
+    def copy_layer(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor, layer_idx: int
+    ) -> None:
+        if src_indices.numel() == 0:
+            return
+        src_indices = src_indices.to(
+            device=self.device, dtype=torch.int64, non_blocking=True
+        )
+        dst_indices = dst_indices.to(
+            device=self.device, dtype=torch.int64, non_blocking=True
+        )
+        for cache in self.device_pool.mamba_cache:
+            layer = cache[layer_idx]
+            layer.index_copy_(0, dst_indices, layer.index_select(0, src_indices))
+
     def alloc_host(self, n: int):
         return self.host_pool.alloc(n)
 
