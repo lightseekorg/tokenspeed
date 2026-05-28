@@ -86,7 +86,11 @@ class TritonRSAGBackend:
                 scattered_num_tokens=[tensor.size(0)] * len(group),
             )
 
-        if dim in (-1, tensor.dim() - 1) and current_platform().is_nvidia:
+        if (
+            current_platform().is_nvidia
+            and dim in (-1, tensor.dim() - 1)
+            and tensor.dtype == torch.bfloat16
+        ):
             hidden_size = tensor.size(-1) * len(group)
             state = self._get_or_create(group, hidden_size)
             return all_gather_inner(
