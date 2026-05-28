@@ -149,6 +149,7 @@ if matmul is not None:
         y=None,
         n_tokens=None,
         n_expts_act=None,
+        **_ignored,
     ):
         with _maybe_lds_guard(x, w, precision_config):
             out = matmul(

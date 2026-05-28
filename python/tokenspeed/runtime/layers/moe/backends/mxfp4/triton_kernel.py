@@ -221,13 +221,13 @@ class Mxfp4TritonKernelBackend(MoEBackend):
 
         layer.w13_precision_config = PrecisionConfig(
             flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
-            b_mx_scale=w13_scale,
+            w_mx_scale=w13_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
             out_dtype=out_dtype,
         )
         layer.w2_precision_config = PrecisionConfig(
             flex_ctx=FlexCtx(lhs_data=w2_lhs, rhs_data=w2_flex),
-            b_mx_scale=w2_scale,
+            w_mx_scale=w2_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
             out_dtype=out_dtype,
         )

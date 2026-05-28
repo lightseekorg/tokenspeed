@@ -30,10 +30,10 @@ HF model card (https://huggingface.co/amd/gpt-oss-120b-w-mxfp4-a-fp8):
   num_experts_per_tok    K  = 4
 
 For each batch_size ``B`` (token count -- 1/32/64 cover decode,
-1024/4096/8192 cover prefill / chunked prefill) we run the three
-Gluon scaled-MFMA kernels (``gluon_mxfp_gating_gemm``,
-``gluon_mxfp_dispatch_swiglu``, ``gluon_mxfp_combine``) on both
-``e2m1`` (mxfp4 x mxfp4) and ``e4m3`` (fp8 x mxfp4) activations.
+1024/4096/8192 cover prefill / chunked prefill) we run the two
+production Gluon scaled-MFMA kernels (``gluon_mxfp_dispatch_swiglu``,
+``gluon_mxfp_combine``) on both ``e2m1`` (mxfp4 x mxfp4) and ``e4m3``
+(fp8 x mxfp4) activations.
 
 For decode batch sizes only ``min(B*topk, E)`` experts are active, so
 the ragged metadata is built with that exact number of active experts;
@@ -135,29 +135,13 @@ def dump_static_profiles():
         _pipelined_moe_kernel_scaled,
         gluon_mxfp_combine,
         gluon_mxfp_dispatch_swiglu,
-        gluon_mxfp_gating_gemm,
         static_profile,
-    )
-    from tokenspeed_kernel.ops.moe.gluon_persistent import (
-        _pipelined_moe_kernel_scaled_persistent,
     )
 
     print("\n=== Static GPR / spill profile (no spills allowed) ===")
     # One representative shape per phase: decode B=32, prefill B=1024.
 
     for B in (32, 1024):
-        # mxfp4 x mxfp4 gating
-        a_packed, _ = _make_mxfp4(B, GPTOSS_HIDDEN, packed_dim=1)
-        w_packed, _ = _make_mxfp4(GPTOSS_HIDDEN, GPTOSS_NUM_EXPERTS, packed_dim=0)
-        a_scale, _ = _make_mx_scale(B, GPTOSS_HIDDEN)
-        w_scale, _ = _make_mx_scale(GPTOSS_NUM_EXPERTS, GPTOSS_HIDDEN)
-        gluon_mxfp_gating_gemm(
-            a_packed,
-            w_packed,
-            w_scale,
-            x_scale=a_scale,
-            a_format="e2m1",
-        )
         # mxfp4 dispatch+swiglu
         md, M_padded, *_ = _build_ragged(B, block_m=64)
         a_pad_packed, _ = _make_mxfp4(M_padded, GPTOSS_HIDDEN, packed_dim=1)
@@ -177,7 +161,7 @@ def dump_static_profiles():
             w3,
             w3_scale,
             x_scale=a_pad_scale,
-            a_format="e2m1",
+            x_format="e2m1",
             bias=None,
             a_ragged_metadata=md,
             gather_indx=None,
@@ -206,7 +190,7 @@ def dump_static_profiles():
             w3_c,
             w3_c_scale,
             x_scale=a_pad_i_scale,
-            a_format="e2m1",
+            x_format="e2m1",
             bias=None,
             a_ragged_metadata=md,
             scatter_indx=scatter,
@@ -239,7 +223,6 @@ def dump_static_profiles():
             )
 
     _scan(_pipelined_moe_kernel_scaled, "scaled  ")
-    _scan(_pipelined_moe_kernel_scaled_persistent, "persist ")
     if bad:
         raise SystemExit(f"{bad} kernel(s) reported spill -- aborting")
 
@@ -264,49 +247,6 @@ def _make_mx_scale(rows, k_logical, *, device="cuda"):
         s.data.to(device),
         s.to(torch.float32).repeat_interleave(32, dim=1).to(device),
     )
-
-
-def bench_scaled_gating(B: int, warmup: int = 10, rep: int = 50, fmt: str = "e2m1"):
-    """Scaled-MFMA gating GEMM ``(B, H) x (H, E)``.
-
-    ``fmt`` selects the A operand format:
-        - ``"e2m1"`` : mxfp4 activations + e8m0 block scale.
-        - ``"e4m3"`` : fp8 activations + a fixed global scalar.
-    The W is always mxfp4 in this version.
-    """
-    from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp_gating_gemm
-
-    torch.manual_seed(0)
-    device = "cuda"
-    H, E = GPTOSS_HIDDEN, GPTOSS_NUM_EXPERTS
-
-    if fmt == "e2m1":
-        a_packed, _ = _make_mxfp4(B, H, packed_dim=1, device=device)
-        a_scale, _ = _make_mx_scale(B, H, device=device)
-        a_global = 1.0
-    else:
-        a_packed = torch.randint(20, 40, (B, H), dtype=torch.uint8, device=device)
-        a_scale = None
-        a_global = 0.137
-
-    w_packed, _ = _make_mxfp4(H, E, packed_dim=0, device=device)
-    w_scale, _ = _make_mx_scale(E, H, device=device)
-
-    def fn():
-        gluon_mxfp_gating_gemm(
-            a_packed,
-            w_packed,
-            w_scale,
-            x_scale=a_scale,
-            a_format=fmt,
-            a_global_scale=a_global,
-            out_dtype=torch.bfloat16,
-        )
-
-    flops = 2.0 * B * E * H
-    t_ms = _bench(fn, warmup=warmup, rep=rep)
-    label = f"B={B},H={H},E={E},fmt={fmt}/e2m1"
-    return label, t_ms, flops / (t_ms * 1e9)
 
 
 def bench_scaled_dispatch_swiglu(B, warmup=10, rep=50, fmt="e2m1"):
@@ -344,8 +284,8 @@ def bench_scaled_dispatch_swiglu(B, warmup=10, rep=50, fmt="e2m1"):
             w3,
             w_scale3,
             x_scale=a_scale,
-            a_format=fmt,
-            a_global_scale=a_global,
+            x_format=fmt,
+            x_global_scale=a_global,
             bias=None,
             a_ragged_metadata=md,
             gather_indx=gather_indx,
@@ -401,8 +341,8 @@ def bench_scaled_combine(B, warmup=10, rep=50, fmt="e2m1"):
             w3,
             w_scale3,
             x_scale=a_scale,
-            a_format=fmt,
-            a_global_scale=a_global,
+            x_format=fmt,
+            x_global_scale=a_global,
             bias=None,
             a_ragged_metadata=md,
             scatter_indx=scatter,
@@ -489,20 +429,6 @@ def main():
 
     # ------ Scaled MFMA variants (mxfp4 / fp8) ------
     print("\n=== Scaled MFMA variants (instr 16x16x128) ===")
-    print("\nKernel 1s: mxfp4 x mxfp4 gating GEMM  (B, H) x (H, E)")
-    print("-" * 110)
-    for B in args.batch_sizes:
-        _print_scaled_row(
-            bench_scaled_gating(B, warmup=args.warmup, rep=args.rep, fmt="e2m1")
-        )
-
-    print("\nKernel 1s.fp8: fp8 x mxfp4 gating GEMM  (B, H) x (H, E)")
-    print("-" * 110)
-    for B in args.batch_sizes:
-        _print_scaled_row(
-            bench_scaled_gating(B, warmup=args.warmup, rep=args.rep, fmt="e4m3")
-        )
-
     print("\nKernel 2s: mxfp4 dispatch + 1st GEMM + SwiGLU")
     print("-" * 110)
     for B in args.batch_sizes:

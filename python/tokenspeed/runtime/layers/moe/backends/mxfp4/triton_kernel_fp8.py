@@ -131,12 +131,52 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
         )
 
         MXFP_BLOCK_SIZE = 32
+        BLOCK_N = 128  # gluon dispatch+combine kernel BLOCK_N
         fp8_dtype = _amd_fp8_dtype()
 
         w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
         w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
         layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
+
+        if current_platform().is_amd:
+            # We need to pad w2 to be able to preshuffle it
+            original_w2_n = int(layer.w2_weight.shape[-2])
+            if original_w2_n % BLOCK_N != 0:
+                n_padded = (original_w2_n + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+                extra_n = n_padded - original_w2_n
+                w2_w = layer.w2_weight.data
+                w2_s = layer.w2_weight_scale.data
+                w2_w_padded = torch.cat(
+                    [
+                        w2_w,
+                        torch.zeros(
+                            *w2_w.shape[:-2],
+                            extra_n,
+                            w2_w.shape[-1],
+                            dtype=w2_w.dtype,
+                            device=w2_w.device,
+                        ),
+                    ],
+                    dim=-2,
+                )
+                w2_s_padded = torch.cat(
+                    [
+                        w2_s,
+                        torch.full(
+                            (*w2_s.shape[:-2], extra_n, w2_s.shape[-1]),
+                            127,
+                            dtype=w2_s.dtype,
+                            device=w2_s.device,
+                        ),
+                    ],
+                    dim=-2,
+                )
+                layer.w2_weight = Parameter(w2_w_padded, requires_grad=False)
+                layer.w2_weight_scale = Parameter(w2_s_padded, requires_grad=False)
+                layer._w2_logical_n = original_w2_n
+            else:
+                layer._w2_logical_n = original_w2_n
 
         num_warps = 8
         w13_weight, w13_flex, w13_scale = swizzle_mxfp4(
@@ -185,7 +225,7 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
                 lhs_data=InFlexData(dtype=fp8_dtype, scale=w13_in_scale),
                 rhs_data=w13_flex,
             ),
-            b_mx_scale=w13_scale,
+            w_mx_scale=w13_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
             out_dtype=out_dtype,
         )
@@ -194,7 +234,7 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
                 lhs_data=InFlexData(dtype=fp8_dtype, scale=w2_in_scale),
                 rhs_data=w2_flex,
             ),
-            b_mx_scale=w2_scale,
+            w_mx_scale=w2_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
             out_dtype=out_dtype,
         )
@@ -203,6 +243,41 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
         layer.w2_weight_triton_tensor = w2_weight
         del layer.w13_weight
         del layer.w2_weight
+
+        if current_platform().is_amd:
+            # BPreshuffle
+            try:
+                from tokenspeed_kernel.ops.moe.gluon import (
+                    _extract_gluon_raw_w,
+                    shuffle_weight_for_gluon_dot_layout,
+                )
+
+                for attr, logical_n in (
+                    ("w13_weight_triton_tensor", None),
+                    ("w2_weight_triton_tensor", layer._w2_logical_n),
+                ):
+                    wrapped = getattr(layer, attr, None)
+                    if wrapped is None:
+                        continue
+                    w_raw = _extract_gluon_raw_w(wrapped)
+                    try:
+                        w_shuffled = shuffle_weight_for_gluon_dot_layout(w_raw)
+                        if logical_n is not None and logical_n != w_shuffled.shape[-1]:
+                            # combine GEMM: backend pre-padded N to a
+                            # multiple of BLOCK_N. Stamp the logical N
+                            # on BOTH the shuffled tensor (consumed by
+                            # ``gluon_mxfp_combine`` on the w_preshuffle
+                            # path) and the raw tensor (consumed by the
+                            # tile-shape-gated LDS fallback in
+                            # ``_try_dispatch_mxfp`` when BLOCK_M<=32).
+                            w_shuffled.original_n = int(logical_n)
+                            w_raw.original_n = int(logical_n)
+                        w_raw._gluon_shuffled = w_shuffled
+                    except (ValueError, AssertionError):
+                        pass
+            except ImportError:
+                pass
+
         # ``w*_input_scale`` parameters are no longer needed (collapsed into
         # the precision configs above) but keep them attached so downstream
         # code can still introspect the loader-populated values.
@@ -275,13 +350,20 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
             features={"ragged_metadata", "dispatch_gemm"},
             traits={"weight_dtype": "mxfp4"},
             expected_kernel_name="triton_kernels_dispatch_gemm",
+            out_quant_scale=layer.w2_act_scale,
         )
 
-        intermediate_fp8 = fp8_quantize(
-            intermediate_cache,
-            scale_inv=layer.w2_act_scale_inv,
-            fp8_dtype=fp8_dtype,
-        )
+        if intermediate_cache.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
+            intermediate_fp8 = intermediate_cache
+        else:
+            intermediate_fp8 = fp8_quantize(
+                intermediate_cache,
+                scale_inv=layer.w2_act_scale_inv,
+                fp8_dtype=fp8_dtype,
+            )
 
         return tokenspeed_kernel.moe_experts(
             intermediate_fp8,

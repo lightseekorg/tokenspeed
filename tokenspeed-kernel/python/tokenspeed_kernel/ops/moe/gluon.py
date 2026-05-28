@@ -25,7 +25,6 @@ import os
 from typing import Any
 
 import tokenspeed_kernel.thirdparty.triton_kernels  # noqa: F401  (side effect)
-import tokenspeed_triton  # noqa: F401
 import torch
 from tokenspeed_kernel._triton import tl, triton  # noqa: F401  (kept for parity)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
@@ -33,40 +32,39 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.experimental.gluon import language as gl
 from tokenspeed_triton.language.core import _aggregate as aggregate
-from triton_kernels.matmul import FlexCtx as _UpstreamFlexCtx  # noqa: F401
-from triton_kernels.matmul import (  # noqa: F401
-    FusedActivation as _UpstreamFusedActivation,
-)
-from triton_kernels.matmul import (  # noqa: F401
-    PrecisionConfig as _UpstreamPrecisionConfig,
-)
 from triton_kernels.matmul import matmul as _upstream_matmul
 from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
 from triton_kernels.tensor import Tensor as _UpstreamWrappedTensor  # noqa: F401
-from triton_kernels.tensor import convert_layout as _upstream_convert_layout
-from triton_kernels.tensor_details.layout_details.strided import (  # noqa: F401
-    StridedLayout as _UpstreamStridedLayout,
-)
 
 # ---------------------------------------------------------------------------
 # Env knob
 # ---------------------------------------------------------------------------
 
-_GLUON_DISABLE_VALUES = {"0", "false", "no", "off", "disable", "disabled"}
+_GLUON_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
 _GLUON_DISABLED_ENV = (
     os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
 )
 
 
-def _env_int(name: str, default: int) -> int:
-    """Read an int from env. Returns ``default`` on missing / unparsable."""
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+def _as_int32(t):
+    if t is None or t.dtype == torch.int32:
+        return t
+    return t.to(torch.int32)
+
+
+# Snapshot block_sizes() at import so launcher lookups skip the
+# per-call list allocation + linear scan.
+_BLOCK_SIZES_TUPLE = tuple(RaggedTensorMetadata.block_sizes())
+_BLOCK_SIZES_FROZEN = frozenset(_BLOCK_SIZES_TUPLE)
+_BLOCK_SIZE_TO_IDX = {bs: i for i, bs in enumerate(_BLOCK_SIZES_TUPLE)}
+
+
+def _ragged_block_offs(metadata, block_size: int):
+    return metadata.block_offs_data[_BLOCK_SIZE_TO_IDX[block_size]]
+
+
+def _ragged_block_schedule(metadata, block_size: int):
+    return metadata.block_schedule_data[_BLOCK_SIZE_TO_IDX[block_size]]
 
 
 def composition(cls):
@@ -90,40 +88,141 @@ def composition(cls):
 
 _DEFAULT_NUM_BUFFERS = 2
 
-
-# X / W SwizzledSharedLayout params (vec, per_phase, max_phase).
-#
-# Both can be overridden at process start via env
-# ``TOKENSPEED_MOE_GLUON_SWIZZLE_{X,W}="vec,per_phase,max_phase"`` for
-# closed-loop tuning. Env is read once at module import (not per
-# kernel-launch) because the Triton JIT cache-key AST walker can't
-# follow a regular Python function call inside a
-# ``@gluon.constexpr_function`` body. Module-level constants are pure
-# ``ast.Name`` references which the walker handles.
-# def _parse_swizzle_env(
-#     name: str, default: tuple[int, int, int]
-# ) -> tuple[int, int, int]:
-#     raw = os.environ.get(name, "").strip()
-#     if not raw:
-#         return default
-#     parts = raw.split(",")
-#     if len(parts) != 3:
-#         raise ValueError(f"{name} must be 'vec,per_phase,max_phase' (got {raw!r})")
-#     try:
-#         v, p, m = (int(x) for x in parts)
-#     except ValueError as e:
-#         raise ValueError(f"{name}={raw!r} is not 3 ints") from e
-#     return (v, p, m)
-
-
-# _SWIZZLE_X = _parse_swizzle_env("TOKENSPEED_MOE_GLUON_SWIZZLE_X", (16, 1, 1))
-# _SWIZZLE_W = _parse_swizzle_env("TOKENSPEED_MOE_GLUON_SWIZZLE_W", (16, 2, 8))
-
-_CDNA4_LDS_BUDGET = 163840
-
 _CDNA4_NUM_CUS = 256
 _PERSISTENT_OVERSUBSCRIBE = 2
 _PERSISTENT_TILES_THRESHOLD = _CDNA4_NUM_CUS * 3
+
+# MFMA-imposed inner dims for the scaled 16x16x128 instruction on CDNA4.
+# Per-CTA tile sizes ``block_k_pk`` / ``block_n`` (host-shuffle args)
+# layer on top and must be multiples of ``K_QUAD*K_WIDTH = 64`` and
+# ``N_LANE = 16``. See ``issue_global_load_to_vgpr`` for the matching
+# in-register unshuffle.
+_GLUON_DOT_K_WIDTH = 16
+_GLUON_DOT_N_LANE = 16
+_GLUON_DOT_K_QUAD = 4
+_GLUON_DOT_SUB_TILE_K = _GLUON_DOT_K_QUAD * _GLUON_DOT_K_WIDTH  # = 64
+
+
+# Default tile for W_VIA_VGPR; ``_pipelined_moe_kernel_scaled``
+# static_asserts ``BLOCK_K_W == 128 and BLOCK_N == 128`` -- changing
+# these defaults requires re-deriving the LOAD_W_LAYOUT bases.
+_GLUON_DOT_DEFAULT_BLOCK_K_PK = 128
+_GLUON_DOT_DEFAULT_BLOCK_N = 128
+
+_TCP_INFLIGHT_CAP_BYTES = 32 * 1024  # gfx9 L1/TCP per-CU in-flight cap
+_CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
+
+
+def shuffle_weight_for_gluon_dot_layout(
+    w: "torch.Tensor",
+    *,
+    block_k_pk: int = _GLUON_DOT_DEFAULT_BLOCK_K_PK,
+    block_n: int = _GLUON_DOT_DEFAULT_BLOCK_N,
+) -> "torch.Tensor":
+    K_pk, N = w.shape[-2], w.shape[-1]
+
+    if block_k_pk <= 0 or block_k_pk % _GLUON_DOT_SUB_TILE_K != 0:
+        raise ValueError(
+            f"shuffle_weight_for_gluon_dot_layout requires block_k_pk "
+            f"to be a positive multiple of {_GLUON_DOT_SUB_TILE_K} "
+            f"(MFMA SUB_TILE_K); got {block_k_pk}."
+        )
+    if block_n <= 0 or block_n % _GLUON_DOT_N_LANE != 0:
+        raise ValueError(
+            f"shuffle_weight_for_gluon_dot_layout requires block_n to "
+            f"be a positive multiple of {_GLUON_DOT_N_LANE} (MFMA "
+            f"N_LANE); got {block_n}."
+        )
+    # W_VIA_VGPR drops the n-mask, so N must be block_n-aligned. The
+    # combine GEMM pads W + W-scale at the backend before this helper
+    # sees the tensor; we still assert here to catch unaligned callers.
+    if N % block_n != 0:
+        raise ValueError(
+            f"shuffle_weight_for_gluon_dot_layout requires N "
+            f"divisible by block_n={block_n} (got N={N}); the kernel's "
+            f"W_VIA_VGPR path assumes block_n-aligned N. Pad the raw W "
+            f"and its e8m0 W-scale at the backend layer (W with zeros, "
+            f"scale with 127 = identity) BEFORE calling "
+            f"``swizzle_mxfp4`` and this helper; trim the kernel "
+            f"output back to the logical N in the high-level launcher."
+        )
+    k_tile_bytes = block_k_pk * block_n
+    # Zero-pad K_pk to a multiple of block_k_pk (kernel's k_limit_w
+    # masks the tail); supports gpt-oss-120b H=2880 etc.
+    K_pk_padded = (K_pk + block_k_pk - 1) // block_k_pk * block_k_pk
+    N_CTA_TILES = N // block_n
+
+    # In-tile dims: (n_block, k_block, k_quad, n_in_sub, k_within).
+    k_block_dim = block_k_pk // _GLUON_DOT_SUB_TILE_K
+    stride_n_in_sub = _GLUON_DOT_K_WIDTH
+    stride_k_quad = _GLUON_DOT_N_LANE * _GLUON_DOT_K_WIDTH
+    stride_k_block = _GLUON_DOT_K_QUAD * stride_k_quad
+    stride_n_block = k_block_dim * stride_k_block
+
+    # (k, n) -> shuffled HBM byte offset within one CTA tile.
+    k = torch.arange(block_k_pk, dtype=torch.int64).view(-1, 1)
+    n = torch.arange(block_n, dtype=torch.int64).view(1, -1)
+    k_within = k % _GLUON_DOT_K_WIDTH
+    k_quad = (k // _GLUON_DOT_K_WIDTH) % _GLUON_DOT_K_QUAD
+    k_block = k // _GLUON_DOT_SUB_TILE_K
+    n_in_sub = n % _GLUON_DOT_N_LANE
+    n_block_in_tile = n // _GLUON_DOT_N_LANE
+    in_tile_offset = (
+        n_block_in_tile * stride_n_block
+        + k_block * stride_k_block
+        + k_quad * stride_k_quad
+        + n_in_sub * stride_n_in_sub
+        + k_within
+    )
+
+    # Across CTA tiles: tile (kt, nt) -> byte (kt * N_CTA_TILES + nt) * k_tile_bytes.
+    K_grid_full = torch.arange(K_pk_padded, dtype=torch.int64).view(-1, 1)
+    N_grid_full = torch.arange(N, dtype=torch.int64).view(1, -1)
+    kt = K_grid_full // block_k_pk
+    nt = N_grid_full // block_n
+    k_in_tile = K_grid_full % block_k_pk
+    n_in_tile = N_grid_full % block_n
+    in_tile_2d = in_tile_offset[k_in_tile, n_in_tile]  # [K_pk_padded, N]
+    P = (kt * N_CTA_TILES + nt) * k_tile_bytes + in_tile_2d
+
+    leading_shape = list(w.shape[:-2])
+    leading = 1
+    for s in leading_shape:
+        leading *= s
+    w_kn = w.reshape(leading, K_pk, N)
+    # Zero-pad K_pk -> K_pk_padded; the kernel's k_limit_w masks the tail.
+    if K_pk_padded != K_pk:
+        pad = torch.zeros(
+            leading, K_pk_padded - K_pk, N, dtype=w.dtype, device=w.device
+        )
+        w_kn_padded = torch.cat([w_kn, pad], dim=-2)
+    else:
+        w_kn_padded = w_kn
+    # K-innermost flat source: src[e, n*K_pk_padded + k] = W[e, k, n].
+    w_nk_contig = w_kn_padded.transpose(-1, -2).contiguous()
+    src_flat = w_nk_contig.reshape(leading, K_pk_padded * N)
+
+    K_grid = (
+        torch.arange(K_pk_padded, dtype=torch.int64).view(-1, 1).expand(K_pk_padded, N)
+    )
+    N_grid = torch.arange(N, dtype=torch.int64).view(1, -1).expand(K_pk_padded, N)
+    src_idx_kn = (N_grid * K_pk_padded + K_grid).flatten().to(w.device)
+    P_flat = P.flatten().to(w.device)
+
+    src_in_kn_order = src_flat.index_select(-1, src_idx_kn)
+    out_flat = torch.empty(leading, K_pk_padded * N, dtype=w.dtype, device=w.device)
+    out_flat.scatter_(
+        -1,
+        P_flat.unsqueeze(0).expand_as(out_flat),
+        src_in_kn_order,
+    )
+
+    # Shape is (..., K_pk_padded, N); ``k_limit_w`` (= original K_pk)
+    # masks the padded tail. Launcher must pass logical K from X.
+    out = out_flat.view(*leading_shape, K_pk_padded, N)
+    out.is_shuffled_for_gluon_dot = True
+    out.original_k_pk = K_pk
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -132,8 +231,15 @@ _PERSISTENT_TILES_THRESHOLD = _CDNA4_NUM_CUS * 3
 
 
 @gluon.constexpr_function
-def _store_layout(num_warps: int):
-    warps_m = 2 if num_warps >= 4 else 1
+def _store_layout(num_warps: int, block_m: int = 0, w_via_vgpr: bool = False):
+    # Mirrors the warps_m policy in get_mfma_layout so the MFMA acc
+    # and store layouts stay convert-compatible.
+    if w_via_vgpr and num_warps >= 4:
+        warps_m = 2
+    elif block_m and block_m <= 32 and num_warps >= 4:
+        warps_m = 1
+    else:
+        warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
     return gl.BlockedLayout([1, 8], [2, 32], [warps_m, warps_n], [1, 0])
 
@@ -146,23 +252,19 @@ def _load_layout(
     order: list[int] = [1, 0],
     elem_bits: int = 8,
 ):
-    # K_PER_THREAD * elem_bits <= 128 (CDNA4 direct-to-LDS coalesce cap).
+    # CDNA4 direct-to-LDS coalesce: K_PER_THREAD * elem_bits <= 128.
     max_vec = max(1, 128 // elem_bits)
     K_PER_THREAD: gl.constexpr = min(max_vec, block_k)
     LANES_K = block_k // K_PER_THREAD
     LANES_NONK = 64 // LANES_K
-    # How many non-K elements one warp covers without warps along non-K.
     NONK_PER_WARP = LANES_NONK
-    # Split the warps so that ``warps_K * warps_NONK == num_warps`` and
-    # the per-CTA tile equals exactly ``[block_K, block_NONK]``.
     if block_nonk >= NONK_PER_WARP:
         WARPS_NONK = block_nonk // NONK_PER_WARP
         if WARPS_NONK > num_warps:
             WARPS_NONK = num_warps
         WARPS_K = num_warps // WARPS_NONK
     else:
-        # Tile is narrower than one warp's natural NONK footprint.
-        # Shrink the per-warp NONK footprint and put more lanes on K.
+        # Narrow tile: more lanes on K so warps_K * warps_NONK == num_warps.
         WARPS_NONK = 1
         WARPS_K = num_warps
     if order == [1, 0]:
@@ -224,16 +326,30 @@ def _swiglu_reduce(
 
 @gluon.constexpr_function
 def get_mfma_layout(
-    num_warps: int, use_mfma_scaled: bool, scale_preshuffle: bool = False
+    num_warps: int,
+    use_mfma_scaled: bool,
+    scale_preshuffle: bool = False,
+    block_m: int = 0,
+    w_via_vgpr: bool = False,
 ) -> gl.constexpr:
-    # CDNA4 (gfx950): scaled MFMA = [16, 16, 128] (mxfp/fp8); regular = [16, 16, 32].
-    # tiles_per_warp=[2,2] when scales are preshuffled+LDS-staged: lets a single
-    # warp issue 2x2 MFMA tiles per K step so the per-tile mfma_scale_layout
-    # absorbs the 5-D unswizzle view cleanly.
+    # CDNA4 (gfx950): scaled MFMA = 16x16x128 (mxfp/fp8); regular = 16x16x32.
+    # ``[2, 2]`` warps_per_cta split keeps W DotOperand per warp at
+    # half the ``[num_warps, 1]`` footprint -- the latter spills VGPRs
+    # at BN=256. ``w_via_vgpr`` forces ``warps_m=2`` because the host-
+    # preshuffled ``LOAD_W_LAYOUT`` assumes that split for the
+    # ``assert_trivial=True`` convert; BM<=32 small-tile decode prefers
+    # ``warps_m=1`` to keep the fundamental block from over-filling M.
     assert num_warps in (4, 8), "MI355 MoE kernel currently supports 4 or 8 warps."
-    warps_m = 2 if num_warps >= 4 else 1
+    if w_via_vgpr and num_warps >= 4:
+        warps_m = 2
+    elif block_m and block_m <= 32 and num_warps >= 4:
+        warps_m = 1
+    else:
+        warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
     instr_shape = [16, 16, 128] if use_mfma_scaled else [16, 16, 32]
+    # tpw=[2,2] required when scales preshuffle through LDS (the 5-D
+    # unswizzle view absorbs one 2x2 MFMA block per warp per K-iter).
     tiles_per_warp = [2, 2] if scale_preshuffle else [1, 1]
     return gl.amd.cdna4.AMDMFMALayout(
         version=4,
@@ -266,21 +382,16 @@ def _effective_scale_load_mode(
     has_x_scale: bool,
     has_w_scale: bool,
     k: int | None = None,
-    a_format: str | None = None,
+    x_format: str | None = None,
     num_buffers: int | None = None,
 ) -> str:
-    del k, a_format, num_buffers  # legacy fallback knobs no longer used
+    del k, x_format, num_buffers
     if mode != "swizzle":
         return mode
-    # "swizzle" is the upstream CDNA4MXScaleLayout preshuffle path:
-    # `unswizzle_mx_scale_cdna4` reshapes the K_S-block dim into
-    # `(BLOCK_K_S // 8, 4, 16, 2, 2, 1)`; this requires
-    # ``BLOCK_K_S = BLOCK_K // SCALE_BLOCK >= 8`` (i.e. BLOCK_K >= 256
-    # for SCALE_BLOCK=32). N-side preshuffle factor is 32 so BLOCK_N
-    # (and BLOCK_M when X has a scale) must be a multiple of 32. We
-    # cannot silently fall back to "bypass" because the input scale
-    # tensor is already in the upstream storage layout (K_S_pad*32
-    # contig) which "bypass" cannot read; so we hard-assert.
+    # CDNA4MXScaleLayout requires BLOCK_K_S >= 8 and BLOCK_{M,N} %
+    # 32 == 0 when the corresponding scale is present. Hard-assert
+    # (no fallback) -- the input scale tensor is already in the
+    # upstream swizzled storage.
     bk_s = block_k // scale_block
     assert bk_s >= _SWIZZLE_K_S_INNER, (
         f"swizzle requires BLOCK_K // SCALE_BLOCK >= "
@@ -316,6 +427,11 @@ class MoEConfig:
     DTYPE_W: gl.constexpr
 
     W_TRANSPOSE: gl.constexpr
+    # Host pre-shuffles W into the 5-D MFMA byte order; K-loop bypasses
+    # W's LDS round-trip and delivers MFMA-ready B operands straight
+    # into VGPRs. Only MoEPipelinedProgram honours this; sliceN/sliceMN
+    # ignore it.
+    W_VIA_VGPR: gl.constexpr
     NUM_BUFFERS: gl.constexpr
 
     SCALE_BLOCK: gl.constexpr
@@ -373,6 +489,7 @@ class MoEConfig:
         EVEN_K=True,
         USE_GATHER=False,
         NUM_WARPS=4,
+        W_VIA_VGPR=False,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -384,6 +501,7 @@ class MoEConfig:
         self.BLOCK_K = gl.constexpr(BLOCK_K)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
         self.W_TRANSPOSE = gl.constexpr(W_TRANSPOSE)
+        self.W_VIA_VGPR = gl.constexpr(W_VIA_VGPR)
         self.WITH_X_MX_SCALE = gl.constexpr(WITH_X_MX_SCALE)
         self.WITH_W_MX_SCALE = gl.constexpr(WITH_W_MX_SCALE)
         self.SCALE_LOAD_MODE = gl.constexpr(SCALE_LOAD_MODE)
@@ -413,11 +531,16 @@ class MoEConfig:
         )
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
 
-        num_loads = 2  # x and w
-        if WITH_X_MX_SCALE:
-            num_loads += 1
-        if WITH_W_MX_SCALE:
-            num_loads += 1
+        # Async commit_groups per K-iter; W_VIA_VGPR drops W from the
+        # batch (direct HBM->VGPR), scales only counted with SCALE_VIA_LDS.
+        num_loads = 1  # x
+        if not W_VIA_VGPR:
+            num_loads += 1  # w (LDS path)
+        if _scale_via_lds:
+            if WITH_X_MX_SCALE:
+                num_loads += 1
+            if WITH_W_MX_SCALE:
+                num_loads += 1
         self.NUM_LOADS_IN_BATCH = gl.constexpr(num_loads)
 
         BLOCK_K_SCALE = BLOCK_K // SCALE_BLOCK
@@ -427,6 +550,8 @@ class MoEConfig:
             NUM_WARPS,
             self.USE_MFMA_SCALED,
             scale_preshuffle=_scale_via_lds,
+            block_m=BLOCK_M,
+            w_via_vgpr=W_VIA_VGPR,
         )
 
         DOT_K_WIDTH_X: gl.constexpr = 16 if self.USE_MFMA_SCALED else 8
@@ -464,26 +589,10 @@ class MoEConfig:
             self.layout_w_scale = gl.constexpr(0)
         self.acc_layout = gl.constexpr(MFMA_LAYOUT)
 
-        # X / W shared layouts: PaddedSharedLayout (Update 11) -- mirrors
-        # the gfx950 a8w8 tutorial's padding pattern (the tutorial uses
-        # plain ``mfma`` with k_width=32; we use ``mfma_scaled`` with
-        # k_width=16 -- see DOT_K_WIDTH_{X,W} above).
-        #
-        # Padding stride ``[[1024, 16], [2048, 32]]`` is borrowed
-        # verbatim from a8w8.  This pattern is tuned for that tutorial's
-        # ``[BM/2, BK]=[128, 128]`` slot; on our auto-tuned tile range
-        # (decode BM=32 / prefill BM=128 BN=256) it is *not* universally
-        # optimal -- prefill currently regresses vs swizzled because the
-        # padding inflates LDS and forces occ=1 + sgpr spills.  The next
-        # step is a per-tile sweep over ``[[stride, pad]]`` (e.g. just
-        # ``[[256, 16]]`` for prefill's 256B-row slots) before locking
-        # the parameters in.
-        #
-        # Offset list and block_shape must match the allocated slot
-        # shape exactly: X = ``[BM, BK_packed]``, W depends on
-        # ``W_TRANSPOSE`` (True -> ``[BN, BK_packed]``,
-        # False -> ``[BK_packed, BN]``).  Packed-K accounts for e2m1's
-        # 2-per-byte storage.
+        # PaddedSharedLayout ``[[1024, 32]]`` (gfx950 a4w4 pattern):
+        # 32 B pad spreads ``ds_read_b128`` across 8 LDS banks; one
+        # spec covers fp8 + mxfp4 X / W. Offsets + block_shape must
+        # match the allocated slot exactly.
         BLOCK_K_PACKED_X_HOST = BLOCK_K // self.DIV_FACTOR_X
         BLOCK_K_PACKED_W_HOST = BLOCK_K // self.DIV_FACTOR_W
 
@@ -496,7 +605,7 @@ class MoEConfig:
 
         self.shared_layout_x = gl.constexpr(
             gl.PaddedSharedLayout(
-                [[1024, 16], [2048, 32]],
+                [[1024, 32]],
                 _row_major_offsets(BLOCK_M, BLOCK_K_PACKED_X_HOST),
                 [],
                 [BLOCK_M, BLOCK_K_PACKED_X_HOST],
@@ -508,23 +617,15 @@ class MoEConfig:
             w_shape = [BLOCK_K_PACKED_W_HOST, BLOCK_N]
         self.shared_layout_w = gl.constexpr(
             gl.PaddedSharedLayout(
-                [[1024, 16], [2048, 32]],
+                [[1024, 32]],
                 _row_major_offsets(w_shape[0], w_shape[1]),
                 [],
                 w_shape,
             )
         )
 
-        # Half-N variant of ``shared_layout_w`` -- used by
-        # :class:`MoESliceNProgram` to allocate two LDS slots, one
-        # per W half (top = N[:BN/2], bot = N[BN/2:]). Splitting the
-        # G->LDS path along N keeps each ``buffer_load_to_shared`` train
-        # under the gfx950 TCP/L1 32 KB in-flight cap (a full BN=256
-        # K-tile is ~32 KB and saturates that cap on its own). The
-        # layout is identical in shape rule -- just halved along the
-        # nonk axis -- so the row_major_offsets pattern stays valid.
-        # See ``v7_sliceN`` in the gfx950-gluon-tutorials for the
-        # canonical pattern.
+        # Half-N variant for :class:`MoESliceNProgram` (two LDS slots,
+        # one per W half) keeping each train under the 32 KB TCP cap.
         if W_TRANSPOSE:
             w_half_shape = [BLOCK_N // 2, BLOCK_K_PACKED_W_HOST]
         else:
@@ -532,28 +633,22 @@ class MoEConfig:
         if (BLOCK_N // 2) >= 1 and BLOCK_K_PACKED_W_HOST >= 1:
             self.shared_layout_w_half_n = gl.constexpr(
                 gl.PaddedSharedLayout(
-                    [[1024, 16], [2048, 32]],
+                    [[1024, 32]],
                     _row_major_offsets(w_half_shape[0], w_half_shape[1]),
                     [],
                     w_half_shape,
                 )
             )
         else:
-            # Fallback so the type-check is happy on tiny tiles (sliceN
-            # is gated by ``_can_use_slice_n`` to BN >= 128 anyway).
+            # Type-check fallback; sliceN is gated to BN>=128 elsewhere.
             self.shared_layout_w_half_n = gl.constexpr(0)
 
-        # Half-M variant of ``shared_layout_x`` -- used by
-        # :class:`MoESliceMNProgram` to allocate two LDS slots, one per
-        # X half along M (top = M[:BM/2], bot = M[BM/2:]). Splitting the
-        # G->LDS X path along M complements the half-N W split so each
-        # of the four ``buffer_load_to_shared`` half-tiles fits comfortably
-        # under the gfx950 TCP/L1 32 KB in-flight cap and the four issues
-        # can be staggered across the v8-style 4-region pipeline.
+        # Half-M variant for :class:`MoESliceMNProgram` (complements
+        # the half-N W split so the 4-region pipeline can stagger).
         if (BLOCK_M // 2) >= 1 and BLOCK_K_PACKED_X_HOST >= 1:
             self.shared_layout_x_half_m = gl.constexpr(
                 gl.PaddedSharedLayout(
-                    [[1024, 16], [2048, 32]],
+                    [[1024, 32]],
                     _row_major_offsets(BLOCK_M // 2, BLOCK_K_PACKED_X_HOST),
                     [],
                     [BLOCK_M // 2, BLOCK_K_PACKED_X_HOST],
@@ -562,21 +657,9 @@ class MoEConfig:
         else:
             self.shared_layout_x_half_m = gl.constexpr(0)
 
-        # --- Previous Swizzled layout (kept for fallback / A-B testing).
-        # self.shared_layout_x = gl.constexpr(
-        #     gl.SwizzledSharedLayout(
-        #         _SWIZZLE_X[0], _SWIZZLE_X[1], _SWIZZLE_X[2], order=[1, 0]
-        #     )
-        # )
-        # self.shared_layout_w = gl.constexpr(
-        #     gl.SwizzledSharedLayout(
-        #         _SWIZZLE_W[0], _SWIZZLE_W[1], _SWIZZLE_W[2], order=[1, 0]
-        #     )
-        # )
-
-        # Scale LDS layout (only used when SCALE_VIA_LDS): vec=4 (32-bit) is
-        # the smallest direct-to-LDS vector on CDNA4. max_phase=1 = no swizzle
-        # so the 5-D unswizzle view on the LDS slot is a pure address remap.
+        # SCALE_VIA_LDS slot: vec=4 (32-bit, smallest CDNA4 direct-to-LDS
+        # unit), max_phase=1 = no swizzle so the 5-D unswizzle is a
+        # pure address remap.
         if _scale_via_lds:
             self.shared_layout_x_scale = gl.constexpr(
                 gl.SwizzledSharedLayout(4, 1, 1, order=[1, 0])
@@ -626,7 +709,13 @@ class MoEProgramBase:
     def issue_global_loads(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
         cfg = self.cfg
         self.x_desc.issue_async_load(load_idx, self.x_buffer, pred, USE_MASK=USE_MASK)
-        self.w_desc.issue_async_load(load_idx, self.w_buffer, pred, USE_MASK=USE_MASK)
+        # W_VIA_VGPR: W is loaded HBM->VGPR directly inside the K-loop body
+        # (see `_load_xw`), not via async_copy.buffer_load_to_shared. Skip
+        # W's async LDS load here.
+        if not cfg.W_VIA_VGPR:
+            self.w_desc.issue_async_load(
+                load_idx, self.w_buffer, pred, USE_MASK=USE_MASK
+            )
         if cfg.SCALE_VIA_LDS:
             if cfg.WITH_X_MX_SCALE:
                 self.x_scale_desc.issue_async_load(
@@ -697,6 +786,8 @@ class AsyncCopyDescriptor:
     k_limit: gl.tensor
     base_offset: gl.tensor
     BLOCK_K: gl.constexpr
+    # AMD vmem cache modifier; ``".cg"`` = non-temporal (skip L1).
+    cache_modifier: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -714,6 +805,7 @@ class AsyncCopyDescriptor:
         masks_nonk,
         k_limit,
         base_offset,
+        cache_modifier="",
     ):
         self.cfg = cfg
         self.op_idx = gl.constexpr(op_idx)
@@ -728,6 +820,7 @@ class AsyncCopyDescriptor:
         self.masks_nonk = masks_nonk
         self.k_limit = k_limit
         self.base_offset = base_offset
+        self.cache_modifier = gl.constexpr(cache_modifier)
 
     @gluon.jit
     def initialize(
@@ -742,6 +835,7 @@ class AsyncCopyDescriptor:
         masks_nonk,
         k_limit,
         base_offset=0,
+        cache_modifier: gl.constexpr = "",
     ):
         offsets = (
             gl.expand_dims(off_k, op_idx) * stride_k
@@ -766,6 +860,7 @@ class AsyncCopyDescriptor:
             masks_nonk,
             k_limit,
             base_offset_t,
+            cache_modifier,
         )
 
     @gluon.jit
@@ -783,6 +878,7 @@ class AsyncCopyDescriptor:
             USE_MASK_RESOLVED: gl.constexpr = 0 if EVEN_K else 1
         else:
             USE_MASK_RESOLVED: gl.constexpr = USE_MASK
+        CACHE_MODIFIER: gl.constexpr = self.cache_modifier
         off_k_step = idx * self.BLOCK_K
         offsets = self.offsets + off_k_step * self.stride_k
         if USE_MASK_RESOLVED == 0:
@@ -790,24 +886,16 @@ class AsyncCopyDescriptor:
                 buffer.index(idx % NUM_BUFFERS),
                 self.ptr,
                 offsets,
+                cache_modifier=CACHE_MODIFIER,
             )
         else:
-            # NOTE: do NOT pass ``other=0``. Gluon's ``buffer_load_to_shared``
-            # routes ``other`` straight into ``ttag.BufferLoadToLocalOp``
-            # (gluon_ir.cc:create_buffer_load_to_local), bypassing the
-            # ``ConvertTritonLoadToBufferLoad`` ``isZeroConst(other)`` strip.
-            # With a non-null ``other`` operand, the LLVM lowering
-            # (LoadStoreOpToLLVM.cpp BufferLoadToLocalOpConversion) emits
-            # ``cond = threadPred AND maskElem`` and ``emitBranch(cond)`` per
-            # vector load -- per-element ``br i1`` blocks around every
-            # ``buffer.load.async.lds``. Those branches prevent LLVM's
-            # ``SIInsertWaitcnts`` from statically counting in-flight vmem,
-            # so ``wait_asyncmark(N)`` collapses to ``s_waitcnt vmcnt(0)``
-            # and kills the async pipeline depth on CDNA4. With ``other``
-            # omitted the lowering uses ``cond = threadPred`` (warp-uniform),
-            # leaving straight-line loads; masked-out lanes still issue the
-            # load and rely on the buffer-descriptor's ``numRecords`` OOB
-            # check to write 0 to LDS for out-of-range offsets.
+            # IMPORTANT: do not pass ``other=0`` here. A non-null
+            # ``other`` causes the lowering to emit per-element
+            # branches around each ``buffer.load.async.lds`` which
+            # break ``SIInsertWaitcnts`` static counting and collapse
+            # the async pipeline to ``s_waitcnt vmcnt(0)``. We rely on
+            # the buffer descriptor's ``numRecords`` OOB check to zero
+            # masked-out lanes in LDS.
             mask_k = gl.expand_dims(off_k_step + self.off_k, self.op_idx) < self.k_limit
             mask = mask_k & self.masks_nonk
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -815,6 +903,7 @@ class AsyncCopyDescriptor:
                 self.ptr,
                 offsets,
                 mask=mask,
+                cache_modifier=CACHE_MODIFIER,
             )
         if COMMIT == 1:
             gl.amd.cdna4.async_copy.commit_group()
@@ -839,12 +928,6 @@ class AsyncCopyDescriptor:
         BLOCK_NONK: gl.constexpr,
         BLOCK_K_SCALE: gl.constexpr,
     ):
-        # Upstream CDNA4MXScaleLayout swizzle: LDS holds the same
-        # [BLOCK_NONK_PS=BLOCK_N/32, BLOCK_K_S * 32] uint8 tile shape;
-        # the in-tile reordering follows upstream's 7-D pattern
-        # (`triton_kernels.tensor_details.layout_details.cdna4_scale.unswizzle_mx_scale_cdna4`).
-        # That requires BLOCK_K_SCALE % 8 == 0; the host preprocess pads
-        # the global K_SCALE up to a multiple of 8 for us.
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
         slot = buffer.index(idx % NUM_BUFFERS)
         slot_7d = slot.reshape((BLOCK_NONK_PS, BLOCK_K_SCALE // 8, 4, 16, 2, 2, 1))
@@ -864,9 +947,6 @@ class AsyncCopyDescriptor:
         SUBTILE_NONK: gl.constexpr,
         subtile_start_nonk: gl.constexpr,
     ):
-        # Upstream CDNA4MXScaleLayout 7-D unswizzle on the per-K_S slot,
-        # followed by an in-LDS slice along the NONK axis to extract the
-        # requested sub-tile (used by sliceN / sliceMN sub-MFMA paths).
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
         slot = buffer.index(idx % NUM_BUFFERS)
         slot_view = (
@@ -879,12 +959,57 @@ class AsyncCopyDescriptor:
         )
 
 
+@gluon.aggregate
+class WVgprDescriptor:
+    """Minimal W descriptor for the host-preshuffled ``W_VIA_VGPR``
+    path; n-mask dropped (W is BLOCK_N-aligned), K-tail zero-filled
+    by ``shuffle_weight_for_gluon_dot_layout``, and per-CTA pid_n /
+    per-expert offsets pre-folded into ``offsets``.
+    """
+
+    cfg: MoEConfig
+    ptr: gl.tensor
+    stride_k: gl.tensor  # = N (bytes between consecutive K-slabs)
+    offsets: gl.tensor  # [BLOCK_N//N_LANE, BLOCK_K*N_LANE]
+    BLOCK_K: gl.constexpr  # = BLOCK_K_W; mirrors AsyncCopyDescriptor
+
+    @gluon.constexpr_function
+    def __init__(self, cfg: MoEConfig, BLOCK_K, ptr, stride_k, offsets):
+        self.cfg = cfg
+        self.BLOCK_K = gl.constexpr(BLOCK_K)
+        self.ptr = ptr
+        self.stride_k = stride_k
+        self.offsets = offsets
+
+    @gluon.jit
+    def issue_global_load_to_vgpr(self, idx, dot_layout: gl.constexpr):
+        BLOCK_K_W: gl.constexpr = self.BLOCK_K
+        BLOCK_N: gl.constexpr = self.cfg.BLOCK_N
+
+        # idx-th K-slab; per-iter shift folds into the scalar ptr so
+        # ``offsets`` stays compile-time constant.
+        k_iter_offset = idx * BLOCK_K_W * self.stride_k
+        ptr_iter = self.ptr + k_iter_offset
+
+        tile_flat = gl.amd.cdna4.buffer_load(ptr=ptr_iter, offsets=self.offsets)
+
+        # 5-D HBM layout -> (BLOCK_K_W, BLOCK_N) MFMA-ready.
+        tile_5d = tile_flat.reshape(
+            BLOCK_N // 16,
+            BLOCK_K_W // 64,
+            4,
+            16,
+            16,
+        )
+        tile_perm = tile_5d.permute(0, 3, 1, 2, 4)
+        tile_2d = tile_perm.reshape(BLOCK_N, BLOCK_K_W)
+        tile_t = tile_2d.trans(1, 0)
+
+        return gl.convert_layout(tile_t, dot_layout, assert_trivial=True)
+
+
 @gluon.jit
-def _load_scale_tile_via_gl_load(desc, mfma_idx, scale_layout: gl.constexpr):
-    # G->VGPR scale load via gl.load. Direct-to-LDS for scales is structurally
-    # impossible on CDNA4 for many tile shapes. K-mask the load so the OOB
-    # scale slots become 0; otherwise junk reads (e.g. 0xFF e8m0 == NaN)
-    # poison the mfma_scaled accumulator on the partial last K tile.
+def _load_scale_tile_via_gl_load(desc, mfma_idx):
     EVEN_K: gl.constexpr = desc.cfg.EVEN_K
     off_k_step = mfma_idx * desc.BLOCK_K
     base = desc.ptr + off_k_step * desc.stride_k
@@ -902,11 +1027,12 @@ class MoEPipelinedProgram:
     base: MoEProgramBase
     cfg: MoEConfig
     x_buffer: gl.shared_memory_descriptor
-    w_buffer: gl.shared_memory_descriptor
+    # W_VIA_VGPR -> ``gl.constexpr(0)`` placeholder (no LDS for W).
+    w_buffer: gl.shared_memory_descriptor | gl.constexpr
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     x_desc: AsyncCopyDescriptor
-    w_desc: AsyncCopyDescriptor
+    w_desc: AsyncCopyDescriptor | WVgprDescriptor
     x_scale_desc: AsyncCopyDescriptor | gl.constexpr
     w_scale_desc: AsyncCopyDescriptor | gl.constexpr
 
@@ -925,9 +1051,7 @@ class MoEPipelinedProgram:
     ):
         self.cfg = cfg
         self.x_buffer = x_buffer
-        self.w_buffer = w_buffer
-        # constexpr fallback set here (Python ctx) so the type check is happy;
-        # initialize() in @gluon.jit ctx can't make a real constexpr.
+        self.w_buffer = w_buffer if not cfg.W_VIA_VGPR else gl.constexpr(0)
         self.x_scale_buffer = (
             x_scale_buffer
             if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
@@ -956,15 +1080,19 @@ class MoEPipelinedProgram:
             shape=[NUM_BUFFERS, cfg.BLOCK_M, BLOCK_K_PACKED_X],
             layout=cfg.shared_layout_x,
         )
-        w_buffer = gl.allocate_shared_memory(
-            w_desc.dtype,
-            shape=(
-                [NUM_BUFFERS, cfg.BLOCK_N, BLOCK_K_PACKED_W]
-                if cfg.W_TRANSPOSE
-                else [NUM_BUFFERS, BLOCK_K_PACKED_W, cfg.BLOCK_N]
-            ),
-            layout=cfg.shared_layout_w,
-        )
+        # W_VIA_VGPR: skip W's LDS slot; K-loop does HBM->VGPR direct.
+        if cfg.W_VIA_VGPR:
+            w_buffer = gl.constexpr(0)
+        else:
+            w_buffer = gl.allocate_shared_memory(
+                w_desc.dtype,
+                shape=(
+                    [NUM_BUFFERS, cfg.BLOCK_N, BLOCK_K_PACKED_W]
+                    if cfg.W_TRANSPOSE
+                    else [NUM_BUFFERS, BLOCK_K_PACKED_W, cfg.BLOCK_N]
+                ),
+                layout=cfg.shared_layout_w,
+            )
 
         if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
             x_scale_buffer = gl.allocate_shared_memory(
@@ -1012,12 +1140,21 @@ class MoEPipelinedProgram:
             self.x_buffer,
             cfg.dot_layout_x,
         )
-        w = self.w_desc.issue_local_load(
-            mfma_idx,
-            self.w_buffer,
-            cfg.dot_layout_w,
-            do_permute=cfg.W_TRANSPOSE,
-        )
+        if cfg.W_VIA_VGPR:
+            # HBM->VGPR direct (no LDS staging). Caller must have
+            # preshuffled W; otherwise gl.convert_layout below stages
+            # through LDS (correct numerics, no perf win).
+            w = self.w_desc.issue_global_load_to_vgpr(
+                mfma_idx,
+                cfg.dot_layout_w,
+            )
+        else:
+            w = self.w_desc.issue_local_load(
+                mfma_idx,
+                self.w_buffer,
+                cfg.dot_layout_w,
+                do_permute=cfg.W_TRANSPOSE,
+            )
         return x, w
 
     @gluon.jit
@@ -1043,9 +1180,7 @@ class MoEPipelinedProgram:
                         BLOCK_K_SCALE,
                     )
                 else:
-                    scale_x = _load_scale_tile_via_gl_load(
-                        self.x_scale_desc, mfma_idx, cfg.layout_x_scale
-                    )
+                    scale_x = _load_scale_tile_via_gl_load(self.x_scale_desc, mfma_idx)
             else:
                 scale_x = gl.full(
                     [cfg.BLOCK_M, BLOCK_K_SCALE],
@@ -1065,9 +1200,7 @@ class MoEPipelinedProgram:
                         BLOCK_K_SCALE,
                     )
                 else:
-                    scale_w = _load_scale_tile_via_gl_load(
-                        self.w_scale_desc, mfma_idx, cfg.layout_w_scale
-                    )
+                    scale_w = _load_scale_tile_via_gl_load(self.w_scale_desc, mfma_idx)
             else:
                 scale_w = gl.full(
                     [cfg.BLOCK_N, BLOCK_K_SCALE],
@@ -1094,7 +1227,7 @@ class MoEPipelinedProgram:
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
         if EVEN_K:
-            # No tail to peel: every iter is in-bounds, no mask anywhere.
+            # All iters in-bounds, no mask needed.
             for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
                 load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
 
@@ -1110,7 +1243,6 @@ class MoEPipelinedProgram:
 
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
-            # epilogue
             for i in gl.static_range(cfg.NUM_BUFFERS - 1):
                 self.async_wait(cfg.NUM_BUFFERS - 2 - i)
                 x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
@@ -1118,10 +1250,9 @@ class MoEPipelinedProgram:
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
         else:
             # Peel last K-iter as masked; main loop stays unmasked.
-            # Precondition: K_iters >= NUM_BUFFERS so the prologue + one
-            # peeled tail fit (main_iters = K_iters - NB >= 0). The
-            # launcher (gluon_mxfp_*; ``_autotune_block``) enforces
-            # this; ``gl.assume`` propagates it to LLVM.
+            # Folding the mask in-loop regresses small-tile shapes
+            # (BN=128 / BM<=64) where the MFMA chain is short. Precond
+            # ``K_iters >= NUM_BUFFERS`` enforced by the launcher.
             for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
                 load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
 
@@ -1137,14 +1268,13 @@ class MoEPipelinedProgram:
 
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
-            # Peeled tail: 1 masked issue + drain oldest + MFMA.
+            # Masked tail iter.
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
             self.async_wait(cfg.NUM_BUFFERS - 1)
             x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
             accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
-            # epilogue: same NUM_BUFFERS - 1 drain pattern as EVEN_K path.
             for i in gl.static_range(cfg.NUM_BUFFERS - 1):
                 self.async_wait(cfg.NUM_BUFFERS - 2 - i)
                 x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
@@ -1154,98 +1284,11 @@ class MoEPipelinedProgram:
         return accumulator
 
     @gluon.jit
-    def pipeline_3stage(self, loop_k):
-        """3-stage software pipeline: do the LDS ``local_load`` for the
-        NEXT iter's tile at the BOTTOM of the current iter, then carry
-        the loaded ``(x, w, scale_x, scale_w)`` registers into the next
-        iter so the top-of-loop MFMA consumes a value already in VGPR
-        (no ``ds_read`` latency in the critical path).
-
-        Layout::
-
-            issue prologue (NB-1)
-            prime    : wait + local_load  -> x0, w0, sx0, sw0
-            iter 0   : issue, wait, MFMA(x0..)  , local_load -> x1...
-            iter 1   : issue, wait, MFMA(x1..)  , local_load -> x2...
-            ...
-            iter N-1 : issue, wait, MFMA(x_N-1..), local_load -> x_N
-            final    :                MFMA(x_N..)
-            epi      : (drain NB-2 leftover slots and consume them)
-
-        This hides the ``ds_read`` latency that the 2-stage pipeline
-        leaves exposed at the top of each iter -- a win when the MFMA
-        chain is too short to absorb it (decode BM=32). The cost is one
-        extra tile's worth of live VGPR (~+8 for fp8 BM=32, well under
-        the ~120 budget headroom we measured at occ=3).
-
-        Requires ``NUM_BUFFERS >= 2``. The pred-mask the 2-stage
-        pipeline uses for tail issues is replaced here by a static-range
-        epilogue, which the compiler unrolls into the steady-state
-        instruction window (no dynamic predicate live across the loop).
-        """
-        cfg = self.cfg
-        gl.static_assert(
-            cfg.NUM_BUFFERS >= 2,
-            "pipeline_3stage requires NUM_BUFFERS >= 2",
-        )
-        load_idx = 0
-        mfma_idx = 0
-
-        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
-            load_idx = self.issue_global_loads(load_idx)
-
-        accumulator = gl.zeros(
-            (cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout
-        )
-        K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
-        gl.assume(K_iters > 0)
-        main_iters = K_iters - (cfg.NUM_BUFFERS - 1)
-        gl.assume(main_iters >= 0)
-
-        # Prime: drain the oldest in-flight load and local_load it so
-        # the first MFMA at the loop top has its operands in VGPR.
-        self.async_wait(cfg.NUM_BUFFERS - 2)
-        x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-        mfma_idx += 1
-
-        for _ in range(0, main_iters):
-            load_idx = self.issue_global_loads(load_idx)
-            self.async_wait(cfg.NUM_BUFFERS - 1)
-            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-            x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-            mfma_idx += 1
-
-        # Final main-loop MFMA consumes the last local-loaded carry.
-        accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-
-        # Epilogue: drain remaining in-flight loads and consume them.
-        # After main_iters issues+drains we still have NB-2 in flight
-        # (the prime drained 1 from the NB-1 prologue, no extra issue
-        # since main_iters last issue was already balanced by its wait).
-        self.async_wait(0)
-        for _ in gl.static_range(cfg.NUM_BUFFERS - 2):
-            x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-            mfma_idx += 1
-            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-
-        return accumulator
-
-    @gluon.jit
     def warp_pipeline(self, loop_k):
-        """Warp-pipelined variant: same compute as ``pipeline`` but marks
-        the loop body with ``gl.amd.warp_pipeline_stage(...)`` so the LLVM
-        backend can interleave LDS-load and MFMA across consecutive
-        iterations on different warps.
-
-        Mirrors the gfx1250 warp_pipeline reference at
-        ``triton-450/third_party/amd/python/examples/gluon/moe_gfx1250.py::518``,
-        ported to CDNA4 ``async_copy.{commit_group,wait_group}``.
-
-        Hard requirements (caller / autotuner must enforce):
-          * ``NUM_BUFFERS >= 3``: with NB=2 the `local_load` and the
-            next `async_copy` would race on the same LDS slot.
-          * ``cdiv(K, BLOCK_K) >= NUM_BUFFERS``: prologue alone needs
-            ``NB - 1`` valid loads.
+        """``pipeline`` with ``gl.amd.warp_pipeline_stage`` markers so
+        LLVM interleaves LDS-load and MFMA across iters on different
+        warps. Requires ``NUM_BUFFERS >= 3`` (avoid LDS slot race) and
+        ``cdiv(K, BLOCK_K) >= NUM_BUFFERS`` (prologue depth).
         """
         cfg = self.cfg
         gl.static_assert(
@@ -1255,7 +1298,6 @@ class MoEPipelinedProgram:
         load_idx = 0
         mfma_idx = 0
 
-        # Prologue: issue NB - 1 batches without waiting.
         for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
             load_idx = self.issue_global_loads(load_idx)
 
@@ -1265,9 +1307,7 @@ class MoEPipelinedProgram:
         main_iters = gl.cdiv(loop_k, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
         gl.assume(main_iters >= 0)
 
-        # Wait so the oldest of the NB - 1 prologue batches is in LDS.
-        # Followed by NB - 2 still in-flight; matches the per-iter wait
-        # at the bottom of the loop.
+        # Drain oldest prologue batch into LDS; rest remain in flight.
         self.async_wait(cfg.NUM_BUFFERS - 2)
 
         for _ in range(0, main_iters):
@@ -1293,46 +1333,18 @@ class MoEPipelinedProgram:
 @composition
 @gluon.aggregate
 class MoESliceMNProgram:
-    """v8-style 4-region split-shmem 2x2 M-N subtile interleave program.
+    """4-region split-shmem 2x2 M-N subtile interleave (v8-style).
 
-    Mirrors ``v8_sliceMN`` from the gfx950-gluon-tutorials. The X tile
-    is split along M into ``[BM/2, BK]`` halves (top / bot), W along N
-    into ``[BK, BN/2]`` halves (left / right), each with its own LDS
-    slot (4 ``allocate_shared_memory`` calls instead of 2). Each K-iter
-    fires **4** ``buffer_load_to_shared`` commit_groups -- one per
-    half-tile -- staggered across the 4-region MFMA pipeline. Two
-    benefits stack:
+    Splits X along M and W along N into halves with their own LDS
+    slots; each K-iter fires 4 ``buffer_load_to_shared`` commit_groups
+    staggered across 4 MFMA sub-tiles. Hides HBM latency at large K
+    by spreading commits across ~3 MFMA regions instead of clustering.
 
-      * **Half-tile fits cleanly under TCP/L1 32 KB cap.** Each
-        ``buffer_load`` train transfers ~half of the full W tile, so a
-        single train no longer saturates the cap on its own (same
-        principle as :class:`MoESliceNProgram`, just extended to X).
-      * **Per-region staggering hides HBM latency at large K.** The 4
-        issues are spread across ~3 regions of MFMA (~1500 cycles)
-        instead of clustered together. The earliest issue retires from
-        the TCP before new ones arrive, resolving the large-K stall
-        analysed in ``v8_sliceMN/README.md`` §4.5.
-
-    The full ``[BLOCK_M, BLOCK_N]`` accumulator decomposes into four
-    ``[BLOCK_M/2, BLOCK_N/2]`` sub-accumulators -- 4 sub-MFMAs
-    interleaved with 4 sub-``ds_read``s per K iter. Each sub-MFMA
-    depends on only one sub-X / sub-W, so the LLVM scheduler overlaps
-    MFMA ``N`` with the ``ds_read`` of MFMA ``N+1`` -- a single-acc
-    :class:`MoEPipelinedProgram` is held off by the long accumulator
-    dep chain. Numerics: bit-exact against
-    :class:`MoEPipelinedProgram` baseline (verified by
-    ``test_slice_mn.py``).
-
-    Constraints (caller / autotuner must enforce):
-
-      * ``cfg.NUM_SUBTILES == (2, 2, 1)``.
-      * ``cfg.NUM_BUFFERS >= 2`` (the 4-region prologue / wait sequence
-        breaks at NB=1).
-      * ``BLOCK_M >= 128`` / ``BLOCK_N >= 128`` (sub-tile floor from
-        ``tiles_per_warp=[2,2] * warps_{m,n}=2`` = 64).
-      * ``cfg.SCALE_VIA_LDS`` whenever ``cfg.WITH_*_MX_SCALE`` (sub-load
-        slices the unswizzled scale view via
-        ``issue_local_load_unswizzle_sub``).
+    Constraints (autotuner enforces):
+      * ``cfg.NUM_SUBTILES == (2, 2, 1)``
+      * ``cfg.NUM_BUFFERS >= 2``
+      * ``BLOCK_M >= 128`` and ``BLOCK_N >= 128``
+      * ``cfg.SCALE_VIA_LDS`` whenever ``cfg.WITH_*_MX_SCALE``
     """
 
     base: MoEProgramBase
@@ -1575,13 +1587,8 @@ class MoESliceMNProgram:
 
     @gluon.jit
     def issue_x_top(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
-        """Region-1 issue: ``X_top`` + ``X_scale`` + ``W_scale`` folded
-        into ONE commit_group. Scales are <= 4 KB combined and each
-        lives in its own LDS slot, so packing them with X_top doesn't
-        grow any in-flight train past the gfx950 TCP/L1 32 KB cap. The
-        scales are issued by the time the next K-iter's Region 0
-        consumes them (3 regions of slack at NB=2, 7 at NB=3).
-        """
+        """Region-1: X_top + (X|W)_scale folded into one commit_group.
+        Scales (<= 4 KB combined) keep the in-flight train under cap."""
         cfg = self.cfg
         self.x_desc_top.issue_async_load(
             load_idx, self.x_buffer_top, pred, USE_MASK=USE_MASK, COMMIT=0
@@ -1616,9 +1623,7 @@ class MoESliceMNProgram:
 
     @gluon.jit
     def issue_w_right(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
-        """Region-3 issue: ``W_right`` only. 1 commit_group. Advances
-        ``load_idx`` (= one K-iter consumed).
-        """
+        """Region-3: ``W_right`` only; advances ``load_idx`` (one K-iter)."""
         self.w_desc_right.issue_async_load(
             load_idx, self.w_buffer_right, pred, USE_MASK=USE_MASK, COMMIT=1
         )
@@ -1626,10 +1631,8 @@ class MoESliceMNProgram:
 
     @gluon.jit
     def issue_global_loads(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
-        """Combined 4-region issue (= 4 commit_groups, 1 K-iter). Used
-        in the prologue to spin up ``NB`` iters worth of in-flight
-        commits before the main loop's per-region drain begins.
-        """
+        """All 4 regions in one call (= 4 commit_groups, 1 K-iter);
+        used by the prologue to spin up the in-flight pipeline."""
         load_idx = self.issue_w_left(load_idx, pred, USE_MASK=USE_MASK)
         load_idx = self.issue_x_top(load_idx, pred, USE_MASK=USE_MASK)
         load_idx = self.issue_x_bot(load_idx, pred, USE_MASK=USE_MASK)
@@ -1638,55 +1641,18 @@ class MoESliceMNProgram:
 
     @gluon.jit
     def async_wait(self, waitcnt):
-        """Coarse drain: 4 commit_groups per K-iter (one per region).
-        Used by callers that batch wait at iter granularity; the main
-        loop body uses raw ``async_copy.wait_group(4*NB - 3)`` for
-        per-region one-commit drain.
-        """
+        """Coarse drain at iter granularity (4 commit_groups / K-iter)."""
         gl.amd.cdna4.async_copy.wait_group(waitcnt * 4)
 
     @gluon.jit
     def pipeline(self, loop_k):
-        """K-loop in v8_sliceMN's 4-region unrolled-by-2 form.
+        """4-region 2x2 sub-MFMA K-loop, body unrolled by 2.
 
-        Each main-loop body covers **2 K-iters** (= 8 regions). Within
-        each K-iter we have 4 sub-MFMAs (one per quadrant) interleaved
-        with 4 commit_groups (W_left, X_top + scales, X_bot, W_right).
-        Each region: MFMA -> wait_group(drain 1) -> ds_read NEXT operand
-        -> issue refill of CURRENT buffer.
-
-        Per-region structure (mfma_idx = m, ahead = m + NB)::
-
-            Region 0:  MFMA(x_top, w_left)   -> c_tl
-                       wait_group(4*NB - 3)  # drain X_bot[m]
-                       ds_read x_bot[m]
-                       async_copy W_left[ahead]   (1 commit)
-
-            Region 1:  MFMA(x_bot, w_left)   -> c_bl
-                       wait_group(4*NB - 3)  # drain W_right[m]
-                       ds_read w_right[m]
-                       async_copy X_top + scales[ahead]  (1 commit)
-
-            Region 2:  MFMA(x_top, w_right)  -> c_tr; mfma_idx++
-                       wait_group(4*NB - 3)  # drain W_left[m+1]
-                       ds_read w_left[m+1]
-                       async_copy X_bot[ahead]   (1 commit)
-
-            Region 3:  MFMA(x_bot, w_right)  -> c_br
-                       wait_group(4*NB - 3)  # drain X_top[m+1]
-                       ds_read x_top[m+1]
-                       async_copy W_right[ahead]   (1 commit)
-
-        With NB=2 the wait_group(5) keeps 6 commits in flight after
-        each region (~ 1 1/2 iters ahead). Each region drains exactly
-        ONE commit_group; 4 regions per iter aligns exactly with the
-        per-iter 4-commit budget.
-
-        Loop is unrolled by 2 so the LDS slot ping-pong (mfma_idx % NB)
-        is statically resolved for NB=2 and the LLVM scheduler can
-        keep all four operands (x_top, x_bot, w_left, w_right) alive
-        concurrently across the iter boundary with minimal AGPR<->VGPR
-        copies (see v8_sliceMN README §3.3).
+        Each region: MFMA(quadrant) -> ``wait_group(4*NB - 3)`` ->
+        ``ds_read`` next operand -> issue refill of current buffer.
+        4 regions per K-iter align with the 4-commit budget so each
+        commit_group has exactly one drain. The unroll-by-2 lets the
+        LDS slot ping-pong resolve statically at NB=2.
         """
         cfg = self.cfg
         EVEN_K: gl.constexpr = cfg.EVEN_K
@@ -1705,11 +1671,8 @@ class MoESliceMNProgram:
         load_idx = 0
         mfma_idx = 0
 
-        # Prologue: issue NB iters worth (= 4*NB commit_groups). NB
-        # iters not NB-1: the v8 4-region pattern needs both iter 0
-        # AND iter 1 already in flight at main-loop entry so region 2
-        # of iter 0 can ds_read iter 1 W_left (and region 3 ds_read
-        # iter 1 X_top).
+        # Prologue: NB iters in flight (region 2/3 of iter 0 ds_read
+        # iter 1 W_left / X_top, so NB not NB-1).
         for _ in gl.static_range(NB):
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
 
@@ -1719,119 +1682,88 @@ class MoESliceMNProgram:
         c_br = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
 
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
-        if EVEN_K:
-            main_iters = K_iters - NB
-        else:
-            main_iters = K_iters - NB - 1
+        # K-tail mask absorbed via USE_MASK=-1 in-loop (no dedicated peel).
+        main_iters = K_iters - NB
         gl.assume(main_iters >= 2)
 
-        # Drain iter 0's first 2 commits (W_left[0] + X_top[0]) so the
-        # very first MFMA (Region 0: c_tl = mfma(x_top, w_left)) has
-        # data. After this, in-flight = 4*NB - 2.
+        # Drain iter 0's first 2 commits so the first MFMA has data.
         gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
         x_top, sx_top = self.issue_local_load_x_sub(mfma_idx, 0)
         w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
 
+        # USE_MASK=-1 + in-loop mask drops the dedicated K-tail peel.
+        # Region order ``mfma -> issue -> wait -> ds_read`` lets the
+        # vmem coalesce start in parallel with the wait's s_barrier
+        # (raising the wait target by 1 to compensate).
         unroll_pairs = main_iters // 2
         odd_main = main_iters - unroll_pairs * 2
         for _ in range(0, unroll_pairs):
-            # ============================================================
-            # iter k: 4 regions (consume buffer (m % NB), refill same)
-            # ============================================================
-            # Region 0: MFMA c_tl; drain X_bot[k]; ds_read; issue W_left[ahead]
+            # iter k: 4 regions (consume buffer (m % NB), refill same).
             c_tl = self.mfma(x_top, sx_top, w_left, sw_left, c_tl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_w_left(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
-            load_idx = self.issue_w_left(load_idx, USE_MASK=0)
-
-            # Region 1: MFMA c_bl; drain W_right[k]; ds_read; issue X_top+scales[ahead]
-            c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_x_top(load_idx, USE_MASK=0)
-
-            # Region 2: MFMA c_tr; mfma_idx++; drain W_left[k+1]; ds_read; issue X_bot[ahead]
-            c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
-            mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_x_bot(load_idx, USE_MASK=0)
-
-            # Region 3: MFMA c_br; drain X_top[k+1]; ds_read; issue W_right[ahead]
-            c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            x_top, sx_top = self.issue_local_load_x_sub(mfma_idx, 0)
-            load_idx = self.issue_w_right(load_idx, USE_MASK=0)
-
-            # ============================================================
-            # iter k+1: same 4 regions, ping-ponged buffer slot
-            # ============================================================
-            c_tl = self.mfma(x_top, sx_top, w_left, sw_left, c_tl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
-            load_idx = self.issue_w_left(load_idx, USE_MASK=0)
 
             c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_x_top(load_idx, USE_MASK=0)
 
             c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
             mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_x_bot(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_x_bot(load_idx, USE_MASK=0)
 
             c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_w_right(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             x_top, sx_top = self.issue_local_load_x_sub(mfma_idx, 0)
-            load_idx = self.issue_w_right(load_idx, USE_MASK=0)
 
-        # Odd-iter peel: 4 regions if main_iters is odd.
+            # iter k+1: same 4 regions, ping-ponged buffer slot.
+            c_tl = self.mfma(x_top, sx_top, w_left, sw_left, c_tl)
+            load_idx = self.issue_w_left(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
+
+            c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
+            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
+
+            c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
+            mfma_idx += 1
+            load_idx = self.issue_x_bot(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
+
+            c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
+            load_idx = self.issue_w_right(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            x_top, sx_top = self.issue_local_load_x_sub(mfma_idx, 0)
+
+        # Odd peel; same USE_MASK=-1 handles the K-tail iter.
         if odd_main:
             c_tl = self.mfma(x_top, sx_top, w_left, sw_left, c_tl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_w_left(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
-            load_idx = self.issue_w_left(load_idx, USE_MASK=0)
 
             c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_x_top(load_idx, USE_MASK=0)
 
             c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
             mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_x_bot(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_x_bot(load_idx, USE_MASK=0)
 
             c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
+            load_idx = self.issue_w_right(load_idx, USE_MASK=-1)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
             x_top, sx_top = self.issue_local_load_x_sub(mfma_idx, 0)
-            load_idx = self.issue_w_right(load_idx, USE_MASK=0)
-
-        # K-tail peel for not-EVEN_K: 4 regions with USE_MASK=1.
-        if not EVEN_K:
-            c_tl = self.mfma(x_top, sx_top, w_left, sw_left, c_tl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
-            load_idx = self.issue_w_left(load_idx, USE_MASK=1)
-
-            c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_x_top(load_idx, USE_MASK=1)
-
-            c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
-            mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_x_bot(load_idx, USE_MASK=1)
-
-            c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
-            x_top, sx_top = self.issue_local_load_x_sub(mfma_idx, 0)
-            load_idx = self.issue_w_right(load_idx, USE_MASK=1)
 
         # Drain epilogue: NB iters of MFMA, no further async issues.
         # Mirrors v8's "iterMax-2 / iterMax-1" tail with the trailing
@@ -1854,8 +1786,7 @@ class MoESliceMNProgram:
             if i < NB - 1:
                 x_top, sx_top = self.issue_local_load_x_sub(mfma_idx, 0)
 
-        # Stitch: 4 quadrants -> [BM, BN] via join along quadrant axis,
-        # permute, reshape.
+        # Stitch the 4 quadrants and re-anchor to cfg.acc_layout.
         acc_top = gl.join(c_tl, c_tr).permute(0, 2, 1).reshape((SUBTILE_M, cfg.BLOCK_N))
         acc_bot = gl.join(c_bl, c_br).permute(0, 2, 1).reshape((SUBTILE_M, cfg.BLOCK_N))
         accumulator = (
@@ -1873,49 +1804,17 @@ class MoESliceMNProgram:
 class MoESliceNProgram:
     """N-only subtile interleave variant of :class:`MoEPipelinedProgram`.
 
-    Splits the ``[BLOCK_M, BLOCK_N]`` accumulator into 2
-    ``[BLOCK_M, BLOCK_N/2]`` sub-accumulators and emits 2 sub-MFMAs per
-    K-loop iter interleaved with 2 sub-W ``ds_read``s + 1 full-X
-    ``ds_read``. Same MFMA-vs-``ds_read`` overlap idea as the 2x2
-    :class:`MoESliceMNProgram` but keeps the M dim intact, so it works
-    on small-BM decode tiles (BM=16/32) where the 2x2 split is
-    structurally illegal (the ``BM/2`` sub-tile would fall below the
-    64-element warp-tile floor).
+    Splits W along N into two LDS halves so each K-iter fires 2 sub-W
+    ``buffer_load_to_shared`` trains (~half each, keeping in-flight
+    bytes under the gfx950 TCP/L1 32 KB cap) interleaved with 2
+    sub-MFMAs. Keeps the M dim intact so it works on small-BM decode
+    tiles (BM=16/32) where the 2x2 :class:`MoESliceMNProgram` split
+    falls below the 64-element warp-tile floor.
 
-    **W is split-shmem'd**: each half of N (``[0:BN/2]`` and
-    ``[BN/2:BN]``) gets its own LDS buffer (``w_buffer_top`` /
-    ``w_buffer_bot``) and its own :class:`AsyncCopyDescriptor`
-    (``w_desc_top`` / ``w_desc_bot``). The K-loop body issues each W
-    half via a separate ``buffer_load_to_shared`` train (~16 KB
-    each), so a single K-iter no longer fires a 32 KB transfer that
-    would saturate the gfx950 TCP/L1 32 KB in-flight cap. Pattern
-    mirrors v7_sliceN in ``gfx950-gluon-tutorials/kernels/gemm/a16w16``.
-
-    Compared to plain :class:`MoEPipelinedProgram`:
-
-      * 2 sub-MFMAs per iter instead of 1 full MFMA; each sub-MFMA's
-        accumulator is half-width along N, so its dep chain is
-        shorter and the LLVM scheduler can interleave the sub-W
-        ``ds_read`` (next iter's sub-W) with the in-flight sub-MFMA.
-      * 5 commit_groups per iter instead of 4 (extra W half).
-        ``async_wait_split`` accounts for that.
-      * X / X-scale / W-scale stay whole (X is small, W-scale is
-        small AND its LDS unswizzle slices in-place via
-        ``issue_local_load_unswizzle_sub``).
-
-    Constraints (caller / autotuner must enforce):
-
-      * ``cfg.NUM_SUBTILES == (1, 2, 1)``.
-      * ``cfg.SCALE_VIA_LDS`` whenever ``cfg.WITH_W_MX_SCALE``: the
-        sub-W-scale load slices the unswizzled view; the G->VGPR
-        path doesn't yet have per-subtile global addressing.
-      * ``BLOCK_N >= 128`` (sub-N >= 64 = warp-tile floor with
-        ``warps_n = 2``, ``tiles_per_warp = 2``).
-      * ``BLOCK_M >= 16`` (no constraint from N-only slicing).
-
-    Numerics: bit-exact against :class:`MoEPipelinedProgram` baseline
-    when both run on the same tile + scale-load mode (verified by
-    ``test_slice_n.py``).
+    Constraints (autotuner enforces):
+      * ``cfg.NUM_SUBTILES == (1, 2, 1)``
+      * ``cfg.SCALE_VIA_LDS`` whenever ``cfg.WITH_W_MX_SCALE``
+      * ``BLOCK_N >= 128`` and ``BLOCK_M >= 16``
     """
 
     base: MoEProgramBase
@@ -1976,13 +1875,9 @@ class MoESliceNProgram:
         x_scale_desc,
         w_scale_desc,
     ):
-        # X / X-scale / W-scale buffers identical to
-        # :class:`MoEPipelinedProgram`. The
-        # **W** buffer is split: two ``[NB, BN/2, BK_packed]`` slots,
-        # one per N half. Each sub-G->LDS train hits its own LDS slot,
-        # which lets the K-loop body issue them as independent
-        # ``buffer_load_to_shared`` commit_groups so each train is ~16
-        # KB rather than 32 KB (= TCP/L1 in-flight cap on gfx9).
+        # X / X-scale / W-scale buffers as in MoEPipelinedProgram; W
+        # is split into two ``[NB, BN/2, BK_packed]`` slots so each
+        # half-N async_copy stays under the 32 KB TCP cap.
         NUM_BUFFERS: gl.constexpr = cfg.NUM_BUFFERS
         BLOCK_K_PACKED_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
         BLOCK_K_PACKED_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
@@ -2053,14 +1948,8 @@ class MoESliceNProgram:
 
     @gluon.jit
     def issue_local_load_x(self, mfma_idx):
-        """Full-M X load + X-scale load. Same shape as
-        :meth:`MoEPipelinedProgram.issue_local_loads` but returns just
-        the X half (W is sliced per sub-MFMA via
-        :meth:`issue_local_load_w_sub`).
-
-        ``cfg.layout_x_scale`` is sized ``[BLOCK_M, BLOCK_K_SCALE]``
-        because ``NUM_SUBTILES_M == 1`` -- no sub-tile slicing on M.
-        """
+        """Full-M X (+ scale) load; W is sliced per sub-MFMA via
+        :meth:`issue_local_load_w_sub`."""
         cfg = self.cfg
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
         x = self.x_desc.issue_local_load(
@@ -2081,9 +1970,7 @@ class MoESliceNProgram:
                         BLOCK_K_SCALE,
                     )
                 else:
-                    scale_x = _load_scale_tile_via_gl_load(
-                        self.x_scale_desc, mfma_idx, cfg.layout_x_scale
-                    )
+                    scale_x = _load_scale_tile_via_gl_load(self.x_scale_desc, mfma_idx)
             else:
                 # fp8 X path: identity scale (e8m0=127 == 2^0).
                 scale_x = gl.full(
@@ -2099,26 +1986,6 @@ class MoESliceNProgram:
 
     @gluon.jit
     def issue_global_load_top(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
-        """Issue the *top* half of a K-iter's loads as ONE commit_group::
-
-            X         + W_top + X_scale + W_scale     (1 commit, ~22 KB)
-
-        Together with :meth:`issue_global_load_bot` (which fires
-        ``W_bot`` as a second commit_group), each K-iter produces
-        exactly **2 commit_groups** -- the bookkeeping that lets the
-        v7-style 4-region main loop drain one commit per region via
-        ``wait_group(2*NB - 2)``.
-
-        ``X / X_scale / W_scale`` are folded into the same commit (not
-        split): they're individually small (<= 4 KB each) and live in
-        separate LDS slots, so packing them into one commit_group
-        doesn't grow any single in-flight train past the gfx950 TCP/L1
-        32 KB cap. Splitting them further would only multiply
-        ``commit_group`` overhead.
-
-        Returns ``load_idx`` unchanged -- :meth:`issue_global_load_bot`
-        is what advances the iter counter.
-        """
         cfg = self.cfg
         self.x_desc.issue_async_load(
             load_idx, self.x_buffer, pred, USE_MASK=USE_MASK, COMMIT=0
@@ -2148,9 +2015,6 @@ class MoESliceNProgram:
 
     @gluon.jit
     def issue_global_load_bot(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
-        """Issue the *bot* half (``W_bot``) of a K-iter's loads as
-        ONE commit_group. See :meth:`issue_global_load_top`.
-        """
         self.w_desc_bot.issue_async_load(
             load_idx, self.w_buffer_bot, pred, USE_MASK=USE_MASK, COMMIT=1
         )
@@ -2158,32 +2022,16 @@ class MoESliceNProgram:
 
     @gluon.jit
     def issue_global_loads(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
-        """Combined top + bot issue for prologue / single-iter peel.
-        Produces 2 commit_groups (= 1 K-iter).
-        """
         load_idx = self.issue_global_load_top(load_idx, pred, USE_MASK=USE_MASK)
         load_idx = self.issue_global_load_bot(load_idx, pred, USE_MASK=USE_MASK)
         return load_idx
 
     @gluon.jit
     def async_wait(self, waitcnt):
-        """SliceN-aware ``async_wait``: 2 commit_groups per K-iter (top
-        + bot). ``waitcnt`` semantics match
-        :meth:`MoEProgramBase.async_wait` (= number of full K-iter
-        batches still in-flight). Used for the prologue's coarse
-        per-iter drain; the main loop uses raw
-        ``async_copy.wait_group(2*NB - 2)`` for per-region one-commit
-        drain.
-        """
         gl.amd.cdna4.async_copy.wait_group(waitcnt * 2)
 
     @gluon.jit
     def issue_local_load_w_sub(self, mfma_idx, subtile_idx_n: gl.constexpr):
-        """Sub-N W load. Picks the per-half LDS slot by
-        ``subtile_idx_n``: ``0`` -> ``w_buffer_top`` (rows [0:BN/2)),
-        ``1`` -> ``w_buffer_bot`` (rows [BN/2:BN)). The slot is
-        already half-sized, so no in-LDS slicing is needed.
-        """
         cfg = self.cfg
         SUBTILE_N: gl.constexpr = cfg.BLOCK_N // cfg.NUM_SUBTILES[1]
         subtile_start_n: gl.constexpr = subtile_idx_n * SUBTILE_N
@@ -2228,42 +2076,6 @@ class MoESliceNProgram:
 
     @gluon.jit
     def pipeline(self, loop_k):
-        """K-loop in v7_sliceN's 4-region unrolled-by-2 form.
-
-        Each main-loop body covers **2 K-iters** (= 4 regions). Within
-        each K-iter we have 2 sub-MFMAs (top, bot) interleaved with 2
-        commit_groups (top half, bot half), and the issue of the next
-        iter's halves is staggered ACROSS the 2 sub-MFMAs of the
-        current iter so MFMA + ds_read sit between the two
-        ``buffer_load_to_shared`` trains. That gap is what lets the
-        gfx950 TCP/L1 in-flight cap (32 KB) drain between the two W
-        halves -- back-to-back issues would still saturate it. Mirrors
-        ``v7_sliceN`` in ``gfx950-gluon-tutorials``.
-
-        Per-region structure (mfma_idx = m, ahead = m+NB)::
-
-            Region 0:  MFMA[0](x[m], w_top[m]) -> c0
-                       wait_group(2*NB-2)   # drain w_bot[m]
-                       ds_read   w_bot[m]
-                       async_copy iter[ahead] top  (1 commit)
-
-            Region 1:  MFMA[1](x[m], w_bot[m]) -> c1
-                       wait_group(2*NB-2)   # drain x[m+1]/w_top[m+1]
-                       ds_read   x[m+1], w_top[m+1]
-                       async_copy iter[ahead] bot  (1 commit)
-
-        With NB=2 the wait_group(2) keeps 2 commits in flight after
-        each region (= 1 iter ahead). Each region drains exactly ONE
-        commit_group, so the per-iter 2-commit budget aligns exactly
-        with the 2 regions per iter.
-
-        Loop is unrolled by 2 so the 4 regions form one body and the
-        ping-pong of LDS slots (mfma_idx % NB) and per-half register
-        names (a/b_left vs a_next/b_left) is explicit -- the LLVM
-        scheduler can then keep a, b_left, b_right alive concurrently
-        across the boundary with minimal AGPR<->VGPR copies (see v7
-        README §4.3).
-        """
         cfg = self.cfg
         EVEN_K: gl.constexpr = cfg.EVEN_K
         NB: gl.constexpr = cfg.NUM_BUFFERS
@@ -2279,10 +2091,6 @@ class MoESliceNProgram:
         load_idx = 0
         mfma_idx = 0
 
-        # Prologue: issue NB iters worth (= 2*NB commit_groups).
-        # NB iters not NB-1: the v7 4-region pattern needs both
-        # iter 0 AND iter 1 already in flight at main-loop entry so
-        # region 1 of iter 0 can ds_read iter 1 X/W_top.
         for _ in gl.static_range(NB):
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
 
@@ -2290,98 +2098,58 @@ class MoESliceNProgram:
         c1 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
 
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
-        # Number of K-iters whose loads are still pending issuance
-        # *during* the main loop. The last one (= iter K_iters-1)
-        # is peeled to a tail iter when not EVEN_K so its USE_MASK=1
-        # cost stays out of the hot body.
-        if EVEN_K:
-            main_iters = K_iters - NB
-        else:
-            main_iters = K_iters - NB - 1
+        main_iters = K_iters - NB
         gl.assume(main_iters >= 2)
 
-        # Drain iter 0's top half so the first ds_read X/W_top has
-        # data. After this, in-flight = 2*NB - 1 commits.
+        # Drain iter 0's top half so the first ds_read has data.
         gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
         x, sx = self.issue_local_load_x(mfma_idx)
         w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
 
-        # Even portion of main loop: unroll by 2 (4 regions / body).
-        # ``main_iters`` is a runtime int -- unroll structure is a
-        # regular ``range`` with step 1 over (main_iters // 2) pairs,
-        # plus a post-loop odd-iter peel below for the case
-        # main_iters % 2 == 1.
         unroll_pairs = main_iters // 2
         odd_main = main_iters - unroll_pairs * 2
         for _ in range(0, unroll_pairs):
-            # ============================================================
-            # iter k: regions 0 + 1
-            # ============================================================
-            # Region 0: MFMA[0]; drain W_bot[k]; ds_read W_bot[k]; issue
-            # top of (k+NB)
+            # iter k regions 0+1.
             c0 = self.mfma(x, sx, w0, sw0, c0)
             gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_global_load_top(load_idx, USE_MASK=0)
-
-            # Region 1: MFMA[1]; mfma_idx++; drain X/W_top[k+1]; ds_read
-            # X/W_top[k+1]; issue bot of (k+NB)
-            c1 = self.mfma(x, sx, w1, sw1, c1)
-            mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
-            x, sx = self.issue_local_load_x(mfma_idx)
-            w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=0)
-
-            # ============================================================
-            # iter k+1: regions 2 + 3 (== regions 0 + 1 with ping-ponged
-            # LDS slot via mfma_idx odd vs even)
-            # ============================================================
-            c0 = self.mfma(x, sx, w0, sw0, c0)
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
-            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_global_load_top(load_idx, USE_MASK=0)
+            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
             gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=0)
+            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
 
-        # Odd-iter peel: 2 regions if main_iters is odd.
+            # iter k+1 regions 2+3 (LDS slot ping-ponged via mfma_idx parity).
+            c0 = self.mfma(x, sx, w0, sw0, c0)
+            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
+            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
+
+            c1 = self.mfma(x, sx, w1, sw1, c1)
+            mfma_idx += 1
+            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            x, sx = self.issue_local_load_x(mfma_idx)
+            w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
+            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
+
+        # Odd peel; USE_MASK=-1 covers the K-tail iter.
         if odd_main:
             c0 = self.mfma(x, sx, w0, sw0, c0)
             gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_global_load_top(load_idx, USE_MASK=0)
+            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
             gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=0)
+            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
 
-        # K-tail peel for not-EVEN_K: same 2-region body but the
-        # issued iter (K_iters - 1) uses USE_MASK=1 so the per-element
-        # K-mask is paid only once (instead of every main-loop iter).
-        if not EVEN_K:
-            c0 = self.mfma(x, sx, w0, sw0, c0)
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
-            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_global_load_top(load_idx, USE_MASK=1)
-
-            c1 = self.mfma(x, sx, w1, sw1, c1)
-            mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
-            x, sx = self.issue_local_load_x(mfma_idx)
-            w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=1)
-
-        # Epilogue: drain everything, then run NB iters' MFMAs without
-        # any further ``async_copy`` issues (all loads have already
-        # been emitted). Mirrors v7's "iterMax-2 / iterMax-1" tail.
+        # Drain + final NB iters of MFMAs (no more async_copy).
         gl.amd.cdna4.async_copy.wait_group(0)
         for i in gl.static_range(NB):
             c0 = self.mfma(x, sx, w0, sw0, c0)
@@ -2394,11 +2162,6 @@ class MoESliceNProgram:
                 x, sx = self.issue_local_load_x(mfma_idx)
                 w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
 
-        # Stitch: c0 is [BM, BN/2], c1 is [BM, BN/2] -- interleave along N.
-        # ``join`` produces [BM, BN/2, 2]; ``permute(0, 2, 1)`` then
-        # ``reshape((BM, BN))`` gives the expected logical
-        # [BM, n0_0, n0_1, ..., n1_0, n1_1, ...] order. Final
-        # ``convert_layout`` matches the downstream acc_layout.
         accumulator = (
             gl.join(c0, c1).permute(0, 2, 1).reshape((cfg.BLOCK_M, cfg.BLOCK_N))
         )
@@ -2419,7 +2182,6 @@ def _pipelined_moe_tile_compute(
     gather_idx_ptr,
     scatter_idx_ptr,
     gate_scal_ptr,
-    expert_remap_ptr,
     slice_offs_ptr,
     slice_sizes_ptr,
     stride_xm,
@@ -2441,6 +2203,7 @@ def _pipelined_moe_tile_compute(
     N,
     K,
     x_global_scale_ptr,
+    out_quant_scale_ptr,
     compact_idx,
     block_in_expert,
     pid_n,
@@ -2461,7 +2224,6 @@ def _pipelined_moe_tile_compute(
     SWIGLU_LIMIT: gl.constexpr,
     OUT_BLOCK_N: gl.constexpr,
     APPLY_GATE_SCAL: gl.constexpr,
-    HAS_EXPERT_REMAP: gl.constexpr,
     HAS_RAGGED_OFFS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
@@ -2473,22 +2235,10 @@ def _pipelined_moe_tile_compute(
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
     USE_SLICE_N: gl.constexpr = False,
-    USE_3STAGE_PIPELINE: gl.constexpr = False,
+    HAS_FP8_QUANT_OUT: gl.constexpr = False,
+    W_VIA_VGPR: gl.constexpr = False,
 ):
-    """Compute one (compact_idx, block_in_expert, pid_n) output tile.
-
-    Extracted from ``_pipelined_moe_kernel_scaled`` so the persistent
-    variant can call it in a per-CTA loop while the non-persistent
-    grid kernel still invokes it once. The LDS allocations inside
-    ``MoEPipelinedProgram.initialize`` are hoisted to the enclosing
-    kernel's prologue by Triton, so calling this helper many times
-    from a runtime-bounded ``for`` loop reuses the same buffers and
-    keeps occupancy unchanged.
-    """
-    if HAS_EXPERT_REMAP:
-        expert_id = gl.load(expert_remap_ptr + compact_idx).to(gl.int32)
-    else:
-        expert_id = compact_idx
+    expert_id = compact_idx
 
     USE_GATHER: gl.constexpr = HAS_GATHER
 
@@ -2496,12 +2246,8 @@ def _pipelined_moe_tile_compute(
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // BLOCK_SCALE_FACTOR
 
     if HAS_RAGGED_OFFS:
-        # Honour the actual ragged packing of x: experts live back-to-back
-        # in HBM at ``slice_offs[expert_id]``; per-expert block boundary
-        # is ``slice_sizes[expert_id]`` (NOT padded up to BLOCK_M).
-        # This is required when per-expert size < BLOCK_M (otherwise the
-        # naive ``compact_idx * BLOCKS_PER_EXPERT * BLOCK_M`` reads rows
-        # belonging to the next expert and corrupts the GEMM).
+        # X experts are packed back-to-back at slice_offs[expert_id];
+        # boundary is slice_sizes[expert_id] (NOT padded to BLOCK_M).
         m_base = gl.load(slice_offs_ptr + expert_id).to(gl.int32)
         m_size = gl.load(slice_sizes_ptr + expert_id).to(gl.int32)
         off_m = m_base + block_in_expert * BLOCK_M
@@ -2513,7 +2259,9 @@ def _pipelined_moe_tile_compute(
     w_base_offset = expert_id * stride_we
     ws_base_offset = expert_id * stride_wse
 
-    STORE: gl.constexpr = _store_layout(NUM_WARPS)
+    STORE: gl.constexpr = _store_layout(
+        NUM_WARPS, block_m=BLOCK_M, w_via_vgpr=W_VIA_VGPR
+    )
 
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
     cfg = MoEConfig(
@@ -2533,76 +2281,137 @@ def _pipelined_moe_tile_compute(
         EVEN_K,
         USE_GATHER,
         NUM_WARPS,
+        W_VIA_VGPR=W_VIA_VGPR,
     )
 
-    # e2m1 packs 2 elements / byte along K.
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
+
+    # Decode (BM<=32) hits each W tile once per CTA, so streaming-skip
+    # the L1 to preserve X / scale cache lines. ``.cg`` lowers to
+    # ``sc0=1, nt=1`` on gfx950 ``buffer_load_to_lds``.
+    W_CACHE_MODIFIER: gl.constexpr = ".cg" if BLOCK_M <= 32 else ""
 
     X_ELEM_BITS: gl.constexpr = x_ptr.dtype.element_ty.primitive_bitwidth
     W_ELEM_BITS: gl.constexpr = w_ptr.dtype.element_ty.primitive_bitwidth
     LOAD_X_LAYOUT: gl.constexpr = _load_layout(
         BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS
     )
-    if W_TRANSPOSE:
+    if W_TRANSPOSE and not cfg.W_VIA_VGPR:
+        # LDS path: offsets shape (BLOCK_NONK, BLOCK_K), K contig in dim 1.
         LOAD_W_LAYOUT: gl.constexpr = _load_layout(
             BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
         )
+    elif W_TRANSPOSE and cfg.W_VIA_VGPR:
+        # W_VIA_VGPR LinearLayout over virtual ``[BLOCK_N//16, BLOCK_K_W*16]``
+        # (= [8, 2048]). Matches the 5-D host shuffle; in-register
+        # reshape/permute/trans folds the assert_trivial convert to noop.
+        # Two ``tiles_per_warp`` variants (n_block bits live in different
+        # reg/warp positions); BLOCK shape pinned, re-derive for others.
+        gl.static_assert(
+            BLOCK_K_W == 128 and BLOCK_N == 128 and NUM_WARPS == 4,
+            "W_VIA_VGPR LinearLayout bases assume BLOCK_K_W=128, "
+            "BLOCK_N=128, NUM_WARPS=4. Re-derive bases for other shapes.",
+        )
+        if cfg.SCALE_VIA_LDS:
+            # tpw=[2,2]
+            LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=[
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 8],
+                    [0, 1024],
+                    [1, 0],
+                    [4, 0],
+                ],
+                lane_bases=[
+                    [0, 16],
+                    [0, 32],
+                    [0, 64],
+                    [0, 128],
+                    [0, 256],
+                    [0, 512],
+                ],
+                warp_bases=[
+                    [2, 0],
+                    [0, 0],
+                ],
+                block_bases=[],
+                shape=[BLOCK_N // 16, BLOCK_K_W * 16],
+            )
+        else:
+            # tpw=[1,1]
+            LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=[
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 8],
+                    [0, 1024],
+                    [2, 0],
+                    [4, 0],
+                ],
+                lane_bases=[
+                    [0, 16],
+                    [0, 32],
+                    [0, 64],
+                    [0, 128],
+                    [0, 256],
+                    [0, 512],
+                ],
+                warp_bases=[
+                    [1, 0],
+                    [0, 0],
+                ],
+                block_bases=[],
+                shape=[BLOCK_N // 16, BLOCK_K_W * 16],
+            )
     else:
-        # HBM W is [K_packed, N] with N contiguous. Vectorise along the
-        # contig axis by passing BLOCK_N as the "k" arg (= contig-axis size).
+        # W is [K_packed, N] (N contig); vectorise the contig axis.
         LOAD_W_LAYOUT: gl.constexpr = _load_layout(
             BLOCK_N, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
         )
 
     offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
-    if W_TRANSPOSE:
+    if W_TRANSPOSE and not cfg.W_VIA_VGPR:
         offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
         offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+    elif W_TRANSPOSE and cfg.W_VIA_VGPR:
+        # W_VIA_VGPR uses virtual (n_block, k_flat).
+        offs_wn = gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
     else:
         offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
         offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
 
     rows_m = off_m + offs_xm
-    # ``m_limit`` is the per-expert tail when HAS_RAGGED_OFFS=True
-    # (= slice_offs[expert_id] + slice_sizes[expert_id]); otherwise it
-    # is the global ``M``. The pre-gather position lives in the
-    # ragged-dispatched order so we use ``m_limit`` to bound it.
+    # m_limit = per-expert tail (HAS_RAGGED_OFFS) or global M.
     pre_gather_mask = rows_m < m_limit
     if HAS_GATHER:
         rows_m_safe = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
         rows_m = gl.load(
             gather_idx_ptr + rows_m_safe, mask=pre_gather_mask, other=0
         ).to(gl.int32)
-        # Post-gather ``rows_m`` lives in the *global* token-id space
-        # of x_orig (size = ``M_X`` = x.shape[-2] = n_tokens), so the
-        # x-load mask must use the pre-gather mask combined with the
-        # global ``rows_m < M_X`` bound (the latter guards a junk
-        # gather_idx value). NOTE: ``M`` is the dispatched / output
-        # tile count (= gather_indx.numel() in production) which can be
-        # > M_X for top-k>1 dispatches; do NOT mix the two.
+        # Post-gather rows_m is in global token-id space (size M_X);
+        # mask out junk gather_idx values too. Don't conflate M_X with
+        # ``M`` (= dispatched tile count, can exceed M_X for top-k>1).
         mask_m = pre_gather_mask & (rows_m < M_X)
     else:
-        # Clamp rows_m to a safe in-bounds value (0) on OOB lanes so
-        # the AsyncCopyDescriptor's per-lane pointer arithmetic
-        # ``x_ptr + rows_m * stride_xm`` stays inside the x allocation
-        # even when ``off_m + BLOCK_M > m_limit`` (per-expert size <
-        # BLOCK_M case in the ragged combine GEMM). The mask still
-        # filters out the bogus rows; we just avoid handing the
-        # AMD/HIP buffer-load path an OOB address (which has been
-        # observed to fault with "Memory access fault by GPU node"
-        # during cuda graph capture warm-up).
+        # Clamp OOB lanes to 0 so the buffer_load address stays in
+        # bounds during HIP graph warm-up; mask still filters.
         rows_m = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
         mask_m = pre_gather_mask
-    mask_n = (off_n + offs_wn) < N
+    if W_TRANSPOSE and cfg.W_VIA_VGPR:
+        # W_VIA_VGPR skips the n-mask (launcher enforces N aligned).
+        mask_n = offs_wn < (BLOCK_N // 16)
+    else:
+        mask_n = (off_n + offs_wn) < N
 
-    # Hint divisibility on K_phys: the launcher requires K % 32 == 0, so
-    # K_phys = K / DIV_FACTOR has div(K_phys) >= 32 // DIV_FACTOR (>= 16 for
-    # mxfp4 packed). Without this hint the K-mask alignment for non-even-K
-    # caps the direct-to-LDS vec at 64b on mxfp4, which CDNA4 rejects.
-    # ``multiple_of`` on a func arg is a silent no-op; apply it on the
-    # ``K // DIV_FACTOR`` SSA which has an arith.divsi defining op.
+    # Hint K_phys divisibility so the non-even-K alignment doesn't cap
+    # mxfp4 direct-to-LDS at 64b (CDNA4 rejects); ``multiple_of`` only
+    # binds on an SSA def, hence the divsi target here.
     k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
     x_desc = AsyncCopyDescriptor.initialize(
@@ -2617,7 +2426,7 @@ def _pipelined_moe_tile_compute(
         mask_m[:, None],
         k_limit_x,
     )
-    if W_TRANSPOSE:
+    if W_TRANSPOSE and not cfg.W_VIA_VGPR:
         w_desc = AsyncCopyDescriptor.initialize(
             cfg,
             0,
@@ -2630,6 +2439,21 @@ def _pipelined_moe_tile_compute(
             mask_n[:, None],
             k_limit_w,
             base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+    elif W_TRANSPOSE and cfg.W_VIA_VGPR:
+        # Preshuffle B and load to VGPRs, bypassing LDS.
+        TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
+        offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
+            BLOCK_K_W * 16
+        )
+        base_off_b_vgpr = w_base_offset + pid_n * TILE_BYTES
+        w_desc = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            w_ptr,
+            gl.to_tensor(N),  # stride_k = N (K-iter advance: idx * BK_W * N)
+            offsets_b_vgpr + base_off_b_vgpr,
         )
     else:
         w_desc = AsyncCopyDescriptor.initialize(
@@ -2644,12 +2468,10 @@ def _pipelined_moe_tile_compute(
             mask_n[None, :],
             k_limit_w,
             base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
         )
-    # Scale offsets: SCALE_VIA_LDS (swizzle) uses the post-swizzle HBM shape
-    # [..., NONK/PF, K_S*PF] with BLOCK_NONK_PRESHUFFLED rows and
-    # BLOCK_K_SCALE_PRESHUFFLED cols, and issues buffer_load_to_shared.
-    # Otherwise scales load G->VGPR directly via gl.load using the
-    # mfma_scale_layout (uniform across bypass/transpose).
+    # SCALE_VIA_LDS uses post-swizzle HBM shape via buffer_load_to_shared;
+    # other modes load scales G->VGPR via gl.load.
     if HAS_X_BLOCK_SCALE:
         if cfg.SCALE_VIA_LDS:
             BLOCK_M_PS: gl.constexpr = cfg.BLOCK_M_PRESHUFFLED
@@ -2659,21 +2481,11 @@ def _pipelined_moe_tile_compute(
             offs_xs_k = gl.arange(0, BLOCK_K_S_PS, layout=gl.SliceLayout(0, LX_S))
             row_base_x_s = off_m // cfg.PRESHUFFLE_FACTOR
             rows_m_scale = row_base_x_s + offs_xs_m
-            # x_scale's row bound follows x's physical row count (M_X),
-            # not the dispatched tile count M. With HAS_GATHER, off_m
-            # is in dispatched space but the x_scale read is gated by
-            # mask_m (post-gather) below; this row_limit only exists to
-            # guard the SCALE_VIA_LDS bulk load.
             row_limit_x_s = (M_X + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
-            # swizzle: the in-tile K-axis is packed with the N-axis,
-            # so a K-mask on the packed column would scramble both. We rely
-            # on the host-side padding (e8m0=0 for OOB microblocks)
-            # combined with the W operand's own K-mask which zeros the OOB
-            # W elements -- making the OOB scale-x weight contribution 0
-            # regardless of the loaded scale value. Suppress the kernel-
-            # side K-mask by setting k_limit = K_S_pad * PF (full post-pad
-            # storage extent), which is guaranteed >= every loaded offset.
-            # K is a runtime arg so we cannot use constexpr ternaries here.
+            # Suppress the K-mask: the swizzle packs K with N so a
+            # K-mask on the packed column scrambles both. The host
+            # pads with e8m0=0 and the W K-mask zeros the OOB product
+            # regardless of scale value.
             k_limit_xs_load = (
                 (K // cfg.SCALE_BLOCK + 7) // 8 * 8
             ) * cfg.PRESHUFFLE_FACTOR
@@ -2724,7 +2536,7 @@ def _pipelined_moe_tile_compute(
             row_base_w_s = off_n // cfg.PRESHUFFLE_FACTOR
             rows_n_scale = row_base_w_s + offs_ws_n
             row_limit_w_s = (N + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
-            # See x_scale comment above for the rationale.
+            # See x_scale: suppress K-mask, OOB product is zero.
             k_limit_ws_load = (
                 (K // cfg.SCALE_BLOCK + 7) // 8 * 8
             ) * cfg.PRESHUFFLE_FACTOR
@@ -2858,6 +2670,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_left_mn[:, None],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
             w_desc_right_mn = AsyncCopyDescriptor.initialize(
                 cfg,
@@ -2871,6 +2684,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_right_mn[:, None],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
         else:
             LOAD_W_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
@@ -2896,6 +2710,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_left_mn[None, :],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
             w_desc_right_mn = AsyncCopyDescriptor.initialize(
                 cfg,
@@ -2909,6 +2724,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_right_mn[None, :],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
         slice_mn_pgm = MoESliceMNProgram.initialize(
             cfg,
@@ -2946,6 +2762,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_top[:, None],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
             w_desc_bot = AsyncCopyDescriptor.initialize(
                 cfg,
@@ -2959,6 +2776,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_bot[:, None],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
         else:
             LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
@@ -2984,6 +2802,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_top[None, :],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
             w_desc_bot = AsyncCopyDescriptor.initialize(
                 cfg,
@@ -2997,6 +2816,7 @@ def _pipelined_moe_tile_compute(
                 mask_n_bot[None, :],
                 k_limit_w,
                 base_offset=w_base_offset,
+                cache_modifier=W_CACHE_MODIFIER,
             )
         pgm = MoESliceNProgram.initialize(
             cfg,
@@ -3013,8 +2833,6 @@ def _pipelined_moe_tile_compute(
         )
         if USE_WARP_PIPELINE:
             acc = pgm.warp_pipeline(K)
-        elif USE_3STAGE_PIPELINE:
-            acc = pgm.pipeline_3stage(K)
         else:
             acc = pgm.pipeline(K)
 
@@ -3036,25 +2854,23 @@ def _pipelined_moe_tile_compute(
         out = _swiglu_reduce(
             acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout
         )
+        if HAS_FP8_QUANT_OUT:
+            scale = gl.load(out_quant_scale_ptr).to(gl.float32)
+            out = out / scale
+        out = out.to(y_ptr.dtype.element_ty)
+        STORE_LAYOUT: gl.constexpr = out.type.layout
     else:
-        out = acc
+        out = acc.to(y_ptr.dtype.element_ty)
+        STORE_LAYOUT: gl.constexpr = STORE
+        out = gl.convert_layout(out, STORE_LAYOUT)
 
-    out = out.to(y_ptr.dtype.element_ty)
-    out = gl.convert_layout(out, STORE)
-
-    offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE))
+    offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
     off_n_out = pid_n * OUT_BLOCK_N
-    offs_y_n = off_n_out + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE))
+    offs_y_n = off_n_out + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
 
-    # Bound ``offs_y_m`` BEFORE using it as a pointer offset. ``gate_scal``
-    # and ``scatter_idx`` are sized to ``M`` (= sum(slice_sizes)), but
-    # ``offs_y_m`` can extend past the per-expert tail (``m_limit < off_m
-    # + BLOCK_M``) AND past the global ``M`` (when per-expert size <
-    # BLOCK_M in the ragged schedule). Even with masked ``gl.load``,
-    # AMD/HIP can surface a "Memory access fault by GPU node" on the
-    # masked-off lanes because pointer arithmetic happens before the
-    # predicate. Mirror the ``HAS_GATHER`` branch above which already
-    # does this clamp pattern.
+    # Clamp offs_y_m to m_limit before any pointer arithmetic; AMD/HIP
+    # faults on the masked-off lanes if the address goes OOB even
+    # under a predicated load.
     y_m_in_bounds = offs_y_m < m_limit
     offs_y_m_safe = gl.where(y_m_in_bounds, offs_y_m, gl.zeros_like(offs_y_m))
 
@@ -3087,21 +2903,6 @@ def _pipelined_moe_tile_compute(
 
 @gluon.jit
 def _xcd_chiplet_swizzle(pid, num_pids, XCD_SWIZZLE: gl.constexpr):
-    """Reorder a linear ``pid`` so consecutive original pids land on the
-    same XCD (chiplet).
-
-    MI355X has 8 XCDs that the hardware scheduler round-robins
-    (sequential pid 0,1,2,...,7 → XCD 0,1,2,...,7). That spreads
-    sequential tiles across DIFFERENT L2 partitions, costing W/X
-    re-fetches. With ``XCD_SWIZZLE = N`` we permute the linear domain
-    so that pids ``[0..pids_per_xcd)`` go to XCD 0, ``[pids_per_xcd..2
-    *pids_per_xcd)`` to XCD 1, etc.; combined with the GROUP_M walk
-    that follows, consecutive original pids land on the same XCD and
-    reuse the same N-tile of W in that XCD's L2.
-
-    Mirrors ``triton_kernels`` ``xcd_swizzle`` in
-    ``matmul_details/_common.py``.
-    """
     if XCD_SWIZZLE == 1:
         return pid
     pids_per_xcd = num_pids // XCD_SWIZZLE
@@ -3118,16 +2919,6 @@ def _group_m_swizzle(
     grid_n,
     GROUP_M: gl.constexpr,
 ):
-    """Map a linear ``pid_mn`` (= row-major over ``grid_m * grid_n``)
-    to ``(pid_m, pid_n)`` so that ``GROUP_M`` consecutive M-tiles share
-    the same N-tile of W.
-
-    For ``GROUP_M == 1`` this is the trivial row-major mapping
-    ``(pid_mn // grid_n, pid_mn % grid_n)``. Boundary tiles where the
-    last M-group is shorter than ``GROUP_M`` use the ``group_size`` =
-    ``min(grid_m - group_id*GROUP_M, GROUP_M)`` formula from
-    ``triton_kernels`` ``swizzle2d``.
-    """
     if GROUP_M == 1:
         pid_m = pid_mn // grid_n
         pid_n = pid_mn % grid_n
@@ -3135,18 +2926,21 @@ def _group_m_swizzle(
         width = GROUP_M * grid_n
         group_id = pid_mn // width
         group_size = gl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
-        # NB: ``(pid_mn % width) % group_size`` -- the modulo against
-        # ``width`` is REQUIRED, not redundant. Without it, the formula
-        # mixes the intra-group index with the group_id and produces
-        # ``pid_m >= grid_m`` for tiles in any group past the first,
-        # which then dereferences out-of-bounds pointers (GPU memfault).
         intra = pid_mn % width
         pid_m = group_id * GROUP_M + (intra % group_size)
         pid_n = intra // group_size
     return pid_m, pid_n
 
 
-@gluon.jit
+def _pipelined_moe_kernel_repr(specialization) -> str:
+    """Distinct rocprof names for schedule vs no-schedule specialization."""
+    use_block_schedule = bool(specialization.constants.get("USE_BLOCK_SCHEDULE", False))
+    if use_block_schedule:
+        return "_pipelined_moe_kernel_scaled_block_schedule"
+    return "_pipelined_moe_kernel_scaled"
+
+
+@gluon.jit(repr=_pipelined_moe_kernel_repr)
 def _pipelined_moe_kernel_scaled(
     x_ptr,
     w_ptr,
@@ -3157,9 +2951,10 @@ def _pipelined_moe_kernel_scaled(
     gather_idx_ptr,
     scatter_idx_ptr,
     gate_scal_ptr,
-    expert_remap_ptr,
     slice_offs_ptr,
     slice_sizes_ptr,
+    block_offs_ptr,
+    block_schedule_ptr,
     stride_xm,
     stride_xk,
     stride_we,
@@ -3179,6 +2974,7 @@ def _pipelined_moe_kernel_scaled(
     N,
     K,
     x_global_scale_ptr,
+    out_quant_scale_ptr,
     NUM_TILES,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -3197,7 +2993,6 @@ def _pipelined_moe_kernel_scaled(
     SWIGLU_LIMIT: gl.constexpr,
     OUT_BLOCK_N: gl.constexpr,
     APPLY_GATE_SCAL: gl.constexpr,
-    HAS_EXPERT_REMAP: gl.constexpr,
     HAS_RAGGED_OFFS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
@@ -3209,32 +3004,22 @@ def _pipelined_moe_kernel_scaled(
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
     USE_SLICE_N: gl.constexpr = False,
-    USE_3STAGE_PIPELINE: gl.constexpr = False,
+    HAS_FP8_QUANT_OUT: gl.constexpr = False,
+    USE_BLOCK_SCHEDULE: gl.constexpr = False,
+    N_EXPTS_TOT: gl.constexpr = 0,
     GRID_N: gl.constexpr = 0,
     GROUP_M: gl.constexpr = 1,
     XCD_SWIZZLE: gl.constexpr = 1,
+    W_VIA_VGPR: gl.constexpr = False,
 ):
-    """Non-persistent MoE GEMM kernel: legacy 2-D grid, one tile per CTA.
+    """Persistent / block-schedule MoE GEMM (single scaled-MFMA flavour).
 
-    The kernel is straight-line -- no constexpr-collapsed for-loop, no
-    schedule-padding ``do_tile`` guard around the body -- so LLVM sees
-    a single basic block per launch and register-allocates accordingly.
-    Iterative launch flavours (persistent / block-schedule) live in
-    :mod:`.gluon_persistent` to keep this entry point lean.
-
-    Grid: ``(blocks_per_expert * grid_n, num_active)``.
-      * ``program_id(0)`` is the intra-(expert) tile id.
-      * ``program_id(1)`` is the compact expert id (in
-        ``[0, num_active)`` -- ``HAS_EXPERT_REMAP`` then maps to the
-        real expert id inside :func:`_pipelined_moe_tile_compute`).
-
-    ``GRID_N`` is passed as constexpr (``= ceil_div(N, BLOCK_N)``) so
-    ``tiles_per_expert`` lowers to a compile-time constant; ``GRID_N=0``
-    falls back to the runtime compute for legacy call sites.
-
-    ``GROUP_M`` / ``XCD_SWIZZLE`` are launcher-side knobs that re-order
-    ``tile_idx`` for L2 reuse and XCD locality respectively; both
-    default to no-op (1).
+    Each CTA walks ``range(program_id(0), NUM_TILES, num_programs(0))``;
+    per-tile ``(compact_idx, block_in_expert, pid_n)`` comes from
+    ``block_schedule_ptr`` (``USE_BLOCK_SCHEDULE=True``, production)
+    or direct XCD/GROUP_M swizzle of ``tile_idx``. Padded tiles in
+    schedule mode are guarded by ``if do_tile`` (gluon-JIT can't
+    lower ``Continue``; scf.if-else-empty has the same cost).
     """
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
@@ -3243,82 +3028,102 @@ def _pipelined_moe_kernel_scaled(
         grid_n = (N + BLOCK_N - 1) // BLOCK_N
         tiles_per_expert = BLOCKS_PER_EXPERT * grid_n
 
-    # tile_idx packs (compact_idx, intra-expert pid). XCD swizzle on the
-    # FULL domain so the permutation crosses experts; GROUP_M then
-    # re-orders within an expert's (BLOCKS_PER_EXPERT, grid_n) sub-grid
-    # for W-tile L2 reuse.
-    tile_idx = gl.program_id(1) * tiles_per_expert + gl.program_id(0)
-    swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
-    compact_idx = swizzled // tiles_per_expert
-    local = swizzled % tiles_per_expert
-    block_in_expert, pid_n = _group_m_swizzle(local, BLOCKS_PER_EXPERT, grid_n, GROUP_M)
+    if USE_BLOCK_SCHEDULE:
+        # Post-swizzle bound; can't check tile_idx directly because
+        # GROUP_M/XCD_SWIZZLE permute it.
+        unpadded_m = gl.load(block_offs_ptr + N_EXPTS_TOT).to(gl.int32)
 
-    _pipelined_moe_tile_compute(
-        x_ptr,
-        w_ptr,
-        x_scale_ptr,
-        w_scale_ptr,
-        bias_ptr,
-        y_ptr,
-        gather_idx_ptr,
-        scatter_idx_ptr,
-        gate_scal_ptr,
-        expert_remap_ptr,
-        slice_offs_ptr,
-        slice_sizes_ptr,
-        stride_xm,
-        stride_xk,
-        stride_we,
-        stride_wn,
-        stride_wk,
-        stride_xsm,
-        stride_xsk,
-        stride_wse,
-        stride_wsn,
-        stride_wsk,
-        stride_yn,
-        stride_ym,
-        stride_be,
-        stride_bn,
-        M,
-        M_X,
-        N,
-        K,
-        x_global_scale_ptr,
-        compact_idx,
-        block_in_expert,
-        pid_n,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
-        X_FORMAT=X_FORMAT,
-        W_FORMAT=W_FORMAT,
-        UPCAST_INDICES=UPCAST_INDICES,
-        HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
-        HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
-        HAS_BIAS=HAS_BIAS,
-        HAS_GATHER=HAS_GATHER,
-        HAS_SCATTER=HAS_SCATTER,
-        DO_SWIGLU=DO_SWIGLU,
-        SWIGLU_ALPHA=SWIGLU_ALPHA,
-        SWIGLU_LIMIT=SWIGLU_LIMIT,
-        OUT_BLOCK_N=OUT_BLOCK_N,
-        APPLY_GATE_SCAL=APPLY_GATE_SCAL,
-        HAS_EXPERT_REMAP=HAS_EXPERT_REMAP,
-        HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
-        NUM_WARPS=NUM_WARPS,
-        NUM_BUFFERS=NUM_BUFFERS,
-        SCALE_LOAD_MODE=SCALE_LOAD_MODE,
-        W_TRANSPOSE=W_TRANSPOSE,
-        NUM_SUBTILES=NUM_SUBTILES,
-        EVEN_K=EVEN_K,
-        APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
-        USE_WARP_PIPELINE=USE_WARP_PIPELINE,
-        USE_SLICE_MN=USE_SLICE_MN,
-        USE_SLICE_N=USE_SLICE_N,
-        USE_3STAGE_PIPELINE=USE_3STAGE_PIPELINE,
-    )
+    for tile_idx in range(gl.program_id(0), NUM_TILES, gl.num_programs(0)):
+        if USE_BLOCK_SCHEDULE:
+            swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
+            grid_m_padded = NUM_TILES // grid_n
+            pid_m, pid_n = _group_m_swizzle(swizzled, grid_m_padded, grid_n, GROUP_M)
+            do_tile = pid_m < unpadded_m
+        else:
+            # Dense path: tile_idx packs (compact_idx, intra-expert pid);
+            # GROUP_M applies WITHIN one expert (W only reusable per expert).
+            swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
+            compact_idx = swizzled // tiles_per_expert
+            local = swizzled % tiles_per_expert
+            block_in_expert, pid_n = _group_m_swizzle(
+                local, BLOCKS_PER_EXPERT, grid_n, GROUP_M
+            )
+            do_tile = True
+
+        if do_tile:
+            if USE_BLOCK_SCHEDULE:
+                schedule_raw = gl.load(block_schedule_ptr + pid_m).to(
+                    gl.uint32, bitcast=True
+                )
+                compact_idx = (schedule_raw & 0x0000FFFF).to(gl.int32)
+                block_in_expert = (schedule_raw >> 16).to(gl.int32)
+
+            _pipelined_moe_tile_compute(
+                x_ptr,
+                w_ptr,
+                x_scale_ptr,
+                w_scale_ptr,
+                bias_ptr,
+                y_ptr,
+                gather_idx_ptr,
+                scatter_idx_ptr,
+                gate_scal_ptr,
+                slice_offs_ptr,
+                slice_sizes_ptr,
+                stride_xm,
+                stride_xk,
+                stride_we,
+                stride_wn,
+                stride_wk,
+                stride_xsm,
+                stride_xsk,
+                stride_wse,
+                stride_wsn,
+                stride_wsk,
+                stride_yn,
+                stride_ym,
+                stride_be,
+                stride_bn,
+                M,
+                M_X,
+                N,
+                K,
+                x_global_scale_ptr,
+                out_quant_scale_ptr,
+                compact_idx,
+                block_in_expert,
+                pid_n,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_K=BLOCK_K,
+                BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
+                X_FORMAT=X_FORMAT,
+                W_FORMAT=W_FORMAT,
+                UPCAST_INDICES=UPCAST_INDICES,
+                HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
+                HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
+                HAS_BIAS=HAS_BIAS,
+                HAS_GATHER=HAS_GATHER,
+                HAS_SCATTER=HAS_SCATTER,
+                DO_SWIGLU=DO_SWIGLU,
+                SWIGLU_ALPHA=SWIGLU_ALPHA,
+                SWIGLU_LIMIT=SWIGLU_LIMIT,
+                OUT_BLOCK_N=OUT_BLOCK_N,
+                APPLY_GATE_SCAL=APPLY_GATE_SCAL,
+                HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
+                NUM_WARPS=NUM_WARPS,
+                NUM_BUFFERS=NUM_BUFFERS,
+                SCALE_LOAD_MODE=SCALE_LOAD_MODE,
+                W_TRANSPOSE=W_TRANSPOSE,
+                NUM_SUBTILES=NUM_SUBTILES,
+                EVEN_K=EVEN_K,
+                APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
+                USE_WARP_PIPELINE=USE_WARP_PIPELINE,
+                USE_SLICE_MN=USE_SLICE_MN,
+                USE_SLICE_N=USE_SLICE_N,
+                HAS_FP8_QUANT_OUT=HAS_FP8_QUANT_OUT,
+                W_VIA_VGPR=W_VIA_VGPR,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3340,12 +3145,6 @@ def _parse_amdgcn_metric(amdgcn: str, key: str) -> int | None:
 
 
 def static_profile(kernel: Any, *, label: str = "") -> dict:
-    """Return a structured GPR / scratch / occupancy profile for ``kernel``.
-
-    Mirrors the helper from
-    ``triton-450/third_party/amd/python/examples/gluon/gfx1250_utils.py``,
-    but tolerant of the slightly different MI355 AMDGCN dump format.
-    """
     amdgcn = kernel.asm.get("amdgcn", "")
     fields = [
         "sgpr_count",
@@ -3367,20 +3166,11 @@ _PROFILE_BY_KERNEL_ID: dict[int, dict] = {}
 
 
 def _capture_launch_profile(k: Any) -> None:
-    """Internal: snapshot the static GPR/occupancy profile of ``k``."""
     global _LAST_KERNEL_PROFILE
     key = id(k)
     prof = _PROFILE_BY_KERNEL_ID.get(key)
     if prof is None:
         prof = static_profile(k)
-        # Capture the underlying kernel function name (e.g.
-        # ``_pipelined_moe_kernel_scaled`` vs
-        # ``_pipelined_moe_kernel_scaled_persistent``) so callers that
-        # bypass autotune via ``--tiles``/``--persistent`` can confirm
-        # which kernel function actually got launched without grepping
-        # the IR dump. ``CompiledKernel`` exposes the function name via
-        # ``.name`` (Triton) or as a fallback through ``.metadata.name``;
-        # be defensive so a future Triton bump doesn't break the bench.
         name = getattr(k, "name", None)
         if name is None:
             md = getattr(k, "metadata", None)
@@ -3392,15 +3182,10 @@ def _capture_launch_profile(k: Any) -> None:
 
 
 def last_kernel_profile() -> dict | None:
-    """Return the static profile (sgpr/vgpr/scratch/occupancy) of the
-    most recent :func:`_launch_kernel` invocation, or ``None`` if no MoE
-    launch has happened yet on this process.
-    """
     return _LAST_KERNEL_PROFILE
 
 
 def assert_no_spills(profile: dict, *, allow_scratch: int = 0) -> None:
-    """Raise if the static profile shows any GPR spill or excess scratch."""
     sgpr_spill = profile.get("sgpr_spill_count") or 0
     vgpr_spill = profile.get("vgpr_spill_count") or 0
     scratch = profile.get("ScratchSize") or 0
@@ -3423,26 +3208,10 @@ def assert_no_spills(profile: dict, *, allow_scratch: int = 0) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _expert_layout(
-    a_ragged_metadata: Any | None,
-    block_m: int,
-    M: int,
-) -> tuple[int, int, torch.Tensor | None]:
-
-    if a_ragged_metadata is None:
-        return 1, (M + block_m - 1) // block_m, None
-    counts = a_ragged_metadata.slice_sizes
-    counts_list = counts.tolist()
-    active = [i for i, c in enumerate(counts_list) if int(c) > 0]
-    num_active = len(active)
-    if num_active == 0:
-        return 1, 0, None
-    max_blocks = max((int(counts_list[i]) + block_m - 1) // block_m for i in active)
-    if num_active == counts.numel():
-        # All experts active: identity remap, no need to materialise.
-        return num_active, max_blocks, None
-    expert_remap = torch.tensor(active, device=counts.device, dtype=torch.int32)
-    return num_active, max_blocks, expert_remap
+def _dense_grid_dims(M: int, block_m: int) -> tuple[int, int]:
+    """Return ``(num_active, blocks_per_expert)`` for the no-ragged
+    (dense / gating GEMM) path."""
+    return 1, (M + block_m - 1) // block_m
 
 
 def _make_dummy(device, dtype=torch.int32, n: int = 0) -> torch.Tensor:
@@ -3450,20 +3219,6 @@ def _make_dummy(device, dtype=torch.int32, n: int = 0) -> torch.Tensor:
 
 
 def _swizzle_scales_cdna4(s: torch.Tensor) -> torch.Tensor:
-    """Pure-python mirror of triton_kernels' ``CDNA4MXScaleLayout.swizzle_data``
-    for uint8 (e8m0) MX block scales.
-
-    Input convention: ``s`` has shape ``(*leading, NONK=N, K_S)`` -- the
-    same layout gluon's launcher passes to ``_preprocess_scale``. This
-    helper internally transposes to upstream's ``(*leading, K_SCALE, N)``
-    convention before applying the swizzle.
-
-    Output: ``(*leading, K_SCALE_pad*32, N_pad/32)`` with ``stride(-2)==1``
-    (i.e. the K_SCALE_pad*32 axis is contiguous in memory). This matches
-    upstream's wrapped scale tensor exactly so a tensor produced by
-    ``triton_kernels.tensor_details.layout.CDNA4MXScaleLayout`` can be
-    consumed zero-copy by the ``swizzle`` mode.
-    """
     assert s.dtype == torch.uint8, (
         f"_swizzle_scales_cdna4: expected uint8 e8m0 scales, " f"got {s.dtype}"
     )
@@ -3481,27 +3236,17 @@ def _swizzle_scales_cdna4(s: torch.Tensor) -> torch.Tensor:
     s = s.mT.contiguous().mT
     s = torch.nn.functional.pad(s, (0, N_pad - N, 0, K_SCALE_pad - K_SCALE))
     s = s.transpose(-1, -2)  # (..., N_pad, K_SCALE_pad)
-    # `view` requires the shape to be reachable without a copy from
-    # current strides. The chain above ensures (..., N_pad, K_SCALE_pad)
-    # is contiguous on the inner two axes; collapse leading dims via
-    # `reshape` (which may copy if non-contig leading slabs).
     s = s.reshape(B, N_pad, K_SCALE_pad)
     s = s.view(B, N_pad // 32, 2, 16, K_SCALE_pad // 8, 2, 4, 1)
     s = s.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
     s = s.reshape(B, N_pad // 32, K_SCALE_pad * 32)
     s = s.transpose(-1, -2)  # (B, K_SCALE_pad*32, N_pad/32)
-    # Match upstream's output shape (collapsed leading dim into B).
-    # Restoring multi-leading would force a non-trivial reshape that can
-    # invalidate `stride(-2) == 1`, which the kernel relies on.
     return s
 
 
 def _is_scale_swizzled_cdna4(s: torch.Tensor) -> bool:
-    """Heuristic: a tensor is already swizzled iff its inner 2-D has
-    ``stride(-2) == 1`` (the contiguous K_S*32 axis) and
-    ``shape[-2] % 32 == 0`` and ``shape[-1] % 1 == 0`` etc. We take
-    the cheap path and just check ``stride(-2) == 1`` since the upstream
-    swizzle asserts that explicitly."""
+    """``stride(-2) == 1`` (the contig K_S*32 axis) is the upstream
+    swizzle's signature; cheap check."""
     return s.stride(-2) == 1 and s.stride(-1) >= s.shape[-2]
 
 
@@ -3526,21 +3271,6 @@ def _preprocess_scale(data: torch.Tensor | None, mode: str) -> torch.Tensor | No
 
 
 def _scale_strides(scale: torch.Tensor | None, mode: str = "bypass") -> tuple[int, int]:
-    """Return ``(stride_nonk, stride_k)`` matching the kernel's address math
-    ``base + r * stride_nonk + c * stride_k`` where ``r`` ranges over the
-    NONK axis (M for x_scale, N for w_scale, possibly preshuffled) and
-    ``c`` ranges over the K_S axis (possibly *PF post-swizzle).
-
-    For ``bypass`` / ``transpose`` the gluon convention is
-    ``[..., NONK, K_S]`` with K_S contiguous, so we return the natural
-    ``(stride(-2), stride(-1))``.
-
-    For ``swizzle`` the post-swizzle storage shape is
-    ``[..., K_SCALE_pad*32, N_pad/32]`` with ``stride(-2)==1`` (the
-    K_SCALE_pad*32 axis contiguous). The kernel still treats it as
-    ``[..., NONK_PS=N/32, K_S_PS=K_S*32]`` so we swap and return
-    ``(stride(-1), stride(-2))``.
-    """
     if scale is None:
         return 0, 0
     if mode == "swizzle":
@@ -3568,47 +3298,39 @@ def _launch_kernel(
     block_k: int,
     num_warps: int,
     num_buffers: int = 2,
-    a_format: str,
-    b_format: str = "e2m1",
+    x_format: str,
+    w_format: str = "e2m1",
     x_scale: torch.Tensor | None = None,
     w_scale: torch.Tensor | None = None,
-    a_global_scale: torch.Tensor | float | None = 1.0,
+    x_global_scale: torch.Tensor | float | None = 1.0,
     scale_load_mode: str = "bypass",
     w_transpose: bool = False,
     apply_x_global_scale: bool | None = None,
     use_warp_pipeline: bool = False,
     use_slice_mn: bool = False,
     use_slice_n: bool = False,
-    use_3stage_pipeline: bool | None = None,
-    persistent: bool | None = None,
+    persistent: bool | None = False,
     num_ctas: int | None = None,
     group_m: int | None = None,
     xcd_swizzle: int | None = None,
+    out_quant_scale: torch.Tensor | float | None = None,
+    w_preshuffle: bool = False,
 ):
-    # Scaled-MFMA-only launcher (mxfp4 / fp8 x mxfp4). ``a_format`` and
-    # ``b_format`` are required and must be in ``_SCALED_FORMATS``.
-    assert a_format in _SCALED_FORMATS, f"unknown a_format={a_format!r}"
-    assert b_format in _SCALED_FORMATS, f"unknown b_format={b_format!r}"
+    assert x_format in _SCALED_FORMATS, f"unknown x_format={x_format!r}"
+    assert w_format in _SCALED_FORMATS, f"unknown w_format={w_format!r}"
     if apply_x_global_scale is None:
         apply_x_global_scale = True
     assert scale_load_mode in _SCALE_LOAD_MODES, (
         f"scale_load_mode must be one of {_SCALE_LOAD_MODES}, "
         f"got {scale_load_mode!r}"
     )
-    has_a_block_scale = a_format == "e2m1"
-    has_w_block_scale = b_format == "e2m1"
-    if has_a_block_scale:
+    has_x_block_scale = x_format == "e2m1"
+    has_w_block_scale = w_format == "e2m1"
+    if has_x_block_scale:
         assert x_scale is not None, "mxfp4 A requires a block-scale tensor"
     if has_w_block_scale:
         assert w_scale is not None, "mxfp4 W requires a block-scale tensor"
 
-    # ``M`` is the dispatched / output tile count consumed by the kernel
-    # for ragged & writeback bookkeeping. With a non-None ``gather_indx``
-    # production passes ``x`` *un-permuted* (shape ``(n_tokens, H)``) and
-    # the kernel walks ``gather_indx[i]`` for ``i in [0, gather_indx.numel())``
-    # -- so M must reflect the dispatched count, not ``n_tokens``.
-    # ``M_X`` stays bound to ``x.shape[-2]`` so the post-gather safety
-    # check (``rows_m < M_X``) keeps catching out-of-range gather idx.
     M_X = x.shape[-2]
     if gather_indx is not None:
         gather_buf_for_m = gather_indx.src_indx
@@ -3616,9 +3338,9 @@ def _launch_kernel(
     else:
         M = M_X
     K_phys = x.shape[-1]
-    div_a = 2 if a_format == "e2m1" else 1
-    div_b = 2 if b_format == "e2m1" else 1
-    K = K_phys * div_a
+    div_x = 2 if x_format == "e2m1" else 1
+    div_w = 2 if w_format == "e2m1" else 1
+    K = K_phys * div_x
 
     scale_load_mode = _effective_scale_load_mode(
         scale_load_mode,
@@ -3626,20 +3348,33 @@ def _launch_kernel(
         block_n,
         block_k,
         scale_block=32,
-        has_x_scale=has_a_block_scale,
+        has_x_scale=has_x_block_scale,
         has_w_scale=has_w_block_scale,
         k=K,
-        a_format=a_format,
+        x_format=x_format,
         num_buffers=num_buffers,
     )
 
     if w.ndim == 3:
-        E, K_w_phys, N = w.shape
+        E, K_w_phys, N_w_phys = w.shape
     else:
-        K_w_phys, N = w.shape
+        K_w_phys, N_w_phys = w.shape
         E = 1
-    K_w = K_w_phys * div_b
-    assert K == K_w, f"K mismatch: A logical K={K} vs W logical K={K_w}"
+    K_w = K_w_phys * div_w
+    if w_preshuffle and getattr(w, "is_shuffled_for_gluon_dot", False):
+        # Host pre-shuffle zero-pads K_pk to a multiple of 128 and W
+        # scale to padded N (combine launcher trims output back).
+        original_k_pk = getattr(w, "original_k_pk", K_w_phys)
+        assert (
+            K == original_k_pk * div_w
+        ), f"K mismatch: A logical K={K} vs W original logical K={original_k_pk * div_w}"
+        assert (
+            K_w_phys >= original_k_pk and K_w_phys % 128 == 0
+        ), f"shuffled W K_pk ({K_w_phys}) must be K_pk_padded (multiple of 128)"
+        N = N_w_phys
+    else:
+        assert K == K_w, f"K mismatch: A logical K={K} vs W logical K={K_w}"
+        N = N_w_phys
 
     assert (
         block_k % _MFMA_SCALED_K == 0
@@ -3651,47 +3386,23 @@ def _launch_kernel(
 
     grid_n = (N + block_n - 1) // block_n
 
-    # Per-expert ragged offsets (slice_offs) + sizes (slice_sizes).
-    # Required when per-expert size < BLOCK_M -- otherwise the kernel's
-    # naive ``compact_idx * BLOCKS_PER_EXPERT * BLOCK_M`` row offset
-    # would step PAST the per-expert tail and load rows belonging to
-    # the NEXT expert (corrupting the GEMM, see check_gluon_mxfp_fp8
-    # n_active=8 per_expert=32 case).
-    # DEBUG knob: ``TOKENSPEED_MOE_GLUON_RAGGED_OFFS=0`` disables the
-    # per-expert slice_offs / slice_sizes mask path even when ragged
-    # metadata is provided. Used to bisect whether a regression comes
-    # from the new ragged-offs code or from elsewhere.
-    _ragged_offs_disabled = os.environ.get(
-        "TOKENSPEED_MOE_GLUON_RAGGED_OFFS", ""
-    ).strip().lower() in {"0", "false", "no", "off"}
-    has_ragged_offs = a_ragged_metadata is not None and not _ragged_offs_disabled
+    # Per-expert ragged offsets needed when per-expert size < BLOCK_M
+    # (else off_m would walk past the expert tail into the next one).
+    has_ragged_offs = a_ragged_metadata is not None
     if has_ragged_offs:
-        slice_offs_buf = a_ragged_metadata.slice_offs.to(torch.int32)
-        slice_sizes_buf = a_ragged_metadata.slice_sizes.to(torch.int32)
+        slice_offs_buf = _as_int32(a_ragged_metadata.slice_offs)
+        slice_sizes_buf = _as_int32(a_ragged_metadata.slice_sizes)
     else:
         slice_offs_buf = _make_dummy(x.device, torch.int32)
         slice_sizes_buf = _make_dummy(x.device, torch.int32)
 
-    # Decide whether to take the schedule-driven (graph-capturable) path.
-    # Schedule mode borrows triton_kernels' device-side per-block-size
-    # ragged schedule: host picks ``grid_m`` from ``n_blocks(E, M, BLOCK_M)``
-    # (a pure-integer upper bound; no D2H sync) and the kernel decodes
-    # ``(expert_id, block_in_expert)`` from ``block_schedule[pid_m]``,
-    # cheap-skipping padded entries. This is what unlocks CUDA / HIP
-    # graph capture for the Gluon MoE kernel; the legacy ``_expert_layout``
-    # branch is kept for shapes the schedule pre-computation doesn't
-    # cover (BLOCK_M outside ``RaggedTensorMetadata.block_sizes()`` or
-    # callers that pass a hand-built metadata without the schedule
-    # tables populated) and for the dense / gating-GEMM paths where
-    # ``a_ragged_metadata is None``.
-    _schedule_disabled = os.environ.get(
-        "TOKENSPEED_MOE_GLUON_SCHEDULE", ""
-    ).strip().lower() in {"0", "false", "no", "off"}
-    _supported_schedule_block_ms = set(RaggedTensorMetadata.block_sizes())
+    # Block-schedule path: host picks grid_m as an integer upper bound
+    # (no D2H sync, graph-capturable) and the kernel decodes
+    # (expert_id, block_in_expert) from block_schedule[pid_m]. The
+    # dense fallback is only valid when ``a_ragged_metadata is None``.
     use_block_schedule = (
         has_ragged_offs
-        and block_m in _supported_schedule_block_ms
-        and not _schedule_disabled
+        and block_m in _BLOCK_SIZES_FROZEN
         and getattr(a_ragged_metadata, "block_offs_data", None) is not None
         and getattr(a_ragged_metadata, "block_schedule_data", None) is not None
     )
@@ -3700,154 +3411,57 @@ def _launch_kernel(
         n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
         grid_m_upper = RaggedTensorMetadata.n_blocks(n_slices, M, block_m)
         num_tiles_total = grid_m_upper * grid_n
-        block_offs_buf = a_ragged_metadata.block_offs(block_m).to(torch.int32)
-        block_schedule_buf = a_ragged_metadata.block_schedule(block_m).to(torch.int32)
-        # BLOCKS_PER_EXPERT is unused in schedule mode (the off_m math
-        # comes from slice_offs + schedule's block_in_expert), but the
-        # constexpr still needs a sentinel value.
-        blocks_per_expert = 1
-        num_active = n_slices
-        expert_remap = None
-        # DEBUG (set via env): dump kernel launch parameters once per
-        # unique (M, block_m, has_gather, has_scatter) signature so we
-        # can correlate runtime shapes with crashes.
-        if os.environ.get("TOKENSPEED_MOE_GLUON_LAUNCH_DEBUG", "").strip() in {
-            "1",
-            "true",
-        }:
-            # Avoid D2H sync (e.g. .item()/.tolist()): unsafe inside
-            # cuda graph capture. Print purely host-side metadata.
-            _key = (
-                M,
-                block_m,
-                block_n,
-                gather_indx is not None,
-                scatter_indx is not None,
-                int(a_ragged_metadata.slice_sizes.shape[0]),
-                int(block_schedule_buf.shape[-1]),
-                grid_m_upper,
-                tuple(x.shape),
-                x.stride(),
-            )
-            _seen = _launch_kernel.__dict__.setdefault("_seen_keys", set())
-            if _key not in _seen:
-                _seen.add(_key)
-                import sys as _sys
-
-                _scatter_shape = (
-                    tuple(scatter_indx.dst_indx.shape)
-                    if scatter_indx is not None
-                    else None
-                )
-                _gather_shape = (
-                    tuple(gather_indx.src_indx.shape)
-                    if gather_indx is not None
-                    else None
-                )
-                _sys.stderr.write(
-                    f"[gluon-launch] M={M} M_X={M_X} block_m={block_m} "
-                    f"block_n={block_n} block_k={block_k} "
-                    f"grid_m_upper={grid_m_upper} grid_n={grid_n} "
-                    f"n_slices={n_slices} "
-                    f"sched.shape={tuple(block_schedule_buf.shape)} "
-                    f"x.shape={tuple(x.shape)} x.stride={x.stride()} "
-                    f"x.dtype={x.dtype} y.shape={tuple(y.shape)} "
-                    f"y.stride={y.stride()} y.dtype={y.dtype} "
-                    f"gather.shape={_gather_shape} "
-                    f"scatter.shape={_scatter_shape} "
-                    f"slice_offs.shape={tuple(a_ragged_metadata.slice_offs.shape)}\n"
-                )
-                _sys.stderr.flush()
-    else:
-        num_active, blocks_per_expert, expert_remap = _expert_layout(
-            a_ragged_metadata, block_m, M
+        block_offs_buf = _as_int32(_ragged_block_offs(a_ragged_metadata, block_m))
+        block_schedule_buf = _as_int32(
+            _ragged_block_schedule(a_ragged_metadata, block_m)
         )
-        num_tiles_total = num_active * blocks_per_expert * grid_n
+        blocks_per_expert = 1  # unused constexpr sentinel in schedule mode
+    else:
+        # Only ``a_ragged_metadata is None`` (dense GEMM) is accepted;
+        # hand-built ragged metadata without schedule tables is rejected
+        # to avoid the historical D2H ``counts.tolist()`` path.
+        assert not has_ragged_offs, (
+            f"_launch_kernel requires a_ragged_metadata to either be None "
+            f"(dense / gating GEMM) or to have populated "
+            f"block_offs_data + block_schedule_data and "
+            f"block_m={block_m} in {sorted(_BLOCK_SIZES_FROZEN)}. Build "
+            f"the metadata via triton_kernels' make_ragged_tensor_metadata."
+        )
+        _, blocks_per_expert = _dense_grid_dims(M, block_m)
+        num_tiles_total = blocks_per_expert * grid_n
         block_offs_buf = _make_dummy(x.device, torch.int32)
         block_schedule_buf = _make_dummy(x.device, torch.int32)
-        n_slices = 0  # unused constexpr below when USE_BLOCK_SCHEDULE=False
+        n_slices = 0
 
-    # Persistent grid: launch one CTA per (num_cus * max_occ) and stride
-    # through tiles in-kernel. Falls back to the historical 2-D grid when
-    # ``persistent`` is False / None and the total tile count is large
-    # enough to fully populate the GPU.
-    if persistent is None:
-        persistent = _should_use_persistent(num_tiles_total)
+    # Unified 1-D grid: persistent (CTAs stride through tiles) or
+    # one-CTA-per-tile (padded entries cheap-skip via ``if do_tile``).
     if persistent:
         if num_ctas is None:
             num_ctas = _persistent_grid_size(num_tiles_total)
         else:
             num_ctas = max(1, min(num_ctas, num_tiles_total))
-        grid = (num_ctas, 1)
-    elif use_block_schedule:
-        # Schedule mode keeps a 1-D grid; padded ``pid_m >= unpadded_m``
-        # CTAs cheap-skip via the kernel's entry early-return.
-        grid = (max(1, num_tiles_total), 1)
     else:
-        grid = (blocks_per_expert * grid_n, num_active)
+        num_ctas = max(1, num_tiles_total)
+    grid = (num_ctas, 1)
 
-    # GROUP_M + XCD_SWIZZLE grid-walk permutation. Default picked by
-    # ``_autotune_pid_swizzle`` (no-op on decode / small-tile shapes,
-    # ``(GROUP_M=8|4|2, XCD_SWIZZLE=8)`` on prefill). Env overrides
-    # ``TOKENSPEED_MOE_GLUON_GROUP_M`` / ``..._XCD_SWIZZLE`` win over
-    # both the heuristic and the caller's kwargs -- match the rest of
-    # the gluon tuning knobs (env always wins for closed-loop sweeps).
-    grid_m_for_swizzle = (
-        (num_tiles_total // grid_n) if use_block_schedule else blocks_per_expert
-    )
+    # GROUP_M + XCD_SWIZZLE grid-walk permutation (caller kwargs
+    # override the heuristic). Both must divide their respective
+    # domain to stay a permutation; otherwise fall back to 1.
+    grid_m_for_swizzle = num_tiles_total // grid_n
     auto_group_m, auto_xcd = _autotune_pid_swizzle(
         num_tiles_total=num_tiles_total,
         grid_n=grid_n,
         grid_m_padded=grid_m_for_swizzle,
         block_m=block_m,
     )
-    env_group_m = _env_int("TOKENSPEED_MOE_GLUON_GROUP_M", -1)
-    env_xcd = _env_int("TOKENSPEED_MOE_GLUON_XCD_SWIZZLE", -1)
-    if env_group_m >= 1:
-        group_m = env_group_m
-    elif group_m is None:
+    if group_m is None:
         group_m = auto_group_m
-    if env_xcd >= 1:
-        xcd_swizzle = env_xcd
-    elif xcd_swizzle is None:
+    if xcd_swizzle is None:
         xcd_swizzle = auto_xcd
-    # Clamp to legal values: GROUP_M must divide grid_m_padded (or 1) so
-    # the swizzle stays a permutation; otherwise fall back to 1.
     if group_m > 1 and grid_m_for_swizzle % group_m != 0:
         group_m = 1
-    # XCD_SWIZZLE must divide the 1-D domain it operates on; otherwise
-    # ``_xcd_chiplet_swizzle`` is identity, so a non-divisor would be a
-    # silent no-op. Clamp to 1 for clarity.
     if xcd_swizzle > 1 and num_tiles_total % xcd_swizzle != 0:
         xcd_swizzle = 1
-
-    # 3-stage software pipeline. Resolution order:
-    #   env TOKENSPEED_MOE_GLUON_3STAGE > caller kwarg > default(False).
-    # The 3-stage variant trades +1 tile of live VGPR for hiding the
-    # ``ds_read`` latency in the MFMA critical path. Empirically on
-    # MI355 the carry cost is too high to be a net win on the current
-    # tile menu (BM=32 fp8 decode: 136 -> 246 VGPRs, occ 3 -> 2,
-    # +6-9% on dispatch / +5-12% on combine). The method is kept and
-    # plumbed end-to-end so future tile shapes (smaller BK or
-    # BM=16) can opt in via env without code edits. ``warp_pipeline``
-    # already covers the NB>=3 case via cross-warp interleave, so the
-    # two are mutex (warp_pipeline wins if both are set). It is also
-    # mutex with sliceMN whose own subtile scheduler doesn't compose
-    # with the carry chain.
-    _3stage_env = os.environ.get("TOKENSPEED_MOE_GLUON_3STAGE", "").strip().lower()
-    if _3stage_env in {"1", "true", "yes", "on"}:
-        use_3stage_pipeline = True
-    elif _3stage_env in {"0", "false", "no", "off"}:
-        use_3stage_pipeline = False
-    elif use_3stage_pipeline is None:
-        use_3stage_pipeline = False
-    # Hard constraints: NB>=2 (already enforced by autotune) and
-    # the program-side gluon.static_assert. Mutex with warp_pipeline
-    # and sliceMN.
-    if use_3stage_pipeline and (use_warp_pipeline or use_slice_mn):
-        use_3stage_pipeline = False
-    if use_3stage_pipeline and num_buffers < 2:
-        use_3stage_pipeline = False
 
     bias_buf = bias if bias is not None else _make_dummy(x.device, torch.float32)
     gather_buf = (
@@ -3863,22 +3477,23 @@ def _launch_kernel(
     gate_scal_buf = (
         gate_scal if gate_scal is not None else _make_dummy(x.device, torch.float32)
     )
-    expert_remap_buf = (
-        expert_remap if expert_remap is not None else _make_dummy(x.device, torch.int32)
-    )
 
     swiglu_alpha = swiglu[0] if swiglu is not None else 0.0
     swiglu_limit = swiglu[1] if swiglu is not None else 0.0
 
     w3 = w if w.ndim == 3 else w.unsqueeze(0)
 
-    if w_transpose:
-        # W -> [E, N, K_packed]: K contig in HBM; kernel stages [BN, BK]
-        # in LDS and permute([1,0])s the LDS view for the dot operand.
+    if w_transpose and not w_preshuffle:
+        # K-contig W staged as [BN, BK] in LDS, view permuted for dot.
         w3 = w3.transpose(-1, -2).contiguous()
         stride_wn, stride_wk = w3.stride(-2), w3.stride(-1)
+    elif w_transpose and w_preshuffle:
+        # Host pre-shuffled into 5-D HBM layout; .contiguous() would
+        # clobber it. W_VIA_VGPR overrides stride_wn / stride_wk inside
+        # the descriptor, only stride_we matters here.
+        stride_wn, stride_wk = w3.stride(-2), w3.stride(-1)
     else:
-        # W stays [E, K_packed, N]: kernel stages [BK, BN] in LDS.
+        # N-contig W staged as [BK, BN] in LDS.
         stride_wn, stride_wk = w3.stride(-1), w3.stride(-2)
 
     if has_w_block_scale:
@@ -3892,7 +3507,7 @@ def _launch_kernel(
         w_scale_buf = _make_dummy(x.device, torch.uint8)
 
     x_scale_proc = (
-        _preprocess_scale(x_scale, scale_load_mode) if has_a_block_scale else None
+        _preprocess_scale(x_scale, scale_load_mode) if has_x_block_scale else None
     )
     stride_xsm, stride_xsk = _scale_strides(x_scale_proc, scale_load_mode)
 
@@ -3900,13 +3515,6 @@ def _launch_kernel(
         x_scale_proc if x_scale_proc is not None else _make_dummy(x.device, torch.uint8)
     )
 
-    # SliceMN halves M and N (v8-style 4-region split-shmem); the
-    # K-loop body emits 4 sub-acc MFMA chains that the scheduler
-    # interleaves with 4 sub-ds_reads. SliceN halves only N so the
-    # body emits 2 sub-acc MFMAs (full-M); used on small-BM tiles
-    # where the 2x2 sliceMN split is structurally illegal. See
-    # ``MoESliceMNProgram`` / ``MoESliceNProgram`` for shape
-    # constraints.
     if use_slice_mn:
         NUM_SUBTILES = (2, 2, 1)
     elif use_slice_n:
@@ -3915,38 +3523,48 @@ def _launch_kernel(
         NUM_SUBTILES = (1, 1, 1)
     EVEN_K = K % block_k == 0
 
-    # Materialise ``a_global_scale`` as a device pointer the kernel can
-    # ``gl.load`` at run time. This keeps the launcher CUDA/HIP-graph
-    # capturable -- the previous ``float(scale.item())`` path forced a
-    # device->host sync that aborted graph capture and is why
-    # ``_try_dispatch_mxfp`` had to bail out under capture.
-    #
-    # The kernel only reads this pointer when
-    # ``APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE`` (i.e. the fp8 x
-    # mxfp4 path). The mxfp4 x mxfp4 path skips the load entirely, so we
-    # hand it a size-0 dummy and avoid the per-launch host->device
-    # transfer that ``torch.tensor`` would do.
-    needs_scale_load = apply_x_global_scale and not has_a_block_scale
+    needs_scale_load = apply_x_global_scale and not has_x_block_scale
     if not needs_scale_load:
         x_global_scale_buf = _make_dummy(x.device, torch.float32)
-    elif isinstance(a_global_scale, torch.Tensor):
-        # Production fp8 path: the upstream FlexCtx hands us a 1-element
-        # f32 tensor already on ``x.device``, so the view + dtype guard
-        # is a zero-copy passthrough (``Tensor.to`` returns self when
-        # device and dtype already match).
-        scale_view = a_global_scale.detach().reshape(-1)[:1]
+    elif isinstance(x_global_scale, torch.Tensor):
+        # Production: zero-copy passthrough of upstream FlexCtx scale.
+        scale_view = x_global_scale.detach().reshape(-1)[:1]
         if scale_view.device == x.device and scale_view.dtype == torch.float32:
             x_global_scale_buf = scale_view
         else:
             x_global_scale_buf = scale_view.to(device=x.device, dtype=torch.float32)
     else:
-        # Tests / microbenchmarks pass a Python float here. This path
-        # materialises the scale via ``torch.tensor``, which is *not*
-        # graph-safe -- production never lands here (it always passes a
-        # tensor through ``_global_scale_passthrough``).
+        # Tests / microbenchmarks: not graph-safe (torch.tensor sync).
         x_global_scale_buf = torch.tensor(
-            [float(a_global_scale)], dtype=torch.float32, device=x.device
+            [float(x_global_scale)], dtype=torch.float32, device=x.device
         )
+
+    has_fp8_quant_out = out_quant_scale is not None
+    if has_fp8_quant_out:
+        if isinstance(out_quant_scale, torch.Tensor):
+            qscale_view = out_quant_scale.detach().reshape(-1)[:1]
+            if qscale_view.device == x.device and qscale_view.dtype == torch.float32:
+                out_quant_scale_buf = qscale_view
+            else:
+                out_quant_scale_buf = qscale_view.to(
+                    device=x.device, dtype=torch.float32
+                )
+        else:
+            out_quant_scale_buf = torch.tensor(
+                [float(out_quant_scale)], dtype=torch.float32, device=x.device
+            )
+        assert y.dtype == torch.float8_e4m3fn, (
+            f"out_quant_scale requires a float8_e4m3fn output buffer, "
+            f"got y.dtype={y.dtype}"
+        )
+        if not swiglu:
+            raise ValueError(
+                "out_quant_scale is currently only wired through the SwiGLU "
+                "epilogue (GEMM1 fused quant). For combine-GEMM (DO_SWIGLU=False) "
+                "quant, see follow-up P0-1 step 5."
+            )
+    else:
+        out_quant_scale_buf = _make_dummy(x.device, torch.float32)
 
     # Common args / constexprs shared by both kernel entries.
     common_args = (
@@ -3959,7 +3577,6 @@ def _launch_kernel(
         gather_buf,
         scatter_buf,
         gate_scal_buf,
-        expert_remap_buf,
         slice_offs_buf,
         slice_sizes_buf,
     )
@@ -3979,16 +3596,24 @@ def _launch_kernel(
         bias.stride(0) if bias is not None else 0,
         bias.stride(-1) if bias is not None else 0,
     )
-    common_dims = (M, M_X, N, K, x_global_scale_buf, num_tiles_total)
+    common_dims = (
+        M,
+        M_X,
+        N,
+        K,
+        x_global_scale_buf,
+        out_quant_scale_buf,
+        num_tiles_total,
+    )
     common_kwargs = dict(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         BLOCKS_PER_EXPERT=blocks_per_expert,
-        X_FORMAT=a_format,
-        W_FORMAT=b_format,
+        X_FORMAT=x_format,
+        W_FORMAT=w_format,
         UPCAST_INDICES=False,
-        HAS_X_BLOCK_SCALE=has_a_block_scale,
+        HAS_X_BLOCK_SCALE=has_x_block_scale,
         HAS_W_BLOCK_SCALE=has_w_block_scale,
         HAS_BIAS=bias is not None,
         HAS_GATHER=gather_indx is not None,
@@ -3998,7 +3623,6 @@ def _launch_kernel(
         SWIGLU_LIMIT=float(swiglu_limit),
         OUT_BLOCK_N=out_block_n,
         APPLY_GATE_SCAL=gate_scal is not None,
-        HAS_EXPERT_REMAP=expert_remap is not None,
         HAS_RAGGED_OFFS=has_ragged_offs,
         NUM_WARPS=num_warps,
         NUM_BUFFERS=num_buffers,
@@ -4010,43 +3634,27 @@ def _launch_kernel(
         USE_WARP_PIPELINE=use_warp_pipeline,
         USE_SLICE_MN=use_slice_mn,
         USE_SLICE_N=use_slice_n,
-        USE_3STAGE_PIPELINE=use_3stage_pipeline,
+        HAS_FP8_QUANT_OUT=has_fp8_quant_out,
+        W_VIA_VGPR=w_preshuffle,
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
         num_warps=num_warps,
     )
 
-    if persistent or use_block_schedule:
-        # Persistent / block-schedule path lives in a sibling module so
-        # the non-persistent kernel stays straight-line. Both flavours
-        # share `_pipelined_moe_tile_compute` and the swizzle helpers.
-        from .gluon_persistent import _pipelined_moe_kernel_scaled_persistent
+    # Schedule path is the production specialization; rocprof name
+    # is ``_pipelined_moe_kernel_scaled_block_schedule`` in that case.
+    k = _pipelined_moe_kernel_scaled[grid](
+        *common_args,
+        block_offs_buf,
+        block_schedule_buf,
+        *common_strides,
+        *common_dims,
+        USE_BLOCK_SCHEDULE=use_block_schedule,
+        N_EXPTS_TOT=n_slices,
+        **common_kwargs,
+    )
 
-        k = _pipelined_moe_kernel_scaled_persistent[grid](
-            *common_args,
-            block_offs_buf,
-            block_schedule_buf,
-            *common_strides,
-            *common_dims,
-            USE_BLOCK_SCHEDULE=use_block_schedule,
-            N_EXPTS_TOT=n_slices,
-            **common_kwargs,
-        )
-    else:
-        # Non-persistent: no block_offs / block_schedule / N_EXPTS_TOT /
-        # USE_BLOCK_SCHEDULE constexprs needed; the kernel is a single
-        # straight-line tile compute.
-        k = _pipelined_moe_kernel_scaled[grid](
-            *common_args,
-            *common_strides,
-            *common_dims,
-            **common_kwargs,
-        )
-
-    # Snapshot the just-launched kernel's static GPR / occupancy profile
-    # for bench-side ``last_kernel_profile()`` readers. id(k)-keyed cache
-    # keeps the regex cost out of the hot launch loop.
     _capture_launch_profile(k)
 
 
@@ -4066,11 +3674,8 @@ def _round_up_int(x: int, m: int) -> int:
 
 
 def _ragged_slice_size(a_ragged_metadata, M: int) -> int | None:
-    """Per-expert M hint for autotune. Mirrors triton_kernels'
-    ``opt_flags_amd.make_default_opt_flags_amd`` slice-size formula so
-    our BLOCK_M picks match what upstream's kernel sees on the same
-    workload. Returns ``None`` (=> use the dense fallback) when no
-    ragged metadata is available."""
+    """Per-expert M hint for autotune (mirrors upstream
+    ``opt_flags_amd``'s formula). Returns ``None`` on no metadata."""
     if a_ragged_metadata is None:
         return None
     expected = getattr(a_ragged_metadata, "expected_slice_size", None)
@@ -4090,210 +3695,51 @@ def _autotune_block(
     *,
     do_swiglu: bool = False,
     ragged: bool = False,
-    a_format: str = "e2m1",
+    x_format: str = "e2m1",
     scale_load_mode: str = "transpose",
     slice_size: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Pick ``(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS)`` for scaled-MFMA tiles.
 
-    Heuristic obtained by sweeping ``benchmarks/moe_gluon_perf_sweep.py``
-    on MI355 with the gpt-oss-120b MoE dimensions (``H=I=2880, E=128,
-    topk=4``). Each candidate must be (a) spill-free per ``static_profile``
-    and (b) the highest-TFLOPs config at its shape.
-
-    ``gl.amd.cdna4.mfma_scaled`` is 16x16x128 (M x N x K), so ``BLOCK_K``
-    must be a multiple of 128 and ``>= 128``. The heuristic tiers off
-    the logical ``M`` (which already includes per-expert padding for
-    the MoE wrappers):
-
-    * tiny decode (``M <= 512``, e.g. B=1 with E=128): tall-thin
-      ``64 x 128 x 512`` with 8 warps -- the few CTAs need every MFMA
-      they can hide under the LDS prefetch.
-
-    * medium (``M <= 16384``, decode B=32..1024 or chunked prefill):
-      ``64 x 256 x BK`` with low BM keeps grid_m large; on mxfp4 inputs
-      ``BK=256`` wins (lower per-tile mfma latency, BK=128 is bandwidth
-      bound on the half-byte X load); fp8 keeps ``BK=128`` and bumps
-      warps to 8 to recover occupancy.
-
-    * large (``M > 16384``, prefill B=4096..8192): the M_d=32768 grid
-      can amortise huge tiles. mxfp4 hits its peak at ``256 x 256 x 128
-      / NW=4`` (occ=4, vgpr~122); fp8 has higher VGPR pressure per
-      tile, so the sweet spot is ``128 x 256 x 128 / NW=4``.
+    Sweep-tuned on gpt-oss-120b (H=I=2880, E=128, top_k=4) at MI355.
+    Tiers off logical ``M`` and the per-expert ``slice_size`` hint;
+    ``BLOCK_K`` must be a multiple of 128 (MFMA 16x16x128).
     """
-    del do_swiglu, ragged  # tile menu is shape-driven; swiglu/ragged flags
-    # currently don't change the pick. Kept in the signature so callers
-    # (and the unit-test pinning the contract) stay stable.
-    is_fp8 = a_format == "e4m3"
-    # NOTE: a BM=16 sub-tier (for fp8 X + slice_size<=2, where the
-    # swizzle scale layout's BM%32 constraint doesn't apply because
-    # there's no per-block X scale) was tried and reverted: microbench
-    # (dispatch B=1, prod-block-m=32) showed 71.9us at BM=16 vs 75.0us
-    # at BM=32, but E2E c=1 TPOT regressed from 7.33ms -> 7.56ms over
-    # 3 stable runs. The bench shape uses slice_sizes[i]=per_expert_padded,
-    # so the microbench measures only MFMA pipeline efficiency at the
-    # smaller tile; production has slice_sizes[i]=actual which apparently
-    # exposes a different bottleneck (LDS pressure / gather path /
-    # num_buffers). Profile c=1 before re-enabling.
+    del do_swiglu, ragged
+    is_fp8 = x_format == "e4m3"
     if slice_size is not None and slice_size <= 16:
-        # Tiny ragged decode (per-expert M <= 16, i.e. B=1..~8 served
-        # alone over E=128 experts). Empirically swept across
-        # ``check_gluon_decode_perf.py --H 2880 --I 2880 --prod-block-m
-        # 32`` on MI355: NW=4 + BK=256 wins by 5-9us vs the legacy
-        # 64/128/512/8 tier across B=4..8. BM=16 sub-tier was tried
-        # and reverted (see above comment block).
-        bm, bn, bk, nw = 32, 128, 256, 4
+        # tinny ragged decode
+        bm, bn, bk, nw = 64, 128, 256, 4
+    elif slice_size is not None and slice_size <= 64 and M <= 8192:
+        # mid ragged decode
+        bm, bn, bk, nw = 64, 128, 256, 4
     elif M <= 512:
         bm, bn, bk, nw = 64, 128, 512, 8
     elif is_fp8:
-        # fp8 X tiles are 1 byte/elem so VGPR pressure is lower; we
-        # promote to the large BM=128 tier as soon as M > 8192. Prefill
-        # tier (M > 8192) lands on (128, 256, 256, NW=4) which is
-        # :class:`MoESliceMNProgram`'s sweet spot (W tile 64 KB / K-iter,
-        # 4-region staggering hides HBM at 32 KB TCP cap; auto-fired via
-        # ``_should_auto_use_slice_mn`` since BM+BN=384 and W bytes >=
-        # 16 KB).
+        # fp8 X is 1 byte/elem (lower VGPR pressure); prefill promotes
+        # to (128, 256, 256, NW=4) -- sliceMN sweet spot.
         if M <= 8192:
             bm, bn, bk, nw = 64, 256, 128, 8
         else:
             bm, bn, bk, nw = 128, 256, 128, 4
     else:
-        # mxfp4 X is 4b packed but the dequant adds VGPR pressure;
-        # decode-y tier (M <= 8192) keeps BM=64 BK=256 to maximise
-        # grid_m. Prefill tier (M > 8192) jumps to (128, 256, 256, NW=4)
-        # -- same sliceMN sweet spot as the fp8 branch. Empirically
-        # (sweep on B=1024..8192 dispatch+swiglu prefill) this beats the
-        # older (64, 256, 256) by ~24% (M_d=16384) and the older
-        # (256, 256, 128) by ~11% (M_d=32768) since 256x256 sets
-        # vgpr=512 -> occ=1 with a high spill rate while 128x256 stays
-        # at vgpr=312 occ=1 spill-light.
+        # mxfp4 X dequant adds VGPR pressure; same sliceMN sweet spot
+        # at the prefill tier.
         if M <= 8192:
             bm, bn, bk, nw = 64, 256, 256, 4
         else:
             bm, bn, bk, nw = 128, 256, 256, 4
-    # Clamp tile to actual shape (rounded up to the MFMA tile / scaled
-    # K granularity). Tiny test shapes like 32x32x256 would otherwise
-    # over-tile and yield NaN-padded reductions.
+    # Clamp tile to actual shape (avoid over-tile + NaN-padded
+    # reduction on tiny test shapes).
     bm = max(_MFMA_M, min(bm, _round_up_int(M, _MFMA_M)))
     bn = max(_MFMA_M, min(bn, _round_up_int(N, _MFMA_M)))
     bk = max(_MFMA_SCALED_K, min(bk, _round_up_int(K, _MFMA_SCALED_K)))
-    # swizzle's in-LDS unswizzle reshapes the K_S-block dim into
-    # `(BLOCK_K_S//8, 4, 16, 2, 2, 1)` which is only valid when
-    # BLOCK_K_S = BLOCK_K // SCALE_BLOCK >= 8 (=> BLOCK_K >= 256 for
-    # SCALE_BLOCK=32). Bump the autotune pick up to 256 so the mode is
-    # usable. This matches what upstream's AMD opt_flags pick for CDNA4
-    # mxfp4 (block_k = 128 // 0.5 = 256).
+    # Swizzle unswizzle reshape requires BLOCK_K_S >= 8 (= BLOCK_K
+    # >= 256 with SCALE_BLOCK=32).
     if scale_load_mode == "swizzle":
         bk = max(bk, 256)
         bk = min(bk, _round_up_int(K, _MFMA_SCALED_K))
     return bm, bn, bk, nw
-
-
-def _scaled_lds_bytes(
-    bm: int,
-    bn: int,
-    bk: int,
-    *,
-    has_x_block_scale: bool,
-    has_w_block_scale: bool,
-    a_format: str,
-    num_buffers: int,
-) -> int:
-    """Bytes of LDS the scaled-MFMA pipeline allocates for a given tile +
-    NUM_BUFFERS. Used by ``_autotune_pipeline`` to decide whether we can
-    bump NUM_BUFFERS to 3 (which warp_pipeline needs) without busting
-    CDNA4's 160 KB LDS budget.
-
-    Matches ``MoEPipelinedProgram.initialize`` exactly: X / W / X-scale /
-    W-scale buffers, each NB-deep. Scales are only allocated when
-    ``SCALE_VIA_LDS`` (== swizzle); we always assume they are for the
-    worst-case budget here.
-    """
-    div_x = 2 if a_format == "e2m1" else 1
-    # X: BM x (BK/div_x) bytes per slot; uint8 storage either way.
-    x_bytes = bm * (bk // div_x)
-    # W is always mxfp4 packed: BN x (BK/2).
-    w_bytes = bn * (bk // 2)
-    # Scale LDS shapes mirror MoEConfig.BLOCK_*_PRESHUFFLED:
-    #   X-scale: (BM // PF) x (BK_S * PF) bytes  -> simplifies to BM*BK/32
-    #   W-scale: (BN // PF) x (BK_S * PF) bytes  -> simplifies to BN*BK/32
-    # (PF = _SCALE_PRESHUFFLE_FACTOR = 32, SCALE_BLOCK = 32, so the two
-    # factors of 32 cancel; BK doesn't need a div_factor here because
-    # mxfp4 scales are addressed in logical-K not packed-K.)
-    x_scale_bytes = (bm * bk // 32) if has_x_block_scale else 0
-    w_scale_bytes = (bn * bk // 32) if has_w_block_scale else 0
-    per_buffer = x_bytes + w_bytes + x_scale_bytes + w_scale_bytes
-    return num_buffers * per_buffer
-
-
-def _autotune_pipeline(
-    bm: int,
-    bn: int,
-    bk: int,
-    *,
-    K: int,
-    a_format: str,
-    has_x_block_scale: bool,
-    has_w_block_scale: bool,
-    scale_load_mode: str,
-) -> tuple[int, bool]:
-    """Pick ``(NUM_BUFFERS, USE_WARP_PIPELINE)`` for the given tile.
-
-    Current heuristic: default to ``(NB=2, USE_WARP_PIPELINE=False)``
-    everywhere. ``warp_pipeline`` is plumbed end-to-end (see
-    ``MoEPipelinedProgram.warp_pipeline``) and can be force-enabled
-    by passing ``use_warp_pipeline=True`` to the launcher; empirically
-    on gpt-oss-120b shapes the gain is washed out by the NB=3 VGPR
-    pressure hit (occupancy drops 4 -> 3, see
-    ``benchmarks/check_gluon_decode_perf.py --force-warp-pipeline``),
-    so we ship it as an opt-in rather than default-on. The LDS-budget
-    helper below stays so the autotuner can be made smarter in a future
-    revision without re-introducing the dead-code risk.
-    """
-    del bm, bn, bk, K, a_format, scale_load_mode  # autotune-off
-    del has_x_block_scale, has_w_block_scale
-    return _DEFAULT_NUM_BUFFERS, False
-
-
-_PERSISTENT_FORCE_ENV = "TOKENSPEED_MOE_GLUON_PERSISTENT"
-
-
-def _persistent_env_override() -> bool | None:
-    """Read ``TOKENSPEED_MOE_GLUON_PERSISTENT`` env (1/0/auto).
-
-    ``1`` / ``true`` / ``on``  -> force persistent kernel,
-    ``0`` / ``false`` / ``off`` -> force non-persistent,
-    anything else (or unset) -> ``None`` (let the heuristic decide).
-    """
-    raw = os.environ.get(_PERSISTENT_FORCE_ENV, "").strip().lower()
-    if raw in {"1", "true", "yes", "on", "force"}:
-        return True
-    if raw in {"0", "false", "no", "off", "disable", "disabled"}:
-        return False
-    return None
-
-
-def _should_use_persistent(num_tiles_total: int) -> bool:
-    """Decide persistent vs traditional grid based on total tile count.
-
-    Empirically on gpt-oss-120b MoE decode shapes (B=1..32, grid_n in
-    [4, 23], n_active <= 4 -> 16..92 tiles total) the per-tile
-    bookkeeping (compact_idx / pid_n div+mod + induction var) costs
-    more SGPR/VGPR than the launch overhead it saves, dropping
-    occupancy 4 -> 3 (dispatch) or 4 -> 2 (combine) and either tying
-    or losing on wall time. We therefore default the heuristic to
-    *off*; the env override and ``persistent=True`` kwarg let callers
-    opt in for workloads where the launch overhead truly dominates
-    (e.g. tiny per-tile MFMA work or very low tile count).
-    """
-    override = _persistent_env_override()
-    if override is not None:
-        return override
-    del num_tiles_total
-    return False
-
-
-_CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
 
 
 def _autotune_pid_swizzle(
@@ -4302,79 +3748,40 @@ def _autotune_pid_swizzle(
     grid_m_padded: int,
     block_m: int,
 ) -> tuple[int, int]:
-    """Pick ``(GROUP_M, XCD_SWIZZLE)`` heuristic defaults.
+    """Pick ``(GROUP_M, XCD_SWIZZLE)`` defaults.
 
-    Only the prefill-shaped regime benefits empirically: decode tile
-    counts (``num_tiles_total < ~256``) are small enough that the
-    natural hardware-rotation order already populates all XCDs evenly,
-    and adding a logical permutation costs more than it saves
-    (measured 1.43e2 -> 1.74e2 us on decode B=1 dispatch+swiglu).
-    For larger tile counts we want to:
-
-    1. **XCD swizzle** so consecutive ``pid`` land on the same XCD --
-       neighbouring CTAs in the launch order then share the same XCD's
-       L2 slice for the W-tile they fetch.
-    2. **GROUP_M** so the same W column tile (selected by ``pid_n``)
-       is reused across ``GROUP_M`` M-tiles before moving on -- the
-       classic GEMM L2-reuse swizzle.
-
-    The combination requires:
-      * ``grid_m_padded % GROUP_M == 0`` (so GROUP_M is a valid 2-D
-        permutation; otherwise ``_group_m_swizzle`` boundary code path
-        leaves orphan tiles).
-      * ``num_tiles_total % XCD_SWIZZLE == 0`` (same reasoning for
-        the linear-domain permutation).
-    Returns ``(1, 1)`` (no-op) on any mismatch.
+    Returns ``(1, 1)`` on decode-sized launches (no benefit, swizzle
+    overhead dominates) and small-BM tiles. Otherwise picks GROUP_M
+    by grid_m_padded divisibility (bpe>=8 -> GM=4, bpe>=2 -> GM=2)
+    and XCD_SWIZZLE = 8 when it divides num_tiles_total.
     """
-    # Decode / tiny prefill: no swizzle. ``256`` is the empirical knee
-    # on MI355 (8 XCDs * ~32 CUs each); below that L2 reuse is already
-    # high and swizzle overhead dominates.
     if num_tiles_total < 256:
         return 1, 1
-    # block_m=32 is the decode autotune tier; even if the tile count is
-    # large (long ragged decode), the per-tile MFMA chain is too short
-    # to amortise the prologue, so disable swizzle there too.
-    if block_m <= 32:
+    if block_m < 32:
         return 1, 1
-    # Pick the largest GROUP_M in {8, 4, 2} that divides grid_m_padded.
-    group_m = 1
-    for g in (8, 4, 2):
-        if grid_m_padded % g == 0:
-            group_m = g
-            break
-    # XCD swizzle: only enable if it divides the full domain.
+    if grid_m_padded >= 8 and grid_m_padded % 4 == 0:
+        group_m = 4
+    elif grid_m_padded >= 2 and grid_m_padded % 2 == 0:
+        group_m = 2
+    else:
+        group_m = 1
     xcd_swizzle = _CDNA4_NUM_XCDS if num_tiles_total % _CDNA4_NUM_XCDS == 0 else 1
     return group_m, xcd_swizzle
 
 
 def _persistent_grid_size(num_tiles_total: int) -> int:
-    """Pick how many CTAs the persistent kernel should launch.
-
-    Cap at ``num_tiles_total`` (no point launching more CTAs than work
-    items) and at ``_CDNA4_NUM_CUS * _PERSISTENT_OVERSUBSCRIBE`` (over-
-    subscribing past this just queues CTAs on the same CU).
-    """
+    """CTA count for the persistent kernel, capped at num_tiles_total
+    and at ``num_cus * oversubscribe`` (over-subscribing past this
+    just queues CTAs on the same CU)."""
     if num_tiles_total <= 0:
         return 1
     return max(1, min(num_tiles_total, _CDNA4_NUM_CUS * _PERSISTENT_OVERSUBSCRIBE))
 
 
-_SLICE_N_FORCE_ENV = "TOKENSPEED_MOE_GLUON_SLICE_N"
-
-
-def _slice_n_env_override() -> bool | None:
-    """Read ``TOKENSPEED_MOE_GLUON_SLICE_N`` env (1/0/auto).
-
-    ``1`` / ``true`` / ``on``  -> force sliceN,
-    ``0`` / ``false`` / ``off`` -> force regular pipeline,
-    anything else (or unset)   -> ``None`` (let auto-heuristic decide).
-    """
-    raw = os.environ.get(_SLICE_N_FORCE_ENV, "").strip().lower()
-    if raw in {"1", "true", "yes", "on", "force"}:
-        return True
-    if raw in {"0", "false", "no", "off", "disable", "disabled"}:
-        return False
-    return None
+def _needs_scale_lds(
+    x_format: str, has_x_block_scale: bool, has_w_block_scale: bool
+) -> bool:
+    return (has_x_block_scale and x_format == "e2m1") or has_w_block_scale
 
 
 def _can_use_slice_n(
@@ -4382,153 +3789,41 @@ def _can_use_slice_n(
     bn: int,
     *,
     scale_load_mode: str,
-    a_format: str,
+    x_format: str,
     has_x_block_scale: bool,
     has_w_block_scale: bool,
 ) -> bool:
-    """Return True iff :class:`MoESliceNProgram` is structurally legal
-    on the requested tile.
-
-    Constraints (mirror the docstring on :class:`MoESliceNProgram`):
-      * ``bn >= 256`` (sub-N >= 128). At ``BN=128`` the half-N
-        ``[BLOCK_K, 64]`` G->LDS tile under-fills the per-warp NONK
-        footprint that ``_load_layout`` selects for ``BLOCK_K`` >=
-        256 with ``NUM_WARPS=4`` -- the LDS unswizzle then rejects
-        the layout (compile fail in test_moe_gluon
-        ``[64-128-2880-swizzle]``). Empirically BN=128 also gives no
-        TCP-overlap win because the half-tile (~16 KB) is already
-        under the gfx9 32 KB cap.
-      * ``(bn // 2) % 64 == 0`` (sub-tile must be a clean MFMA stripe).
-      * ``bm >= 16`` (no further constraint from N-only slicing).
-      * Same scale-LDS gating as sliceMN.
-
-    Notice ``bm`` is intentionally NOT capped at 64 / 128 the way the
-    2x2 sliceMN split is -- that's the entire point of having sliceN:
-    cover the BM=16 / BM=32 decode tiles that the 2x2 split refuses.
-    """
-    if bn < 256 or bm < 16:
+    if bn < 256 or bm < 16 or (bn // 2) % 64 != 0:
         return False
-    if (bn // 2) % 64 != 0:
-        return False
-    needs_scale_lds = (has_x_block_scale and a_format == "e2m1") or has_w_block_scale
-    if needs_scale_lds and scale_load_mode != "swizzle":
-        return False
-    return True
-
-
-_TCP_INFLIGHT_CAP_BYTES = 32 * 1024  # gfx9 L1/TCP per-CU in-flight cap
-
-
-def _should_auto_use_slice_n(bm: int, bn: int, bk: int) -> bool:
-    """Auto-enable heuristic for sliceN.
-
-    Returns True when ALL of the following hold:
-      1. ``BN >= 256`` -- empirically the only regime where sliceN's
-         per-region wait_group + extra commit_group overhead is
-         dominated by the TCP-overlap benefit. At ``BN=128`` the
-         half-N ``buffer_load_to_shared`` train (~16 KB or less)
-         is well under the gfx9 32 KB cap, so splitting it adds
-         scheduling overhead without any in-flight headroom gain
-         (see e4m3 BN=128 BK=256 microbench: +3.2% regression).
-         The half-N async_copy + LDS layout shapes also have to
-         tile cleanly across ``num_warps`` warps; at BN=128 with
-         NW=4 the ``[BLOCK_K, BN/2=64]`` G->LDS tile under-fills
-         a warp's natural NONK footprint and the layout selector
-         emits a degenerate config that the LDS unswizzle rejects
-         (test_moe_gluon ``[64-128-2880-swizzle]`` repro).
-      2. ``W tile >= 32 KB`` per K-iter (= gfx9 TCP/L1 in-flight
-         cap). Below this, plain ``buffer_load_to_shared`` doesn't
-         saturate the cap and there's no overlap window to win
-         back via the 4-region staggered issue.
-      3. ``BM <= 64`` -- sliceMN already covers BM>=128 with a
-         tighter MFMA-sub-tile schedule; don't double up.
-
-    Empirical wins on MI355 gpt-oss-120b dispatch (e2m1) at
-    ``check_gluon_decode_perf.py``::
-
-        BM=64 BN=256 BK=256 NB=2:
-            B=  8  : 182.12 us -> 152.49 us (-16.3%)
-            B= 16  : 230.88 us -> 205.90 us (-10.8%)
-            B= 32  : 307.93 us -> 281.02 us (-8.7%)
-            B= 64  : 307.90 us -> 280.44 us (-8.9%)
-            B=128  : 309.83 us -> 281.90 us (-9.0%)
-    """
-    if bn < 256:
-        return False
-    # mxfp4 W (always packed 0.5 byte/elem in our kernels).
-    w_bytes = (bn * bk) // 2
-    if w_bytes < _TCP_INFLIGHT_CAP_BYTES:
-        return False
-    if bm > 64:
-        return False
+    if _needs_scale_lds(x_format, has_x_block_scale, has_w_block_scale):
+        return scale_load_mode == "swizzle"
     return True
 
 
 def _resolve_use_slice_n(
-    user: bool | None,
+    use_slice_n: bool | None,
     bm: int,
     bn: int,
     *,
     scale_load_mode: str,
-    a_format: str,
+    x_format: str,
     has_x_block_scale: bool,
     has_w_block_scale: bool,
-    bk: int | None = None,
+    bk: int,
 ) -> bool:
-    """Combine user kwarg + env + auto-heuristic + structural feasibility.
-
-    Precedence (high -> low):
-      1. ``user is not None``: caller explicit.
-      2. ``TOKENSPEED_MOE_GLUON_SLICE_N`` env (force on/off).
-      3. Auto-heuristic: enable iff W tile per K-iter saturates the
-         gfx9 TCP 32 KB cap on small-BM tiles where sliceMN cannot
-         apply (``BM<=64``). See :func:`_should_auto_use_slice_n`.
-
-    sliceN is the small-BM counterpart of sliceMN; the two have
-    disjoint structural domains (sliceN covers BM<=64, sliceMN
-    requires BM>=128) so no host-side mutex is needed.
-    """
-    if user is not None:
-        decision = bool(user)
+    if use_slice_n is not None:
+        enabled = bool(use_slice_n)
     else:
-        env = _slice_n_env_override()
-        if env is not None:
-            decision = env
-        elif bk is not None:
-            decision = _should_auto_use_slice_n(bm, bn, bk)
-        else:
-            # Caller didn't pass BK (legacy entry point) -- preserve
-            # the original opt-in default to avoid changing behaviour
-            # silently on paths that haven't been audited.
-            decision = False
-    if not decision:
-        return False
-    return _can_use_slice_n(
+        w_bytes = (bn * bk) // 2  # mxfp4 W is 0.5 byte/elem
+        enabled = bn >= 256 and bm <= 64 and w_bytes >= _TCP_INFLIGHT_CAP_BYTES
+    return enabled and _can_use_slice_n(
         bm,
         bn,
         scale_load_mode=scale_load_mode,
-        a_format=a_format,
+        x_format=x_format,
         has_x_block_scale=has_x_block_scale,
         has_w_block_scale=has_w_block_scale,
     )
-
-
-_SLICE_MN_FORCE_ENV = "TOKENSPEED_MOE_GLUON_SLICE_MN"
-
-
-def _slice_mn_env_override() -> bool | None:
-    """Read ``TOKENSPEED_MOE_GLUON_SLICE_MN`` env (1/0/auto).
-
-    ``1`` / ``true`` / ``on``  -> force sliceMN,
-    ``0`` / ``false`` / ``off`` -> force regular pipeline,
-    anything else (or unset)   -> ``None`` (let auto-heuristic decide).
-    """
-    raw = os.environ.get(_SLICE_MN_FORCE_ENV, "").strip().lower()
-    if raw in {"1", "true", "yes", "on", "force"}:
-        return True
-    if raw in {"0", "false", "no", "off", "disable", "disabled"}:
-        return False
-    return None
 
 
 def _can_use_slice_mn(
@@ -4537,270 +3832,50 @@ def _can_use_slice_mn(
     *,
     num_buffers: int,
     scale_load_mode: str,
-    a_format: str,
+    x_format: str,
     has_x_block_scale: bool,
     has_w_block_scale: bool,
 ) -> bool:
-    """Return True iff :class:`MoESliceMNProgram` is structurally
-    legal on the requested tile.
-
-    Constraints (mirror the docstring on :class:`MoESliceMNProgram`):
-      * ``BM >= 128`` / ``BN >= 128`` (sub-tile floor from
-        ``tiles_per_warp=[2,2] * warps_{m,n}=2`` = 64).
-      * ``(BM // 2) % 64 == 0`` and ``(BN // 2) % 64 == 0``.
-      * ``NUM_BUFFERS >= 2`` (the 4-region prologue / drain dance
-        breaks at NB=1 -- ``gluon.static_assert`` in the program).
-      * Same scale-LDS gating as sliceN.
-    """
     if bm < 128 or bn < 128:
         return False
     if (bm // 2) % 64 != 0 or (bn // 2) % 64 != 0:
         return False
     if num_buffers < 2:
         return False
-    needs_scale_lds = (has_x_block_scale and a_format == "e2m1") or has_w_block_scale
-    if needs_scale_lds and scale_load_mode != "swizzle":
-        return False
-    return True
-
-
-def _should_auto_use_slice_mn(bm: int, bn: int, bk: int, a_format: str) -> bool:
-    """Auto-enable heuristic for :class:`MoESliceMNProgram`.
-
-    Returns True when the tile is in the regime where the 4-region
-    staggered async-copy schedule pays off vs the plain pipelined
-    single ``buffer_load_to_shared`` train:
-
-      1. ``BM >= 128`` AND ``BN >= 128`` -- structural prereq for
-         the 2x2 sub-tile MFMA grid.
-      2. **W tile per K-iter >= 16 KB** -- the half-W tile (= region's
-         own ``buffer_load`` train) only meaningfully benefits from
-         per-region staggering once the full-W issue is comfortably
-         within the gfx9 32 KB TCP/L1 cap. Below 16 KB the 4-commit
-         overhead of split-issue can outweigh the staggering win.
-         (e2m1 BN=128 BK=128 = 8 KB W tile; e4m3 BN=128 BK=128 = 16
-         KB; e2m1 BN=256 BK=128 = 16 KB. So this triggers above
-         BN=128 BK=128 e2m1 / BN=128 BK=128 e4m3 prefill tiles.)
-      3. ``BM + BN >= 384`` -- the per-region MFMA budget needs to be
-         long enough (~3 regions ~= 1500 cycles) to hide HBM at large
-         K. Tiny tiles (BM=128 BN=128) have only ~32 MFMAs/region
-         which is borderline; we require BM+BN >= 384 = roughly 48
-         MFMAs/region.
-
-    These thresholds will be tuned once the prefill sweep results
-    come in. Conservative for now -- caller can force-enable via
-    ``TOKENSPEED_MOE_GLUON_SLICE_MN=1`` if the heuristic misses
-    a win.
-    """
-    if bm < 128 or bn < 128:
-        return False
-    # Approximate W tile bytes per K-iter assuming packed mxfp4 (0.5
-    # byte/elem) for e2m1 and 1 byte/elem for fp8.
-    if a_format == "e2m1":
-        w_bytes = (bn * bk) // 2
-    else:
-        w_bytes = bn * bk
-    if w_bytes < 16 * 1024:
-        return False
-    if (bm + bn) < 384:
-        return False
+    if _needs_scale_lds(x_format, has_x_block_scale, has_w_block_scale):
+        return scale_load_mode == "swizzle"
     return True
 
 
 def _resolve_use_slice_mn(
-    user: bool | None,
+    use_slice_mn: bool | None,
     bm: int,
     bn: int,
     *,
     num_buffers: int,
     scale_load_mode: str,
-    a_format: str,
+    x_format: str,
     has_x_block_scale: bool,
     has_w_block_scale: bool,
     use_slice_n: bool = False,
-    bk: int | None = None,
+    bk: int,
 ) -> bool:
-    """Combine user kwarg + env + auto-heuristic + structural feasibility.
-
-    Precedence (high -> low):
-      1. ``user is not None``: caller explicit.
-      2. ``TOKENSPEED_MOE_GLUON_SLICE_MN`` env (force on/off).
-      3. Auto-heuristic: enable iff the tile is in the v8 sweet
-         spot (``BM/BN >= 128``, large enough W half-tile, long
-         enough per-region MFMA budget). See
-         :func:`_should_auto_use_slice_mn`.
-
-    sliceN covers small-BM tiles (BM<=64) where sliceMN would
-    require ``BM >= 128`` anyway -- they don't overlap, but if a
-    caller explicitly forced sliceN we still bail out here so the
-    kernel picks ONE subtile-strategy flavour.
-    """
     if use_slice_n:
         return False
-    if user is not None:
-        decision = bool(user)
+    if use_slice_mn is not None:
+        enabled = bool(use_slice_mn)
     else:
-        env = _slice_mn_env_override()
-        if env is not None:
-            decision = env
-        elif bk is not None:
-            decision = _should_auto_use_slice_mn(bm, bn, bk, a_format)
-        else:
-            decision = False
-    if not decision:
-        return False
-    return _can_use_slice_mn(
+        w_bytes = (bn * bk) // 2 if x_format == "e2m1" else bn * bk
+        enabled = bm >= 128 and bn >= 128 and w_bytes >= 16 * 1024 and (bm + bn) >= 384
+    return enabled and _can_use_slice_mn(
         bm,
         bn,
         num_buffers=num_buffers,
         scale_load_mode=scale_load_mode,
-        a_format=a_format,
+        x_format=x_format,
         has_x_block_scale=has_x_block_scale,
         has_w_block_scale=has_w_block_scale,
     )
-
-
-def _can_use_warp_pipeline(
-    bm: int,
-    bn: int,
-    bk: int,
-    *,
-    K: int,
-    a_format: str,
-    has_x_block_scale: bool,
-    has_w_block_scale: bool,
-    scale_load_mode: str,
-    num_buffers: int = 3,
-) -> bool:
-    """Return True iff ``warp_pipeline`` is *safely* runnable with
-    ``num_buffers`` on the requested tile: enough K-iters and the LDS
-    budget fits under ``_CDNA4_LDS_BUDGET``.
-
-    Use this from test / bench harnesses that want to force-enable
-    warp_pipeline without triggering an OOR at compile time.
-    """
-    if num_buffers < 3:
-        return False
-    if (K + bk - 1) // bk < num_buffers:
-        return False
-    via_lds = scale_load_mode == "swizzle"
-    bytes_used = _scaled_lds_bytes(
-        bm,
-        bn,
-        bk,
-        has_x_block_scale=has_x_block_scale and via_lds,
-        has_w_block_scale=has_w_block_scale and via_lds,
-        a_format=a_format,
-        num_buffers=num_buffers,
-    )
-    return bytes_used <= _CDNA4_LDS_BUDGET
-
-
-def gluon_mxfp_gating_gemm(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scale: torch.Tensor,
-    *,
-    x_scale: torch.Tensor | None = None,
-    a_format: str = "e2m1",
-    a_global_scale: torch.Tensor | float = 1.0,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    block_m: int | None = None,
-    block_n: int | None = None,
-    block_k: int | None = None,
-    num_warps: int | None = None,
-    num_buffers: int | None = None,
-    use_warp_pipeline: bool | None = None,
-    use_slice_mn: bool | None = None,
-    use_slice_n: bool | None = None,
-    scale_load_mode: str = "transpose",
-    w_transpose: bool = False,
-    persistent: bool | None = None,
-    num_ctas: int | None = None,
-) -> torch.Tensor:
-    # Scaled-MFMA dense GEMM y = (a_scale * x) @ (w_scale * w).
-    # See _launch_kernel for scale_load_mode and tensor layouts.
-    assert x.dim() == 2 and w.dim() == 2
-    M = x.shape[0]
-    N = w.shape[-1]
-    div_a = 2 if a_format == "e2m1" else 1
-    K = x.shape[-1] * div_a
-    bm, bn, bk, nw = _autotune_block(
-        M,
-        N,
-        K,
-        a_format=a_format,
-        scale_load_mode=scale_load_mode,
-    )
-    block_m = block_m or bm
-    block_n = block_n or bn
-    block_k = block_k or bk
-    num_warps = num_warps or nw
-    nb_auto, wp_auto = _autotune_pipeline(
-        block_m,
-        block_n,
-        block_k,
-        K=K,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
-        has_w_block_scale=True,
-        scale_load_mode=scale_load_mode,
-    )
-    num_buffers = num_buffers if num_buffers is not None else nb_auto
-    use_warp_pipeline = use_warp_pipeline if use_warp_pipeline is not None else wp_auto
-    use_slice_mn = _resolve_use_slice_mn(
-        use_slice_mn,
-        block_m,
-        block_n,
-        num_buffers=num_buffers,
-        scale_load_mode=scale_load_mode,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
-        has_w_block_scale=True,
-        bk=block_k,
-    )
-    use_slice_n = _resolve_use_slice_n(
-        use_slice_n,
-        block_m,
-        block_n,
-        scale_load_mode=scale_load_mode,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
-        has_w_block_scale=True,
-        bk=block_k,
-    )
-    y = torch.empty((M, N), device=x.device, dtype=out_dtype)
-    _launch_kernel(
-        x,
-        w,
-        y=y,
-        bias=bias,
-        gather_indx=None,
-        scatter_indx=None,
-        gate_scal=None,
-        a_ragged_metadata=None,
-        swiglu=None,
-        out_block_n=block_n,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        a_format=a_format,
-        b_format="e2m1",
-        x_scale=x_scale,
-        w_scale=w_scale,
-        a_global_scale=a_global_scale,
-        scale_load_mode=scale_load_mode,
-        w_transpose=w_transpose,
-        num_buffers=num_buffers,
-        use_warp_pipeline=use_warp_pipeline,
-        use_slice_mn=use_slice_mn,
-        use_slice_n=use_slice_n,
-        persistent=persistent,
-        num_ctas=num_ctas,
-    )
-    return y
 
 
 def gluon_mxfp_dispatch_swiglu(
@@ -4809,8 +3884,8 @@ def gluon_mxfp_dispatch_swiglu(
     w_scale: torch.Tensor,
     *,
     x_scale: torch.Tensor | None = None,
-    a_format: str = "e2m1",
-    a_global_scale: torch.Tensor | float = 1.0,
+    x_format: str = "e2m1",
+    x_global_scale: torch.Tensor | float = 1.0,
     bias: torch.Tensor | None,
     a_ragged_metadata,
     gather_indx,
@@ -4829,12 +3904,10 @@ def gluon_mxfp_dispatch_swiglu(
     w_transpose: bool = False,
     persistent: bool | None = None,
     num_ctas: int | None = None,
+    out_quant_scale: torch.Tensor | float | None = None,
+    w_preshuffle: bool = False,
 ) -> torch.Tensor:
-    """Scaled-MFMA dispatch + 1st GEMM + fused SwiGLU."""
     assert w.ndim == 3 and w.shape[-1] % 2 == 0
-    # Output rows: dispatched tile count (= ``gather_indx.numel()`` when
-    # ``x`` is the un-permuted (n_tokens, H) input from production), or
-    # ``x.shape[-2]`` for pre-permuted bench-style calls.
     if gather_indx is not None:
         gather_t = (
             gather_indx.src_indx if hasattr(gather_indx, "src_indx") else gather_indx
@@ -4843,14 +3916,14 @@ def gluon_mxfp_dispatch_swiglu(
     else:
         M = x.shape[-2]
     N = w.shape[-1]
-    div_a = 2 if a_format == "e2m1" else 1
-    K = x.shape[-1] * div_a
+    div_x = 2 if x_format == "e2m1" else 1
+    K = x.shape[-1] * div_x
     bm, bn, bk, nw = _autotune_block(
         M,
         N,
         K,
         do_swiglu=True,
-        a_format=a_format,
+        x_format=x_format,
         scale_load_mode=scale_load_mode,
         slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
@@ -4858,26 +3931,18 @@ def gluon_mxfp_dispatch_swiglu(
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
-    nb_auto, wp_auto = _autotune_pipeline(
-        block_m,
-        block_n,
-        block_k,
-        K=K,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
-        has_w_block_scale=True,
-        scale_load_mode=scale_load_mode,
+    num_buffers = num_buffers if num_buffers is not None else _DEFAULT_NUM_BUFFERS
+    use_warp_pipeline = (
+        bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
-    num_buffers = num_buffers if num_buffers is not None else nb_auto
-    use_warp_pipeline = use_warp_pipeline if use_warp_pipeline is not None else wp_auto
     use_slice_mn = _resolve_use_slice_mn(
         use_slice_mn,
         block_m,
         block_n,
         num_buffers=num_buffers,
         scale_load_mode=scale_load_mode,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
+        x_format=x_format,
+        has_x_block_scale=x_format == "e2m1",
         has_w_block_scale=True,
         bk=block_k,
     )
@@ -4886,13 +3951,14 @@ def gluon_mxfp_dispatch_swiglu(
         block_m,
         block_n,
         scale_load_mode=scale_load_mode,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
+        x_format=x_format,
+        has_x_block_scale=x_format == "e2m1",
         has_w_block_scale=True,
         bk=block_k,
     )
     out_block_n = block_n // 2
-    y = torch.empty((M, N // 2), device=x.device, dtype=out_dtype)
+    y_dtype = torch.float8_e4m3fn if out_quant_scale is not None else out_dtype
+    y = torch.empty((M, N // 2), device=x.device, dtype=y_dtype)
     _launch_kernel(
         x,
         w,
@@ -4908,11 +3974,11 @@ def gluon_mxfp_dispatch_swiglu(
         block_n=block_n,
         block_k=block_k,
         num_warps=num_warps,
-        a_format=a_format,
-        b_format="e2m1",
+        x_format=x_format,
+        w_format="e2m1",
         x_scale=x_scale,
         w_scale=w_scale,
-        a_global_scale=a_global_scale,
+        x_global_scale=x_global_scale,
         scale_load_mode=scale_load_mode,
         w_transpose=w_transpose,
         num_buffers=num_buffers,
@@ -4921,6 +3987,8 @@ def gluon_mxfp_dispatch_swiglu(
         use_slice_n=use_slice_n,
         persistent=persistent,
         num_ctas=num_ctas,
+        out_quant_scale=out_quant_scale,
+        w_preshuffle=w_preshuffle,
     )
     return y
 
@@ -4931,8 +3999,8 @@ def gluon_mxfp_combine(
     w_scale: torch.Tensor,
     *,
     x_scale: torch.Tensor | None = None,
-    a_format: str = "e2m1",
-    a_global_scale: torch.Tensor | float = 1.0,
+    x_format: str = "e2m1",
+    x_global_scale: torch.Tensor | float = 1.0,
     bias: torch.Tensor | None,
     a_ragged_metadata,
     scatter_indx,
@@ -4952,19 +4020,19 @@ def gluon_mxfp_combine(
     w_transpose: bool = False,
     persistent: bool | None = None,
     num_ctas: int | None = None,
+    w_preshuffle: bool = False,
 ) -> torch.Tensor:
-    """Scaled-MFMA 2nd GEMM + scatter combine for MoE."""
     assert w.ndim == 3
     M = x.shape[-2]
     N = w.shape[-1]
-    div_a = 2 if a_format == "e2m1" else 1
-    K = x.shape[-1] * div_a
+    div_x = 2 if x_format == "e2m1" else 1
+    K = x.shape[-1] * div_x
     bm, bn, bk, nw = _autotune_block(
         M,
         N,
         K,
         ragged=a_ragged_metadata is not None,
-        a_format=a_format,
+        x_format=x_format,
         scale_load_mode=scale_load_mode,
         slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
@@ -4972,26 +4040,18 @@ def gluon_mxfp_combine(
     block_n = block_n or bn
     block_k = block_k or bk
     num_warps = num_warps or nw
-    nb_auto, wp_auto = _autotune_pipeline(
-        block_m,
-        block_n,
-        block_k,
-        K=K,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
-        has_w_block_scale=True,
-        scale_load_mode=scale_load_mode,
+    num_buffers = num_buffers if num_buffers is not None else _DEFAULT_NUM_BUFFERS
+    use_warp_pipeline = (
+        bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
-    num_buffers = num_buffers if num_buffers is not None else nb_auto
-    use_warp_pipeline = use_warp_pipeline if use_warp_pipeline is not None else wp_auto
     use_slice_mn = _resolve_use_slice_mn(
         use_slice_mn,
         block_m,
         block_n,
         num_buffers=num_buffers,
         scale_load_mode=scale_load_mode,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
+        x_format=x_format,
+        has_x_block_scale=x_format == "e2m1",
         has_w_block_scale=True,
         bk=block_k,
     )
@@ -5000,18 +4060,13 @@ def gluon_mxfp_combine(
         block_m,
         block_n,
         scale_load_mode=scale_load_mode,
-        a_format=a_format,
-        has_x_block_scale=a_format == "e2m1",
+        x_format=x_format,
+        has_x_block_scale=x_format == "e2m1",
         has_w_block_scale=True,
         bk=block_k,
     )
-    # Scatter writeback produces a *flat* ``(n_tokens * n_expts_act, N)``
-    # buffer (matching upstream ``triton_kernels.matmul`` semantics). The
-    # caller-supplied ``n_tokens`` is the post-combine token count; with
-    # ``n_expts_act > 1`` we still need ``n_tokens * n_expts_act`` rows
-    # in the kernel's HBM output so each expert's slot is independently
-    # writable, then we reduce over the top-k axis below. With
-    # ``n_tokens=None`` (bench callers) we default to ``M`` rows.
+    # Scatter writeback is flat (n_tokens * n_expts_act, N); reduce
+    # the top-k axis below. ``n_tokens=None`` (bench) defaults to M.
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
     if n_tokens is None:
         n_rows = M
@@ -5019,7 +4074,10 @@ def gluon_mxfp_combine(
     else:
         n_tokens_eff = int(n_tokens)
         n_rows = n_tokens_eff * n_act_eff
-    y = torch.zeros((n_rows, N), device=x.device, dtype=out_dtype)
+    # ``empty`` -- gpt-oss routing is dense (no -1 drops), so every
+    # row is written before the sum. Callers that allow drops must
+    # pre-zero ``y`` themselves.
+    y = torch.empty((n_rows, N), device=x.device, dtype=out_dtype)
     _launch_kernel(
         x,
         w,
@@ -5035,11 +4093,11 @@ def gluon_mxfp_combine(
         block_n=block_n,
         block_k=block_k,
         num_warps=num_warps,
-        a_format=a_format,
-        b_format="e2m1",
+        x_format=x_format,
+        w_format="e2m1",
         x_scale=x_scale,
         w_scale=w_scale,
-        a_global_scale=a_global_scale,
+        x_global_scale=x_global_scale,
         scale_load_mode=scale_load_mode,
         w_transpose=w_transpose,
         num_buffers=num_buffers,
@@ -5048,9 +4106,15 @@ def gluon_mxfp_combine(
         use_slice_n=use_slice_n,
         persistent=persistent,
         num_ctas=num_ctas,
+        w_preshuffle=w_preshuffle,
     )
     if n_act_eff > 1:
         y = y.view(n_tokens_eff, n_act_eff, N).sum(dim=1)
+    # Unpad N if the caller padded W for w_preshuffle. Padded W bytes
+    # are 0 and padded scales are 127 so acc[:, N:N_padded] == 0.
+    logical_n = int(getattr(w, "original_n", N))
+    if logical_n != N:
+        y = y[..., :logical_n].contiguous()
     return y
 
 
@@ -5064,39 +4128,36 @@ _TUNING_KW = frozenset(
     {"block_m", "block_n", "block_k", "num_warps", "num_buffers", "dtype"}
 )
 
+# Gluon-only kwargs; explicitly stripped before forwarding upstream.
+_GLUON_PRIVATE_KW = frozenset({"out_quant_scale"})
+
 
 def _extract_gluon_raw_w(w):
-    """Return the raw ``(E, K_packed, N) uint8`` weight tensor that the
-    Gluon scaled MoE launcher expects, given a possibly upstream-wrapped
-    ``triton_kernels.tensor.Tensor``.
+    """Return the raw ``(E, K_packed, N) uint8`` W tensor (zero-copy).
 
-    On AMD CDNA4 the value layout used by ``swizzle_mxfp4`` is
-    ``StridedLayout(major_dim=-2)``: the production runtime calls
-    ``wrap_torch_tensor`` on a *non-contiguous* ``transpose(-2, -1)`` of
-    the loaded weight, so ``wrap_torch_tensor`` already infers the
-    target layout and ``convert_layout`` is a no-op -- the underlying
-    ``storage.data`` is the original transposed view of shape
-    ``(E, K_packed, N)`` with K contiguous (``stride == (..., 1,
-    K_packed)``). The Gluon kernel only consults ``.stride()`` for its
-    address math, so we can pass this through zero-copy.
-
-    For tensors that are not upstream-wrapped (``torch.Tensor`` already
-    in the right shape), pass through unchanged.
+    The upstream wrapper's ``storage.data`` is already K-contiguous
+    so we pass it through. If a ``_gluon_shuffled`` attribute is
+    attached (set by the backend's preshuffle hook) we return the
+    shuffled view instead -- ``is_shuffled_for_gluon_dot=True`` then
+    triggers the kernel's W_VIA_VGPR path.
     """
     if isinstance(w, torch.Tensor):
+        shuffled = getattr(w, "_gluon_shuffled", None)
+        if shuffled is not None:
+            return shuffled
         return w
     if not isinstance(w, _UpstreamWrappedTensor):
         return w
-    return w.storage.data
+    raw = w.storage.data
+    shuffled = getattr(raw, "_gluon_shuffled", None)
+    if shuffled is not None:
+        return shuffled
+    return raw
 
 
 def _extract_gluon_raw_s(s):
-    """Return the raw uint8 scale tensor that Gluon's ``swizzle``
-    mode consumes. ``CDNA4MXScaleLayout.swizzle_data`` and our host
-    ``_swizzle_scales_cdna4`` are bit-equivalent (verified by
-    ``benchmarks/check_cdna4_upstream_scale.py``), so an upstream-
-    wrapped scale's underlying bytes can be passed straight through.
-    """
+    """Return the raw uint8 scale tensor for Gluon's ``swizzle`` mode
+    (bit-equivalent to upstream CDNA4MXScaleLayout.swizzle_data)."""
     if isinstance(s, torch.Tensor):
         return s
     if not isinstance(s, _UpstreamWrappedTensor):
@@ -5122,14 +4183,8 @@ def _maybe_extract_swiglu_args(fused_activation):
 
 
 def _global_scale_passthrough(scale):
-    """Return the per-tensor flex scale in a form the Gluon launcher can
-    take without going through ``.item()`` on the host stream.
-
-    The launcher accepts ``Tensor | float | None`` for ``a_global_scale``;
-    passing the upstream flex-scale tensor unchanged keeps the launch
-    CUDA/HIP-graph capturable (the launcher itself materialises a
-    1-element f32 device tensor and the kernel ``gl.load``s it).
-    """
+    """Return the flex scale in a form the launcher can take without
+    a host ``.item()`` (keeps HIP-graph capture working)."""
     if scale is None:
         return 1.0
     if isinstance(scale, torch.Tensor):
@@ -5149,41 +4204,12 @@ def _try_dispatch_mxfp(
     fused_activation,
     n_tokens,
     n_expts_act,
-    passthrough,
+    **extra_kwargs,
 ) -> tuple[torch.Tensor | None, bool]:
-    """Try to route an upstream-shaped ``moe_experts`` call to the
-    Gluon scaled-MFMA path (mxfp4 weight + fp8 / mxfp4 activation).
-
-    Returns ``(out, True)`` on success, ``(None, False)`` if anything in
-    the call shape is outside what we currently support, in which case
-    the caller falls back to ``triton_kernels.matmul``.
-    """
     if precision_config is None:
         return None, False
-    b_mx_scale = getattr(precision_config, "b_mx_scale", None)
-    if b_mx_scale is None:
-        return None, False
-
-    # NOTE: previously this guard fell back to upstream whenever the
-    # current stream was capturing into a CUDA/HIP graph, because the
-    # Gluon launcher took ``a_global_scale: float`` and ``.item()``-ed
-    # the upstream fp8 flex-scale tensor on the host stream (forbidden
-    # during capture). Now the launcher accepts a tensor and the kernel
-    # ``gl.load``s the scale at run time, so this path is graph-safe and
-    # Gluon participates in decode CUDA-graph replay just like upstream.
-
-    # KILL-SWITCH: until production-shape gluon swiglu compile lands and
-    # the W_TRANSPOSE+scatter NaN is fixed, allow disabling the gluon
-    # dispatcher entirely via env knob so we can isolate baseline /
-    # upstream-only behaviour.
-    import os as _os
-
-    if _os.environ.get("TOKENSPEED_MOE_GLUON_DISABLE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    w_mx_scale = getattr(precision_config, "b_mx_scale", None)
+    if w_mx_scale is None:
         return None, False
 
     flex = getattr(precision_config, "flex_ctx", None)
@@ -5191,20 +4217,20 @@ def _try_dispatch_mxfp(
     fp8_dtype = getattr(lhs, "dtype", None) if lhs is not None else None
     fp8_scale = getattr(lhs, "scale", None) if lhs is not None else None
 
-    a_mx_scale = getattr(precision_config, "a_mx_scale", None)
-    if fp8_dtype is not None and a_mx_scale is not None:
+    x_mx_scale = getattr(precision_config, "a_mx_scale", None)
+    if fp8_dtype is not None and x_mx_scale is not None:
         return None, False
 
     if fp8_dtype is not None:
-        a_format = "e4m3"
-        a_global_scale = _global_scale_passthrough(fp8_scale)
+        x_format = "e4m3"
+        x_global_scale = _global_scale_passthrough(fp8_scale)
         x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
         x_scale = None
-    elif a_mx_scale is not None:
-        a_format = "e2m1"
-        a_global_scale = 1.0
+    elif x_mx_scale is not None:
+        x_format = "e2m1"
+        x_global_scale = 1.0
         x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
-        x_scale = _extract_gluon_raw_s(a_mx_scale)
+        x_scale = _extract_gluon_raw_s(x_mx_scale)
         if not isinstance(x_scale, torch.Tensor):
             return None, False
     else:
@@ -5218,16 +4244,15 @@ def _try_dispatch_mxfp(
         out_dtype = torch.bfloat16
 
     w_raw = _extract_gluon_raw_w(w)
-    s_raw = _extract_gluon_raw_s(b_mx_scale)
+    s_raw = _extract_gluon_raw_s(w_mx_scale)
 
     if not isinstance(w_raw, torch.Tensor) or not isinstance(s_raw, torch.Tensor):
         return None, False
     if w_raw.ndim != 3:
         return None, False
 
-    # Gluon's launcher consults ``gather_indx.src_indx`` / ``scatter_indx.dst_indx``
-    # whereas the upstream-routed callers (production + tests) often pass a
-    # plain ``torch.Tensor``. Accept both by lazily wrapping bare tensors.
+    # Wrap bare tensors into ``.<attr>``-typed adapters; the launcher
+    # consults gather_indx.src_indx / scatter_indx.dst_indx.
     def _adapt_indx(obj, attr):
         if obj is None:
             return None
@@ -5247,84 +4272,57 @@ def _try_dispatch_mxfp(
     if fused_activation is not None and swiglu_args is None:
         return None, False
 
-    gammas = passthrough.get("gammas")
-    betas = passthrough.get("betas")
-    out_alpha = passthrough.get("out_alpha")
+    gammas = extra_kwargs.get("gammas")
+    betas = extra_kwargs.get("betas")
+    out_alpha = extra_kwargs.get("out_alpha")
     if betas is not None or out_alpha is not None:
         return None, False
-    epilogue = passthrough.get("epilogue")
+    epilogue = extra_kwargs.get("epilogue")
     if epilogue is not None:
         return None, False
-    fused_comm = passthrough.get("fused_comm")
+    fused_comm = extra_kwargs.get("fused_comm")
     if fused_comm is not None:
         return None, False
-    c_in = passthrough.get("c") or passthrough.get("c_acc_in")
+    c_in = extra_kwargs.get("c") or extra_kwargs.get("c_acc_in")
     if c_in is not None:
         return None, False
 
-    try:
-        # Per-path kill-switches (debug aid for bisecting end-to-end
-        # crashes). Set ``TOKENSPEED_MOE_GLUON_DISPATCH=0`` /
-        # ``TOKENSPEED_MOE_GLUON_COMBINE=0`` to fall back to upstream
-        # for one specific kernel without disabling gluon entirely.
-        _disable_dispatch = _os.environ.get(
-            "TOKENSPEED_MOE_GLUON_DISPATCH", ""
-        ).strip().lower() in {"0", "false", "no", "off"}
-        _disable_combine = _os.environ.get(
-            "TOKENSPEED_MOE_GLUON_COMBINE", ""
-        ).strip().lower() in {"0", "false", "no", "off"}
+    out_quant_scale = extra_kwargs.get("out_quant_scale")
 
+    try:
         if has_scatter and not has_gather:
-            if _disable_combine:
-                return None, False
-            # gemm + scatter combine path. The pre-ragged-offs bug
-            # (off_m past per-expert tail loaded NEXT expert's rows)
-            # used to taint this path's writeback with NaNs whenever
-            # per-expert size < BLOCK_M; the HAS_RAGGED_OFFS fix
-            # bounds writes to the actual per-expert tail and now
-            # produces bit-identical output vs upstream.
+            # gemm + combine
+            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
             out = gluon_mxfp_combine(
                 x_view,
                 w_raw,
                 s_raw,
                 x_scale=x_scale,
-                a_format=a_format,
-                a_global_scale=a_global_scale,
+                x_format=x_format,
+                x_global_scale=x_global_scale,
                 bias=bias,
                 a_ragged_metadata=a_ragged_metadata,
                 scatter_indx=scatter_indx,
                 gate_scal=gammas,
-                # ``n_tokens`` / ``n_expts_act`` arrive as direct
-                # parameters on ``_try_dispatch_mxfp`` (see
-                # ``_gluon_mxfp_ragged_matmul``), NOT in ``passthrough``;
-                # falling back to the latter silently dropped them and
-                # left the kernel allocating a ``(M, N)`` slab without
-                # the post-kernel top-k reduction, producing a
-                # ``(top_k * n_tokens, N)`` output that crashed the
-                # downstream layernorm with a shape mismatch on decode
-                # batches.
                 n_tokens=n_tokens,
                 n_expts_act=n_expts_act,
                 out_dtype=out_dtype,
                 scale_load_mode="swizzle",
                 w_transpose=True,
+                w_preshuffle=w_preshuffle,
             )
             return out, True
 
         if not has_scatter and swiglu_args is not None:
-            if _disable_dispatch:
-                return None, False
-            # Covers both gather_indx-driven dispatch+swiglu (production
-            # path from triton_kernel_fp8.py) AND the pre-permuted
-            # bench-style call where ``gather_indx=None``.
             swiglu_alpha, swiglu_limit = swiglu_args
+            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
             out = gluon_mxfp_dispatch_swiglu(
                 x_view,
                 w_raw,
                 s_raw,
                 x_scale=x_scale,
-                a_format=a_format,
-                a_global_scale=a_global_scale,
+                x_format=x_format,
+                x_global_scale=x_global_scale,
                 bias=bias,
                 a_ragged_metadata=a_ragged_metadata,
                 gather_indx=gather_indx,
@@ -5333,42 +4331,25 @@ def _try_dispatch_mxfp(
                 swiglu_limit=swiglu_limit,
                 scale_load_mode="swizzle",
                 w_transpose=True,
+                out_quant_scale=out_quant_scale,
+                w_preshuffle=w_preshuffle,
             )
             return out, True
 
-        if not has_gather and not has_scatter and swiglu_args is None:
-            if x.ndim != 2 or w_raw.shape[0] != 1:
-                return None, False
-            out = gluon_mxfp_gating_gemm(
-                x_view,
-                w_raw.squeeze(0),
-                s_raw if s_raw.ndim == 2 else s_raw.squeeze(0),
-                x_scale=x_scale,
-                a_format=a_format,
-                a_global_scale=a_global_scale,
-                bias=bias,
-                out_dtype=out_dtype,
-                scale_load_mode="swizzle",
-                w_transpose=True,
-            )
-            return out, True
     except Exception as exc:  # noqa: BLE001
         import logging
-        import os as _os
+        import traceback
 
-        logging.getLogger("tokenspeed_kernel.ops.moe.gluon").warning(
+        logger = logging.getLogger("tokenspeed_kernel.ops.moe.gluon")
+        logger.warning(
             "_try_dispatch_mxfp falling back to upstream: %s: %s",
             type(exc).__name__,
             exc,
         )
-        if _os.environ.get("TOKENSPEED_MOE_GLUON_DEBUG", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-            "debug",
-        }:
-            raise
+        logger.warning(
+            "  full chain:\n%s",
+            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        )
         return None, False
 
     return None, False
@@ -5388,22 +4369,6 @@ def _gluon_mxfp_ragged_matmul(
     n_expts_act=None,
     **passthrough,
 ) -> torch.Tensor:
-    """Selector-facing entry: matches the upstream ``matmul`` signature.
-
-    Routes mxfp4 weight + (fp8 / mxfp4) activation calls to our scaled-MFMA
-    Gluon launchers via :func:`_try_dispatch_mxfp`. Any call shape that our
-    launchers don't support (e.g. plain bf16 x bf16 with no block scale,
-    unsupported epilogue knobs, missing ``b_mx_scale``) is transparently
-    forwarded to ``triton_kernels.matmul`` so the gpt-oss-120b path keeps
-    working.
-
-    Extra keyword arguments (``gammas``, ``betas``, ``out_alpha``,
-    ``c``/``c_acc_in``, ``fused_comm``, ``epilogue``,
-    ``b_ragged_metadata``, ...) the runtime backends pass to
-    ``tokenspeed_kernel.moe_experts`` are forwarded transparently to the
-    upstream ``triton_kernels.matmul`` so combine-side scaling
-    (``gammas``) and other epilogue knobs are preserved when we fall back.
-    """
     out, ok = _try_dispatch_mxfp(
         x,
         w,
@@ -5415,7 +4380,7 @@ def _gluon_mxfp_ragged_matmul(
         fused_activation=fused_activation,
         n_tokens=n_tokens,
         n_expts_act=n_expts_act,
-        passthrough=passthrough,
+        **passthrough,
     )
     if ok:
         return out
@@ -5429,16 +4394,12 @@ def _gluon_mxfp_ragged_matmul(
         scatter_indx=scatter_indx,
         precision_config=precision_config,
         fused_activation=fused_activation,
-        **{k: v for k, v in passthrough.items() if k not in _TUNING_KW},
+        **{
+            k: v
+            for k, v in passthrough.items()
+            if k not in _TUNING_KW and k not in _GLUON_PRIVATE_KW
+        },
     )
-    # Mirror the post-processing applied by the registered
-    # ``triton_kernels`` wrapper (see ``ops.moe.triton_kernels._matmul``):
-    # when the caller passes ``scatter_indx`` together with
-    # ``n_expts_act > 1``, the upstream matmul writes a flat
-    # ``(n_tokens * n_expts_act, N)`` slab that has to be folded back
-    # into ``(n_tokens, N)`` via top-k expert summation. The previous
-    # adapter skipped this step, which surfaced the moment we won
-    # selection over ``triton_kernels_gemm_combine``.
     if scatter_indx is not None and n_expts_act is not None and n_expts_act > 1:
         assert (
             n_tokens is not None
@@ -5453,14 +4414,7 @@ def _gluon_mxfp_ragged_matmul(
 
 
 def _kernel_priority() -> int:
-    # The Gluon MoE GEMM is a throughput/latency-optimized kernel for MI355
-    # (gfx950). When enabled (default), sit clearly above the upstream
-    # ``triton_kernels`` MoE GEMM (PERFORMANT + 2 = 10) so that the selector
-    # picks us on MI355 without requiring an explicit override.
     if _GLUON_DISABLED_ENV:
-        # Drop below triton_kernels so the upstream path wins. Kept as a
-        # candidate so that an explicit ``TOKENSPEED_KERNEL_OVERRIDE_MOE_EXPERTS``
-        # can still target the Gluon kernel by name.
         return Priority.PORTABLE + 1  # 5
     return Priority.SPECIALIZED + 2  # 14
 
@@ -5507,6 +4461,5 @@ __all__ = [
     "assert_no_spills",
     "gluon_mxfp_combine",
     "gluon_mxfp_dispatch_swiglu",
-    "gluon_mxfp_gating_gemm",
     "static_profile",
 ]
