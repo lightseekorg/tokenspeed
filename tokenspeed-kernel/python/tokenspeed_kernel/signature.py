@@ -97,14 +97,24 @@ class TensorFormat:
 
     Args:
         storage_dtype: Physical dtype used by the main tensor payload.
-        format: Logical representation format, such as "dense", "fp8",
-            "mxfp8", "mxfp4", or "nvfp4".
+        format: Logical representation format, such as "dense",
+            "scaled-fp8", "mxfp8", "mxfp4", or "nvfp4".
+            Use "dense" with an FP8 storage dtype for unscaled FP8 tensors.
         scale: Optional scale sidecar metadata bundled with this tensor role.
     """
 
     storage_dtype: torch.dtype
     format: str = "dense"
     scale: ScaleFormat | None = None
+
+    def __post_init__(self) -> None:
+        if self.format == "fp8":
+            raise ValueError(
+                "TensorFormat format=fp8 is ambiguous; use dense for "
+                "unscaled FP8 or scaled-fp8 with scale metadata"
+            )
+        if self.format == "scaled-fp8" and self.scale is None:
+            raise ValueError("scaled-fp8 tensor format requires scale metadata")
 
     def __str__(self) -> str:
         if self.scale is None:
@@ -179,8 +189,9 @@ def tensor_format(
     """Construct a format for one tensor role.
 
     Args:
-        format: Logical representation format, such as "dense", "fp8",
-            "mxfp8", "mxfp4", or "nvfp4".
+        format: Logical representation format, such as "dense",
+            "scaled-fp8", "mxfp8", "mxfp4", or "nvfp4".
+            Use "dense" with an FP8 storage dtype for unscaled FP8 tensors.
         storage_dtype: Physical dtype used by the main tensor payload.
         scale: Optional scale sidecar metadata bundled with this tensor role.
     """

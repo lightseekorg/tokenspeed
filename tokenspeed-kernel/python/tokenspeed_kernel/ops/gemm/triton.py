@@ -53,8 +53,8 @@ _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE
 )
 _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
-) | format_signatures(("a", "b"), "fp8", {_fp8_dtype}, scale=_FP8_CHANNEL_SCALE)
+    ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
+) | format_signatures(("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_CHANNEL_SCALE)
 
 
 def prepare_block_fp8_matmul_inputs(

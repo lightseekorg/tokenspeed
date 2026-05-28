@@ -204,7 +204,7 @@ def test_gemm_fp8_scaled_signature_uses_fp8_format_with_scale() -> None:
     for role in ("a", "b"):
         tensor_format = signature.format_for(role)
         assert tensor_format is not None
-        assert tensor_format.format == "fp8"
+        assert tensor_format.format == "scaled-fp8"
         assert tensor_format.storage_dtype == _fp8_dtype()
         assert tensor_format.scale is not None
         assert tensor_format.scale.granularity == "tensor"

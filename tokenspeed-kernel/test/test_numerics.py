@@ -119,10 +119,18 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
     tensor_scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
     channel_scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
     tensor_signature = next(
-        iter(format_signatures(("a", "b"), "fp8", {_fp8_dtype}, scale=tensor_scale))
+        iter(
+            format_signatures(
+                ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=tensor_scale
+            )
+        )
     )
     channel_signature = next(
-        iter(format_signatures(("a", "b"), "fp8", {_fp8_dtype}, scale=channel_scale))
+        iter(
+            format_signatures(
+                ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=channel_scale
+            )
+        )
     )
     ref_spec = KernelSpec(
         name="test_tensor_scale_reference",

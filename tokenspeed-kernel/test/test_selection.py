@@ -618,8 +618,8 @@ class TestSelectKernel:
             granularity="tensor",
         )
         fp8_signature = format_signature(
-            a=tensor_format("fp8", torch.float8_e4m3fn, scale=fp8_scale),
-            b=tensor_format("fp8", torch.float8_e4m3fn, scale=fp8_scale),
+            a=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=fp8_scale),
+            b=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=fp8_scale),
         )
 
         reg.register(

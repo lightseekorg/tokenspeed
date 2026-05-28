@@ -105,6 +105,22 @@ class TestKernelSpec:
                 block_shape=(16,),
             )
 
+    def test_fp8_tensor_format_names_are_unambiguous(self):
+        dense = dense_tensor_format(torch.float8_e4m3fn)
+        assert dense.format == "dense"
+        assert dense.scale is None
+
+        scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+        scaled = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=scale)
+        assert scaled.format == "scaled-fp8"
+        assert scaled.scale == scale
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            tensor_format("fp8", torch.float8_e4m3fn)
+
+        with pytest.raises(ValueError, match="requires scale"):
+            tensor_format("scaled-fp8", torch.float8_e4m3fn)
+
     def test_equality(self):
         spec1 = KernelSpec(name="k1", family="attention", mode="decode")
         spec2 = KernelSpec(name="k1", family="attention", mode="decode")

@@ -42,7 +42,7 @@ _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {fp8_dtype}, scale=_FP8_BLOCK_SCALE
 )
 _FP8_TENSOR_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
+    ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
 )
 _DENSE_GEMM_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "dense", {torch.bfloat16, torch.float16, torch.float32}

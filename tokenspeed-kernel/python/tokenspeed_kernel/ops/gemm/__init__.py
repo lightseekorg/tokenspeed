@@ -112,8 +112,8 @@ def _gemm_format_signature(
             granularity=_infer_scale_type(A_scales, B_scales) or "unknown",
         )
         return format_signature(
-            a=tensor_format("fp8", A.dtype, scale=scale),
-            b=tensor_format("fp8", B.dtype, scale=scale),
+            a=tensor_format("scaled-fp8", A.dtype, scale=scale),
+            b=tensor_format("scaled-fp8", B.dtype, scale=scale),
         )
     if quant == "nvfp4":
         a_scale = ScaleFormat(
