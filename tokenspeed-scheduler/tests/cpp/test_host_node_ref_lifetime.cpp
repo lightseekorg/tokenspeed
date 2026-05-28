@@ -28,6 +28,8 @@
 #include "core/token_container.h"
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
+#include "resource/allocator/kv_allocator.h"
+#include "resource/allocator/local_mamba_allocator.h"
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/page_allocator.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
@@ -73,6 +75,10 @@ protected:
         return ref;
     }
 
+    std::unique_ptr<RequestLocalCacheState> MakeLocalCache() {
+        return std::make_unique<RequestLocalCacheState>(std::make_unique<LocalKVAllocator>(&device_alloc_, 0));
+    }
+
     PageAllocator device_alloc_;
     PageAllocator host_alloc_;
     KVPrefixCache cache_;
@@ -106,7 +112,7 @@ TEST_F(HostNodeRefLifetimeTest, Prefilling_HoldsHostLockAfterCallerExits) {
         /*page_size=*/kPageSize,
         /*host_node_ref=*/std::move(host_ref),
         /*device_node_ref=*/std::unique_ptr<DeviceNodeRef>{},
-        /*local_kv_allocator=*/std::unique_ptr<LocalKVAllocator>{},
+        /*local_cache=*/MakeLocalCache(),
         /*req_pool_index=*/std::unique_ptr<ReqPoolIndex>{},
         /*window=*/TokenContainer::Window{},
     };
@@ -125,7 +131,7 @@ TEST_F(HostNodeRefLifetimeTest, PrefillDone_HoldsHostLockAfterCallerExits) {
         /*page_size=*/kPageSize,
         /*host_node_ref=*/std::move(host_ref),
         /*device_node_ref=*/std::unique_ptr<DeviceNodeRef>{},
-        /*local_kv_allocator=*/std::unique_ptr<LocalKVAllocator>{},
+        /*local_cache=*/MakeLocalCache(),
         /*req_pool_index=*/std::unique_ptr<ReqPoolIndex>{},
         /*window=*/TokenContainer::Window{},
         /*reserve_num_tokens_in_next_schedule_event=*/0,
@@ -145,7 +151,7 @@ TEST_F(HostNodeRefLifetimeTest, Decoding_HoldsHostLockAfterCallerExits) {
         /*page_size=*/kPageSize,
         /*host_node_ref=*/std::move(host_ref),
         /*node_ref=*/std::unique_ptr<DeviceNodeRef>{},
-        /*local_kv_allocator=*/std::unique_ptr<LocalKVAllocator>{},
+        /*local_cache=*/MakeLocalCache(),
         /*req_pool_index=*/std::unique_ptr<ReqPoolIndex>{},
         /*reserve_num_tokens_in_next_schedule_event=*/0,
     };
@@ -172,7 +178,7 @@ TEST_F(HostNodeRefLifetimeTest, RemotePrefillDoneEvent_PreservesHostLock) {
             /*page_size=*/kPageSize,
             /*host_node_ref=*/std::move(host_ref),
             /*device_node_ref=*/std::unique_ptr<DeviceNodeRef>{},
-            /*local_kv_allocator=*/std::unique_ptr<LocalKVAllocator>{},
+            /*local_cache=*/MakeLocalCache(),
             /*req_pool_index=*/std::unique_ptr<ReqPoolIndex>{},
             /*window=*/TokenContainer::Window{},
         };
