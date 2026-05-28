@@ -133,8 +133,9 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
     device_node_ref = std::make_unique<DeviceNodeRef>(insert_result.last_node);
 }
 
-// Submitted -> PrefillDone / Prefilling
-std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
+// Submitted / PrefetchDone -> PrefillDone / Prefilling
+template <typename StateT>
+std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::applyFirstChunk(StateT&& state) {
     // Lock node
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
@@ -198,6 +199,14 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
                           window,
                           std::move(local_mamba_allocator)};
     }
+}
+
+std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
+    return applyFirstChunk(std::move(state));
+}
+
+std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(PrefetchDone&& state) {
+    return applyFirstChunk(std::move(state));
 }
 
 // Prefilling -> Prefilling / PrefillDone

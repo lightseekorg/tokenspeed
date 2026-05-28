@@ -64,4 +64,12 @@ std::vector<std::int32_t> Request::GetHostPageIds() const {
     return s->GetHostPageIds();
 }
 
+OwnedPages Request::TakeHostPages() {
+    auto* s = std::get_if<fsm::Prefetching>(&state_);
+    if (s == nullptr) {
+        throw std::logic_error("Request::TakeHostPages: expected state=Prefetching; got state=" + StateName());
+    }
+    return std::move(*s).TakeHostPages();
+}
+
 }  // namespace tokenspeed

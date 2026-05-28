@@ -86,6 +86,10 @@ public:
     // Returns the host pages allocated in Prefetching state (only valid when Is<Prefetching>()).
     std::vector<std::int32_t> GetHostPageIds() const;
 
+    // Moves host page ownership out of the Prefetching state (only valid when Is<Prefetching>()).
+    // After this call the Prefetching state's host_pages_ is empty.
+    OwnedPages TakeHostPages();
+
     const StorageInfo& GetStorageInfo() const { return storage_info_; }
 
     std::vector<std::span<const std::int32_t>> GetFullPagedTokens(bool except_last) const {

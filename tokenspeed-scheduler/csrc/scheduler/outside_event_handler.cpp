@@ -52,15 +52,19 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
         // Insert completed host pages into the KVPrefixCache so that future Match() calls
         // see them in the host side and can generate LoadBack ops.
         auto token_pages = req->GetFullPagedTokens(false);
-        auto all_host_pages = req->GetHostPageIds();
 
-        std::int32_t n = std::min(event.completed_pages, static_cast<std::int32_t>(all_host_pages.size()));
+        // Move host page ownership out of the Prefetching state so we can pass
+        // proper OwnedPages to Insert. The subsequent FSM transition will see
+        // empty pages and skip its cleanup (all handled here).
+        OwnedPages host_owned = req->TakeHostPages();
+        std::int32_t total_host = host_owned.Size();
+
+        std::int32_t n = std::min(event.completed_pages, total_host);
         std::int32_t n_tokens = std::min(n, static_cast<std::int32_t>(token_pages.size()));
 
         if (n_tokens > 0) {
             std::vector<std::span<const std::int32_t>> insert_token_pages(token_pages.begin(),
                                                                           token_pages.begin() + n_tokens);
-            std::vector<std::int32_t> insert_pages(all_host_pages.begin(), all_host_pages.begin() + n);
 
             // Storage hashes for L3 backup (optional).
             const auto& storage = req->GetStorageInfo();
@@ -70,13 +74,16 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
                 page_hashes.assign(storage.rolling_hashes.begin(), storage.rolling_hashes.begin() + nh);
             }
 
-            // Insert into host side; InsertHost returns how many were actually inserted
-            // (0 for pages that already existed — "overlapping").
-            auto insert_result = kv_prefix_cache_.Insert<ResourceType::Host>(insert_token_pages, insert_pages,
-                                                                             OwnedPages{}, page_hashes);
+            // Take the first n_tokens pages as allocator_pages for Insert;
+            // remaining uncompleted pages are freed when host_owned goes out of scope.
+            OwnedPages insert_pages = host_owned.TakeFirst(n_tokens);
+
+            auto insert_result = kv_prefix_cache_.Insert<ResourceType::Host>(insert_token_pages, {},
+                                                                             std::move(insert_pages), page_hashes);
             completed = n;
             inserted = insert_result.inserted_num_pages;
         }
+        // host_owned destructor frees any uncompleted pages back to the host allocator.
     }
 
     fsm::PrefetchDoneEvent fsm_event{completed, inserted};

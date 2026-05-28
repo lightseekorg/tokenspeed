@@ -195,12 +195,15 @@ def cache_event_to_payload(event) -> dict:
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
-    return {
+    payload = {
         "kind": kind,
         "op_id": int(event.op_id),
         "success": bool(event.success),
         "request_id": getattr(event, "request_id", ""),
     }
+    if hasattr(event, "completed_pages"):
+        payload["completed_pages"] = int(event.completed_pages)
+    return payload
 
 
 def cache_event_from_payload(payload: dict):
@@ -213,6 +216,8 @@ def cache_event_from_payload(payload: dict):
     request_id = payload.get("request_id", "")
     if request_id:
         event.request_id = request_id
+    if "completed_pages" in payload and hasattr(event, "completed_pages"):
+        event.completed_pages = int(payload["completed_pages"])
     return event
 
 

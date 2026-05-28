@@ -82,6 +82,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 
     // Returns PrefillDone (single-chunk or last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Submitted&& state);
+    std::variant<PrefillDone, Prefilling> operator()(PrefetchDone&& state);
 
     const MatchResult GetMatchResult() const { return match_result_; }
 
@@ -89,6 +90,9 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
     const std::vector<TreeNode*>& GetMambaLoadbackNodes() const { return mamba_loadback_nodes_; }
 
 private:
+    template <typename StateT>
+    std::variant<PrefillDone, Prefilling> applyFirstChunk(StateT&& state);
+
     std::int32_t tokens_this_round_{};
     std::int32_t decode_input_tokens_{};
     PageAllocator* device_allocator_{};
