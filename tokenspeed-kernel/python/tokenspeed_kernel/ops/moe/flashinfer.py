@@ -38,10 +38,12 @@ _NVIDIA_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia"}))
 _FP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
+    block_shape=(128, 128),
 )
 _NVFP4_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
+    block_shape=(16,),
 )
 _MXFP4_SCALE = ScaleFormat(
     storage_dtype=torch.uint8,

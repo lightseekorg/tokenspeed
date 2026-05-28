@@ -45,17 +45,49 @@ class ScaleFormat:
         storage_dtype: Physical dtype used by the scale tensor.
         granularity: Scale granularity, such as "tensor", "channel", "block".
         block_shape: Logical block shape covered by each scale value when
-            granularity is block-based.
+            granularity is block-based. Required for block scales unless
+            ``dynamic_block_shape`` is true.
+        dynamic_block_shape: Whether a block scale intentionally supports a
+            runtime-selected block shape and should not match on one fixed
+            shape.
     """
 
     storage_dtype: torch.dtype
     granularity: str
     block_shape: tuple[int, ...] | None = None
+    dynamic_block_shape: bool = False
+
+    def __post_init__(self) -> None:
+        if self.block_shape is not None:
+            block_shape = tuple(self.block_shape)
+            if not block_shape or any(dim <= 0 for dim in block_shape):
+                raise ValueError("block_shape must contain positive dimensions")
+            object.__setattr__(self, "block_shape", block_shape)
+
+        if self.granularity == "block":
+            if self.block_shape is not None and self.dynamic_block_shape:
+                raise ValueError(
+                    "block_shape and dynamic_block_shape are mutually exclusive"
+                )
+            if self.block_shape is None and not self.dynamic_block_shape:
+                raise ValueError(
+                    "block scale format requires block_shape or dynamic_block_shape=True"
+                )
+            return
+
+        if self.block_shape is not None:
+            raise ValueError("block_shape is only valid for block scale formats")
+        if self.dynamic_block_shape:
+            raise ValueError(
+                "dynamic_block_shape is only valid for block scale formats"
+            )
 
     def __str__(self) -> str:
         parts = [self.granularity, f"storage={self.storage_dtype}"]
         if self.block_shape is not None:
             parts.append(f"block={self.block_shape}")
+        elif self.dynamic_block_shape:
+            parts.append("block=dynamic")
         return "scale(" + ", ".join(parts) + ")"
 
 

@@ -179,6 +179,10 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     assert b_format is not None
     assert a_format.storage_dtype == _fp8_dtype()
     assert b_format.storage_dtype == _fp8_dtype()
+    assert a_format.scale is not None
+    assert b_format.scale is not None
+    assert a_format.scale.block_shape == (128, 128)
+    assert b_format.scale.block_shape == (128, 128)
 
 
 def test_gemm_fp8_scaled_signature_uses_fp8_format_with_scale() -> None:
@@ -245,6 +249,29 @@ def _mm_nvfp4() -> torch.Tensor:
         alpha=alpha,
         quant="nvfp4",
     )
+
+
+def test_gemm_nvfp4_signature_uses_fixed_block_shape() -> None:
+    a = torch.empty((4, 64), dtype=torch.uint8)
+    b = torch.empty((128, 64), dtype=torch.uint8)
+    a_scales = torch.empty((4, 1), dtype=torch.float32)
+    b_scales = torch.empty((128, 1), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "nvfp4",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.block_shape == (16,)
 
 
 def _attention_prefill() -> object:

@@ -78,6 +78,33 @@ class TestKernelSpec:
         assert mixed != dense
         assert mixed.format_for("b").scale == scale
 
+    def test_block_scale_requires_shape_or_dynamic_marker(self):
+        with pytest.raises(ValueError, match="requires block_shape"):
+            ScaleFormat(storage_dtype=torch.float32, granularity="block")
+
+        dynamic = ScaleFormat(
+            storage_dtype=torch.float32,
+            granularity="block",
+            dynamic_block_shape=True,
+        )
+        assert dynamic.block_shape is None
+        assert str(dynamic) == "scale(block, storage=torch.float32, block=dynamic)"
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ScaleFormat(
+                storage_dtype=torch.float32,
+                granularity="block",
+                block_shape=(16,),
+                dynamic_block_shape=True,
+            )
+
+        with pytest.raises(ValueError, match="only valid for block"):
+            ScaleFormat(
+                storage_dtype=torch.float32,
+                granularity="tensor",
+                block_shape=(16,),
+            )
+
     def test_equality(self):
         spec1 = KernelSpec(name="k1", family="attention", mode="decode")
         spec2 = KernelSpec(name="k1", family="attention", mode="decode")

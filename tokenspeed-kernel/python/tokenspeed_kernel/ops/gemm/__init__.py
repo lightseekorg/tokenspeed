@@ -94,10 +94,12 @@ def _gemm_format_signature(
 ):
     _ = out_dtype
     if quant == "mxfp8":
+        if block_size is None:
+            raise ValueError("mxfp8 format selection requires block_size")
         scale = ScaleFormat(
             storage_dtype=_scale_storage_dtype(A_scales, B_scales),
             granularity="block",
-            block_shape=tuple(block_size) if block_size is not None else None,
+            block_shape=tuple(block_size),
         )
         a_storage_dtype = _fp8_dtype if A_scales is None else A.dtype
         return format_signature(
@@ -117,10 +119,12 @@ def _gemm_format_signature(
         a_scale = ScaleFormat(
             storage_dtype=_scale_storage_dtype(A_scales),
             granularity="block",
+            block_shape=(16,),
         )
         b_scale = ScaleFormat(
             storage_dtype=_scale_storage_dtype(B_scales),
             granularity="block",
+            block_shape=(16,),
         )
         return format_signature(
             a=tensor_format("nvfp4", A.dtype, scale=a_scale),

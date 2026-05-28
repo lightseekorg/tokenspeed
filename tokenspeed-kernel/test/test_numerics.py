@@ -97,6 +97,7 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
     scale = ScaleFormat(
         storage_dtype=torch.float32,
         granularity="block",
+        dynamic_block_shape=True,
     )
     signature = next(
         iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
@@ -110,7 +111,7 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
         device="cpu",
     )
 
-    with pytest.raises(ValueError, match="requires block_shape"):
+    with pytest.raises(ValueError, match="requires concrete block_shape"):
         generator.generate(M=4, N=256, K=128)
 
 

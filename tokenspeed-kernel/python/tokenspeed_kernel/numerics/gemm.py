@@ -151,7 +151,9 @@ class GemmInputGenerator(InputGenerator):
 
         if scale.granularity == "block" and tensor_format.format == "mxfp8":
             if block_size is None:
-                raise ValueError("mxfp8 block scale format requires block_shape")
+                raise ValueError(
+                    "mxfp8 block scale format requires concrete block_shape"
+                )
             block_n, block_k = block_size
             k_tiles = math.ceil(K / block_k)
             if role == "a":

@@ -44,12 +44,16 @@ _NVFP4_FORMAT_SIGNATURES = frozenset(
         a=tensor_format(
             "nvfp4",
             storage_dtype,
-            scale=ScaleFormat(storage_dtype=a_scale_dtype, granularity="block"),
+            scale=ScaleFormat(
+                storage_dtype=a_scale_dtype, granularity="block", block_shape=(16,)
+            ),
         ),
         b=tensor_format(
             "nvfp4",
             storage_dtype,
-            scale=ScaleFormat(storage_dtype=b_scale_dtype, granularity="block"),
+            scale=ScaleFormat(
+                storage_dtype=b_scale_dtype, granularity="block", block_shape=(16,)
+            ),
         ),
     )
     for storage_dtype in _fp4_dtypes

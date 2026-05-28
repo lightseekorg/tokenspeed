@@ -125,10 +125,12 @@ EXPERTS_GEMM_COMBINE = (
 _FP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
+    block_shape=(128, 128),
 )
 _NVFP4_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
+    block_shape=(16,),
 )
 _MXFP4_SCALE = ScaleFormat(
     storage_dtype=torch.uint8,
@@ -306,10 +308,12 @@ def moe_fused(
 
             * ``"bf16"``: dense bfloat16 weights with no scale tensor.
             * ``"fp8"``: FP8 E4M3 weights with float32 block scales.
+              Fused MoE kernels currently register this as a fixed
+              ``block_shape=(128, 128)`` format.
             * ``"mxfp4"``: packed MXFP4 weights stored as uint8 with uint8
               block scales over 32-value blocks.
             * ``"nvfp4"``: packed NVFP4 weights stored as uint8 with float32
-              block scales.
+              block scales over 16-value blocks.
 
             The activation/input format is selected by ``dtype``. When
             ``dtype=torch.uint8``, ``weight_format`` disambiguates whether the
