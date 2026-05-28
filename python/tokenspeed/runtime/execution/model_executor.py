@@ -1299,7 +1299,11 @@ class ModelExecutor:
 
             with nvtx_range("output_d2h", color="green"):
                 next_input_ids = None
-                if capture_next_input_ids and self.drafter is not None and num_extends > 0:
+                if (
+                    capture_next_input_ids
+                    and self.drafter is not None
+                    and num_extends > 0
+                ):
                     next_input_ids = self.runtime_states.future_input_map.index_select(
                         0, self.input_buffers.req_pool_indices_buf[:num_extends]
                     ).to("cpu", non_blocking=True)

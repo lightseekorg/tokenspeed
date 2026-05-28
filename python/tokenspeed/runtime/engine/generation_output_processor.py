@@ -556,7 +556,8 @@ class OutputProcesser:
                     model_execution_results.next_input_ids
                 ):
                     spec_candidate_ids = [
-                        int(x) for x in model_execution_results.next_input_ids[i].tolist()
+                        int(x)
+                        for x in model_execution_results.next_input_ids[i].tolist()
                     ]
                 on_first_token(
                     forward_op.request_pool_indices[i],

@@ -144,10 +144,13 @@ class DisaggDecodeExecutor:
                 # message from the prefill side.  bootstrap_room == bootstrap_info.bootstrap_room,
                 # which is the key used in MooncakeKVReceiver.
                 bootstrap_room = self.receivers[req_id].bootstrap_room
-                bootstrap_token, spec_candidate_ids = self.kv_manager.pop_prefill_metadata(
-                    bootstrap_room
+                bootstrap_token, spec_candidate_ids = (
+                    self.kv_manager.pop_prefill_metadata(bootstrap_room)
                 )
-                if spec_candidate_ids is not None and req_id in self._request_pool_indices:
+                if (
+                    spec_candidate_ids is not None
+                    and req_id in self._request_pool_indices
+                ):
                     self._remote_spec_candidate_ids[req_id] = (
                         self._request_pool_indices[req_id],
                         spec_candidate_ids,
