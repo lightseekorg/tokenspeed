@@ -747,13 +747,37 @@ class EventLoop:
                 kind, consumer_indices if consumer_indices else -1
             )
 
-    def _flush_mamba_retract_states(self, forward_op) -> None:
-        """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
+    def _flush_mamba_retract_states(self, forward_op, execution_plan) -> None:
+        """Copy draft->working mamba states when a retract WriteBack is scheduled.
+
+        Fires on iterations that have no forward but do carry a retract
+        WriteBackOp — the scheduler defers the draft->working sync to the
+        event loop because ``execute_forward_op`` (which normally performs
+        it inside the mamba copy path) is skipped.
+
+        We over-approximate by triggering on ANY retract WriteBackOp rather
+        than only those that touch mamba pages: in a mamba-enabled model
+        every retract WriteBack carries mamba state, and the underlying
+        flush is idempotent against a stale ``_prev_decode_bs`` (invalid
+        src/dst pairs are masked out via the sentinel path).
+
+        TODO: replace the cache-op scan with a scheduler-side
+        ``execution_plan.has_mamba_retract`` flag so we don't pay the O(n)
+        scan on every idle iter. The scan is cheap today (few ops) but the
+        flag is cleaner once we have other "retract-only" cleanups to gate.
+        """
         if forward_op is not None:
             return
         if self.model_executor.drafter is None:
             return
         if self.model_executor.runtime_states.mamba_pool is None:
+            return
+        has_retract = any(
+            isinstance(op, Cache.WriteBackOp)
+            and any(getattr(op, "is_retract", ()) or ())
+            for op in execution_plan.cache
+        )
+        if not has_retract:
             return
         self.model_executor.flush_mamba_draft_to_working_on_retract()
 
@@ -1047,7 +1071,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
-            self._flush_mamba_retract_states(forward_op)
+            self._flush_mamba_retract_states(forward_op, execution_plan)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1162,7 +1186,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
-            self._flush_mamba_retract_states(forward_op)
+            self._flush_mamba_retract_states(forward_op, execution_plan)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
