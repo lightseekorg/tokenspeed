@@ -49,6 +49,7 @@ class Nvfp4FlashinferCutlassBackend(MoEBackend):
         self.key = key
         self.spec = spec
         self.quant_config = quant_config
+        self._autotuned = False
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
@@ -75,32 +76,9 @@ class Nvfp4FlashinferCutlassBackend(MoEBackend):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         finalize_common_flashinfer_weights(layer, swap_gate_up=True)
 
-    def forward(
-        self,
-        layer: nn.Module,
-        hidden_states: torch.Tensor,
-        topk_output: object,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
+    def _call_cutlass_kernel(self, x, symm_output, output_dtype, layer, topk_output):
         from tokenspeed_kernel.ops.moe.flashinfer import (
             ActivationType,
-        )
-
-        x = hidden_states
-        output_dtype = torch.bfloat16
-        output_col = x.shape[1]
-
-        # After dispatch, some ranks may receive 0 tokens. The
-        # flashinfer CUTLASS kernel cannot handle empty input, so return
-        # a zero tensor directly.
-        if x.shape[0] == 0:
-            return x.new_zeros(0, output_col, dtype=output_dtype)
-
-        # Allocate output
-        symm_output = torch.empty(
-            x.shape[0], output_col, dtype=output_dtype, device=x.device
         )
 
         return tokenspeed_kernel.moe_fused(
@@ -136,6 +114,48 @@ class Nvfp4FlashinferCutlassBackend(MoEBackend):
             },
             expected_kernel_name="flashinfer_cutlass_fused_moe",
         )[0]
+
+    def forward(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        topk_output: object,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        del num_global_tokens, max_num_tokens_per_gpu
+        x = hidden_states
+        output_dtype = torch.bfloat16
+        output_col = x.shape[1]
+
+        # After dispatch, some ranks may receive 0 tokens. The
+        # flashinfer CUTLASS kernel cannot handle empty input, so return
+        # a zero tensor directly.
+        if x.shape[0] == 0:
+            return x.new_zeros(0, output_col, dtype=output_dtype)
+
+        # Allocate output
+        symm_output = torch.empty(
+            x.shape[0], output_col, dtype=output_dtype, device=x.device
+        )
+
+        try:
+            from tokenspeed_kernel.ops.moe.flashinfer import (
+                autotune as flashinfer_autotune,
+            )
+        except ImportError:
+            flashinfer_autotune = None
+
+        if not self._autotuned and flashinfer_autotune is not None:
+            with flashinfer_autotune():
+                self._call_cutlass_kernel(
+                    x, symm_output, output_dtype, layer, topk_output
+                )
+            self._autotuned = True
+
+        return self._call_cutlass_kernel(
+            x, symm_output, output_dtype, layer, topk_output
+        )
 
 
 __all__ = ["Nvfp4FlashinferCutlassBackend"]

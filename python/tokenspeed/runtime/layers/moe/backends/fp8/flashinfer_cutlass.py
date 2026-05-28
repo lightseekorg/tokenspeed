@@ -43,6 +43,16 @@ def _swap_w13_to_w31(tensor: torch.Tensor) -> torch.Tensor:
 class Fp8FlashinferCutlassBackend(MoEBackend):
     supported_arches = frozenset({"sm90"})
 
+    def __init__(
+        self,
+        key,
+        spec: MoELayerSpec,
+        quant_config: object,
+        routing_config: dict | None = None,
+    ):
+        super().__init__(key, spec, quant_config, routing_config)
+        self._autotuned = False
+
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
         platform = current_platform()
@@ -102,27 +112,8 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
         layer.w13_weight_scale_inv.data.clamp_(min=_FI_CUTLASS_MIN_BLOCK_SCALE)
         layer.w2_weight_scale_inv.data.clamp_(min=_FI_CUTLASS_MIN_BLOCK_SCALE)
 
-    def forward(
-        self,
-        layer: nn.Module,
-        hidden_states: torch.Tensor,
-        topk_output: object,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
+    def _call_cutlass_kernel(self, x, output, output_dtype, layer, topk_output):
         from tokenspeed_kernel.ops.moe.flashinfer import ActivationType
-
-        x = hidden_states
-        output_dtype = x.dtype
-        output_col = x.shape[1]
-
-        if x.shape[0] == 0:
-            return x.new_zeros(0, output_col, dtype=output_dtype)
-
-        output = torch.empty(
-            x.shape[0], output_col, dtype=output_dtype, device=x.device
-        )
 
         return tokenspeed_kernel.moe_fused(
             output=output,
@@ -156,6 +147,40 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
             expected_kernel_name="flashinfer_cutlass_fused_moe",
             use_deepseek_fp8_block_scale=True,
         )[0]
+
+    def forward(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        topk_output: object,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        del num_global_tokens, max_num_tokens_per_gpu
+        x = hidden_states
+        output_dtype = x.dtype
+        output_col = x.shape[1]
+
+        if x.shape[0] == 0:
+            return x.new_zeros(0, output_col, dtype=output_dtype)
+
+        output = torch.empty(
+            x.shape[0], output_col, dtype=output_dtype, device=x.device
+        )
+
+        try:
+            from tokenspeed_kernel.ops.moe.flashinfer import (
+                autotune as flashinfer_autotune,
+            )
+        except ImportError:
+            flashinfer_autotune = None
+
+        if not self._autotuned and flashinfer_autotune is not None:
+            with flashinfer_autotune():
+                self._call_cutlass_kernel(x, output, output_dtype, layer, topk_output)
+            self._autotuned = True
+
+        return self._call_cutlass_kernel(x, output, output_dtype, layer, topk_output)
 
 
 __all__ = ["Fp8FlashinferCutlassBackend"]
