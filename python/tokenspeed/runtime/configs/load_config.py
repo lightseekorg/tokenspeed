@@ -68,7 +68,7 @@ class LoadConfig:
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None
     weight_loader_prefetch_checkpoints: bool = False
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
 
     ext_yaml: str = None
 

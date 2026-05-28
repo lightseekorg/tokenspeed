@@ -251,7 +251,7 @@ class ServerArgs:
     triton_attention_reduce_in_fp32: bool = False
     delete_ckpt_after_loading: bool = False
     weight_loader_prefetch_checkpoints: bool = False
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
     enable_memory_saver: bool = False
     enable_custom_logit_processor: bool = False
     mla_disable_ragged: bool = False
