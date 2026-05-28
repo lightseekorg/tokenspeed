@@ -172,7 +172,7 @@ def _online_quantize_mxfp8(
             block_k,
             column_major_scales=True,
             scale_tma_aligned=True,
-            scale_ue8m0=False,
+            scale_ue8m0=_platform.is_blackwell_plus,
         )
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import (

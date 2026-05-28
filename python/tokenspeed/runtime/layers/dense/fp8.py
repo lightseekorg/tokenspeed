@@ -25,6 +25,8 @@
 # SOFTWARE.
 
 
+import logging
+
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -34,6 +36,17 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
 )
 from tokenspeed_kernel.platform import Platform
 from torch.nn.parameter import Parameter
+
+logger = logging.getLogger(__name__)
+
+try:
+    from tokenspeed_kernel.thirdparty.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
+    from tokenspeed_kernel.thirdparty.deep_gemm import (
+        transform_sf_into_required_layout as _transform_sf,
+    )
+except ImportError:
+    _ceil_to_ue8m0 = None
+    _transform_sf = None
 
 from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
 from tokenspeed.runtime.layers.parameter import (
@@ -193,6 +206,27 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
+            layer._use_deep_gemm_fp8 = False
+            is_bmm = getattr(layer, "is_bmm", False)
+            is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+            if (
+                _transform_sf is not None
+                and _ceil_to_ue8m0 is not None
+                and not is_bmm
+                and is_ue8m0
+            ):
+                N, K = layer.weight.shape
+                block_n, block_k = self.quant_config.weight_block_size
+                if N % 64 == 0 and K % 128 == 0:
+                    sf = _ceil_to_ue8m0(layer.weight_scale_inv.data)
+                    layer.weight_scale_inv.data = _transform_sf(
+                        sf=sf,
+                        mn=N,
+                        k=K,
+                        recipe=(1, block_n, block_k),
+                        is_sfa=False,
+                    )
+                    layer._use_deep_gemm_fp8 = True
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -259,6 +293,11 @@ class Fp8LinearMethod(LinearMethodBase):
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
 
+            override = (
+                "deep_gemm_mm_fp8_blockscale"
+                if getattr(layer, "_use_deep_gemm_fp8", False)
+                else None
+            )
             output = tokenspeed_kernel.mm(
                 input_2d,
                 layer.weight,
@@ -268,6 +307,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 out_dtype=output_dtype,
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
+                override=override,
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:
