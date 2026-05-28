@@ -298,7 +298,6 @@ def fused_all_gather(
 
 def token_all_gather(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     scattered_num_tokens: list[int],
     backend=None,
@@ -311,12 +310,11 @@ def token_all_gather(
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.token_all_gather(tensor, rank, group, scattered_num_tokens)
+    return backend.token_all_gather(tensor, group, scattered_num_tokens)
 
 
 def token_reduce_scatter(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     scattered_num_tokens: list[int],
     backend=None,
@@ -329,4 +327,4 @@ def token_reduce_scatter(
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.token_reduce_scatter(tensor, rank, group, scattered_num_tokens)
+    return backend.token_reduce_scatter(tensor, group, scattered_num_tokens)

@@ -28,7 +28,7 @@
 import torch
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -459,10 +459,7 @@ class ColumnParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            nccl_group = pg_manager.get_process_group("nccl", self.tp_group)
-            gathered = [torch.empty_like(output_parallel) for _ in range(self.tp_size)]
-            torch.distributed.all_gather(gathered, output_parallel, group=nccl_group)
-            output = torch.cat(gathered, dim=-1)
+            output = all_gather(output_parallel, self.tp_rank, self.tp_group, dim=-1)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None

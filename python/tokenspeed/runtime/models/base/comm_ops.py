@@ -172,7 +172,6 @@ class ReduceScatterOp(CommOp):
         )
         hidden_states = token_reduce_scatter(
             hidden_states,
-            rank=self._rank,
             group=self._group,
             scattered_num_tokens=scattered_num_tokens,
         )
@@ -195,7 +194,6 @@ class AllGatherOp(CommOp):
         )
         hidden_states = token_all_gather(
             hidden_states,
-            rank=self._rank,
             group=self._group,
             scattered_num_tokens=scattered_num_tokens,
         )
@@ -218,7 +216,6 @@ class ResidualAllGatherOp(CommOp):
         )
         residual = token_all_gather(
             residual,
-            rank=self._rank,
             group=self._group,
             scattered_num_tokens=scattered_num_tokens,
         )
@@ -393,7 +390,6 @@ class FinalNormOp(CommOp):
                 )
                 hidden_states = token_all_gather(
                     hidden_states,
-                    rank=self._lm_rank,
                     group=self._lm_group,
                     scattered_num_tokens=scattered_num_tokens,
                 )
