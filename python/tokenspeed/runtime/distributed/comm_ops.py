@@ -31,7 +31,6 @@ import torch
 import torch.distributed
 from tokenspeed_kernel.ops.communication.trtllm import (
     allgather_dual_rmsnorm,
-    allgather_vocab,
     allreduce_residual_rmsnorm,
     reducescatter_residual_rmsnorm,
 )
@@ -66,8 +65,6 @@ class FusionOp(IntEnum):
     RS_RESIDUAL_RMS_NORM = 2
     # all_gather + dual RMSNorm (for MLA)
     AG_DUAL_RMS_NORM = 3
-    # all_gather for vocab logits
-    AG_VOCAB = 4
 
 
 @dataclass
@@ -94,8 +91,7 @@ class FusionParams:
     residual_reduce_scattered: bool = False
     has_partial_norm_out: bool = False
 
-    # --- For AG_VOCAB ---
-    local_vocab_size: int = 0
+    # --- Shared by RESIDUAL_RMS_NORM / RS_RESIDUAL_RMS_NORM / AG_DUAL_RMS_NORM ---
     max_token_num: int = 0
 
     # --- For FP8 block quantization ---
@@ -243,7 +239,7 @@ def fused_all_gather(
     backend: CommBackend | None = None,
     fusion_params: FusionParams | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """All-gather with optional fused dual-RMSNorm or vocab gather."""
+    """All-gather with optional fused dual-RMSNorm."""
     if backend is None:
         backend = get_global_backend()
 
@@ -265,21 +261,6 @@ def fused_all_gather(
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
             launch_with_pdl=pdl_enabled(),
-        )
-
-    if fusion_params.fusion_op == FusionOp.AG_VOCAB:
-
-        def fallback_all_gather(input_tensor: torch.Tensor, _) -> torch.Tensor:
-            return backend.all_gather(input_tensor, group, dim=-1)
-
-        return allgather_vocab(
-            input_tensor=tensor,
-            rank=rank,
-            group=_get_process_group(group),
-            max_tokens_num=fusion_params.max_token_num,
-            local_vocab_size=fusion_params.local_vocab_size,
-            launch_with_pdl=pdl_enabled(),
-            fallback_all_gather=fallback_all_gather,
         )
 
     raise ValueError(

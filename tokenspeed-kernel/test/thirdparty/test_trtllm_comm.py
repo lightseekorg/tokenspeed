@@ -43,16 +43,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 _num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-_sm_major = (
-    torch.cuda.get_device_capability(0)[0]
-    if _num_gpus > 0 and current_platform().is_nvidia
-    else 0
-)
 
 requires_multi_gpu = pytest.mark.skipif(_num_gpus < 2, reason="need >=2 GPUs")
-requires_sm_below_100 = pytest.mark.skipif(
-    _sm_major >= 10, reason="SM100+: known kernel incompatibility"
-)
 
 
 def find_free_port():
@@ -331,85 +323,6 @@ def _worker_reducescatter(rank, world_size, port, results):
         cleanup()
 
 
-# ─── Test: Simple AllGather (skip on SM100/B200 — known kernel crash) ───
-
-
-def _worker_simple_allgather(rank, world_size, port, results):
-    device = setup_distributed(rank, world_size, port)
-    try:
-        import tokenspeed_kernel.thirdparty.cuda.trtllm as tk_comm
-
-        sm_major = torch.cuda.get_device_capability(rank)[0]
-        if sm_major >= 10:
-            if rank == 0:
-                print("  simple_allgather: SKIP (SM100+, known kernel incompatibility)")
-                results["simple_allgather"] = True
-            dist.barrier()
-            cleanup()
-            return
-
-        hidden_dim = 2048
-        max_token_num = 64
-        dtype = torch.bfloat16
-
-        ipc_handles, workspace_tensor = tk_comm.create_ipc_workspace_for_allgather(
-            rank,
-            world_size,
-            max_token_num,
-            hidden_dim * world_size,
-            group=dist.group.WORLD,
-        )
-
-        all_ok = True
-        for token_num in [1, 8, 16]:
-            torch.manual_seed(42 + rank)
-            local_in = torch.randn(token_num, hidden_dim, dtype=dtype, device=device)
-            out = torch.empty(
-                token_num, hidden_dim * world_size, dtype=dtype, device=device
-            )
-
-            all_inputs = [torch.empty_like(local_in) for _ in range(world_size)]
-            dist.all_gather(all_inputs, local_in)
-            ref_out = torch.cat(all_inputs, dim=1)
-
-            dist.barrier()
-            tk_comm.simple_all_gather(
-                allgather_in=local_in,
-                world_size=world_size,
-                world_rank=rank,
-                token_num=token_num,
-                hidden_size=hidden_dim,
-                workspace_ptrs=workspace_tensor,
-                launch_with_pdl=True,
-                trigger_completion_at_end=False,
-                max_num_tokens=max_token_num,
-                allgather_out=out,
-                max_sm_to_use=None,
-            )
-            torch.cuda.synchronize()
-
-            match = torch.equal(out, ref_out)
-            if rank == 0:
-                status = "PASS" if match else "FAIL"
-                print(f"  simple_allgather tok={token_num}: {status}")
-                if not match:
-                    all_ok = False
-
-            dist.barrier()
-
-        tk_comm.destroy_ipc_workspace_for_allgather(ipc_handles, group=dist.group.WORLD)
-        if rank == 0:
-            results["simple_allgather"] = all_ok
-    except Exception as e:
-        if rank == 0:
-            import traceback
-
-            traceback.print_exc()
-            results["simple_allgather"] = False
-    finally:
-        cleanup()
-
-
 # ─── Pytest-compatible multi-GPU test runner ───
 
 
@@ -433,9 +346,3 @@ def test_allreduce():
 @requires_multi_gpu
 def test_reducescatter():
     _spawn_test(_worker_reducescatter, "reducescatter")
-
-
-@requires_multi_gpu
-@requires_sm_below_100
-def test_simple_allgather():
-    _spawn_test(_worker_simple_allgather, "simple_allgather")

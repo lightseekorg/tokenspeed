@@ -323,17 +323,6 @@ class TestFusionParams:
         assert params.fusion_op == FusionOp.RESIDUAL_RMS_NORM
         assert params.norm_weight is weight
 
-    def test_vocab_gather_params(self):
-        from tokenspeed.runtime.distributed.comm_ops import FusionOp, FusionParams
-
-        params = FusionParams(
-            fusion_op=FusionOp.AG_VOCAB,
-            local_vocab_size=32000,
-            max_token_num=2048,
-        )
-        assert params.fusion_op == FusionOp.AG_VOCAB
-        assert params.local_vocab_size == 32000
-
 
 # ---------------------------------------------------------------------------
 # Multi-GPU test classes
