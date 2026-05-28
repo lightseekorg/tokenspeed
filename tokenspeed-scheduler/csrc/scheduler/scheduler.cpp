@@ -43,6 +43,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
+#include "resource/radix_tree/node_range.h"
 #include "resource/radix_tree/radix_tree.h"
 #include "resource/radix_tree/tree_node.h"
 #include "scheduler/execution_event.h"
@@ -288,6 +289,30 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
             cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
             CacheOpSpec spec;
             spec.request_id = id;
+            // Capture L3 backup metadata while the host node-ref is still alive.
+            // write_diff pages correspond to the tail of the full root→leaf hash path.
+            if (config_.enable_l3_storage) {
+                TreeNode* host_node = req->GetHostNode<fsm::Draining>();
+                if (host_node) {
+                    std::vector<std::string> all_hashes;
+                    for (TreeNode* n : RootToLeaf(host_node)) {
+                        const auto& h = n->PageHashes();
+                        all_hashes.insert(all_hashes.end(), h.begin(), h.end());
+                    }
+                    std::int32_t n_kv_pairs = 0;
+                    for (const auto& p : pages_to_transfer) {
+                        if (p.kind == CacheKind::kKV) n_kv_pairs++;
+                    }
+                    if (n_kv_pairs > 0 && static_cast<std::int32_t>(all_hashes.size()) >= n_kv_pairs) {
+                        spec.backup_rolling_hashes.assign(all_hashes.end() - n_kv_pairs, all_hashes.end());
+                        for (const auto& p : pages_to_transfer) {
+                            if (p.kind == CacheKind::kKV) {
+                                spec.backup_host_pages.push_back(p.dst);
+                            }
+                        }
+                    }
+                }
+            }
             cache_op_tracker_[op_id] = std::move(spec);
             ops.push_back(WriteBackOperation{
                 op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
@@ -338,6 +363,15 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             plan.With(CacheOperation{FlatLoadBackOperation{*lb}});
         }
     }
+    // Emit L3 storage ops (prefetch from newForwardOperation, backup from WriteBackDone handler).
+    for (auto& op : pending_prefetch_ops_) {
+        plan.With(CacheOperation{std::move(op)});
+    }
+    pending_prefetch_ops_.clear();
+    for (auto& op : pending_backup_ops_) {
+        plan.With(CacheOperation{std::move(op)});
+    }
+    pending_backup_ops_.clear();
     if (std::getenv("DEBUG_MEM")) {
         check_device_mem();
     }

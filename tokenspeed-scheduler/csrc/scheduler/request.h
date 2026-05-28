@@ -271,6 +271,16 @@ public:
             state_);
     }
 
+    template <typename S>
+        requires(std::same_as<S, fsm::Draining>)
+    TreeNode* GetHostNode() const {
+        return std::visit(Overloaded{
+            [](const fsm::Draining& s) -> TreeNode* { return s.HostNode(); },
+            [](const auto&) -> TreeNode* { return nullptr; },
+            },
+            state_);
+    }
+
 private:
     std::string id_;
     TokenContainer token_container_;

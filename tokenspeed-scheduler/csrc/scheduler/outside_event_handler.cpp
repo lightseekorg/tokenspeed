@@ -152,12 +152,25 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
     auto now = std::chrono::steady_clock::now();
     for (TreeNode* n : spec.nodes) n->Touch(now);
 
+    // Generate L3 backup from the pages just written to host (fire-and-forget).
+    if (config_.enable_l3_storage && !spec.backup_host_pages.empty()) {
+        BackUpOperation backup_op;
+        backup_op.op_id = kv_prefix_cache_.AllocateCacheOpId();
+        backup_op.src_pages = std::move(spec.backup_host_pages);
+        backup_op.rolling_page_hashes = std::move(spec.backup_rolling_hashes);
+        pending_backup_ops_.push_back(std::move(backup_op));
+    }
+
     if (!spec.request_id.empty()) {
         if (auto* req = find_request(spec.request_id)) {
             req->Apply(
                 fsm::WriteBackDoneEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
         }
     }
+}
+
+void Scheduler::handleEvent(const cache::BackUpDone& event) {
+    // Reserved for future use (e.g. marking tree nodes as persisted).
 }
 
 }  // namespace tokenspeed

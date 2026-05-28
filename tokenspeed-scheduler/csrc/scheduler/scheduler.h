@@ -112,6 +112,7 @@ private:
 private:
     void handleEvent(const cache::PrefetchDone& event);
     void handleEvent(const cache::WriteBackDone& event);
+    void handleEvent(const cache::BackUpDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
@@ -143,6 +144,9 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::unordered_map<cache_op_id, CacheOpSpec> cache_op_tracker_;
     std::vector<KvCacheEvent> kv_events_;
+    // L3 ops produced during scheduling / event handling, drained in NextExecutionPlan().
+    std::vector<PrefetchOperation> pending_prefetch_ops_;
+    std::vector<BackUpOperation> pending_backup_ops_;
     // Stats
     SchedulerStats stats_;
 };

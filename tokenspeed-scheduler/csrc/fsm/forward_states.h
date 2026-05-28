@@ -297,6 +297,8 @@ public:
     // Transfer pairs that must be copied Device→Host.
     const std::vector<PagePair>& GetPagesToTransfer() const { return pages_to_transfer_; }
 
+    TreeNode* HostNode() const { return host_node_ref_ ? host_node_ref_->Node() : nullptr; }
+
     std::unique_ptr<DeviceNodeRef> TakeDeviceNodeRef() && { return std::move(device_node_ref_); }
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
     std::vector<TreeNode*> TakeMambaWriteBackNodes() && { return std::move(mamba_writeback_nodes_); }

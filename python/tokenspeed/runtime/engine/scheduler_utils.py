@@ -40,6 +40,7 @@ from tokenspeed_scheduler import (
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
+    "BackUpDoneEvent": Cache.BackUpDoneEvent,
 }
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 

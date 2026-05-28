@@ -550,7 +550,7 @@ std::tuple<std::vector<ForwardOperation>, std::variant<std::vector<LoadBackOpera
 Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     auto priority = [&](const Request* req) -> int {
         if (req->Is<fsm::Prefilling>()) return 1;
-        if (req->Is<fsm::Submitted>()) return 2;
+        if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>()) return 2;
         if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
             // Decode-first if mixed-batch is enabled; prefill-first otherwise.
             return config_.enable_mixed_prefill_decode ? 0 : 3;
@@ -594,18 +594,30 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Submitted>() || request->Is<fsm::PrefetchDone>()) {
-            // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
-            std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
-
-            if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
-                                                    config_.disable_l2_cache, simulated_free)) {
-                std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
-                std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
-                push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
-                // will be empty when disable_l2_cache
-                if (!loadback_diff.empty() || !mamba_loadback_nodes.empty()) {
-                    cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
-                    loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_nodes, op_id));
+            // L3 prefetch path: for Submitted requests with enough L3 hits,
+            // start an async L3→Host transfer before entering prefill.
+            bool prefetch_scheduled = false;
+            if (request->Is<fsm::Submitted>()) {
+                auto token_pages = request->GetFullPagedTokens(true);
+                MatchResult match = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(token_pages)
+                                                         : kv_prefix_cache_.Match(token_pages);
+                if (auto prefetch_ev = schedulePrefetch(request, match)) {
+                    pending_prefetch_ops_.push_back(applyEventAndGenerateOp(request, std::move(*prefetch_ev)));
+                    prefetch_scheduled = true;
+                }
+            }
+            // PrefetchDone or Submitted without L3 hit: proceed to prefill.
+            if (!prefetch_scheduled) {
+                std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+                if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
+                                                        config_.disable_l2_cache, simulated_free)) {
+                    std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
+                    std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
+                    push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
+                    if (!loadback_diff.empty() || !mamba_loadback_nodes.empty()) {
+                        cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
+                        loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_nodes, op_id));
+                    }
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
