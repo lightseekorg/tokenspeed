@@ -100,10 +100,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from tokenspeed.runtime.spec_decode.helper import (
-    apply_draft_active_row_slice_post_attn,
-    apply_draft_active_row_slice_pre_oproj,
-)
+from tokenspeed.runtime.spec_decode.draft_attn_wrapper import DraftSliceAttnWrapper
 from tokenspeed.runtime.utils import (
     add_prefix,
     make_layers,
@@ -751,7 +748,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             sigmoid_mul(attn_output, gate)
 
-        attn_output = apply_draft_active_row_slice_pre_oproj(attn_output, ctx)
+        attn_output = DraftSliceAttnWrapper.pre_oproj(attn_output, ctx)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -781,8 +778,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
             )
 
-        hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
-            hidden_states, residual, ctx,
+        hidden_states, residual, ctx = DraftSliceAttnWrapper.post_attn(
+            hidden_states,
+            residual,
+            ctx,
         )
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx

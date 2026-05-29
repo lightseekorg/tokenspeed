@@ -35,7 +35,6 @@ from transformers import LlamaConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -55,10 +54,7 @@ from tokenspeed.runtime.models.base import (
     BaseTransformerModel,
 )
 from tokenspeed.runtime.models.utils import create_fused_set_kv_buffer_arg
-from tokenspeed.runtime.spec_decode.helper import (
-    apply_draft_active_row_slice_post_attn,
-    apply_draft_active_row_slice_pre_oproj,
-)
+from tokenspeed.runtime.spec_decode.draft_attn_wrapper import DraftSliceAttnWrapper
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -141,12 +137,14 @@ class LlamaAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = PagedAttention(
-            self.num_heads,
-            self.head_dim,
-            self.head_dim**-0.5,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
+        self.attn = DraftSliceAttnWrapper(
+            PagedAttention(
+                self.num_heads,
+                self.head_dim,
+                self.head_dim**-0.5,
+                num_kv_heads=self.num_kv_heads,
+                layer_id=layer_id,
+            )
         )
 
     def forward(
@@ -190,56 +188,20 @@ class LlamaAttention(nn.Module):
                 output_q_rope=q_rope,
                 enable_pdl=pdl_enabled(),
             )
-            attn_output = self._apply_draft_active_attn_dispatch(
-                q_rope, ctx, out_cache_loc,
+            attn_output = self.attn(
+                q_rope,
+                None,
+                None,
+                ctx=ctx,
+                out_cache_loc=out_cache_loc,
+                save_kv_cache=False,
             )
         else:
             q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
-            attn_output = apply_draft_active_row_slice_pre_oproj(attn_output, ctx)
 
         output, _ = self.o_proj(attn_output)
         return output
-
-    def _apply_draft_active_attn_dispatch(
-        self,
-        q_rope: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        """KV is already pre-written via fused_set_kv_buffer_arg before this call.
-
-        Decode catch-up (``forward_mode.is_decode()`` + ``draft_active_row_slice``
-        + ``gather_ids`` set): slice Q to one query per request and route through
-        the decode kernel (Optimization B for prewrite backends); output is
-        already bs rows.
-
-        All other paths (EXTEND/MIXED prefill, idle, no-spec): run the standard
-        extend kernel, then slice attn_output so o_proj and the layer-level
-        ``apply_draft_active_row_slice_post_attn`` see bs rows.
-        """
-        if (
-            ctx.draft_active_row_slice
-            and ctx.gather_ids is not None
-            and ctx.forward_mode.is_decode()
-        ):
-            q_rope = q_rope.index_select(0, ctx.gather_ids)
-            return ctx.attn_backend.forward(
-                q_rope,
-                None,
-                None,
-                self.attn,
-                out_cache_loc,
-                ctx.token_to_kv_pool,
-                ForwardMode.DECODE,
-                ctx.bs,
-                save_kv_cache=False,
-            )
-        attn_output = self.attn(
-            q_rope, None, None,
-            save_kv_cache=False, ctx=ctx, out_cache_loc=out_cache_loc,
-        )
-        return apply_draft_active_row_slice_pre_oproj(attn_output, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +364,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
-            hidden_states, residual, ctx,
+        hidden_states, residual, ctx = DraftSliceAttnWrapper.post_attn(
+            hidden_states,
+            residual,
+            ctx,
         )
 
         # Fused post-attn allreduce + norm (uses attn tp group)
@@ -470,8 +434,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
-            hidden_states, residual, ctx,
+        hidden_states, residual, ctx = DraftSliceAttnWrapper.post_attn(
+            hidden_states,
+            residual,
+            ctx,
         )
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
