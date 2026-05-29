@@ -1,5 +1,7 @@
 #!/usr/bin/bash
 
+# Tested on SGLang tag: 0.5.12.post1
+
 set -euo pipefail
 
 # Prepare dataset
