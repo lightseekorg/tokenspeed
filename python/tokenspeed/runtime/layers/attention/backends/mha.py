@@ -307,31 +307,17 @@ class MHAAttnBackend(AttentionBackend):
             k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
             v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
-        if q_len_per_req > 1:
-            return self._forward_spec_decode(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                self.forward_decode_metadata,
-                save_kv_cache=save_kv_cache,
-                sinks=kwargs.get("sinks"),
-            )
-        else:
-            return self._forward_decode(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                self.forward_decode_metadata,
-                save_kv_cache=save_kv_cache,
-                sinks=kwargs.get("sinks"),
-            )
+        return self._forward_decode(
+            q,
+            k,
+            v,
+            layer,
+            out_cache_loc,
+            token_to_kv_pool,
+            self.forward_decode_metadata,
+            save_kv_cache=save_kv_cache,
+            sinks=kwargs.get("sinks"),
+        )
 
     def forward_extend(
         self,
@@ -565,44 +551,6 @@ class MHAAttnBackend(AttentionBackend):
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
             scheduler_metadata=metadata.scheduler_metadata,
-            solution=self.kernel_solution,
-        )
-        output = self._unwrap_output(result)
-        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-    def _forward_spec_decode(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        metadata: MHADecodeMetadata,
-        save_kv_cache: bool,
-        sinks: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if save_kv_cache:
-            token_to_kv_pool.set_kv_buffer(
-                layer,
-                out_cache_loc,
-                k,
-                v,
-                layer.k_scale,
-                layer.v_scale,
-            )
-
-        k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        result = mha_decode_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=metadata.page_table,
-            cache_seqlens=metadata.seq_lens,
-            window_left=layer.sliding_window_size,
-            logit_cap=layer.logit_cap,
-            sinks=sinks,
-            max_seqlen_k=self.max_context_len,
             solution=self.kernel_solution,
         )
         output = self._unwrap_output(result)
