@@ -95,24 +95,6 @@ _paged_prefill_metadata_buffers: dict[
 ] = {}
 
 
-def _validate_mha_prefill_cu_seqlens_cpu(cu_seqlens_cpu: list[int]) -> None:
-    if not isinstance(cu_seqlens_cpu, list):
-        raise TypeError(
-            f"cu_seqlens_cpu must be list[int], got {type(cu_seqlens_cpu).__name__}"
-        )
-    if not cu_seqlens_cpu:
-        raise ValueError("cu_seqlens_cpu must not be empty")
-    if any(type(x) is not int for x in cu_seqlens_cpu):
-        raise TypeError("cu_seqlens_cpu must contain only int values")
-    if cu_seqlens_cpu[0] != 0:
-        raise ValueError("cu_seqlens_cpu must start with 0")
-    prev = cu_seqlens_cpu[0]
-    for cur in cu_seqlens_cpu[1:]:
-        if cur < prev:
-            raise ValueError("cu_seqlens_cpu must be monotonic non-decreasing")
-        prev = cur
-
-
 @triton.jit
 def _build_paged_prefill_metadata_kernel(
     page_table,
@@ -224,7 +206,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
             raise NotImplementedError(
                 "FlashInfer ragged prefill does not support sinks"
             )
-        _validate_mha_prefill_cu_seqlens_cpu(cu_seqlens_cpu)
         wrapper = _get_ragged_prefill_wrapper(q.device)
         wrapper.plan(
             cu_seqlens,
