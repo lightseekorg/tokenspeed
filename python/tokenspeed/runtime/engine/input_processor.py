@@ -144,7 +144,7 @@ class InputProcessor:
             # VisionEmbedder can plan vision-token scatter ranges from each
             # item's offsets — the bare placeholder token alone would not
             # encode per-item uniqueness needed by the radix prefix layer.
-            if not self.engine.model_config.is_multimodal:
+            if not self.engine.model_config.is_multimodal_active:
                 raise ValueError(
                     "precomputed_multimodal_inputs is provided for a text-only model."
                 )

@@ -210,7 +210,9 @@ class LogitsProcessor(nn.Module):
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
             gather_ids = logits_metadata.gather_ids
-            if gather_ids is None:
+            # Shapes align iff midlayer already pruned to one row per request
+            # (draft first-step reduce). Other paths emit [N, H] with N > bs.
+            if gather_ids is None or gather_ids.shape[0] == hidden_states.shape[0]:
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
@@ -411,7 +413,7 @@ class LogitsProcessor(nn.Module):
                 .view(logits.size(0), -1)
             )
 
-        logits = logits[:, : self.config.vocab_size].float()
+        logits = logits[:, : self.config.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)
@@ -480,6 +482,7 @@ class LogitsProcessor(nn.Module):
         Returns:
             torch.Tensor: logprobs from logits
         """
+        last_logits = last_logits.float()
         # Scale logits if temperature scaling is enabled
         if logits_metadata.temp_scaled_logprobs:
             last_logits = last_logits / logits_metadata.temperature
@@ -513,7 +516,7 @@ def fused_softcap_kernel(
     mask = offsets < n_elements
 
     # Load values
-    x = tl.load(full_logits_ptr + offsets, mask=mask)
+    x = tl.load(full_logits_ptr + offsets, mask=mask).to(tl.float32)
 
     # Perform operations in-place
     x = x / softcapping_value

@@ -105,8 +105,8 @@ class Bf16FlashinferCutlassBackend(MoEBackend):
             activation_type=ActivationType.Swiglu,
             dtype=x.dtype,
             features={"pre_routed"},
+            weight_format="bf16",
             traits={
-                "weight_dtype": "bf16",
                 "tp": True,
                 "ep": True,
                 "cuda_graph": False,

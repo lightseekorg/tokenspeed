@@ -37,7 +37,7 @@ choices (still evolving; subject to change):
                        public API  (mha_prefill, mm, moe_fused, ...)
                                        │
                            ┌───────────┴───────────┐
-                           │     select_kernel     │  (family, mode, dtype, traits, ...)
+                           │     select_kernel     │  (family, mode, format_signature, traits, ...)
                            └───────────┬───────────┘
                                        │ queries
                             ┌──────────┴──────────┐
@@ -57,8 +57,8 @@ choices (still evolving; subject to change):
 ```
 
 - **Registration** — backends register with `@register_kernel(family, mode, ...)`,
-  declaring supported dtypes, arch capability requirements, traits (head dim,
-  GQA factor, ...), and a priority band.
+  declaring supported `format_signatures`, arch capability requirements,
+  non-format traits (head dim, GQA factor, ...), and a priority band.
 - **Auto-selection** — `select_kernel` filters by capability and traits,
   ranks the survivors with an optional per-family `SelectionOracle` and
   priority, and returns a callable. Selection accepts an objective (latency,
@@ -71,6 +71,7 @@ choices (still evolving; subject to change):
 tokenspeed_kernel/
   __init__.py            # Public API re-exports
   platform.py            # PlatformInfo, capability detection
+  signature.py           # TensorFormat, ScaleFormat, FormatSignature
   registry.py            # KernelRegistry, register_kernel, Priority bands
   selection.py           # select_kernel, oracles, overrides
   profiling.py           # ShapeCapture, kernel_scope, Proton bootstrap

@@ -50,7 +50,6 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import apply_rotary_pos_emb_native
 from tokenspeed.runtime.utils import add_prefix, round_up
-from tokenspeed.runtime.utils.env import envs, get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +349,7 @@ class VisionAttention(nn.Module):
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        mm_attention_backend: str | None = None,
     ):
         super().__init__()
         self.vision = mapping.vision
@@ -370,9 +370,7 @@ class VisionAttention(nn.Module):
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
         )
-        self._backend_fn = _resolve_backend(
-            get_global_server_args().mm_attention_backend
-        )
+        self._backend_fn = _resolve_backend(mm_attention_backend)
         self._workspace_buffer = workspace_buffer
 
         self.qkv_proj = QKVParallelLinear(

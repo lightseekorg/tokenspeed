@@ -261,8 +261,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.num_splits = 0
         self.cuda_graph_scheduler_num_splits = FA3_CUDA_GRAPH_SCHEDULER_NUM_SPLITS
 
-    @property
-    def support_kv_cache_prewrite(self) -> bool:
+    def support_kv_cache_prewrite(
+        self, forward_mode: ForwardMode | None = None
+    ) -> bool:
         return True
 
     def configure_runtime(self, **kwargs) -> None:

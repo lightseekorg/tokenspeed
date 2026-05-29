@@ -77,6 +77,7 @@ class ServerArgs:
     device: str = "cuda"
     served_model_name: str | None = None
     revision: str | None = None
+    language_model_only: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -355,6 +356,7 @@ class ServerArgs:
             gpu_mem = None
 
         # Set GPU memory utilization, which depends on the tensor parallelism size.
+        self._gpu_memory_utilization_defaulted = False
         if self.gpu_memory_utilization is None:
             if self.mapping.world_size >= 16:
                 self.gpu_memory_utilization = 0.79
@@ -366,6 +368,7 @@ class ServerArgs:
                 self.gpu_memory_utilization = 0.87
             else:
                 self.gpu_memory_utilization = 0.88
+            self._gpu_memory_utilization_defaulted = True
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
@@ -696,6 +699,13 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.skip_tokenizer_init,
             help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--language-model-only",
+            action="store_true",
+            default=ServerArgs.language_model_only,
+            help="Skip vision/audio encoders on a multimodal checkpoint and "
+            "run text-only. Multimodal requests are rejected.",
         )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(
@@ -1292,7 +1302,7 @@ class ServerArgs:
             help="Sampling backend. "
             "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
-            "'flashinfer': temperature/top_k/top_p via one fused kernel (top_k_top_p_sampling_from_logits); "
+            "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "

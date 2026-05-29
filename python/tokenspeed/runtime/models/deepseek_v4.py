@@ -63,14 +63,10 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.trtllm import (
     fast_topk_v2,
 )
-from tokenspeed_kernel.thirdparty.trtllm import (
-    per_token_group_quant_8bit as trtllm_fp8_quantize_1x128,
-)
 from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_FP8_BLOCK_SIZE,
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
     deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
     deepseek_v4_indexer_mxfp4_scale_dim,
@@ -154,12 +150,6 @@ def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tenso
     if scale is None or weight.dtype != torch.float8_e4m3fn:
         return weight.float()
 
-    cache = getattr(layer, "_deepseek_v4_dequant_cache", None)
-    if cache is not None:
-        cached_shape, cached_weight = cache
-        if cached_shape == tuple(shape):
-            return cached_weight
-
     block_n, block_k = getattr(layer.quant_config, "weight_block_size", (128, 128))
     if len(shape) == 2:
         out_dim, in_dim = shape
@@ -172,9 +162,7 @@ def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tenso
             .repeat_interleave(block_n, dim=0)
             .repeat_interleave(block_k, dim=1)
         )
-        out = weight.float() * expanded_scale[:out_dim, :in_dim]
-        layer._deepseek_v4_dequant_cache = (tuple(shape), out)
-        return out
+        return weight.float() * expanded_scale[:out_dim, :in_dim]
 
     groups, out_dim, in_dim = shape
     scale = scale.view(
@@ -187,59 +175,7 @@ def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tenso
         .repeat_interleave(block_n, dim=1)
         .repeat_interleave(block_k, dim=2)
     )
-    out = weight.float() * expanded_scale[:, :out_dim, :in_dim]
-    layer._deepseek_v4_dequant_cache = (tuple(shape), out)
-    return out
-
-
-def _fp8_act_quant_dequant(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
-    """Simulate DeepSeek V4's block FP8 activation quantization."""
-
-    if x.shape[-1] % block_size != 0:
-        raise ValueError(
-            f"DeepSeek V4 FP8 activation quantization expects K divisible by "
-            f"{block_size}, got {x.shape[-1]}"
-        )
-    orig_shape = x.shape
-
-    if x.is_cuda and block_size == DEEPSEEK_V4_FP8_BLOCK_SIZE:
-        x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
-        quantized, scale = trtllm_fp8_quantize_1x128(
-            x_2d,
-            block_size,
-            use_ue8m0=True,
-        )
-        scale = scale.float().transpose(0, 1).contiguous()
-        return (
-            (quantized.float().unflatten(-1, (-1, block_size)) * scale.unsqueeze(-1))
-            .flatten(-2)
-            .reshape(orig_shape)
-        )
-
-    x_blocks = x.float().reshape(-1, orig_shape[-1]).unflatten(-1, (-1, block_size))
-    amax = x_blocks.abs().amax(dim=-1).clamp_min(1.0e-4)
-    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
-    scale = scale.to(torch.float8_e8m0fnu).float()
-    quantized = (
-        (x_blocks / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    )
-    return (quantized.float() * scale.unsqueeze(-1)).flatten(-2).reshape(orig_shape)
-
-
-def _fp8_linear(
-    layer: nn.Module,
-    x: torch.Tensor,
-    shape: tuple[int, ...],
-    *,
-    quantize_act: bool = True,
-) -> torch.Tensor:
-    weight = _dequant_fp8_weight(layer, shape)
-    x_eff = (
-        _fp8_act_quant_dequant(x, DEEPSEEK_V4_FP8_BLOCK_SIZE)
-        if quantize_act and layer.weight.dtype == torch.float8_e4m3fn
-        else x.float()
-    )
-    return torch.matmul(x_eff, weight.transpose(-2, -1)).to(x.dtype)
+    return weight.float() * expanded_scale[:, :out_dim, :in_dim]
 
 
 def _deepseek_v4_router_gemm(
@@ -2035,26 +1971,13 @@ class DeepseekV4MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((0, self.down_proj.output_size))
-        gate_up = _fp8_linear(
-            self.gate_up_proj,
-            x,
-            (
-                self.gate_up_proj.output_size_per_partition,
-                self.gate_up_proj.input_size,
-            ),
-        )
+        gate_up, _ = self.gate_up_proj(x)
         gate, up = gate_up.float().chunk(2, dim=-1)
         if self.swiglu_limit is not None and self.swiglu_limit > 0:
             gate = torch.clamp(gate, max=self.swiglu_limit)
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
         x = (F.silu(gate) * up).to(x.dtype)
-        out = _fp8_linear(
-            self.down_proj,
-            x,
-            (self.down_proj.output_size, self.down_proj.input_size_per_partition),
-        )
-        if self.reduce_results and self.tp_size > 1:
-            out = all_reduce(out, self.tp_rank, self.tp_group)
+        out, _ = self.down_proj(x)
         return out
 
 
@@ -3277,15 +3200,7 @@ class DeepseekV4Attention(nn.Module):
     def _project_q_kv(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qr_kv_shape = (
-            self.fused_wqa_wkv.output_size_per_partition,
-            self.fused_wqa_wkv.input_size,
-        )
-        qr_kv = _fp8_linear(
-            self.fused_wqa_wkv,
-            hidden_states,
-            qr_kv_shape,
-        )
+        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         if self.use_fused_qkv_rmsnorm and qr.is_cuda and qr.shape[0] > 0:
             qr_norm = torch.empty(
@@ -3309,11 +3224,7 @@ class DeepseekV4Attention(nn.Module):
         else:
             qr = self.q_norm(qr)
             kv = self.kv_norm(kv.contiguous())
-        q = _fp8_linear(
-            self.wq_b,
-            qr,
-            (self.wq_b.output_size_per_partition, self.wq_b.input_size),
-        )
+        q, _ = self.wq_b(qr)
         q = q.view(-1, self.num_local_heads, self.head_dim)
         return q, kv, qr
 

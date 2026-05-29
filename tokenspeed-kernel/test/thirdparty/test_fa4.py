@@ -383,10 +383,13 @@ def test_fa4_prefill_selection_accepts_head_dim_256() -> None:
     assert spec.solution == "fa4"
     assert 256 in spec.traits["head_dim"]
 
+    signature = spec.format_signature_for_storage_dtype(torch.bfloat16, "q")
+    assert signature is not None
+
     selected = select_kernel(
         "attention",
         "mha_prefill",
-        torch.bfloat16,
+        signature,
         traits={
             "head_dim": 256,
             "sliding_window": False,

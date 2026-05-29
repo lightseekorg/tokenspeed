@@ -23,10 +23,15 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
+from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import Tolerance
-from tokenspeed_kernel.numerics.verify import verify_kernel
+from tokenspeed_kernel.numerics.verify import (
+    _verification_signature_and_reference,
+    verify_kernel,
+)
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
+from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 
@@ -59,9 +64,105 @@ class TestCompareOutputs:
         assert result.num_mismatches == 1
 
 
+def test_gemm_input_generator_uses_signature_scale_metadata() -> None:
+    scale = ScaleFormat(
+        storage_dtype=torch.float32,
+        granularity="block",
+        block_shape=(128, 128),
+    )
+    signature = next(
+        iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(M=4, N=256, K=128)
+
+    assert inputs["A"].dtype == _fp8_dtype
+    assert inputs["B"].dtype == _fp8_dtype
+    assert inputs["A_scales"].shape == (4, 1)
+    assert inputs["B_scales"].shape == (2, 1)
+    assert inputs["A_scales"].dtype == torch.float32
+    assert inputs["B_scales"].dtype == torch.float32
+    assert inputs["block_size"] == [128, 128]
+
+
+def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
+    scale = ScaleFormat(
+        storage_dtype=torch.float32,
+        granularity="block",
+        dynamic_block_shape=True,
+    )
+    signature = next(
+        iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="requires concrete block_shape"):
+        generator.generate(M=4, N=256, K=128)
+
+
+def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:
+    tensor_scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+    channel_scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+    tensor_signature = next(
+        iter(
+            format_signatures(
+                ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=tensor_scale
+            )
+        )
+    )
+    channel_signature = next(
+        iter(
+            format_signatures(
+                ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=channel_scale
+            )
+        )
+    )
+    ref_spec = KernelSpec(
+        name="test_tensor_scale_reference",
+        family="gemm",
+        mode="mm",
+        solution="reference",
+        format_signatures=frozenset({tensor_signature}),
+        traits={"b_layout": frozenset({"KN"})},
+    )
+    test_spec = KernelSpec(
+        name="test_fp8_scaled",
+        family="gemm",
+        mode="mm",
+        solution="triton",
+        format_signatures=frozenset({channel_signature, tensor_signature}),
+        traits={"b_layout": frozenset({"KN"})},
+    )
+    registry = KernelRegistry.get()
+    registry.register(ref_spec, lambda **_kwargs: None)
+    registry.register(test_spec, lambda **_kwargs: None)
+
+    signature, reference = _verification_signature_and_reference(
+        registry, test_spec, _fp8_dtype, "a"
+    )
+
+    assert signature == tensor_signature
+    assert reference is ref_spec
+
+
 class TestNumericsVerification:
     def _get_verifiable_specs(
-        dtype: torch.dtype, family: str | None = None
+        dtype: torch.dtype, dtype_role: str, family: str | None = None
     ) -> list[KernelSpec]:
         load_builtin_kernels()
         registry = KernelRegistry.get()
@@ -72,13 +173,16 @@ class TestNumericsVerification:
                 continue
             # Only run kernels that have a paired reference for this dtype;
             # otherwise verify_kernel raises ValueError and the test errors.
-            has_reference = any(
-                s.solution == "reference"
-                for s in registry.get_for_operator(family_name, mode, dtype=dtype)
-            )
+            op_specs = registry.get_for_operator(family_name, mode)
+            dtype_specs = [
+                s
+                for s in op_specs
+                if s.format_signatures_for_storage_dtype(dtype, dtype_role)
+            ]
+            has_reference = any(s.solution == "reference" for s in dtype_specs)
             if not has_reference:
                 continue
-            for spec in registry.get_for_operator(family_name, mode, dtype=dtype):
+            for spec in dtype_specs:
                 if spec.solution == "reference":
                     continue
                 if spec.solution == "deep_gemm":
@@ -89,12 +193,14 @@ class TestNumericsVerification:
         specs.sort(key=lambda s: (s.family, s.mode, s.name))
         return specs
 
-    def _verify(self, spec: KernelSpec, dtype: torch.dtype) -> None:
+    def _verify(self, spec: KernelSpec, dtype: torch.dtype, dtype_role: str) -> None:
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required for numerics verification")
 
         try:
-            results = verify_kernel(spec.name, dtype=dtype, verbose=False)
+            results = verify_kernel(
+                spec.name, dtype=dtype, dtype_role=dtype_role, verbose=False
+            )
         except Exception as exc:
             pytest.fail(
                 f"Kernel {spec.name} raised an exception during verification: {exc}"
@@ -109,32 +215,32 @@ class TestNumericsVerification:
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(_fp8_dtype, family="gemm"),
+        _get_verifiable_specs(_fp8_dtype, "a", family="gemm"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_gemm_fp8(self, spec: KernelSpec):
-        self._verify(spec, _fp8_dtype)
+        self._verify(spec, _fp8_dtype, "a")
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(torch.bfloat16, family="gemm"),
+        _get_verifiable_specs(torch.bfloat16, "a", family="gemm"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_gemm_bf16(self, spec: KernelSpec):
-        self._verify(spec, torch.bfloat16)
+        self._verify(spec, torch.bfloat16, "a")
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(torch.bfloat16, family="quantize"),
+        _get_verifiable_specs(torch.bfloat16, "x", family="quantize"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_quantize_bf16(self, spec: KernelSpec):
-        self._verify(spec, torch.bfloat16)
+        self._verify(spec, torch.bfloat16, "x")
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(torch.int32, family="moe"),
+        _get_verifiable_specs(torch.int32, "indices", family="moe"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
     def test_moe_int32(self, spec: KernelSpec):
-        self._verify(spec, torch.int32)
+        self._verify(spec, torch.int32, "indices")
