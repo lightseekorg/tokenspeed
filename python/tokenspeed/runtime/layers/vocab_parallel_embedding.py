@@ -500,7 +500,13 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.shard_indices.added_vocab_end_index,
             )
         else:
-            masked_input = input_
+            # Single-rank (DP / replicated) path has no shard mask, so an
+            # out-of-range id (e.g. CUDA-graph capture warmup where the drafter
+            # feeds argmax over uninitialized logits) hits F.embedding OOB.
+            # Clamp here for parity with the tp_size>1 mask path; under normal
+            # inference upstream guarantees id < num_embeddings_padded so this
+            # is a no-op.
+            masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
 
         # Get the embeddings.
         output_parallel = self.linear_method.embedding(self, masked_input)
