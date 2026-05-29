@@ -225,14 +225,7 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        draft_first_mode = (
-            ForwardMode.DRAFT_EXTEND
-            if forward_mode.is_target_verify()
-            else forward_mode
-        )
-
         draft_first_step_reduce = forward_mode.is_decode()
-
         if draft_first_step_reduce and self.attn_backend.support_kv_cache_prewrite:
             # Trim seq_lens by rejected-draft count so the sliced decode
             # query does not attend to dead positions.
@@ -240,6 +233,12 @@ class Eagle(BaseDrafter):
                 self.draft_seq_lens_buf.dtype
             )
             self.draft_seq_lens_buf[:bs].sub_(correction)
+
+        draft_first_mode = (
+            ForwardMode.DRAFT_EXTEND
+            if forward_mode.is_target_verify()
+            else forward_mode
+        )
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,

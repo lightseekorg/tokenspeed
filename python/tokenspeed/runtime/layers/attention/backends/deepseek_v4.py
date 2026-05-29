@@ -514,6 +514,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             token_to_req_indices=metadata.token_to_req_indices,
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
+            is_valid_token=metadata.is_valid_token,
         )
         _refresh_decode_indexer_plan_cache(
             metadata,
@@ -2033,6 +2034,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 token_to_req_indices=metadata.token_to_req_indices,
                 query_start_loc=metadata.query_start_loc,
                 seq_lens=metadata.seq_lens,
+                is_valid_token=metadata.is_valid_token,
             )
             _refresh_decode_indexer_plan_cache(
                 metadata,
@@ -2069,6 +2071,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             token_to_req_indices=metadata.token_to_req_indices,
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
+            is_valid_token=metadata.is_valid_token,
         )
         _refresh_decode_indexer_plan_cache(
             metadata,

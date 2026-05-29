@@ -656,6 +656,11 @@ class CudaGraphWrapper:
         **kwargs,
     ):
         """Eager path — allocate/refresh metadata for the upcoming forward."""
+        if (
+            getattr(self.attn_backend, "uses_paged_cache_groups", False)
+            and forward_mode.is_speculative()
+        ):
+            kwargs.setdefault("num_tokens", padded_bs * self.max_tokens_per_req)
         self.attn_backend.init_forward_metadata(
             bs=padded_bs,
             num_extends=num_extends,
@@ -714,15 +719,21 @@ class CudaGraphWrapper:
                 draft_metadata_seq_lens = (
                     seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
                 )
+                draft_forward_mode = _draft_decode_forward_mode(
+                    self.use_target_verify_forward_mode
+                )
+                if (
+                    getattr(self.draft_attn_backend, "uses_paged_cache_groups", False)
+                    and draft_forward_mode.is_speculative()
+                ):
+                    draft_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
                     num_extends=0,
                     req_pool_indices=req_pool_indices,
                     seq_lens=draft_metadata_seq_lens,
                     req_to_page=self.drafter.req_to_page,
-                    forward_mode=_draft_decode_forward_mode(
-                        self.use_target_verify_forward_mode
-                    ),
+                    forward_mode=draft_forward_mode,
                     **draft_kwargs,
                 )
 

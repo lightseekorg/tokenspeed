@@ -401,6 +401,21 @@ def _safe_page_ids(
     return torch.where(valid, page_ids, sentinel)
 
 
+def _expand_group_values_for_tokens(
+    values: torch.Tensor,
+    num_tokens: int,
+    name: str,
+) -> torch.Tensor:
+    if values.numel() == num_tokens:
+        return values
+    if values.numel() <= 0 or num_tokens % values.numel() != 0:
+        raise RuntimeError(
+            f"DeepSeek V4 {name} has incompatible shape for packed tokens: "
+            f"{values.numel()} entries for {num_tokens} tokens"
+        )
+    return values.repeat_interleave(num_tokens // values.numel())
+
+
 def _group_slot_mapping_from_raw(
     positions: torch.Tensor,
     req_indices: torch.Tensor,
@@ -417,6 +432,11 @@ def _group_slot_mapping_from_raw(
     logical_row = torch.div(pos_i64, entry_stride_tokens, rounding_mode="floor")
     logical_page = torch.div(logical_row, rows_per_page, rounding_mode="floor")
     offsets = logical_row % rows_per_page
+    req_indices = _expand_group_values_for_tokens(
+        req_indices,
+        positions.numel(),
+        "request indices",
+    )
     table_page = logical_page
     if base_offsets is not None:
         req_i64 = req_indices.to(torch.int64)
@@ -434,6 +454,23 @@ def _group_slot_mapping_from_raw(
     page_ids = _safe_page_ids(block_table, req_indices, table_page)
     slots = page_ids * rows_per_page + offsets
     return torch.where(page_ids >= 0, slots, torch.full_like(slots, -1))
+
+
+def _mask_invalid_graph_tokens(
+    slot_mapping: torch.Tensor,
+    is_valid_token: torch.Tensor | None,
+) -> torch.Tensor:
+    if is_valid_token is None:
+        return slot_mapping
+    valid = _expand_group_values_for_tokens(
+        is_valid_token,
+        slot_mapping.numel(),
+        "slot validity mask",
+    ).to(
+        device=slot_mapping.device,
+        dtype=torch.bool,
+    )
+    return torch.where(valid, slot_mapping, torch.full_like(slot_mapping, -1))
 
 
 @dataclass
@@ -486,6 +523,7 @@ class DeepseekV4CacheMetadata:
         seq_lens: torch.Tensor,
         compress_ratio: int,
         kv_cache_block_size: int,
+        is_valid_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = token_to_req_indices.shape[0]
         key = (compress_ratio, kv_cache_block_size)
@@ -535,16 +573,15 @@ class DeepseekV4CacheMetadata:
                     )[req_idx]
                 )
             page_ids = _safe_page_ids(block_table, req_idx, page_indices)
-            out.copy_(
-                torch.where(
-                    page_ids >= 0,
-                    page_ids * kv_cache_block_size + offsets,
-                    torch.full_like(page_ids, -1),
-                )
+            slot_mapping = torch.where(
+                page_ids >= 0,
+                page_ids * kv_cache_block_size + offsets,
+                torch.full_like(page_ids, -1),
             )
+            out.copy_(_mask_invalid_graph_tokens(slot_mapping, is_valid_token))
             return out
 
-        return deepseek_v4_compressed_slot_mapping(
+        mapping = deepseek_v4_compressed_slot_mapping(
             num_tokens=num_tokens,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
@@ -553,6 +590,9 @@ class DeepseekV4CacheMetadata:
             compress_ratio=compress_ratio,
             out=out,
         )
+        if is_valid_token is not None:
+            mapping.copy_(_mask_invalid_graph_tokens(mapping, is_valid_token))
+        return mapping
 
     def refresh_decode_compressed_slot_mappings(
         self,
@@ -560,6 +600,7 @@ class DeepseekV4CacheMetadata:
         token_to_req_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         seq_lens: torch.Tensor,
+        is_valid_token: torch.Tensor | None = None,
     ) -> None:
         for compress_ratio, kv_cache_block_size in list(
             self.decode_compressed_slot_mappings
@@ -570,6 +611,7 @@ class DeepseekV4CacheMetadata:
                 seq_lens=seq_lens,
                 compress_ratio=compress_ratio,
                 kv_cache_block_size=kv_cache_block_size,
+                is_valid_token=is_valid_token,
             )
 
     def compressed_slot_mapping(
@@ -582,6 +624,7 @@ class DeepseekV4CacheMetadata:
         seq_lens: torch.Tensor,
         kv_cache_block_size: int | None = None,
         use_decode_cache: bool = False,
+        is_valid_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
@@ -606,6 +649,7 @@ class DeepseekV4CacheMetadata:
                 seq_lens=seq_lens,
                 compress_ratio=compress_ratio,
                 kv_cache_block_size=kv_cache_block_size,
+                is_valid_token=is_valid_token,
             )
             return mapping[: positions.numel()]
         compressed_pos = torch.div(
@@ -632,11 +676,12 @@ class DeepseekV4CacheMetadata:
                 )
             page_ids = _safe_page_ids(block_table, req_idx, page_indices.long())
         slots = page_ids.to(torch.int64) * kv_cache_block_size + offsets
-        return torch.where(
+        slot_mapping = torch.where(
             page_ids >= 0,
             slots,
             torch.full_like(slots, -1),
         )
+        return _mask_invalid_graph_tokens(slot_mapping, is_valid_token)
 
 
 def deepseek_v4_cache_layout_from_config(

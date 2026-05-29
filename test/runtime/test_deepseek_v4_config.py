@@ -1576,6 +1576,19 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(torch.equal(slots, torch.tensor([640, 641, -1, 1280])))
 
+    def test_deepseek_v4_group_slot_mapping_expands_per_request_indices(self):
+        slots = _group_slot_mapping_from_raw(
+            positions=torch.tensor([0, 1, 2, 64, 65, 66], dtype=torch.int64),
+            req_indices=torch.tensor([0, 1], dtype=torch.int32),
+            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            rows_per_page=64,
+            base_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        )
+
+        self.assertTrue(
+            torch.equal(slots, torch.tensor([640, 641, 642, 1280, 1281, 1282]))
+        )
+
     def test_deepseek_v4_backend_preserves_compact_paged_cache_contract(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
@@ -1942,6 +1955,15 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=metadata.seq_lens,
         )
         self.assertTrue(torch.equal(slots, torch.tensor([640, 641, 671])))
+        masked_slots = metadata.cache.compressed_slot_mapping(
+            torch.tensor([3, 7, 127], dtype=torch.int64),
+            compress_ratio=4,
+            token_to_req_indices=metadata.token_to_req_indices,
+            query_start_loc=metadata.query_start_loc,
+            seq_lens=metadata.seq_lens,
+            is_valid_token=torch.tensor([True, False, True], dtype=torch.bool),
+        )
+        self.assertTrue(torch.equal(masked_slots, torch.tensor([640, -1, 671])))
 
         page256_metadata = _make_deepseek_v4_forward_metadata(
             page_size=256,
