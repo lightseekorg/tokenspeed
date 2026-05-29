@@ -7,6 +7,7 @@ import torch
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
+    dp_sampling_layout_bucket_bs,
     resolve_dp_sampling_min_bs,
     should_use_dp_sampling_for_bucket,
 )
@@ -67,6 +68,12 @@ def test_dp_sampling_min_bs_ignores_env_override(monkeypatch):
     assert resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=12) == 12
 
 
+def test_dp_sampling_layout_bucket_rounds_to_tp_size():
+    assert dp_sampling_layout_bucket_bs(real_bs=32, tp_size=8) == 32
+    assert dp_sampling_layout_bucket_bs(real_bs=33, tp_size=8) == 40
+    assert dp_sampling_layout_bucket_bs(real_bs=79, tp_size=8) == 80
+
+
 def test_dp_sampling_route_uses_graph_bucket_threshold():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = False
@@ -91,6 +98,32 @@ def test_dp_sampling_route_uses_graph_bucket_threshold():
     assert dp_sampling
     assert use_graph
     assert bucket_bs == 32
+
+
+def test_dp_sampling_route_pads_graph_layout_bucket_to_tp_size():
+    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    runner.disable = False
+    runner.dp_size = 1
+    runner.disable_padding = False
+    runner.max_bs = 80
+    runner.capture_bs = [72, 79, 80]
+    runner.dp_sampling_enabled = True
+    runner.dp_sampling_min_bs = 32
+    runner.logits_tp_size = 8
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=79,
+        num_extends=0,
+        input_num_tokens=79,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(79, ctx)
+
+    assert dp_sampling
+    assert use_graph
+    assert bucket_bs == 80
 
 
 def test_dp_sampling_route_keeps_graph_bucket_below_threshold_non_dp():

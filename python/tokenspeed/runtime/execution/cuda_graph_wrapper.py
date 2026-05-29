@@ -88,6 +88,10 @@ def should_use_dp_sampling_for_bucket(
     )
 
 
+def dp_sampling_layout_bucket_bs(*, real_bs: int, tp_size: int) -> int:
+    return ((real_bs + tp_size - 1) // tp_size) * tp_size
+
+
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
 
@@ -333,10 +337,15 @@ class CudaGraphWrapper:
         dp_sampling = self._dp_sampling_for_effective_bs(bs, ForwardMode.DECODE)
         logits_layout_plan = None
         if self.sampling_backend is not None:
+            bucket_bs = (
+                dp_sampling_layout_bucket_bs(real_bs=bs, tp_size=self.logits_tp_size)
+                if dp_sampling
+                else bs
+            )
             logits_layout_plan = self.sampling_backend.build_logits_layout_plan(
                 dp_sampling=dp_sampling,
                 real_bs=bs,
-                bucket_bs=bs,
+                bucket_bs=bucket_bs,
                 tp_size=self.logits_tp_size,
                 num_tokens_per_req=self.max_tokens_per_req,
             )
@@ -723,10 +732,11 @@ class CudaGraphWrapper:
         effective_bs = self._padded_bs(bs, ctx) if use_graph else bs
         dp_sampling = self._dp_sampling_for_effective_bs(effective_bs, ctx.forward_mode)
         layout_bucket_bs = effective_bs
-        if dp_sampling and not use_graph:
-            layout_bucket_bs = (
-                (bs + self.logits_tp_size - 1) // self.logits_tp_size
-            ) * self.logits_tp_size
+        if dp_sampling:
+            layout_bucket_bs = dp_sampling_layout_bucket_bs(
+                real_bs=effective_bs if use_graph else bs,
+                tp_size=self.logits_tp_size,
+            )
         return (dp_sampling, use_graph, layout_bucket_bs)
 
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
