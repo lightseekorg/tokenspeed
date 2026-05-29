@@ -26,6 +26,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
     "flash_attn_func",
@@ -79,7 +80,9 @@ if (
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
@@ -130,7 +133,9 @@ if (
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
@@ -186,7 +191,9 @@ if (
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED + 3,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
@@ -247,7 +254,9 @@ elif platform.is_nvidia and platform.is_hopper:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED + 3,
         traits={
             "sliding_window": frozenset({False, True}),
@@ -296,7 +305,9 @@ elif platform.is_nvidia and platform.is_hopper:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED + 3,
         traits={
             "is_causal": frozenset({False, True}),
@@ -354,7 +365,9 @@ elif platform.is_nvidia and platform.is_hopper:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED + 3,
         traits={
             "sliding_window": frozenset({False, True}),

@@ -336,7 +336,7 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
             tune_max_num_tokens=next_power_of_2(num_tokens),
             dtype=x.dtype,
             features={"self_routing"},
-            traits={"weight_dtype": "nvfp4"},
+            weight_format="nvfp4",
             expected_kernel_name="flashinfer_trtllm_fp4_fused_moe",
         )
         if do_finalize:

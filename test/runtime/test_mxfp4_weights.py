@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import create_mxfp4_weights
+from tokenspeed.runtime.layers.moe.backends.weight_loaders import load_model_weight
 
 
 class _Backend:
@@ -37,6 +38,50 @@ class TestMxfp4Weights(unittest.TestCase):
 
         self.assertEqual(layer.w13_weight_scale.dtype, torch.uint8)
         self.assertEqual(layer.w2_weight_scale.dtype, torch.uint8)
+
+    def test_e8m0_scale_load_preserves_checkpoint_bytes(self):
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is None:
+            self.skipTest("torch.float8_e8m0fnu is unavailable")
+
+        layer = nn.Module()
+        create_mxfp4_weights(
+            _Backend(),
+            layer,
+            num_local_experts=1,
+            hidden_size_padded=64,
+            ispp_padded=64,
+        )
+
+        raw_w1_scale = (
+            torch.tensor([120, 121], dtype=torch.uint8).repeat(64).reshape(64, 2)
+        )
+        load_model_weight(
+            layer.w13_weight_scale,
+            raw_w1_scale.view(e8m0_dtype),
+            "w1",
+            local_expert_id=0,
+            tp_rank=0,
+            is_bias=False,
+            use_presharded_weights=False,
+            do_transpose=False,
+        )
+        self.assertTrue(torch.equal(layer.w13_weight_scale.data[0, :64], raw_w1_scale))
+
+        raw_w2_scale = (
+            torch.tensor([122, 123], dtype=torch.uint8).repeat(64).reshape(64, 2)
+        )
+        load_model_weight(
+            layer.w2_weight_scale,
+            raw_w2_scale.view(e8m0_dtype),
+            "w2",
+            local_expert_id=0,
+            tp_rank=0,
+            is_bias=False,
+            use_presharded_weights=False,
+            do_transpose=False,
+        )
+        self.assertTrue(torch.equal(layer.w2_weight_scale.data[0], raw_w2_scale))
 
 
 if __name__ == "__main__":

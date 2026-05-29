@@ -32,8 +32,16 @@ import torch
 from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
+
+
+def _attention_format_signature(**roles: torch.Tensor):
+    return format_signature(
+        **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
+    )
+
 
 __all__ = [
     "mha_prefill",
@@ -95,10 +103,11 @@ def mha_prefill(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
         "mha_prefill",
-        q.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,
@@ -203,10 +212,11 @@ def mha_extend_with_kvcache(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
         "mha_extend_with_kvcache",
-        q.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,
@@ -312,10 +322,11 @@ def mha_decode_with_kvcache(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
         "mha_decode_with_kvcache",
-        q.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,
@@ -394,10 +405,11 @@ def mha_merge_state(
     traits = {
         "head_dim": out_a.shape[-1],
     }
+    signature = _attention_format_signature(out_a=out_a, out_b=out_b)
     kernel = select_kernel(
         "attention",
         "mha_merge_state",
-        out_a.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,

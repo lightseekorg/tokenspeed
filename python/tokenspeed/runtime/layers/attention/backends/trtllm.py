@@ -97,8 +97,9 @@ class TRTLLMMHAMetadata:
 class TRTLLMMHAAttnBackend(AttentionBackend):
     """trtllm_mha attention backend optimized for SM100 (Blackwell)."""
 
-    @property
-    def support_kv_cache_prewrite(self) -> bool:
+    def support_kv_cache_prewrite(
+        self, forward_mode: ForwardMode | None = None
+    ) -> bool:
         return True
 
     @property

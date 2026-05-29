@@ -652,7 +652,7 @@ def extract_evalscope_score(report_table: str) -> float | None:
         cells = [cell.strip() for cell in stripped.strip(separator).split(separator)]
         if not cells:
             continue
-        if any(set(cell) <= {"=", "-"} for cell in cells if cell):
+        if all(set(cell) <= {"=", "-"} for cell in cells if cell):
             continue
         normalized = [cell.lower() for cell in cells]
         if "score" in normalized:

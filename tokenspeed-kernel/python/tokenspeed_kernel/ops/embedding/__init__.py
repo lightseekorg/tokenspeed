@@ -23,6 +23,7 @@ from typing import Optional
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @dataclass
@@ -111,10 +112,14 @@ def apply_rope(
         "has_q_out": output_q_rope is not None,
         "has_k_out": output_k_rope is not None,
     }
+    signature = format_signature(
+        query=dense_tensor_format(query.dtype),
+        key=dense_tensor_format(key.dtype),
+    )
     kernel = select_kernel(
         "embedding",
         "rope",
-        query.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,

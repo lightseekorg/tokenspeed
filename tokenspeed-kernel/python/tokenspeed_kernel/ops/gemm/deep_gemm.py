@@ -23,8 +23,17 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_MXFP8_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(128, 128),
+)
+_MXFP8_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE
+)
 
 try:
     from tokenspeed_kernel.thirdparty.deep_gemm import (
@@ -54,9 +63,8 @@ if fp8_gemm_nt is not None:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={_fp8_dtype},
+        signatures=_MXFP8_FORMAT_SIGNATURES,
         traits={
-            "quant": frozenset({"mxfp8"}),
             "n_align_64": frozenset({True}),
             "k_align_128": frozenset({True}),
         },
@@ -76,8 +84,9 @@ if fp8_gemm_nt is not None:
         assert (
             A_scales is not None
         ), "A_scales is required; online quantization should be done by the caller"
-        A_scales_aligned = get_mn_major_tma_aligned_tensor(A_scales)
+        if A_scales.dtype == torch.float32:
+            A_scales = get_mn_major_tma_aligned_tensor(A_scales)
         N = B.shape[0]
         C = A.new_empty(A.shape[0], N, dtype=torch.bfloat16)
-        fp8_gemm_nt((A, A_scales_aligned), (B, B_scales), C)
+        fp8_gemm_nt((A, A_scales), (B, B_scales), C)
         return C.to(out_dtype)
