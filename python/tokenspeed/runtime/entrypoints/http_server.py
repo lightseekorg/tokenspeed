@@ -46,8 +46,8 @@ async def health():
 
 
 @app.post("/flush_cache")
-async def flush_cache():
-    return JSONResponse({"status": "ok"})
+async def flush_cache(request: Request):
+    return await _proxy_request(request)
 
 
 @app.get("/get_server_info")
