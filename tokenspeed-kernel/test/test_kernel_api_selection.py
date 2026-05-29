@@ -278,14 +278,14 @@ def _attention_prefill() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
     v = torch.empty((4, 8, 64), dtype=torch.bfloat16)
-    cu_seqlens_q = torch.tensor([0, 4], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
     return tokenspeed_kernel.mha_prefill(
         q,
         k,
         v,
-        cu_seqlens_q,
-        max_seqlen_q=4,
-        max_seqlen_k=4,
+        cu_seqlens,
+        cu_seqlens_cpu=[0, 4],
+        max_seqlen=4,
     )
 
 
