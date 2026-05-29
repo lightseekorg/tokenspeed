@@ -47,23 +47,28 @@ def apply_draft_active_row_slice_post_attn(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Finalize the active-row slice after the layer's self-attention.
 
-    The attention module is expected to have already sliced its output via
-    ``apply_draft_active_row_slice``. This helper gathers residual to match
-    and mutates ctx (``input_num_tokens``, ``global_num_tokens``, clears
-    ``gather_ids`` / ``draft_active_row_slice``) so downstream collectives,
-    layernorms, MLP, and final-norm see the post-slice row count without
-    flag-based override. Idle ranks and standard forwards are no-ops.
+    Active ranks: attn already sliced its output via ``apply_draft_active_row_slice``;
+    here we gather residual to match and update ``input_num_tokens``.
+
+    Idle ranks (``gather_ids is None``): tensors are empty already, but we
+    still switch ``global_num_tokens`` to ``global_bs`` so downstream MoE
+    collectives see cross-rank-consistent scatter sizes (active ranks switch
+    here too — DP ranks must agree).
+
+    Both: clear ``gather_ids`` / ``draft_active_row_slice`` so downstream
+    layernorms, MLP, and final-norm don't double-slice.
     """
-    if not ctx.draft_active_row_slice or ctx.gather_ids is None:
+    if not ctx.draft_active_row_slice:
         return hidden_states, residual
     gather_ids = ctx.gather_ids
-    assert hidden_states.size(0) == gather_ids.size(0), (
-        "attention module must call apply_draft_active_row_slice before "
-        "apply_draft_active_row_slice_post_attn"
-    )
-    if residual is not None and residual.size(0) != gather_ids.size(0):
-        residual = residual.index_select(0, gather_ids)
-    ctx.input_num_tokens = gather_ids.size(0)
+    if gather_ids is not None:
+        assert hidden_states.size(0) == gather_ids.size(0), (
+            "attention module must call apply_draft_active_row_slice before "
+            "apply_draft_active_row_slice_post_attn"
+        )
+        if residual is not None and residual.size(0) != gather_ids.size(0):
+            residual = residual.index_select(0, gather_ids)
+        ctx.input_num_tokens = gather_ids.size(0)
     if ctx.global_bs is not None:
         ctx.global_num_tokens = ctx.global_bs
     ctx.gather_ids = None
