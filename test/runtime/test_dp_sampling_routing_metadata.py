@@ -4,12 +4,15 @@ from types import SimpleNamespace
 
 import torch
 
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    CudaGraphWrapper,
     resolve_dp_sampling_min_bs,
     should_use_dp_sampling_for_bucket,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
 
 def test_dp_sampling_bucket_threshold():
@@ -64,6 +67,80 @@ def test_dp_sampling_min_bs_ignores_env_override(monkeypatch):
     assert resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=12) == 12
 
 
+def test_dp_sampling_route_uses_graph_bucket_threshold():
+    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    runner.disable = False
+    runner.dp_size = 1
+    runner.disable_padding = False
+    runner.max_bs = 32
+    runner.capture_bs = [24, 32]
+    runner.dp_sampling_enabled = True
+    runner.dp_sampling_min_bs = 32
+    runner.logits_tp_size = 8
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=30,
+        num_extends=0,
+        input_num_tokens=30,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(30, ctx)
+
+    assert dp_sampling
+    assert use_graph
+    assert bucket_bs == 32
+
+
+def test_dp_sampling_route_keeps_graph_bucket_below_threshold_non_dp():
+    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    runner.disable = False
+    runner.dp_size = 1
+    runner.disable_padding = False
+    runner.max_bs = 32
+    runner.capture_bs = [24, 32]
+    runner.dp_sampling_enabled = True
+    runner.dp_sampling_min_bs = 32
+    runner.logits_tp_size = 8
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=23,
+        num_extends=0,
+        input_num_tokens=23,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(23, ctx)
+
+    assert not dp_sampling
+    assert use_graph
+    assert bucket_bs == 24
+
+
+def test_dp_sampling_eager_route_still_returns_tp_divisible_layout_bucket():
+    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    runner.disable = True
+    runner.dp_sampling_enabled = True
+    runner.dp_sampling_min_bs = 16
+    runner.logits_tp_size = 4
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=17,
+        num_extends=0,
+        input_num_tokens=17,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(17, ctx)
+
+    assert dp_sampling
+    assert not use_graph
+    assert bucket_bs == 20
+
+
 def test_configure_dp_sampling_sets_state():
     processor = LogitsProcessor(
         SimpleNamespace(vocab_size=7, model_type="unit_test"),
@@ -74,7 +151,9 @@ def test_configure_dp_sampling_sets_state():
 
     processor.configure_dp_sampling(
         dp_num_tokens_per_req=6,
-        dp_comm=None,
+        max_bucket_bs=8,
+        vocab_size=8,
+        device="cpu",
     )
     assert processor.dp_sampling_enabled
     assert processor.dp_num_tokens_per_req == 6
@@ -96,7 +175,16 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
     logits = processor._get_logits(
         hidden_states,
         lm_head,
-        LogitsMetadata(forward_mode=ForwardMode.DECODE, dp_sampling=True),
+        LogitsMetadata(
+            forward_mode=ForwardMode.DECODE,
+            dp_sampling=True,
+            logits_layout_plan=LogitsLayoutPlan.dp_all_to_all(
+                real_bs=5,
+                bucket_bs=8,
+                tp_size=4,
+                num_tokens_per_req=6,
+            ),
+        ),
     )
 
     assert logits.shape == (12, 7)

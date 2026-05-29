@@ -337,9 +337,15 @@ class ModelExecutor:
             )
             if configure_dp_vocab is not None:
                 configure_dp_vocab(dp_vocab_size)
+            max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+            max_bucket_bs = (
+                (max_bs + processor.tp_size - 1) // processor.tp_size
+            ) * processor.tp_size
             processor.configure_dp_sampling(
                 dp_num_tokens_per_req=spec_num_tokens,
-                dp_comm=self.sampling_backend._dp_comm,
+                max_bucket_bs=max_bucket_bs,
+                vocab_size=dp_vocab_size,
+                device=self.device,
             )
         logger.info(
             "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
@@ -373,6 +379,7 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
             dp_sampling_enabled=self.dp_sampling_enabled,
             dp_sampling_min_bs=self.dp_sampling_min_bs,
+            logits_tp_size=processor.tp_size,
         )
 
         # Encoder CUDA graph: install the model-built wrapper by overriding
@@ -1273,7 +1280,16 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
-                ctx.dp_sampling, _, _ = self.forward_step.dp_sampling_route(bs, ctx)
+                ctx.dp_sampling, _use_graph, bucket_bs = (
+                    self.forward_step.dp_sampling_route(bs, ctx)
+                )
+                ctx.logits_layout_plan = self.sampling_backend.build_logits_layout_plan(
+                    dp_sampling=ctx.dp_sampling,
+                    real_bs=bs,
+                    bucket_bs=bucket_bs,
+                    tp_size=self.model_runner.model.logits_processor.tp_size,
+                    num_tokens_per_req=self.config.output_length,
+                )
                 if forward_mode.is_decode() and self.config.global_rank == 0:
                     logger.debug(
                         "Batch-DP sampling: bs=%s enabled=%s",

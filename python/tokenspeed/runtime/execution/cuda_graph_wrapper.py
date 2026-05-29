@@ -227,6 +227,7 @@ class CudaGraphWrapper:
         runtime_states: RuntimeStates | None = None,
         dp_sampling_enabled: bool = False,
         dp_sampling_min_bs: int = 1,
+        logits_tp_size: int = 1,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -241,6 +242,7 @@ class CudaGraphWrapper:
         self.runtime_states = runtime_states
         self.dp_sampling_enabled = dp_sampling_enabled
         self.dp_sampling_min_bs = max(1, int(dp_sampling_min_bs))
+        self.logits_tp_size = logits_tp_size
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -329,6 +331,15 @@ class CudaGraphWrapper:
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
         dp_sampling = self._dp_sampling_for_effective_bs(bs, ForwardMode.DECODE)
+        logits_layout_plan = None
+        if self.sampling_backend is not None:
+            logits_layout_plan = self.sampling_backend.build_logits_layout_plan(
+                dp_sampling=dp_sampling,
+                real_bs=bs,
+                bucket_bs=bs,
+                tp_size=self.logits_tp_size,
+                num_tokens_per_req=self.max_tokens_per_req,
+            )
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -343,6 +354,7 @@ class CudaGraphWrapper:
                 else CaptureHiddenMode.NULL
             ),
             dp_sampling=dp_sampling,
+            logits_layout_plan=logits_layout_plan,
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -709,11 +721,13 @@ class CudaGraphWrapper:
     def dp_sampling_route(self, bs: int, ctx: ForwardContext) -> tuple[bool, bool, int]:
         use_graph = self._can_use_graph(bs, ctx)
         effective_bs = self._padded_bs(bs, ctx) if use_graph else bs
-        return (
-            self._dp_sampling_for_effective_bs(effective_bs, ctx.forward_mode),
-            use_graph,
-            effective_bs,
-        )
+        dp_sampling = self._dp_sampling_for_effective_bs(effective_bs, ctx.forward_mode)
+        layout_bucket_bs = effective_bs
+        if dp_sampling and not use_graph:
+            layout_bucket_bs = (
+                (bs + self.logits_tp_size - 1) // self.logits_tp_size
+            ) * self.logits_tp_size
+        return (dp_sampling, use_graph, layout_bucket_bs)
 
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:

@@ -28,13 +28,16 @@ import triton.language as tl
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
-from tokenspeed.runtime.distributed.dp_sampling_swap import swap_batch_vocab
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.sampling.logits_layout import (
+    LogitsLayoutExecutor,
+    LogitsLayoutPlan,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -107,6 +110,7 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
     dp_sampling: bool = False
+    logits_layout_plan: LogitsLayoutPlan | None = None
 
     @classmethod
     def from_forward_context(
@@ -120,6 +124,7 @@ class LogitsMetadata:
             gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
             dp_sampling=ctx.dp_sampling,
+            logits_layout_plan=ctx.logits_layout_plan,
         )
 
 
@@ -186,7 +191,7 @@ class LogitsProcessor(nn.Module):
         self.dp_sampling_enabled = dp_sampling_enabled
         self.dp_num_tokens_per_req = dp_num_tokens_per_req
         self.logit_scale = logit_scale
-        self._dp_comm = None
+        self._logits_layout_executor: LogitsLayoutExecutor | None = None
 
         if tp_rank is None:
             assert tp_size is None
@@ -217,11 +222,24 @@ class LogitsProcessor(nn.Module):
         self,
         *,
         dp_num_tokens_per_req: int,
-        dp_comm,
+        max_bucket_bs: int,
+        vocab_size: int,
+        device: torch.device | str,
     ) -> None:
         self.dp_sampling_enabled = True
         self.dp_num_tokens_per_req = dp_num_tokens_per_req
-        self._dp_comm = dp_comm
+        assert (
+            self.tp_size > 1 and self.tp_group is not None
+        ), "dp_sampling requires tp_size > 1 and a real tp_group"
+        self._logits_layout_executor = LogitsLayoutExecutor(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            tp_group=self.tp_group,
+            max_bucket_bs=max_bucket_bs,
+            num_tokens_per_req=dp_num_tokens_per_req,
+            vocab_size=vocab_size,
+            device=device,
+        )
 
     def forward(
         self,
@@ -408,28 +426,48 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        dp_sampling = logits_metadata.dp_sampling
+        plan = logits_metadata.logits_layout_plan
+        if plan is None and logits_metadata.dp_sampling:
+            rows = hidden_states.shape[0]
+            n = self.dp_num_tokens_per_req
+            assert (
+                rows % n == 0
+            ), f"hidden_states have {rows} rows, not divisible by N={n}"
+            real_bs = rows // n
+            bucket_bs = ((real_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
+            plan = LogitsLayoutPlan.dp_all_to_all(
+                real_bs=real_bs,
+                bucket_bs=bucket_bs,
+                tp_size=self.tp_size,
+                num_tokens_per_req=n,
+            )
+        dp_sampling = plan is not None and plan.is_dp_all_to_all
         assert (not dp_sampling) or self.dp_sampling_enabled, (
             "logits_metadata.dp_sampling=True but LogitsProcessor was not "
             "built with dp_sampling_enabled=True"
         )
 
         if dp_sampling and self.skip_all_gather:
-            n = self.dp_num_tokens_per_req
-            rows = hidden_states.shape[0]
-            assert (
-                rows % n == 0
-            ), f"hidden_states have {rows} rows, not divisible by N={n}"
-            bs = rows // n
-            pad_bs = ((bs + self.tp_size - 1) // self.tp_size) * self.tp_size
-            reqs_per_rank = pad_bs // self.tp_size
-            pad_rows = (pad_bs - bs) * n
-            if pad_rows > 0:
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states, (0, 0, 0, pad_rows)
+            if self._logits_layout_executor is not None:
+                hidden_states = self._logits_layout_executor.slice_hidden_states(
+                    hidden_states, plan
                 )
-            start = self.tp_rank * reqs_per_rank * n
-            hidden_states = hidden_states[start : start + reqs_per_rank * n]
+            else:
+                n = self.dp_num_tokens_per_req
+                rows = hidden_states.shape[0]
+                assert (
+                    rows % n == 0
+                ), f"hidden_states have {rows} rows, not divisible by N={n}"
+                bs = rows // n
+                pad_bs = ((bs + self.tp_size - 1) // self.tp_size) * self.tp_size
+                reqs_per_rank = pad_bs // self.tp_size
+                pad_rows = (pad_bs - bs) * n
+                if pad_rows > 0:
+                    hidden_states = torch.nn.functional.pad(
+                        hidden_states, (0, 0, 0, pad_rows)
+                    )
+                start = self.tp_rank * reqs_per_rank * n
+                hidden_states = hidden_states[start : start + reqs_per_rank * n]
 
         if hasattr(lm_head, "weight"):
             if self._use_fused_lm_head:
@@ -446,29 +484,11 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if dp_sampling and not self.skip_all_gather:
-            n = self.dp_num_tokens_per_req
-            rows = logits.shape[0]
-            assert (
-                rows % n == 0
-            ), f"local logits have {rows} rows, not divisible by N={n}"
-            bs = rows // n
-            pad_bs = ((bs + self.tp_size - 1) // self.tp_size) * self.tp_size
-            pad_rows = (pad_bs - bs) * n
-            if pad_rows > 0:
-                logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_rows))
-            v_padded = logits.shape[1] * self.tp_size
-            if self._dp_comm is not None:
-                logits = self._dp_comm.swap_batch_vocab(logits, pad_bs=pad_bs)
-            else:
-                logits = swap_batch_vocab(
-                    logits,
-                    tp_size=self.tp_size,
-                    pad_bs=pad_bs,
-                    num_tokens_per_req=n,
-                    vocab_size=v_padded,
-                    rank=self.tp_rank,
-                    group=self.tp_group,
+            if self._logits_layout_executor is None:
+                raise RuntimeError(
+                    "dp_sampling logits layout executor is not configured"
                 )
+            logits = self._logits_layout_executor.swap_batch_vocab(logits, plan)
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
             gathered_logits = torch.empty(
                 self.tp_size * logits.size(0),

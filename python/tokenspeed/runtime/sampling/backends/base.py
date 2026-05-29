@@ -27,11 +27,13 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+from tokenspeed.runtime.utils.server_args import ServerArgs
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 DEFAULT_RANDOM_SEED = 48
@@ -212,6 +214,29 @@ class SamplingBackend(ABC):
             num_tokens_per_req=num_tokens_per_req,
             bs=bs,
             request_pool_indices=None,
+        )
+
+    def build_logits_layout_plan(
+        self,
+        *,
+        dp_sampling: bool,
+        real_bs: int,
+        bucket_bs: int,
+        tp_size: int,
+        num_tokens_per_req: int,
+    ) -> LogitsLayoutPlan:
+        if not dp_sampling:
+            return LogitsLayoutPlan.normal(
+                real_bs=real_bs,
+                bucket_bs=bucket_bs,
+                tp_size=tp_size,
+                num_tokens_per_req=num_tokens_per_req,
+            )
+        return LogitsLayoutPlan.dp_all_to_all(
+            real_bs=real_bs,
+            bucket_bs=bucket_bs,
+            tp_size=tp_size,
+            num_tokens_per_req=num_tokens_per_req,
         )
 
     def _prepare_step_hook(

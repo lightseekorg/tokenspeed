@@ -33,6 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
 
 @dataclass
@@ -62,3 +63,4 @@ class ForwardContext:
     gather_ids: torch.Tensor | None = None
 
     dp_sampling: bool = False
+    logits_layout_plan: LogitsLayoutPlan | None = None
