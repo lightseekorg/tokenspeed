@@ -138,6 +138,16 @@ async def models(request: Request):
     return await _proxy_request(request)
 
 
+@app.api_route("/v1/messages", methods=["POST"])
+async def messages(request: Request):
+    return await _proxy_request(request)
+
+
+@app.api_route("/v1/responses", methods=["POST"])
+async def responses(request: Request):
+    return await _proxy_request(request)
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
