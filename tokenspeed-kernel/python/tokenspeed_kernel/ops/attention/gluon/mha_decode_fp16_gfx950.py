@@ -317,8 +317,11 @@ class AttentionProgram:
     def load_page(self, start_n):
         cfg = self.cfg
         page_index = start_n // cfg.PAGE_SIZE
+        valid = start_n < self.split_end
         return gl.load(
-            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index
+            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index,
+            mask=valid,
+            other=0,
         )
 
     @gluon.jit
@@ -332,6 +335,7 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
+        # can't use buffer_load: paged KV offsets may exceed its 32-bit range.
         async_copy.global_load_to_shared(k_smem, self.k_cache_ptr + offsets)
         async_copy.commit_group()
 
@@ -346,6 +350,7 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
+        # can't use buffer_load: paged KV offsets may exceed its 32-bit range.
         async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)
         async_copy.commit_group()
 
@@ -499,19 +504,25 @@ def _mha_decode_fp16(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
-    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
-        physical_page = program.load_page(start_n)
-        program.issue_load_k(physical_page, k_smem)
-        program.issue_load_v(physical_page, v_smem)
-        async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-        qk = program.apply_kv_mask(qk, start_n)
-        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+    physical_page = program.load_page(program.split_start)
 
-        async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem)
-        acc = program.compute_pv(p, v, acc)
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        with gl.amd.warp_pipeline_stage("load", priority=1):
+            program.issue_load_k(physical_page, k_smem)
+            program.issue_load_v(physical_page, v_smem)
+            physical_page = program.load_page(start_n + cfg.BLOCK_N)
+
+        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
+            async_copy.wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            qk = program.apply_kv_mask(qk, start_n)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+        with gl.amd.warp_pipeline_stage("pv", priority=1):
+            async_copy.wait_group(0)
+            v = program.shared_load_v(v_smem)
+            acc = program.compute_pv(p, v, acc)
 
     program.store_split(acc, l_i, m_i)
 
