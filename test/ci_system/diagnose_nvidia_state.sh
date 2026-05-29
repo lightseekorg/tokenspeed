@@ -42,13 +42,6 @@ run_optional free -h
 section "CPU"
 run_optional lscpu
 
-section "NUMA"
-if command -v numactl >/dev/null 2>&1; then
-  run_optional numactl --hardware
-else
-  printf 'numactl not found\n'
-fi
-
 section "Top processes by CPU"
 ps -eo pid,ppid,user,stat,psr,pcpu,pmem,rss,etime,cmd --sort=-pcpu 2>&1 | head -80 || true
 
