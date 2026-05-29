@@ -457,7 +457,7 @@ class ColumnParallelLinear(LinearBase):
             )
         else:
             output_parallel = self.quant_method.apply(self, input_, bias)
-        if self.gather_output:
+        if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
             output = all_gather(output_parallel, self.tp_group, dim=-1)
         else:
