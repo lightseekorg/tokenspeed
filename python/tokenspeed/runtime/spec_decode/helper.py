@@ -18,22 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Speculative decoding helpers for the draft head's first-step active-row slice.
+"""Speculative decoding helpers.
 
-The draft head emits a hidden state for every input token but downstream only
-consumes the per-request last token (lm_head + next draft step). These helpers
-drop the dead-position rows so MLP / norm / collective ops only touch live
-rows.
-
-Usage in a single layer:
-
-    attn_output = self.attn(...)
-    attn_output = apply_draft_active_row_slice_pre_oproj(attn_output, ctx)    # before o_proj
-    output = self.o_proj(attn_output)
-    ...
-    hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
-        hidden_states, residual, ctx,
-    )                                                                # once per layer
+Add new helpers grouped by feature under a section divider.
 """
 
 from __future__ import annotations
@@ -41,6 +28,13 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.execution.context import ForwardContext
+
+
+# ---- Draft head first-step active-row slice ---------------------------------
+# Drop dead-position rows so o_proj / MLP / norm / comm only run on the live
+# row per request. Use in the draft model's *last* attention layer — slicing
+# in an intermediate layer would truncate downstream layers' KV cache writes
+# and break the model.
 
 
 def apply_draft_active_row_slice_pre_oproj(
