@@ -1158,7 +1158,7 @@ class DeepseekV3DecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
-            hidden_states, residual = apply_draft_active_row_slice_post_attn(
+            hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
                 hidden_states, residual, ctx,
             )
             # apply_draft_active_row_slice_post_attn may have mutated ctx's
@@ -1710,7 +1710,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
 
-            hidden_states, residual = apply_draft_active_row_slice_post_attn(
+            hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
                 hidden_states, residual, ctx,
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(

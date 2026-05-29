@@ -190,7 +190,7 @@ class LlamaAttention(nn.Module):
                 output_q_rope=q_rope,
                 enable_pdl=pdl_enabled(),
             )
-            attn_output = self._apply_attn_dispatch_with_prewritten_kv(
+            attn_output = self._apply_draft_active_attn_dispatch(
                 q_rope, ctx, out_cache_loc,
             )
         else:
@@ -201,7 +201,7 @@ class LlamaAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def _apply_attn_dispatch_with_prewritten_kv(
+    def _apply_draft_active_attn_dispatch(
         self,
         q_rope: torch.Tensor,
         ctx: ForwardContext,
@@ -402,7 +402,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        hidden_states, residual = apply_draft_active_row_slice_post_attn(
+        hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
             hidden_states, residual, ctx,
         )
 
@@ -470,7 +470,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        hidden_states, residual = apply_draft_active_row_slice_post_attn(
+        hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
             hidden_states, residual, ctx,
         )
         hidden_states, residual = self.comm_manager.post_attn_comm(

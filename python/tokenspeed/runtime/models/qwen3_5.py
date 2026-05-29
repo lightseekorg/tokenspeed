@@ -780,7 +780,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
             )
-            hidden_states, residual = apply_draft_active_row_slice_post_attn(
+            hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
                 hidden_states, residual, ctx,
             )
             # apply_draft_active_row_slice_post_attn may have mutated ctx's

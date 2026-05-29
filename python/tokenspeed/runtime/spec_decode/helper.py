@@ -31,7 +31,7 @@ Usage in a single layer:
     attn_output = apply_draft_active_row_slice_pre_oproj(attn_output, ctx)    # before o_proj
     output = self.o_proj(attn_output)
     ...
-    hidden_states, residual = apply_draft_active_row_slice_post_attn(
+    hidden_states, residual, ctx = apply_draft_active_row_slice_post_attn(
         hidden_states, residual, ctx,
     )                                                                # once per layer
 """
@@ -52,26 +52,50 @@ def apply_draft_active_row_slice_pre_oproj(
     return tensor.index_select(0, ctx.gather_ids)
 
 
+def _post_slice_global_num_tokens(
+    ctx: ForwardContext, gather_ids: torch.Tensor | None
+) -> list[int] | None:
+    """Compute ``global_num_tokens`` after the active-row slice.
+
+    Three paths:
+    - ``global_bs`` set (production event-loop): source of truth.
+    - ``global_bs`` unset + active rank (cuda_graph_wrapper capture path):
+      broadcast local bs — capture assumes uniform batch across ranks.
+    - ``global_bs`` unset + idle rank: can't infer from this rank alone;
+      clear so downstream collective sizing degrades to the non-DP path
+      instead of using stale capture totals.
+    """
+    if ctx.global_bs is not None:
+        return ctx.global_bs
+    if ctx.global_num_tokens is None:
+        return None
+    if gather_ids is not None:
+        return [gather_ids.size(0)] * len(ctx.global_num_tokens)
+    return None
+
+
 def apply_draft_active_row_slice_post_attn(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     ctx: ForwardContext,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, ForwardContext]:
     """Finalize the active-row slice after the layer's self-attention.
 
-    Active rank: gather ``residual`` to match the already-sliced ``attn_output``
-    and update ``ctx.input_num_tokens``.
+    Active rank: gather ``residual`` to match the already-sliced
+    ``attn_output`` and update ``ctx.input_num_tokens``.
 
-    All ranks (active + idle): switch ``ctx.global_num_tokens`` to
-    ``ctx.global_bs`` so cross-rank MoE / RSAG see consistent scatter sizes,
-    then clear ``gather_ids`` / ``draft_active_row_slice`` so downstream
-    layernorms, MLP, and final-norm don't double-slice.
+    All ranks (active + idle): switch ``ctx.global_num_tokens`` to the
+    post-slice scatter sizes (see ``_post_slice_global_num_tokens``) so
+    cross-rank MoE / RSAG see consistent values, then clear ``gather_ids``
+    and ``draft_active_row_slice``.
+
+    The returned ctx is the same object — mutated in place; callers must
+    rebind (``hidden_states, residual, ctx = apply_..._post_attn(...)``)
+    so the ctx mutation is visible at the call site rather than hidden.
     """
     if not ctx.draft_active_row_slice:
-        return hidden_states, residual
+        return hidden_states, residual, ctx
 
-    # Active rank: attn module already sliced its output via
-    # apply_draft_active_row_slice_pre_oproj; line up residual + per-rank token count.
     gather_ids = ctx.gather_ids
     if gather_ids is not None:
         assert hidden_states.size(0) == gather_ids.size(0), (
@@ -81,22 +105,8 @@ def apply_draft_active_row_slice_post_attn(
             residual = residual.index_select(0, gather_ids)
         ctx.input_num_tokens = gather_ids.size(0)
 
-    # All ranks: switch DP-global counts so collectives agree across the world.
-    #   1. global_bs set (production event-loop path): source of truth.
-    #   2. global_bs unset + active rank (cuda_graph_wrapper capture path):
-    #      fall back to broadcasting local bs — capture assumes uniform batch.
-    #   3. global_bs unset + idle rank: can't infer the post-slice batch size
-    #      from this rank alone; clear global_num_tokens so downstream collective
-    #      sizing degrades to the non-DP path instead of using stale capture
-    #      totals.
-    if ctx.global_bs is not None:
-        ctx.global_num_tokens = ctx.global_bs
-    elif ctx.global_num_tokens is not None:
-        if gather_ids is not None:
-            ctx.global_num_tokens = [gather_ids.size(0)] * len(ctx.global_num_tokens)
-        else:
-            ctx.global_num_tokens = None
+    ctx.global_num_tokens = _post_slice_global_num_tokens(ctx, gather_ids)
     ctx.gather_ids = None
     ctx.draft_active_row_slice = False
 
-    return hidden_states, residual
+    return hidden_states, residual, ctx
