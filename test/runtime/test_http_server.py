@@ -2,103 +2,56 @@
 
 import os
 import sys
+import threading
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import requests
+import uvicorn
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
 CONTROL_HOST = "127.0.0.1"
-CONTROL_PORT = 21101
-BASE_URL = f"http://{CONTROL_HOST}:{CONTROL_PORT}"
-FAKE_GATEWAY = "http://127.0.0.1:29999"
 
 
-def _start_control_server():
-    """Start the control server against a fake gateway URL."""
-    from tokenspeed.runtime.entrypoints.http_server import start
+class TestControlHttpServerEndpoints(unittest.TestCase):
+    """Test /health and /readiness without a real engine or smg."""
 
-    start(gateway_url=FAKE_GATEWAY, host=CONTROL_HOST, port=CONTROL_PORT)
-
-
-class TestControlHttpServer(unittest.TestCase):
-    """Unit-level tests for the control HTTP server endpoints.
-
-    These tests mock aiohttp so no real gateway or engine is needed.
-    """
-
-    def _make_mock_resp(self, payload: dict, status: int = 200):
-        mock_resp = AsyncMock()
-        mock_resp.status = status
-        mock_resp.json = AsyncMock(return_value=payload)
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=None)
-        return mock_resp
-
-    def _make_mock_session(self, payload: dict, status: int = 200):
-        session = MagicMock()
-        session.__aenter__ = AsyncMock(return_value=session)
-        session.__aexit__ = AsyncMock(return_value=None)
-        session.post = MagicMock(return_value=self._make_mock_resp(payload, status))
-        session.get = MagicMock(return_value=self._make_mock_resp(payload, status))
-        return session
-
-    def test_health_always_ok(self):
-        """GET /health returns 200 without hitting the gateway."""
-        import threading
-
-        import uvicorn
-
+    @classmethod
+    def setUpClass(cls):
         from tokenspeed.runtime.entrypoints import http_server as hs
 
-        hs._gateway_url = FAKE_GATEWAY
+        cls.port = 21101
         config = uvicorn.Config(
-            hs.app, host=CONTROL_HOST, port=CONTROL_PORT + 1, log_level="error"
+            hs.app, host=CONTROL_HOST, port=cls.port, log_level="error"
         )
-        server = uvicorn.Server(config)
+        cls.server = uvicorn.Server(config)
+        cls.thread = threading.Thread(target=cls.server.run, daemon=True)
+        cls.thread.start()
+        # Wait for the server to be ready
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                requests.get(f"http://{CONTROL_HOST}:{cls.port}/health", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.2)
 
-        t = threading.Thread(target=server.run, daemon=True)
-        t.start()
-        time.sleep(1)
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.should_exit = True
 
-        try:
-            r = requests.get(
-                f"http://{CONTROL_HOST}:{CONTROL_PORT + 1}/health", timeout=5
-            )
-            self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.json()["status"], "ok")
-        finally:
-            server.should_exit = True
+    def test_health(self):
+        r = requests.get(f"http://{CONTROL_HOST}:{self.port}/health", timeout=5)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "ok")
 
-    def test_readiness_always_ok(self):
-        """GET /readiness returns 200 without hitting the gateway."""
-        import threading
-
-        import uvicorn
-
-        from tokenspeed.runtime.entrypoints import http_server as hs
-
-        hs._gateway_url = FAKE_GATEWAY
-        config = uvicorn.Config(
-            hs.app, host=CONTROL_HOST, port=CONTROL_PORT + 2, log_level="error"
-        )
-        server = uvicorn.Server(config)
-
-        t = threading.Thread(target=server.run, daemon=True)
-        t.start()
-        time.sleep(1)
-
-        try:
-            r = requests.get(
-                f"http://{CONTROL_HOST}:{CONTROL_PORT + 2}/readiness", timeout=5
-            )
-            self.assertEqual(r.status_code, 200)
-        finally:
-            server.should_exit = True
+    def test_readiness(self):
+        r = requests.get(f"http://{CONTROL_HOST}:{self.port}/readiness", timeout=5)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "ready")
 
 
 class TestOrchestratorControlPort(unittest.TestCase):
@@ -107,9 +60,7 @@ class TestOrchestratorControlPort(unittest.TestCase):
     def test_control_port_parsed(self):
         from tokenspeed.cli._argsplit import split_argv
 
-        result = split_argv(
-            ["--model", "meta-llama/Llama-3.1-8B-Instruct", "--control-port", "8081"]
-        )
+        result = split_argv(["--model", "m", "--control-port", "8081"])
         self.assertEqual(result.opts.control_port, 8081)
 
     def test_control_port_not_in_engine_or_gateway_args(self):
