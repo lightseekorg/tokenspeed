@@ -508,7 +508,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
         self.fc = ColumnParallelLinear(
             config.hidden_size * self.num_fc_input_dim,
             config.hidden_size,
-            bias=True,
+            bias=False,
             gather_output=True,
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
