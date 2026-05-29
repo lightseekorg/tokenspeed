@@ -160,6 +160,7 @@ class DisaggDecodeExecutor:
                     "[decode][generate_events] rid=%s -> FailedEvent", req_id
                 )
                 events.append(PD.FailedEvent(req_id))
+                to_remove.append(req_id)
             elif (
                 self._local_states[req_id] == KVPoll.Bootstrapped
                 and poll == KVPoll.Success
@@ -197,8 +198,20 @@ class DisaggDecodeExecutor:
             else:
                 pass
         for req_id in to_remove:
-            del self.receivers[req_id]
+            # Best-effort cleanup mirroring prefill side; request_id is stable
+            # so without explicit pop these dicts would grow unbounded across
+            # failed requests. NOTE: _remote_spec_candidate_ids must NOT be
+            # popped here — its consumer pop_remote_spec_candidate_ids runs
+            # later inside event_loop._process_pd_events, after we return.
+            # That dict is small (one tuple per Success request, between
+            # generate_events emitting RemotePrefillDoneEvent and event_loop
+            # consuming it) and is naturally drained by the pop path; an
+            # eager pop here drops the spec candidates on the floor and the
+            # next decode forward reads uninitialized future_input_map tail,
+            # causing CUDA illegal memory access on embedding lookup.
+            self.receivers.pop(req_id, None)
             self._request_pool_indices.pop(req_id, None)
+            self._local_states.pop(req_id, None)
 
         return events
 

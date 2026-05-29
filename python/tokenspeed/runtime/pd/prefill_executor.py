@@ -246,6 +246,7 @@ class DisaggPrefillExecutor:
                     "[prefill][generate_events] rid=%s -> FailedEvent", req_id
                 )
                 events.append(PD.FailedEvent(req_id))
+                to_remove.append(req_id)
             elif (
                 self._local_states[req_id] == KVPoll.Bootstrapped
                 and poll == KVPoll.Success
@@ -259,6 +260,16 @@ class DisaggPrefillExecutor:
             else:
                 pass
         for req_id in to_remove:
-            del self.senders[req_id]
+            # Best-effort cleanup of all per-request state so failed/aborted
+            # requests do not leak into the bookkeeping dicts. request_id is
+            # stable (not a reusable slot index), so without explicit pop here
+            # these entries would live until the engine restarts.
+            sender = self.senders.pop(req_id, None)
+            if sender is not None:
+                self.kv_manager.discard_expired_metadata_room(sender.bootstrap_room)
+            self._local_states.pop(req_id, None)
+            self._request_token.pop(req_id, None)
+            self._request_spec_candidate_ids.pop(req_id, None)
+            self._layerwise_token_published.discard(req_id)
 
         return events

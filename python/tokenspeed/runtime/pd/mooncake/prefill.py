@@ -144,6 +144,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             self.prefill_metadata[room] = (token, spec_candidate_ids)
             self.bootstrap_token_cond.notify_all()
 
+    def discard_expired_metadata_room(self, room: int) -> None:
+        """Best-effort cleanup of an expired-room marker; safe to call
+        when the room may or may not have ever been added."""
+        with self.bootstrap_token_cond:
+            self.expired_prefill_metadata_rooms.discard(room)
+
     def _wait_prefill_metadata(
         self,
         room: Optional[int],
@@ -152,7 +158,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     ) -> tuple[int, Optional[list[int]]]:
         if room is None or fallback_token != -1:
             return fallback_token, fallback_candidate_ids
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + envs.TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT.get()
         with self.bootstrap_token_cond:
             while room not in self.prefill_metadata:
                 remaining = deadline - time.monotonic()
