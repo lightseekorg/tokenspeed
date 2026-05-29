@@ -4,6 +4,7 @@ type: perf
 triggers:
   - per-commit
   - manual
+  - debug
 runner:
   labels:
     - gb200-4gpu-perf

@@ -370,6 +370,13 @@ def setup_runner(
 
         # Kill stale processes from previous run
         pgm.cleanup_stale(dry_run=dry_run)
+        shell_run(
+            "bash test/ci_system/cleanup_nvidia_gpu_state.sh",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+            check=False,
+        )
 
         venv_path = create_ci_venv_name(runner_name=pgm.runner_id)
 
