@@ -25,6 +25,16 @@ from functools import partial
 import torch
 
 
+def _preserve_e8m0_bytes_for_uint8_param(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None and dst.dtype == torch.uint8 and src.dtype == e8m0_dtype:
+        return src.view(torch.uint8)
+    return src
+
+
 def _load_w13(
     expert_data: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -72,6 +82,7 @@ def _load_w13(
         )
 
     expert_data = expert_data.narrow(shard_dim, start, shard_size)
+    loaded_weight = _preserve_e8m0_bytes_for_uint8_param(expert_data, loaded_weight)
     expert_data.copy_(loaded_weight)
 
 
@@ -114,6 +125,7 @@ def _load_w2(
         )
 
     # w2, down_proj: Load into only logical weight of w2.
+    loaded_weight = _preserve_e8m0_bytes_for_uint8_param(expert_data, loaded_weight)
     expert_data.copy_(loaded_weight)
 
 
@@ -223,6 +235,7 @@ def load_per_channel_weight_scale(
 
     # for per channel weight quantization
     if shard_id == "w2":
+        loaded_weight = _preserve_e8m0_bytes_for_uint8_param(expert_data, loaded_weight)
         expert_data.copy_(loaded_weight)
     elif shard_id in ("w1", "w3"):
         _load_w13(

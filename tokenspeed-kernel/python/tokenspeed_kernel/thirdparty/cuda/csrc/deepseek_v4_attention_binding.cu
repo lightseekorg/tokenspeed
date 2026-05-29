@@ -30,7 +30,8 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     TensorView positions,
     TensorView cos_sin_cache,
     double rms_norm_eps,
-    int64_t cache_block_size);
+    int64_t cache_block_size,
+    bool enable_pdl);
 
 void deepseek_v4_indexer_topk_prefill(TensorView logits,
                                       TensorView row_starts,

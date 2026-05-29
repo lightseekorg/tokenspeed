@@ -229,11 +229,14 @@ PagedCacheGroupTable::CommitResult PagedCacheGroupTable::CheckpointStateToSnapsh
     }
 
     // Snapshot stores ONLY this commit step's owned delta (the new LCM segment's
-    // pages). The trailing window is reconstructed across the chain at match
-    // time by augmentMatchPagedCache::assemble; borrowed pages still belong to
-    // upstream snapshots and must not be re-stored here. base is the absolute
-    // logical page where the delta starts: post-Step-1/2 base + remaining borrowed.
-    OwnedPages segment = owned_pages_.TakeFirst(owned_pages_.Size());
+    // pages). Pages beyond the commit target stay as owned for future commit
+    // steps — converting them all to borrowed here would bloat the snapshot and
+    // prevent the pool from reclaiming pages that no future boundary window needs.
+    const std::int32_t target_page = target_raw_tokens / raw_per_page;
+    const std::int32_t owned_base = base_logical_page_ + static_cast<std::int32_t>(borrowed_page_ids_.size());
+    const std::int32_t segment_count =
+        std::min(static_cast<std::int32_t>(owned_pages_.Size()), std::max(0, target_page - owned_base));
+    OwnedPages segment = owned_pages_.TakeFirst(segment_count);
     const std::int32_t segment_base_logical_page =
         base_logical_page_ + static_cast<std::int32_t>(borrowed_page_ids_.size());
     const auto& seg_ids = segment.Ids();

@@ -30,6 +30,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
@@ -176,7 +177,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128, 256}),
@@ -191,10 +194,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        softmax_scale: float | None = None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_cpu: list[int],
+        max_seqlen: int,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -206,8 +208,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             )
         wrapper = _get_ragged_prefill_wrapper(q.device)
         wrapper.plan(
-            cu_seqlens_q,
-            cu_seqlens_q,
+            cu_seqlens,
+            cu_seqlens,
             q.shape[1],
             k.shape[1],
             q.shape[-1],
@@ -215,11 +217,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             causal=True,
             window_left=window_left,
             logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
-            sm_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            sm_scale=1.0 / math.sqrt(q.shape[-1]),
             q_data_type=q.dtype,
             kv_data_type=k.dtype,
             o_data_type=q.dtype,
@@ -239,10 +237,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128, 256}),
+            "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
@@ -259,7 +260,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         cache_seqlens: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        softmax_scale: float | None = None,
+        is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -313,12 +314,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             q.shape[-1],
             page_size,
             head_dim_vo=v_cache.shape[-1],
-            causal=False,
-            sm_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            causal=is_causal,
+            sm_scale=1.0 / math.sqrt(q.shape[-1]),
             window_left=window_left,
             q_data_type=q.dtype,
             kv_data_type=k_cache.dtype,
@@ -346,9 +343,12 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
+            "is_causal": frozenset({False, True}),
             "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
@@ -366,7 +366,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         cache_seqlens: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        softmax_scale: float | None = None,
+        is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -397,11 +397,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             seq_lens=cache_seqlens,
             max_q_len=max_seqlen_q,
             max_kv_len=max_seqlen_k,
-            bmm1_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
             bmm2_scale=1.0,
             batch_size=cache_seqlens.shape[0],
             cum_seq_lens_q=cu_seqlens_q,
@@ -409,6 +405,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             window_left=window_left,
             sinks=sinks,
             out_dtype=q.dtype,
+            causal=is_causal,
         )
 
     @register_kernel(
@@ -420,7 +417,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
             "sliding_window": frozenset({False, True}),
@@ -437,7 +436,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
-        softmax_scale: float | None = None,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -464,11 +462,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             block_tables=page_table,
             seq_lens=cache_seqlens,
             max_seq_len=max_seqlen_k,
-            bmm1_scale=(
-                softmax_scale
-                if softmax_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1])
-            ),
+            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
             bmm2_scale=1.0,
             window_left=window_left,
             sinks=sinks,

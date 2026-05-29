@@ -93,14 +93,29 @@ def _detect_arch() -> str:
     platform = current_platform()
 
     major, minor = platform.arch_version.major, platform.arch_version.minor
+    if platform.is_amd:
+        return f"gfx{major}{minor}"
     if major >= 9:
         return f"sm{major}0"
     return f"sm{major}{minor}"
 
 
 def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
+    # TODO: The selection logic should be folded into tokenspeed-kernel/ to
+    # leverage the infrastructure there.
+
     backend = get_moe_backend()
     auto_candidates = _AUTO_IMPL_PREFERENCE.get(quant_kind, ())
+    platform = current_platform()
+    if backend.is_auto() and platform.is_amd:
+        if quant_kind in {"unquantized", "fp8", "w8a8_fp8"}:
+            auto_candidates = tuple(
+                impl for impl in auto_candidates if impl == "triton"
+            )
+        elif quant_kind == "mxfp4":
+            auto_candidates = tuple(
+                impl for impl in auto_candidates if impl == "triton_kernel"
+            )
 
     if not backend.is_auto():
         # If a specific MoE backend is forced globally, only honor it
@@ -139,7 +154,18 @@ def select_backend(
             tried.append(f"{impl}:not-registered")
             continue
 
-        if not backend_cls.supports(spec, quant_config):
+        # When the backend is forced by the user (not auto-selected), try the
+        # optional supports_single_gpu() fallback before the regular supports()
+        # check.  This allows backends to be explicitly requested in
+        # configurations where auto-selection would normally filter them out
+        # (e.g. Fp8FlashinferCutlassBackend on ep_size=1 single-GPU).
+        forced = not get_moe_backend().is_auto()
+        supports_fn = (
+            getattr(backend_cls, "supports_single_gpu", None) if forced else None
+        )
+        if supports_fn is None:
+            supports_fn = backend_cls.supports
+        if not supports_fn(spec, quant_config):
             tried.append(f"{impl}:unsupported")
             continue
 

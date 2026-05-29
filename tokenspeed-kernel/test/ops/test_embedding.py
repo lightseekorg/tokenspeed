@@ -39,7 +39,7 @@ def test_rope_neox_full_bf16(
     rotary_dim = 128
     max_position = 1024
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype, "query")
 
     inv_freq = 1.0 / (
         10000.0
@@ -106,7 +106,7 @@ def test_rope_gptj_full_bf16(
     rotary_dim = 64
     max_position = 512
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype, "query")
 
     inv_freq = 1.0 / (
         10000.0
@@ -173,7 +173,7 @@ def test_rope_neox_partial_bf16(
     rotary_dim = 64
     max_position = 256
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype, "query")
 
     inv_freq = 1.0 / (
         10000.0
@@ -251,7 +251,7 @@ def test_rope_single_token(
     rotary_dim = 128
     max_position = 64
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype, "query")
 
     inv_freq = 1.0 / (
         10000.0
@@ -312,7 +312,7 @@ def test_rope_fused_set_kv_buffer(
     max_position = 512
     cache_size = 32
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype)
+    require("embedding", "rope", solution, dtype, "query")
 
     inv_freq = 1.0 / (
         10000.0

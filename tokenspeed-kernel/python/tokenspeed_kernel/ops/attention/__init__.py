@@ -32,8 +32,16 @@ import torch
 from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
+
+
+def _attention_format_signature(**roles: torch.Tensor):
+    return format_signature(
+        **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
+    )
+
 
 __all__ = [
     "mha_prefill",
@@ -51,11 +59,10 @@ def mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
     # attention options
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -70,11 +77,11 @@ def mha_prefill(
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
         k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
         v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
-        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
             KV cumulative sequence lengths are assumed to be identical.
-        max_seqlen_q: Maximum query length.
-        max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
+        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
+            list[int]. Used for host-side launch metadata; must match cu_seqlens.
+        max_seqlen: Maximum sequence length.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -85,6 +92,8 @@ def mha_prefill(
 
     Standard full-sequence prefill assumes query and KV sequence boundaries match.
     """
+    batch_size = cu_seqlens.shape[0] - 1
+
     # Select kernel
     traits = {
         "num_q_heads": q.shape[1],
@@ -95,10 +104,11 @@ def mha_prefill(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
         "mha_prefill",
-        q.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,
@@ -106,14 +116,13 @@ def mha_prefill(
 
     # Record shapes
     shape_params = {
-        "batch_size": cu_seqlens_q.shape[0] - 1,
+        "batch_size": batch_size,
         "total_q": q.shape[0],
         "total_kv": k.shape[0],
         "num_q_heads": q.shape[1],
         "num_kv_heads": k.shape[1],
         "head_dim": q.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
+        "max_seqlen": max_seqlen,
     }
     ShapeCapture.get().record(
         "attention",
@@ -135,10 +144,9 @@ def mha_prefill(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=max_seqlen,
             window_left=window_left,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -157,7 +165,7 @@ def mha_extend_with_kvcache(
     max_seqlen_q: int,
     max_seqlen_k: int,
     # attention options
-    softmax_scale: float | None = None,
+    is_causal: bool = False,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -178,7 +186,7 @@ def mha_extend_with_kvcache(
             lengths are independent and may be smaller than KV lengths.
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
+        is_causal: Whether query tokens are a causal suffix of cached KV.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -195,15 +203,17 @@ def mha_extend_with_kvcache(
         "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
+        "is_causal": is_causal,
         "sliding_window": window_left >= 0,
         "support_logit_cap": logit_cap != 0.0,
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
         "mha_extend_with_kvcache",
-        q.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,
@@ -245,7 +255,7 @@ def mha_extend_with_kvcache(
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            softmax_scale=softmax_scale,
+            is_causal=is_causal,
             window_left=window_left,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -264,7 +274,6 @@ def mha_decode_with_kvcache(
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
     # attention options
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -283,7 +292,6 @@ def mha_decode_with_kvcache(
         page_table: Page table with shape [batch, max_pages_per_seq].
         cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
         max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -308,10 +316,11 @@ def mha_decode_with_kvcache(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
         "mha_decode_with_kvcache",
-        q.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,
@@ -352,7 +361,6 @@ def mha_decode_with_kvcache(
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            softmax_scale=softmax_scale,
             window_left=window_left,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -390,10 +398,11 @@ def mha_merge_state(
     traits = {
         "head_dim": out_a.shape[-1],
     }
+    signature = _attention_format_signature(out_a=out_a, out_b=out_b)
     kernel = select_kernel(
         "attention",
         "mha_merge_state",
-        out_a.dtype,
+        signature,
         traits=traits,
         solution=solution,
         override=override,

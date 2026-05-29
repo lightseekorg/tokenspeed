@@ -158,6 +158,82 @@ def _mm_mxfp8() -> torch.Tensor:
     )
 
 
+def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
+    a = torch.empty((4, 128), dtype=torch.bfloat16)
+    b = torch.empty((128, 128), dtype=_fp8_dtype())
+    b_scales = torch.empty((1, 1), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        None,
+        b_scales,
+        torch.bfloat16,
+        "mxfp8",
+        [128, 128],
+    )
+
+    a_format = signature.format_for("a")
+    b_format = signature.format_for("b")
+    assert a_format is not None
+    assert b_format is not None
+    assert a_format.storage_dtype == _fp8_dtype()
+    assert b_format.storage_dtype == _fp8_dtype()
+    assert a_format.scale is not None
+    assert b_format.scale is not None
+    assert a_format.scale.block_shape == (128, 128)
+    assert b_format.scale.block_shape == (128, 128)
+
+
+def test_gemm_fp8_scaled_signature_uses_fp8_format_with_scale() -> None:
+    a = torch.empty((4, 128), dtype=_fp8_dtype())
+    b = torch.empty((128, 128), dtype=_fp8_dtype())
+    a_scales = torch.empty((1,), dtype=torch.float32)
+    b_scales = torch.empty((1,), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "fp8",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.format == "scaled-fp8"
+        assert tensor_format.storage_dtype == _fp8_dtype()
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.granularity == "tensor"
+        assert tensor_format.scale.storage_dtype == torch.float32
+
+
+def test_gemm_fp8_scaled_signature_uses_channel_granularity() -> None:
+    a = torch.empty((4, 128), dtype=_fp8_dtype())
+    b = torch.empty((128, 128), dtype=_fp8_dtype())
+    a_scales = torch.empty((4,), dtype=torch.float32)
+    b_scales = torch.empty((128,), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "fp8",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.granularity == "channel"
+
+
 def _mm_nvfp4() -> torch.Tensor:
     a = torch.empty((4, 64), dtype=torch.uint8)
     b = torch.empty((128, 64), dtype=torch.uint8)
@@ -175,18 +251,41 @@ def _mm_nvfp4() -> torch.Tensor:
     )
 
 
+def test_gemm_nvfp4_signature_uses_fixed_block_shape() -> None:
+    a = torch.empty((4, 64), dtype=torch.uint8)
+    b = torch.empty((128, 64), dtype=torch.uint8)
+    a_scales = torch.empty((4, 1), dtype=torch.float32)
+    b_scales = torch.empty((128, 1), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "nvfp4",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.block_shape == (16,)
+
+
 def _attention_prefill() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
     v = torch.empty((4, 8, 64), dtype=torch.bfloat16)
-    cu_seqlens_q = torch.tensor([0, 4], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
     return tokenspeed_kernel.mha_prefill(
         q,
         k,
         v,
-        cu_seqlens_q,
-        max_seqlen_q=4,
-        max_seqlen_k=4,
+        cu_seqlens,
+        cu_seqlens_cpu=[0, 4],
+        max_seqlen=4,
     )
 
 
@@ -324,7 +423,7 @@ def _moe_fused_self_routing_bf16() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"self_routing"},
-        traits={"weight_dtype": "bf16"},
+        weight_format="bf16",
     )
 
 
@@ -332,7 +431,7 @@ def _moe_fused_self_routing_mxfp4() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"self_routing"},
-        traits={"weight_dtype": "mxfp4"},
+        weight_format="mxfp4",
     )
 
 
@@ -340,8 +439,8 @@ def _moe_fused_prerouted_nvfp4_cutlass() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"pre_routed"},
+        weight_format="nvfp4",
         traits={
-            "weight_dtype": "nvfp4",
             "tp": True,
             "ep": True,
             "cuda_graph": False,
@@ -353,8 +452,8 @@ def _moe_fused_prerouted_nvfp4_cutedsl() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.uint8,
         features={"pre_routed"},
+        weight_format="nvfp4",
         traits={
-            "weight_dtype": "nvfp4",
             "tp": False,
             "ep": True,
             "cuda_graph": True,
@@ -366,7 +465,8 @@ def _moe_fused_prerouted_bf16_reference() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
         features={"pre_routed"},
-        traits={"weight_dtype": "bf16", "tp": False, "ep": False},
+        weight_format="bf16",
+        traits={"tp": False, "ep": False},
     )
 
 

@@ -46,7 +46,6 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.env import get_global_server_args
 
 
 @lru_cache(maxsize=1024)
@@ -159,6 +158,7 @@ class Qwen3VLVisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         workspace_buffer: torch.Tensor | None = None,
+        mm_attention_backend: str | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -175,6 +175,7 @@ class Qwen3VLVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             workspace_buffer=workspace_buffer,
             mapping=mapping,
+            mm_attention_backend=mm_attention_backend,
         )
         self.mlp = Qwen3VLVisionMLP(
             dim,
@@ -283,9 +284,11 @@ class Qwen3VLMoeVisionModel(nn.Module):
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
     ) -> None:
         super().__init__()
         vision = mapping.vision
+        self.mm_attention_backend = mm_attention_backend
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -315,7 +318,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         )
 
         workspace_buffer = None
-        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+        if self.mm_attention_backend == "flashinfer_cudnn":
             if torch.cuda.is_available():
                 ws_device = torch.device("cuda", torch.cuda.current_device())
             else:
@@ -339,6 +342,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     workspace_buffer=workspace_buffer,
                     mapping=mapping,
+                    mm_attention_backend=mm_attention_backend,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -567,7 +571,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
         real_max_seqlen = int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
 
-        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+        if self.mm_attention_backend == "flashinfer_cudnn":
             # (B_padded,) token lengths
             seq_lens_padded = self.compute_cudnn_sequence_lengths_padded(
                 token_cu_seqlens

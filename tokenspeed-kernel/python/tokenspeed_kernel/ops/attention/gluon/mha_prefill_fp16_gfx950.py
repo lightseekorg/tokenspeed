@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.gluon.utils import (
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
@@ -936,7 +937,7 @@ def get_config(
     q: torch.Tensor,
     k: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
+    max_seqlen: int,
     window_left: int,
 ) -> LaunchConfig:
     n_heads = q.shape[1]
@@ -958,7 +959,7 @@ def get_config(
         block_n=block_n,
         num_warps=num_warps,
         batch_size=batch_size,
-        max_seqlen=max_seqlen_q,
+        max_seqlen=max_seqlen,
         is_sliding=is_sliding,
         window_left=window_left,
         grid=(512,),
@@ -975,7 +976,9 @@ def get_config(
         max_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd"}),
     ),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.SPECIALIZED,
     traits={
         "head_dim": frozenset({64}),
@@ -989,10 +992,9 @@ def gluon_mha_prefill_fp16_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    softmax_scale: float | None = None,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -1002,8 +1004,8 @@ def gluon_mha_prefill_fp16_gfx950(
     config = get_config(
         q=q,
         k=k,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen=max_seqlen,
         window_left=window_left,
     )
     output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
@@ -1021,7 +1023,7 @@ def gluon_mha_prefill_fp16_gfx950(
         q,
         k,
         v,
-        cu_seqlens_q,
+        cu_seqlens,
         output,
         sink_arg,
         lse_arg,

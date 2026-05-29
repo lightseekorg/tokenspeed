@@ -33,6 +33,11 @@ from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 # ---------------------------------------------------------------------------
@@ -46,10 +51,14 @@ from tokenspeed_kernel.torch_compile import get_compiler_backend
     name="reference_moe_fused",
     features={"pre_routed"},
     solution="reference",
-    dtypes={torch.float16, torch.bfloat16, torch.float32},
+    signatures=frozenset(
+        format_signature(
+            x=dense_tensor_format(dtype), weight=dense_tensor_format(torch.bfloat16)
+        )
+        for dtype in {torch.float16, torch.bfloat16, torch.float32}
+    ),
     priority=Priority.REFERENCE,
     traits={
-        "weight_dtype": frozenset({"bf16", "fp16", "fp32"}),
         "tp": frozenset({False}),
         "ep": frozenset({False}),
     },
@@ -89,7 +98,9 @@ def fused_moe_forward_native(
     "route",
     name="torch_compile_fused_topk_bias",
     solution="reference",
-    dtypes={torch.float16, torch.bfloat16, torch.float32},
+    signatures=format_signatures(
+        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
     traits={
         "output_type": frozenset({"topk"}),
         "biased": frozenset({True}),
@@ -131,7 +142,9 @@ def fused_topk_bias(
     "route",
     name="torch_native_fused_topk",
     solution="reference",
-    dtypes={torch.float16, torch.bfloat16, torch.float32},
+    signatures=format_signatures(
+        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
     traits={
         "output_type": frozenset({"topk"}),
         "biased": frozenset({True, False}),
@@ -189,7 +202,9 @@ def _mask_topk_ids_padded_region(
     "route",
     name="torch_compile_grouped_topk",
     solution="reference",
-    dtypes={torch.float16, torch.bfloat16, torch.float32},
+    signatures=format_signatures(
+        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
     traits={
         "output_type": frozenset({"topk"}),
         "biased": frozenset({False}),
@@ -270,7 +285,9 @@ def grouped_topk_gpu(
     "route",
     name="torch_compile_biased_grouped_topk",
     solution="reference",
-    dtypes={torch.float16, torch.bfloat16, torch.float32},
+    signatures=format_signatures(
+        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
     traits={
         "output_type": frozenset({"topk"}),
         "biased": frozenset({True}),
@@ -366,7 +383,7 @@ def biased_grouped_topk_gpu(
     "align_block_size",
     name="torch_moe_align_block_size",
     solution="reference",
-    dtypes={torch.int32},
+    signatures=format_signatures("indices", "dense", {torch.int32}),
     traits={},
     priority=10,
     tags={"determinism", "portability"},

@@ -99,7 +99,6 @@ def cp_all_gather_rerange_output(
     """
     x = token_all_gather(
         x,
-        rank,
         group,
         scattered_num_tokens=cp_metadata.per_rank_actual_token,
     )

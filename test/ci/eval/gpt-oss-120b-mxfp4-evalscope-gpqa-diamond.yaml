@@ -45,13 +45,23 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   # Expected GPQA-Diamond AveragePass@1 bar: 0.74 +- 0.03 (gpt-oss-120b reasoning).
+  # --repeats 3 samples each of the 198 questions 3x and averages, shrinking the
+  # per-run stddev by ~sqrt(3). At the 0.7 threshold this drops the noise-only
+  # failure rate from ~11% to ~2%.
+  # --eval-batch-size 64 lifts evalscope's client-side concurrency from 16 to 64
+  # (server's max_num_seqs=160, so still 2.5x headroom). At batch=16 the server
+  # was pinned at 13-16 in-flight requests with page_ratio=0.00-0.01, leaving
+  # most decode capacity idle. Higher concurrency also lets the prefix cache
+  # hit on --repeats duplicates, further reducing TTFT. Net effect: roughly
+  # cancels the 3x sample cost, making this change cost-neutral overall.
   command: >-
     /tmp/evalscope-perf/bin/evalscope eval
     --model ${GPT_OSS_EVAL_MODEL}
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
-    --eval-batch-size 16
+    --eval-batch-size 64
+    --repeats 3
 report:
   github_step_summary: true
 score_threshold: 0.7

@@ -52,6 +52,34 @@ TEST(MambaChunkAllocatorTest, ExhaustedPoolReturnsNullopt) {
     EXPECT_FALSE(s2.has_value());
 }
 
+TEST(MambaChunkAllocatorTest, AllocateReturnsSmallestFreeIndexRegardlessOfFreeOrder) {
+    // TP-determinism invariant: the index returned by Allocate() must depend
+    // only on the SET of free indices, not on the order in which Free() was
+    // called. Replays the same Free sequence in two different orders and
+    // expects the same Allocate result.
+    MambaChunkAllocator allocator_a(8);
+    MambaChunkAllocator allocator_b(8);
+    // Drain both pools.
+    std::vector<std::optional<MambaSlot>> slots_a, slots_b;
+    for (int i = 0; i < 8; ++i) {
+        slots_a.push_back(allocator_a.Allocate());
+        slots_b.push_back(allocator_b.Allocate());
+    }
+    // Free the same set of indices in opposite orders.
+    slots_a[3].reset();
+    slots_a[6].reset();
+    slots_a[1].reset();
+    slots_b[1].reset();
+    slots_b[6].reset();
+    slots_b[3].reset();
+    auto next_a = allocator_a.Allocate();
+    auto next_b = allocator_b.Allocate();
+    ASSERT_TRUE(next_a.has_value());
+    ASSERT_TRUE(next_b.has_value());
+    EXPECT_EQ(next_a->Index(), next_b->Index());
+    EXPECT_EQ(next_a->Index(), 1);  // smallest free index after freeing {1,3,6}
+}
+
 TEST(MambaHostAllocatorTest, AllocateFreeAndDrainReleased) {
     tokenspeed::MambaHostAllocator allocator(3);
     auto slot = allocator.Allocate();
@@ -65,6 +93,49 @@ TEST(MambaHostAllocatorTest, AllocateFreeAndDrainReleased) {
     ASSERT_EQ(released.size(), 1);
     EXPECT_EQ(released[0], idx);
     EXPECT_TRUE(allocator.DrainReleased().empty());
+}
+
+TEST(MambaHostAllocatorTest, AllocateReturnsSmallestFreeIndexRegardlessOfFreeOrder) {
+    // Mirror of the MambaChunkAllocator determinism test for the host pool.
+    tokenspeed::MambaHostAllocator allocator_a(8);
+    tokenspeed::MambaHostAllocator allocator_b(8);
+    std::vector<std::optional<tokenspeed::MambaSlot>> slots_a, slots_b;
+    for (int i = 0; i < 8; ++i) {
+        slots_a.push_back(allocator_a.Allocate());
+        slots_b.push_back(allocator_b.Allocate());
+    }
+    slots_a[5].reset();
+    slots_a[2].reset();
+    slots_a[7].reset();
+    slots_b[7].reset();
+    slots_b[2].reset();
+    slots_b[5].reset();
+    auto next_a = allocator_a.Allocate();
+    auto next_b = allocator_b.Allocate();
+    ASSERT_TRUE(next_a.has_value());
+    ASSERT_TRUE(next_b.has_value());
+    EXPECT_EQ(next_a->Index(), next_b->Index());
+    EXPECT_EQ(next_a->Index(), 2);
+}
+
+TEST(MambaHostAllocatorTest, DrainReleasedReturnsSortedRegardlessOfFreeOrder) {
+    // The drain output must be order-independent across TP ranks too — the
+    // consumer treats it as a SET of released indices.
+    tokenspeed::MambaHostAllocator allocator(8);
+    std::vector<std::optional<tokenspeed::MambaSlot>> slots;
+    for (int i = 0; i < 8; ++i) {
+        slots.push_back(allocator.Allocate());
+    }
+    slots[5].reset();
+    slots[1].reset();
+    slots[7].reset();
+    slots[3].reset();
+    auto released = allocator.DrainReleased();
+    ASSERT_EQ(released.size(), 4);
+    EXPECT_EQ(released[0], 1);
+    EXPECT_EQ(released[1], 3);
+    EXPECT_EQ(released[2], 5);
+    EXPECT_EQ(released[3], 7);
 }
 
 TEST(MambaSlotTest, CustomReleaserRunsOnDestruction) {

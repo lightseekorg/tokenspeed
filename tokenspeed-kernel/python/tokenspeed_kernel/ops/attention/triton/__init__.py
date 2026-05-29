@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention.triton.mha_decode import decode_attention_f
 from tokenspeed_kernel.ops.attention.triton.mha_prefill import prefill_attention_fwd
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -72,7 +73,9 @@ def mha_merge_state_kernel(
     name="triton_mha_prefill",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={
         "sliding_window": frozenset({False, True}),
@@ -86,16 +89,14 @@ def triton_mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    softmax_scale: float | None = None,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    batch_size = cu_seqlens_q.shape[0] - 1
     out = torch.empty_like(q)
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
@@ -105,9 +106,6 @@ def triton_mha_prefill(
     cache_seqlens = torch.empty((0,), dtype=torch.int32, device=q.device)
     empty_k = torch.empty((0, k.shape[1], k.shape[2]), dtype=k.dtype, device=k.device)
     empty_v = torch.empty((0, v.shape[1], v.shape[2]), dtype=v.dtype, device=v.device)
-    sm_scale = (
-        softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    )
     prefill_attention_fwd(
         q,
         k,
@@ -115,12 +113,12 @@ def triton_mha_prefill(
         out,
         empty_k,
         empty_v,
-        cu_seqlens_q,
+        cu_seqlens,
         cache_seqlens,
         None,
         True,
-        max_seqlen_q,
-        sm_scale=sm_scale,
+        max_seqlen,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
         logit_cap=logit_cap,
         sliding_window_size=window_left,
         sinks=sinks,
@@ -138,9 +136,12 @@ def triton_mha_prefill(
     name="triton_mha_extend_with_kvcache",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={
+        "is_causal": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False, True}),
@@ -157,7 +158,7 @@ def triton_mha_extend_with_kvcache(
     cache_seqlens: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    softmax_scale: float | None = None,
+    is_causal: bool = False,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -180,9 +181,6 @@ def triton_mha_extend_with_kvcache(
         if return_lse
         else None
     )
-    sm_scale = (
-        softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    )
     prefill_attention_fwd(
         q,
         k,
@@ -193,9 +191,9 @@ def triton_mha_extend_with_kvcache(
         cu_seqlens_q,
         cache_seqlens,
         None,
-        False,
+        is_causal,
         max_seqlen_q,
-        sm_scale=sm_scale,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
         logit_cap=logit_cap,
         sliding_window_size=window_left,
         sinks=sinks,
@@ -216,7 +214,9 @@ def triton_mha_extend_with_kvcache(
     name="triton_mha_decode_with_kvcache_cached",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={
         "sliding_window": frozenset({False, True}),
@@ -233,7 +233,6 @@ def triton_mha_decode_with_kvcache(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -259,9 +258,6 @@ def triton_mha_decode_with_kvcache(
     num_kv_splits = torch.ones(
         (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
     )
-    sm_scale = (
-        softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    )
     decode_attention_fwd(
         q,
         k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
@@ -276,7 +272,7 @@ def triton_mha_decode_with_kvcache(
         page_table.stride(0),
         k_cache.shape[1],
         window_left,
-        sm_scale=sm_scale,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
         logit_cap=logit_cap,
         sinks=sinks,
     )
@@ -289,7 +285,9 @@ def triton_mha_decode_with_kvcache(
     name="triton_mha_merge_state",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    dtypes={torch.float16, torch.bfloat16},
+    signatures=format_signatures(
+        ("out_a", "out_b"), "dense", {torch.float16, torch.bfloat16}
+    ),
     priority=Priority.PORTABLE,
     traits={},
     tags={"portability"},

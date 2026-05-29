@@ -224,7 +224,7 @@ class GptOssAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         fused_kv_arg = None
-        if ctx.attn_backend.support_kv_cache_prewrite:
+        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
             n = q.shape[0]
             v_3d = v.view(n, self.num_kv_heads, self.head_dim)
             fused_kv_arg = create_fused_set_kv_buffer_arg(
