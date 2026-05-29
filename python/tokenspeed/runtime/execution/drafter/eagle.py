@@ -225,7 +225,7 @@ class Eagle(BaseDrafter):
         # to both pure DECODE and the decode slice of a MIXED batch; prefill
         # rows have no accept_lengths semantics and are left alone.
         num_decodes = bs - draft_input.num_extends
-        if num_decodes > 0 and self.attn_backend.support_kv_cache_prewrite:
+        if num_decodes > 0 and self.attn_backend.support_kv_cache_prewrite():
             correction = (
                 self.spec_num_tokens
                 - draft_input.accept_lengths[draft_input.num_extends:]
