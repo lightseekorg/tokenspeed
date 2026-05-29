@@ -655,8 +655,16 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             and kv_chunk.begin_cache_step is None
                         ):
                             if kv_chunk.wait_for_bootstrap_token:
-                                self._wait_bootstrap_token(
-                                    kv_chunk.prefill_aux_index, kv_chunk.bootstrap_token
+                                # Block until prefill metadata is published, then
+                                # discard the returned tuple — the bootstrap token
+                                # itself is delivered via the status message that
+                                # follows this Mamba send (line ~711). This call
+                                # only exists to serialize "Mamba send" after
+                                # sampling completes.
+                                self._wait_prefill_metadata(
+                                    kv_chunk.room,
+                                    kv_chunk.bootstrap_token,
+                                    kv_chunk.spec_candidate_ids,
                                 )
                             ret = self.send_mamba_cache(
                                 req.mooncake_session_id,

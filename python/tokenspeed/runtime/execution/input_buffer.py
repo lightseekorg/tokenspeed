@@ -36,18 +36,6 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
-def _remote_spec_tail_seed_mask(
-    runtime_states: "RuntimeStates",
-    decode_req_pool_indices: torch.Tensor,
-    token_mask: torch.Tensor,
-) -> torch.Tensor:
-    remote_mask = getattr(runtime_states, "remote_spec_candidate_mask", None)
-    if remote_mask is None:
-        return token_mask
-    has_remote_candidates = remote_mask[decode_req_pool_indices].unsqueeze(1)
-    return token_mask & ~has_remote_candidates
-
-
 class InputBuffers:
     """
     ForwardContext tensor data source, read-only after fill. Holds only
@@ -200,19 +188,19 @@ class InputBuffers:
             mask = (decode_input_ids_tensor != -1).unsqueeze(1)
             ids = decode_input_ids_tensor.unsqueeze(1)
 
+            # Only seed col 0 (the verified token). The draft slots
+            # (cols 1..spec_num_draft_tokens-1) are owned by either the local
+            # drafter or write_remote_spec_candidate_ids; for retract-recovery
+            # there is no draft source, so leaving the tail untouched lets the
+            # verifier reject those slots and the step naturally falls back to
+            # a 1-token decode. Broadcasting the seed across the tail would
+            # turn the retract step into a synthetic-candidate proposal that
+            # the target may accept, producing duplicate tokens the drafter
+            # never actually proposed.
             first_slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
             runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
                 mask, ids, first_slot
             )
-
-            if runtime_states.future_input_map.shape[1] > 1:
-                tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
-                tail_seed_mask = _remote_spec_tail_seed_mask(
-                    runtime_states, decode_req_pool_indices, mask
-                )
-                runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
-                    torch.where(tail_seed_mask, ids.expand(-1, tail.shape[1]), tail)
-                )
 
         valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
             0, req_pool_indices_device
@@ -299,17 +287,6 @@ class InputBuffers:
                 runtime_states.future_input_map[req_pool_indices_device].flatten(),
                 non_blocking=True,
             )
-
-        remote_spec_candidate_mask = getattr(
-            runtime_states, "remote_spec_candidate_mask", None
-        )
-        if remote_spec_candidate_mask is not None:
-            if num_extends > 0 and num_extends < batch_size:
-                remote_spec_candidate_mask[
-                    req_pool_indices_device[num_extends:batch_size]
-                ] = False
-            elif num_extends == 0:
-                remote_spec_candidate_mask[req_pool_indices_device] = False
 
         self.seq_lens_buf[:batch_size].copy_(input_lengths_device + valid_cache_lengths)
 

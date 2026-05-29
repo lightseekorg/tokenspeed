@@ -52,9 +52,6 @@ class RuntimeStates:
         self.future_input_map = torch.empty(
             (req_pool_size + 1, output_length), dtype=torch.int32, device=device
         )
-        self.remote_spec_candidate_mask = torch.zeros(
-            req_pool_size + 1, dtype=torch.bool, device=device
-        )
         self.linear_penalties = torch.zeros(
             (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
         )
@@ -74,7 +71,6 @@ class RuntimeStates:
         extend_prefix_lens: torch.Tensor,
     ) -> None:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
-        self.remote_spec_candidate_mask[extend_request_pool_indices] = False
         self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
         self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
 
@@ -88,7 +84,6 @@ class RuntimeStates:
             )
         ids = torch.tensor(candidate_ids, dtype=torch.int32, device=self.device)
         self.future_input_map[req_pool_idx, :width] = ids
-        self.remote_spec_candidate_mask[req_pool_idx] = True
 
     def copy_mamba_states(
         self,
