@@ -64,6 +64,7 @@ def _iter_candidate_specs(
     kernel_name: str | None,
     op_filter: tuple[str, str] | None,
     dtype_filter: torch.dtype | None,
+    dtype_role: str,
 ) -> list[KernelSpec]:
     if kernel_name is not None:
         spec = registry.get_by_name(kernel_name)
@@ -80,7 +81,11 @@ def _iter_candidate_specs(
         specs = [s for s in specs if s.family == family and s.mode == mode]
 
     if dtype_filter is not None:
-        specs = [s for s in specs if dtype_filter in s.dtypes]
+        specs = [
+            s
+            for s in specs
+            if s.format_signatures_for_storage_dtype(dtype_filter, dtype_role)
+        ]
 
     specs.sort(key=lambda s: (s.family, s.mode, s.name))
     return specs
@@ -89,10 +94,11 @@ def _iter_candidate_specs(
 def _iter_dtypes(
     spec: KernelSpec,
     dtype_filter: torch.dtype | None,
+    dtype_role: str,
 ) -> Iterable[torch.dtype]:
     if dtype_filter is not None:
         return (dtype_filter,)
-    return sorted(spec.dtypes, key=str)
+    return sorted(spec.storage_dtypes_for_role(dtype_role), key=str)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
         "--dtype",
         choices=sorted(_DTYPE_SELECTIONS),
         help="Filter by dtype selection",
+    )
+    parser.add_argument(
+        "--dtype-role",
+        required=True,
+        help="Tensor role whose storage dtype is selected by --dtype",
     )
     parser.add_argument(
         "--shapes",
@@ -122,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         kernel_name=args.kernel_name,
         op_filter=op_filter,
         dtype_filter=dtype_filter,
+        dtype_role=args.dtype_role,
     )
 
     if not specs:
@@ -132,13 +144,14 @@ def main(argv: list[str] | None = None) -> int:
     failing = False
     ran = False
     for spec in specs:
-        for dtype in _iter_dtypes(spec, dtype_filter):
+        for dtype in _iter_dtypes(spec, dtype_filter, args.dtype_role):
             ran = True
             try:
                 results = verify_kernel(
                     spec.name,
                     shapes=shapes,
                     dtype=dtype,
+                    dtype_role=args.dtype_role,
                     verbose=False,
                 )
             except Exception as exc:

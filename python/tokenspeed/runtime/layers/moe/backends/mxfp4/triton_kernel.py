@@ -294,7 +294,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             fused_activation=act,
             dtype=hidden_states.dtype,
             features={"ragged_metadata", "dispatch_gemm"},
-            traits={"weight_dtype": "mxfp4"},
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
 
@@ -321,7 +320,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             n_expts_act=top_k,
             dtype=hidden_states.dtype,
             features={"ragged_metadata", "gemm_combine"},
-            traits={"weight_dtype": "mxfp4"},
             expected_kernel_name="triton_kernels_gemm_combine",
         )
 

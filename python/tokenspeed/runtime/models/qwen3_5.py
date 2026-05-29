@@ -747,6 +747,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             sigmoid_mul(attn_output, gate)
 
+        if ctx.draft_first_step_reduce:
+            # Slice attn_output to [bs, H] so o_proj runs on live rows only.
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -774,6 +778,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
             )
+            if ctx.draft_first_step_reduce:
+                # Gather residual to self_attention's [bs, H].
+                residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -1123,6 +1130,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
     ):
         super().__init__(
             config=config.text_config,
@@ -1135,19 +1144,29 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.config, "rope_scaling", {}
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            mapping=mapping,
-        )
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
-        self.vision_embedder = VisionEmbedder()
-        self.image_encoder = self.get_image_feature
-        self.video_encoder = self.get_video_feature
+        self.is_multimodal_active = is_multimodal_active
+        if not self.is_multimodal_active:
+            self.visual = None
+            self.deepstack_visual_indexes = []
+            self.num_deepstack_embeddings = 0
+            self.vision_embedder = None
+            self.image_encoder = None
+            self.video_encoder = None
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                mapping=mapping,
+                mm_attention_backend=mm_attention_backend,
+            )
+            self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+            self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+            # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
+            self.vision_embedder = VisionEmbedder()
+            self.image_encoder = self.get_image_feature
+            self.video_encoder = self.get_video_feature
 
     def separate_deepstack_embeds(self, embedding: torch.Tensor):
         assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
@@ -1315,6 +1334,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 continue
             if "mtp" in name:
                 continue
+            if not self.is_multimodal_active and "visual" in name:
+                continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1366,12 +1387,16 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
     ) -> None:
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            is_multimodal_active=is_multimodal_active,
+            mm_attention_backend=mm_attention_backend,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -1428,6 +1453,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
+                continue
+            if not self.is_multimodal_active and "visual" in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")

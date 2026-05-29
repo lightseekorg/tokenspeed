@@ -161,8 +161,8 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
             capacity=capacity,
             dtype=x_fp4.dtype,
             features={"pre_routed"},
+            weight_format="nvfp4",
             traits={
-                "weight_dtype": "nvfp4",
                 "tp": False,
                 "ep": True,
                 "cuda_graph": True,

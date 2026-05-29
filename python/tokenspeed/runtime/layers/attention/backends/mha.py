@@ -72,9 +72,10 @@ class MHAMetadata:
 class MHAAttnBackend(AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
-    @property
-    def support_kv_cache_prewrite(self) -> bool:
-        return False
+    def support_kv_cache_prewrite(
+        self, forward_mode: ForwardMode | None = None
+    ) -> bool:
+        return forward_mode is not None and forward_mode.is_decode()
 
     def __init__(self, config: MHAConfig):
         super().__init__(config)

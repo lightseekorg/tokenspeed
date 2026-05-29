@@ -30,6 +30,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
@@ -176,7 +177,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128, 256}),
@@ -239,7 +242,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128, 256}),
@@ -348,7 +353,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
             "is_causal": frozenset({False, True}),
@@ -425,7 +432,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        dtypes={torch.float16, torch.bfloat16},
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.SPECIALIZED,
         traits={
             "sliding_window": frozenset({False, True}),

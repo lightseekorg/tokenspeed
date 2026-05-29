@@ -210,6 +210,7 @@ class MoonViTEncoderLayer(nn.Module):
         attn_bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -234,6 +235,7 @@ class MoonViTEncoderLayer(nn.Module):
             prefix=add_prefix("attn", prefix),
             customized_position_embedding_applier=apply_rope,
             mapping=mapping,
+            mm_attention_backend=mm_attention_backend,
         )
 
     def forward(
@@ -623,6 +625,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         *inputs,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mm_attention_backend: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -649,6 +652,7 @@ class MoonViT3dPretrainedModel(nn.Module):
                 "activation": PytorchGELUTanh(),
                 "attn_bias": True,
                 "mapping": mapping,
+                "mm_attention_backend": mm_attention_backend,
             },
             video_attn_type=config.video_attn_type,
             quant_config=quant_config,
@@ -724,21 +728,29 @@ class KimiK25ForConditionalGeneration(nn.Module):
         mapping: Mapping,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
         **kwargs,  # fix init_tts argument error
     ) -> None:
         super().__init__()
         self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
-        self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config,
-            quant_config=(
-                quant_config if isinstance(quant_config, ModelSlimConfig) else None
-            ),
-            prefix="vision_tower",
-            mapping=mapping,
-        )
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        self.is_multimodal_active = is_multimodal_active
+        if not self.is_multimodal_active:
+            self.vision_tower = None
+            self.mm_projector = None
+        else:
+            self.vision_tower = MoonViT3dPretrainedModel(
+                config.vision_config,
+                quant_config=(
+                    quant_config if isinstance(quant_config, ModelSlimConfig) else None
+                ),
+                prefix="vision_tower",
+                mapping=mapping,
+                mm_attention_backend=mm_attention_backend,
+            )
+            self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
         self.language_model = None
         if not getattr(config, "encoder_only", False):
@@ -753,16 +765,22 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 ),
             )
 
-        # Match vision-tower / mm-projector dtype to language-model dtype;
-        # the vision tower defaults to float32 while the LM may be bf16 / fp8.
-        if self.language_model is not None and hasattr(self.language_model, "dtype"):
-            target_dtype = self.language_model.dtype
-            self.vision_tower = self.vision_tower.to(dtype=target_dtype)
-            self.mm_projector = self.mm_projector.to(dtype=target_dtype)
+        if self.is_multimodal_active:
+            # Match vision-tower / mm-projector dtype to language-model dtype;
+            # the vision tower defaults to float32 while the LM may be bf16 / fp8.
+            if self.language_model is not None and hasattr(
+                self.language_model, "dtype"
+            ):
+                target_dtype = self.language_model.dtype
+                self.vision_tower = self.vision_tower.to(dtype=target_dtype)
+                self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-        # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
-        self.vision_embedder = VisionEmbedder()
-        self.image_encoder = self.get_image_feature
+            # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
+            self.vision_embedder = VisionEmbedder()
+            self.image_encoder = self.get_image_feature
+        else:
+            self.vision_embedder = None
+            self.image_encoder = None
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Eager image encode via the same ``pre_encode`` / ``forward_blocks``
@@ -907,7 +925,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 name = name.replace("language_model.", "")
                 language_weights.append((name, loaded_weight))
 
-        if not getattr(self.config, "language_only", False):
+        if self.is_multimodal_active and not getattr(
+            self.config, "language_only", False
+        ):
             vision_state_dict = dict(vision_weights)
             params_dict = dict(self.named_parameters(remove_duplicate=False))
             for name, loaded_weight in vision_state_dict.items():

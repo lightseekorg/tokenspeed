@@ -25,6 +25,7 @@ import logging
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +278,7 @@ def _fwd_kernel_ep_scatter_2(
     "dispatch",
     name="deepep_moe_scatter",
     solution="deep_ep",
-    dtypes={torch.float8_e4m3fn, torch.bfloat16},
+    signatures=format_signatures("x", "dense", {torch.float8_e4m3fn, torch.bfloat16}),
     traits={
         "comm_strategy": frozenset({"deep_ep"}),
     },
@@ -414,7 +415,7 @@ def _fwd_kernel_ep_gather(
     "combine",
     name="deepep_moe_gather",
     solution="deep_ep",
-    dtypes={torch.bfloat16},
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
     traits={
         "comm_strategy": frozenset({"deep_ep"}),
     },

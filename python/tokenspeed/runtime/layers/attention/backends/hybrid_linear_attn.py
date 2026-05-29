@@ -1213,9 +1213,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             *args, **common_kw, **mamba_kw
         )
 
-    @property
-    def support_kv_cache_prewrite(self) -> bool:
-        return self.full_attn_backend.support_kv_cache_prewrite
+    def support_kv_cache_prewrite(
+        self, forward_mode: ForwardMode | None = None
+    ) -> bool:
+        return self.full_attn_backend.support_kv_cache_prewrite(forward_mode)
 
     # ---- Forward dispatch ----
 
