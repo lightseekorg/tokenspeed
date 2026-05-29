@@ -69,7 +69,6 @@ class CommBackend(ABC):
     def token_all_gather(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor: ...
@@ -78,7 +77,6 @@ class CommBackend(ABC):
     def token_reduce_scatter(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor: ...

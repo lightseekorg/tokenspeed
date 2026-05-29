@@ -25,13 +25,16 @@ Lazily creates and caches Triton RS/AG state keyed by (group_tuple, hidden_size)
 """
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
     all_gather,
+    all_gather_inner,
     create_state,
     reduce_scatter,
 )
+from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.distributed.comm_backend.base import Group
+from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -47,44 +50,76 @@ class TritonRSAGBackend:
     (group, hidden_size) pair because RSAG pre-allocates buffers.
     """
 
-    def __init__(self):
+    def __init__(self, fallback: CommBackend):
+        self._fallback = fallback
         # (group_tuple, hidden_size) -> Triton RS/AG state
         self._instances = {}
 
-    def _get_or_create(self, rank: int, group: Group, hidden_size: int):
+    def _get_or_create(self, group: Group, hidden_size: int):
         key = (group, hidden_size)
         if key in self._instances:
             return self._instances[key]
 
         max_num_tokens = self._get_max_num_gathered_tokens()
-        rsag = create_state(
+        state = create_state(
             group=pg_manager.get_process_group("nccl", group),
-            rank_in_group=rank,
+            rank_in_group=group.index(dist.get_rank()),
             max_tokens=max_num_tokens,
             hidden_size=hidden_size,
         )
-        self._instances[key] = rsag
-        return rsag
+        self._instances[key] = state
+        return state
+
+    def all_gather(
+        self,
+        tensor: torch.Tensor,
+        group: Group,
+        dim: int = 0,
+    ) -> torch.Tensor:
+        if tensor.dim() != 2:
+            return self._fallback.all_gather(tensor, group=group, dim=dim)
+
+        if dim == 0:
+            return self.token_all_gather(
+                tensor,
+                group=group,
+                scattered_num_tokens=[tensor.size(0)] * len(group),
+            )
+
+        if (
+            current_platform().is_nvidia
+            and dim in (-1, tensor.dim() - 1)
+            and tensor.dtype == torch.bfloat16
+        ):
+            hidden_size = tensor.size(-1) * len(group)
+            state = self._get_or_create(group, hidden_size)
+            return all_gather_inner(
+                state,
+                tensor,
+                tp_hidden_dim=hidden_size,
+                skip_entry_sync=False,
+                safe=False,
+            )
+
+        return self._fallback.all_gather(tensor, group=group, dim=dim)
 
     def token_all_gather(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        rsag = self._get_or_create(rank, group, tensor.size(-1))
-        return all_gather(rsag, tensor, token_list_in_group=scattered_num_tokens)
+        state = self._get_or_create(group, tensor.size(-1))
+        return all_gather(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def token_reduce_scatter(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        rsag = self._get_or_create(rank, group, tensor.size(-1))
-        return reduce_scatter(rsag, tensor, token_list_in_group=scattered_num_tokens)
+        state = self._get_or_create(group, tensor.size(-1))
+        return reduce_scatter(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def _get_max_num_gathered_tokens(self):
         """Compute max buffer size for TritonRSAG.

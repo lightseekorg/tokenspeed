@@ -50,7 +50,7 @@ class AutoBackend(CommBackend):
         self._custom_ar = CustomAllReduceBackend(fallback=self._nccl)
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)
-        self._rsag = TritonRSAGBackend()
+        self._rsag = TritonRSAGBackend(fallback=self._nccl)
 
     @property
     def nccl(self) -> NcclBackend:
@@ -75,22 +75,18 @@ class AutoBackend(CommBackend):
     def token_all_gather(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        return self._rsag.token_all_gather(tensor, rank, group, scattered_num_tokens)
+        return self._rsag.token_all_gather(tensor, group, scattered_num_tokens)
 
     def token_reduce_scatter(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        return self._rsag.token_reduce_scatter(
-            tensor, rank, group, scattered_num_tokens
-        )
+        return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
 
     # ---- Public CommBackend interface ----
 
@@ -106,6 +102,9 @@ class AutoBackend(CommBackend):
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
+        if tensor.dim() == 2 and dim in (-1, tensor.dim() - 1):
+            return self._rsag.all_gather(tensor, group, dim)
+
         return self._nccl.all_gather(tensor, group, dim)
 
     def all_gather_into_tensor(

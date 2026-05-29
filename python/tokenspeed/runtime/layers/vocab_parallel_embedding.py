@@ -510,7 +510,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
 
             if reduce_results:
-                output = all_reduce(output_parallel, self.tp_rank, self.tp_group)
+                output = all_reduce(output_parallel, self.tp_group)
             else:
                 output = output_parallel
 

@@ -57,6 +57,8 @@ def _worker_main(rank, world_size, port, test_fn):
     pg_manager.init_process_group(group)
     ref_group = pg_manager.get_process_group("nccl", group)
 
+    _setup_runtime_globals(rank, world_size)
+
     test_fn(
         rank=rank,
         world_size=world_size,
@@ -66,6 +68,23 @@ def _worker_main(rank, world_size, port, test_fn):
     )
 
     dist.destroy_process_group()
+
+
+def _setup_runtime_globals(rank, world_size):
+    """Match the runtime's setup of global_server_args_dict.
+
+    AutoBackend's 2-D last-dim all_gather and all token-aware ops route through
+    TritonRSAGBackend, which sizes its persistent buffers from these globals.
+    """
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    mapping = Mapping(rank=rank, world_size=world_size, attn_tp_size=world_size)
+    global_server_args_dict["mapping"] = mapping
+    global_server_args_dict["chunked_prefill_size"] = 8192
+    global_server_args_dict["max_prefill_tokens"] = 8192
+    global_server_args_dict["max_model_len"] = 4096
+    global_server_args_dict["force_deterministic_rsag"] = True
 
 
 def _run(world_size, test_fn):
@@ -102,7 +121,7 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
             inp = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
             expected = inp.clone()
             dist.all_reduce(expected, group=ref_group)
-            result = all_reduce(inp.clone(), rank, group)
+            result = all_reduce(inp.clone(), group)
             torch.testing.assert_close(result, expected)
 
     # 2D
@@ -110,7 +129,7 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
         inp = torch.randint(1, 16, (8, 512), dtype=dtype, device=device)
         expected = inp.clone()
         dist.all_reduce(expected, group=ref_group)
-        result = all_reduce(inp.clone(), rank, group)
+        result = all_reduce(inp.clone(), group)
         torch.testing.assert_close(result, expected)
 
 
@@ -123,7 +142,7 @@ def _test_all_gather(rank, world_size, device, group, ref_group):
             output_list = [torch.empty_like(inp) for _ in range(world_size)]
             dist.all_gather(output_list, inp, group=ref_group)
             expected = torch.cat(output_list, dim=0)
-            result = all_gather(inp, rank, group, dim=0)
+            result = all_gather(inp, group, dim=0)
             torch.testing.assert_close(result, expected)
 
     # last dim
@@ -132,7 +151,7 @@ def _test_all_gather(rank, world_size, device, group, ref_group):
         output_list = [torch.empty_like(inp) for _ in range(world_size)]
         dist.all_gather(output_list, inp, group=ref_group)
         expected = torch.cat(output_list, dim=-1)
-        result = all_gather(inp, rank, group, dim=-1)
+        result = all_gather(inp, group, dim=-1)
         torch.testing.assert_close(result, expected)
 
 
@@ -145,7 +164,7 @@ def _test_all_gather_into_tensor(rank, world_size, device, group, ref_group):
             output = torch.empty(sz * world_size, dtype=dtype, device=device)
             expected = torch.empty_like(output)
             dist.all_gather_into_tensor(expected, inp, group=ref_group)
-            all_gather_into_tensor(output, inp, rank, group)
+            all_gather_into_tensor(output, inp, group)
             torch.testing.assert_close(output, expected)
 
     # 2D
@@ -153,7 +172,7 @@ def _test_all_gather_into_tensor(rank, world_size, device, group, ref_group):
     output = torch.empty(4 * world_size, 128, dtype=torch.float32, device=device)
     expected = torch.empty_like(output)
     dist.all_gather_into_tensor(expected, inp, group=ref_group)
-    all_gather_into_tensor(output, inp, rank, group)
+    all_gather_into_tensor(output, inp, group)
     torch.testing.assert_close(output, expected)
 
 
@@ -188,7 +207,7 @@ def _test_reduce_scatter(rank, world_size, device, group, ref_group):
             inp = torch.randint(1, 16, (total_sz,), dtype=dtype, device=device)
             expected = torch.empty(sz, dtype=dtype, device=device)
             dist.reduce_scatter_tensor(expected, inp, group=ref_group)
-            result = reduce_scatter(inp.clone(), rank, group)
+            result = reduce_scatter(inp.clone(), group)
             torch.testing.assert_close(result, expected)
 
     # 2D
@@ -197,20 +216,8 @@ def _test_reduce_scatter(rank, world_size, device, group, ref_group):
         inp = torch.randint(1, 16, (total_rows, 128), dtype=dtype, device=device)
         expected = torch.empty(16, 128, dtype=dtype, device=device)
         dist.reduce_scatter_tensor(expected, inp, group=ref_group)
-        result = reduce_scatter(inp.clone(), rank, group)
+        result = reduce_scatter(inp.clone(), group)
         torch.testing.assert_close(result, expected)
-
-
-def _setup_token_ops_globals(rank, world_size):
-    from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    mapping = Mapping(rank=rank, world_size=world_size, attn_tp_size=world_size)
-    global_server_args_dict["mapping"] = mapping
-    global_server_args_dict["chunked_prefill_size"] = 8192
-    global_server_args_dict["max_prefill_tokens"] = 8192
-    global_server_args_dict["max_model_len"] = 4096
-    global_server_args_dict["force_deterministic_rsag"] = True
 
 
 def _test_token_ops(rank, world_size, device, group, ref_group):
@@ -219,20 +226,19 @@ def _test_token_ops(rank, world_size, device, group, ref_group):
         token_reduce_scatter,
     )
 
-    _setup_token_ops_globals(rank, world_size)
     hidden_size = 256
 
     # Even all_gather
     tokens_per_rank = 64
     scattered = [tokens_per_rank] * world_size
     inp = torch.randn(tokens_per_rank, hidden_size, dtype=torch.bfloat16, device=device)
-    result = token_all_gather(inp, rank, group, scattered_num_tokens=scattered)
+    result = token_all_gather(inp, group, scattered_num_tokens=scattered)
     assert result.shape[0] == tokens_per_rank * world_size
 
     # Even reduce_scatter
     total_tokens = tokens_per_rank * world_size
     inp = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-    result = token_reduce_scatter(inp, rank, group, scattered_num_tokens=scattered)
+    result = token_reduce_scatter(inp, group, scattered_num_tokens=scattered)
     assert result.shape[0] == tokens_per_rank
 
     # Roundtrip: all_gather(reduce_scatter(x) / world_size) == x
@@ -241,13 +247,9 @@ def _test_token_ops(rank, world_size, device, group, ref_group):
     scattered = [tokens_per_rank] * world_size
     torch.manual_seed(42)
     full = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-    scattered_out = token_reduce_scatter(
-        full, rank, group, scattered_num_tokens=scattered
-    )
+    scattered_out = token_reduce_scatter(full, group, scattered_num_tokens=scattered)
     scattered_out = scattered_out / world_size
-    gathered = token_all_gather(
-        scattered_out, rank, group, scattered_num_tokens=scattered
-    )
+    gathered = token_all_gather(scattered_out, group, scattered_num_tokens=scattered)
     torch.testing.assert_close(gathered, full, atol=0.02, rtol=0.02)
 
     # Uneven distribution
@@ -256,13 +258,9 @@ def _test_token_ops(rank, world_size, device, group, ref_group):
     total_tokens = sum(scattered)
     my_tokens = scattered[rank]
     full = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-    scattered_out = token_reduce_scatter(
-        full, rank, group, scattered_num_tokens=scattered
-    )
+    scattered_out = token_reduce_scatter(full, group, scattered_num_tokens=scattered)
     assert scattered_out.shape[0] == my_tokens
-    gathered = token_all_gather(
-        scattered_out, rank, group, scattered_num_tokens=scattered
-    )
+    gathered = token_all_gather(scattered_out, group, scattered_num_tokens=scattered)
     assert gathered.shape[0] == total_tokens
 
 
@@ -346,17 +344,6 @@ class TestFusionParams:
         )
         assert params.fusion_op == FusionOp.RESIDUAL_RMS_NORM
         assert params.norm_weight is weight
-
-    def test_vocab_gather_params(self):
-        from tokenspeed.runtime.distributed.comm_ops import FusionOp, FusionParams
-
-        params = FusionParams(
-            fusion_op=FusionOp.AG_VOCAB,
-            local_vocab_size=32000,
-            max_token_num=2048,
-        )
-        assert params.fusion_op == FusionOp.AG_VOCAB
-        assert params.local_vocab_size == 32000
 
 
 # ---------------------------------------------------------------------------

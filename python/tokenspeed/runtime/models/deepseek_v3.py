@@ -1755,12 +1755,16 @@ class Eagle3MlaModel(nn.Module):
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         fc_input_size = target_hidden_size * self.num_fc_input_dim
 
-        self.fc = ReplicatedLinear(
+        self.fc = ColumnParallelLinear(
             fc_input_size,
             config.hidden_size,
             bias=False,
+            gather_output=True,
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
         )
 
         self.midlayer = Eagle3MlaDecoderLayer(
