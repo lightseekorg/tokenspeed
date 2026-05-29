@@ -92,7 +92,6 @@ def triton_mha_prefill(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: list[int],
     max_seqlen: int,
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -107,9 +106,6 @@ def triton_mha_prefill(
     cache_seqlens = torch.empty((0,), dtype=torch.int32, device=q.device)
     empty_k = torch.empty((0, k.shape[1], k.shape[2]), dtype=k.dtype, device=k.device)
     empty_v = torch.empty((0, v.shape[1], v.shape[2]), dtype=v.dtype, device=v.device)
-    sm_scale = (
-        softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    )
     prefill_attention_fwd(
         q,
         k,
@@ -122,7 +118,7 @@ def triton_mha_prefill(
         None,
         True,
         max_seqlen,
-        sm_scale=sm_scale,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
         logit_cap=logit_cap,
         sliding_window_size=window_left,
         sinks=sinks,
@@ -162,7 +158,6 @@ def triton_mha_extend_with_kvcache(
     cache_seqlens: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    softmax_scale: float | None = None,
     is_causal: bool = False,
     window_left: int = -1,
     logit_cap: float = 0.0,
@@ -186,9 +181,6 @@ def triton_mha_extend_with_kvcache(
         if return_lse
         else None
     )
-    sm_scale = (
-        softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    )
     prefill_attention_fwd(
         q,
         k,
@@ -201,7 +193,7 @@ def triton_mha_extend_with_kvcache(
         None,
         is_causal,
         max_seqlen_q,
-        sm_scale=sm_scale,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
         logit_cap=logit_cap,
         sliding_window_size=window_left,
         sinks=sinks,
@@ -241,7 +233,6 @@ def triton_mha_decode_with_kvcache(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -267,9 +258,6 @@ def triton_mha_decode_with_kvcache(
     num_kv_splits = torch.ones(
         (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
     )
-    sm_scale = (
-        softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    )
     decode_attention_fwd(
         q,
         k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
@@ -284,7 +272,7 @@ def triton_mha_decode_with_kvcache(
         page_table.stride(0),
         k_cache.shape[1],
         window_left,
-        sm_scale=sm_scale,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
         logit_cap=logit_cap,
         sinks=sinks,
     )

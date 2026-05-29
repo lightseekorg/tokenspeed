@@ -63,7 +63,6 @@ def mha_prefill(
     cu_seqlens_cpu: list[int],
     max_seqlen: int,
     # attention options
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -83,7 +82,6 @@ def mha_prefill(
         cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
             list[int]. Used for host-side launch metadata; must match cu_seqlens.
         max_seqlen: Maximum sequence length.
-        softmax_scale: Optional scale factor applied before softmax.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -149,7 +147,6 @@ def mha_prefill(
             cu_seqlens=cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
             max_seqlen=max_seqlen,
-            softmax_scale=softmax_scale,
             window_left=window_left,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -168,7 +165,6 @@ def mha_extend_with_kvcache(
     max_seqlen_q: int,
     max_seqlen_k: int,
     # attention options
-    softmax_scale: float | None = None,
     is_causal: bool = False,
     window_left: int = -1,
     logit_cap: float = 0.0,
@@ -190,7 +186,6 @@ def mha_extend_with_kvcache(
             lengths are independent and may be smaller than KV lengths.
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
         is_causal: Whether query tokens are a causal suffix of cached KV.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
@@ -260,7 +255,6 @@ def mha_extend_with_kvcache(
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            softmax_scale=softmax_scale,
             is_causal=is_causal,
             window_left=window_left,
             logit_cap=logit_cap,
@@ -280,7 +274,6 @@ def mha_decode_with_kvcache(
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
     # attention options
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -299,7 +292,6 @@ def mha_decode_with_kvcache(
         page_table: Page table with shape [batch, max_pages_per_seq].
         cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
         max_seqlen_k: Maximum KV length.
-        softmax_scale: Optional scale factor applied before softmax.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -369,7 +361,6 @@ def mha_decode_with_kvcache(
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            softmax_scale=softmax_scale,
             window_left=window_left,
             logit_cap=logit_cap,
             sinks=sinks,

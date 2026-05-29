@@ -995,7 +995,6 @@ def gluon_mha_prefill_fp16_gfx950(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: list[int],
     max_seqlen: int,
-    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
