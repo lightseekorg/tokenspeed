@@ -40,7 +40,7 @@ launch_server() {
 }
 
 wait_for_ready() {
-    local TIMEOUT=600
+    local TIMEOUT=1200
     local START=$SECONDS
     until curl -sf -o /dev/null http://127.0.0.1:8003/health; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
