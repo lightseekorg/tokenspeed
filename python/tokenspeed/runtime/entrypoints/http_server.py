@@ -165,6 +165,16 @@ async def flush_cache(request: Request):
     return await _proxy_request(request)
 
 
+@app.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile(request: Request):
+    return await _proxy_request(request)
+
+
+@app.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile(request: Request):
+    return await _proxy_request(request)
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
