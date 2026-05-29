@@ -247,7 +247,10 @@ class MHAAttnBackend(AttentionBackend):
                 page_table=self.cuda_graph_page_table[:expanded_bs, :],
                 seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
             )
-            self._fill_spec_seq_lens(metadata.seq_lens, seq_lens[:bs])
+            self._fill_spec_seq_lens(
+                metadata.seq_lens,
+                seq_lens[:bs].clamp_min(self.spec_num_tokens),
+            )
             self.cuda_graph_decode_metadata[bs] = metadata
             self.forward_decode_metadata = metadata
         else:
