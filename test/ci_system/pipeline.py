@@ -56,15 +56,15 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = ("linux-mi355",)
-B300_PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
+PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
 
 def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
-def should_run_b300_perf_diagnostics(task: Dict[str, Any], runner: str) -> bool:
-    return task["type"] == "perf" and runner in B300_PERF_DIAGNOSTIC_RUNNERS
+def should_run_perf_diagnostics(task: Dict[str, Any], runner: str) -> bool:
+    return task["type"] == "perf" and runner in PERF_DIAGNOSTIC_RUNNERS
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -479,7 +479,7 @@ def setup_runner(
     return local_env, pgm
 
 
-def run_b300_perf_diagnostics(
+def run_perf_diagnostics(
     label: str,
     env: Dict[str, str],
     cwd: Path,
@@ -1321,7 +1321,7 @@ def execute_task(
     runner_env, pgm = setup_runner(
         runner, env, repo_root, dry_run, reuse_state=reuse_runner_state
     )
-    enable_b300_perf_diagnostics = should_run_b300_perf_diagnostics(task, runner)
+    enable_perf_diagnostics = should_run_perf_diagnostics(task, runner)
     stages_run: List[str] = []
     command_results: List[Dict[str, Any]] = []
     eval_score_check: Dict[str, Any] | None = None
@@ -1330,13 +1330,13 @@ def execute_task(
     server_log_path: Path | None = None
 
     try:
-        if enable_b300_perf_diagnostics:
-            run_b300_perf_diagnostics("before stages", runner_env, repo_root, dry_run)
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("before stages", runner_env, repo_root, dry_run)
         for stage_name, stage_payload in stages:
             stages_run.append(stage_name)
             if stage_name == "server":
-                if enable_b300_perf_diagnostics:
-                    run_b300_perf_diagnostics(
+                if enable_perf_diagnostics:
+                    run_perf_diagnostics(
                         "before server", runner_env, repo_root, dry_run
                     )
                 server_log_path = repo_root / ".ci-artifacts" / "server.log"
@@ -1367,14 +1367,14 @@ def execute_task(
                         dry_run,
                     )
                 poll_readiness(stage_payload["ready"], dry_run)
-                if enable_b300_perf_diagnostics:
-                    run_b300_perf_diagnostics(
+                if enable_perf_diagnostics:
+                    run_perf_diagnostics(
                         "after server ready", runner_env, repo_root, dry_run
                     )
                 continue
             for command in stage_payload:
-                if enable_b300_perf_diagnostics and stage_name == "perf":
-                    run_b300_perf_diagnostics(
+                if enable_perf_diagnostics and stage_name == "perf":
+                    run_perf_diagnostics(
                         "before perf command", runner_env, repo_root, dry_run
                     )
                 if pgm is not None:
@@ -1395,8 +1395,8 @@ def execute_task(
                     )
                 )
                 command_results.append(command_result)
-                if enable_b300_perf_diagnostics and stage_name == "perf":
-                    run_b300_perf_diagnostics(
+                if enable_perf_diagnostics and stage_name == "perf":
+                    run_perf_diagnostics(
                         "after perf command", runner_env, repo_root, dry_run
                     )
 
@@ -1458,16 +1458,16 @@ def execute_task(
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
-        if enable_b300_perf_diagnostics:
-            run_b300_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         if pgm is not None:
             pgm.terminate_all(dry_run=dry_run)
         else:
             stop_server(server_process)
         if not keep_runner_state:
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
-        if enable_b300_perf_diagnostics:
-            run_b300_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
