@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""End-to-end Batch-DP sampling parity test."""
+"""Batch-DP logits-to-verify parity tests."""
 
 from __future__ import annotations
 
@@ -295,7 +295,7 @@ SHAPES = [
 ]
 
 
-class TestDPSamplingE2E:
+class TestDPSamplingLogitsVerify:
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     @pytest.mark.parametrize("bs,n", SHAPES)
     def test_stochastic(self, world_size, bs, n):
