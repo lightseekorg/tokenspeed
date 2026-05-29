@@ -579,6 +579,7 @@ def get_config(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
+    softmax_scale: float | None,
     window_left: int,
 ) -> LaunchConfig:
     head_dim = q.shape[2]
@@ -589,7 +590,7 @@ def get_config(
     group_blocks = (group_size + block_m - 1) // block_m
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
-    sm_scale = 1.0 / math.sqrt(head_dim)
+    sm_scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
@@ -635,6 +636,7 @@ def gluon_mha_decode_fp16_gfx950(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
+    softmax_scale: float | None = None,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -646,6 +648,7 @@ def gluon_mha_decode_fp16_gfx950(
         q=q,
         k_cache=k_cache,
         page_table=page_table,
+        softmax_scale=softmax_scale,
         window_left=window_left,
     )
 

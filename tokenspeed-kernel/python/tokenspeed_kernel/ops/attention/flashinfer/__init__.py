@@ -194,9 +194,10 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        cu_seqlens_cpu: list[int],
-        max_seqlen: int,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: float | None = None,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -208,8 +209,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             )
         wrapper = _get_ragged_prefill_wrapper(q.device)
         wrapper.plan(
-            cu_seqlens,
-            cu_seqlens,
+            cu_seqlens_q,
+            cu_seqlens_q,
             q.shape[1],
             k.shape[1],
             q.shape[-1],
@@ -217,7 +218,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             causal=True,
             window_left=window_left,
             logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
-            sm_scale=1.0 / math.sqrt(q.shape[-1]),
+            sm_scale=(
+                softmax_scale
+                if softmax_scale is not None
+                else 1.0 / math.sqrt(q.shape[-1])
+            ),
             q_data_type=q.dtype,
             kv_data_type=k.dtype,
             o_data_type=q.dtype,
@@ -260,6 +265,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         cache_seqlens: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        softmax_scale: float | None = None,
         is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
@@ -315,7 +321,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             page_size,
             head_dim_vo=v_cache.shape[-1],
             causal=is_causal,
-            sm_scale=1.0 / math.sqrt(q.shape[-1]),
+            sm_scale=(
+                softmax_scale
+                if softmax_scale is not None
+                else 1.0 / math.sqrt(q.shape[-1])
+            ),
             window_left=window_left,
             q_data_type=q.dtype,
             kv_data_type=k_cache.dtype,
@@ -366,6 +376,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         cache_seqlens: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        softmax_scale: float | None = None,
         is_causal: bool = False,
         window_left: int = -1,
         logit_cap: float = 0.0,
@@ -397,7 +408,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             seq_lens=cache_seqlens,
             max_q_len=max_seqlen_q,
             max_kv_len=max_seqlen_k,
-            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
+            bmm1_scale=(
+                softmax_scale
+                if softmax_scale is not None
+                else 1.0 / math.sqrt(q.shape[-1])
+            ),
             bmm2_scale=1.0,
             batch_size=cache_seqlens.shape[0],
             cum_seq_lens_q=cu_seqlens_q,
@@ -436,6 +451,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
+        softmax_scale: float | None = None,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -462,7 +478,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             block_tables=page_table,
             seq_lens=cache_seqlens,
             max_seq_len=max_seqlen_k,
-            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
+            bmm1_scale=(
+                softmax_scale
+                if softmax_scale is not None
+                else 1.0 / math.sqrt(q.shape[-1])
+            ),
             bmm2_scale=1.0,
             window_left=window_left,
             sinks=sinks,
