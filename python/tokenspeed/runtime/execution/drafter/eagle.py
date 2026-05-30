@@ -222,14 +222,6 @@ class Eagle(BaseDrafter):
 
         draft_first_step_reduce = forward_mode.is_decode()
 
-        if draft_first_step_reduce and self.attn_backend.support_kv_cache_prewrite:
-            # Trim seq_lens by rejected-draft count so the sliced decode
-            # query does not attend to dead positions.
-            correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
-                self.draft_seq_lens_buf.dtype
-            )
-            self.draft_seq_lens_buf[:bs].sub_(correction)
-
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
