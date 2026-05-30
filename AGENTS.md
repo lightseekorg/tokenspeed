@@ -30,5 +30,9 @@ Inside the root tokenspeed-kernel/ directory:
   re-import to other places.
 * All direct third-party code should be placed in `thirdparty/` and imported
   into `ops/` then registered via `register_kernel`.
+* Prefer CuteDSL for NVIDIA GPU kernels and Triton Gluon for AMD GPU kernels.
+  Use Triton for portable solutions across vendors. Vendor libraries should
+  stay optional, and other solutions may be used as temporary transitions, but
+  new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py` or `attention/triton/`.
