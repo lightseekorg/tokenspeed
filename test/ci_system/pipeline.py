@@ -56,12 +56,17 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = ("linux-mi355",)
+GB200_RUNNER_PREFIXES = ("gb200",)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
 
 def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
+
+
+def is_gb200_runner(runner: str) -> bool:
+    return runner.startswith(GB200_RUNNER_PREFIXES)
 
 
 def should_run_nvidia_gpu_cleanup(runner: str) -> bool:
@@ -373,10 +378,10 @@ def setup_runner(
     local_env = dict(env)
     pgm: Optional[ProcessGroupManager] = None
 
-    if should_run_nvidia_gpu_cleanup(runner):
+    if is_gb200_runner(runner):
         pgm = make_manager()
         local_env["CI_RUNNER_ID"] = pgm.runner_id
-        print(f"[nvidia-gpu-cleanup] runner_id={pgm.runner_id}", flush=True)
+        print(f"[gb200] runner_id={pgm.runner_id}", flush=True)
 
         # Kill stale processes from previous run
         pgm.cleanup_stale(dry_run=dry_run)
@@ -397,7 +402,7 @@ def setup_runner(
 
         # Recreate venv at fixed path unless a previous CI step already did it.
         if Path(venv_path).exists() and not dry_run and not reuse_state:
-            print(f"[nvidia-gpu-cleanup] removing old venv: {venv_path}", flush=True)
+            print(f"[gb200] removing old venv: {venv_path}", flush=True)
             shutil.rmtree(venv_path, ignore_errors=True)
         if not reuse_state or not Path(venv_path).exists():
             shell_run(
@@ -424,6 +429,14 @@ def setup_runner(
         return local_env, pgm
 
     kill_stale_processes(local_env, cwd, dry_run)
+    if should_run_nvidia_gpu_cleanup(runner):
+        shell_run(
+            "bash test/ci_system/cleanup_nvidia_gpu_state.sh",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+            check=False,
+        )
     shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
     shell_run(
         "sudo apt-get install -y ninja-build",
