@@ -20,16 +20,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-
 
 logger = get_colorful_logger(__name__)
 
@@ -54,9 +48,9 @@ def nan_guard_logits(
     logits: torch.Tensor,
     enable_nan_detection: bool,
 ) -> torch.Tensor:
-    """Replace NaNs with a low finite logit and optionally crash."""
+    """Replace NaNs with -1e5 and optionally crash; no-op when detection is disabled."""
     if not enable_nan_detection:
-        return logits.nan_to_num_(nan=-1e5)
+        return logits
 
     if not torch.any(torch.isnan(logits)):
         return logits
@@ -68,38 +62,16 @@ def nan_guard_logits(
     return logits
 
 
-def force_reject_invalid_greedy_rows(
-    target_predict: torch.Tensor,
-    candidates: torch.Tensor,
-    valid_rows: torch.Tensor,
-    vocab_size: int,
-) -> torch.Tensor:
-    """Make all-nonfinite verify rows reject instead of accepting fallback tokens.
-
-    `verify_chain_greedy` compares `target_predict[:, i]` against
-    `candidates[:, i + 1]`. If both draft and target logits are all NaN, a
-    plain NaN guard can turn both argmaxes into token 0 and falsely accept an
-    invalid draft prefix. For invalid rows, choose a valid token that differs
-    from the next candidate position, forcing verification to stop there.
-    """
-
-    bs, n = candidates.shape
-    next_candidate = torch.cat((candidates[:, 1:], candidates[:, -1:]), dim=1)
-    fallback = (next_candidate.to(target_predict.dtype) + 1) % int(vocab_size)
-    invalid = ~valid_rows.reshape(bs, n)
-    return torch.where(invalid, fallback, target_predict)
-
-
-def write_output_logprobs(
-    logits_output: LogitsProcessorOutput,
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def gather_token_logprobs_torch(
     logits: torch.Tensor,
     tokens: torch.Tensor,
-) -> None:
-    """Fill logits_output.next_token_logprobs; callers gate on the enable flag."""
-    raw_logprobs = torch.log_softmax(logits, dim=-1)
-    logits_output.next_token_logprobs = raw_logprobs.gather(
-        -1, tokens.unsqueeze(-1)
-    ).squeeze(-1)
+) -> torch.Tensor:
+    """Per-row log_softmax(logits)[tokens]. Fuses cast + online softmax + gather
+    into one Triton kernel sequence so the full [B, V] log_softmax matrix is
+    never materialized."""
+    raw_logprobs = torch.log_softmax(logits.float(), dim=-1)
+    return raw_logprobs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

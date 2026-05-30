@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_RANDOM_SEED = 48
+CUDA_GRAPH_VARIANT_DEFAULT = "default"
 SPECULATIVE_ACCEPT_THRESHOLD_SINGLE = 1.0
 SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 
@@ -54,8 +55,8 @@ class SamplingBackendConfig:
     max_draft_tokens_per_req: int = 1
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
-    # for penalties in TritonFullSamplingBackend). Indexed by req_pool_idx, not
-    # batch row, so the data survives batch membership changes.
+    # for full sampling backends). Indexed by req_pool_idx, not batch row,
+    # so the data survives batch membership changes.
     max_req_pool_size: int = 0
     vocab_size: int = 0
 
@@ -204,48 +205,39 @@ class SamplingBackend(ABC):
             request_pool_indices=request_pool_indices,
         )
 
-    def prepare_capture(
-        self,
-        bs: int,
-        num_tokens_per_req: int = 1,
-        capture_variant: str | None = None,
-    ) -> None:
+    def prepare_capture(self, bs: int, num_tokens_per_req: int = 1) -> None:
         """Per-step refill for the capture/warm-up path. No flip detection;
         the backend uses its stub generator for any RNG-fed buffers so the
         captured graph sees a fully-written state.
         Default: no-op.
         """
-        _ = capture_variant
         self._prepare_step_hook(
             num_tokens_per_req=num_tokens_per_req,
             bs=bs,
             request_pool_indices=None,
         )
 
-    def cuda_graph_capture_variants(
-        self, num_tokens_per_req: int = 1
-    ) -> tuple[str, ...]:
-        """CUDA graph sampler variants this backend wants captured."""
-        _ = num_tokens_per_req
-        return ("default",)
+    def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
+        """Return sampler-specific CUDA graph variants to capture.
 
-    def cuda_graph_replay_variant(self) -> str:
-        """CUDA graph sampler variant to replay for the already-prepared step."""
-        return "default"
-
-    def cuda_graph_capture_is_all_greedy(
-        self,
-        capture_variant: str,
-        num_tokens_per_req: int = 1,
-    ) -> bool:
-        """Whether a capture variant should record the greedy sampler path.
-
-        Most backends only capture stochastic/default graphs. Backends with a
-        dedicated greedy graph override this so CudaGraphWrapper can bind
-        SamplingBatchInfo.is_all_greedy=True during capture.
+        Most backends have one graph. Backends with graph-captured control-flow
+        differences can add variants while keeping replay selection internal to
+        the backend.
         """
-        _ = capture_variant, num_tokens_per_req
-        return False
+        return (CUDA_GRAPH_VARIANT_DEFAULT,)
+
+    def prepare_capture_variant(
+        self,
+        bs: int,
+        num_tokens_per_req: int,
+        variant: str,
+    ) -> None:
+        if variant != CUDA_GRAPH_VARIANT_DEFAULT:
+            raise ValueError(f"Unsupported CUDA graph variant: {variant}")
+        self.prepare_capture(bs=bs, num_tokens_per_req=num_tokens_per_req)
+
+    def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
+        return CUDA_GRAPH_VARIANT_DEFAULT
 
     def _prepare_step_hook(
         self,
@@ -293,3 +285,60 @@ class SamplingBackend(ABC):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class PoolSamplingBackend(SamplingBackend):
+    """Sampling backend base for TokenSpeed request-pool state.
+
+    This owns the backend-neutral state shared by probability-route and
+    Gumbel-route samplers: per-pool scalar knobs and common output buffers.
+    Backend-specific RNG/probability state stays in the concrete backend.
+    """
+
+    _HAS_POOL_STATE = True
+
+    def __init__(self, config: SamplingBackendConfig) -> None:
+        super().__init__(config)
+        self._init_sampling_pool_scalars(config)
+        self._init_sampling_output_buffers(config)
+
+    def _init_sampling_pool_scalars(self, config: SamplingBackendConfig) -> None:
+        pool_rows = config.max_req_pool_size + 1
+        self._temperature_pool = torch.ones(
+            (pool_rows,), dtype=torch.float32, device=config.device
+        )
+        self._top_k_pool = torch.ones(
+            (pool_rows,), dtype=torch.int32, device=config.device
+        )
+        self._top_p_pool = torch.ones(
+            (pool_rows,), dtype=torch.float32, device=config.device
+        )
+        self._seed_pool = torch.zeros(
+            (pool_rows,), dtype=torch.int64, device=config.device
+        )
+
+    def _init_sampling_output_buffers(self, config: SamplingBackendConfig) -> None:
+        self._ones_buf = torch.ones(
+            (config.max_bs,), dtype=torch.int32, device=config.device
+        )
+        self._predict_buf = torch.zeros(
+            (config.max_bs * config.max_draft_tokens_per_req,),
+            dtype=torch.int32,
+            device=config.device,
+        )
+        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
+        # (required by maybe_broadcast / NCCL).
+        self._accept_index_buf = torch.zeros(
+            (config.max_bs * config.max_draft_tokens_per_req,),
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self._accept_length_buf = torch.zeros(
+            (config.max_bs,), dtype=torch.int32, device=config.device
+        )
+
+    def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
+        self._temperature_pool[pool_idx].fill_(float(sp.temperature))
+        self._top_k_pool[pool_idx].fill_(int(sp.top_k))
+        self._top_p_pool[pool_idx].fill_(float(sp.top_p))
+        self._seed_pool[pool_idx].fill_(int(sp.seed))

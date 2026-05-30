@@ -256,24 +256,17 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(args.moe_backend, "triton")
 
     def test_sampling_backend_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--sampling-backend", "triton"]
-        )
-        self.assertEqual(args.sampling_backend, "triton")
-
-        args = self._parse_args(
-            ["--model", "test/model", "--sampling-backend", "triton_full"]
-        )
-        self.assertEqual(args.sampling_backend, "triton_full")
-
-    def test_removed_flashinfer_sampling_backend_rejected(self):
-        with (
-            contextlib.redirect_stderr(io.StringIO()),
-            self.assertRaises(SystemExit),
+        for backend in (
+            "greedy",
+            "flashinfer",
+            "flashinfer_full",
+            "triton",
+            "triton_full",
         ):
-            self._parse_args(
-                ["--model", "test/model", "--sampling-backend", "flashinfer"]
+            args = self._parse_args(
+                ["--model", "test/model", "--sampling-backend", backend]
             )
+            self.assertEqual(args.sampling_backend, backend)
 
     def test_all2all_backend_arg(self):
         args = self._parse_args(

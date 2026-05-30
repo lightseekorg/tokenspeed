@@ -18,30 +18,48 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Adapted from vLLM MRV2's full sampling primitives:
+#   https://vllm.ai/blog/2026-03-24-mrv2
+#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/min_p.py
+#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/penalties.py
+#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/logit_bias.py
+# This file keeps TokenSpeed-owned pool/count/logit-bias state and applies the
+# MRV2-style logits -> Gumbel-Max token selection route.
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.cuda import (
-    chain_speculative_sampling_target_only,
-)
-from tokenspeed_kernel.ops.sampling.probability import (
-    build_top_k_top_p_probs_from_logits,
-)
 from tokenspeed_kernel.ops.sampling.triton import (
-    gather_and_expand_scalars,
-    min_p_renorm_prob,
-    sample_rejection_min_p_from_pools,
+    accumulate_counts_inplace,
+    apply_penalties_logit_bias_inplace,
+    gumbel_sample_from_pools,
+    gumbel_sample_from_pools_compact,
+    gumbel_sample_from_pools_generic,
+    gumbel_sample_min_p_from_pools,
+    gumbel_sample_min_p_from_pools_parallel,
+    gumbel_sample_top_k_top_p_from_pools,
+    gumbel_sample_top_k_top_p_qrita_from_pools,
+    gumbel_sample_top_p_parallel_from_pools,
+    verify_chain_target_sampled,
 )
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
-    SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-    SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+    CUDA_GRAPH_VARIANT_DEFAULT,
+    PoolSamplingBackend,
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.backends.triton import (
+    _COMPACT_GUMBEL_BLOCK_SIZE,
+    _COMPACT_GUMBEL_VOCAB_MAX,
+    _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+    _SAMPLE_ROUTE_GUMBEL_TOP_K,
+    _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+    _SAMPLE_ROUTE_GUMBEL_TOP_P,
+    _TOP_P_PARALLEL_SAMPLE_ATTEMPTS,
+    _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
+    _TOP_P_PARALLEL_VERIFY_ATTEMPTS,
     TritonSamplingBackend,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
@@ -55,76 +73,39 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
+CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P = "triton_full_min_p"
+CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P = "triton_full_top_k_top_p_min_p"
+
+
 class TritonFullSamplingBackend(TritonSamplingBackend):
-    """Superset of `triton` adding min_p, frequency/presence/repetition
-    penalties, and per-token logit_bias, for both single-step sampling and
-    multi-step spec-decode verification.
+    """Full-feature sampling backend with Triton Gumbel single-step sample.
 
-    Stochastic sample path uses a TokenSpeed Triton bounded-rejection sampler
-    directly on logits after penalties/bias. It applies temperature, top_k,
-    top_p, and min_p without materializing full probabilities.
-
-    Layout:
-      * Per-pool-idx token counts (int32[max_req_pool_size, vocab]) —
-        accumulated after each sample/verify. Zeroed when a pool slot is
-        re-assigned to a new rid (see `on_pool_assignment`).
-      * Per-pool-idx logit bias (bf16[max_req_pool_size, vocab]) — zero by
-        default, scattered from SamplingParams.logit_bias on pool
-        assignment. Added to logits per step.
-      * Per-batch-row bf16 penalty scalars flowing through SamplingBatchInfo.
-
-    sample() / verify() apply (in order, BEFORE temperature/softmax):
-      1. repetition (multiplicative): logits = where(count>0,
-         where(logits>0, logits/rep, logits*rep), logits)
-      2. frequency + presence (additive):
-         logits -= freq_pen * count + pres_pen * (count>0)
-      3. logit_bias (additive): logits += logit_bias[req_pool_idx]
-
-    Post-sample/verify, accumulate accepted tokens into counts.
-
-    Out of scope in this iteration: min_new_tokens EOS mask.
+    This backend deliberately owns its full-sampling state instead of
+    inheriting ``FlashInferFullSamplingBackend``. FlashInferFull remains a
+    separate probability-route baseline; TritonFull keeps the TokenSpeed pool
+    lifecycle and routes token selection through logits -> Gumbel-Max.
     """
 
-    def cuda_graph_capture_variants(
-        self, num_tokens_per_req: int = 1
-    ) -> tuple[str, ...]:
-        _ = num_tokens_per_req
-        return ("default",)
-
-    def cuda_graph_replay_variant(self) -> str:
-        return "default"
-
     def __init__(self, config: SamplingBackendConfig) -> None:
-
         super().__init__(config)
-
         if config.max_req_pool_size <= 0 or config.vocab_size <= 0:
-
             raise ValueError(
                 "TritonFullSamplingBackend requires max_req_pool_size > 0 and "
                 f"vocab_size > 0; got max_req_pool_size={config.max_req_pool_size}, "
                 f"vocab_size={config.vocab_size}"
             )
 
-        # Valid pool indices run 0..max_req_pool_size inclusive.
         pool_rows = config.max_req_pool_size + 1
-
         self._counts = torch.zeros(
             (pool_rows, config.vocab_size),
             dtype=torch.int32,
             device=config.device,
         )
-
-        # bf16 is enough precision for typical client-supplied bias values
-        # (OpenAI caps |logit_bias| at 100).
         self._logit_bias = torch.zeros(
             (pool_rows, config.vocab_size),
             dtype=torch.bfloat16,
             device=config.device,
         )
-
-        # Per-request penalty scalars + min_p. rep_pen starts at 1.0
-        # (multiplicative identity); others at 0.0 (additive identity).
         self._min_p_pool = torch.zeros(
             (pool_rows,), dtype=torch.float32, device=config.device
         )
@@ -137,30 +118,110 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         self._rep_pen_pool = torch.full(
             (pool_rows,), 1.0, dtype=torch.bfloat16, device=config.device
         )
+        self._min_p_row_max = torch.empty(
+            (config.max_bs * config.max_draft_tokens_per_req,),
+            dtype=torch.float32,
+            device=config.device,
+        )
+        self._req_pool_indices_i32 = torch.empty(
+            (config.max_bs,), dtype=torch.int32, device=config.device
+        )
+        self._full_has_min_p = True
 
-    # ------------------------------------------------------------------
-    # Lifecycle hooks
-    # ------------------------------------------------------------------
+    def _req_pool_indices_for_kernels(
+        self, req_pool_indices: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        req_pool_indices = req_pool_indices[:rows]
+        if req_pool_indices.dtype == torch.int32:
+            return req_pool_indices
+        if req_pool_indices.dtype != torch.int64:
+            raise ValueError(
+                "Triton full sampling requires int32/int64 req_pool_indices, "
+                f"got {req_pool_indices.dtype}"
+            )
+        out = self._req_pool_indices_i32[:rows]
+        out.copy_(req_pool_indices, non_blocking=True)
+        return out
+
+    def prepare_step(
+        self,
+        request_ids: list[str],
+        request_pool_indices: list[int],
+        sampling_params_list: list[SamplingParams],
+        num_tokens_per_req: int = 1,
+    ) -> None:
+        super().prepare_step(
+            request_ids=request_ids,
+            request_pool_indices=request_pool_indices,
+            sampling_params_list=sampling_params_list,
+            num_tokens_per_req=num_tokens_per_req,
+        )
+        self._full_has_min_p = any(float(sp.min_p) > 0.0 for sp in sampling_params_list)
+
+    def prepare_capture(self, bs: int, num_tokens_per_req: int = 1) -> None:
+        self._full_has_min_p = True
+        super().prepare_capture(bs=bs, num_tokens_per_req=num_tokens_per_req)
+
+    def prepare_capture_variant(
+        self,
+        bs: int,
+        num_tokens_per_req: int,
+        variant: str,
+    ) -> None:
+        if variant == CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P:
+            self._full_has_min_p = True
+            self._sample_route = _SAMPLE_ROUTE_GUMBEL_NO_FILTER
+            PoolSamplingBackend.prepare_capture(
+                self,
+                bs=bs,
+                num_tokens_per_req=num_tokens_per_req,
+            )
+            return
+        if variant == CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P:
+            self._full_has_min_p = True
+            self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P
+            self._top_k_top_p_pad = 128
+            PoolSamplingBackend.prepare_capture(
+                self,
+                bs=bs,
+                num_tokens_per_req=num_tokens_per_req,
+            )
+            return
+        self._full_has_min_p = variant == CUDA_GRAPH_VARIANT_DEFAULT
+        super().prepare_capture_variant(
+            bs=bs,
+            num_tokens_per_req=num_tokens_per_req,
+            variant=variant,
+        )
+
+    def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
+        return (
+            *super().cuda_graph_capture_variants(num_tokens_per_req),
+            CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P,
+            CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P,
+        )
+
+    def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
+        if self._full_has_min_p:
+            if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
+                return CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P
+            if self._sample_route in (
+                _SAMPLE_ROUTE_GUMBEL_TOP_K,
+                _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+            ):
+                return CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P
+            return CUDA_GRAPH_VARIANT_DEFAULT
+        return super().cuda_graph_replay_variant(num_tokens_per_req)
 
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
-
-        # Scatter scalars inherited from the parent backend (temperature, top_k,
-        # top_p, seed).
         super()._reset_slot(pool_idx, sp)
 
-        # Penalty + min_p scalars.
         self._min_p_pool[pool_idx].fill_(float(sp.min_p))
         self._freq_pen_pool[pool_idx].fill_(float(sp.frequency_penalty))
         self._pres_pen_pool[pool_idx].fill_(float(sp.presence_penalty))
         self._rep_pen_pool[pool_idx].fill_(float(sp.repetition_penalty))
 
-        # Zero the slot's count row (history from the previous occupant is
-        # no longer applicable).
         self._counts[pool_idx].fill_(0)
-
-        # Zero + scatter logit_bias for the new rid. Zeroing the whole row
-        # first rather than diffing because the previous occupant's bias
-        # keys are unknown here.
         self._logit_bias[pool_idx].fill_(0.0)
 
         bias_map = getattr(sp, "logit_bias", None) if sp is not None else None
@@ -169,7 +230,8 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             raw_ids = [int(tid) for tid in bias_map.keys()]
             assert all(0 <= tid < vocab for tid in raw_ids), (
                 f"logit_bias contains out-of-vocab token id(s); "
-                f"vocab_size={vocab}, offending={[t for t in raw_ids if not 0 <= t < vocab]}"
+                f"vocab_size={vocab}, offending="
+                f"{[t for t in raw_ids if not 0 <= t < vocab]}"
             )
             token_ids = torch.tensor(
                 raw_ids,
@@ -184,88 +246,210 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:
-
-        # Warm-up iterations route all pool indices to row 0, which
-        # accumulates sampled tokens into _counts[0]. Zero it so the graph
-        # captures reads against a clean baseline. _logit_bias[0] is only
-        # written in on_pool_assignment, so it stays zero across warm-up.
         self._counts[0].fill_(0)
 
-    # ------------------------------------------------------------------
-    # Penalty + bias application (shared by sample and verify)
-    # ------------------------------------------------------------------
-
     @nvtx_range("sampling:penalties", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _apply_penalties_and_bias(
         self,
         logits: torch.Tensor,
-        sampling_info: SamplingBatchInfo,
+        req_pool_indices: torch.Tensor,
         num_tokens_per_req: int = 1,
     ) -> torch.Tensor:
-        """logits is [bs * num_tokens_per_req, V]. Penalty scalars are gathered
-        from the pool-indexed buffers. num_tokens_per_req > 1 is the spec-decode
-        verify() path where per-request scalars are repeat_interleave'd to
-        align with flat logits.
-        """
-
-        pool_idx = sampling_info.req_pool_indices
-
-        if num_tokens_per_req > 1:
-
-            pool_idx = torch.repeat_interleave(pool_idx, num_tokens_per_req, dim=0)
-
-        counts = self._counts.index_select(0, pool_idx)  # [bs*N, V]
-        active = counts > 0
-        counts_f = counts.to(logits.dtype)
-        active_f = active.to(logits.dtype)
-
-        # Gather per-request penalty scalars from the pool. [bs*N] → [bs*N, 1]
-        # for broadcast against [bs*N, V] logits.
-        rep = (
-            self._rep_pen_pool.index_select(0, pool_idx).to(logits.dtype).unsqueeze(-1)
+        return apply_penalties_logit_bias_inplace(
+            logits,
+            req_pool_indices,
+            self._counts,
+            self._logit_bias,
+            self._freq_pen_pool,
+            self._pres_pen_pool,
+            self._rep_pen_pool,
+            num_tokens_per_req=num_tokens_per_req,
         )
-        freq = (
-            self._freq_pen_pool.index_select(0, pool_idx).to(logits.dtype).unsqueeze(-1)
-        )
-        presence = (
-            self._pres_pen_pool.index_select(0, pool_idx).to(logits.dtype).unsqueeze(-1)
-        )
-
-        # 1. Repetition (multiplicative). scales is 1.0 where count==0, else
-        # rep_pen. Apply as logits/scales where logits>0, logits*scales else.
-        scales = torch.where(active, rep.expand_as(logits), torch.ones_like(logits))
-        logits = torch.where(logits > 0, logits / scales, logits * scales)
-
-        # 2. Frequency + presence (additive). Fused into a single subtract.
-        logits = logits - freq * counts_f - presence * active_f
-
-        # 3. Per-token logit_bias (additive). Rows without a logit_bias are
-        # all-zero, so the add is a no-op for them.
-        logits = logits + self._logit_bias.index_select(0, pool_idx)
-
-        return logits
 
     @nvtx_range("sampling:accum_counts", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _accumulate_counts(
         self,
         pool_idx: torch.Tensor,
         tokens: torch.Tensor,
         weights: torch.Tensor,
     ) -> None:
-        """Graph-safe in-place scatter: counts[pool_idx, tokens] += weights.
-        weights is int32; 0 masks invalid rows, 1 accumulates."""
+        accumulate_counts_inplace(self._counts, pool_idx, tokens, weights)
 
-        self._counts.index_put_(
-            (pool_idx, tokens.long()),
-            weights.to(torch.int32),
-            accumulate=True,
+    def _gumbel_sample_full_logits(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        num_tokens_per_req: int = 1,
+    ) -> torch.Tensor:
+        rows = logits.shape[0]
+        if (
+            self._full_has_min_p
+            and self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER
+        ):
+            if logits.shape[1] > _COMPACT_GUMBEL_VOCAB_MAX:
+                local_ids = (
+                    self._gumbel_local_ids
+                    if num_tokens_per_req == 1
+                    else self._gumbel_verify_local_ids
+                )
+                local_scores = (
+                    self._gumbel_local_scores
+                    if num_tokens_per_req == 1
+                    else self._gumbel_verify_local_scores
+                )
+                return gumbel_sample_min_p_from_pools_parallel(
+                    logits,
+                    req_pool_indices,
+                    self._temperature_pool,
+                    self._min_p_pool,
+                    self._seed_pool,
+                    offsets_pool,
+                    local_ids[:rows],
+                    local_scores[:rows],
+                    self._min_p_row_max[:rows],
+                    out[:rows],
+                    num_tokens_per_req=num_tokens_per_req,
+                )
+            return gumbel_sample_min_p_from_pools(
+                logits,
+                req_pool_indices,
+                self._temperature_pool,
+                self._min_p_pool,
+                self._seed_pool,
+                offsets_pool,
+                out[:rows],
+                num_tokens_per_req=num_tokens_per_req,
+            )
+
+        if self._sample_route in (
+            _SAMPLE_ROUTE_GUMBEL_TOP_K,
+            _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+        ):
+            if (
+                not self._full_has_min_p
+                and num_tokens_per_req > 1
+                and self._use_qrita_verify_top_k_route(rows, logits.shape[1])
+            ):
+                return gumbel_sample_top_k_top_p_qrita_from_pools(
+                    logits,
+                    req_pool_indices,
+                    self._temperature_pool,
+                    self._top_k_pool,
+                    self._top_p_pool,
+                    self._seed_pool,
+                    offsets_pool,
+                    self._qrita_verify_buffer,
+                    self._qrita_percentile_to_std_table,
+                    out[:rows],
+                    num_tokens_per_req=num_tokens_per_req,
+                    num_programs=min(self._qrita_verify_num_programs, rows),
+                )
+            candidate_ids = (
+                self._topk_candidate_ids
+                if num_tokens_per_req == 1
+                else self._topk_verify_candidate_ids
+            )
+            candidate_logits = (
+                self._topk_candidate_logits
+                if num_tokens_per_req == 1
+                else self._topk_verify_candidate_logits
+            )
+            return gumbel_sample_top_k_top_p_from_pools(
+                logits,
+                req_pool_indices,
+                self._temperature_pool,
+                self._top_k_pool,
+                self._top_p_pool,
+                self._seed_pool,
+                offsets_pool,
+                candidate_ids[:rows],
+                candidate_logits[:rows],
+                out[:rows],
+                min_p_pool=self._min_p_pool if self._full_has_min_p else None,
+                block_size=self._select_top_k_top_p_block_size(rows, logits.shape[1]),
+                top_k_pad=self._top_k_top_p_pad,
+                num_tokens_per_req=num_tokens_per_req,
+            )
+
+        if not self._full_has_min_p:
+            if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
+                if logits.shape[1] <= _COMPACT_GUMBEL_VOCAB_MAX:
+                    return gumbel_sample_from_pools_compact(
+                        logits,
+                        req_pool_indices,
+                        self._temperature_pool,
+                        self._seed_pool,
+                        offsets_pool,
+                        out[:rows],
+                        block_size=_COMPACT_GUMBEL_BLOCK_SIZE,
+                        num_tokens_per_req=num_tokens_per_req,
+                    )
+                local_ids = (
+                    self._gumbel_local_ids
+                    if num_tokens_per_req == 1
+                    else self._gumbel_verify_local_ids
+                )
+                local_scores = (
+                    self._gumbel_local_scores
+                    if num_tokens_per_req == 1
+                    else self._gumbel_verify_local_scores
+                )
+                return gumbel_sample_from_pools(
+                    logits,
+                    req_pool_indices,
+                    self._temperature_pool,
+                    self._seed_pool,
+                    offsets_pool,
+                    local_ids[:rows],
+                    local_scores[:rows],
+                    out[:rows],
+                    num_tokens_per_req=num_tokens_per_req,
+                )
+            if self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
+                return gumbel_sample_top_p_parallel_from_pools(
+                    logits,
+                    req_pool_indices,
+                    self._temperature_pool,
+                    self._top_p_pool,
+                    self._seed_pool,
+                    offsets_pool,
+                    self._top_p_local_max[:rows],
+                    self._top_p_local_sum[:rows],
+                    self._top_p_local_argmax[:rows],
+                    self._top_p_local_scores[:rows],
+                    self._top_p_local_logits[:rows],
+                    self._top_p_local_ids[:rows],
+                    self._top_p_row_max[:rows],
+                    self._top_p_row_total[:rows],
+                    self._top_p_row_argmax[:rows],
+                    self._top_p_row_candidate_logits[:rows],
+                    self._top_p_row_candidate_ids[:rows],
+                    self._top_p_accepted[:rows],
+                    out[:rows],
+                    block_size=_TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
+                    num_attempts=(
+                        _TOP_P_PARALLEL_SAMPLE_ATTEMPTS
+                        if num_tokens_per_req == 1
+                        else _TOP_P_PARALLEL_VERIFY_ATTEMPTS
+                    ),
+                    num_tokens_per_req=num_tokens_per_req,
+                )
+
+        return gumbel_sample_from_pools_generic(
+            logits,
+            req_pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._seed_pool,
+            offsets_pool,
+            out[:rows],
+            min_p_pool=self._min_p_pool,
+            num_tokens_per_req=num_tokens_per_req,
         )
-
-    # ------------------------------------------------------------------
-    # Sample / verify
-    # ------------------------------------------------------------------
 
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
@@ -273,74 +457,52 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
         ).float()
 
-        # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
-        # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
-        # Applied before raw_logprobs capture so constrained logprobs reflect
-        # the grammar-masked distribution.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
 
-        # Raw-distribution logprobs (pre-penalty, pre-temperature) when the
-        # server flag is on. Gather is done after we know the sampled id.
-        raw_logprobs = (
-            torch.log_softmax(logits, dim=-1)
-            if self.config.enable_output_logprobs
-            else None
+        logits_for_logprobs = (
+            logits.clone() if self.config.enable_output_logprobs else None
         )
 
-        logits = self._apply_penalties_and_bias(logits, sampling_info)
-
-        bs = logits.shape[0]
-        batch_next_token_ids = sample_rejection_min_p_from_pools(
+        req_pool_indices = self._req_pool_indices_for_kernels(
+            sampling_info.req_pool_indices, logits.shape[0]
+        )
+        logits = self._apply_penalties_and_bias(logits, req_pool_indices)
+        offsets_pool = (
+            sampling_info.valid_cache_lengths
+            if sampling_info.valid_cache_lengths is not None
+            else self._zero_offsets_pool
+        )
+        sampled = self._gumbel_sample_full_logits(
             logits,
-            sampling_info.req_pool_indices,
-            self._temperature_pool,
-            self._top_k_pool,
-            self._top_p_pool,
-            self._min_p_pool,
-            self._seed_pool,
-            sampling_info.valid_cache_lengths,
-            self._rejection_local_ids[:bs],
-            self._rejection_local_scores[:bs],
-            self._rejection_argmax_ids[:bs],
-            self._rejection_argmax_scores[:bs],
-            self._rejection_candidate_ids[:bs],
-            self._rejection_candidate_logits[:bs],
-            self._top_k_local_values[:bs],
-            self._rejection_top_k_total_probs[:bs],
-            self._rejection_local_total_probs[:bs],
-            self._rejection_local_before_probs[:bs],
-            self._rejection_local_before_counts[:bs],
-            self._gumbel_out[:bs],
-        )
+            req_pool_indices,
+            offsets_pool,
+            self._gumbel_out[: logits.shape[0]],
+        ).to(torch.int32)
 
-        sampled = batch_next_token_ids.to(torch.int32)
-
-        # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
         self.maybe_broadcast(sampled)
 
-        if raw_logprobs is not None:
+        if logits_for_logprobs is not None:
+            self._write_logprob_outputs(
+                logits_output,
+                logits_for_logprobs,
+                sampled,
+                sampling_info,
+            )
 
-            logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, sampled.unsqueeze(-1)
-            ).squeeze(-1)
-
-        # Accumulate sampled tokens into counts (greedy path accumulates too
-        # so mixed later batches see the correct history).
         self._accumulate_counts(
-            sampling_info.req_pool_indices,
+            req_pool_indices,
             sampled,
             torch.ones_like(sampled, dtype=torch.int32),
         )
 
-        return sampled, self._ones_buf[:bs]
+        return sampled, self._ones_buf[: logits.shape[0]]
 
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
@@ -349,7 +511,6 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 
@@ -360,94 +521,61 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             .fill_(-1)
         )
         accept_length = self._accept_length_buf[:bs]
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
 
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
         ).float()
 
-        # Per-draft-position grammar bitmask: buffer shape
-        # [bs * num_tokens_per_req, V/32] matches the flat target logits.
-        # Applied before raw_logprobs capture so constrained logprobs reflect
-        # the grammar-masked distribution.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
 
-        # Raw (pre-penalty) logprobs captured before penalty application to
-        # match sample()'s semantics.
-        raw_logprobs = (
-            torch.log_softmax(logits, dim=-1)
-            if self.config.enable_output_logprobs
-            else None
+        logits_for_logprobs = (
+            logits.clone() if self.config.enable_output_logprobs else None
         )
 
+        req_pool_indices = self._req_pool_indices_for_kernels(
+            sampling_info.req_pool_indices, bs
+        )
         logits = self._apply_penalties_and_bias(
             logits,
-            sampling_info,
+            req_pool_indices,
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        temperatures, top_ks, top_ps, min_ps, _, _ = gather_and_expand_scalars(
-            sampling_info.req_pool_indices,
-            temperature=self._temperature_pool,
-            top_k=self._top_k_pool,
-            top_p=self._top_p_pool,
-            min_p=self._min_p_pool,
-            n=num_tokens_per_req,
-            enable_pdl=pdl_enabled(),
+        offsets_pool = (
+            sampling_info.valid_cache_lengths
+            if sampling_info.valid_cache_lengths is not None
+            else self._zero_offsets_pool
         )
-
-        target_probs = build_top_k_top_p_probs_from_logits(
+        target_sampled = self._gumbel_sample_full_logits(
             logits,
-            temperatures,
-            top_ks,
-            top_ps,
-            enable_pdl=pdl_enabled(),
+            req_pool_indices,
+            offsets_pool,
+            self._gumbel_verify_out[: bs * num_tokens_per_req],
+            num_tokens_per_req=num_tokens_per_req,
         )
-
-        target_probs = min_p_renorm_prob(target_probs, min_ps, enable_pdl=pdl_enabled())
-
-        target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
-
-        coins = self._coins_buf[:bs, :num_tokens_per_req]
-        coins_for_final_sampling = self._final_coins_buf[:bs]
-
-        chain_speculative_sampling_target_only(
+        verify_chain_target_sampled(
             predicts=predict,
             accept_index=accept_index,
             accept_token_num=accept_length,
             candidates=candidates.to(torch.int32),
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=None,
-            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-            deterministic=True,
+            target_sampled=target_sampled,
             enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1
 
-        # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
         self.maybe_broadcast(predict, accept_index, accept_length)
 
-        # Accumulate accepted tokens into counts. accept_index is [bs, N]
-        # with -1 in unused slots; clamp to a safe index and mask with a
-        # weight of 0 so invalid slots are no-ops.
-        valid = accept_index >= 0  # [bs, N]
-        safe_positions = accept_index.clamp(min=0).long()  # [bs, N]
+        valid = accept_index >= 0
+        safe_positions = accept_index.clamp(min=0).long()
         accepted_tokens = predict.long().gather(0, safe_positions.view(-1))
 
         pool_idx_expanded = (
-            sampling_info.req_pool_indices.unsqueeze(-1)
-            .expand(-1, num_tokens_per_req)
-            .reshape(-1)
+            req_pool_indices.unsqueeze(-1).expand(-1, num_tokens_per_req).reshape(-1)
         )
 
         self._accumulate_counts(
@@ -456,11 +584,14 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             valid.reshape(-1).to(torch.int32),
         )
 
-        if raw_logprobs is not None:
-
-            logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, predict.unsqueeze(-1)
-            ).squeeze(-1)
+        if logits_for_logprobs is not None:
+            self._write_logprob_outputs(
+                logits_output,
+                logits_for_logprobs,
+                predict,
+                sampling_info,
+                num_tokens_per_req=num_tokens_per_req,
+            )
 
         return predict, accept_length
 

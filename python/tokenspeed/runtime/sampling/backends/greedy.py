@@ -35,9 +35,8 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
-    force_reject_invalid_greedy_rows,
+    gather_token_logprobs_torch,
     nan_guard_logits,
-    write_output_logprobs,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -126,13 +125,14 @@ def _verify_chain_greedy(
 
 class GreedySamplingBackend(SamplingBackend):
     """Greedy-only backend: argmax for single-step, chain-greedy verify for
-    multi-step verification. No min_p / penalty machinery, no
+    multi-step verification. No flashinfer / min_p / penalty machinery, no
     coin buffers. Verify uses the fused CUDA kernel when available; falls
     back to a pure-torch implementation otherwise (CPU, ROCm, etc.).
 
     sampling_info is ignored for single-step (always argmax). verify() also
     treats every request as greedy — stochastic verification is not
-    supported. Intended as a lightweight fallback backend."""
+    supported. Intended as the default backend and as a fallback when
+    flashinfer is unavailable."""
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
@@ -189,8 +189,9 @@ class GreedySamplingBackend(SamplingBackend):
         self.maybe_broadcast(tokens)
 
         if self.config.enable_output_logprobs:
-
-            write_output_logprobs(logits_output, logits, tokens)
+            logits_output.next_token_logprobs = gather_token_logprobs_torch(
+                logits, tokens
+            )
 
         return tokens, self._ones_buf[:bs]
 
@@ -212,7 +213,7 @@ class GreedySamplingBackend(SamplingBackend):
             .fill_(-1)
         )
         accept_length = self._accept_length_buf[:bs]
-        valid_rows = torch.isfinite(logits_output.next_token_logits).any(dim=-1)
+
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
         )
@@ -225,12 +226,6 @@ class GreedySamplingBackend(SamplingBackend):
                 vocab_mask=sampling_info.vocab_mask,
             )
         target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
-        target_predict = force_reject_invalid_greedy_rows(
-            target_predict,
-            candidates,
-            valid_rows,
-            self.config.vocab_size,
-        )
 
         _verify_chain_greedy(
             predicts=predict,
@@ -253,8 +248,9 @@ class GreedySamplingBackend(SamplingBackend):
         self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:
-
-            write_output_logprobs(logits_output, logits, predict)
+            logits_output.next_token_logprobs = gather_token_logprobs_torch(
+                logits, predict
+            )
 
         return predict, accept_length
 

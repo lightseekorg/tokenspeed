@@ -13,20 +13,22 @@ leaves a finished request's scalars live for its slot's next tenant.
 
 Tests below cover:
   * greedy backend opts out of pool state (prepare_step is a no-op).
-  * triton backend scatters temperature/top_k/top_p/seed on flip.
+  * flashinfer backend scatters temperature/top_k/top_p/seed on flip.
   * steady-state: same rid+slot across steps → no redundant _reset_slot.
   * slot recycle: slot reassigned to a new rid → _reset_slot fires.
-  * triton_full additionally scatters penalty scalars, counts (zero),
+  * flashinfer_full additionally scatters penalty scalars, counts (zero),
     and logit_bias (zero-then-scatter) on flip; out-of-vocab bias raises.
   * boundary asserts: misaligned rid/pool/sp lists, out-of-range pool_idx.
 
-Runs on CUDA because the backends allocate GPU tensors in ``__init__``.
+Runs on CUDA because the backends allocate GPU tensors in ``__init__``;
+the test doesn't invoke any flashinfer kernels.
 """
 
+import dataclasses
 import os
 import sys
 import unittest
-from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -35,16 +37,42 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch  # noqa: E402
 
+import tokenspeed.runtime.sampling.backends.triton as triton_backend_module  # noqa: E402
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (  # noqa: E402
+    CudaGraphWrapper,
+)
+from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
+    LogitsProcessorOutput,
+)
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
+    CUDA_GRAPH_VARIANT_DEFAULT,
     SamplingBackendConfig,
+)
+from tokenspeed.runtime.sampling.backends.flashinfer import (  # noqa: E402
+    FlashInferSamplingBackend,
+)
+from tokenspeed.runtime.sampling.backends.flashinfer_full import (  # noqa: E402
+    FlashInferFullSamplingBackend,
 )
 from tokenspeed.runtime.sampling.backends.greedy import (  # noqa: E402
     GreedySamplingBackend,
 )
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
+    _SAMPLE_ROUTE_GUMBEL_GENERIC,
+    _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+    _SAMPLE_ROUTE_GUMBEL_TOP_K,
+    _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+    _SAMPLE_ROUTE_GUMBEL_TOP_P,
+    CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
+    CUDA_GRAPH_VARIANT_TRITON_TOP_K,
+    CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
+    CUDA_GRAPH_VARIANT_TRITON_TOP_P,
+    CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
     TritonSamplingBackend,
 )
 from tokenspeed.runtime.sampling.backends.triton_full import (  # noqa: E402
+    CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P,
+    CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P,
     TritonFullSamplingBackend,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import (  # noqa: E402
@@ -56,17 +84,12 @@ VOCAB = 1024
 POOL = 8  # max_req_pool_size → pool_rows == POOL + 1
 
 
-def _make_config(
-    *,
-    enable_output_logprobs: bool = False,
-    vocab_size: int = VOCAB,
-) -> SamplingBackendConfig:
+def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
-        enable_output_logprobs=enable_output_logprobs,
         max_bs=4,
         max_draft_tokens_per_req=4,
         max_req_pool_size=POOL,
-        vocab_size=vocab_size,
+        vocab_size=VOCAB,
         device="cuda",
     )
 
@@ -110,13 +133,13 @@ class TestGreedyNoPoolState(unittest.TestCase):
         )
 
 
-class TestTritonFlipDetection(unittest.TestCase):
-    """triton's pool-indexed scalar buffers are core scheduler state.
+class TestFlashInferFlipDetection(unittest.TestCase):
+    """flashinfer's pool-indexed scalar buffers are core scheduler state.
     These tests pin flip semantics down at the Python state-machine level
     (no kernel invocation needed)."""
 
     def setUp(self):
-        self.backend = TritonSamplingBackend(_make_config())
+        self.backend = FlashInferSamplingBackend(_make_config())
 
     def test_dp_verify_buffers_are_lazy(self):
         self.assertIsNone(self.backend._predict_local_buf)
@@ -174,7 +197,7 @@ class TestTritonFlipDetection(unittest.TestCase):
             request_pool_indices=[2],
             sampling_params_list=[sp_a],
         )
-        gen_a = self.backend._cpu_generator_per_slot[2]
+        gen_a = self.backend._generator_per_slot[2]
         sp_b = _sp("b", temperature=0.3, seed=99)
         self.backend.prepare_step(
             request_ids=["b"],
@@ -184,428 +207,629 @@ class TestTritonFlipDetection(unittest.TestCase):
         self.assertEqual(self.backend._last_rid_per_slot[2], "b")
         self.assertAlmostEqual(self.backend._temperature_pool[2].item(), 0.3, places=3)
         self.assertEqual(self.backend._seed_pool[2].item(), 99)
-        self.assertIsNot(self.backend._cpu_generator_per_slot[2], gen_a)
+        self.assertIsNot(self.backend._generator_per_slot[2], gen_a)
 
 
-class TestTritonSamplingDefault(unittest.TestCase):
-    def _sampling_info(
-        self,
-        pool_indices,
-        *,
-        is_all_greedy=False,
-        vocab_mask=None,
-        apply_vocab_mask=None,
-    ):
-        return SamplingBatchInfo(
-            is_all_greedy=is_all_greedy,
-            req_pool_indices=torch.tensor(
-                pool_indices, dtype=torch.int32, device="cuda"
-            ),
-            valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int64, device="cuda"),
-            vocab_mask=vocab_mask,
-            apply_vocab_mask=apply_vocab_mask,
-            device="cuda",
-        )
+class TestTritonRouteSelection(unittest.TestCase):
+    def setUp(self):
+        self.backend = TritonSamplingBackend(_make_config())
 
-    def test_no_filter_samples_batch_order(self):
-        backend = TritonSamplingBackend(_make_config())
-        backend.prepare_step(
+    def test_no_filter_step_selects_triton_gumbel(self):
+        self.backend.prepare_step(
             request_ids=["a", "b"],
-            request_pool_indices=[4, 2],
+            request_pool_indices=[1, 2],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0), _sp("b", top_k=-1)],
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_NO_FILTER)
+
+    def test_finite_top_k_step_selects_triton_gumbel(self):
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=50, top_p=1.0)],
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K)
+        self.assertEqual(self.backend._top_k_top_p_pad, 64)
+
+    def test_finite_top_k_top_p_step_selects_triton_gumbel(self):
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P)
+        self.assertEqual(self.backend._top_k_top_p_pad, 64)
+
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=128, top_p=0.9)],
+        )
+        self.assertEqual(self.backend._top_k_top_p_pad, 128)
+
+    def test_top_p_only_step_selects_top_p_triton_gumbel(self):
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_P)
+
+    def test_mixed_step_selects_generic_triton_gumbel(self):
+        self.backend.prepare_step(
+            request_ids=["a", "b"],
+            request_pool_indices=[1, 2],
             sampling_params_list=[
-                _sp("a", top_k=-1, top_p=1.0, seed=11),
-                _sp("b", top_k=-1, top_p=1.0, seed=22),
+                _sp("a", top_k=-1, top_p=1.0),
+                _sp("b", top_k=50, top_p=1.0),
             ],
         )
-        logits = torch.full((2, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, VOCAB - 1] = 1.0e6
-        logits[1, VOCAB - 7] = 1.0e6
-        logits_output = SimpleNamespace(
-            next_token_logits=logits, next_token_logprobs=None
-        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
 
-        sampled, accept_lengths = backend.sample(
-            logits_output, self._sampling_info([4, 2])
-        )
-
-        self.assertEqual(sampled.tolist(), [VOCAB - 1, VOCAB - 7])
-        self.assertEqual(accept_lengths.tolist(), [1, 1])
-
-    def test_top_k_samples_allowed_candidate(self):
-        backend = TritonSamplingBackend(_make_config())
-        backend.prepare_step(
-            request_ids=["top_k"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("top_k", top_k=2, top_p=1.0, seed=55)],
-        )
-        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, 17] = 5.0
-        logits[0, 23] = 4.0
-        logits[0, 99] = 3.0
-        logits_output = SimpleNamespace(
-            next_token_logits=logits, next_token_logprobs=None
-        )
-
-        sampled, accept_lengths = backend.sample(
-            logits_output, self._sampling_info([1])
-        )
-
-        self.assertIn(sampled.item(), {17, 23})
-        self.assertEqual(accept_lengths.tolist(), [1])
-
-    def test_top_k_top_p_samples_nucleus_candidate(self):
-        backend = TritonSamplingBackend(_make_config())
-        backend.prepare_step(
-            request_ids=["top_k_top_p"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("top_k_top_p", top_k=3, top_p=0.6, seed=66)],
-        )
-        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, 17] = 10.0
-        logits[0, 23] = 9.0
-        logits[0, 99] = 8.0
-        logits_output = SimpleNamespace(
-            next_token_logits=logits, next_token_logprobs=None
-        )
-
-        sampled, accept_lengths = backend.sample(
-            logits_output, self._sampling_info([1])
-        )
-
-        self.assertEqual(sampled.item(), 17)
-        self.assertEqual(accept_lengths.tolist(), [1])
-
-    def test_top_p_samples_valid_candidate(self):
-        backend = TritonSamplingBackend(_make_config())
-        backend.prepare_step(
-            request_ids=["top_p"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("top_p", top_k=-1, top_p=0.6, seed=33)],
-        )
-        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, 17] = 10.0
-        logits[0, 23] = 1.0
-        logits_output = SimpleNamespace(
-            next_token_logits=logits,
-            next_token_logprobs=None,
-        )
-
-        sampled, _ = backend.sample(logits_output, self._sampling_info([1]))
-
-        self.assertEqual(sampled.item(), 17)
-
-    def test_grammar_mask_applies_before_sampling(self):
-        backend = TritonSamplingBackend(_make_config())
-        backend.prepare_step(
-            request_ids=["grammar"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("grammar", top_k=-1, top_p=1.0, seed=44)],
-        )
-        logits_output = SimpleNamespace(
-            next_token_logits=torch.zeros(
-                (1, VOCAB), dtype=torch.float32, device="cuda"
-            ),
-            next_token_logprobs=None,
-        )
-        vocab_mask = torch.ones((1, 1), dtype=torch.int32, device="cuda")
-
-        def apply_mask(logits, vocab_mask):
-            logits.fill_(-float("inf"))
-            logits[:, 23] = 1.0e6
-
-        sampled, _ = backend.sample(
-            logits_output,
-            self._sampling_info(
-                [1],
-                vocab_mask=vocab_mask,
-                apply_vocab_mask=apply_mask,
-            ),
-        )
-
-        self.assertEqual(sampled.item(), 23)
-
-    def test_prepare_capture_variants_sample(self):
-        def set_top_k_top_p(backend):
-            backend._top_k_pool[0].fill_(3)
-            backend._top_p_pool[0].fill_(0.6)
-            backend._temperature_pool[0].fill_(1.0)
-            backend._seed_pool[0].fill_(66)
-
-        def set_top_p(backend):
-            backend._top_p_pool[0].fill_(0.6)
-            backend._temperature_pool[0].fill_(1.0)
-            backend._seed_pool[0].fill_(33)
-
-        cases = (
-            (None, 42, None),
-            ("no_filter", 47, None),
-            ("top_k_top_p", 17, set_top_k_top_p),
-            ("top_p", 17, set_top_p),
-        )
-        for capture_variant, expected_token, configure in cases:
-            with self.subTest(capture_variant=capture_variant):
-                backend = TritonSamplingBackend(_make_config())
-                backend.prepare_capture(
-                    bs=1,
-                    num_tokens_per_req=1,
-                    capture_variant=capture_variant,
-                )
-                if configure is not None:
-                    configure(backend)
-
-                logits = torch.full(
-                    (1, VOCAB), -10.0, dtype=torch.float32, device="cuda"
-                )
-                if capture_variant in ("top_k_top_p", "top_p"):
-                    logits[0, 17] = 10.0
-                    logits[0, 23] = 9.0
-                    logits[0, 99] = 8.0
-                else:
-                    logits[0, expected_token] = 1.0e6
-                logits_output = SimpleNamespace(
-                    next_token_logits=logits,
-                    next_token_logprobs=None,
-                )
-
-                sampled, _ = backend.sample(
-                    logits_output,
-                    self._sampling_info(
-                        [0],
-                        is_all_greedy=capture_variant == "greedy",
-                    ),
-                )
-                self.assertEqual(sampled.item(), expected_token)
-
-    def test_cuda_graph_replay_variant_selects_no_filter_after_prepare_step(self):
-        backend = TritonSamplingBackend(_make_config())
-        backend.prepare_step(
-            request_ids=["g"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("g", top_k=1, top_p=1.0)],
-        )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "top_k_top_p")
-
-        backend.prepare_step(
-            request_ids=["gv"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("gv", top_k=1, top_p=1.0)],
-            num_tokens_per_req=4,
-        )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "greedy")
-
-        backend.prepare_step(
+    def test_multi_token_no_filter_step_selects_verify_fast_path(self):
+        self.backend.prepare_step(
             request_ids=["a"],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
+            num_tokens_per_req=4,
         )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "no_filter")
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_NO_FILTER)
 
-        backend.prepare_step(
-            request_ids=["p"],
-            request_pool_indices=[3],
-            sampling_params_list=[_sp("p", top_k=-1, top_p=0.9)],
-        )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "top_p")
+    def test_capture_keeps_generic_sampler_graph(self):
+        self.backend._sample_route = _SAMPLE_ROUTE_GUMBEL_NO_FILTER
+        self.backend.prepare_capture(bs=1)
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
 
-        backend.prepare_step(
-            request_ids=["b"],
-            request_pool_indices=[2],
-            sampling_params_list=[_sp("b", top_k=50, top_p=0.9)],
-        )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "top_k_top_p")
-
-        backend.prepare_step(
-            request_ids=["k"],
-            request_pool_indices=[2],
-            sampling_params_list=[_sp("k", top_k=50, top_p=1.0)],
-        )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "top_k_top_p")
-
-        large_backend = TritonSamplingBackend(_make_config(vocab_size=151936))
-        large_backend.prepare_step(
-            request_ids=["b"],
-            request_pool_indices=[2],
-            sampling_params_list=[_sp("b", top_k=50, top_p=0.9)],
-        )
-        self.assertEqual(large_backend.cuda_graph_replay_variant(), "top_k_top_p")
-
-    def test_cuda_graph_capture_variants(self):
-        compact_backend = TritonSamplingBackend(_make_config())
+    def test_cuda_graph_variants_cover_top_p_and_verify_no_filter(self):
         self.assertEqual(
-            compact_backend.cuda_graph_capture_variants(num_tokens_per_req=1),
-            ("default", "no_filter", "top_k_top_p", "top_p"),
+            self.backend.cuda_graph_capture_variants(num_tokens_per_req=1),
+            (
+                CUDA_GRAPH_VARIANT_DEFAULT,
+                CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
+                CUDA_GRAPH_VARIANT_TRITON_TOP_P,
+                CUDA_GRAPH_VARIANT_TRITON_TOP_K,
+                CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
+            ),
         )
         self.assertEqual(
-            compact_backend.cuda_graph_capture_variants(num_tokens_per_req=4),
-            ("default", "greedy"),
-        )
-        self.assertTrue(
-            compact_backend.cuda_graph_capture_is_all_greedy(
-                "greedy", num_tokens_per_req=4
-            )
-        )
-        self.assertFalse(
-            compact_backend.cuda_graph_capture_is_all_greedy(
-                "default", num_tokens_per_req=4
-            )
+            self.backend.cuda_graph_capture_variants(num_tokens_per_req=4),
+            (
+                CUDA_GRAPH_VARIANT_DEFAULT,
+                CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
+                CUDA_GRAPH_VARIANT_TRITON_TOP_P,
+                CUDA_GRAPH_VARIANT_TRITON_TOP_K,
+                CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
+                CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
+            ),
         )
 
-        backend = TritonSamplingBackend(_make_config(vocab_size=151936))
-        self.assertEqual(
-            backend.cuda_graph_capture_variants(num_tokens_per_req=1),
-            ("default", "no_filter", "top_k_top_p", "top_p"),
-        )
-        backend.prepare_step(
-            request_ids=["p"],
+        self.backend.prepare_step(
+            request_ids=["a"],
             request_pool_indices=[1],
-            sampling_params_list=[_sp("p", top_k=-1, top_p=0.9)],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
+            num_tokens_per_req=4,
         )
-        self.assertEqual(backend.cuda_graph_replay_variant(), "top_p")
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
+            CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
+        )
 
-    def test_mixed_modes_sample_batch(self):
-        backend = TritonSamplingBackend(_make_config())
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
+            num_tokens_per_req=1,
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=1),
+            CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
+        )
+
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
+            num_tokens_per_req=4,
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
+            CUDA_GRAPH_VARIANT_TRITON_TOP_P,
+        )
+
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=50, top_p=1.0)],
+            num_tokens_per_req=4,
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
+            CUDA_GRAPH_VARIANT_TRITON_TOP_K,
+        )
+
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
+            num_tokens_per_req=4,
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
+            CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
+        )
+
+    def test_top_k_top_p_block_size_tuning_is_scoped_to_small_vocab(self):
+        self.assertEqual(self.backend._select_top_k_top_p_block_size(1, 32768), 1024)
+        self.assertEqual(self.backend._select_top_k_top_p_block_size(8, 32768), 1024)
+        self.assertEqual(self.backend._select_top_k_top_p_block_size(32, 32768), 1024)
+        self.assertEqual(self.backend._select_top_k_top_p_block_size(32, 151936), 1024)
+
+    def test_verify_finite_top_k_top_p_uses_direct_sampler(self):
+        n = 4
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
+            num_tokens_per_req=n,
+        )
+        logits = torch.randn((n, VOCAB), dtype=torch.float32, device="cuda")
+        candidates = torch.zeros((1, n), dtype=torch.int32, device="cuda")
+        sampling_info = SamplingBatchInfo(
+            req_pool_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            valid_cache_lengths=torch.zeros(
+                (POOL + 1,), dtype=torch.int32, device="cuda"
+            ),
+            is_all_greedy=False,
+            vocab_size=VOCAB,
+            device="cuda",
+        )
+        target_sampled = torch.arange(n, dtype=torch.int32, device="cuda")
+
+        def _fake_verify_chain(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            target_sampled,
+            *,
+            enable_pdl=False,
+        ):
+            del accept_index, candidates, target_sampled, enable_pdl
+            predicts.fill_(0)
+            accept_token_num.fill_(0)
+
+        with (
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_top_k_top_p_from_pools",
+                return_value=target_sampled,
+            ) as direct_sampler,
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_from_pools_generic",
+                side_effect=AssertionError("generic sampler should not be used"),
+            ),
+            patch.object(
+                triton_backend_module,
+                "verify_chain_target_sampled",
+                side_effect=_fake_verify_chain,
+            ),
+        ):
+            self.backend.verify(
+                LogitsProcessorOutput(next_token_logits=logits),
+                sampling_info,
+                candidates,
+            )
+
+        direct_sampler.assert_called_once()
+        args, kwargs = direct_sampler.call_args
+        self.assertEqual(args[7].shape[0], n)
+        self.assertEqual(args[8].shape[0], n)
+
+    def test_verify_top_p_only_uses_top_p_sampler(self):
+        n = 4
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
+            num_tokens_per_req=n,
+        )
+        logits = torch.randn((n, VOCAB), dtype=torch.float32, device="cuda")
+        candidates = torch.zeros((1, n), dtype=torch.int32, device="cuda")
+        sampling_info = SamplingBatchInfo(
+            req_pool_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            valid_cache_lengths=torch.zeros(
+                (POOL + 1,), dtype=torch.int32, device="cuda"
+            ),
+            is_all_greedy=False,
+            vocab_size=VOCAB,
+            device="cuda",
+        )
+        target_sampled = torch.arange(n, dtype=torch.int32, device="cuda")
+
+        def _fake_verify_chain(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            target_sampled,
+            *,
+            enable_pdl=False,
+        ):
+            del accept_index, candidates, target_sampled, enable_pdl
+            predicts.fill_(0)
+            accept_token_num.fill_(0)
+
+        with (
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_top_p_parallel_from_pools",
+                return_value=target_sampled,
+            ) as top_p_sampler,
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_from_pools_generic",
+                side_effect=AssertionError("generic sampler should not be used"),
+            ),
+            patch.object(
+                triton_backend_module,
+                "verify_chain_target_sampled",
+                side_effect=_fake_verify_chain,
+            ),
+        ):
+            self.backend.verify(
+                LogitsProcessorOutput(next_token_logits=logits),
+                sampling_info,
+                candidates,
+            )
+
+        top_p_sampler.assert_called_once()
+        args, kwargs = top_p_sampler.call_args
+        self.assertEqual(args[6].shape[0], n)
+        self.assertEqual(args[17].shape[0], n)
+        self.assertEqual(kwargs["num_tokens_per_req"], n)
+
+    def test_verify_large_finite_top_k_top_p_uses_qrita_sampler(self):
+        bs, n, vocab = 32, 4, 32768
+        backend = TritonSamplingBackend(
+            SamplingBackendConfig(
+                max_bs=bs,
+                max_draft_tokens_per_req=n,
+                max_req_pool_size=POOL + bs,
+                vocab_size=vocab,
+                device="cuda",
+            )
+        )
+        backend.prepare_step(
+            request_ids=[f"r{i}" for i in range(bs)],
+            request_pool_indices=list(range(1, bs + 1)),
+            sampling_params_list=[
+                _sp(f"qrita_{i}", top_k=128, top_p=0.9) for i in range(bs)
+            ],
+            num_tokens_per_req=n,
+        )
+        logits = torch.randn((bs * n, vocab), dtype=torch.float32, device="cuda")
+        candidates = torch.zeros((bs, n), dtype=torch.int32, device="cuda")
+        sampling_info = SamplingBatchInfo(
+            req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int32, device="cuda"),
+            valid_cache_lengths=torch.zeros(
+                (POOL + bs + 1,), dtype=torch.int32, device="cuda"
+            ),
+            is_all_greedy=False,
+            vocab_size=vocab,
+            device="cuda",
+        )
+        target_sampled = torch.arange(bs * n, dtype=torch.int32, device="cuda")
+
+        def _fake_verify_chain(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            target_sampled,
+            *,
+            enable_pdl=False,
+        ):
+            del accept_index, candidates, target_sampled, enable_pdl
+            predicts.fill_(0)
+            accept_token_num.fill_(0)
+
+        with (
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_top_k_top_p_qrita_from_pools",
+                return_value=target_sampled,
+            ) as qrita_sampler,
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_top_k_top_p_from_pools",
+                side_effect=AssertionError("candidate sampler should not be used"),
+            ),
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_from_pools_generic",
+                side_effect=AssertionError("generic sampler should not be used"),
+            ),
+            patch.object(
+                triton_backend_module,
+                "verify_chain_target_sampled",
+                side_effect=_fake_verify_chain,
+            ),
+        ):
+            backend.verify(
+                LogitsProcessorOutput(next_token_logits=logits),
+                sampling_info,
+                candidates,
+            )
+
+        qrita_sampler.assert_called_once()
+        args, kwargs = qrita_sampler.call_args
+        self.assertEqual(args[7].shape[1], vocab)
+        self.assertEqual(
+            args[8].shape[0],
+            len(triton_backend_module._QRITA_PERCENTILE_TO_STD_TABLE),
+        )
+        self.assertEqual(kwargs["num_tokens_per_req"], n)
+
+    def test_verify_large_finite_top_k_only_uses_qrita_sampler(self):
+        bs, n, vocab = 32, 4, 200064
+        backend = TritonSamplingBackend(
+            SamplingBackendConfig(
+                max_bs=bs,
+                max_draft_tokens_per_req=n,
+                max_req_pool_size=POOL + bs,
+                vocab_size=vocab,
+                device="cuda",
+            )
+        )
+        backend.prepare_step(
+            request_ids=[f"r{i}" for i in range(bs)],
+            request_pool_indices=list(range(1, bs + 1)),
+            sampling_params_list=[
+                _sp(f"qrita_topk_{i}", top_k=64, top_p=1.0) for i in range(bs)
+            ],
+            num_tokens_per_req=n,
+        )
+        logits = torch.randn((bs * n, vocab), dtype=torch.float32, device="cuda")
+        candidates = torch.zeros((bs, n), dtype=torch.int32, device="cuda")
+        sampling_info = SamplingBatchInfo(
+            req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int32, device="cuda"),
+            valid_cache_lengths=torch.zeros(
+                (POOL + bs + 1,), dtype=torch.int32, device="cuda"
+            ),
+            is_all_greedy=False,
+            vocab_size=vocab,
+            device="cuda",
+        )
+        target_sampled = torch.arange(bs * n, dtype=torch.int32, device="cuda")
+
+        def _fake_verify_chain(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            target_sampled,
+            *,
+            enable_pdl=False,
+        ):
+            del accept_index, candidates, target_sampled, enable_pdl
+            predicts.fill_(0)
+            accept_token_num.fill_(0)
+
+        with (
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_top_k_top_p_qrita_from_pools",
+                return_value=target_sampled,
+            ) as qrita_sampler,
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_top_k_top_p_from_pools",
+                side_effect=AssertionError("candidate sampler should not be used"),
+            ),
+            patch.object(
+                triton_backend_module,
+                "gumbel_sample_from_pools_generic",
+                side_effect=AssertionError("generic sampler should not be used"),
+            ),
+            patch.object(
+                triton_backend_module,
+                "verify_chain_target_sampled",
+                side_effect=_fake_verify_chain,
+            ),
+        ):
+            backend.verify(
+                LogitsProcessorOutput(next_token_logits=logits),
+                sampling_info,
+                candidates,
+            )
+
+        qrita_sampler.assert_called_once()
+        args, kwargs = qrita_sampler.call_args
+        self.assertEqual(args[7].shape[1], vocab)
+        self.assertEqual(kwargs["num_tokens_per_req"], n)
+
+    def test_prepare_capture_variant_sets_verify_fast_path(self):
+        self.backend.prepare_capture_variant(
+            bs=1,
+            num_tokens_per_req=4,
+            variant=CUDA_GRAPH_VARIANT_TRITON_TOP_K,
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K)
+
+        self.backend.prepare_capture_variant(
+            bs=1,
+            num_tokens_per_req=4,
+            variant=CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P)
+
+        self.backend.prepare_capture_variant(
+            bs=1,
+            num_tokens_per_req=4,
+            variant=CUDA_GRAPH_VARIANT_TRITON_TOP_P,
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_P)
+
+        self.backend.prepare_capture_variant(
+            bs=1,
+            num_tokens_per_req=4,
+            variant=CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_NO_FILTER)
+
+        self.backend.prepare_capture_variant(
+            bs=1,
+            num_tokens_per_req=4,
+            variant=CUDA_GRAPH_VARIANT_DEFAULT,
+        )
+        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
+
+    def test_triton_verify_is_owned_by_triton_backend(self):
+        self.assertFalse(issubclass(TritonSamplingBackend, FlashInferSamplingBackend))
+        self.assertIsNot(TritonSamplingBackend.verify, FlashInferSamplingBackend.verify)
+        self.assertIsNot(
+            TritonFullSamplingBackend.verify,
+            FlashInferFullSamplingBackend.verify,
+        )
+        self.assertTrue(issubclass(TritonFullSamplingBackend, TritonSamplingBackend))
+        self.assertFalse(
+            issubclass(TritonFullSamplingBackend, FlashInferFullSamplingBackend)
+        )
+
+    def test_triton_reuses_pool_state_without_flashinfer_probability_state(self):
+        self.assertTrue(hasattr(self.backend, "_temperature_pool"))
+        self.assertTrue(hasattr(self.backend, "_top_k_pool"))
+        self.assertTrue(hasattr(self.backend, "_top_p_pool"))
+        self.assertTrue(hasattr(self.backend, "_seed_pool"))
+        self.assertFalse(hasattr(self.backend, "_coins_buf"))
+        self.assertFalse(hasattr(self.backend, "_generator_per_slot"))
+
+
+class TestTritonLogprobOutputs(unittest.TestCase):
+    def _make_backend(self, backend_cls):
+        config = dataclasses.replace(_make_config(), enable_output_logprobs=True)
+        backend = backend_cls(config)
         backend.prepare_step(
             request_ids=["a", "b"],
             request_pool_indices=[1, 2],
             sampling_params_list=[
-                _sp("a", top_k=-1, top_p=1.0, seed=11),
-                _sp("b", top_k=50, top_p=0.9, seed=22),
+                _sp("a", top_k=-1, top_p=1.0),
+                _sp("b", top_k=-1, top_p=1.0),
             ],
         )
-        logits = torch.full((2, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, 17] = 1.0e6
-        logits[1, 29] = 1.0e6
-        logits_output = SimpleNamespace(
-            next_token_logits=logits,
-            next_token_logprobs=None,
-        )
+        return backend
 
-        sampled, _ = backend.sample(logits_output, self._sampling_info([1, 2]))
-
-        torch.testing.assert_close(
-            sampled.cpu(), torch.tensor([17, 29], dtype=torch.int32)
-        )
-
-    def test_output_logprobs_are_written(self):
-        backend = TritonSamplingBackend(_make_config(enable_output_logprobs=True))
-        backend.prepare_step(
-            request_ids=["a"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0, seed=11)],
-        )
-        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, 7] = 1.0e6
-        logits_output = SimpleNamespace(
-            next_token_logits=logits,
-            next_token_logprobs=None,
-        )
-
-        sampled, _ = backend.sample(logits_output, self._sampling_info([1]))
-
-        self.assertEqual(sampled.item(), 7)
-        self.assertIsNotNone(logits_output.next_token_logprobs)
-        torch.testing.assert_close(
-            logits_output.next_token_logprobs.cpu(),
-            torch.tensor([0.0], dtype=torch.float32),
-            atol=0.0,
-            rtol=0.0,
-        )
-
-    def test_unresolved_mode_raises(self):
-        backend = TritonSamplingBackend(_make_config())
-        backend.prepare_step(
-            request_ids=["a"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0, seed=11)],
-            num_tokens_per_req=2,
-        )
-        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, 7] = 1.0e6
-        logits_output = SimpleNamespace(
-            next_token_logits=logits,
-            next_token_logprobs=None,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "did not select a sampling mode"):
-            backend.sample(logits_output, self._sampling_info([1]))
-
-    def test_verify_nan_guard_keeps_greedy_tokens_valid(self):
-        if torch.version.hip is not None:
-            self.skipTest("verify_chain_greedy is only available on NVIDIA")
-
-        vocab_size = 151936
-        backend = TritonSamplingBackend(_make_config(vocab_size=vocab_size))
-        backend.prepare_step(
-            request_ids=["mtp"],
-            request_pool_indices=[1],
-            sampling_params_list=[_sp("mtp", top_k=1, top_p=1.0)],
-            num_tokens_per_req=4,
-        )
-        logits = torch.full(
-            (4, vocab_size),
-            float("nan"),
-            dtype=torch.float32,
+    def _make_sampling_info(self):
+        return SamplingBatchInfo(
+            req_pool_indices=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+            valid_cache_lengths=torch.zeros(
+                (POOL + 1,), dtype=torch.int32, device="cuda"
+            ),
+            is_all_greedy=False,
+            vocab_size=VOCAB,
             device="cuda",
         )
-        logits_output = SimpleNamespace(
-            next_token_logits=logits,
-            next_token_logprobs=None,
-        )
-        candidates = torch.zeros((1, 4), dtype=torch.int32, device="cuda")
 
-        predict, accept_lengths = backend.verify(
-            logits_output,
-            self._sampling_info([1], is_all_greedy=True),
-            candidates,
+    def _assert_logprob_outputs(self, logits, sampled, logits_output):
+        ref = torch.log_softmax(logits.float(), dim=-1)
+        ref_selected = ref.gather(-1, sampled.long().unsqueeze(-1)).squeeze(-1)
+        torch.testing.assert_close(
+            logits_output.next_token_logprobs,
+            ref_selected,
+            rtol=1e-4,
+            atol=1e-4,
         )
 
-        self.assertEqual(accept_lengths.tolist(), [1])
-        accepted = predict[: accept_lengths.item()]
-        self.assertTrue(torch.all(accepted >= 0).item())
-        self.assertTrue(torch.all(accepted < vocab_size).item())
-        self.assertTrue(torch.all(accepted != candidates[0, 0]).item())
-        self.assertFalse(torch.isnan(logits).any().item())
+        self.assertIsNone(logits_output.next_token_top_logprobs_val)
+        self.assertIsNone(logits_output.next_token_top_logprobs_idx)
+        self.assertIsNone(logits_output.next_token_token_ids_logprobs_val)
+        self.assertIsNone(logits_output.next_token_token_ids_logprobs_idx)
 
-    def test_sample_nan_guard_does_not_promote_nan_logits(self):
-        backend = TritonSamplingBackend(_make_config())
-        logits = torch.tensor(
-            [[-2.0, float("nan"), -3.0]],
-            dtype=torch.float32,
-            device="cuda",
+    def test_triton_sample_writes_compact_logprob_side_outputs(self):
+        backend = self._make_backend(TritonSamplingBackend)
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        logits = torch.randn(
+            (2, VOCAB), dtype=torch.float32, device="cuda", generator=generator
         )
-        logits_output = SimpleNamespace(
-            next_token_logits=logits,
-            next_token_logprobs=None,
-        )
+        logits_output = LogitsProcessorOutput(next_token_logits=logits.clone())
 
         sampled, _ = backend.sample(
             logits_output,
-            self._sampling_info([1], is_all_greedy=True),
+            self._make_sampling_info(),
         )
 
-        self.assertEqual(sampled.tolist(), [0])
-        self.assertEqual(float(logits[0, 1].item()), -1e5)
+        self._assert_logprob_outputs(logits, sampled, logits_output)
+
+    def test_triton_full_sample_writes_compact_logprob_side_outputs(self):
+        backend = self._make_backend(TritonFullSamplingBackend)
+        generator = torch.Generator(device="cuda").manual_seed(11)
+        logits = torch.randn(
+            (2, VOCAB), dtype=torch.float32, device="cuda", generator=generator
+        )
+        logits_output = LogitsProcessorOutput(next_token_logits=logits.clone())
+
+        sampled, _ = backend.sample(
+            logits_output,
+            self._make_sampling_info(),
+        )
+
+        self._assert_logprob_outputs(logits, sampled, logits_output)
 
 
-class TestTritonFullFlipExtended(unittest.TestCase):
+class TestCudaGraphSamplingVariants(unittest.TestCase):
+    def test_wrapper_dedupes_default_and_selects_replay_variant(self):
+        class FakeSamplingBackend:
+            variant = CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER
+
+            def cuda_graph_capture_variants(self, num_tokens_per_req):
+                self.capture_num_tokens_per_req = num_tokens_per_req
+                return (
+                    CUDA_GRAPH_VARIANT_DEFAULT,
+                    CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
+                )
+
+            def cuda_graph_replay_variant(self, num_tokens_per_req):
+                self.replay_num_tokens_per_req = num_tokens_per_req
+                return self.variant
+
+        backend = FakeSamplingBackend()
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.sampling_backend = backend
+        wrapper.max_tokens_per_req = 4
+        wrapper.graphs = {
+            (CUDA_GRAPH_VARIANT_DEFAULT, 8): object(),
+            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8): object(),
+        }
+
+        self.assertEqual(
+            wrapper._cuda_graph_capture_variants(),
+            (
+                CUDA_GRAPH_VARIANT_DEFAULT,
+                CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
+            ),
+        )
+        self.assertEqual(backend.capture_num_tokens_per_req, 4)
+        self.assertEqual(
+            wrapper._cuda_graph_key(8),
+            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8),
+        )
+        self.assertEqual(backend.replay_num_tokens_per_req, 4)
+
+        backend.variant = "missing"
+        self.assertEqual(
+            wrapper._cuda_graph_key(8),
+            (CUDA_GRAPH_VARIANT_DEFAULT, 8),
+        )
+
+
+class TestFlashInferFullFlipExtended(unittest.TestCase):
     """Full backend extends flip behavior with penalty scalars, count rows,
     and logit_bias scatter. Each of these must be cleared/scattered on
     flip or a new request inherits the previous occupant's state."""
 
     def setUp(self):
-        self.backend = TritonFullSamplingBackend(_make_config())
-
-    def _sampling_info(self, pool_indices):
-        return SamplingBatchInfo(
-            is_all_greedy=False,
-            req_pool_indices=torch.tensor(
-                pool_indices, dtype=torch.int32, device="cuda"
-            ),
-            valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int64, device="cuda"),
-            vocab_mask=None,
-            apply_vocab_mask=None,
-            device="cuda",
-        )
+        self.backend = FlashInferFullSamplingBackend(_make_config())
 
     def test_penalty_scalars_scattered(self):
         sp = _sp(
@@ -664,29 +888,96 @@ class TestTritonFullFlipExtended(unittest.TestCase):
                 sampling_params_list=[sp],
             )
 
-    def test_sample_applies_min_p_and_accumulates_counts(self):
-        backend = TritonFullSamplingBackend(_make_config())
-        sp = _sp("full", top_k=-1, top_p=1.0, min_p=0.5, seed=123)
-        backend.prepare_step(
-            request_ids=["full"],
-            request_pool_indices=[1],
+
+class TestTritonFullIndependentState(unittest.TestCase):
+    """TritonFull owns the same full-sampling slot state as FlashInferFull,
+    but it must not inherit the FlashInferFull probability route."""
+
+    def setUp(self):
+        self.backend = TritonFullSamplingBackend(_make_config())
+
+    def test_penalty_scalars_scattered(self):
+        sp = _sp(
+            "a",
+            frequency_penalty=0.5,
+            presence_penalty=0.25,
+            repetition_penalty=1.2,
+            min_p=0.1,
+        )
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[3],
             sampling_params_list=[sp],
         )
+        self.assertAlmostEqual(self.backend._freq_pen_pool[3].item(), 0.5, places=2)
+        self.assertAlmostEqual(self.backend._pres_pen_pool[3].item(), 0.25, places=2)
+        self.assertAlmostEqual(self.backend._rep_pen_pool[3].item(), 1.2, places=2)
+        self.assertAlmostEqual(self.backend._min_p_pool[3].item(), 0.1, places=3)
 
-        logits = torch.full((1, VOCAB), -10.0, dtype=torch.float32, device="cuda")
-        logits[0, 33] = 1.0e6
-        logits_output = SimpleNamespace(
-            next_token_logits=logits,
-            next_token_logprobs=None,
+    def test_counts_and_bias_cleared_on_flip(self):
+        self.backend._counts[2, 100] = 7
+        self.backend._logit_bias[2, 100] = 5.0
+        self.backend.prepare_step(
+            request_ids=["new"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("new")],
+        )
+        self.assertEqual(self.backend._counts[2, 100].item(), 0)
+        self.assertAlmostEqual(self.backend._logit_bias[2, 100].item(), 0.0, places=3)
+
+    def test_logit_bias_scattered(self):
+        sp = _sp("a")
+        sp.logit_bias = {"100": 2.0, "200": -1.5}
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[4],
+            sampling_params_list=[sp],
+        )
+        self.assertAlmostEqual(self.backend._logit_bias[4, 100].item(), 2.0, places=2)
+        self.assertAlmostEqual(self.backend._logit_bias[4, 200].item(), -1.5, places=2)
+        self.assertAlmostEqual(self.backend._logit_bias[4, 150].item(), 0.0, places=3)
+
+    def test_reset_capture_state_clears_capture_counts(self):
+        self.backend._counts[0, 10] = 3
+        self.backend.reset_capture_state()
+        self.assertEqual(self.backend._counts[0, 10].item(), 0)
+
+    def test_min_p_cuda_graph_routes_have_dedicated_variants(self):
+        variants = self.backend.cuda_graph_capture_variants(num_tokens_per_req=4)
+        self.assertIn(CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P, variants)
+        self.assertIn(CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P, variants)
+
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=-1, top_p=1.0, min_p=0.2)],
+            num_tokens_per_req=4,
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
+            CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P,
         )
 
-        sampled, accept_lengths = backend.sample(
-            logits_output, self._sampling_info([1])
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("a", top_k=64, top_p=0.9, min_p=0.05)],
+            num_tokens_per_req=4,
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
+            CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P,
         )
 
-        self.assertEqual(sampled.item(), 33)
-        self.assertEqual(accept_lengths.tolist(), [1])
-        self.assertEqual(backend._counts[1, 33].item(), 1)
+    def test_logit_bias_out_of_vocab_asserts(self):
+        sp = _sp("a")
+        sp.logit_bias = {str(VOCAB + 5): 1.0}
+        with self.assertRaises(AssertionError):
+            self.backend.prepare_step(
+                request_ids=["a"],
+                request_pool_indices=[1],
+                sampling_params_list=[sp],
+            )
 
 
 class TestPrepareStepGuardRails(unittest.TestCase):
@@ -695,7 +986,7 @@ class TestPrepareStepGuardRails(unittest.TestCase):
     corruption if they slip through."""
 
     def setUp(self):
-        self.backend = TritonSamplingBackend(_make_config())
+        self.backend = FlashInferSamplingBackend(_make_config())
 
     def test_misaligned_lists_assert(self):
         with self.assertRaises(AssertionError):
