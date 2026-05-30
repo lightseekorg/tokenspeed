@@ -963,6 +963,17 @@ class ModelExecutor:
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
         )
+        ctx.dp_sampling, _use_graph, bucket_bs = self.forward_step.dp_sampling_route(
+            0, ctx
+        )
+        if self.sampling_backend is not None:
+            ctx.logits_layout_plan = self.sampling_backend.build_logits_layout_plan(
+                dp_sampling=ctx.dp_sampling,
+                real_bs=0,
+                bucket_bs=bucket_bs,
+                tp_size=self.model_runner.model.logits_processor.tp_size,
+                num_tokens_per_req=self.config.output_length,
+            )
 
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -970,6 +981,7 @@ class ModelExecutor:
             is_all_greedy=True,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
+            dp_sampling=ctx.dp_sampling,
         )
         if self.forward_step.can_run(bs=0, ctx=ctx):
             padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)

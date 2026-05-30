@@ -183,6 +183,36 @@ def test_dp_sampling_route_keeps_graph_bucket_below_threshold_non_dp():
     assert bucket_bs == 24
 
 
+def test_dp_sampling_route_uses_global_decode_bucket_for_idle_rank():
+    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    runner.disable = False
+    runner.dp_size = 2
+    runner.disable_padding = False
+    runner.max_bs = 32
+    runner.capture_bs = [16, 32]
+    runner.max_tokens_per_req = 1
+    runner.dp_sampling_enabled = True
+    runner.dp_sampling_min_bs = 16
+    runner.logits_tp_size = 8
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=0,
+        num_extends=0,
+        input_num_tokens=0,
+        forward_mode=ForwardMode.DECODE,
+        global_num_tokens=[16, 0],
+        global_bs=[16, 0],
+        all_decode_or_idle=True,
+    )
+
+    dp_sampling, use_graph, bucket_bs = runner.dp_sampling_route(0, ctx)
+
+    assert dp_sampling
+    assert use_graph
+    assert bucket_bs == 16
+
+
 def test_dp_sampling_eager_route_still_returns_tp_divisible_layout_bucket():
     runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
     runner.disable = True
