@@ -341,7 +341,6 @@ class DpSamplingComm:
         all_gather_into_tensor(
             combined_full,
             combined_local,
-            self._rank,
             self._group,
             backend=self._fallback_backend,
         )
@@ -372,7 +371,6 @@ class DpSamplingComm:
         all_gather_into_tensor(
             logprobs_full,
             logprobs_local.contiguous(),
-            self._rank,
             self._group,
             backend=self._fallback_backend,
         )

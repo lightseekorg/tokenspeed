@@ -244,18 +244,23 @@ def _test_verify_dp_matches_today(
     if forbid_global_logprob_writer:
         import tokenspeed.runtime.sampling.backends.flashinfer as flashinfer_backend
 
-        original_writer = flashinfer_backend.write_output_logprobs
+        original_writer = getattr(flashinfer_backend, "write_output_logprobs", None)
+        if original_writer is not None:
 
-        def _fail_global_writer(*args, **kwargs):
-            raise AssertionError("DP verify must not call write_output_logprobs")
+            def _fail_global_writer(*args, **kwargs):
+                raise AssertionError("DP verify must not call write_output_logprobs")
 
-        flashinfer_backend.write_output_logprobs = _fail_global_writer
-        try:
+            flashinfer_backend.write_output_logprobs = _fail_global_writer
+            try:
+                predict_dp, accept_length_dp = backend.verify(
+                    dp_in, sampling_info_dp, candidates
+                )
+            finally:
+                flashinfer_backend.write_output_logprobs = original_writer
+        else:
             predict_dp, accept_length_dp = backend.verify(
                 dp_in, sampling_info_dp, candidates
             )
-        finally:
-            flashinfer_backend.write_output_logprobs = original_writer
     else:
         predict_dp, accept_length_dp = backend.verify(
             dp_in, sampling_info_dp, candidates
