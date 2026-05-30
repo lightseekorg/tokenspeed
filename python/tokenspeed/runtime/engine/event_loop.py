@@ -88,6 +88,10 @@ from tokenspeed.runtime.utils import (
     get_zmq_socket,
 )
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
+from tokenspeed.runtime.utils.hf_transformers_utils import (
+    get_tokenizer,
+    get_tokenizer_vocab_size,
+)
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
@@ -141,6 +145,8 @@ class EventLoop:
             )
         else:
             draft_model_config = None
+
+        self._apply_sampling_vocab_size(self.model_config, draft_model_config)
 
         min_per_gpu_mem = self._init_distributed()
 
@@ -376,7 +382,7 @@ class EventLoop:
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
             max_req_len=self.model_config.context_len - 1,
-            vocab_size=self.model_config.vocab_size,
+            vocab_size=self.model_config.sampling_vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
@@ -760,6 +766,52 @@ class EventLoop:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _resolve_tokenizer_vocab_size(self) -> int | None:
+        server_args = self.server_args
+        if server_args.tokenizer_vocab_size is not None:
+            return server_args.tokenizer_vocab_size
+        if server_args.skip_tokenizer_init:
+            return None
+
+        tokenizer = get_tokenizer(
+            server_args.tokenizer,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            architectures=self.model_config.hf_config.architectures,
+        )
+        server_args.tokenizer_vocab_size = get_tokenizer_vocab_size(tokenizer)
+        return server_args.tokenizer_vocab_size
+
+    def _set_sampling_vocab_size(
+        self, model_config: ModelConfig, vocab_size: int
+    ) -> None:
+        model_config.sampling_vocab_size = vocab_size
+        for cfg in (model_config.hf_config, model_config.hf_text_config):
+            setattr(cfg, "sampling_vocab_size", vocab_size)
+
+    def _apply_sampling_vocab_size(self, *model_configs: ModelConfig | None) -> None:
+        tokenizer_vocab_size = self._resolve_tokenizer_vocab_size()
+        for model_config in model_configs:
+            if model_config is None:
+                continue
+            sampling_vocab_size = model_config.vocab_size
+            if tokenizer_vocab_size is not None:
+                sampling_vocab_size = min(model_config.vocab_size, tokenizer_vocab_size)
+            self._set_sampling_vocab_size(model_config, sampling_vocab_size)
+
+        if (
+            tokenizer_vocab_size is not None
+            and self.model_config.sampling_vocab_size != self.model_config.vocab_size
+        ):
+            logger.info(
+                "Using tokenizer-bounded sampling vocab: model_vocab_size=%s "
+                "tokenizer_vocab_size=%s sampling_vocab_size=%s",
+                self.model_config.vocab_size,
+                tokenizer_vocab_size,
+                self.model_config.sampling_vocab_size,
+            )
 
     def _load_model_config(
         self, model_path: str, is_draft_worker: bool = False

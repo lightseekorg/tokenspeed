@@ -213,7 +213,7 @@ class CudaGraphWrapper:
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
         self.context_len = config.context_len
-        self.vocab_size = config.vocab_size
+        self.vocab_size = config.sampling_vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
         self.max_bs = max(self.capture_bs)

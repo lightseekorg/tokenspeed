@@ -200,6 +200,12 @@ class LogitsProcessor(nn.Module):
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
 
+        self.vocab_size = int(
+            getattr(self.config, "sampling_vocab_size", self.config.vocab_size)
+        )
+        if self.vocab_size <= 0 or self.vocab_size > self.config.vocab_size:
+            self.vocab_size = self.config.vocab_size
+
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -460,7 +466,7 @@ class LogitsProcessor(nn.Module):
                     .view(logits.size(0), -1)
                 )
 
-        logits = logits[:, : self.config.vocab_size].contiguous()
+        logits = logits[:, : self.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)

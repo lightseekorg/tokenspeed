@@ -79,6 +79,7 @@ class ModelExecutorConfig:
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
+    sampling_vocab_size: int
     context_len: int
     device: str
     gpu_id: int
@@ -137,6 +138,9 @@ class ModelExecutorConfig:
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
+            sampling_vocab_size=getattr(
+                model_config, "sampling_vocab_size", model_config.vocab_size
+            ),
             context_len=model_config.context_len,
             device=server_args.device,
             gpu_id=gpu_id,
@@ -214,7 +218,7 @@ class ModelExecutor:
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             context_len=config.context_len,
-            vocab_size=config.vocab_size,
+            vocab_size=config.sampling_vocab_size,
             device=self.device,
             output_length=config.output_length,
             mamba_pool=mamba_pool,
@@ -231,7 +235,7 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
                 attn_backend=draft_attn_backend,
                 token_to_kv_pool=draft_token_to_kv_pool,
-                vocab_size=config.vocab_size,
+                vocab_size=config.sampling_vocab_size,
             )
             embed, head = self.model_runner.model.get_embed_and_head()
             draft_model_runner.model.set_embed_and_head(embed, head)
@@ -267,14 +271,14 @@ class ModelExecutor:
             if use_captured:
                 self.grammar_runtime = CapturableGrammarExecutor(
                     max_bs=config.max_num_seqs,
-                    vocab_size=config.vocab_size,
+                    vocab_size=config.sampling_vocab_size,
                     max_tokens_per_req=spec_num_tokens,
                     device=self.device,
                 )
             else:
                 self.grammar_runtime = EagerGrammarBuffers(
                     max_bs=config.max_num_seqs // max(config.data_parallel_size, 1),
-                    vocab_size=config.vocab_size,
+                    vocab_size=config.sampling_vocab_size,
                     max_tokens_per_req=spec_num_tokens,
                     device=self.device,
                 )

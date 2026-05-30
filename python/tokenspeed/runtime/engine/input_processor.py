@@ -210,7 +210,7 @@ class InputProcessor:
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.resolve_seed(obj.rid)
         sampling_params.normalize(self.engine.tokenizer)
-        sampling_params.verify(self.engine.model_config.vocab_size)
+        sampling_params.verify(self.engine.model_config.sampling_vocab_size)
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(

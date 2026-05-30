@@ -66,6 +66,9 @@ class ServerArgs:
     tokenizer: str | None = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    # Resolved at launch from len(tokenizer); not exposed as a CLI flag.
+    # It bounds sampling/logit-bias/grammar masks without changing model weight shapes.
+    tokenizer_vocab_size: int | None = None
     load_format: str = "auto"
     trust_remote_code: bool = True
     dtype: str = "auto"

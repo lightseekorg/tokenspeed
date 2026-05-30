@@ -95,7 +95,7 @@ def create_model_executor(
         max_draft_tokens_per_req=max_draft_tokens_per_req,
         device=config.device,
         max_req_pool_size=config.max_req_pool_size,
-        vocab_size=config.vocab_size,
+        vocab_size=config.sampling_vocab_size,
         # Same TP group as LogitsProcessor.
         tp_group=model_runner.mapping.attn.tp_group,
     )

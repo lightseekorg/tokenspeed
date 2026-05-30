@@ -96,7 +96,10 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
-from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
+from tokenspeed.runtime.utils.hf_transformers_utils import (
+    get_tokenizer,
+    get_tokenizer_vocab_size,
+)
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
@@ -170,6 +173,20 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 revision=server_args.revision,
                 architectures=self.model_config.hf_config.architectures,
             )
+            server_args.tokenizer_vocab_size = get_tokenizer_vocab_size(self.tokenizer)
+            if server_args.tokenizer_vocab_size is not None:
+                self.model_config.sampling_vocab_size = min(
+                    self.model_config.vocab_size, server_args.tokenizer_vocab_size
+                )
+                for cfg in (
+                    self.model_config.hf_config,
+                    self.model_config.hf_text_config,
+                ):
+                    setattr(
+                        cfg,
+                        "sampling_vocab_size",
+                        self.model_config.sampling_vocab_size,
+                    )
             if self.model_config.is_multimodal:
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         # Store states

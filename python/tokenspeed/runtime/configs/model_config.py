@@ -294,6 +294,9 @@ class ModelConfig:
             if mtp_layers is not None:
                 self.num_attention_layers = mtp_layers
         self.vocab_size = self.hf_text_config.vocab_size
+        self.sampling_vocab_size = self.vocab_size
+        for cfg in (self.hf_config, self.hf_text_config):
+            setattr(cfg, "sampling_vocab_size", self.sampling_vocab_size)
 
         # Verify quantization
         self._verify_quantization()
