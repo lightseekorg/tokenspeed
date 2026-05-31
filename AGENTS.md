@@ -21,6 +21,8 @@
   boundary.
 * Third-party kernel libraries belong under `tokenspeed-kernel`; avoid direct
   runtime dependencies or imports that bypass it.
+* If a dependency repeatedly breaks during version upgrades or slows project
+  progress, consider removing it entirely or at least making it optional.
 
 ## tokenspeed-kernel
 
