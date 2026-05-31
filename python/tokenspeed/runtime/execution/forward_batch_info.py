@@ -86,12 +86,22 @@ class CaptureHiddenMode(IntEnum):
 
 
 def compute_position_triton(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum,
+    out: torch.Tensor | None = None,
 ):
     batch_size = extend_seq_lens.shape[0]
-    positions = torch.empty(
-        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
-    )
+    if out is None:
+        positions = torch.empty(
+            extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
+        )
+    else:
+        assert out.numel() >= extend_seq_lens_sum, (
+            f"compute_position_triton out buffer too small: "
+            f"{out.numel()} < {extend_seq_lens_sum}"
+        )
+        positions = out
     extend_start_loc = torch.empty(
         batch_size, dtype=torch.int32, device=extend_seq_lens.device
     )
