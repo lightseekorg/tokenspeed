@@ -93,82 +93,6 @@ def swizzle_mxfp4(quant_tensor, scale, num_warps):
     return quant_tensor, InFlexData(), scale
 
 
-def _pad_w2_to_block_n(layer: nn.Module, block_n: int) -> None:
-    original_n = int(layer.w2_weight.shape[-2])
-    layer._w2_logical_n = original_n
-
-    if original_n % block_n == 0:
-        return
-
-    n_padded = (original_n + block_n - 1) // block_n * block_n
-    extra_n = n_padded - original_n
-
-    w2_w = layer.w2_weight.data
-    w2_s = layer.w2_weight_scale.data
-    w2_w_padded = torch.cat(
-        [
-            w2_w,
-            torch.zeros(
-                *w2_w.shape[:-2],
-                extra_n,
-                w2_w.shape[-1],
-                dtype=w2_w.dtype,
-                device=w2_w.device,
-            ),
-        ],
-        dim=-2,
-    )
-    w2_s_padded = torch.cat(
-        [
-            w2_s,
-            torch.full(
-                (*w2_s.shape[:-2], extra_n, w2_s.shape[-1]),
-                127,
-                dtype=w2_s.dtype,
-                device=w2_s.device,
-            ),
-        ],
-        dim=-2,
-    )
-    layer.w2_weight = Parameter(w2_w_padded, requires_grad=False)
-    layer.w2_weight_scale = Parameter(w2_s_padded, requires_grad=False)
-
-
-def _attach_gluon_bpreshuffle(layer: nn.Module) -> None:
-    if not _is_amd:
-        return
-
-    try:
-        from tokenspeed_kernel.ops.moe.gluon import (
-            _extract_gluon_raw_w,
-            shuffle_weight_for_gluon_dot_layout,
-        )
-    except ImportError:
-        return
-
-    targets = (
-        ("w13_weight_triton_tensor", None),
-        ("w2_weight_triton_tensor", getattr(layer, "_w2_logical_n", None)),
-    )
-    for attr, logical_n in targets:
-        wrapped = getattr(layer, attr, None)
-        if wrapped is None:
-            continue
-        w_raw = _extract_gluon_raw_w(wrapped)
-        try:
-            w_shuffled = shuffle_weight_for_gluon_dot_layout(w_raw)
-        except (ValueError, AssertionError):
-            continue
-        if logical_n is not None and logical_n != w_shuffled.shape[-1]:
-            # combine GEMM: backend pre-padded N to a multiple of BLOCK_N.
-            # Stamp the logical N on BOTH the shuffled tensor (consumed by
-            # ``gluon_mxfp_combine`` on the W_VIA_VGPR path) and the raw
-            # tensor (consumed by the LDS fallback when BLOCK_M<=32).
-            w_shuffled.original_n = int(logical_n)
-            w_raw.original_n = int(logical_n)
-        w_raw._gluon_shuffled = w_shuffled
-
-
 class Mxfp4TritonKernelBackend(MoEBackend):
     supported_arches = frozenset({"any"})
 
@@ -249,12 +173,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
 
-        # Pre-pad w2 along N before swizzle so the gluon W_VIA_VGPR path can
-        # drop its n-mask. Only relevant on AMD where bpreshuffle is wired up.
-        if self._is_w4a8_fp8 and _is_amd:
-            _GLUON_COMBINE_BLOCK_N = 128
-            _pad_w2_to_block_n(layer, _GLUON_COMBINE_BLOCK_N)
-
         num_warps = 8
         w13_weight, w13_flex, w13_scale = swizzle_mxfp4(
             layer.w13_weight, layer.w13_weight_scale, num_warps
@@ -316,10 +234,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         # Free original weights (replaced by shuffled versions)
         del layer.w13_weight
         del layer.w2_weight
-
-        if self._is_w4a8_fp8:
-            _attach_gluon_bpreshuffle(layer)
-
         torch.cuda.empty_cache()
 
     def forward(
@@ -330,7 +244,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
         router_logits = topk_output.router_logits
         top_k = topk_output.topk_config.top_k
         n_tokens = router_logits.shape[0]
@@ -367,18 +280,8 @@ class Mxfp4TritonKernelBackend(MoEBackend):
                 scale=layer.w13_act_scale,
                 solution="triton",
             )
-            # Fused output quant on the SwiGLU epilogue: writes FP8 directly so
-            # the second GEMM can skip a separate quantise pass on the gluon
-            # path. ``traits={"weight_dtype": "mxfp4"}`` selects the gluon
-            # dispatch kernel.
-            gemm1_out_quant_scale = layer.w2_act_scale
-            gemm1_traits = {"weight_dtype": "mxfp4"}
-            gemm2_traits = {"weight_dtype": "mxfp4"}
         else:
             gemm1_input = hidden_states
-            gemm1_out_quant_scale = None
-            gemm1_traits = None
-            gemm2_traits = None
 
         # First GEMM: gate_up projection with fused activation
         intermediate_cache = tokenspeed_kernel.moe_experts(
@@ -391,25 +294,15 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             fused_activation=act,
             dtype=hidden_states.dtype,
             features={"ragged_metadata", "dispatch_gemm"},
-            traits=gemm1_traits,
             expected_kernel_name="triton_kernels_dispatch_gemm",
-            out_quant_scale=gemm1_out_quant_scale,
         )
 
         if self._is_w4a8_fp8:
-            # Skip a redundant quantise when the gluon dispatch GEMM already
-            # produced FP8 via the fused ``out_quant_scale`` epilogue.
-            if intermediate_cache.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
-                gemm2_input = intermediate_cache
-            else:
-                gemm2_input = tokenspeed_kernel.quantize_fp8(
-                    intermediate_cache,
-                    scale=layer.w2_act_scale,
-                    solution="triton",
-                )
+            gemm2_input = tokenspeed_kernel.quantize_fp8(
+                intermediate_cache,
+                scale=layer.w2_act_scale,
+                solution="triton",
+            )
         else:
             gemm2_input = intermediate_cache
 
@@ -427,7 +320,6 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             n_expts_act=top_k,
             dtype=hidden_states.dtype,
             features={"ragged_metadata", "gemm_combine"},
-            traits=gemm2_traits,
             expected_kernel_name="triton_kernels_gemm_combine",
         )
 
