@@ -1302,12 +1302,15 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
+#endif
+  // Load upstream-produced inputs only after gridDepSync, but before releasing
+  // PDL dependents that may reuse those producer buffers.
+  fused_op.load_upstream_inputs();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (!TriggerCompletionAtEnd) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
-  // Load upstream-produced inputs only after gridDepSync
-  fused_op.load_upstream_inputs();
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / VEC_SIZE;
   for (int idx = access_id, tidx = token_id; idx < tot_access;
