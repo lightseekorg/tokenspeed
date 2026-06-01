@@ -45,6 +45,12 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     write_deepseek_v4_indexer_fp8_cache,
     write_deepseek_v4_indexer_mxfp4_cache,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+    _mask_invalid_graph_tokens,
+)
+from tokenspeed.runtime.models.deepseek_v4 import (
+    _deepseek_v4_sanitize_swa_slot_mapping,
+)
 
 HEAD_DIM = 512
 NOPE_DIM = 448
@@ -282,6 +288,62 @@ def _expected_overlap_normed(
 
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
+    def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
+        cache = torch.empty((2, 4 * SWA_TOKEN_STRIDE), dtype=torch.uint8)
+        slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
+
+        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(slots, cache, 4)
+
+        torch.testing.assert_close(
+            sanitized,
+            torch.tensor([-1, -1, 0, 7, -1, -1], dtype=torch.int64),
+        )
+
+    def test_swa_slot_mapping_guard_masks_invalid_graph_tokens(self):
+        cache = torch.empty((2, 4 * SWA_TOKEN_STRIDE), dtype=torch.uint8)
+        slots = torch.tensor([0, 1, 2, 9, -1, 3], dtype=torch.int64)
+        is_valid_token = torch.tensor([True, False, True, True, True, False])
+
+        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(
+            slots,
+            cache,
+            4,
+            is_valid_token=is_valid_token,
+        )
+
+        torch.testing.assert_close(
+            sanitized,
+            torch.tensor([0, -1, 2, -1, -1, -1], dtype=torch.int64),
+        )
+
+    def test_slot_mapping_guard_masks_invalid_graph_tokens(self):
+        slots = torch.tensor([0, 1, -1, 3], dtype=torch.int64)
+        is_valid_token = torch.tensor([True, False, True, False])
+
+        sanitized = _mask_invalid_graph_tokens(
+            slots,
+            is_valid_token,
+        )
+
+        torch.testing.assert_close(
+            sanitized,
+            torch.tensor([0, -1, -1, -1], dtype=torch.int64),
+        )
+
+    def test_slot_mapping_guard_expands_per_request_validity(self):
+        slots = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64)
+        is_valid_token = torch.tensor([True, False])
+
+        sanitized = _mask_invalid_graph_tokens(
+            slots,
+            is_valid_token,
+        )
+
+        torch.testing.assert_close(
+            sanitized,
+            torch.tensor([0, 1, 2, -1, -1, -1], dtype=torch.int64),
+        )
+
     def test_indexer_q_mxfp4_requires_cuda(self):
         q = torch.zeros(1, 1, 128, dtype=torch.bfloat16)
         positions = torch.zeros(1, dtype=torch.int64)

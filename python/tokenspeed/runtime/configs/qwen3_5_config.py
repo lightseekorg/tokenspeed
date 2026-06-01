@@ -86,6 +86,10 @@ class Qwen3_5Config(PretrainedConfig):
         text_cls = self.sub_configs["text_config"]
         if isinstance(text_config, dict):
             return text_cls(**text_config)
+        if isinstance(text_config, Qwen3_5Config):
+            nested_text_config = text_config.__dict__.get("text_config")
+            if nested_text_config is not None and nested_text_config is not text_config:
+                return self._ensure_text_config(nested_text_config)
         if text_config is None:
             return text_cls()
         return text_config
@@ -110,11 +114,22 @@ class Qwen3_5Config(PretrainedConfig):
 
     def __getattr__(self, name):
         """Forward attribute access to text_config for inference-only usage."""
-        try:
-            text_config = super().__getattribute__("text_config")
-            return getattr(text_config, name)
-        except AttributeError:
+        if name.startswith("_") or name in {"text_config", "vision_config"}:
             raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+        text_config = self.__dict__.get("text_config")
+        if isinstance(text_config, dict):
+            text_config = self._ensure_text_config(text_config)
+            self.__dict__["text_config"] = text_config
+        if text_config is None or text_config is self:
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+        try:
+            return getattr(text_config, name)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no attribute '{name}'"
+            ) from exc
 
 
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
@@ -136,3 +151,8 @@ class Qwen3_5MoeConfig(Qwen3_5Config):
         "vision_config": Qwen3_5MoeVisionConfig,
         "text_config": Qwen3_5MoeTextConfig,
     }
+
+    def __init__(self, **kwargs):
+        # Explicit __init__ prevents transformers from auto-generating one
+        # that skips Qwen3_5Config.__init__ (text/vision config setup).
+        super().__init__(**kwargs)

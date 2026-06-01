@@ -39,6 +39,10 @@ class ForwardMode(IntEnum):
     MIXED = auto()
     # No sequence to forward; used for data parallel attention idle ranks.
     IDLE = auto()
+    # Used in speculative decoding: verify a batch in the target model.
+    TARGET_VERIFY = auto()
+    # Used in speculative decoding: extend a batch in the draft model.
+    DRAFT_EXTEND = auto()
 
     def is_extend(self):
         return self == ForwardMode.EXTEND
@@ -55,17 +59,47 @@ class ForwardMode(IntEnum):
     def is_extend_or_mixed(self):
         return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
 
+    def is_target_verify(self):
+        return self == ForwardMode.TARGET_VERIFY
+
+    def is_draft_extend(self):
+        return self == ForwardMode.DRAFT_EXTEND
+
+    def is_speculative(self):
+        return self == ForwardMode.TARGET_VERIFY or self == ForwardMode.DRAFT_EXTEND
+
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     @staticmethod
-    def from_num_extends(num_extends: int, batch_size: int) -> "ForwardMode":
+    def decode_or_target_verify(
+        *,
+        has_drafter: bool = False,
+        use_target_verify: bool = False,
+    ) -> "ForwardMode":
+        return (
+            ForwardMode.TARGET_VERIFY
+            if has_drafter and use_target_verify
+            else ForwardMode.DECODE
+        )
+
+    @staticmethod
+    def from_num_extends(
+        num_extends: int,
+        batch_size: int,
+        *,
+        has_drafter: bool = False,
+        use_target_verify: bool = False,
+    ) -> "ForwardMode":
         if batch_size <= 0:
             return ForwardMode.IDLE
         elif num_extends > 0:
             return ForwardMode.MIXED if num_extends < batch_size else ForwardMode.EXTEND
         else:
-            return ForwardMode.DECODE
+            return ForwardMode.decode_or_target_verify(
+                has_drafter=has_drafter,
+                use_target_verify=use_target_verify,
+            )
 
 
 class CaptureHiddenMode(IntEnum):
@@ -86,12 +120,22 @@ class CaptureHiddenMode(IntEnum):
 
 
 def compute_position_triton(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum,
+    out: torch.Tensor | None = None,
 ):
     batch_size = extend_seq_lens.shape[0]
-    positions = torch.empty(
-        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
-    )
+    if out is None:
+        positions = torch.empty(
+            extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
+        )
+    else:
+        assert out.numel() >= extend_seq_lens_sum, (
+            f"compute_position_triton out buffer too small: "
+            f"{out.numel()} < {extend_seq_lens_sum}"
+        )
+        positions = out
     extend_start_loc = torch.empty(
         batch_size, dtype=torch.int32, device=extend_seq_lens.device
     )

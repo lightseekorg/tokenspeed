@@ -72,6 +72,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_indexer_mxfp4_scale_dim,
     deepseek_v4_indexer_mxfp4_value_bytes,
     deepseek_v4_nope_dim,
+    v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -81,6 +82,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
     DeepseekV4IndexerBatchMetadata,
@@ -100,6 +102,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _group_slot_mapping_from_raw,
+    _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_pre as fast_mhc_pre
@@ -142,6 +145,53 @@ _platform = current_platform()
 
 
 logger = get_colorful_logger(__name__)
+
+
+def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
+    return (
+        metadata is not None
+        and getattr(metadata, "token_to_req_indices", None) is not None
+        and metadata.token_to_req_indices.numel() == num_tokens
+    )
+
+
+def _deepseek_v4_indexer_token_split(
+    forward_mode: Optional[ForwardMode],
+    metadata,
+    total_tokens: int,
+) -> tuple[int, int]:
+    if forward_mode is not None and forward_mode.is_mixed():
+        return int(metadata.num_prefill_tokens), metadata.decode_token_count()
+    if forward_mode is not None and (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend()
+    ):
+        return 0, int(total_tokens)
+    return int(total_tokens), 0
+
+
+def _deepseek_v4_forward_metadata(ctx: ForwardContext):
+    metadata = getattr(ctx.attn_backend, "forward_metadata", None)
+    if ctx.forward_mode == ForwardMode.EXTEND:
+        return getattr(ctx.attn_backend, "forward_prefill_metadata", None) or metadata
+    if ctx.forward_mode is not None and ctx.forward_mode.is_draft_extend():
+        prefill_metadata = getattr(ctx.attn_backend, "forward_prefill_metadata", None)
+        if _deepseek_v4_metadata_matches_tokens(
+            prefill_metadata,
+            ctx.input_num_tokens,
+        ):
+            return prefill_metadata
+        return metadata or prefill_metadata
+    if ctx.forward_mode is not None and ctx.forward_mode.is_decode_or_idle():
+        decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
+        if _deepseek_v4_metadata_matches_tokens(
+            decode_metadata,
+            ctx.input_num_tokens,
+        ):
+            return decode_metadata
+        return decode_metadata or metadata
+    return metadata
 
 
 def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tensor:
@@ -1109,6 +1159,7 @@ def _deepseek_v4_indexer_decode_plan(
     compress_ratio: int,
     metadata: Optional[DeepseekV4ForwardMetadata] = None,
     is_valid_token: Optional[torch.Tensor] = None,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> DeepseekV4IndexerDecodePlan:
     num_tokens = positions.numel()
     key = (int(compress_ratio), int(cache_block_size), int(num_tokens))
@@ -1194,6 +1245,7 @@ def _deepseek_v4_indexer_decode_plan(
             max_blocks=max_blocks,
             out_context_lens=plan.context_lens,
             out_block_tables=plan.block_table,
+            block_table_base_offsets=block_table_base_offsets,
         )
         if is_valid_token is None:
             is_valid_token = getattr(metadata, "is_valid_token", None)
@@ -1885,6 +1937,22 @@ def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
     )
 
 
+def _deepseek_v4_sanitize_swa_slot_mapping(
+    slot_mapping: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    block_size: int,
+    is_valid_token: torch.Tensor | None = None,
+) -> torch.Tensor:
+    slot_mapping = _mask_invalid_graph_tokens(slot_mapping, is_valid_token)
+    capacity = int(swa_kv_cache.shape[0]) * int(block_size)
+    valid = (slot_mapping >= 0) & (slot_mapping < capacity)
+    return torch.where(
+        valid,
+        slot_mapping,
+        torch.full_like(slot_mapping, -1),
+    )
+
+
 def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
     override = global_server_args_dict.get("attention_use_fp4_indexer_cache", None)
     if override is not None:
@@ -2565,7 +2633,7 @@ class DeepseekV4Compressor(nn.Module):
         write_compressed_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
-        metadata = ctx.attn_backend.forward_metadata
+        metadata = _deepseek_v4_forward_metadata(ctx)
         if metadata is None:
             raise RuntimeError("DeepSeek V4 compressor requires forward metadata")
         profile_prefix = (
@@ -2604,6 +2672,11 @@ class DeepseekV4Compressor(nn.Module):
                 if state_block_table is not None
                 else pool.state_block_size
             )
+        valid_token = (
+            metadata.is_valid_token[: positions.numel()]
+            if getattr(metadata, "is_valid_token", None) is not None
+            else None
+        )
         if state_block_table is not None:
             state_slot_mapping = _group_slot_mapping_from_raw(
                 positions,
@@ -2615,6 +2688,10 @@ class DeepseekV4Compressor(nn.Module):
         else:
             state_block_table = cache_metadata.block_table
             state_slot_mapping = out_cache_loc
+        state_slot_mapping = _mask_invalid_graph_tokens(
+            state_slot_mapping,
+            valid_token,
+        )
         with nvtx_range(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
                 kv=kv,
@@ -2641,6 +2718,7 @@ class DeepseekV4Compressor(nn.Module):
                 use_decode_cache=(
                     ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                 ),
+                is_valid_token=valid_token,
             )
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
@@ -2770,7 +2848,11 @@ class DeepseekV4Indexer(nn.Module):
         if forward_mode is not None and forward_mode.is_mixed():
             num_prefill_tokens = int(metadata.num_prefill_tokens)
             num_decode_tokens = metadata.decode_token_count()
-        elif forward_mode is not None and forward_mode.is_decode():
+        elif forward_mode is not None and (
+            forward_mode.is_decode()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
+        ):
             num_prefill_tokens = 0
             num_decode_tokens = positions.numel()
         else:
@@ -2790,6 +2872,13 @@ class DeepseekV4Indexer(nn.Module):
             self.compress_ratio,
             indexer_block_size,
         )
+        indexer_block_table_base_offsets = None
+        if indexer_block_table is not metadata.cache.block_table:
+            indexer_block_table_base_offsets = (
+                metadata.cache.paged_cache_block_table_base_offsets.get(
+                    v4_compressed_kv_group_id(self.compress_ratio)
+                )
+            )
         decode_plan = _deepseek_v4_indexer_decode_plan(
             positions=decode_positions,
             token_to_req_indices=metadata.token_to_req_indices[decode_start:decode_end],
@@ -2798,6 +2887,7 @@ class DeepseekV4Indexer(nn.Module):
             compress_ratio=self.compress_ratio,
             metadata=metadata,
             is_valid_token=decode_valid_token,
+            block_table_base_offsets=indexer_block_table_base_offsets,
         )
         _deepseek_v4_indexer_decode_schedule_metadata(
             positions=decode_positions,
@@ -2834,15 +2924,11 @@ class DeepseekV4Indexer(nn.Module):
                 device=positions.device,
                 dtype=torch.int32,
             )
-        if forward_mode is not None and forward_mode.is_mixed():
-            num_prefill_tokens = int(metadata.num_prefill_tokens)
-            num_decode_tokens = metadata.decode_token_count()
-        elif forward_mode is not None and forward_mode.is_decode():
-            num_prefill_tokens = 0
-            num_decode_tokens = total_tokens
-        else:
-            num_prefill_tokens = total_tokens
-            num_decode_tokens = 0
+        num_prefill_tokens, num_decode_tokens = _deepseek_v4_indexer_token_split(
+            forward_mode,
+            metadata,
+            total_tokens,
+        )
 
         with nvtx_range("indexer_wq_b"):
             index_q, _ = self.wq_b(qr)
@@ -2973,13 +3059,18 @@ class DeepseekV4Indexer(nn.Module):
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
         pool = ctx.token_to_kv_pool
-        metadata = ctx.attn_backend.forward_metadata
+        metadata = _deepseek_v4_forward_metadata(ctx)
         if metadata is None:
             raise RuntimeError("DeepSeek V4 indexer requires forward metadata")
         cache_metadata = metadata.cache
         indexer_state = pool.get_indexer_state_buffer(layer_index)
         indexer_state_block_table = cache_metadata.indexer_state_block_table
         indexer_state_base_logical_page = cache_metadata.indexer_state_base_logical_page
+        valid_token = (
+            metadata.is_valid_token[: positions.numel()]
+            if getattr(metadata, "is_valid_token", None) is not None
+            else None
+        )
         if indexer_state_block_table is not None:
             indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
             indexer_state_slot_mapping = _group_slot_mapping_from_raw(
@@ -2994,6 +3085,10 @@ class DeepseekV4Indexer(nn.Module):
             indexer_state_block_size = pool.state_block_size
             indexer_state_slot_mapping = out_cache_loc
             indexer_state_base_logical_page = None
+        indexer_state_slot_mapping = _mask_invalid_graph_tokens(
+            indexer_state_slot_mapping,
+            valid_token,
+        )
         with nvtx_range("indexer_compressor_total"):
             self.compressor(
                 hidden_states=hidden_states,
@@ -3024,6 +3119,7 @@ class DeepseekV4Indexer(nn.Module):
                 use_decode_cache=(
                     ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                 ),
+                is_valid_token=valid_token,
             )
         with nvtx_range("indexer_cache_insert"):
             deepseek_v4_csa_indexer_cache_insert(
@@ -3065,9 +3161,15 @@ class DeepseekV4Attention(nn.Module):
         prefix: str,
         aux_stream: torch.cuda.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
+        cache_layer_index: int | None = None,
     ) -> None:
         super().__init__()
+        # `layer_index` addresses checkpoint/config metadata; `cache_layer_index`
+        # addresses this model's compact KV cache slot.
         self.layer_index = layer_index
+        self.cache_layer_index = (
+            layer_index if cache_layer_index is None else cache_layer_index
+        )
         self.stream_fork = StreamFork(aux_stream)
         self.compress_ratio = max(1, int(config.compress_ratios[layer_index]))
         if self.compress_ratio <= 1:
@@ -3237,9 +3339,16 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         block_size: int,
+        is_valid_token: torch.Tensor | None = None,
     ) -> None:
         if q.shape[0] == 0:
             return
+        slot_mapping = _deepseek_v4_sanitize_swa_slot_mapping(
+            slot_mapping,
+            swa_kv_cache,
+            block_size,
+            is_valid_token=is_valid_token,
+        )
         fused_qnorm_rope_kv_insert(
             q=q,
             kv=kv,
@@ -3313,14 +3422,20 @@ class DeepseekV4Attention(nn.Module):
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
+                is_valid_token = (
+                    metadata.is_valid_token[: positions.numel()]
+                    if metadata.is_valid_token is not None
+                    else None
+                )
                 self._insert_swa_cache(
                     q=q,
                     kv=kv,
-                    swa_kv_cache=pool.get_swa_kv_buffer(self.layer_index),
+                    swa_kv_cache=pool.get_swa_kv_buffer(self.cache_layer_index),
                     slot_mapping=swa_slot_mapping,
                     positions=positions,
                     cos_sin_cache=cos_sin_cache,
                     block_size=pool.swa_block_size,
+                    is_valid_token=is_valid_token,
                 )
 
         def run_compressor() -> None:
@@ -3332,7 +3447,7 @@ class DeepseekV4Attention(nn.Module):
                     positions=positions,
                     ctx=ctx,
                     out_cache_loc=out_cache_loc,
-                    layer_index=self.layer_index,
+                    layer_index=self.cache_layer_index,
                     cos_sin_cache=cos_sin_cache,
                 )
 
@@ -3344,7 +3459,9 @@ class DeepseekV4Attention(nn.Module):
                     positions=positions,
                     metadata=metadata,
                     ctx=ctx,
-                    indexer_block_size=pool.get_indexer_block_size(self.layer_index),
+                    indexer_block_size=pool.get_indexer_block_size(
+                        self.cache_layer_index
+                    ),
                 )
 
             with self.stream_fork.scope(
@@ -3357,7 +3474,7 @@ class DeepseekV4Attention(nn.Module):
                         positions=positions,
                         ctx=ctx,
                         out_cache_loc=out_cache_loc,
-                        layer_index=self.layer_index,
+                        layer_index=self.cache_layer_index,
                         cos_sin_cache=cos_sin_cache,
                     )
                 with fork.branch():
@@ -3381,7 +3498,7 @@ class DeepseekV4Attention(nn.Module):
                     q=q,
                     positions=positions,
                     token_to_kv_pool=pool,
-                    layer_id=self.layer_index,
+                    layer_id=self.cache_layer_index,
                     kind=self.attention_kind,
                     compress_ratio=self.compress_ratio,
                     num_local_heads=self.num_local_heads,
@@ -3392,13 +3509,13 @@ class DeepseekV4Attention(nn.Module):
                     attn_sink=self.attn_sink,
                     topk_indices=topk_indices,
                 )
-        elif forward_mode.is_decode():
+        elif forward_mode.is_decode() or forward_mode.is_speculative():
             with nvtx_range(f"{profile_prefix}_decode_backend"):
                 attn_output = ctx.attn_backend.forward_deepseek_v4_decode(
                     q=q,
                     positions=positions,
                     token_to_kv_pool=pool,
-                    layer_id=self.layer_index,
+                    layer_id=self.cache_layer_index,
                     kind=self.attention_kind,
                     compress_ratio=self.compress_ratio,
                     num_local_heads=self.num_local_heads,
@@ -3415,7 +3532,7 @@ class DeepseekV4Attention(nn.Module):
                     q=q,
                     positions=positions,
                     token_to_kv_pool=pool,
-                    layer_id=self.layer_index,
+                    layer_id=self.cache_layer_index,
                     kind=self.attention_kind,
                     compress_ratio=self.compress_ratio,
                     num_local_heads=self.num_local_heads,
@@ -3446,6 +3563,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str,
         aux_stream: torch.cuda.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
+        cache_layer_index: int | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -3465,6 +3583,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             add_prefix("attn", prefix),
             aux_stream=aux_stream,
             topk_buffer=topk_buffer,
+            cache_layer_index=cache_layer_index,
         )
         self.ffn = DeepseekV4MoE(
             config,
@@ -3660,7 +3779,7 @@ class DeepseekV4Model(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         hidden_states = input_embeds
         if hidden_states is None:
             with nvtx_range("embed_tokens"):
@@ -3671,6 +3790,13 @@ class DeepseekV4Model(nn.Module):
             hidden_states = layer(
                 positions, hidden_states, ctx, out_cache_loc, input_ids
             )
+        aux_hidden_states = None
+        if (
+            ctx.capture_hidden_mode is not None
+            and ctx.capture_hidden_mode.need_capture()
+        ):
+            # V4 MTP consumes the pre-hc_head hypercompressed residual.
+            aux_hidden_states = [hidden_states.flatten(1)]
         with nvtx_range("hc_head"):
             hidden_states = hc_head(
                 hidden_states,
@@ -3682,7 +3808,7 @@ class DeepseekV4Model(nn.Module):
             )
         with nvtx_range("final_norm"):
             hidden_states = self.norm(hidden_states)
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
 
 class DeepseekV4ForCausalLM(BaseCausalLM):

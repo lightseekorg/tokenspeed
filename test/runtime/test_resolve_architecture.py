@@ -13,6 +13,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs import Qwen3_5MoeConfig  # noqa: E402
+from tokenspeed.runtime.configs.model_config import get_hf_text_config  # noqa: E402
 from tokenspeed.runtime.utils.hf_transformers_utils import (  # noqa: E402
     _materialize_architectures,
     resolve_architecture,
@@ -41,6 +42,20 @@ class ResolveArchitectureTests(unittest.TestCase):
             pass
 
         self.assertEqual(resolve_architecture(_Stub()), "_Stub")
+
+
+class Qwen3_5ConfigTests(unittest.TestCase):
+    def test_nested_moe_text_config_unwraps_to_attention_config(self) -> None:
+        nested = Qwen3_5MoeConfig()
+        config = Qwen3_5MoeConfig(text_config=nested)
+
+        self.assertIs(config.text_config, nested.text_config)
+        self.assertIs(get_hf_text_config(config), config.text_config)
+        self.assertTrue(hasattr(config.text_config, "num_attention_heads"))
+        self.assertEqual(
+            config.num_attention_heads,
+            config.text_config.num_attention_heads,
+        )
 
 
 class MaterializeArchitecturesTests(unittest.TestCase):
