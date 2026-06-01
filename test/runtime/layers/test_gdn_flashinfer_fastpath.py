@@ -45,9 +45,12 @@ def _l2norm():
 
 def test_is_supported_gates() -> None:
     D = gdn.SUPPORTED_HEAD_DIM
-    assert gdn.is_supported(D, torch.bfloat16)
-    assert not gdn.is_supported(64, torch.bfloat16)
-    assert not gdn.is_supported(D, torch.float16)
+    assert gdn.is_supported(D, torch.bfloat16, 16, 16)
+    assert gdn.is_supported(D, torch.bfloat16, 16, 32)  # GVA num_v > num_q
+    assert not gdn.is_supported(64, torch.bfloat16, 16, 16)
+    assert not gdn.is_supported(D, torch.float16, 16, 16)
+    # num_v < num_q would read g/beta/state out of bounds in flashinfer.
+    assert not gdn.is_supported(D, torch.bfloat16, 32, 16)
 
 
 @pytest.mark.parametrize("Hk,Hv", [(16, 16), (16, 32), (16, 64)])

@@ -1102,7 +1102,9 @@ class MambaAttnBackend(AttentionBackend):
                     output_h=True,
                 )
             elif (
-                gdn_flashinfer.is_supported(head_k_dim, query.dtype)
+                gdn_flashinfer.is_supported(
+                    head_k_dim, query.dtype, num_heads, num_value_heads
+                )
                 and head_v_dim == head_k_dim
             ):
                 # sm100 fast-path. q/k l2norm here since the kernel ignores its

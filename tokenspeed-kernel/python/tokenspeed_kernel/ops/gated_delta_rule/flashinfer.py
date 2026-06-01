@@ -60,9 +60,19 @@ def is_available() -> bool:
     return _AVAILABLE
 
 
-def is_supported(head_dim: int, dtype: torch.dtype) -> bool:
+def is_supported(
+    head_dim: int, dtype: torch.dtype, num_q_heads: int, num_v_heads: int
+) -> bool:
     # bf16 is the verified path; fp16 falls back to Triton FLA.
-    return _AVAILABLE and head_dim == SUPPORTED_HEAD_DIM and dtype == torch.bfloat16
+    # flashinfer reads g/beta/state with max(num_q, num_v) heads; the runtime
+    # supplies them with num_v heads, so num_v < num_q (e.g. Hk=32, Hv=16) reads
+    # out of bounds. Only num_v >= num_q is safe (GVA or equal heads).
+    return (
+        _AVAILABLE
+        and head_dim == SUPPORTED_HEAD_DIM
+        and dtype == torch.bfloat16
+        and num_v_heads >= num_q_heads
+    )
 
 
 def gdn_chunk_prefill(
