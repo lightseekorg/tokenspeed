@@ -3389,6 +3389,11 @@ def _capture_launch_profile(k: Any) -> None:
             name = getattr(md, "name", None) if md is not None else None
         if name is not None:
             prof["kernel_name"] = str(name)
+        md = getattr(k, "metadata", None)
+        if md is not None:
+            shared = getattr(md, "shared", None)
+            if shared is not None:
+                prof["shared"] = int(shared)
         _PROFILE_BY_KERNEL_ID[key] = prof
     _LAST_KERNEL_PROFILE = prof
 
