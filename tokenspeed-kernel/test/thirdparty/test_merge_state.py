@@ -96,6 +96,30 @@ SHAPES = [
 ]
 
 
+# Head counts that overflow the old single-block layout (kBdx * num_heads must
+# stay <= 1024). For D=128 bf16, kBdx=16 so H>64 used to fail at launch; the
+# non-multiples also exercise the grid-y tail mask.
+LARGE_HEAD_SHAPES = [
+    (256, 65, 128),
+    (256, 128, 128),
+    (64, 200, 128),
+    (128, 128, 256),
+]
+
+
+@pytest.mark.parametrize("T,H,D", LARGE_HEAD_SHAPES)
+def test_large_num_heads(device: str, T: int, H: int, D: int) -> None:
+    """num_heads beyond kBdx*H<=1024 must tile over grid-y, not fail at launch."""
+    v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, torch.bfloat16)
+
+    v_out, s_out = merge_state(v_a, s_a, v_b, s_b)
+    torch.cuda.synchronize()
+
+    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, LSE_LN)
+    assert torch.allclose(v_out.float(), v_ref.float(), atol=5e-2, rtol=1e-2)
+    assert torch.allclose(s_out, s_ref, atol=1e-4, rtol=1e-5)
+
+
 @pytest.mark.parametrize("T,H,D", SHAPES)
 @pytest.mark.parametrize("v_dtype", [torch.bfloat16, torch.float16])
 def test_natural_log_default(

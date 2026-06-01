@@ -38,17 +38,23 @@ __global__ void MergeStateKernel(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* 
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
-  uint32_t head_idx = ty;
+  // heads are tiled over gridDim.y to keep blockDim <= 1024.
+  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
+  // masked lanes skip load/store but still reach __syncwarp below.
+  bool valid = head_idx < num_heads;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
   // Load phase: snapshot every aliasable input into registers before any store fires.
-  float s_a_val = s_a[pos * num_heads + head_idx] * lse_scale_log2;
-  float s_b_val = s_b[pos * num_heads + head_idx] * lse_scale_log2;
+  float s_a_val = 0.f, s_b_val = 0.f;
   vec_t<float, kVecSize> v_a_vec, v_b_vec, v_merged_vec;
-  v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
-  v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+  if (valid) {
+    s_a_val = s_a[pos * num_heads + head_idx] * lse_scale_log2;
+    s_b_val = s_b[pos * num_heads + head_idx] * lse_scale_log2;
+    v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+    v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+  }
 
   // Compute phase: register-only.
   float s_max = max(s_a_val, s_b_val);
@@ -62,7 +68,9 @@ __global__ void MergeStateKernel(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* 
   }
 
   // v_merged store: per-lane disjoint slice, no cross-lane ordering needed.
-  v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+  if (valid) {
+    v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+  }
 
   // s_merged store: kBdx lanes share one slot. Sync so every lane's s_a load
   // is complete before the writer fires, then a single lane writes.
@@ -71,7 +79,7 @@ __global__ void MergeStateKernel(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* 
   } else {
     __syncthreads();
   }
-  if (tx == 0) {
+  if (valid && tx == 0) {
     s_merged[pos * num_heads + head_idx] =
         (math::ptx_log2(s_a_val + s_b_val) + s_max) * lse_scale_inv;
   }
@@ -93,8 +101,11 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
   DISPATCH_HEAD_DIM(head_dim, HeadDim, {
     constexpr size_t kVecSize = std::max(16U / sizeof(DTypeIn), HeadDim / 32U);
     constexpr size_t kBdx = HeadDim / kVecSize;
-    uint32_t bdy = num_heads;
-    dim3 nblks(seq_len);
+    // cap block y so kBdx * bdy <= 1024; tile remaining heads over grid y.
+    constexpr uint32_t kMaxBdy = 1024U / static_cast<uint32_t>(kBdx);
+    uint32_t bdy = std::min(num_heads, kMaxBdy);
+    uint32_t grid_y = (num_heads + bdy - 1) / bdy;
+    dim3 nblks(seq_len, grid_y);
     dim3 nthrs(static_cast<uint32_t>(kBdx), bdy);
     auto kernel = MergeStateKernel<HeadDim, DTypeIn, DTypeO>;
 
