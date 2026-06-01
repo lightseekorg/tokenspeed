@@ -32,6 +32,10 @@ struct RequestSpec {
     std::vector<std::int32_t> tokens;
     std::vector<std::string> rolling_hashes;
     std::int32_t storage_hit_pages{0};
+    // Prompt position (in full-sequence coordinates) from which to return
+    // input/prompt-token logprobs. -1 (default) means input logprobs are not
+    // requested; only sampled-output logprobs (if any) are produced.
+    std::int32_t logprob_start_len{-1};
 };
 
 struct PrefillInfo {

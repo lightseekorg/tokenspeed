@@ -192,9 +192,18 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+        # Input/prompt-token logprobs are requested only when return_logprob is
+        # set AND a non-negative logprob_start_len is given; otherwise -1 tells
+        # the scheduler to skip them (output-only or no logprobs).
+        logprob_start_len = -1
+        if recv_req.return_logprob and recv_req.logprob_start_len is not None:
+            if recv_req.logprob_start_len >= 0:
+                logprob_start_len = recv_req.logprob_start_len
+
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            logprob_start_len=logprob_start_len,
         )
         req_state = RequestState.from_recv_req(
             recv_req,

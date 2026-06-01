@@ -123,6 +123,11 @@ class LogitsMetadata:
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
+            extend_return_logprob=ctx.extend_return_logprob,
+            extend_logprob_start_lens_cpu=ctx.extend_logprob_start_lens_cpu,
+            extend_seq_lens_cpu=ctx.extend_seq_lens_cpu,
+            extend_logprob_pruned_lens_cpu=ctx.extend_logprob_pruned_lens_cpu,
+            extend_input_logprob_token_ids_gpu=ctx.extend_input_logprob_token_ids_gpu,
         )
 
 

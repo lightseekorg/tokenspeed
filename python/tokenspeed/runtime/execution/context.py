@@ -60,3 +60,17 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+
+    # --- input/prompt-token logprobs ---
+    # When True, the LogitsProcessor also computes per-position logprobs for the
+    # input (prompt+completion) tokens, not just the sampled token.
+    extend_return_logprob: bool = False
+    # Per-extend-request start position (within the extend tokens) from which to
+    # collect input logprobs, and the per-extend-request extend lengths.
+    extend_logprob_start_lens_cpu: list[int] | None = None
+    extend_seq_lens_cpu: list[int] | None = None
+    # Per-request count of kept input-logprob positions (extend_len - start_len).
+    extend_logprob_pruned_lens_cpu: list[int] | None = None
+    # Flat GPU tensor of target token ids (one per kept input position) whose
+    # logprob is gathered: the shifted input ids sliced to [start_len:extend_len].
+    extend_input_logprob_token_ids_gpu: torch.Tensor | None = None

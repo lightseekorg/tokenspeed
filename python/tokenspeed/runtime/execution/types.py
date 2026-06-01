@@ -55,6 +55,10 @@ class ModelExecutionResult:
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    # Input/prompt-token logprobs for pure-extend scoring batches, as a
+    # (values, token_ids) CPU-tensor pair flat over all extend requests, or None
+    # when no request in the batch requested input logprobs.
+    input_token_logprobs: tuple[torch.Tensor, torch.Tensor | None] | None = None
 
     def sync(self) -> None:
         assert self.copy_event is not None

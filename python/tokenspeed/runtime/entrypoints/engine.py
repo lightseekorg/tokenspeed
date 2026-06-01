@@ -57,6 +57,7 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 import torch
 import uvloop
 
+from tokenspeed.runtime.engine.compute_log_probs import compute_log_probs_core
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -410,6 +411,26 @@ class Engine(EngineBase):
     def resume_memory_occupation(self, tags: list[str] | None = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         return self.llm.run(self.tokenizer_manager.resume_memory_occupation(obj))
+
+    def compute_log_probs(
+        self,
+        sequences: list[dict[str, list[int]]],
+        temperature: float = 1.0,
+    ) -> dict[str, list[list[float]]]:
+        """Score prompt+completion sequences under current weights (RL-plan M2).
+
+        ``sequences`` is a list of
+        ``{"prompt_token_ids": [...], "completion_token_ids": [...]}``.
+        Returns ``{"log_probs": [[...], ...], "tokens": [[completion ids], ...]}``
+        where ``log_probs[i][j] == log P(completion_token_ids[i][j] | context)``
+        at temperature 1.0 (raw log_softmax).
+        """
+        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
+            raise RuntimeError(
+                "compute_log_probs is unavailable when speculative decoding is "
+                "enabled (Engine.generate disables logprobs in that mode)."
+            )
+        return compute_log_probs_core(sequences, self.generate, temperature)
 
     """
     Execute an RPC call on all scheduler processes.

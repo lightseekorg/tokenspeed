@@ -65,6 +65,9 @@ struct PrefillOperation : public ForwardOperationBase {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::int32_t extend_prefix_len;
+    // Start position (relative to this prefill chunk's extend tokens) from which
+    // input/prompt-token logprobs should be collected. -1 means not requested.
+    std::int32_t extend_logprob_start_len{-1};
 };
 
 struct DecodeOperation : public ForwardOperationBase {
@@ -89,6 +92,9 @@ struct FlatForwardOperation {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::vector<std::int32_t> extend_prefix_lens;
+    // Per-prefill (parallel to extend_prefix_lens): start position within the
+    // extend tokens from which to collect input logprobs. -1 = not requested.
+    std::vector<std::int32_t> extend_logprob_start_lens;
     std::vector<std::int32_t> decode_input_ids;
     std::vector<std::int32_t> hist_token_lens;
 
@@ -139,6 +145,7 @@ struct FlatForwardOperation {
                 shifted_input_ids.insert(shifted_input_ids.end(), prefill->shifted_input_ids.begin(),
                                          prefill->shifted_input_ids.end());
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
+                extend_logprob_start_lens.push_back(prefill->extend_logprob_start_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
                 hist_token_lens.push_back(decode->hist_token_len);

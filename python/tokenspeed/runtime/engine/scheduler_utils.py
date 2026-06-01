@@ -44,10 +44,12 @@ _CACHE_EVENT_TYPES = {
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], logprob_start_len: int = -1) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    # -1 means input/prompt-token logprobs are not requested.
+    spec.logprob_start_len = logprob_start_len
     return spec
 
 

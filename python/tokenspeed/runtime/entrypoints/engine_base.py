@@ -80,5 +80,13 @@ class EngineBase(ABC):
         """Resume GPU memory occupation which is previously released."""
 
     @abstractmethod
+    def compute_log_probs(
+        self,
+        sequences: list[dict[str, list[int]]],
+        temperature: float = 1.0,
+    ) -> dict[str, list[list[float]]]:
+        """Score prompt+completion sequences and return per-completion-token logprobs."""
+
+    @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the engine and clean up resources."""

@@ -491,7 +491,54 @@ class ModelExecutor:
             ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        # Input/prompt-token logprobs (only produced in EXTEND when requested).
+        # Bundled as a single (val, token_ids) payload to keep the forward_step
+        # return arity stable across the captured-decode path (which has none).
+        input_logprobs = None
+        if logits_output.input_token_logprobs is not None:
+            input_logprobs = (
+                logits_output.input_token_logprobs,
+                ctx.extend_input_logprob_token_ids_gpu,
+            )
+        return output_tokens, accept_lengths, output_logprobs, input_logprobs
+
+    def _maybe_set_input_logprob_ctx(self, ctx, forward_op, bs, num_extends):
+        """Enable input/prompt-token logprobs on the ForwardContext when every
+        request in a pure-extend batch requests them (the compute_log_probs
+        scoring path).
+
+        Gated to pure-extend batches (num_extends == bs) so the per-request
+        hidden-state slicing in LogitsProcessor stays aligned — mixed batches
+        interleave decode rows. Target token ids are the already-shifted prefill
+        ids sliced to each request's [start_len:extend_len] window.
+        """
+        if num_extends == 0 or num_extends != bs:
+            return
+        start_lens = [
+            int(s) for s in forward_op.extend_logprob_start_lens[:num_extends]
+        ]
+        if not all(s >= 0 for s in start_lens):
+            return
+        seq_lens = [
+            int(x)
+            for x in self.input_buffers.extend_seq_lens_cpu[:num_extends].tolist()
+        ]
+        pruned = [el - sl for sl, el in zip(start_lens, seq_lens)]
+        if any(p <= 0 for p in pruned):
+            return
+        shifted = self.input_buffers.shifted_prefill_ids_buf
+        idx_slices = []
+        pt = 0
+        for sl, el in zip(start_lens, seq_lens):
+            idx_slices.append(shifted[pt + sl : pt + el])
+            pt += el
+        ctx.extend_return_logprob = True
+        ctx.extend_logprob_start_lens_cpu = start_lens
+        ctx.extend_seq_lens_cpu = seq_lens
+        ctx.extend_logprob_pruned_lens_cpu = pruned
+        ctx.extend_input_logprob_token_ids_gpu = (
+            torch.cat(idx_slices) if idx_slices else None
+        )
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1217,6 +1264,8 @@ class ModelExecutor:
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
 
+                self._maybe_set_input_logprob_ctx(ctx, forward_op, bs, num_extends)
+
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
                     grammar_completion = setup_grammar_step(
@@ -1279,7 +1328,12 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        input_logprobs,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -1349,6 +1403,17 @@ class ModelExecutor:
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
 
+                if input_logprobs is not None:
+                    ilp_val, ilp_idx = input_logprobs
+                    input_logprobs = (
+                        ilp_val.to("cpu", non_blocking=True),
+                        (
+                            ilp_idx.to("cpu", non_blocking=True)
+                            if ilp_idx is not None
+                            else None
+                        ),
+                    )
+
                 copy_event = torch.cuda.Event()
                 copy_event.record()
 
@@ -1356,6 +1421,7 @@ class ModelExecutor:
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
+            input_token_logprobs=input_logprobs,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
         )

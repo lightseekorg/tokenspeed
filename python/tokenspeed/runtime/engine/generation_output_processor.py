@@ -107,6 +107,12 @@ class RequestState:
         self.output_token_logprobs_idx: list[int] | None = (
             [] if return_logprob else None
         )
+        # Input/prompt-token logprobs (populated once at prefill when requested).
+        self.input_token_logprobs_val: list[float] | None = (
+            [] if return_logprob else None
+        )
+        self.input_token_logprobs_idx: list[int] | None = [] if return_logprob else None
+        self.input_token_logprobs_sent: bool = False
 
         # --- Streaming bookkeeping (internal) ---
         self._surr_offset: int | None = None
@@ -521,6 +527,20 @@ class OutputProcesser:
             if model_execution_results.output_logprobs is not None
             else None
         )
+        # Input/prompt-token logprobs for this forward (pure-extend scoring
+        # batches only): a flat (values, token_ids) pair over extend requests.
+        _input_logprobs_pair = model_execution_results.input_token_logprobs
+        input_logprobs_val = (
+            _input_logprobs_pair[0].tolist()
+            if _input_logprobs_pair is not None
+            else None
+        )
+        input_logprobs_idx = (
+            _input_logprobs_pair[1].tolist()
+            if _input_logprobs_pair is not None and _input_logprobs_pair[1] is not None
+            else None
+        )
+        ilp_pt = 0
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -538,11 +558,40 @@ class OutputProcesser:
             else:
                 pt += output_length
 
+            # Slice this request's input/prompt logprobs and advance the flat
+            # pointer BEFORE any `continue`, so alignment holds across requests.
+            req_input_lp_val = None
+            req_input_lp_idx = None
+            if input_logprobs_val is not None and i < num_extends:
+                sl = int(forward_op.extend_logprob_start_lens[i])
+                if sl >= 0:
+                    plen = int(forward_op.input_lengths[i]) - sl
+                    if plen > 0:
+                        req_input_lp_val = input_logprobs_val[ilp_pt : ilp_pt + plen]
+                        if input_logprobs_idx is not None:
+                            req_input_lp_idx = input_logprobs_idx[
+                                ilp_pt : ilp_pt + plen
+                            ]
+                        ilp_pt += plen
+
             if rid not in self.rid_to_state:
                 # means it's delayed token, do not process
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
+
+            # Accumulate input/prompt logprobs BEFORE the chunked-prefill guard
+            # below: when a scored sequence spans multiple prefill chunks, each
+            # non-final chunk contributes part of the requested window. Skipping
+            # this on chunk boundaries would drop those tokens and leave
+            # compute_log_probs with fewer logprobs than completion tokens.
+            if (
+                req_input_lp_val is not None
+                and request_state.input_token_logprobs_val is not None
+            ):
+                request_state.input_token_logprobs_val.extend(req_input_lp_val)
+                if req_input_lp_idx is not None:
+                    request_state.input_token_logprobs_idx.extend(req_input_lp_idx)
 
             # Do not output chunking result
             if not request_state.prefill_finished:
@@ -706,6 +755,8 @@ class OutputProcesser:
         output_extra_infos: list[dict] = []
         output_token_logprobs_val: list[list[float]] = []
         output_token_logprobs_idx: list[list[int]] = []
+        input_token_logprobs_val: list[list[float]] = []
+        input_token_logprobs_idx: list[list[int]] = []
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -785,6 +836,21 @@ class OutputProcesser:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
 
+            # Input/prompt logprobs are produced once at prefill; ship them on
+            # the first output for this request, then mark sent so multi-token
+            # generations don't resend them every stream step.
+            if (
+                rs.return_logprob
+                and rs.input_token_logprobs_val
+                and not rs.input_token_logprobs_sent
+            ):
+                input_token_logprobs_val.append(list(rs.input_token_logprobs_val))
+                input_token_logprobs_idx.append(list(rs.input_token_logprobs_idx))
+                rs.input_token_logprobs_sent = True
+            else:
+                input_token_logprobs_val.append([])
+                input_token_logprobs_idx.append([])
+
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
             return
@@ -804,8 +870,8 @@ class OutputProcesser:
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
             spec_verify_ct=spec_verify_ct,
-            input_token_logprobs_val=[],
-            input_token_logprobs_idx=[],
+            input_token_logprobs_val=input_token_logprobs_val,
+            input_token_logprobs_idx=input_token_logprobs_idx,
             output_token_logprobs_val=output_token_logprobs_val,
             output_token_logprobs_idx=output_token_logprobs_idx,
             input_top_logprobs_val=[],

@@ -414,6 +414,27 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event) {
     op.shifted_input_ids = std::move(info.shifted_input_ids);
     op.extend_prefix_len = info.already_scheduled_len;
 
+    // Rebase the prompt-relative logprob_start_len onto this prefill chunk's
+    // extend tokens. -1 ⇒ input logprobs not requested, or the requested region
+    // lies entirely after this chunk.
+    //
+    // When the requested window spans multiple prefill chunks (long
+    // prompt+completion), three cases arise per chunk:
+    //   * rel >= extend_len : window starts after this chunk -> skip (-1).
+    //   * 0 <= rel < extend_len : window starts inside this chunk -> collect
+    //     from `rel`.
+    //   * rel < 0 : the window opened in an earlier chunk and is still active,
+    //     so this whole chunk is inside the window -> collect from offset 0.
+    //     (Previously this set -1 and silently dropped every token after the
+    //     first in-window chunk.)
+    const std::int32_t logprob_start_len = request->LogprobStartLen();
+    if (logprob_start_len < 0) {
+        op.extend_logprob_start_len = -1;
+    } else {
+        const std::int32_t rel = logprob_start_len - info.already_scheduled_len;
+        op.extend_logprob_start_len = (rel < info.extend_len) ? std::max(rel, 0) : -1;
+    }
+
     auto* mamba = request->GetLocalMambaAllocator();
     if (mamba != nullptr && mamba->HasWorking()) {
         op.mamba_working_idx = mamba->WorkingIndex();

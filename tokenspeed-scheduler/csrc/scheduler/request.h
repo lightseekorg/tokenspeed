@@ -54,6 +54,10 @@ public:
 
     std::string Id() const { return id_; }
 
+    // Full-sequence position from which input/prompt-token logprobs are
+    // requested. -1 means not requested.
+    std::int32_t LogprobStartLen() const { return logprob_start_len_; }
+
     // Keep Apply the only non-const function in Request
     // The wrapper lambda converts any concrete state type returned by event's operator()
     // into fsm::State, allowing operator() to return specific state types instead of State.
@@ -277,6 +281,7 @@ private:
     std::int32_t page_size_;
     fsm::State state_;
     StorageInfo storage_info_;
+    std::int32_t logprob_start_len_{-1};
 };
 
 using ConstRequestVector = std::vector<const Request*>;

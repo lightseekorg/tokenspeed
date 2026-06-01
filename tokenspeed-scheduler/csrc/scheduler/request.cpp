@@ -33,7 +33,8 @@ Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
       page_size_{page_size},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}},
-      storage_info_{spec.rolling_hashes, spec.storage_hit_pages} {}
+      storage_info_{spec.rolling_hashes, spec.storage_hit_pages},
+      logprob_start_len_{spec.logprob_start_len} {}
 
 PrefillInfo Request::GetPrefillInfo() const {
     return std::visit(Overloaded{

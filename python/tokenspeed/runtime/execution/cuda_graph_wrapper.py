@@ -453,7 +453,10 @@ class CudaGraphWrapper:
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
-        return graph, out
+        # Captured decode graphs never produce input/prompt logprobs (4th
+        # element of _forward_step's return); keep the output buffers a 3-tuple
+        # to match the replay-path unpack.
+        return graph, out[:3]
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
         specs = tuple(pool.paged_cache_group_specs)
@@ -911,6 +914,8 @@ class CudaGraphWrapper:
                     if output_logprobs is not None
                     else None
                 ),
+                # Captured (decode) graphs never produce input/prompt logprobs.
+                None,
             )
 
         else:
