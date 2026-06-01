@@ -327,7 +327,7 @@ def fused_qk_rmsnorm_triton(
     )
 
     if tp_size > 1:
-        sum_sq = all_reduce(sum_sq, tp_rank, tp_group)
+        sum_sq = all_reduce(sum_sq, tp_group)
 
     out1 = torch.empty_like(q)
     out2 = torch.empty_like(k)
@@ -672,7 +672,7 @@ class MiniMaxM2Attention(nn.Module):
         )
 
         fused_kv_arg = None
-        if ctx.attn_backend.support_kv_cache_prewrite:
+        if ctx.attn_backend.support_kv_cache_prewrite():
             n = q.shape[0]
             v_3d = v.view(n, self.num_kv_heads, self.head_dim)
             fused_kv_arg = create_fused_set_kv_buffer_arg(

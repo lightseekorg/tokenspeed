@@ -29,6 +29,7 @@ from tokenspeed_kernel.numerics.moe import (
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.trtllm import (
     moe_align_block_size as _trtllm_moe_align_block_size,
 )
@@ -43,7 +44,7 @@ from tokenspeed_kernel.thirdparty.trtllm import (
         min_arch_version=ArchVersion(9, 0),
         vendors=frozenset({"nvidia"}),
     ),
-    dtypes={torch.int32},
+    signatures=format_signatures("indices", "dense", {torch.int32}),
     traits={},
     priority=12,
     tags={"latency"},

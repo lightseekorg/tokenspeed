@@ -65,6 +65,7 @@ def fused_qnorm_rope_kv_insert(
     cos_sin_cache: torch.Tensor,
     rms_norm_eps: float,
     block_size: int,
+    enable_pdl: bool = False,
 ) -> None:
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"q must be float16 or bfloat16, got {q.dtype}")
@@ -88,6 +89,7 @@ def fused_qnorm_rope_kv_insert(
         cos_sin_cache.contiguous(),
         float(rms_norm_eps),
         int(block_size),
+        bool(enable_pdl),
     )
 
 

@@ -675,6 +675,10 @@ class DeepseekV3AttentionMLA(nn.Module):
                 attn_output[num_prefill_tokens:],
             )
 
+        if ctx.draft_first_step_reduce:
+            # KV already written; drop dead-position rows so o_proj / MLP /
+            # post-norms only run on one live row per request.
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1153,6 +1157,9 @@ class DeepseekV3DecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
+            if ctx.draft_first_step_reduce:
+                # Gather residual to self_attn's [bs, H].
+                residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -1697,6 +1704,9 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
 
+            if ctx.draft_first_step_reduce:
+                # Gather residual to self_attn's [bs, H].
+                residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -1745,12 +1755,16 @@ class Eagle3MlaModel(nn.Module):
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         fc_input_size = target_hidden_size * self.num_fc_input_dim
 
-        self.fc = ReplicatedLinear(
+        self.fc = ColumnParallelLinear(
             fc_input_size,
             config.hidden_size,
             bias=False,
+            gather_output=True,
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
         )
 
         self.midlayer = Eagle3MlaDecoderLayer(

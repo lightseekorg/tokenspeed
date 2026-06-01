@@ -24,7 +24,7 @@ import math
 import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import torch
 from tokenspeed_kernel.benchmark.config import BenchmarkConfig
@@ -135,8 +135,13 @@ class BenchmarkRunner:
         kernel: Callable[..., Any],
         shape: dict[str, Any],
         dtype: torch.dtype,
+        dtype_role: str | Iterable[str],
     ) -> BenchmarkResult | None:
         if not spec_matches_shape_traits(spec, shape):
+            return None
+
+        signature = spec.format_signature_for_storage_dtype(dtype, dtype_role)
+        if signature is None:
             return None
 
         generator = get_input_generator(
@@ -144,6 +149,7 @@ class BenchmarkRunner:
             spec.mode,
             dtype=dtype,
             traits=spec.traits,
+            format_signature=signature,
             device="cuda",
             seed=self.config.seed,
         )
@@ -186,6 +192,7 @@ class BenchmarkRunner:
                 kernel,
                 shape,
                 dtype,
+                dtype_role,
                 generator,
             )
 
@@ -218,16 +225,21 @@ class BenchmarkRunner:
         kernel: Callable[..., Any],
         shape: dict[str, Any],
         dtype: torch.dtype,
+        dtype_role: str | Iterable[str],
         generator: Any,
     ) -> tuple[bool | None, float | None, float | None]:
         if spec.solution == "reference":
             return None, None, None
 
         registry = KernelRegistry.get()
+        signature = spec.format_signature_for_storage_dtype(dtype, dtype_role)
+        if signature is None:
+            return None, None, None
+
         ref_specs = registry.get_for_operator(
             spec.family,
             spec.mode,
-            dtype=dtype,
+            format_signature=signature,
             solution="reference",
         )
         if not ref_specs:
@@ -278,6 +290,7 @@ class BenchmarkRunner:
         *,
         shapes: list[dict[str, Any]] | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        dtype_role: str | Iterable[str],
     ) -> list[BenchmarkResult]:
         """Benchmark a single kernel across shapes."""
         registry = KernelRegistry.get()
@@ -285,8 +298,11 @@ class BenchmarkRunner:
         if spec is None:
             raise ValueError(f"Kernel {kernel_name!r} is not registered")
 
-        if dtype not in spec.dtypes:
-            raise ValueError(f"Kernel {kernel_name!r} does not support dtype={dtype}")
+        if spec.format_signature_for_storage_dtype(dtype, dtype_role) is None:
+            raise ValueError(
+                f"Kernel {kernel_name!r} does not support storage dtype={dtype} "
+                f"on dtype role(s) {dtype_role}"
+            )
 
         platform = current_platform()
         if not spec.capability.satisfied_by(platform):
@@ -307,6 +323,7 @@ class BenchmarkRunner:
                 kernel,
                 shape,
                 dtype,
+                dtype_role,
             )
             if result is not None:
                 results.append(result)
@@ -318,12 +335,14 @@ class BenchmarkRunner:
         *,
         shapes: list[dict[str, Any]] | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        dtype_role: str | Iterable[str],
     ) -> list[BenchmarkResult]:
         with self._profiling_context(default_output=f"bench_{kernel_name}"):
             return self._benchmark_kernel_impl(
                 kernel_name,
                 shapes=shapes,
                 dtype=dtype,
+                dtype_role=dtype_role,
             )
 
     def _benchmark_op_impl(
@@ -333,21 +352,27 @@ class BenchmarkRunner:
         *,
         shapes: list[dict[str, Any]] | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        dtype_role: str | Iterable[str],
     ) -> list[BenchmarkResult]:
         """Benchmark all implementations of an op."""
         registry = KernelRegistry.get()
         platform = current_platform()
-        specs = registry.get_for_operator(
-            op_family,
-            op_mode,
-            platform=platform,
-            dtype=dtype,
-        )
+        specs = [
+            spec
+            for spec in registry.get_for_operator(
+                op_family,
+                op_mode,
+                platform=platform,
+            )
+            if spec.format_signatures_for_storage_dtype(dtype, dtype_role)
+        ]
 
         results: list[BenchmarkResult] = []
         for spec in sorted(specs, key=lambda item: (item.solution, item.name)):
             results.extend(
-                self._benchmark_kernel_impl(spec.name, shapes=shapes, dtype=dtype)
+                self._benchmark_kernel_impl(
+                    spec.name, shapes=shapes, dtype=dtype, dtype_role=dtype_role
+                )
             )
         return results
 
@@ -358,6 +383,7 @@ class BenchmarkRunner:
         *,
         shapes: list[dict[str, Any]] | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        dtype_role: str | Iterable[str],
     ) -> list[BenchmarkResult]:
         with self._profiling_context(default_output=f"bench_{op_family}_{op_mode}"):
             return self._benchmark_op_impl(
@@ -365,19 +391,23 @@ class BenchmarkRunner:
                 op_mode,
                 shapes=shapes,
                 dtype=dtype,
+                dtype_role=dtype_role,
             )
 
     def _benchmark_all_impl(
         self,
         *,
         dtype: torch.dtype = torch.bfloat16,
+        dtype_role: str | Iterable[str],
     ) -> list[BenchmarkResult]:
         """Benchmark all registered kernels on this platform."""
         registry = KernelRegistry.get()
         results: list[BenchmarkResult] = []
         for family, mode in sorted(registry.list_operators()):
             try:
-                op_results = self._benchmark_op_impl(family, mode, dtype=dtype)
+                op_results = self._benchmark_op_impl(
+                    family, mode, dtype=dtype, dtype_role=dtype_role
+                )
             except KeyError:
                 continue
             if op_results:
@@ -388,6 +418,7 @@ class BenchmarkRunner:
         self,
         *,
         dtype: torch.dtype = torch.bfloat16,
+        dtype_role: str | Iterable[str],
     ) -> list[BenchmarkResult]:
         with self._profiling_context(default_output="bench_all"):
-            return self._benchmark_all_impl(dtype=dtype)
+            return self._benchmark_all_impl(dtype=dtype, dtype_role=dtype_role)

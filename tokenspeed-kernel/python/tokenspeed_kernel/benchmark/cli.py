@@ -100,6 +100,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Benchmark dtype",
     )
     parser.add_argument(
+        "--dtype-role",
+        required=True,
+        help="Tensor role whose storage dtype is selected by --dtype",
+    )
+    parser.add_argument(
         "--shapes",
         help="JSON object or list of shape objects override",
     )
@@ -178,13 +183,17 @@ def main(argv: list[str] | None = None) -> int:
     runner = BenchmarkRunner(config)
 
     if args.kernel_name is not None:
-        results = runner.benchmark_kernel(args.kernel_name, shapes=shapes, dtype=dtype)
+        results = runner.benchmark_kernel(
+            args.kernel_name, shapes=shapes, dtype=dtype, dtype_role=args.dtype_role
+        )
     elif op_filter is not None:
         assert op_filter is not None
         family, mode = op_filter
-        results = runner.benchmark_op(family, mode, shapes=shapes, dtype=dtype)
+        results = runner.benchmark_op(
+            family, mode, shapes=shapes, dtype=dtype, dtype_role=args.dtype_role
+        )
     else:
-        results = runner.benchmark_all(dtype=dtype)
+        results = runner.benchmark_all(dtype=dtype, dtype_role=args.dtype_role)
 
     print(format_report(results))
 

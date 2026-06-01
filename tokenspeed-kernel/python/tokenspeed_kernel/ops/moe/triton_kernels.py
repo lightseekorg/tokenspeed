@@ -27,6 +27,7 @@ import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 # Trigger the redirect that aliases ``triton`` -> ``tokenspeed_triton`` for
 # upstream ``triton_kernels`` imports.
@@ -138,7 +139,9 @@ def _matmul(
 
 _matmul_common = dict(
     solution="triton",
-    dtypes={torch.float16, torch.bfloat16, torch.uint8},
+    signatures=format_signatures(
+        "x", "dense", {torch.float16, torch.bfloat16, torch.uint8}
+    ),
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
 )
@@ -173,7 +176,9 @@ register_kernel(
     "route",
     name="triton_kernels_routing",
     solution="triton",
-    dtypes={torch.float16, torch.bfloat16, torch.float32},
+    signatures=format_signatures(
+        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
     traits={"output_type": frozenset({"ragged_metadata"})},
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},

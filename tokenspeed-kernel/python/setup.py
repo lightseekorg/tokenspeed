@@ -378,6 +378,15 @@ KERNEL_GROUPS = [
         ["-O3", "-DNDEBUG", "-use_fast_math"],
     ),
     (
+        "flashinfer_softmax",
+        [
+            CUDA_CSRC_DIR / "flashinfer_softmax.cu",
+        ],
+        [],
+        # Match flashinfer's stock sampling.cuh build flags.
+        ["-O3", "-DNDEBUG", "-use_fast_math"],
+    ),
+    (
         "silu_fuse_block_quant",
         [
             CUDA_CSRC_DIR / "silu_and_mul_fuse_block_quant.cu",
@@ -422,7 +431,6 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
-            CUDA_CSRC_DIR / "all_gather.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
         ],
         [],

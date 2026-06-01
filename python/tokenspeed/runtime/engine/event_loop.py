@@ -643,7 +643,7 @@ class EventLoop:
                 )
 
     def _get_multimodal_context_for_forward(self, forward_op):
-        if not self.model_config.is_multimodal:
+        if not self.model_config.is_multimodal_active:
             return None
 
         num_extends = forward_op.num_extends()

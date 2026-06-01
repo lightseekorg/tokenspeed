@@ -21,13 +21,10 @@
 import os
 import warnings
 from contextlib import contextmanager
-from types import SimpleNamespace
 from typing import Any
 
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
-
-global_server_args: ServerArgs | None = None
 
 global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
@@ -73,8 +70,6 @@ global_server_args_dict: dict = {
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
-    global global_server_args
-    global_server_args = server_args
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
@@ -119,18 +114,6 @@ def global_server_args_dict_update(server_args: ServerArgs):
         }
     )
     pdl_enabled.cache_clear()
-
-
-def get_global_server_args():
-    if global_server_args is not None:
-        return global_server_args
-
-    defaults = dict(global_server_args_dict)
-    defaults.setdefault("mm_attention_backend", None)
-    defaults.setdefault("skip_tokenizer_init", False)
-    defaults.setdefault("chunked_prefill_size", None)
-    defaults.setdefault("tp_size", 1)
-    return SimpleNamespace(**defaults)
 
 
 class EnvField:

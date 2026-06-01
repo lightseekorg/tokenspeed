@@ -60,17 +60,21 @@ class CommManager:
         return sum(scattered), max(scattered)
 
     def scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
-        if ctx.global_num_tokens is not None:
+        # Under draft first-step reduce, comm operates on bs / global_bs since
+        # the midlayer pruned activations to one row per request.
+        global_counts = (
+            ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
+        )
+        if global_counts is not None:
             scattered = []
             for attn_dp_rank in range(self.mapping.attn.dp_size):
-                num_tokens = ctx.global_num_tokens[
-                    attn_dp_rank * self.mapping.attn.tp_size
-                ]
+                num_tokens = global_counts[attn_dp_rank * self.mapping.attn.tp_size]
                 scattered.extend(
                     self._scatter_count(num_tokens, self.mapping.attn.tp_size)
                 )
             return scattered
-        return self._scatter_count(ctx.input_num_tokens, self.mapping.attn.tp_size)
+        num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
+        return self._scatter_count(num_tokens, self.mapping.attn.tp_size)
 
     def attn_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         start = self.mapping.attn.tp_size * self.mapping.attn.dp_rank
@@ -84,15 +88,17 @@ class CommManager:
 
     def moe_tp_ep_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         tp_ep_size = self.mapping.moe.tp_ep_size
-        if ctx.global_num_tokens is not None:
-            # DP path: global_num_tokens has one entry per world rank.
-            # MoE group = tp_ep_size contiguous ranks starting at dp_rank * tp_ep_size.
+        # Under draft first-step reduce, the midlayer pruned activations to bs
+        # rows before pre_moe_comm; MoE collectives must size accordingly.
+        global_counts = (
+            ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
+        )
+        if global_counts is not None:
             start = self.mapping.moe.dp_rank * tp_ep_size
-            return list(ctx.global_num_tokens[start : start + tp_ep_size])
-        # No global_num_tokens (e.g., drafter context or non-DP).
-        # This rank has all input_num_tokens; other ranks in the EP group have 0.
+            return list(global_counts[start : start + tp_ep_size])
+        num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
         result = [0] * tp_ep_size
-        result[self.mapping.moe.tp_ep_rank] = ctx.input_num_tokens
+        result[self.mapping.moe.tp_ep_rank] = num_tokens
         return result
 
     # ---- Communication patterns ----
@@ -114,7 +120,6 @@ class CommManager:
 
         return token_all_gather(
             hidden_states,
-            rank=self.mapping.attn.tp_rank,
             group=self.mapping.attn.tp_group,
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )
@@ -126,16 +131,13 @@ class CommManager:
             return hidden_states, residual
 
         if self.use_all_reduce(self.is_moe):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.attn.tp_rank, self.mapping.attn.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
             # The output residual is expected to have attn_tp_num_tokens.
             # For first layer, the input residual has attn_tp_num_tokens.
             # Otherwise, if this layer experiences a RSAG -> AR switch, residual needs allgather.
             if self.layer_id > 0 and not self.use_all_reduce(self.prev_is_moe):
                 residual = token_all_gather(
                     residual,
-                    rank=self.mapping.attn.tp_rank,
                     group=self.mapping.attn.tp_group,
                     scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
                 )
@@ -143,7 +145,6 @@ class CommManager:
             token_list = self.attn_tp_group_scattered_num_tokens(ctx)
             hidden_states = token_reduce_scatter(
                 hidden_states,
-                rank=self.mapping.attn.tp_rank,
                 group=self.mapping.attn.tp_group,
                 scattered_num_tokens=token_list,
             )
@@ -171,7 +172,6 @@ class CommManager:
 
         return token_all_gather(
             hidden_states,
-            rank=self.mapping.dense.tp_rank,
             group=self.mapping.dense.tp_group,
             scattered_num_tokens=self.dense_tp_group_scattered_num_tokens(ctx),
         )
@@ -185,7 +185,6 @@ class CommManager:
 
         return token_all_gather(
             hidden_states,
-            rank=self.mapping.moe.tp_ep_rank,
             group=self.mapping.moe.tp_ep_group,
             scattered_num_tokens=self.moe_tp_ep_group_scattered_num_tokens(ctx),
         )
@@ -205,13 +204,10 @@ class CommManager:
             return hidden_states, residual
 
         if self.use_all_reduce(is_moe=False):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.dense.tp_rank, self.mapping.dense.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
             hidden_states,
-            rank=self.mapping.dense.tp_rank,
             group=self.mapping.dense.tp_group,
             scattered_num_tokens=self.dense_tp_group_scattered_num_tokens(ctx),
         )
@@ -224,13 +220,10 @@ class CommManager:
             return hidden_states, residual
 
         if self.use_all_reduce(is_moe=True):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.moe.tp_ep_rank, self.mapping.moe.tp_ep_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.moe.tp_ep_group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
             hidden_states,
-            rank=self.mapping.moe.tp_ep_rank,
             group=self.mapping.moe.tp_ep_group,
             scattered_num_tokens=self.moe_tp_ep_group_scattered_num_tokens(ctx),
         )
@@ -245,7 +238,6 @@ class CommManager:
             return hidden_states, residual
         hidden_states = token_all_gather(
             hidden_states,
-            rank=self.mapping.attn.tp_rank,
             group=self.mapping.attn.tp_group,
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )

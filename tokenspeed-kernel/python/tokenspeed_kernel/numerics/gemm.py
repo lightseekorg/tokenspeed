@@ -31,6 +31,7 @@ from tokenspeed_kernel.numerics.inputs import (
     set_standard_shapes,
 )
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
+from tokenspeed_kernel.signature import TensorFormat
 
 # ---------------------------------------------------------------------------
 # Tolerance
@@ -119,45 +120,97 @@ class GemmInputGenerator(InputGenerator):
         )
         return scales.to(dtype)
 
+    def _format(self, role: str) -> TensorFormat | None:
+        if self.format_signature is None:
+            return None
+        return self.format_signature.format_for(role)
+
+    def _block_size(
+        self,
+        *formats: TensorFormat | None,
+    ) -> list[int] | None:
+        for tensor_format in formats:
+            scale = tensor_format.scale if tensor_format is not None else None
+            if scale is not None and scale.block_shape is not None:
+                return list(scale.block_shape)
+        return None
+
+    def _scale_for_format(
+        self,
+        tensor_format: TensorFormat | None,
+        role: str,
+        *,
+        M: int,
+        N: int,
+        K: int,
+        block_size: list[int] | None,
+    ) -> torch.Tensor | None:
+        scale = tensor_format.scale if tensor_format is not None else None
+        if scale is None:
+            return None
+
+        if scale.granularity == "block" and tensor_format.format == "mxfp8":
+            if block_size is None:
+                raise ValueError(
+                    "mxfp8 block scale format requires concrete block_shape"
+                )
+            block_n, block_k = block_size
+            k_tiles = math.ceil(K / block_k)
+            if role == "a":
+                return self._generate_scales((M, k_tiles), scale.storage_dtype)
+            if role == "b":
+                n_tiles = math.ceil(N / block_n)
+                return self._generate_scales((n_tiles, k_tiles), scale.storage_dtype)
+
+        if scale.granularity == "channel":
+            return self._generate_scales(
+                (M,) if role == "a" else (N,),
+                scale.storage_dtype,
+            )
+
+        return self._generate_scales((1,), scale.storage_dtype)
+
     def generate(
         self,
         M: int,
         N: int,
         K: int,
     ) -> dict[str, Any]:
-        quant = self.traits.get("quant")
-        scale_type = self.traits.get("scale_type")
         a_layout = self.traits.get("a_layout")
         b_layout = self.traits.get("b_layout")
+        a_format = self._format("a")
+        b_format = self._format("b")
+        a_dtype = a_format.storage_dtype if a_format is not None else self.dtype
+        b_dtype = b_format.storage_dtype if b_format is not None else self.dtype
 
         A = (
-            self._generate_value((K, M), self.dtype)
+            self._generate_value((K, M), a_dtype)
             if a_layout == {"KM"}
-            else self._generate_value((M, K), self.dtype)
+            else self._generate_value((M, K), a_dtype)
         )
         B = (
-            self._generate_value((K, N), self.dtype)
+            self._generate_value((K, N), b_dtype)
             if b_layout == {"KN"}
-            else self._generate_value((N, K), self.dtype)
+            else self._generate_value((N, K), b_dtype)
         )
 
-        A_scales = None
-        B_scales = None
-        block_size = None
-
-        if quant == {"mxfp8"}:
-            block_size = [128, 128]
-            k_tiles = math.ceil(K / block_size[0])
-            n_tiles = math.ceil(N / block_size[1])
-            A_scales = self._generate_scales((M, k_tiles), torch.float32)
-            B_scales = self._generate_scales((n_tiles, k_tiles), torch.float32)
-        else:
-            if scale_type == {"per_channel"}:
-                A_scales = self._generate_scales((M,), torch.float32)
-                B_scales = self._generate_scales((N,), torch.float32)
-            else:
-                A_scales = self._generate_scales((1,), torch.float32)
-                B_scales = self._generate_scales((1,), torch.float32)
+        block_size = self._block_size(a_format, b_format)
+        A_scales = self._scale_for_format(
+            a_format,
+            "a",
+            M=M,
+            N=N,
+            K=K,
+            block_size=block_size,
+        )
+        B_scales = self._scale_for_format(
+            b_format,
+            "b",
+            M=M,
+            N=N,
+            K=K,
+            block_size=block_size,
+        )
 
         out_dtype = torch.bfloat16
         alpha = None

@@ -35,10 +35,12 @@ from transformers import LlamaConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -164,7 +166,7 @@ class LlamaAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         fused_kv_arg = None
-        if ctx.attn_backend.support_kv_cache_prewrite:
+        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
             n = q.shape[0]
             v_3d = v.view(n, self.num_kv_heads, self.head_dim)
             fused_kv_arg = create_fused_set_kv_buffer_arg(
@@ -185,17 +187,37 @@ class LlamaAttention(nn.Module):
                 output_q_rope=q_rope,
                 enable_pdl=pdl_enabled(),
             )
-            attn_output = self.attn(
-                q_rope,
-                None,
-                None,
-                save_kv_cache=False,
-                ctx=ctx,
-                out_cache_loc=out_cache_loc,
-            )
+            if ctx.draft_first_step_reduce:
+                # KV already written via fused_set_kv_buffer_arg above; slice Q
+                # to one query per request and route attn as decode.
+                q_rope = q_rope.index_select(0, ctx.gather_ids)
+                attn_output = ctx.attn_backend.forward(
+                    q_rope,
+                    None,
+                    None,
+                    self.attn,
+                    out_cache_loc,
+                    ctx.token_to_kv_pool,
+                    ForwardMode.DECODE,
+                    ctx.bs,
+                    save_kv_cache=False,
+                )
+            else:
+                attn_output = self.attn(
+                    q_rope,
+                    None,
+                    None,
+                    save_kv_cache=False,
+                    ctx=ctx,
+                    out_cache_loc=out_cache_loc,
+                )
         else:
             q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
+            if ctx.draft_first_step_reduce:
+                # KV written by self.attn above; slice attn_output so o_proj
+                # and the rest of the layer only run on the live rows.
+                attn_output = attn_output.index_select(0, ctx.gather_ids)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -361,6 +383,9 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
+        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
+            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
+            residual = residual.index_select(0, ctx.gather_ids)
 
         # Fused post-attn allreduce + norm (uses attn tp group)
         block_scale = None
@@ -426,6 +451,9 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
+        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
+            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
+            residual = residual.index_select(0, ctx.gather_ids)
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
         )
@@ -477,8 +505,16 @@ class Eagle3LlamaModel(BaseTransformerModel):
             else 3
         )
 
-        self.fc = torch.nn.Linear(
-            config.hidden_size * self.num_fc_input_dim, config.hidden_size
+        self.fc = ColumnParallelLinear(
+            config.hidden_size * self.num_fc_input_dim,
+            config.hidden_size,
+            bias=False,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
         )
 
     def forward(
@@ -508,8 +544,9 @@ class Eagle3LlamaModel(BaseTransformerModel):
 
         if hidden_states is None:
             raise ValueError("Eagle3 forward requires hidden_states")
-        if hidden_states.shape[-1] != embeds.shape[-1]:
-            hidden_states = self.fc(hidden_states)
+
+        if hidden_states.size(-1) != embeds.size(-1):
+            hidden_states, _ = self.fc(hidden_states)
 
         residual = None
         midlayer = self.midlayer
@@ -524,7 +561,9 @@ class Eagle3LlamaModel(BaseTransformerModel):
             fuse_embed_reduce=fuse_embed_reduce,
         )
 
-        if midlayer.comm_manager.should_fuse(hidden_states.shape[0]):
+        # Decide on pre-slice token count so this matches the path midlayer
+        # actually took; under draft reduce, hidden_states.shape[0] shrinks.
+        if midlayer.comm_manager.should_fuse(input_ids.shape[0]):
             hidden_states_to_logits, hidden_states_to_aux = hidden_states, residual
         else:
             hidden_states_to_logits, hidden_states_to_aux = self.norm(

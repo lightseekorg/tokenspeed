@@ -409,7 +409,7 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
             output=output,
             dtype=torch.bfloat16,
             features={"self_routing"},
-            traits={"weight_dtype": "mxfp4"},
+            weight_format="mxfp4",
             expected_kernel_name="flashinfer_trtllm_fp4_fused_moe",
         )[0]
 

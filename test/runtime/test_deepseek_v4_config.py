@@ -85,7 +85,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
     _DeepseekV4TopKBuffer,
-    _fp8_act_quant_dequant,
     deepseek_v4_rope_config,
     deepseek_v4_select_experts,
     hc_head,
@@ -2968,29 +2967,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(torch.equal(topk_ids, expected_ids))
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    @unittest.skipUnless(
-        current_platform().is_blackwell_plus,
-        "trtllm fp8_quantize_1x128 kernel layout requires sm100+",
-    )
-    def test_deepseek_v4_fp8_activation_quant_matches_reference(self):
-        x = torch.randn(5, 256, device="cuda", dtype=torch.bfloat16) * 3.0
-
-        actual = _fp8_act_quant_dequant(x, 128)
-
-        x_blocks = x.float().reshape(-1, x.shape[-1]).unflatten(-1, (-1, 128))
-        amax = x_blocks.abs().amax(dim=-1).clamp_min(1.0e-4)
-        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
-        scale = scale.to(torch.float8_e8m0fnu).float()
-        quantized = (
-            (x_blocks / scale.unsqueeze(-1))
-            .clamp(-448.0, 448.0)
-            .to(torch.float8_e4m3fn)
-        )
-        expected = (quantized.float() * scale.unsqueeze(-1)).flatten(-2).reshape_as(x)
-
-        self.assertTrue(torch.equal(actual, expected))
 
     def test_packed_topk_router_logits_recover_weights_after_softmax(self):
         topk_ids = torch.tensor([[3, 1], [2, 0]], dtype=torch.int32)

@@ -42,6 +42,12 @@ from tokenspeed_kernel.selection import (
     register_oracle,
     select_kernel,
 )
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +94,7 @@ FUSED_PRE_ROUTED = (
     "pre_routed"  # caller provides topk_weights/topk_ids (marlin, cutlass, reference)
 )
 
-# Weight format trait values — used via traits={"weight_dtype": ...}
+# Weight format values used by moe_fused(weight_format=...).
 WEIGHT_BF16 = "bf16"  # dense bfloat16 weights
 WEIGHT_FP8 = "fp8"  # FP8 block-scaled weights
 WEIGHT_MXFP4 = "mxfp4"  # MXFP4 block-scaled weights
@@ -116,6 +122,61 @@ EXPERTS_GEMM_COMBINE = (
 )
 
 
+_FP8_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(128, 128),
+)
+_NVFP4_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(16,),
+)
+_MXFP4_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(32,),
+)
+
+
+def _single_dense_tensor_format_signature(role: str, storage_dtype: torch.dtype):
+    return format_signature(**{role: dense_tensor_format(storage_dtype)})
+
+
+def _moe_dispatch_format_signature(storage_dtype: torch.dtype, traits: Optional[dict]):
+    comm_strategy = (traits or {}).get("comm_strategy")
+    if storage_dtype == torch.int32 or comm_strategy == "local":
+        return _single_dense_tensor_format_signature("indices", storage_dtype)
+    return _single_dense_tensor_format_signature("x", storage_dtype)
+
+
+def _moe_fused_format_signature(
+    storage_dtype: torch.dtype,
+    weight_format: str,
+):
+    if weight_format == WEIGHT_FP8:
+        weight = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE)
+    elif weight_format == WEIGHT_NVFP4:
+        weight = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
+    elif weight_format == WEIGHT_MXFP4:
+        weight = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
+    elif weight_format == WEIGHT_BF16:
+        weight = dense_tensor_format(torch.bfloat16)
+    else:
+        raise ValueError(f"Unsupported MoE fused weight_format={weight_format!r}")
+
+    if storage_dtype == torch.uint8 and weight_format == WEIGHT_NVFP4:
+        x = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
+    elif storage_dtype == torch.uint8 and weight_format == WEIGHT_MXFP4:
+        x = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
+    elif storage_dtype == torch.float8_e4m3fn:
+        x = tensor_format("scaled-fp8", storage_dtype, scale=_FP8_SCALE)
+    else:
+        x = dense_tensor_format(storage_dtype)
+
+    return format_signature(x=x, weight=weight)
+
+
 def moe_route(
     *args,
     dtype: torch.dtype = torch.bfloat16,
@@ -134,10 +195,11 @@ def moe_route(
     * ``{"biased": True/False}``: whether correction_bias is applied.
     * ``{"grouped": True/False}``: whether grouped expert selection is used.
     """
+    signature = _single_dense_tensor_format_signature("logits", dtype)
     kernel = select_kernel(
         "moe",
         "route",
-        dtype,
+        signature,
         features=frozenset(features) if features else None,
         traits=traits or {},
         expected_kernel_name=expected_kernel_name,
@@ -157,11 +219,13 @@ def moe_dispatch(
 
     Returns ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``.
     """
+    selection_traits = traits or {"comm_strategy": "local"}
+    signature = _moe_dispatch_format_signature(dtype, selection_traits)
     kernel = select_kernel(
         "moe",
         "dispatch",
-        dtype,
-        traits=traits or {"comm_strategy": "local"},
+        signature,
+        traits=selection_traits,
         expected_kernel_name=expected_kernel_name,
     )
 
@@ -189,10 +253,11 @@ def moe_experts(
     * ``{"dispatch_gemm"}``: gather/dispatch tokens then GEMM (uses gather_indx).
     * ``{"gemm_combine"}``: GEMM then scatter/combine results (uses scatter_indx).
     """
+    signature = _single_dense_tensor_format_signature("x", dtype)
     kernel = select_kernel(
         "moe",
         "experts",
-        dtype,
+        signature,
         features=frozenset(features) if features else None,
         traits=traits or {},
         expected_kernel_name=expected_kernel_name,
@@ -209,10 +274,11 @@ def moe_combine(
     **kwargs,
 ):
     """Combine expert outputs with weighted reduction."""
+    signature = _single_dense_tensor_format_signature("x", dtype)
     kernel = select_kernel(
         "moe",
         "combine",
-        dtype,
+        signature,
         traits=traits or {},
         expected_kernel_name=expected_kernel_name,
     )
@@ -224,6 +290,7 @@ def moe_fused(
     *args,
     dtype: torch.dtype = torch.bfloat16,
     features: Optional[Set[str]] = None,
+    weight_format: str = WEIGHT_BF16,
     traits: Optional[dict] = None,
     expected_kernel_name: Optional[str] = None,
     **kwargs,
@@ -235,18 +302,31 @@ def moe_fused(
     * ``{"self_routing"}``: kernel does routing internally (trtllm).
     * ``{"pre_routed"}``: routing already done by caller (cutlass, reference).
 
-    Weight format traits (pass via ``traits``):
+    Args:
+        weight_format: Weight tensor encoding used for the expert weights.
+            Supported values are:
 
-    * ``{"weight_dtype": "bf16"}``: dense bfloat16 weights.
-    * ``{"weight_dtype": "fp8"}``: FP8 block-scaled weights.
-    * ``{"weight_dtype": "mxfp4"}``: MXFP4 block-scaled weights.
+            * ``"bf16"``: dense bfloat16 weights with no scale tensor.
+            * ``"fp8"``: FP8 E4M3 weights with float32 block scales.
+              Fused MoE kernels currently register this as a fixed
+              ``block_shape=(128, 128)`` format.
+            * ``"mxfp4"``: packed MXFP4 weights stored as uint8 with uint8
+              block scales over 32-value blocks.
+            * ``"nvfp4"``: packed NVFP4 weights stored as uint8 with float32
+              block scales over 16-value blocks.
+
+            The activation/input format is selected by ``dtype``. When
+            ``dtype=torch.uint8``, ``weight_format`` disambiguates whether the
+            input is interpreted as MXFP4 or NVFP4.
     """
+    signature = _moe_fused_format_signature(dtype, weight_format)
+    selection_traits = dict(traits or {})
     kernel = select_kernel(
         "moe",
         "fused",
-        dtype,
+        signature,
         features=frozenset(features) if features else None,
-        traits=traits or {},
+        traits=selection_traits,
         expected_kernel_name=expected_kernel_name,
     )
 

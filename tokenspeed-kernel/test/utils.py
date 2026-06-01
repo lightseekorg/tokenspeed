@@ -24,7 +24,10 @@ from typing import Callable
 
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import KernelRegistry, register_kernel
+from tokenspeed_kernel.signature import FormatSignature, format_signatures
+
+SampleRegistration = tuple[dict, Callable]
 
 
 def dummy_impl(name: str) -> Callable:
@@ -35,17 +38,45 @@ def dummy_impl(name: str) -> Callable:
     return impl
 
 
-def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
-    specs: dict[str, tuple[KernelSpec, Callable]] = {}
+def _sample_registration(
+    name: str,
+    family: str,
+    mode: str,
+    solution: str,
+    signatures: frozenset[FormatSignature],
+    *,
+    features: frozenset[str] | None = None,
+    capability: CapabilityRequirement | None = None,
+    priority: int = 10,
+    tags: frozenset[str] | None = None,
+) -> SampleRegistration:
+    return (
+        {
+            "family": family,
+            "mode": mode,
+            "name": name,
+            "solution": solution,
+            "features": features,
+            "capability": capability,
+            "signatures": signatures,
+            "priority": priority,
+            "tags": tags,
+        },
+        dummy_impl(name),
+    )
 
-    specs["flashinfer_decode"] = (
-        KernelSpec(
-            name="flashinfer_decode",
-            family="attention",
-            mode="decode",
-            solution="flashinfer",
+
+def make_sample_specs() -> dict[str, SampleRegistration]:
+    return {
+        "flashinfer_decode": _sample_registration(
+            "flashinfer_decode",
+            "attention",
+            "decode",
+            "flashinfer",
+            format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ),
             features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(8, 0),
@@ -53,30 +84,26 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             priority=18,
             tags=frozenset({"latency"}),
         ),
-        dummy_impl("flashinfer_decode"),
-    )
-
-    specs["triton_decode"] = (
-        KernelSpec(
-            name="triton_decode",
-            family="attention",
-            mode="decode",
-            solution="triton",
+        "triton_decode": _sample_registration(
+            "triton_decode",
+            "attention",
+            "decode",
+            "triton",
+            format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ),
             features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
             priority=10,
             tags=frozenset({"portability"}),
         ),
-        dummy_impl("triton_decode"),
-    )
-
-    specs["cutlass_prefill"] = (
-        KernelSpec(
-            name="cutlass_prefill",
-            family="attention",
-            mode="prefill",
-            solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "cutlass_prefill": _sample_registration(
+            "cutlass_prefill",
+            "attention",
+            "prefill",
+            "cutlass",
+            format_signatures(
+                ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(9, 0),
@@ -84,48 +111,40 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             priority=16,
             tags=frozenset({"throughput"}),
         ),
-        dummy_impl("cutlass_prefill"),
-    )
-
-    specs["reference_decode"] = (
-        KernelSpec(
-            name="reference_decode",
-            family="attention",
-            mode="decode",
-            solution="reference",
+        "reference_decode": _sample_registration(
+            "reference_decode",
+            "attention",
+            "decode",
+            "reference",
+            format_signatures(
+                ("q", "k_cache", "v_cache"),
+                "dense",
+                {torch.float16, torch.bfloat16, torch.float32},
+            ),
             features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32}),
             capability=CapabilityRequirement(),
             priority=10,
             tags=frozenset({"determinism", "portability"}),
         ),
-        dummy_impl("reference_decode"),
-    )
-
-    specs["aiter_decode"] = (
-        KernelSpec(
-            name="aiter_decode",
-            family="attention",
-            mode="decode",
-            solution="aiter",
-            features=frozenset({"paged"}),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
-            capability=CapabilityRequirement(
-                vendors=frozenset({"amd"}),
+        "aiter_decode": _sample_registration(
+            "aiter_decode",
+            "attention",
+            "decode",
+            "aiter",
+            format_signatures(
+                ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
             ),
+            features=frozenset({"paged"}),
+            capability=CapabilityRequirement(vendors=frozenset({"amd"})),
             priority=16,
             tags=frozenset({"latency", "portability"}),
         ),
-        dummy_impl("aiter_decode"),
-    )
-
-    specs["cutlass_gemm"] = (
-        KernelSpec(
-            name="cutlass_gemm",
-            family="gemm",
-            mode="mm",
-            solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "cutlass_gemm": _sample_registration(
+            "cutlass_gemm",
+            "gemm",
+            "mm",
+            "cutlass",
+            format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(8, 0),
@@ -133,29 +152,21 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             priority=15,
             tags=frozenset({"throughput", "latency"}),
         ),
-        dummy_impl("cutlass_gemm"),
-    )
-
-    specs["triton_gemm"] = (
-        KernelSpec(
-            name="triton_gemm",
-            family="gemm",
-            mode="mm",
-            solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "triton_gemm": _sample_registration(
+            "triton_gemm",
+            "gemm",
+            "mm",
+            "triton",
+            format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             priority=10,
             tags=frozenset({"portability"}),
         ),
-        dummy_impl("triton_gemm"),
-    )
-
-    specs["cutlass_grouped_gemm"] = (
-        KernelSpec(
-            name="cutlass_grouped_gemm",
-            family="gemm",
-            mode="grouped_mm",
-            solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "cutlass_grouped_gemm": _sample_registration(
+            "cutlass_grouped_gemm",
+            "gemm",
+            "grouped_mm",
+            "cutlass",
+            format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(9, 0),
@@ -163,42 +174,34 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             priority=16,
             tags=frozenset({"throughput"}),
         ),
-        dummy_impl("cutlass_grouped_gemm"),
-    )
-
-    specs["triton_grouped_gemm"] = (
-        KernelSpec(
-            name="triton_grouped_gemm",
-            family="gemm",
-            mode="grouped_mm",
-            solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "triton_grouped_gemm": _sample_registration(
+            "triton_grouped_gemm",
+            "gemm",
+            "grouped_mm",
+            "triton",
+            format_signatures(("a", "b"), "dense", {torch.float16, torch.bfloat16}),
             priority=10,
             tags=frozenset({"portability"}),
         ),
-        dummy_impl("triton_grouped_gemm"),
-    )
-
-    specs["triton_fused_moe"] = (
-        KernelSpec(
-            name="triton_fused_moe",
-            family="moe",
-            mode="fused",
-            solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "triton_fused_moe": _sample_registration(
+            "triton_fused_moe",
+            "moe",
+            "fused",
+            "triton",
+            format_signatures(
+                ("x", "weight"), "dense", {torch.float16, torch.bfloat16}
+            ),
             priority=12,
             tags=frozenset({"throughput", "portability"}),
         ),
-        dummy_impl("triton_fused_moe"),
-    )
-
-    specs["cutlass_fused_moe"] = (
-        KernelSpec(
-            name="cutlass_fused_moe",
-            family="moe",
-            mode="fused",
-            solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "cutlass_fused_moe": _sample_registration(
+            "cutlass_fused_moe",
+            "moe",
+            "fused",
+            "cutlass",
+            format_signatures(
+                ("x", "weight"), "dense", {torch.float16, torch.bfloat16}
+            ),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(9, 0),
@@ -206,29 +209,21 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             priority=15,
             tags=frozenset({"latency", "throughput"}),
         ),
-        dummy_impl("cutlass_fused_moe"),
-    )
-
-    specs["triton_modular_moe"] = (
-        KernelSpec(
-            name="triton_modular_moe",
-            family="moe",
-            mode="modular",
-            solution="triton",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "triton_modular_moe": _sample_registration(
+            "triton_modular_moe",
+            "moe",
+            "modular",
+            "triton",
+            format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
             priority=10,
             tags=frozenset({"determinism", "portability"}),
         ),
-        dummy_impl("triton_modular_moe"),
-    )
-
-    specs["cutlass_modular_moe"] = (
-        KernelSpec(
-            name="cutlass_modular_moe",
-            family="moe",
-            mode="modular",
-            solution="cutlass",
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+        "cutlass_modular_moe": _sample_registration(
+            "cutlass_modular_moe",
+            "moe",
+            "modular",
+            "cutlass",
+            format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}),
                 min_arch_version=ArchVersion(8, 0),
@@ -236,12 +231,13 @@ def make_sample_specs() -> dict[str, tuple[KernelSpec, Callable]]:
             priority=14,
             tags=frozenset({"throughput"}),
         ),
-        dummy_impl("cutlass_modular_moe"),
-    )
-
-    return specs
+    }
 
 
-def register_all_samples(registry: KernelRegistry, specs: dict) -> None:
-    for spec, impl in specs.values():
-        registry.register(spec, impl)
+def register_all_samples(
+    registry: KernelRegistry, samples: dict[str, SampleRegistration]
+) -> None:
+    if registry is not KernelRegistry.get():
+        raise ValueError("sample registrations must target the active KernelRegistry")
+    for options, impl in samples.values():
+        register_kernel(**options)(impl)

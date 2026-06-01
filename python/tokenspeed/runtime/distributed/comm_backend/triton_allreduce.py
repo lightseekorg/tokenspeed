@@ -96,7 +96,6 @@ class TritonAllReduceBackend(CommBackend):
     def token_all_gather(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
@@ -105,7 +104,6 @@ class TritonAllReduceBackend(CommBackend):
     def token_reduce_scatter(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:

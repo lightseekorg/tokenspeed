@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import torch
-from tokenspeed_kernel.registry import KernelSpec
+from tokenspeed_kernel.signature import FormatSignature
 
 __all__ = [
     "InputGenerator",
@@ -52,6 +52,7 @@ class InputGenerator:
         dtype: torch.dtype,
         traits: dict,
         *,
+        format_signature: FormatSignature | None = None,
         device: str | None = None,
         seed: int = 42,
     ) -> None:
@@ -59,6 +60,7 @@ class InputGenerator:
         self.op_mode = op_mode
         self.dtype = dtype
         self.traits = traits
+        self.format_signature = format_signature
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         rng_device = "cuda" if self.device.startswith("cuda") else "cpu"
@@ -98,6 +100,7 @@ def get_input_generator(
     dtype: torch.dtype,
     traits: dict,
     *,
+    format_signature: FormatSignature | None = None,
     device: str | None = None,
     seed: int = 42,
 ) -> InputGenerator:
@@ -107,7 +110,15 @@ def get_input_generator(
         raise KeyError(
             f"No input generator registered for {op_family}.{op_mode}. Known: {known}"
         )
-    return factory(op_family, op_mode, dtype, traits, device=device, seed=seed)
+    return factory(
+        op_family,
+        op_mode,
+        dtype,
+        traits,
+        format_signature=format_signature,
+        device=device,
+        seed=seed,
+    )
 
 
 def get_standard_shapes(op_family: str, op_mode: str) -> list[dict[str, Any]]:

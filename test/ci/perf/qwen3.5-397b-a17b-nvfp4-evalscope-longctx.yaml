@@ -1,0 +1,87 @@
+api_version: ci.tokenspeed.io/v1
+name: perf-qwen3.5-397b-a17b-nvfp4-longctx
+type: perf
+triggers:
+  - manual
+runner:
+  labels:
+    - b200-8gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model nvidia/Qwen3.5-397B-A17B-NVFP4
+    --attn-tp-size 8
+    --moe-tp-size 8
+    --max-model-len 1048576
+    --hf-overrides '{"max_position_embeddings": 1048576}'
+    --max-num-seqs 4
+    --gpu-memory-utilization 0.8
+    --trust-remote-code
+    --attention-backend trtllm
+    --moe-backend flashinfer_trtllm
+    --kv-cache-dtype fp8_e4m3
+    --comm-fusion-max-num-tokens 4096
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --enable-cache-report
+    --weight-loader-prefetch-checkpoints
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+    - >-
+      mkdir -p /tmp/long-context-prompts &&
+      for len in 128k 256k 512k 1024k; do
+      f=/tmp/long-context-prompts/prompt_${len}.txt;
+      test -f "$f" ||
+      curl -fL
+      https://huggingface.co/datasets/lightseekorg/long-context/resolve/main/prompt_${len}.txt
+      -o "$f";
+      done
+  command: >-
+    REPO_ROOT=$PWD &&
+    PROMPTS_DIR=/tmp/long-context-prompts &&
+    OUTPUTS_DIR=/tmp/tokenspeed-longctx-perf &&
+    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" &&
+    MODEL=nvidia/Qwen3.5-397B-A17B-NVFP4 &&
+    URL=http://127.0.0.1:8000/v1/chat/completions &&
+    RUNS=3 &&
+    set +e &&
+    PERF_STATUS=0 &&
+    for run in $(seq 1 $RUNS); do
+    for len in 128k 256k 512k 1024k; do
+    echo "==================================================";
+    echo ">>> RUN ${run}/${RUNS}  |  prompt_len=${len}";
+    echo "==================================================";
+    /tmp/evalscope-perf/bin/evalscope perf
+    --parallel 1
+    --number 1
+    --model "$MODEL"
+    --url "$URL"
+    --api openai
+    --prompt "@${PROMPTS_DIR}/prompt_${len}.txt"
+    --max-tokens 1024
+    --min-tokens 1024
+    --outputs-dir "$OUTPUTS_DIR/run${run}/${len}"
+    --no-timestamp
+    --extra-args '{"ignore_eos": true, "temperature": 0.0}';
+    rc=$?;
+    if [ $rc -ne 0 ] && [ $PERF_STATUS -eq 0 ]; then PERF_STATUS=$rc; fi;
+    done;
+    done;
+    python3 "$REPO_ROOT/test/long_context_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR";
+    PARSE_STATUS=$?;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true

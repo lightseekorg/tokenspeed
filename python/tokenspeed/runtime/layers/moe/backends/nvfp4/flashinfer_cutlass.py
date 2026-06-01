@@ -128,8 +128,8 @@ class Nvfp4FlashinferCutlassBackend(MoEBackend):
             activation_type=ActivationType.Swiglu,
             dtype=x.dtype,
             features={"pre_routed"},
+            weight_format="nvfp4",
             traits={
-                "weight_dtype": "nvfp4",
                 "tp": True,
                 "ep": True,
                 "cuda_graph": False,

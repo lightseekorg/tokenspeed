@@ -34,7 +34,10 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import nan_guard_logits, write_output_logprobs
+from tokenspeed.runtime.sampling.utils import (
+    gather_token_logprobs_torch,
+    nan_guard_logits,
+)
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -182,8 +185,9 @@ class GreedySamplingBackend(SamplingBackend):
         tokens = cute_argmax(logits, out=self._sample_token_buf[:bs])
 
         if self.config.enable_output_logprobs:
-
-            write_output_logprobs(logits_output, logits, tokens)
+            logits_output.next_token_logprobs = gather_token_logprobs_torch(
+                logits, tokens
+            )
 
         return tokens, self._ones_buf[:bs]
 
@@ -206,16 +210,18 @@ class GreedySamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
+        logits = nan_guard_logits(
+            logits_output.next_token_logits, self.config.enable_nan_detection
+        )
+
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
-                logits=logits_output.next_token_logits,
+                logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = cute_argmax(logits_output.next_token_logits).reshape(
-            bs, num_tokens_per_req
-        )
+        target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
 
         _verify_chain_greedy(
             predicts=predict,
@@ -231,9 +237,8 @@ class GreedySamplingBackend(SamplingBackend):
         accept_length += 1
 
         if self.config.enable_output_logprobs:
-
-            write_output_logprobs(
-                logits_output, logits_output.next_token_logits, predict
+            logits_output.next_token_logprobs = gather_token_logprobs_torch(
+                logits, predict
             )
 
         return predict, accept_length

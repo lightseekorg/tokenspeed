@@ -147,8 +147,8 @@ class Fp8FlashinferCutlassBackend(MoEBackend):
             activation_type=ActivationType.Swiglu,
             dtype=x.dtype,
             features={"pre_routed"},
+            weight_format="fp8",
             traits={
-                "weight_dtype": "fp8",
                 "tp": self.spec.tp_size > 1,
                 "ep": self.spec.ep_size > 1,
                 "cuda_graph": False,

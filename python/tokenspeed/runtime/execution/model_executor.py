@@ -50,7 +50,7 @@ from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
-from tokenspeed.runtime.utils.env import envs, get_global_server_args
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -235,6 +235,12 @@ class ModelExecutor:
             )
             embed, head = self.model_runner.model.get_embed_and_head()
             draft_model_runner.model.set_embed_and_head(embed, head)
+            target_hf = self.model_runner.model_config.hf_config
+            mm_pad_substitute_id = getattr(
+                target_hf, "image_token_id", None
+            ) or getattr(target_hf, "media_placeholder_token_id", None)
+            if mm_pad_substitute_id is not None:
+                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
@@ -308,8 +314,9 @@ class ModelExecutor:
         _mm_model = self.model_runner.model
         if (
             hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            and getattr(_mm_model, "is_multimodal_active", True)
             and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and get_global_server_args().mm_attention_backend != "flashinfer_cudnn"
+            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
         ):
             self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
                 _mm_model.mapping
@@ -885,19 +892,22 @@ class ModelExecutor:
         # NCCL collectives. Idle ranks must match those collectives:
         # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
         if self.drafter is not None:
-            draft_ctx = ForwardContext(
-                attn_backend=self.drafter.attn_backend,
-                token_to_kv_pool=self.drafter.token_to_kv_pool,
-                req_to_page=self.drafter.req_to_page,
-                bs=0,
-                num_extends=0,
-                input_num_tokens=0,
-                forward_mode=ForwardMode.IDLE,
-                global_num_tokens=global_num_tokens,
-                global_bs=global_bs,
-                all_decode_or_idle=all_decode_or_idle,
-            )
-            for _ in range(self.drafter.spec_num_steps):
+            for step_idx in range(self.drafter.spec_num_steps):
+                # Mirror active rank's catch-up step: when all non-idle ranks
+                # are decoding, step 0 sizes collectives from bs/global_bs.
+                draft_ctx = ForwardContext(
+                    attn_backend=self.drafter.attn_backend,
+                    token_to_kv_pool=self.drafter.token_to_kv_pool,
+                    req_to_page=self.drafter.req_to_page,
+                    bs=0,
+                    num_extends=0,
+                    input_num_tokens=0,
+                    forward_mode=ForwardMode.IDLE,
+                    global_num_tokens=global_num_tokens,
+                    global_bs=global_bs,
+                    all_decode_or_idle=all_decode_or_idle,
+                    draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
+                )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
                     input_ids=empty,
