@@ -25,15 +25,22 @@ import dataclasses
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -165,6 +172,10 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
 
 
 class LogitsProcessor(nn.Module):
+
+    _LOGITS_AG_MAX_TOKENS = 128
+    _LOGITS_AG_STATE_UNINITIALIZED = object()
+
     def __init__(
         self,
         config,
@@ -187,6 +198,8 @@ class LogitsProcessor(nn.Module):
         assert tp_size == 1 or tp_group is not None
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
 
+        self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
+
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -198,6 +211,24 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
+    def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
+        if not current_platform().is_nvidia:
+            return None
+
+        if self.tp_size == 1 or self.skip_all_gather:
+            return None
+
+        vocab_padded = lm_head.weight.size(0) * self.tp_size
+        if vocab_padded % (self.tp_size * 8) != 0:
+            return None
+
+        return create_state(
+            group=pg_manager.get_process_group("nccl", self.tp_group),
+            rank_in_group=self.tp_rank,
+            max_tokens=self._LOGITS_AG_MAX_TOKENS,
+            hidden_size=vocab_padded,
+        )
 
     def forward(
         self,
@@ -399,19 +430,35 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.tp_size > 1 and not self.skip_all_gather:
-            gathered_logits = torch.empty(
-                self.tp_size * logits.size(0),
-                logits.size(1),
-                dtype=logits.dtype,
-                device=logits.device,
-            )
-            all_gather_into_tensor(gathered_logits, logits, self.tp_rank, self.tp_group)
-            logits = (
-                gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
-                .transpose(0, 1)
-                .contiguous()
-                .view(logits.size(0), -1)
-            )
+            if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
+                self._all_gather_state = self._init_all_gather_state(lm_head)
+
+            if (
+                self._all_gather_state is not None
+                and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS
+            ):
+                # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
+                logits = all_gather_inner(
+                    self._all_gather_state,
+                    logits,
+                    tp_hidden_dim=logits.size(-1) * self.tp_size,
+                    skip_entry_sync=True,
+                    safe=False,
+                )
+            else:
+                gathered_logits = torch.empty(
+                    self.tp_size * logits.size(0),
+                    logits.size(1),
+                    dtype=logits.dtype,
+                    device=logits.device,
+                )
+                all_gather_into_tensor(gathered_logits, logits, self.tp_group)
+                logits = (
+                    gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
+                    .transpose(0, 1)
+                    .contiguous()
+                    .view(logits.size(0), -1)
+                )
 
         logits = logits[:, : self.config.vocab_size].contiguous()
 

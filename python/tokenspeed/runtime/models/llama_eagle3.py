@@ -40,6 +40,7 @@ from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -504,8 +505,16 @@ class Eagle3LlamaModel(BaseTransformerModel):
             else 3
         )
 
-        self.fc = torch.nn.Linear(
-            config.hidden_size * self.num_fc_input_dim, config.hidden_size
+        self.fc = ColumnParallelLinear(
+            config.hidden_size * self.num_fc_input_dim,
+            config.hidden_size,
+            bias=False,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
         )
 
     def forward(
@@ -535,8 +544,9 @@ class Eagle3LlamaModel(BaseTransformerModel):
 
         if hidden_states is None:
             raise ValueError("Eagle3 forward requires hidden_states")
-        if hidden_states.shape[-1] != embeds.shape[-1]:
-            hidden_states = self.fc(hidden_states)
+
+        if hidden_states.size(-1) != embeds.size(-1):
+            hidden_states, _ = self.fc(hidden_states)
 
         residual = None
         midlayer = self.midlayer

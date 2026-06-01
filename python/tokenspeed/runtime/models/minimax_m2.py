@@ -327,7 +327,7 @@ def fused_qk_rmsnorm_triton(
     )
 
     if tp_size > 1:
-        sum_sq = all_reduce(sum_sq, tp_rank, tp_group)
+        sum_sq = all_reduce(sum_sq, tp_group)
 
     out1 = torch.empty_like(q)
     out2 = torch.empty_like(k)

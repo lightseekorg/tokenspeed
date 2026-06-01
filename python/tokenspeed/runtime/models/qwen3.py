@@ -288,9 +288,7 @@ class Qwen3DecoderLayer(nn.Module):
         elif (
             ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
         ):
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.dense.tp_rank, self.mapping.dense.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
             hidden_states, residual, *_ = (
@@ -312,9 +310,7 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.attn.tp_rank, self.mapping.attn.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
@@ -395,9 +391,7 @@ class Qwen3Model(nn.Module):
                 cos_sin=None,
             )
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(
-                hidden_states, self.mapping.dense.tp_rank, self.mapping.dense.tp_group
-            )
+            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             hidden_states, _ = self.norm(hidden_states, residual)
         else:
             hidden_states, *_ = self.norm.forward_with_allreduce_fusion(

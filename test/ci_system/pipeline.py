@@ -56,10 +56,25 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = ("linux-mi355",)
+GB200_RUNNER_PREFIXES = ("gb200",)
+NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
+PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
 
 def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
+
+
+def is_gb200_runner(runner: str) -> bool:
+    return runner.startswith(GB200_RUNNER_PREFIXES)
+
+
+def should_run_nvidia_gpu_cleanup(runner: str) -> bool:
+    return runner.startswith(NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES)
+
+
+def should_run_perf_diagnostics(task: Dict[str, Any], runner: str) -> bool:
+    return task["type"] == "perf" and runner in PERF_DIAGNOSTIC_RUNNERS
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -363,13 +378,20 @@ def setup_runner(
     local_env = dict(env)
     pgm: Optional[ProcessGroupManager] = None
 
-    if runner.startswith("gb200"):
+    if is_gb200_runner(runner):
         pgm = make_manager()
         local_env["CI_RUNNER_ID"] = pgm.runner_id
         print(f"[gb200] runner_id={pgm.runner_id}", flush=True)
 
         # Kill stale processes from previous run
         pgm.cleanup_stale(dry_run=dry_run)
+        shell_run(
+            "bash test/ci_system/cleanup_nvidia_gpu_state.sh",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+            check=False,
+        )
 
         venv_path = create_ci_venv_name(runner_name=pgm.runner_id)
 
@@ -407,6 +429,14 @@ def setup_runner(
         return local_env, pgm
 
     kill_stale_processes(local_env, cwd, dry_run)
+    if should_run_nvidia_gpu_cleanup(runner):
+        shell_run(
+            "bash test/ci_system/cleanup_nvidia_gpu_state.sh",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+            check=False,
+        )
     shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
     shell_run(
         "sudo apt-get install -y ninja-build",
@@ -465,6 +495,21 @@ def setup_runner(
             f"{Path(lib_path).parent}:{local_env.get('LD_LIBRARY_PATH', '')}"
         ).strip(":")
     return local_env, pgm
+
+
+def run_perf_diagnostics(
+    label: str,
+    env: Dict[str, str],
+    cwd: Path,
+    dry_run: bool,
+) -> None:
+    shell_run(
+        f"bash test/ci_system/diagnose_nvidia_state.sh {shlex.quote(label)}",
+        env=env,
+        cwd=cwd,
+        dry_run=dry_run,
+        check=False,
+    )
 
 
 def _read_ast(path: Path) -> ast.AST:
@@ -1294,6 +1339,7 @@ def execute_task(
     runner_env, pgm = setup_runner(
         runner, env, repo_root, dry_run, reuse_state=reuse_runner_state
     )
+    enable_perf_diagnostics = should_run_perf_diagnostics(task, runner)
     stages_run: List[str] = []
     command_results: List[Dict[str, Any]] = []
     eval_score_check: Dict[str, Any] | None = None
@@ -1302,9 +1348,15 @@ def execute_task(
     server_log_path: Path | None = None
 
     try:
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("before stages", runner_env, repo_root, dry_run)
         for stage_name, stage_payload in stages:
             stages_run.append(stage_name)
             if stage_name == "server":
+                if enable_perf_diagnostics:
+                    run_perf_diagnostics(
+                        "before server", runner_env, repo_root, dry_run
+                    )
                 server_log_path = repo_root / ".ci-artifacts" / "server.log"
                 server_log_path.parent.mkdir(parents=True, exist_ok=True)
                 if not dry_run:
@@ -1333,8 +1385,16 @@ def execute_task(
                         dry_run,
                     )
                 poll_readiness(stage_payload["ready"], dry_run)
+                if enable_perf_diagnostics:
+                    run_perf_diagnostics(
+                        "after server ready", runner_env, repo_root, dry_run
+                    )
                 continue
             for command in stage_payload:
+                if enable_perf_diagnostics and stage_name == "perf":
+                    run_perf_diagnostics(
+                        "before perf command", runner_env, repo_root, dry_run
+                    )
                 if pgm is not None:
                     command_result = pgm.run(
                         command,
@@ -1353,6 +1413,10 @@ def execute_task(
                     )
                 )
                 command_results.append(command_result)
+                if enable_perf_diagnostics and stage_name == "perf":
+                    run_perf_diagnostics(
+                        "after perf command", runner_env, repo_root, dry_run
+                    )
 
         eval_accept_rate = summarize_eval_accept_rate(
             task, command_results, stages_run, server_log_path
@@ -1412,12 +1476,16 @@ def execute_task(
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         if pgm is not None:
             pgm.terminate_all(dry_run=dry_run)
         else:
             stop_server(server_process)
         if not keep_runner_state:
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
