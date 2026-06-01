@@ -30,31 +30,24 @@ from tokenspeed_kernel._triton import (  # noqa: F401  (kept for parity)
     tl,
     triton,
 )
-
-# Trigger the redirect that aliases ``triton`` -> ``tokenspeed_triton`` for
-# upstream ``triton_kernels`` imports below. This must run before any
-# ``triton_kernels.*`` imports.
-with redirect_triton_to_tokenspeed_triton():
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
     format_signature,
-    format_signatures,
     tensor_format,
 )
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.experimental.gluon import language as gl
 from tokenspeed_triton.language.core import _aggregate as aggregate
-from triton_kernels.matmul import FnSpecs, FusedActivation
-from triton_kernels.matmul import matmul as _upstream_matmul
-from triton_kernels.swiglu import swiglu_fn
-from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
-from triton_kernels.tensor import Tensor as _UpstreamWrappedTensor  # noqa: F401
+
+with redirect_triton_to_tokenspeed_triton():
+    from triton_kernels.matmul import FnSpecs, FusedActivation
+    from triton_kernels.matmul import matmul as _upstream_matmul
+    from triton_kernels.swiglu import swiglu_fn
+    from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
+    from triton_kernels.tensor import Tensor as _UpstreamWrappedTensor  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Env knob
@@ -139,32 +132,67 @@ def composition(cls):
 _DEFAULT_NUM_BUFFERS = 2
 
 
-def _default_num_buffers(K: int, block_k: int) -> int:
-    """K-iter-aware default for the LDS prefetch ring depth.
+_CDNA4_LDS_BYTES = 160 * 1024
+_CDNA4_LDS_BUDGET_BYTES = 158 * 1024
 
-    The pipeline pre-loop fires ``NB-1`` K-iters worth of async copies
-    before entering the main loop, then each main iter fires +1 and
-    waits for the oldest to drain (``async_wait(NB-1)``). This implies
-    ``K_iters = ceil(K, BLOCK_K) >= NB`` -- below that the pre-loop
-    issues past the K boundary and the kernel reads garbage / faults.
 
-    Production decode/prefill dispatch+combine on gpt-oss-120b have
-    ``K_iters = 12`` (K=2880, BK=256) so any reasonable NB fits;
-    bench unit tests with K=128 BK=128 (K_iters=1) need NB=2.
-    """
+def _estimate_pipeline_lds_per_buffer(
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    x_format: str,
+    w_format: str = "e2m1",
+    has_x_block_scale: bool | None = None,
+    has_w_block_scale: bool = True,
+    scale_load_mode: str = "transpose",
+) -> int:
+    if has_x_block_scale is None:
+        has_x_block_scale = x_format == "e2m1"
+    x_bytes = block_m * block_k
+    if x_format == "e2m1":
+        x_bytes //= 2
+    w_bytes = block_n * block_k
+    if w_format == "e2m1":
+        w_bytes //= 2
+    scale_bytes = 0
+    if scale_load_mode != "bypass":
+        if has_x_block_scale:
+            scale_bytes += block_m * (block_k // 32)
+        if has_w_block_scale:
+            scale_bytes += block_n * (block_k // 32)
+    return x_bytes + w_bytes + scale_bytes
+
+
+def _default_num_buffers(
+    K: int,
+    block_k: int,
+    *,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    x_format: str = "e2m1",
+    w_format: str = "e2m1",
+    has_x_block_scale: bool | None = None,
+    has_w_block_scale: bool = True,
+    scale_load_mode: str = "transpose",
+) -> int:
     K_iters = max(1, (K + block_k - 1) // block_k)
-    # Bump default to 3 when there are enough K-iters to fill the
-    # extra pipeline slot. Empirically (sweep on gpt-oss-120b decode
-    # H=I=2880 BS=1..32 fp8 W_VIA_VGPR + scale_swizzle): NB=3 helps
-    # dispatch BS=16 (-1.5%) / BS=32 (-3.8%) and combine BS=1 (-10.8%);
-    # is neutral or +1-5% on combine BS=4..32 (vgpr 151 -> 218, occ
-    # 3 -> 2 on combine -- the larger M values are saturated CTAs
-    # where occupancy matters more than per-iter pipeline). Net is
-    # ~tied or slightly +ve aggregated across BS, with a clear win
-    # at BS=1 (the bs=1 cuda graph capture batch).
-    if K_iters >= 3:
-        return 3
-    return 2
+    nb = 3 if K_iters >= 3 else 2
+    if block_m is not None and block_n is not None:
+        per_buf = _estimate_pipeline_lds_per_buffer(
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            x_format=x_format,
+            w_format=w_format,
+            has_x_block_scale=has_x_block_scale,
+            has_w_block_scale=has_w_block_scale,
+            scale_load_mode=scale_load_mode,
+        )
+        if per_buf > 0:
+            max_nb = max(1, _CDNA4_LDS_BUDGET_BYTES // per_buf)
+            nb = min(nb, max_nb)
+    return nb
 
 
 _CDNA4_NUM_CUS = 256
@@ -3938,7 +3966,7 @@ def _autotune_block(
     Tiers off logical ``M`` and the per-expert ``slice_size`` hint;
     ``BLOCK_K`` must be a multiple of 128 (MFMA 16x16x128).
     """
-    del do_swiglu, ragged
+    del ragged
     is_fp8 = x_format == "e4m3"
     if slice_size is not None and slice_size <= 16:
         # tinny ragged decode
@@ -3950,18 +3978,32 @@ def _autotune_block(
         bm, bn, bk, nw = 64, 128, 512, 8
     elif is_fp8:
         # fp8 X is 1 byte/elem (lower VGPR pressure); prefill promotes
-        # to (128, 256, 256, NW=4) -- sliceMN sweet spot.
+        # to (128, 256, 256, NW=4) -- sliceMN sweet spot for dispatch.
         if M <= 8192:
-            bm, bn, bk, nw = 64, 256, 128, 8
-        else:
+            # combine + W_VIA_VGPR requires NW=4 (LinearLayout bases);
+            # dispatch tolerates NW=8 since OUT_BLOCK_N halving sidesteps
+            # the BN=256 / SLICE_N constraint at the BN=256 tile.
+            bm, bn, bk, nw = (64, 256, 128, 8) if do_swiglu else (64, 256, 128, 4)
+        elif do_swiglu:
+            # dispatch+swiglu writes BLOCK_N//2 so the W_VIA_VGPR
+            # LinearLayout static_assert (expects BN=128 or
+            # USE_SLICE_N) is satisfied via OUT_BLOCK_N halving.
             bm, bn, bk, nw = 128, 256, 128, 4
+        else:
+            # combine path: keep BN=256 throughput but force BM<=64
+            # so ``_resolve_use_slice_n`` enables USE_SLICE_N=True
+            # (half-tile path), which the W_VIA_VGPR static_assert
+            # explicitly accepts. NW=4 also required.
+            bm, bn, bk, nw = 64, 256, 128, 4
     else:
         # mxfp4 X dequant adds VGPR pressure; same sliceMN sweet spot
         # at the prefill tier.
         if M <= 8192:
             bm, bn, bk, nw = 64, 256, 256, 4
-        else:
+        elif do_swiglu:
             bm, bn, bk, nw = 128, 256, 256, 4
+        else:
+            bm, bn, bk, nw = 64, 256, 256, 4
     # Clamp tile to actual shape (avoid over-tile + NaN-padded
     # reduction on tiny test shapes).
     bm = max(_MFMA_M, min(bm, _round_up_int(M, _MFMA_M)))
@@ -4165,7 +4207,19 @@ def gluon_mxfp_dispatch_swiglu(
     block_k = block_k or bk
     num_warps = num_warps or nw
     num_buffers = (
-        num_buffers if num_buffers is not None else _default_num_buffers(K, block_k)
+        num_buffers
+        if num_buffers is not None
+        else _default_num_buffers(
+            K,
+            block_k,
+            block_m=block_m,
+            block_n=block_n,
+            x_format=x_format,
+            w_format="e2m1",
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            scale_load_mode=scale_load_mode,
+        )
     )
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
@@ -4276,7 +4330,19 @@ def gluon_mxfp_combine(
     block_k = block_k or bk
     num_warps = num_warps or nw
     num_buffers = (
-        num_buffers if num_buffers is not None else _default_num_buffers(K, block_k)
+        num_buffers
+        if num_buffers is not None
+        else _default_num_buffers(
+            K,
+            block_k,
+            block_m=block_m,
+            block_n=block_n,
+            x_format=x_format,
+            w_format="e2m1",
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            scale_load_mode=scale_load_mode,
+        )
     )
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False

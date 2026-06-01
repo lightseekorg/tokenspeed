@@ -124,6 +124,8 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
+        import os
+
         if not isinstance(quant_config, Mxfp4Config):
             return False
         if should_ignore_quant_layer(
@@ -136,6 +138,15 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
             return False
         if not current_platform().is_amd:
             return False
+        if os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "disable",
+            "disabled",
+        }:
+            return False
         return spec.ep_size <= 1 and spec.activation in {"silu", "swiglu"}
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
@@ -146,10 +157,6 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
         w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
         layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
-
-        # Pre-pad w2 along N before swizzle so the gluon W_VIA_VGPR path can
-        # drop its n-mask.
-        _pad_w2_to_block_n(layer, _GLUON_COMBINE_BLOCK_N)
 
         num_warps = 8
         w13_weight, w13_flex, w13_scale = swizzle_mxfp4(
@@ -206,8 +213,6 @@ class Mxfp4GluonKernelBackend(Mxfp4TritonKernelBackend):
         layer.w2_weight_triton_tensor = w2_weight
         del layer.w13_weight
         del layer.w2_weight
-
-        _attach_gluon_bpreshuffle(layer)
 
         torch.cuda.empty_cache()
 
