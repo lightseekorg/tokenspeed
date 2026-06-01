@@ -61,28 +61,12 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
 
 
-def _swa_block_table(metadata: DeepseekV4ForwardMetadata) -> torch.Tensor:
-    cache_metadata = metadata.cache
-    return (
-        cache_metadata.swa_block_table
-        if cache_metadata.swa_block_table is not None
-        else cache_metadata.block_table
-    )
-
-
 def _compressed_block_table_base_offsets(
     metadata: DeepseekV4ForwardMetadata,
     compress_ratio: int,
 ) -> torch.Tensor | None:
     return metadata.cache.paged_cache_block_table_base_offsets.get(
         v4_compressed_kv_group_id(compress_ratio)
-    )
-
-
-def _cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.pad(
-        torch.cumsum(lengths.to(torch.int32), dim=0, dtype=torch.int32),
-        (1, 0),
     )
 
 
@@ -480,7 +464,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 req_pool_indices=prefill_metadata.req_pool_indices,
                 seq_lens=decode_seq_lens,
                 query_lens=query_lens,
-                query_start_loc=_cu_seqlens(query_lens),
+                query_start_loc=torch.nn.functional.pad(
+                    torch.cumsum(
+                        query_lens.to(torch.int32),
+                        dim=0,
+                        dtype=torch.int32,
+                    ),
+                    (1, 0),
+                ),
                 token_to_req_indices=token_to_req,
                 cache=prefill_metadata.cache,
                 is_valid_token=decode_is_valid_token,
@@ -770,7 +761,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
-            block_table=_swa_block_table(metadata),
+            block_table=(
+                cache_metadata.swa_block_table
+                if cache_metadata.swa_block_table is not None
+                else cache_metadata.block_table
+            ),
             block_table_base_offsets=cache_metadata.swa_base_logical_page,
             window_size=window_size,
             block_size=block_size,

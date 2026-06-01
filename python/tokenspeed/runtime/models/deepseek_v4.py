@@ -63,14 +63,10 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.trtllm import (
     fast_topk_v2,
 )
-from tokenspeed_kernel.thirdparty.trtllm import (
-    per_token_group_quant_8bit as trtllm_fp8_quantize_1x128,
-)
 from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_FP8_BLOCK_SIZE,
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
     deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
     deepseek_v4_indexer_mxfp4_scale_dim,
@@ -230,63 +226,6 @@ def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tenso
         .repeat_interleave(block_k, dim=2)
     )
     return weight.float() * expanded_scale[:, :out_dim, :in_dim]
-
-
-def _fp8_act_quant_dequant(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
-    if x.shape[-1] % block_size != 0:
-        raise ValueError(
-            f"DeepSeek V4 FP8 activation quantization expects K divisible by "
-            f"{block_size}, got {x.shape[-1]}"
-        )
-    orig_shape = x.shape
-
-    if x.is_cuda and block_size == DEEPSEEK_V4_FP8_BLOCK_SIZE:
-        x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
-        quantized, scale = trtllm_fp8_quantize_1x128(
-            x_2d,
-            block_size,
-            use_ue8m0=True,
-        )
-        scale = scale.float().transpose(0, 1).contiguous()
-        return (
-            (quantized.float().unflatten(-1, (-1, block_size)) * scale.unsqueeze(-1))
-            .flatten(-2)
-            .reshape(orig_shape)
-        )
-
-    x_blocks = x.float().reshape(-1, orig_shape[-1]).unflatten(-1, (-1, block_size))
-    amax = x_blocks.abs().amax(dim=-1).clamp_min(1.0e-4)
-    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
-    scale = scale.to(torch.float8_e8m0fnu).float()
-    quantized = (
-        (x_blocks / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    )
-    return (quantized.float() * scale.unsqueeze(-1)).flatten(-2).reshape(orig_shape)
-
-
-def _fp8_linear(
-    layer: nn.Module,
-    x: torch.Tensor,
-    shape: tuple[int, ...],
-    *,
-    quantize_act: bool = True,
-) -> torch.Tensor:
-    if (
-        x.is_cuda
-        and layer.weight.dtype == torch.float8_e4m3fn
-        and hasattr(layer, "quant_method")
-        and getattr(layer.quant_method, "block_quant", False)
-    ):
-        output, _ = layer(x, output_dtype=x.dtype)
-        return output
-
-    weight = _dequant_fp8_weight(layer, shape)
-    x_eff = (
-        _fp8_act_quant_dequant(x, DEEPSEEK_V4_FP8_BLOCK_SIZE)
-        if quantize_act and layer.weight.dtype == torch.float8_e4m3fn
-        else x.float()
-    )
-    return torch.matmul(x_eff, weight.transpose(-2, -1)).to(x.dtype)
 
 
 def _deepseek_v4_router_gemm(

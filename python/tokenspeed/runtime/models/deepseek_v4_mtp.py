@@ -50,7 +50,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Compressor,
     DeepseekV4DecoderLayer,
     DeepseekV4MegaMoEExperts,
-    _fp8_linear,
     hc_head,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -171,17 +170,9 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
             -1, self.hc_mult, self.config.hidden_size
         )
         previous_hidden_states = self.hnorm(previous_hidden_states)
-        hidden_states = _fp8_linear(
-            self.h_proj,
-            previous_hidden_states,
-            (self.h_proj.output_size, self.h_proj.input_size),
-        ) + _fp8_linear(
-            self.e_proj,
-            input_embeds,
-            (self.e_proj.output_size, self.e_proj.input_size),
-        ).unsqueeze(
-            -2
-        )
+        h_out, _ = self.h_proj(previous_hidden_states)
+        e_out, _ = self.e_proj(input_embeds)
+        hidden_states = h_out + e_out.unsqueeze(-2)
 
         return self.mtp_block(
             positions,
