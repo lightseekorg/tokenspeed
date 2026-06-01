@@ -52,8 +52,6 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
-    should_disable_prefix_cache,
-    should_enable_mixed_prefill_decode,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -305,24 +303,9 @@ class EventLoop:
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         self._paged_cache_groups = paged_cache_groups
-        enable_mixed_prefill_decode = should_enable_mixed_prefill_decode(
-            enable_mixed_batch=server_args.enable_mixed_batch,
-            speculative_algorithm=server_args.speculative_algorithm,
-            paged_cache_groups=paged_cache_groups,
-        )
-        disable_prefix_cache = should_disable_prefix_cache(
-            server_args.enable_prefix_caching,
-            paged_cache_groups,
-        )
-        if paged_cache_groups and server_args.enable_prefix_caching:
-            logger.warning(
-                "Disabling scheduler prefix cache because this KV pool uses "
-                "request-local paged cache groups. Prefix-cache reuse must "
-                "also restore those group caches before it is safe here."
-            )
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
-        if required_groups is not None and not disable_prefix_cache:
+        if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
@@ -340,14 +323,14 @@ class EventLoop:
                 if server_args.speculative_algorithm is not None
                 else 1
             ),
-            disable_prefix_cache=disable_prefix_cache,
+            disable_prefix_cache=not server_args.enable_prefix_caching,
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             enable_mamba_l2=server_args.enable_mamba_l2,
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
-            enable_mixed_prefill_decode=enable_mixed_prefill_decode,
+            enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(

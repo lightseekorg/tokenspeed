@@ -163,36 +163,6 @@ def pool_to_prefix_cache_adjunct_spec(
     return spec
 
 
-def should_disable_prefix_cache(
-    enable_prefix_caching: bool,
-    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
-) -> bool:
-    """Return the scheduler prefix-cache setting for the current cache layout.
-
-    The scheduler prefix cache currently owns only the ordinary KV page table.
-    Extra paged cache groups are request-local; a prefix hit would skip model
-    execution for prefix tokens without restoring those group caches.
-    """
-    return (not enable_prefix_caching) or bool(paged_cache_groups)
-
-
-def should_enable_mixed_prefill_decode(
-    *,
-    enable_mixed_batch: bool,
-    speculative_algorithm: Any | None,
-    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
-) -> bool:
-    """Return whether mixed prefill/decode can be enabled safely.
-
-    V4 paged-cache groups are request-local and currently have no mixed-batch
-    speculative contract. Keep the guard scoped to that layout so non-V4
-    speculative backends retain their previous scheduler behavior.
-    """
-    return bool(enable_mixed_batch) and not (
-        speculative_algorithm is not None and bool(paged_cache_groups)
-    )
-
-
 def should_use_overlap_schedule(
     *,
     disable_overlap_schedule: bool,

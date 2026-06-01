@@ -685,7 +685,7 @@ class CudaGraphWrapper:
             # decode metadata must alias that buffer.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
-            if forward_mode == ForwardMode.EXTEND or forward_mode.is_mixed():
+            if forward_mode.is_extend_or_mixed():
                 # Non-V4 draft backends follow the legacy contract: a single
                 # EXTEND/MIXED metadata init fills both first-step prefill
                 # metadata and step 1+ decode metadata, with seq_lens aliased

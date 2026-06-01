@@ -473,6 +473,15 @@ def _mask_invalid_graph_tokens(
     return torch.where(valid, slot_mapping, torch.full_like(slot_mapping, -1))
 
 
+def _compressed_boundary_mask(
+    positions: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor:
+    if compress_ratio <= 1:
+        return torch.ones_like(positions, dtype=torch.bool)
+    return ((positions.to(torch.int64) + 1) % compress_ratio) == 0
+
+
 @dataclass
 class DeepseekV4CacheMetadata:
     page_size: int
@@ -573,8 +582,12 @@ class DeepseekV4CacheMetadata:
                     )[req_idx]
                 )
             page_ids = _safe_page_ids(block_table, req_idx, page_indices)
+            valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
+                positions,
+                compress_ratio,
+            )
             slot_mapping = torch.where(
-                page_ids >= 0,
+                valid_slots,
                 page_ids * kv_cache_block_size + offsets,
                 torch.full_like(page_ids, -1),
             )
@@ -676,8 +689,12 @@ class DeepseekV4CacheMetadata:
                 )
             page_ids = _safe_page_ids(block_table, req_idx, page_indices.long())
         slots = page_ids.to(torch.int64) * kv_cache_block_size + offsets
+        valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
+            positions,
+            compress_ratio,
+        )
         slot_mapping = torch.where(
-            page_ids >= 0,
+            valid_slots,
             slots,
             torch.full_like(slots, -1),
         )

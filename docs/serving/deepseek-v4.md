@@ -90,11 +90,10 @@ the draft-extend/prefill metadata and refresh `decode_swa_indices`/`decode_swa_l
 after each accepted-prefix advance; otherwise later draft steps can read stale or
 out-of-range SWA rows.
 
-Scheduler prefix caching is disabled automatically for KV pools with these
-paged cache groups. The current scheduler prefix cache reuses ordinary KV pages
-only; it does not restore SWA, compressed KV, compressor state, or CSA indexer
-group pages for prefix-hit requests, so enabling it would let V4 skip tokens
-whose group cache state is not actually populated.
+Do not enable scheduler prefix caching for V4 MTP yet. The current scheduler
+prefix cache reuses ordinary KV pages only; it does not restore SWA, compressed
+KV, compressor state, or CSA indexer group pages for prefix-hit requests, so a
+prefix hit could skip tokens whose group cache state is not actually populated.
 
 SWA cache insert slot mappings are validated against the current SWA group cache
 capacity before invoking fused cache writers. Multi-step MTP can carry padded or
@@ -102,11 +101,11 @@ draft-tail slot entries that are valid as ignored tokens but not valid physical
 SWA cache locations; these entries must stay negative or be masked before the
 writer touches paged cache memory.
 
-The overlapped scheduler loop is also disabled automatically when speculative
-decoding is combined with V4 paged cache groups. MTP advances each request by
-the sampled accepted length, not by a fixed verify width; the next target-verify
-step must therefore wait for the scheduler to observe the previous accepted
-length before it builds group block tables and base logical-page offsets.
+Do not enable mixed prefill/decode batches for V4 MTP yet. MTP advances each
+request by the sampled accepted length, not by a fixed verify width; the next
+target-verify step must therefore wait for the scheduler to observe the previous
+accepted length before it builds group block tables and base logical-page
+offsets.
 
 ## Hardware / dependency requirements
 

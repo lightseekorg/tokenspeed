@@ -284,6 +284,12 @@ class ModelConfig:
         else:
             self.attention_arch = AttentionArch.MHA
 
+        self.use_target_verify_forward_mode = (
+            getattr(server_args, "speculative_algorithm", None) is not None
+            and not is_draft_worker
+            and is_deepseek_v4(self.hf_config)
+        )
+
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None

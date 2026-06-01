@@ -41,9 +41,6 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4_nextn,
 )
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.engine.scheduler_utils import (
-    should_enable_mixed_prefill_decode,
-)
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
     _draft_decode_forward_mode,
@@ -279,29 +276,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 has_drafter=True, use_target_verify=True
             ),
             ForwardMode.TARGET_VERIFY,
-        )
-
-    def test_mixed_prefill_decode_guard_is_v4_paged_cache_specific(self):
-        self.assertTrue(
-            should_enable_mixed_prefill_decode(
-                enable_mixed_batch=True,
-                speculative_algorithm="EAGLE3",
-                paged_cache_groups=[],
-            )
-        )
-        self.assertFalse(
-            should_enable_mixed_prefill_decode(
-                enable_mixed_batch=True,
-                speculative_algorithm="MTP",
-                paged_cache_groups=[object()],
-            )
-        )
-        self.assertFalse(
-            should_enable_mixed_prefill_decode(
-                enable_mixed_batch=False,
-                speculative_algorithm=None,
-                paged_cache_groups=[],
-            )
         )
 
     def test_model_runner_forwards_supported_spec_step_idx(self):
@@ -1982,7 +1956,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=page256_metadata.seq_lens,
             kv_cache_block_size=64,
         )
-        self.assertTrue(torch.equal(slots, torch.tensor([383, 384, 447])))
+        self.assertTrue(torch.equal(slots, torch.tensor([383, -1, 447])))
 
         grouped_metadata = _make_deepseek_v4_forward_metadata(
             page_size=256,
@@ -2006,7 +1980,18 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=grouped_metadata.seq_lens,
             kv_cache_block_size=64,
         )
-        self.assertTrue(torch.equal(slots, torch.tensor([1343, 1344, 1407, -1, 1921])))
+        self.assertTrue(torch.equal(slots, torch.tensor([1343, -1, 1407, -1, -1])))
+
+        decode_slots = grouped_metadata.cache._update_decode_compressed_slot_mapping(
+            token_to_req_indices=grouped_metadata.token_to_req_indices,
+            query_start_loc=grouped_metadata.query_start_loc,
+            seq_lens=grouped_metadata.seq_lens,
+            compress_ratio=4,
+            kv_cache_block_size=64,
+        )
+        self.assertTrue(
+            torch.equal(decode_slots[:5], torch.tensor([-1, -1, 1354, -1, -1]))
+        )
 
     def test_deepseek_v4_group_slot_mapping_from_raw(self):
         block_table = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
