@@ -179,7 +179,6 @@ class NcclBackend(CommBackend):
     def token_all_gather(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
@@ -216,7 +215,6 @@ class NcclBackend(CommBackend):
     def token_reduce_scatter(
         self,
         tensor: torch.Tensor,
-        rank: int,
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
@@ -245,4 +243,5 @@ class NcclBackend(CommBackend):
         torch.distributed.reduce_scatter_tensor(
             output, padded_input.contiguous(), group=res["device_group"]
         )
+        rank = group.index(torch.distributed.get_rank())
         return output[: scattered_num_tokens[rank]].contiguous()

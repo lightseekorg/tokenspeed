@@ -35,6 +35,7 @@ __all__ = [
     "get_token_dist",
     "reduce_scatter",
     "all_gather",
+    "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
     "allreduce_residual_rmsnorm",
@@ -1292,3 +1293,198 @@ def all_gather(
             token_list_in_group=token_list_in_group,
             safe=safe,
         )
+
+
+INNER_AG_NUMEL_PER_THREAD = 8
+
+
+@triton.jit
+def nvidia_rsag_all_gather_kernel_inner(
+    input_ptr,
+    multicast_ptr,
+    signal_pad_ptr,
+    total_tokens,
+    hidden_offset,
+    LOCAL_HIDDEN: tl.constexpr,
+    TOTAL_HIDDEN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    SKIP_ENTRY_SYNC: tl.constexpr,
+) -> None:
+    if SKIP_ENTRY_SYNC == 0:
+        blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="relaxed")
+        sync_threads()
+
+    chunks_per_row: tl.constexpr = LOCAL_HIDDEN // NUMEL_PER_THREAD
+    total_hidden_chunks: tl.constexpr = TOTAL_HIDDEN // NUMEL_PER_THREAD
+    hidden_offset_chunks = hidden_offset // NUMEL_PER_THREAD
+    total_chunks = total_tokens * chunks_per_row
+
+    pid = tl.program_id(axis=0)
+    tid = get_flat_tid()
+    block_start = pid * BLOCK_SIZE
+
+    while block_start < total_chunks:
+        chunk = block_start + tid
+        mask = chunk < total_chunks
+        row = chunk // chunks_per_row
+        col_chunk = chunk % chunks_per_row
+
+        in_ptr = input_ptr.to(tl.pointer_type(tl.uint64)) + chunk * 2
+        out_chunk = row * total_hidden_chunks + hidden_offset_chunks + col_chunk
+        out_ptr = (
+            multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint64)) + out_chunk * 2
+        )
+        x, y, z, w = local_ld_128(in_ptr, mask)
+        multimem_st_128(out_ptr, x, y, z, w, mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+    sync_threads()
+    blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="acq_rel")
+
+
+def nvidia_rsag_multimem_all_gather_inner(
+    state: TritonCommState,
+    hidden_states: torch.Tensor,
+    total_tokens: int,
+    local_hidden: int,
+    hidden_offset: int,
+    skip_entry_sync: bool,
+) -> None:
+    num_elts = total_tokens * local_hidden
+    num_blocks, block_size, num_warps, numel_per_thread = nvidia_rsag_get_launch_config(
+        num_elts
+    )
+    symm_mem_hdl = symm_mem.rendezvous(state.comm_buff, group=state.group)
+    assert state.rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
+    grid = (num_blocks, 1, 1)
+    nvidia_rsag_all_gather_kernel_inner[grid](
+        input_ptr=hidden_states,
+        multicast_ptr=symm_mem_hdl.multicast_ptr,
+        signal_pad_ptr=symm_mem_hdl.signal_pad_ptrs_dev,
+        total_tokens=total_tokens,
+        hidden_offset=hidden_offset,
+        LOCAL_HIDDEN=local_hidden,
+        TOTAL_HIDDEN=state.hidden_dim,
+        BLOCK_SIZE=block_size,
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=symm_mem_hdl.world_size,
+        SKIP_ENTRY_SYNC=1 if skip_entry_sync else 0,
+        num_warps=num_warps,
+    )
+
+
+def nvidia_rsag_all_gather_inner(
+    state: TritonCommState,
+    hidden_states: torch.Tensor,
+    tp_hidden_dim: int = None,
+    hidden_list_in_group: List[int] = None,
+    skip_entry_sync: bool = False,
+    safe: bool = True,
+) -> torch.Tensor:
+    assert (
+        tp_hidden_dim is not None or hidden_list_in_group is not None
+    ), "Either tp_hidden_dim or hidden_list_in_group must be provided"
+    if hidden_list_in_group is None:
+        # Strict even split: refuse to distribute remainder because 128-bit
+        # multimem.st needs each per-rank slice to be a multiple of 8 bf16, and
+        # remainder distribution would yield non-aligned widths.
+        assert tp_hidden_dim % state.world_size == 0, (
+            f"For automatic even hidden split, tp_hidden_dim ({tp_hidden_dim}) "
+            f"must be divisible by world_size ({state.world_size}); otherwise "
+            f"pass hidden_list_in_group explicitly."
+        )
+        hidden_list_in_group = [tp_hidden_dim // state.world_size] * state.world_size
+    for r, h in enumerate(hidden_list_in_group):
+        assert h > 0, (
+            f"hidden_list_in_group[{r}]={h} must be > 0; a zero-width shard "
+            f"would make the kernel's chunks_per_row constexpr collapse and "
+            f"trigger a div-by-zero at JIT time while peers hang in the barrier"
+        )
+        assert h % INNER_AG_NUMEL_PER_THREAD == 0, (
+            f"hidden_list_in_group[{r}]={h} must be a multiple of "
+            f"{INNER_AG_NUMEL_PER_THREAD} bf16 (16-byte multimem.st alignment); "
+            f"pad in the producer if needed"
+        )
+    total_hidden = sum(hidden_list_in_group)
+    assert total_hidden <= state.hidden_dim, (
+        f"The inner comm buffer is too narrow: {total_hidden=} is not <= "
+        f"{state.hidden_dim=}"
+    )
+    local_hidden = hidden_list_in_group[state.rank_in_group]
+    hidden_offset = sum(hidden_list_in_group[: state.rank_in_group])
+
+    assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported"
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    # is_contiguous() does not imply 16-byte data_ptr alignment — e.g. a
+    # contiguous slice of a larger tensor (outer[i] on a 3D tensor) can land
+    # at a 2-byte offset. local_ld_128 in the kernel issues unaligned loads
+    # in that case, so reject early.
+    assert hidden_states.data_ptr() % 16 == 0, (
+        f"hidden_states.data_ptr()={hex(hidden_states.data_ptr())} must be "
+        f"16-byte aligned for 128-bit multimem.st loads; copy/contiguous "
+        f"the input through a fresh allocation if needed"
+    )
+    assert state.hidden_dim % INNER_AG_NUMEL_PER_THREAD == 0, (
+        f"state.hidden_dim={state.hidden_dim} must be a multiple of "
+        f"{INNER_AG_NUMEL_PER_THREAD} bf16 (16-byte multimem.st row stride alignment)"
+    )
+    total_tokens, in_hidden = hidden_states.shape
+    assert in_hidden == local_hidden, (
+        f"input hidden ({in_hidden}) does not match this rank's "
+        f"hidden_list_in_group[{state.rank_in_group}]={local_hidden}"
+    )
+    assert (
+        total_tokens <= state.max_token_num
+    ), f"{total_tokens=} exceeds {state.max_token_num=}"
+
+    hidden_size_bak, comm_buff_bak = rsag_resize_hidden_if_needed(state, total_hidden)
+    try:
+        nvidia_rsag_multimem_all_gather_inner(
+            state,
+            hidden_states,
+            total_tokens,
+            local_hidden,
+            hidden_offset,
+            skip_entry_sync,
+        )
+        output = state.comm_buff[:total_tokens, :]
+        return output.clone() if safe else output
+    finally:
+        rsag_restore_hidden(state, hidden_size_bak, comm_buff_bak)
+
+
+def all_gather_inner(
+    state: TritonCommState,
+    hidden_states: torch.Tensor,
+    tp_hidden_dim: int = None,
+    hidden_list_in_group: List[int] = None,
+    skip_entry_sync: bool = False,
+    safe: bool = True,
+) -> torch.Tensor:
+    """Inner all-gather — NVIDIA-only, concatenates along the hidden dim.
+
+    ``skip_entry_sync=True`` removes the entry CAS barrier via a compile-time
+    constexpr. Safe only when the caller has externally guaranteed that *all
+    ranks* have finished reading ``state.comm_buff`` before this call enters;
+    otherwise a faster rank may multicast new data into a slower peer's
+    comm-buf while that peer is still consuming the previous result (clone,
+    matmul, etc.). An adjacent tokenspeed collective's acq_rel exit barrier
+    is NOT sufficient on its own — it only synchronizes the end of the kernel,
+    not the end of consumers queued after it. Typical safe patterns: an
+    explicit ``dist.barrier`` since the last buffer read, or back-to-back
+    skip-entry calls where the consumer is the next kernel's multimem store.
+    """
+    platform = current_platform()
+    assert platform.is_nvidia, f"all_gather_inner only supports NVIDIA, got {platform}"
+    return nvidia_rsag_all_gather_inner(
+        state,
+        hidden_states,
+        tp_hidden_dim=tp_hidden_dim,
+        hidden_list_in_group=hidden_list_in_group,
+        skip_entry_sync=skip_entry_sync,
+        safe=safe,
+    )

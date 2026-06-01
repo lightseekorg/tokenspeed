@@ -22,7 +22,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 # Directory that survives across CI runs on the same host.
 # Must be writable by the runner user.
@@ -43,19 +43,38 @@ def _pgid_path(runner_id: str) -> Path:
     return _PGID_DIR / f"{_safe_runner_id(runner_id)}.pgid"
 
 
-def _save_pgid(runner_id: str, pgid: int) -> None:
+def _save_pgids(runner_id: str, pgids: Iterable[int]) -> None:
     _PGID_DIR.mkdir(parents=True, exist_ok=True)
-    _pgid_path(runner_id).write_text(str(pgid))
+    _pgid_path(runner_id).write_text(
+        "".join(f"{pgid}\n" for pgid in sorted(set(pgids)))
+    )
+
+
+def _add_pgid(runner_id: str, pgid: int) -> None:
+    pgids = _load_pgids(runner_id)
+    pgids.add(pgid)
+    _save_pgids(runner_id, pgids)
+
+
+def _load_pgids(runner_id: str) -> set[int]:
+    path = _pgid_path(runner_id)
+    if not path.exists():
+        return set()
+    pgids: set[int] = set()
+    try:
+        for token in path.read_text().split():
+            pgids.add(int(token))
+    except (ValueError, OSError):
+        return set()
+    return pgids
 
 
 def _load_pgid(runner_id: str) -> Optional[int]:
-    path = _pgid_path(runner_id)
-    if not path.exists():
+    """Backward-compatible single-pgid accessor for older callers/tests."""
+    pgids = _load_pgids(runner_id)
+    if not pgids:
         return None
-    try:
-        return int(path.read_text().strip())
-    except (ValueError, OSError):
-        return None
+    return next(iter(sorted(pgids)))
 
 
 def _remove_pgid(runner_id: str) -> None:
@@ -82,8 +101,8 @@ class ProcessGroupManager:
         Kill any process group left over from a previous run of this runner.
         Safe to call even if no stale pgid file exists.
         """
-        pgid = _load_pgid(self.runner_id)
-        if pgid is None:
+        pgids = _load_pgids(self.runner_id)
+        if not pgids:
             print(
                 f"[pgm] cleanup_stale: no stale pgid file for runner={self.runner_id}",
                 flush=True,
@@ -91,23 +110,34 @@ class ProcessGroupManager:
             return
 
         print(
-            f"[pgm] cleanup_stale: killing stale process group pgid={pgid} "
+            f"[pgm] cleanup_stale: killing stale process groups pgids={sorted(pgids)} "
             f"for runner={self.runner_id}",
             flush=True,
         )
         if dry_run:
-            print(f"[pgm] cleanup_stale: [dry-run] skip kill pgid={pgid}", flush=True)
+            print(
+                f"[pgm] cleanup_stale: [dry-run] skip kill pgids={sorted(pgids)}",
+                flush=True,
+            )
             return
 
-        print(f"[pgm] cleanup_stale: sending SIGTERM to pgid={pgid}", flush=True)
-        _kill_pgid(pgid, signal.SIGTERM)
+        print(
+            f"[pgm] cleanup_stale: sending SIGTERM to pgids={sorted(pgids)}",
+            flush=True,
+        )
+        for pgid in sorted(pgids):
+            _kill_pgid(pgid, signal.SIGTERM)
         print(
             f"[pgm] cleanup_stale: waiting {self.term_timeout}s for graceful shutdown",
             flush=True,
         )
         time.sleep(self.term_timeout)
-        print(f"[pgm] cleanup_stale: sending SIGKILL to pgid={pgid}", flush=True)
-        _kill_pgid(pgid, signal.SIGKILL)
+        print(
+            f"[pgm] cleanup_stale: sending SIGKILL to pgids={sorted(pgids)}",
+            flush=True,
+        )
+        for pgid in sorted(pgids):
+            _kill_pgid(pgid, signal.SIGKILL)
         _remove_pgid(self.runner_id)
         print(
             f"[pgm] cleanup_stale: removed pgid file for runner={self.runner_id}",
@@ -145,7 +175,7 @@ class ProcessGroupManager:
 
         try:
             pgid = os.getpgid(proc.pid)
-            _save_pgid(self.runner_id, pgid)
+            _add_pgid(self.runner_id, pgid)
             print(
                 f"[pgm] start: pid={proc.pid} pgid={pgid} "
                 f"runner={self.runner_id} pgid_file={_pgid_path(self.runner_id)}",
@@ -192,7 +222,7 @@ class ProcessGroupManager:
 
         try:
             pgid = os.getpgid(proc.pid)
-            _save_pgid(self.runner_id, pgid)
+            _add_pgid(self.runner_id, pgid)
             print(
                 f"[pgm] run: spawned pid={proc.pid} pgid={pgid} "
                 f"tracked_procs={len(self._procs)}",
@@ -265,18 +295,20 @@ class ProcessGroupManager:
         procs = list(self._procs)
         if not procs:
             # run() removes completed parents from _procs, but their process
-            # group may still have surviving children.  Kill the persisted
-            # pgid before discarding the record.
-            saved_pgid = _load_pgid(self.runner_id)
-            if saved_pgid is not None:
+            # groups may still have surviving children. Kill the persisted
+            # pgids before discarding the record.
+            saved_pgids = _load_pgids(self.runner_id)
+            if saved_pgids:
                 print(
                     f"[pgm] terminate_all: no tracked procs but pgid file exists, "
-                    f"killing pgid={saved_pgid}",
+                    f"killing pgids={sorted(saved_pgids)}",
                     flush=True,
                 )
-                _kill_pgid(saved_pgid, signal.SIGTERM)
+                for pgid in sorted(saved_pgids):
+                    _kill_pgid(pgid, signal.SIGTERM)
                 time.sleep(1)
-                _kill_pgid(saved_pgid, signal.SIGKILL)
+                for pgid in sorted(saved_pgids):
+                    _kill_pgid(pgid, signal.SIGKILL)
             else:
                 print(
                     f"[pgm] terminate_all: no tracked processes, nothing to do",
@@ -291,7 +323,7 @@ class ProcessGroupManager:
             flush=True,
         )
 
-        pgids: set[int] = set()
+        pgids: set[int] = _load_pgids(self.runner_id)
         for proc in procs:
             try:
                 pgid = os.getpgid(proc.pid)

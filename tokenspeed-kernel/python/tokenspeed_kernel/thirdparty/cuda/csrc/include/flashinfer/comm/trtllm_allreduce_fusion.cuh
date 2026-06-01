@@ -937,19 +937,22 @@ class FusedOp {
  public:
   __device__ __forceinline__ FusedOp(AllReduceFusionParams<T> const& params, int access_id,
                                      int access_id_in_token)
-      : m_params(params), m_access_id(access_id), m_access_id_in_token(access_id_in_token) {
+      : m_params(params), m_access_id(access_id), m_access_id_in_token(access_id_in_token) {}
+
+  __device__ __forceinline__ void load_upstream_inputs() {
     if constexpr (HasRMSNorm<Pattern>) {
-      m_gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + m_access_id_in_token * VEC_SIZE);
+      m_gamma_val.load(reinterpret_cast<T*>(m_params.rms_gamma) +
+                       m_access_id_in_token * VEC_SIZE);
     }
-    if (!params.residual_reduce_scattered) {
+    if (!m_params.residual_reduce_scattered) {
       if constexpr (HasResidual<Pattern>) {
-        m_residual_val.load(reinterpret_cast<T*>(params.residual_in) + m_access_id * VEC_SIZE);
+        m_residual_val.load(reinterpret_cast<T*>(m_params.residual_in) + m_access_id * VEC_SIZE);
       }
     }
     if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
-      m_scale_factor = 1.f / *(params.scale_factor);
+      m_scale_factor = 1.f / *(m_params.scale_factor);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-      m_scale_factor = *(params.scale_factor);
+      m_scale_factor = *(m_params.scale_factor);
     }
   }
 
@@ -1299,6 +1302,11 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
+#endif
+  // Load upstream-produced inputs only after gridDepSync, but before releasing
+  // PDL dependents that may reuse those producer buffers.
+  fused_op.load_upstream_inputs();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (!TriggerCompletionAtEnd) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
@@ -1328,7 +1336,6 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
     // Clear comm buffer that previous kernel used
     clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
   }
-
   for (int idx = access_id, tidx = token_id; idx < tot_access;
        idx += access_stride, tidx += token_stride) {
     fused_op.update(idx, res_add_before_reduce);
@@ -1383,6 +1390,8 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
+  // Load upstream-produced inputs only after gridDepSync
+  fused_op.load_upstream_inputs();
   SyncComm<NRanks> comm(params.workspace);
 #pragma unroll
   for (int r = 0; r < NRanks; ++r) {

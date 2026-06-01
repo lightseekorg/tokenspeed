@@ -100,6 +100,7 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    use_target_verify_forward_mode: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -153,6 +154,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -448,7 +450,9 @@ class ModelExecutor:
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
-            is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
+            is_spec_verify = n > 1 and (
+                ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()
+            )
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
@@ -831,6 +835,10 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
+        graph_forward_mode = ForwardMode.decode_or_target_verify(
+            has_drafter=self.drafter is not None,
+            use_target_verify=self.config.use_target_verify_forward_mode,
+        )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -838,7 +846,7 @@ class ModelExecutor:
             bs=0,
             num_extends=0,
             input_num_tokens=0,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=graph_forward_mode,
             global_num_tokens=global_num_tokens,
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
@@ -912,6 +920,7 @@ class ModelExecutor:
                     positions=empty,
                     out_cache_loc=empty,
                     input_lengths=empty,
+                    spec_step_idx=step_idx,
                 )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
@@ -1097,7 +1106,12 @@ class ModelExecutor:
                 total_tokens=total_tokens,
             )
 
-            forward_mode = ForwardMode.from_num_extends(num_extends, bs)
+            forward_mode = ForwardMode.from_num_extends(
+                num_extends,
+                bs,
+                has_drafter=self.drafter is not None,
+                use_target_verify=self.config.use_target_verify_forward_mode,
+            )
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs

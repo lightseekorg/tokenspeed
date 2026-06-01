@@ -230,6 +230,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
 
+    def get_hot_token_id(self):
+        # MTP drafts every vocab token; the hot-token-id mechanism is an
+        # EAGLE3-only optimization (see deepseek_v3.py:2063, llama_eagle3.py).
+        return None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
