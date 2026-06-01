@@ -311,13 +311,15 @@ async def _start_control_server(
 
     # uvicorn sets `started = True` only after the socket is bound and serving.
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+    start = loop.time()
+    deadline = start + timeout
     while not server.started:
         if not thread.is_alive():
             return False  # uvicorn raised during startup (e.g. AddrInUse)
         if loop.time() >= deadline:
             return False
         await asyncio.sleep(0.05)
+    logger.info("control server bound in %.2fs", loop.time() - start)
     return True
 
 
@@ -453,7 +455,6 @@ async def run_smg(
                 f"serving continues without it\n"
             )
         sys.stdout.flush()
-        sys.stderr.flush()
 
         engine_wait = asyncio.create_task(engine.wait())
         gateway_wait = asyncio.create_task(gateway.wait())
