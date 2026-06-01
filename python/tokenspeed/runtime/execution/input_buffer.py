@@ -66,16 +66,19 @@ class InputBuffers:
         self.has_mamba = has_mamba
 
         with torch.device(device):
-            # Initialise buffers with the *padding* values each iteration needs
-            # so the per-step `[total_tokens:].fill_(...)` becomes redundant:
-            # every iteration overwrites only `[:total_tokens]`, the tail stays
-            # at its safe default for the lifetime of the buffer.
+            # Initialise buffers to the *padding* values the captured graph
+            # expects for padded rows (input_ids=1, positions=0, req_pool=0,
+            # seq_lens=1, out_cache_loc=dummy_kv_slot). Each iteration overwrites
+            # the active prefix [:total_tokens]; fill_input_buffers refreshes the
+            # padding tail [total_tokens:] back to these defaults every step,
+            # because a larger prior iter can leave stale values past the
+            # current prefix.
             self.input_ids_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
-            # Zero (not arange) so padding tokens read a consistent position
-            # whether or not the inter-iter padding fill ran.
+            # Zero (not arange) so padded positions read a consistent, in-range
+            # value; the tail is re-zeroed every iteration by fill_input_buffers.
             self.positions_buf = torch.zeros(max_num_tokens, dtype=torch.int64)
             self.mrope_positions_buf = torch.zeros(
                 (3, max_num_tokens), dtype=torch.int64
@@ -311,6 +314,20 @@ class InputBuffers:
                 non_blocking=True,
             )
 
+        # Defensive clamp into the valid vocab range. The decode input ids come
+        # from future_input_map, written by the previous iteration's
+        # sampler/drafter; the intermittent spec-decode decode-state race can
+        # surface a stale/corrupt out-of-range id there. Feeding an out-of-range
+        # id to the captured graph's embedding gather trips a device-side assert
+        # (`vectorized_gather_kernel index out of bounds`) that tears the whole
+        # server down. Clamp the active prefix before the graph reads these
+        # buffers (a no-op for legitimate ids). Mirrors the post-graph
+        # output_tokens clamp in the output_d2h step of
+        # ModelExecutor.execute_forward_op.
+        vocab_size = runtime_states.vocab_size
+        self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
+        self.shifted_prefill_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
+
         if valid_cache_lengths is not None:
             torch.add(
                 input_lengths_device,
@@ -318,28 +335,26 @@ class InputBuffers:
                 out=self.seq_lens_buf[:batch_size],
             )
 
-        # NOTE: The padding region of these buffers is initialised to safe
-        # defaults in __init__:
-        #   input_ids_buf=1, req_pool_indices_buf=0, positions_buf=0.
-        # No kernel writes past the active prefix for those three (compute_position,
-        # the future_input_map copy, and the req_pool/positions writes are all
-        # bounded by [:total_tokens] / [:batch_size]), and the captured graph
-        # only reads from the live persistent slot — so the inter-iter fills
-        # for these are redundant.
-        # out_cache_loc_buf and seq_lens_buf still need refreshing because a
-        # previous iter with a *larger* total_tokens / batch_size leaves real
-        # cache locations / per-request seq lengths in the tail, and reusing
-        # those for padded tokens would route their KV writes into real cache
-        # slots (corrupting them) and force attention to scan oversize ranges.
+        # Refresh the padding tail of the persistent buffers every iteration.
+        # The captured graph replays at a padded batch size and DOES read the
+        # padded rows; a previous iter with a *larger* total_tokens / batch_size
+        # leaves stale values in the tail (real cache locations, per-request seq
+        # lengths, positions, token ids, req-pool slots). Reusing those for
+        # padded tokens routes KV writes into real cache slots (corruption),
+        # forces attention to scan oversize ranges, and -- for a stale
+        # out-of-range token id -- trips the embedding gather's device-side
+        # assert that tears the server down. The __init__ safe defaults
+        # (input_ids=1, req_pool=0, positions=0) are not enough on their own
+        # once a larger iter has overwritten the tail, so scrub it back here
+        # (cheap tail-only fills; the active prefix was written above).
         if total_tokens < self.max_num_tokens:
+            self.input_ids_buf[total_tokens:].fill_(1)
             self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
-        if batch_size < self.max_bs:
-            self.seq_lens_buf[batch_size:].fill_(1)
-        if total_tokens < self.max_num_tokens:
-            # mrope_positions_buf still needs the per-iter zero. Its
-            # tail isn't safely covered by the init alone because callers
-            # may write [:total_tokens] of it in non-zero patterns.
+            self.positions_buf[total_tokens:].fill_(0)
             self.mrope_positions_buf[:, total_tokens:].zero_()
+        if batch_size < self.max_bs:
+            self.req_pool_indices_buf[batch_size:].fill_(0)
+            self.seq_lens_buf[batch_size:].fill_(1)
 
         if (
             self.has_mamba
