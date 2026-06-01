@@ -407,14 +407,9 @@ def mha_decode_scheduler_metadata(
     cache_seqlens: torch.Tensor,
     qkv_dtype: torch.dtype,
     page_size: int,
-    causal: bool = True,
+    causal: bool = False,
 ) -> torch.Tensor | None:
-    """Pre-compute decode scheduler metadata once per scheduler step.
-
-    Only the FA3 decode kernel consumes pre-computed scheduler metadata; on
-    every other backend the kernel computes it internally and this helper
-    returns ``None`` so callers can pass through unconditionally.
-    """
+    """Pre-compute FA3 decode scheduler metadata once per scheduler step."""
     if get_scheduler_metadata is error_fn:
         return None
     return get_scheduler_metadata(

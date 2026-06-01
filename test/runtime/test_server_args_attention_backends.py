@@ -21,6 +21,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -138,6 +140,45 @@ class TestAttentionBackendChoices(unittest.TestCase):
 
         self.assertEqual(config.speculative_num_steps, 3)
         self.assertEqual(config.speculative_num_draft_tokens, 4)
+
+    def test_mha_scheduler_metadata_is_fa3_only_and_noncausal(self):
+        from tokenspeed.runtime.layers.attention.backends import mha
+
+        base_kwargs = dict(
+            device="cpu",
+            num_attention_heads=16,
+            num_kv_heads=8,
+            head_dim=128,
+            attn_tp_size=4,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            page_size=64,
+            context_len=4096,
+            max_bs=8,
+            max_graph_bs=4,
+            kv_cache_quant_method="none",
+        )
+        seq_lens = torch.ones((2,), dtype=torch.int32)
+
+        for backend_name in ("mha", "fa4", "triton", "flashinfer"):
+            backend = mha.MHAAttnBackend(
+                MHAConfig(backend_name=backend_name, **base_kwargs)
+            )
+            with mock.patch.object(mha, "mha_decode_scheduler_metadata") as mocked:
+                self.assertIsNone(
+                    backend._maybe_compute_scheduler_metadata(2, seq_lens)
+                )
+                mocked.assert_not_called()
+
+        marker = torch.empty((1,), dtype=torch.int32)
+        fa3_backend = mha.MHAAttnBackend(MHAConfig(backend_name="fa3", **base_kwargs))
+        with mock.patch.object(
+            mha, "mha_decode_scheduler_metadata", return_value=marker
+        ) as mocked:
+            self.assertIs(
+                fa3_backend._maybe_compute_scheduler_metadata(2, seq_lens), marker
+            )
+            self.assertFalse(mocked.call_args.kwargs["causal"])
 
 
 if __name__ == "__main__":

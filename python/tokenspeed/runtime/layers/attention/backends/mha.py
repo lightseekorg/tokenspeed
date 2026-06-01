@@ -651,10 +651,11 @@ class MHAAttnBackend(AttentionBackend):
     ) -> torch.Tensor | None:
         """Pre-compute FA3 decode scheduler metadata once per step.
 
-        Returns ``None`` when the active backend does not consume pre-computed
-        scheduler metadata (only FA3 on Hopper does); the kernel then falls
-        back to its internal prepare_varlen_num_blocks launch.
+        Other MHA solutions do not accept this FA3-specific metadata, so the
+        runtime leaves it unset unless the selected kernel solution is FA3.
         """
+        if self.kernel_solution != "fa3":
+            return None
         return mha_decode_scheduler_metadata(
             batch_size=bs,
             max_seqlen_q=1,
@@ -665,7 +666,7 @@ class MHAAttnBackend(AttentionBackend):
             cache_seqlens=seq_lens,
             qkv_dtype=self.qkv_dtype,
             page_size=self.page_size,
-            causal=True,
+            causal=False,
         )
 
 

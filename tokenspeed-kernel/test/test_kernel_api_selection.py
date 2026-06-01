@@ -324,6 +324,34 @@ def _attention_decode() -> object:
     )
 
 
+def test_mha_decode_scheduler_metadata_defaults_to_noncausal(monkeypatch) -> None:
+    marker = torch.empty((1,), dtype=torch.int32)
+    call_kwargs = {}
+
+    def fake_get_scheduler_metadata(**kwargs):
+        call_kwargs.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(
+        _attention_flash_attn, "get_scheduler_metadata", fake_get_scheduler_metadata
+    )
+
+    result = _attention_flash_attn.mha_decode_scheduler_metadata(
+        batch_size=2,
+        max_seqlen_q=1,
+        max_seqlen_k=128,
+        num_heads_q=16,
+        num_heads_kv=8,
+        headdim=64,
+        cache_seqlens=torch.tensor([64, 128], dtype=torch.int32),
+        qkv_dtype=torch.bfloat16,
+        page_size=64,
+    )
+
+    assert result is marker
+    assert call_kwargs["causal"] is False
+
+
 def _attention_merge_state() -> object:
     out_a = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     out_b = torch.empty((4, 16, 64), dtype=torch.bfloat16)
