@@ -25,12 +25,6 @@ from __future__ import annotations
 from tokenspeed_kernel.ops.attention.gluon.mha_decode_fp16_gfx950 import (  # noqa: F401
     gluon_mha_decode_fp16_gfx950,
 )
-from tokenspeed_kernel.ops.attention.gluon.mha_decode_fp16_gfx950_v2 import (  # noqa: F401
-    gluon_mha_decode_fp16_gfx950_v2,
-)
 from tokenspeed_kernel.ops.attention.gluon.mha_prefill_fp16_gfx950 import (  # noqa: F401
     gluon_mha_prefill_fp16_gfx950,
-)
-from tokenspeed_kernel.ops.attention.gluon.mha_prefill_fp16_gfx950_v2 import (  # noqa: F401
-    gluon_mha_prefill_fp16_gfx950_v2,
 )
