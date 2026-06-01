@@ -944,13 +944,15 @@ class ModelExecutor:
         req_pool_tensor = torch.tensor(
             [req_pool_idx for req_pool_idx, _ in pairs],
             dtype=torch.int64,
-            device=self.device,
-        )
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
         mamba_tensor = torch.tensor(
             [mamba_idx for _, mamba_idx in pairs],
             dtype=torch.int64,
-            device=self.device,
-        )
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
         self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
 
     @nvtx_range("reset_valid_cache_length", color="orange")

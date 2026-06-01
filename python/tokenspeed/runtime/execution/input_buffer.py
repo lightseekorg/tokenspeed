@@ -188,18 +188,36 @@ class InputBuffers:
             mask = (decode_input_ids_tensor != -1).unsqueeze(1)
             ids = decode_input_ids_tensor.unsqueeze(1)
 
-            # Only seed col 0 (the verified token). The draft slots
-            # (cols 1..spec_num_draft_tokens-1) are owned by either the local
-            # drafter or write_remote_spec_candidate_ids; for retract-recovery
-            # there is no draft source, so leaving the tail untouched lets the
-            # verifier reject those slots and the step naturally falls back to
-            # a 1-token decode. Broadcasting the seed across the tail would
-            # turn the retract step into a synthetic-candidate proposal that
-            # the target may accept, producing duplicate tokens the drafter
-            # never actually proposed.
+            # Col 0: verified token (mask preserves drafter-owned rows).
             first_slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
             runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
                 mask, ids, first_slot
+            )
+            # Cols 1..: future_input_map is torch.empty-initialized and never
+            # reset on slot reuse. Retract-recovery rows have no candidate
+            # source, so stale tails must be hidden behind a reject sentinel.
+            # Remote-prefill rows carry real P-side draft candidates, and
+            # drafter-owned rows (mask False) keep their tail intact.
+            width = runtime_states.future_input_map.shape[1]
+            remote_candidate_ready = runtime_states.remote_spec_candidate_ready[
+                decode_req_pool_indices
+            ]
+            if width > 1:
+                tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
+                # Remote prefill can write real P-side draft candidates before
+                # the scheduler supplies the verified bootstrap token. Preserve
+                # that one real tail; sentinel-fill only rows that have no
+                # candidate source, such as retract recovery.
+                sentinel_mask = mask & ~remote_candidate_ready.unsqueeze(1)
+                runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
+                    torch.where(sentinel_mask, torch.full_like(tail, -1), tail)
+                )
+            runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = (
+                torch.where(
+                    mask.squeeze(1),
+                    torch.zeros_like(remote_candidate_ready),
+                    remote_candidate_ready,
+                )
             )
 
         valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
