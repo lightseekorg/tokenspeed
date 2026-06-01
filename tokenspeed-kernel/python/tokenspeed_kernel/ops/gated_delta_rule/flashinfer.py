@@ -104,7 +104,9 @@ def gdn_chunk_prefill(
         # flashinfer requires fp32 state; runtime ssm dtype may be bf16.
         initial_state=initial_state.float().transpose(-1, -2).contiguous(),
         output_final_state=True,
-        cu_seqlens=cu_seqlens.to(torch.int32),
+        # flashinfer casts cu_seqlens per path internally (int32 for sm100), so
+        # pass it through rather than forcing a dtype.
+        cu_seqlens=cu_seqlens,
     )
 
     out = out.to(q.dtype)
