@@ -112,9 +112,11 @@ class Qwen3_5Config(PretrainedConfig):
         """Forward attribute access to text_config for inference-only usage."""
         try:
             text_config = super().__getattribute__("text_config")
-            return getattr(text_config, name)
         except AttributeError:
             raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+        if text_config is self:
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+        return getattr(text_config, name)
 
 
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
@@ -132,6 +134,13 @@ class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
 
 class Qwen3_5MoeConfig(Qwen3_5Config):
     model_type = "qwen3_5_moe"
+
+    def __init__(self, **kwargs):
+        # Transformers can synthesize a composite-config __init__ from
+        # sub_configs; keep this wrapper on Qwen3_5Config's path so
+        # text_config and vision_config are always materialized.
+        super().__init__(**kwargs)
+
     sub_configs = {
         "vision_config": Qwen3_5MoeVisionConfig,
         "text_config": Qwen3_5MoeTextConfig,

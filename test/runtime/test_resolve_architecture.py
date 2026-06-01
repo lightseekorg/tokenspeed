@@ -13,8 +13,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs import Qwen3_5MoeConfig  # noqa: E402
+from tokenspeed.runtime.configs.model_config import get_hf_text_config  # noqa: E402
 from tokenspeed.runtime.utils.hf_transformers_utils import (  # noqa: E402
     _materialize_architectures,
+    _materialize_text_config,
     resolve_architecture,
 )
 
@@ -86,6 +88,39 @@ class MaterializeArchitecturesTests(unittest.TestCase):
         self.assertEqual(
             config.architectures, ["Qwen3_5MoeForConditionalGenerationNextN"]
         )
+
+
+class Qwen35MoeConfigTextConfigTests(unittest.TestCase):
+    def test_default_construction_materializes_text_config(self) -> None:
+        config = Qwen3_5MoeConfig()
+        self.assertIsNot(config.text_config, config)
+        self.assertTrue(hasattr(config.text_config, "num_attention_heads"))
+        self.assertIs(get_hf_text_config(config), config.text_config)
+
+    def test_self_referential_text_config_preserves_raw_values(self) -> None:
+        config = Qwen3_5MoeConfig()
+        config.__dict__["text_config"] = config
+        _materialize_text_config(
+            config,
+            {
+                "text_config": {
+                    "hidden_size": 8192,
+                    "num_attention_heads": 64,
+                    "num_hidden_layers": 12,
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "mrope_section": [16, 24, 24],
+                    },
+                }
+            },
+        )
+        text_config = get_hf_text_config(config)
+        self.assertIsNot(text_config, config)
+        self.assertIs(text_config, config.text_config)
+        self.assertEqual(text_config.hidden_size, 8192)
+        self.assertEqual(text_config.num_attention_heads, 64)
+        self.assertEqual(text_config.num_hidden_layers, 12)
+        self.assertEqual(text_config.rope_parameters["mrope_section"], [16, 24, 24])
 
 
 if __name__ == "__main__":

@@ -174,6 +174,28 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     config.__dict__["architectures"] = list(raw_archs)
 
 
+def _materialize_text_config(config: PretrainedConfig, raw_config: dict) -> None:
+    """Repair a self-referential text_config from raw config.json values."""
+    if config.__dict__.get("text_config") is not config:
+        return
+
+    raw_text_config = raw_config.get("text_config")
+    if not isinstance(raw_text_config, dict):
+        raise RuntimeError(
+            f"{type(config).__name__} has a self-referential text_config, "
+            "but config.json does not contain a text_config object"
+        )
+
+    ensure_text_config = getattr(config, "_ensure_text_config", None)
+    if not callable(ensure_text_config):
+        raise RuntimeError(
+            f"{type(config).__name__} has a self-referential text_config "
+            "that cannot be materialized"
+        )
+
+    config.__dict__["text_config"] = ensure_text_config(raw_text_config)
+
+
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -212,6 +234,7 @@ def get_config(
             raise e
 
     _materialize_architectures(config, raw_config)
+    _materialize_text_config(config, raw_config)
 
     # extract 'text_config'
     text_config = get_hf_text_config(config)
