@@ -1,0 +1,113 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""FlashInfer Blackwell (sm100) gated delta net chunked prefill.
+
+Fast-path for GDN prefill, otherwise run with Triton FLA kernels in the runtime.
+NVIDIA sm100 + head_dim==128 only. The caller gates on ``is_supported`` and keeps
+its own Triton fallback; this module never falls back, so it has no dependency on
+the runtime FLA code.
+
+Convention vs the Triton FLA path (verified equal to bf16 on B200):
+- q, k must be L2-normalized by the caller (the sm100 kernel ignores its own
+  use_qk_l2norm flag).
+- g is the FLA log-space forget gate; the sm100 kernel takes log internally, so
+  we pass alpha = exp(g).
+- beta is cast to float32 (flashinfer passes it through without casting).
+- the recurrent state is stored transposed (K<->V) vs FLA, so we transpose the
+  initial state in and the final state out.
+- scale defaults to head_dim**-0.5 (FLA default).
+"""
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel.platform import current_platform
+
+SUPPORTED_HEAD_DIM = 128
+
+_chunk_gated_delta_rule = None
+_AVAILABLE = False
+
+if current_platform().is_nvidia:
+    try:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
+
+        _chunk_gated_delta_rule = _fi_chunk
+        _p = current_platform()
+        _sm = _p.arch_version.major * 10 + _p.arch_version.minor
+        _AVAILABLE = _sm == 100
+    except ImportError:
+        _AVAILABLE = False
+
+
+def is_available() -> bool:
+    """Whether the sm100 GDN kernel can run on this platform."""
+    return _AVAILABLE
+
+
+def is_supported(head_dim: int, dtype: torch.dtype) -> bool:
+    # bf16 is the verified path; fp16 falls back to Triton FLA.
+    return _AVAILABLE and head_dim == SUPPORTED_HEAD_DIM and dtype == torch.bfloat16
+
+
+def gdn_chunk_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    scale: float | None,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one chunked GDN prefill on the sm100 kernel.
+
+    q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
+    g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the FLA
+    [N, H, K, V] recurrent state. Returns (out, final_state) matching the FLA
+    layout: out [B, T, Hv, D] in q.dtype, final_state [N, H, K, V].
+    """
+    batched = q.dim() == 4
+    q3 = q.squeeze(0) if batched else q
+    k3 = k.squeeze(0) if batched else k
+    v3 = v.squeeze(0) if batched else v
+    g2 = g.squeeze(0) if g.dim() == 3 else g
+    beta2 = beta.squeeze(0) if beta.dim() == 3 else beta
+
+    head_dim = q3.shape[-1]
+    if scale is None:
+        scale = head_dim**-0.5
+
+    out, final_state = _chunk_gated_delta_rule(
+        q3.contiguous(),
+        k3.contiguous(),
+        v3.contiguous(),
+        g=torch.exp(g2).float().contiguous(),
+        beta=beta2.float().contiguous(),
+        scale=scale,
+        # flashinfer requires fp32 state; runtime ssm dtype may be bf16.
+        initial_state=initial_state.float().transpose(-1, -2).contiguous(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens.to(torch.int32),
+    )
+
+    out = out.to(q.dtype)
+    if batched:
+        out = out.unsqueeze(0)
+    return out, final_state.transpose(-1, -2)
