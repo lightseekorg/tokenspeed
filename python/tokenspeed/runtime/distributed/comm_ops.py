@@ -31,7 +31,6 @@ import torch
 import torch.distributed
 from tokenspeed_kernel.ops.communication.trtllm import (
     allgather_dual_rmsnorm,
-    allgather_vocab,
     allreduce_residual_rmsnorm,
     reducescatter_residual_rmsnorm,
 )
@@ -66,8 +65,6 @@ class FusionOp(IntEnum):
     RS_RESIDUAL_RMS_NORM = 2
     # all_gather + dual RMSNorm (for MLA)
     AG_DUAL_RMS_NORM = 3
-    # all_gather for vocab logits
-    AG_VOCAB = 4
 
 
 @dataclass
@@ -94,8 +91,7 @@ class FusionParams:
     residual_reduce_scattered: bool = False
     has_partial_norm_out: bool = False
 
-    # --- For AG_VOCAB ---
-    local_vocab_size: int = 0
+    # --- Shared by RESIDUAL_RMS_NORM / RS_RESIDUAL_RMS_NORM / AG_DUAL_RMS_NORM ---
     max_token_num: int = 0
 
     # --- For FP8 block quantization ---
@@ -115,7 +111,6 @@ class FusionParams:
 
 def all_reduce(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
@@ -128,7 +123,6 @@ def all_reduce(
 
 def all_gather(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     dim: int = -1,
     backend: CommBackend | None = None,
@@ -142,7 +136,6 @@ def all_gather(
 def all_gather_into_tensor(
     output: torch.Tensor,
     input: torch.Tensor,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
 ) -> None:
@@ -154,7 +147,6 @@ def all_gather_into_tensor(
 
 def reduce_scatter(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
 ) -> torch.Tensor:
@@ -247,7 +239,7 @@ def fused_all_gather(
     backend: CommBackend | None = None,
     fusion_params: FusionParams | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """All-gather with optional fused dual-RMSNorm or vocab gather."""
+    """All-gather with optional fused dual-RMSNorm."""
     if backend is None:
         backend = get_global_backend()
 
@@ -271,21 +263,6 @@ def fused_all_gather(
             launch_with_pdl=pdl_enabled(),
         )
 
-    if fusion_params.fusion_op == FusionOp.AG_VOCAB:
-
-        def fallback_all_gather(input_tensor: torch.Tensor, _) -> torch.Tensor:
-            return backend.all_gather(input_tensor, group, dim=-1)
-
-        return allgather_vocab(
-            input_tensor=tensor,
-            rank=rank,
-            group=_get_process_group(group),
-            max_tokens_num=fusion_params.max_token_num,
-            local_vocab_size=fusion_params.local_vocab_size,
-            launch_with_pdl=pdl_enabled(),
-            fallback_all_gather=fallback_all_gather,
-        )
-
     raise ValueError(
         f"Unsupported fusion_op {fusion_params.fusion_op} for fused_all_gather"
     )
@@ -298,7 +275,6 @@ def fused_all_gather(
 
 def token_all_gather(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     scattered_num_tokens: list[int],
     backend=None,
@@ -311,12 +287,11 @@ def token_all_gather(
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.token_all_gather(tensor, rank, group, scattered_num_tokens)
+    return backend.token_all_gather(tensor, group, scattered_num_tokens)
 
 
 def token_reduce_scatter(
     tensor: torch.Tensor,
-    rank: int,
     group: Group,
     scattered_num_tokens: list[int],
     backend=None,
@@ -329,4 +304,4 @@ def token_reduce_scatter(
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.token_reduce_scatter(tensor, rank, group, scattered_num_tokens)
+    return backend.token_reduce_scatter(tensor, group, scattered_num_tokens)

@@ -321,7 +321,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
                 shared_output = all_reduce(
                     shared_output,
-                    self.mapping.dense.tp_rank,
                     self.mapping.dense.tp_group,
                 )
 
