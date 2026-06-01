@@ -1305,20 +1305,32 @@ class ModelExecutor:
                 )
 
             with nvtx_range("output_d2h", color="green"):
-                # Defensive clamp into the valid vocab range. An out-of-range
-                # token id (e.g. a stale/corrupt value surfaced by the
-                # intermittent spec-decode decode-state race) would otherwise
-                # reach the detokenizer, whose HF tokenizer.decode raises
-                # OverflowError on ids outside [0, vocab) -- and that exception
-                # is fatal: the asyncio handler (async_llm.print_exception_wrapper)
-                # kills the whole server process tree. Clamping degrades a rare
-                # corrupt token to at most one wrong token in one request
-                # instead of taking the server (and the entire eval) down.
+                # Defensive clamp into the valid vocab range (kept from the
+                # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
+                # value surfaced by the intermittent spec-decode decode-state race
+                # -- would otherwise reach the detokenizer, whose HF
+                # tokenizer.decode raises a fatal OverflowError on ids outside
+                # [0, vocab) and tears down the whole server process tree.
+                # It must run on-GPU *before* the non_blocking D2H: clamping the
+                # CPU result afterwards would race the in-flight copy. In-place
+                # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
+                # the get_packed_output_d2h data_ptr fast-path still fires -- and
+                # in-place on the forward's inference tensors is only legal inside
+                # inference mode, so re-enter it (maybe_inference_mode mirrors the
+                # forward and reduces to no_grad when inference mode is disabled,
+                # where output_tokens isn't an inference tensor anyway).
                 vocab_size = self.runtime_states.vocab_size
-                output_tokens = output_tokens.clamp(0, vocab_size - 1).to(
-                    "cpu", non_blocking=True
+                with maybe_inference_mode():
+                    output_tokens.clamp_(0, vocab_size - 1)
+
+                packed = self.sampling_backend.get_packed_output_d2h(
+                    output_tokens, output_lengths
                 )
-                output_lengths = output_lengths.to("cpu", non_blocking=True)
+                if packed is not None:
+                    output_tokens, output_lengths = packed
+                else:
+                    output_tokens = output_tokens.to("cpu", non_blocking=True)
+                    output_lengths = output_lengths.to("cpu", non_blocking=True)
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)

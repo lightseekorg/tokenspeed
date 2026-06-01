@@ -24,7 +24,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.execution.cache_loc_kernel import compute_out_cache_loc
+from tokenspeed.runtime.execution.cache_loc_kernel import (
+    compute_out_cache_loc,
+    compute_out_cache_loc_uniform,
+    fused_decode_input_prep,
+)
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -62,11 +66,17 @@ class InputBuffers:
         self.has_mamba = has_mamba
 
         with torch.device(device):
+            # Initialise buffers with the *padding* values each iteration needs
+            # so the per-step `[total_tokens:].fill_(...)` becomes redundant:
+            # every iteration overwrites only `[:total_tokens]`, the tail stays
+            # at its safe default for the lifetime of the buffer.
             self.input_ids_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
-            self.positions_buf = torch.arange(0, max_num_tokens, dtype=torch.int64)
+            # Zero (not arange) so padding tokens read a consistent position
+            # whether or not the inter-iter padding fill ran.
+            self.positions_buf = torch.zeros(max_num_tokens, dtype=torch.int64)
             self.mrope_positions_buf = torch.zeros(
                 (3, max_num_tokens), dtype=torch.int64
             )
@@ -125,6 +135,12 @@ class InputBuffers:
         batch_size = len(forward_op.request_ids)
         assert batch_size >= 0
         num_extends = forward_op.num_extends()
+
+        # CPU-side fast path: when the scheduler always emits a decode_input_ids
+        # list (even though every entry is -1, meaning "no override").
+        decode_input_ids = forward_op.decode_input_ids
+        if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
+            decode_input_ids = None
         req_pool_indices_cpu = torch.tensor(
             forward_op.request_pool_indices, device="cpu", pin_memory=True
         )
@@ -132,13 +148,6 @@ class InputBuffers:
             req_pool_indices_cpu,
             non_blocking=True,
         )
-        # Build the CPU staging tensor directly as int32 (matches
-        # input_lengths_buf) so this is a plain int32 H2D copy instead of an
-        # int64-staged converting copy: skips the implicit int64->int32 cast
-        # and halves the H2D bytes for input_lengths each step. Empirically
-        # validated to keep CI green (3 passing runs) -- unlike the
-        # out_cache_loc / positions / seq_lens data-path rewrites, which
-        # re-trigger the pre-existing decode-state race.
         input_lengths_cpu = torch.tensor(
             forward_op.input_lengths,
             dtype=torch.int32,
@@ -178,44 +187,55 @@ class InputBuffers:
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
 
-        valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
-            0, req_pool_indices_device
-        )
-
-        # Compute out_cache_loc using Triton kernel.
-        # NOTE: the decode-uniform fast path (compute_out_cache_loc_uniform,
-        # which skips the cumsum) is intentionally NOT used here. Although it
-        # is bit-identical to this general path, it empirically re-triggers a
-        # pre-existing intermittent decode-state corruption on this model
-        # (accept-rate collapse on the long tail) -- as does any GPU-op change
-        # on the model-forward data path (out_cache_loc / positions /
-        # input_ids / seq_lens). Keep the general path until that underlying
-        # race is root-caused.
-        compute_out_cache_loc(
-            out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-            req_pool_indices=req_pool_indices_device,
-            input_lengths=input_lengths_device,
-            cache_start=valid_cache_lengths,
-            req_to_pages=req_to_page,
-            page_size=self.page_size,
-        )
-
-        # Compute positions. In mixed batches, prefill rows use their extend
-        # prefix lengths while decode rows use the current valid cache lengths.
-        prefill_prefix_lens = self.extend_prefix_lens_buf[:num_extends]
-        if num_extends == 0:
-            prefix_lens = valid_cache_lengths
-        elif num_extends == batch_size:
-            prefix_lens = prefill_prefix_lens
+        # Decode-only fast path: one fused Triton kernel writes out_cache_loc,
+        # positions, and seq_lens in a single launch and reads
+        # valid_cache_lengths[pool_idx] directly, so the indexSelect + cumsum
+        # path + compute_position + seq_lens add are all gone.
+        if num_extends == 0 and batch_size > 0:
+            fused_decode_input_prep(
+                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
+                positions_ptr=self.positions_buf[:total_tokens],
+                seq_lens_out_ptr=self.seq_lens_buf[:batch_size],
+                req_pool_indices=req_pool_indices_device,
+                valid_cache_lengths=runtime_states.valid_cache_lengths,
+                uniform_input_length=total_tokens // batch_size,
+                req_to_pages=req_to_page,
+                page_size=self.page_size,
+            )
+            # Decode path's seq_lens / positions / out_cache_loc are done.
+            valid_cache_lengths = None
         else:
-            prefix_lens = valid_cache_lengths.clone()
-            prefix_lens[:num_extends].copy_(prefill_prefix_lens)
-        positions, _ = compute_position_triton(
-            extend_prefix_lens=prefix_lens,
-            extend_seq_lens=input_lengths_device,
-            extend_seq_lens_sum=total_tokens,
-        )
-        self.positions_buf[:total_tokens].copy_(positions)
+            # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
+            # for valid_cache_lengths is required because compute_position and
+            # the seq_lens add use it.
+            valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
+                0, req_pool_indices_device
+            )
+            compute_out_cache_loc(
+                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
+                req_pool_indices=req_pool_indices_device,
+                input_lengths=input_lengths_device,
+                cache_start=valid_cache_lengths,
+                req_to_pages=req_to_page,
+                page_size=self.page_size,
+            )
+
+            # Compute positions. In mixed batches, prefill rows use their extend
+            # prefix lengths while decode rows use the current valid cache lengths.
+            prefill_prefix_lens = self.extend_prefix_lens_buf[:num_extends]
+            if num_extends == batch_size:
+                prefix_lens = prefill_prefix_lens
+            else:
+                prefix_lens = valid_cache_lengths.clone()
+                prefix_lens[:num_extends].copy_(prefill_prefix_lens)
+            # Write positions directly into the persistent buffer to skip the
+            # otherwise-required DtoD copy.
+            compute_position_triton(
+                extend_prefix_lens=prefix_lens,
+                extend_seq_lens=input_lengths_device,
+                extend_seq_lens_sum=total_tokens,
+                out=self.positions_buf[:total_tokens],
+            )
 
         # Determine input_ids and forward_mode
         if num_extends > 0:
@@ -238,16 +258,16 @@ class InputBuffers:
                 decode_req_pool_indices = req_pool_indices_device[
                     num_extends:batch_size
                 ]
-                if forward_op.decode_input_ids is not None:
+                if decode_input_ids is not None:
                     decode_count = batch_size - num_extends
-                    if len(forward_op.decode_input_ids) != decode_count:
+                    if len(decode_input_ids) != decode_count:
                         raise RuntimeError(
                             "mixed forward decode_input_ids length mismatch: "
-                            f"got {len(forward_op.decode_input_ids)}, "
+                            f"got {len(decode_input_ids)}, "
                             f"expected {decode_count}"
                         )
                     decode_input_ids_tensor = torch.tensor(
-                        forward_op.decode_input_ids,
+                        decode_input_ids,
                         dtype=torch.int32,
                         device="cpu",
                         pin_memory=True,
@@ -272,9 +292,9 @@ class InputBuffers:
             # If the scheduler provides explicit decode input ids (!= -1), write
             # them into future_input_map before reading, so that they take effect
             # as the input for this decode step.
-            if forward_op.decode_input_ids is not None:
+            if decode_input_ids is not None:
                 decode_input_ids_tensor = torch.tensor(
-                    forward_op.decode_input_ids,
+                    decode_input_ids,
                     dtype=torch.int32,
                     device="cpu",
                     pin_memory=True,
@@ -291,25 +311,35 @@ class InputBuffers:
                 non_blocking=True,
             )
 
-        self.seq_lens_buf[:batch_size].copy_(input_lengths_device + valid_cache_lengths)
+        if valid_cache_lengths is not None:
+            torch.add(
+                input_lengths_device,
+                valid_cache_lengths,
+                out=self.seq_lens_buf[:batch_size],
+            )
 
-        # Reset the padding region every iter so a CUDA-graph replay padded up
-        # to a larger captured size reads safe defaults rather than stale tails.
-        # Token-indexed buffers are guarded by total_tokens; the batch-indexed
-        # req_pool_indices / seq_lens tail must be guarded by batch_size instead
-        # -- a previous iter with total_tokens == max_num_tokens but a larger
-        # batch_size would otherwise (single-guard form) skip scrubbing the
-        # per-request tail that a later padded replay still reads. Same GPU fill
-        # kernels as before; only the guard split changes (no launch-order
-        # change in the common total_tokens<max & batch_size<max_bs path).
+        # NOTE: The padding region of these buffers is initialised to safe
+        # defaults in __init__:
+        #   input_ids_buf=1, req_pool_indices_buf=0, positions_buf=0.
+        # No kernel writes past the active prefix for those three (compute_position,
+        # the future_input_map copy, and the req_pool/positions writes are all
+        # bounded by [:total_tokens] / [:batch_size]), and the captured graph
+        # only reads from the live persistent slot — so the inter-iter fills
+        # for these are redundant.
+        # out_cache_loc_buf and seq_lens_buf still need refreshing because a
+        # previous iter with a *larger* total_tokens / batch_size leaves real
+        # cache locations / per-request seq lengths in the tail, and reusing
+        # those for padded tokens would route their KV writes into real cache
+        # slots (corrupting them) and force attention to scan oversize ranges.
         if total_tokens < self.max_num_tokens:
-            self.input_ids_buf[total_tokens:].fill_(1)
             self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
-            self.positions_buf[total_tokens:].fill_(0)
-            self.mrope_positions_buf[:, total_tokens:].zero_()
         if batch_size < self.max_bs:
-            self.req_pool_indices_buf[batch_size:].fill_(0)
             self.seq_lens_buf[batch_size:].fill_(1)
+        if total_tokens < self.max_num_tokens:
+            # mrope_positions_buf still needs the per-iter zero. Its
+            # tail isn't safely covered by the init alone because callers
+            # may write [:total_tokens] of it in non-zero patterns.
+            self.mrope_positions_buf[:, total_tokens:].zero_()
 
         if (
             self.has_mamba
