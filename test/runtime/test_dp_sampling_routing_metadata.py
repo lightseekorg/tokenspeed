@@ -8,10 +8,11 @@ import torch
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.model_executor import (
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    resolve_dp_sampling_support,
     validate_dp_sampling_lm_head_vocab,
 )
-from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutPlan,
     LogitsLayoutPlanner,
@@ -342,6 +343,19 @@ def test_dp_sampling_skip_all_gather_rejects_sharded_lm_head_vocab():
             tp_size=2,
             skip_all_gather=True,
             tie_word_embeddings=True,
+        )
+
+
+def test_resolve_dp_sampling_support_rejects_missing_preconditions():
+    backend = SimpleNamespace(_SUPPORTS_DP_VERIFY=False)
+    processor = SimpleNamespace(tp_size=4, tp_group=(0, 1, 2, 3))
+
+    with pytest.raises(RuntimeError, match="backend_supports_dp_verify=False"):
+        resolve_dp_sampling_support(
+            requested=True,
+            drafter=object(),
+            sampling_backend=backend,
+            logits_processor=processor,
         )
 
 

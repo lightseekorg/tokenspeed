@@ -49,6 +49,11 @@ from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    dp_sampling_comm_vocab_size,
+    resolve_dp_sampling_support,
+    validate_dp_sampling_lm_head_vocab,
+)
 from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutPlan,
     LogitsLayoutPlanner,
@@ -68,37 +73,6 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
-
-
-def dp_sampling_comm_vocab_size(
-    *,
-    lm_head_rows: int,
-    tp_size: int,
-    skip_all_gather: bool,
-) -> int:
-    vocab_size = int(lm_head_rows)
-    if not skip_all_gather:
-        vocab_size *= int(tp_size)
-    return ((vocab_size + int(tp_size) - 1) // int(tp_size)) * int(tp_size)
-
-
-def validate_dp_sampling_lm_head_vocab(
-    *,
-    lm_head_rows: int,
-    vocab_size: int,
-    tp_size: int,
-    skip_all_gather: bool,
-    tie_word_embeddings: bool,
-) -> None:
-    if skip_all_gather and int(lm_head_rows) < int(vocab_size):
-        raise RuntimeError(
-            "Batch-DP sampling with skip_all_gather requires a replicated/"
-            "full-vocab LM head. Got a sharded LM head with "
-            f"lm_head_rows={lm_head_rows}, vocab_size={vocab_size}, "
-            f"tp_size={tp_size}, tie_word_embeddings={tie_word_embeddings}. "
-            "Disable --dp-sampling or use a model path that resolves a "
-            "replicated LM head."
-        )
 
 
 @dataclass
@@ -331,27 +305,14 @@ class ModelExecutor:
             )
 
         processor = self.model_runner.model.logits_processor
-        backend_supports_dp = bool(
-            getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
-        )
-        infra_supports_dp = (
-            self.drafter is not None
-            and backend_supports_dp
-            and processor.tp_size > 1
-            and processor.tp_group is not None
+        dp_support = resolve_dp_sampling_support(
+            requested=self.config.dp_sampling,
+            drafter=self.drafter,
+            sampling_backend=self.sampling_backend,
+            logits_processor=processor,
         )
 
-        if self.config.dp_sampling and not infra_supports_dp:
-            raise RuntimeError(
-                "--dp-sampling was set but Batch-DP spec-verify "
-                "preconditions are not met: "
-                f"drafter={self.drafter is not None}, "
-                f"backend_supports_dp_verify={backend_supports_dp}, "
-                f"processor.tp_size={processor.tp_size}, "
-                f"processor.tp_group_set={processor.tp_group is not None}"
-            )
-
-        self.dp_sampling_enabled = infra_supports_dp and self.config.dp_sampling
+        self.dp_sampling_enabled = dp_support.enabled
         self.logits_layout_planner = LogitsLayoutPlanner.from_settings(
             dp_sampling_enabled=self.dp_sampling_enabled,
             configured_min_bs=self.config.dp_sampling_min_bs,
@@ -400,14 +361,14 @@ class ModelExecutor:
             "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
             "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
             "tp_size=%s, tp_group=%s)",
-            self.config.dp_sampling,
-            infra_supports_dp,
-            self.dp_sampling_enabled,
+            dp_support.requested,
+            dp_support.infra_supports,
+            dp_support.enabled,
             self.logits_layout_planner.dp_sampling_min_bs,
-            self.drafter is not None,
-            backend_supports_dp,
-            processor.tp_size,
-            processor.tp_group is not None,
+            dp_support.drafter_available,
+            dp_support.backend_supports_verify,
+            dp_support.tp_size,
+            dp_support.tp_group_set,
         )
 
         self._active_multimodal_context = None
