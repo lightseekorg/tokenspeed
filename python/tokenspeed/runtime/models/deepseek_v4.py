@@ -27,6 +27,7 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
@@ -2098,6 +2099,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         intermediate_size: int,
         mapping: Mapping,
         prefix: str,
+        swiglu_limit: float | None,
     ) -> None:
         super().__init__()
         self.prefix = prefix
@@ -2108,6 +2110,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.mapping = mapping
         self.max_num_tokens = _deepseek_v4_mega_moe_max_num_tokens()
+        # DeepGEMM bakes the activation clamp into the kernel as a compile-time
+        # template arg, so the warmup below must use the same value serving does
+        # (the caller passes it to ``forward``) for the pre-compiled tiles to
+        # match the served kernels.
+        self.swiglu_limit = swiglu_limit
 
         weight_attrs = {"weight_loader": self.weight_loader}
         self.w13_weight = nn.Parameter(
@@ -2321,6 +2328,71 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         return y
 
+    def warmup_jit_variants(self) -> None:
+        """Pre-compile every DeepGEMM mega-MoE tile this layer can hit at runtime.
+
+        DeepGEMM JITs ``fp8_fp4_mega_moe`` on first use and selects the tile
+        (``block_m``) from the per-rank token count -- roughly
+        ``num_tokens * num_ranks * num_topk / num_experts`` mapped to a
+        ``block_m`` bucket (DeepGEMM ``heuristics/mega_moe.hpp``). CUDA-graph
+        capture only exercises decode-sized token counts, so the larger prefill
+        tiles would otherwise JIT mid-serving -- and because the kernel arms its
+        NVLink EP barrier on the same launch, a cold compile stalls one rank
+        past DeepGEMM's 30 s barrier timeout and aborts the job.
+
+        Sweeping a few token counts that cross every ``block_m`` boundary
+        compiles each tile at startup with all EP ranks in lock-step, so serving
+        never JITs on the hot path. The kernels are cached by shape + tile (not
+        by layer or activation values), so dummy activations on one module
+        cover the whole stack.
+        """
+        if deep_gemm is None or self._transformed_l1_weights is None:
+            return
+
+        device = self._transformed_l1_weights[0].device
+        cap = self.max_num_tokens
+        # Token counts spanning the block_m buckets up to the symmetric-buffer
+        # capacity. Decode-sized tiles are also covered by CUDA-graph capture;
+        # the small counts here keep the warmup self-contained.
+        token_counts = sorted(
+            {n for n in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096) if n < cap}
+            | {cap}
+        )
+
+        # The launch runs an NVLink barrier across the EP group, so every rank
+        # must enter the sweep together; align them once after weight load so a
+        # straggler cannot trip the barrier's 30 s timeout.
+        if torch.distributed.is_initialized():
+            group = pg_manager.get_process_group("nccl", self.mapping.moe.tp_ep_group)
+            torch.distributed.barrier(group=group)
+
+        for num_tokens in token_counts:
+            hidden_states = torch.randn(
+                (num_tokens, self.hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            topk_weights = torch.full(
+                (num_tokens, self.top_k),
+                1.0 / self.top_k,
+                dtype=torch.float32,
+                device=device,
+            )
+            topk_ids = torch.randint(
+                0,
+                self.num_experts,
+                (num_tokens, self.top_k),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.forward(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=self.swiglu_limit,
+            )
+        torch.cuda.synchronize()
+
 
 class DeepseekV4MoE(nn.Module):
     def __init__(
@@ -2395,6 +2467,7 @@ class DeepseekV4MoE(nn.Module):
                 intermediate_size=config.moe_intermediate_size,
                 mapping=mapping,
                 prefix=add_prefix("experts", prefix),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
             self.topk = None
         else:
@@ -3885,13 +3958,27 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         self.post_load_weights()
 
     def post_load_weights(self):
+        mega_moe_experts: list[DeepseekV4MegaMoEExperts] = []
         for module in self.modules():
             if isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
             elif isinstance(module, DeepseekV4MegaMoEExperts):
                 module.finalize_weights()
+                mega_moe_experts.append(module)
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
+        # Pre-compile the DeepGEMM mega-MoE tiles now so DeepGEMM never JITs on
+        # the serving hot path: a cold mid-serving compile stalls one EP rank
+        # past the NVLink barrier's 30 s timeout and aborts the job. Tiles are
+        # cached by GEMM shape + token count (not by layer), so warming one
+        # experts module covers every layer. Opt out with
+        # TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1.
+        if (
+            mega_moe_experts
+            and os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") != "1"
+        ):
+            logger.info("Pre-compiling DeepGEMM mega-MoE kernel variants...")
+            mega_moe_experts[0].warmup_jit_variants()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
