@@ -163,6 +163,24 @@ def pool_to_prefix_cache_adjunct_spec(
     return spec
 
 
+def should_use_overlap_schedule(
+    *,
+    disable_overlap_schedule: bool,
+    disaggregation_mode: str,
+    speculative_algorithm: Any | None,
+    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+) -> bool:
+    """Return whether the runtime can use the overlapped scheduler loop."""
+
+    if disable_overlap_schedule:
+        return False
+    if disaggregation_mode == "prefill":
+        return False
+    if speculative_algorithm is not None and paged_cache_groups:
+        return False
+    return True
+
+
 def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id

@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "apache-tvm-ffi>=0.1.5",
     "nvidia-cutlass-dsl",
-    "tokenspeed-triton>=3.7.10.post20260505",
+    "tokenspeed-triton>=3.7.10.post20260531",
     "torch",
 ]
 

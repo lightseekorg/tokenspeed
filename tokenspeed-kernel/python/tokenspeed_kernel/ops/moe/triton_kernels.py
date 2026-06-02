@@ -150,14 +150,6 @@ _matmul_common = dict(
 register_kernel(
     "moe",
     "experts",
-    name="triton_kernels_matmul_ogs",
-    features={"ragged_metadata"},
-    **_matmul_common,
-)(_matmul)
-
-register_kernel(
-    "moe",
-    "experts",
     name="triton_kernels_dispatch_gemm",
     features={"ragged_metadata", "dispatch_gemm"},
     **_matmul_common,

@@ -55,6 +55,8 @@ class ModelExecutionResult:
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    # Optional next-round input rows captured for PD prefill data-plane handoff.
+    next_input_ids: torch.Tensor | None = None
 
     def sync(self) -> None:
         assert self.copy_event is not None

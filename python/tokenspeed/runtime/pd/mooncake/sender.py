@@ -67,6 +67,7 @@ class MooncakeKVSender:
         is_last,
         mla_l1_5_args: Optional[PageTransferMetadata] = None,
         bootstrap_token: int = -1,
+        spec_candidate_ids: Optional[list[int]] = None,
         mamba_indices: Optional[npt.NDArray[np.int64]] = None,
     ):
         """
@@ -106,6 +107,7 @@ class MooncakeKVSender:
                 aux_index=aux_index,
                 mla_l1_5_args=mla_l1_5_args,
                 bootstrap_token=bootstrap_token,
+                spec_candidate_ids=spec_candidate_ids,
                 mamba_indices=mamba_indices,
             )
 
@@ -120,6 +122,7 @@ class MooncakeKVSender:
         mla_l1_5_args: Optional[PageTransferMetadata] = None,
         bootstrap_token: int = -1,
         wait_for_bootstrap_token: bool = False,
+        spec_candidate_ids: Optional[list[int]] = None,
         mamba_indices: Optional[npt.NDArray[np.int64]] = None,
     ):
         self._layerwise_transfer_started = True
@@ -150,6 +153,7 @@ class MooncakeKVSender:
             begin_cache_step=begin_cache_step,
             layerwise_interval=layerwise_interval,
             wait_for_bootstrap_token=wait_for_bootstrap_token,
+            spec_candidate_ids=spec_candidate_ids,
             mamba_indices=mamba_indices,
         )
 

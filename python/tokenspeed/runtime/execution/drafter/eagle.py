@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -49,6 +50,12 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+
+
+def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None:
+    advance = getattr(attn_backend, "advance_draft_forward_metadata", None)
+    if advance is not None:
+        advance(seq_lens)
 
 
 @dataclass
@@ -219,16 +226,27 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-
         draft_first_step_reduce = forward_mode.is_decode()
 
-        if draft_first_step_reduce and self.attn_backend.support_kv_cache_prewrite:
-            # Trim seq_lens by rejected-draft count so the sliced decode
-            # query does not attend to dead positions.
+        # TODO: remove the isinstance/flag gate together with pre_attention_trim
+        # once Qwen NextN and DeepSeek V3 NextN also pre-slice q.
+        draft_model = self.draft_model_runner.model
+        if (
+            draft_first_step_reduce
+            and self.attn_backend.support_kv_cache_prewrite
+            and isinstance(draft_model, BaseCausalLM)
+            and draft_model.pre_attention_trim
+        ):
             correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
                 self.draft_seq_lens_buf.dtype
             )
             self.draft_seq_lens_buf[:bs].sub_(correction)
+
+        draft_first_mode = (
+            ForwardMode.DRAFT_EXTEND
+            if forward_mode.is_target_verify()
+            else forward_mode
+        )
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -237,7 +255,7 @@ class Eagle(BaseDrafter):
             bs=bs,
             num_extends=draft_input.num_extends,
             input_num_tokens=draft_input.input_num_tokens,
-            forward_mode=forward_mode,
+            forward_mode=draft_first_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=gather_ids,
             global_num_tokens=draft_input.global_num_tokens,
@@ -253,6 +271,7 @@ class Eagle(BaseDrafter):
             out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
             input_lengths=unpadded_input_lengths,  # Used in logits processor
             captured_hidden_states=draft_input.base_out_hidden_states,
+            spec_step_idx=0,
         )
 
     @nvtx_range("draft_multi_step", color="purple")
@@ -267,7 +286,9 @@ class Eagle(BaseDrafter):
         num_extends = draft_input.num_extends
         num_decodes = bs - num_extends
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        cache_start = self.input_buffers.seq_lens_buf[:bs]
+        cache_start = self.input_buffers.seq_lens_buf[:bs].clone()
+        # Step 1's write position uses vc+accept_length after target verify so
+        # rotary/cache metadata stay on the accepted prefix, not rejected tail.
         if num_decodes > 0:
             cache_start[num_extends:] = (
                 self.runtime_states.valid_cache_lengths.index_select(
@@ -286,8 +307,7 @@ class Eagle(BaseDrafter):
             req_to_pages=self.req_to_page,
             page_size=self.page_size,
         )
-        cache_locs_trans = cache_locs.view(bs, self.spec_num_steps - 1).t().contiguous()
-
+        cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)
@@ -323,14 +343,22 @@ class Eagle(BaseDrafter):
                 all_decode_or_idle=draft_input.all_decode_or_idle,
             )
 
+            out_cache_loc = cache_locs[:, i - 1].contiguous()
+            # Keep attention metadata on the accepted prefix; rejected verify
+            # tail slots may still contain stale draft KV.
+            _advance_draft_forward_metadata_if_supported(
+                ctx.attn_backend, draft_seq_lens
+            )
+
             with nvtx_range("draft_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
                     input_ids=self._map_hot(draft_ids),
                     positions=positions,
-                    out_cache_loc=cache_locs_trans[i - 1],
+                    out_cache_loc=out_cache_loc,
                     input_lengths=input_lengths,
                     captured_hidden_states=logits_output.hidden_states,
+                    spec_step_idx=i,
                 )
 
             with nvtx_range("draft_sample", color="yellow"):

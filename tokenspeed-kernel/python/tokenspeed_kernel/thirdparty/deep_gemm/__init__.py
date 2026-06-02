@@ -71,6 +71,7 @@ _prepare_deep_gemm_cuda_home()
 from deep_gemm import (
     ceil_div,
     ceil_to_ue8m0,
+    fp8_einsum,
     fp8_fp4_mega_moe,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -95,6 +96,7 @@ __all__ = [
     "fp8_fp4_mega_moe",
     "fp8_fp4_mqa_logits",
     "fp8_fp4_paged_mqa_logits",
+    "fp8_einsum",
     "fp8_gemm_nt",
     "get_num_sms",
     "get_symm_buffer_for_mega_moe",

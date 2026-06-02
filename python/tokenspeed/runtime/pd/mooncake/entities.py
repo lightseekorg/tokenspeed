@@ -59,6 +59,7 @@ class TransferKVChunk:
     begin_cache_step: Optional[int] = None
     layerwise_interval: int = 1
     wait_for_bootstrap_token: bool = False
+    spec_candidate_ids: Optional[list[int]] = None
 
 
 @dataclasses.dataclass

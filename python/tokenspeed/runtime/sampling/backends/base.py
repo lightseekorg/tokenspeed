@@ -232,6 +232,16 @@ class SamplingBackend(ABC):
         pool row 0 (see CudaGraphWrapper capture path); stateful backends
         override this to zero whatever row 0 accumulates. Default: no-op."""
 
+    def get_packed_output_d2h(
+        self,
+        output_tokens: torch.Tensor,
+        output_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """If the backend wrote both outputs into a single contiguous GPU
+        buffer, return CPU views obtained from one D2H copy. Otherwise
+        return None and let the caller fall back to two separate D2Hs."""
+        return None
+
     @abstractmethod
     def sample(
         self,
