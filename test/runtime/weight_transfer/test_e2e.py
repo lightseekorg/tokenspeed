@@ -2,9 +2,9 @@
 
 These drive the *real* WeightTransferManager through the *real* FastAPI app over
 a *real* socket (uvicorn in a background thread), with an HTTP client. They
-exercise the full lifecycle, the response JSON, and -- most importantly --
-the pause/resume admission gate actually blocking a concurrent generation on the
-same event loop (the headline RL-safety behavior).
+exercise the full lifecycle, the response JSON, the error contract, and -- most
+importantly -- the pause/resume admission gate actually blocking a concurrent
+generation on the same event loop (the headline RL-safety behavior).
 
 A full ``ts serve`` boot is not exercised here: it needs a GPU + a matching
 ``tokenspeed_kernel`` wheel + the external smg servicer. ``AsyncLLM``'s heavy
@@ -251,20 +251,21 @@ def test_pause_wait_drains_concurrent_generation(server_nccl):
 # --------------------------------------------------------------------------- #
 
 
-def test_lifecycle_ordering_errors_over_http(server_nccl):
+def test_error_contract_over_http(server_nccl):
     base, _ = server_nccl
     with httpx.Client(base_url=base, timeout=10.0) as c:
-        # update before start -> 409 Conflict
-        r = c.post("/update_weights", json={"update_info": {"names": []}})
-        assert r.status_code == 409
-        assert "error" in r.json()
+        # update before start: lifecycle error is left unwrapped -> 500
+        assert (
+            c.post("/update_weights", json={"update_info": {"names": []}}).status_code
+            == 500
+        )
         # missing init_info -> 400
         assert c.post("/init_weight_transfer_engine", json={}).status_code == 400
-        # invalid pause mode -> 400
+        # invalid pause mode -> 400 (manager raises ValueError, caught by /pause)
         assert c.post("/pause", params={"mode": "bogus"}).status_code == 400
 
 
-def test_ipc_update_not_implemented_over_http(server_ipc):
+def test_ipc_update_deferred_over_http(server_ipc):
     base, _ = server_ipc
     with httpx.Client(base_url=base, timeout=10.0) as c:
         c.post("/init_weight_transfer_engine", json={"init_info": {}})
@@ -280,8 +281,9 @@ def test_ipc_update_not_implemented_over_http(server_ipc):
                 }
             },
         )
-        # Metadata validated, but worker-side IPC load is deferred -> 501.
-        assert r.status_code == 501
+        # Metadata validated, but worker-side IPC load is deferred; the error is
+        # left unwrapped -> 500.
+        assert r.status_code == 500
 
 
 # --------------------------------------------------------------------------- #

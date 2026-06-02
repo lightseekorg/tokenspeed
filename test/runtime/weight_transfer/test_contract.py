@@ -200,7 +200,8 @@ def test_invalid_pause_mode_is_4xx(client):
 
 
 # --------------------------------------------------------------------------- #
-# Error-code mapping for lifecycle/backend errors
+# Error model: lifecycle endpoints leave manager errors unwrapped -> 500
+# (only missing-field / invalid-JSON are 400). Matches the upstream router.
 # --------------------------------------------------------------------------- #
 
 
@@ -214,23 +215,12 @@ class RaisingManager(RecordingManager):
 
 
 @pytest.mark.parametrize(
-    "exc,code",
-    [
-        (
-            __import__(
-                "tokenspeed.runtime.engine.weight_transfer.manager",
-                fromlist=["WeightTransferStateError"],
-            ).WeightTransferStateError("nope"),
-            409,
-        ),
-        (ValueError("bad"), 400),
-        (NotImplementedError("later"), 501),
-        (RuntimeError("kaboom"), 500),
-    ],
+    "exc",
+    [ValueError("bad"), NotImplementedError("later"), RuntimeError("kaboom")],
 )
-def test_update_error_mapping(exc, code):
+def test_update_errors_surface_as_500(exc):
     app = build_weight_transfer_app(RaisingManager(exc))
     client = TestClient(app, raise_server_exceptions=False)
     r = client.post("/update_weights", json={"update_info": {}})
-    assert r.status_code == code
-    assert "error" in r.json()
+    # Unwrapped error -> Starlette's default 500 (plain text, not JSON).
+    assert r.status_code == 500

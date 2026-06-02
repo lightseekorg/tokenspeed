@@ -89,8 +89,8 @@ The following require GPU hardware and land separately:
 - **Worker-side weight load.** The NCCL broadcast receive + `load_weights` and
   the CUDA-IPC handle rebuild run on the scheduler/model-runner workers. Until
   wired, `nccl` `update_weights` drives the existing distributed receive path
-  and `ipc` `update_weights` returns `501 Not Implemented` after validating the
-  payload.
+  and `ipc` `update_weights` validates the payload then errors (the worker IPC
+  path is not implemented yet).
 - **`keep`-mode KV preservation.** New-request admission is gated in the
   frontend today; freezing in-flight KV/request state in the C++ scheduler is a
   follow-up. `abort` and `wait` are fully supported.

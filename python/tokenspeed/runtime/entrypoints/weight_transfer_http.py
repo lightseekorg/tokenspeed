@@ -46,10 +46,7 @@ import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from tokenspeed.runtime.engine.weight_transfer.manager import (
-    PAUSE_MODES,
-    WeightTransferStateError,
-)
+from tokenspeed.runtime.engine.weight_transfer.manager import PAUSE_MODES
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
@@ -88,36 +85,13 @@ async def _read_json(request: Request) -> dict[str, Any]:
     return body
 
 
-async def _run(action: Awaitable[Any], success_content: dict[str, Any]) -> JSONResponse:
-    """Await a manager action and map exceptions to HTTP status codes.
-
-    - ``WeightTransferStateError`` (lifecycle misuse) -> 409 Conflict
-    - ``NotImplementedError`` (backend path not wired) -> 501 Not Implemented
-    - ``ValueError`` (bad request payload) -> 400 Bad Request
-    - anything else -> 500 Internal Server Error
-    """
-    try:
-        await action
-    except WeightTransferStateError as e:
-        return JSONResponse({"error": str(e)}, status_code=HTTPStatus.CONFLICT.value)
-    except NotImplementedError as e:
-        return JSONResponse(
-            {"error": str(e)}, status_code=HTTPStatus.NOT_IMPLEMENTED.value
-        )
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=HTTPStatus.BAD_REQUEST.value)
-    except Exception as e:  # noqa: BLE001 - defensive
-        logger.exception("Weight transfer action failed")
-        return JSONResponse(
-            {"error": f"Weight transfer action failed: {e}"},
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-        )
-    return JSONResponse(content=success_content)
-
-
 # --------------------------------------------------------------------------- #
 # Weight-update lifecycle
 # --------------------------------------------------------------------------- #
+#
+# Error model: lifecycle endpoints validate the request body (400 on missing
+# field / invalid JSON) and otherwise let manager errors surface as 500;
+# pause/resume catch ValueError -> 400 and otherwise return 500.
 
 
 @router.post("/init_weight_transfer_engine")
@@ -129,20 +103,16 @@ async def init_weight_transfer_engine(raw_request: Request) -> JSONResponse:
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Missing 'init_info' in request body",
         )
-    return await _run(
-        _manager(raw_request).init_engine(init_info),
-        {"message": "Weight transfer initialized"},
-    )
+    await _manager(raw_request).init_engine(init_info)
+    return JSONResponse(content={"message": "Weight transfer initialized"})
 
 
 @router.post("/start_weight_update")
 async def start_weight_update(raw_request: Request) -> JSONResponse:
     body = await _read_json(raw_request)
     is_checkpoint_format = body.get("is_checkpoint_format", True)
-    return await _run(
-        _manager(raw_request).start_update(is_checkpoint_format=is_checkpoint_format),
-        {"message": "Weight update started"},
-    )
+    await _manager(raw_request).start_update(is_checkpoint_format=is_checkpoint_format)
+    return JSONResponse(content={"message": "Weight update started"})
 
 
 @router.post("/update_weights")
@@ -154,18 +124,14 @@ async def update_weights(raw_request: Request) -> JSONResponse:
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Missing 'update_info' in request body",
         )
-    return await _run(
-        _manager(raw_request).update(update_info),
-        {"message": "Weights updated"},
-    )
+    await _manager(raw_request).update(update_info)
+    return JSONResponse(content={"message": "Weights updated"})
 
 
 @router.post("/finish_weight_update")
 async def finish_weight_update(raw_request: Request) -> JSONResponse:
-    return await _run(
-        _manager(raw_request).finish_update(),
-        {"message": "Weight update finished"},
-    )
+    await _manager(raw_request).finish_update()
+    return JSONResponse(content={"message": "Weight update finished"})
 
 
 # --------------------------------------------------------------------------- #
@@ -194,20 +160,43 @@ async def pause_generation(
         mode = "wait"
     if mode not in PAUSE_MODES:
         return JSONResponse(
-            {
+            content={
                 "error": f"Invalid pause mode: {mode!r}. Must be one of {list(PAUSE_MODES)}."
             },
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
-    return await _run(
-        _manager(raw_request).pause(mode=mode, clear_cache=clear_cache),
-        {"status": "paused"},
-    )
+    engine = _manager(raw_request)
+    try:
+        await engine.pause(mode=mode, clear_cache=clear_cache)
+        return JSONResponse(
+            content={"status": "paused"}, status_code=HTTPStatus.OK.value
+        )
+    except ValueError as err:
+        return JSONResponse(
+            content={"error": str(err)}, status_code=HTTPStatus.BAD_REQUEST.value
+        )
+    except Exception as err:  # noqa: BLE001 - defensive
+        logger.exception("Failed to pause generation")
+        return JSONResponse(
+            content={"error": f"Failed to pause generation: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
 
 
 @router.post("/resume")
 async def resume_generation(raw_request: Request) -> JSONResponse:
-    return await _run(_manager(raw_request).resume(), {"status": "resumed"})
+    engine = _manager(raw_request)
+    try:
+        await engine.resume()
+        return JSONResponse(
+            content={"status": "resumed"}, status_code=HTTPStatus.OK.value
+        )
+    except Exception as err:  # noqa: BLE001 - defensive
+        logger.exception("Failed to resume generation")
+        return JSONResponse(
+            content={"error": f"Failed to resume generation: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
 
 
 @router.get("/is_paused")

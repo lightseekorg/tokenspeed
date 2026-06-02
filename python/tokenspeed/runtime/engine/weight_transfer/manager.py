@@ -247,6 +247,20 @@ class WeightTransferManager:
                 f"{what} has unknown key(s): {unknown}. Allowed: {sorted(allowed)}."
             )
 
+    @staticmethod
+    def _check_dense(update_info: dict[str, Any], what: str) -> None:
+        """Accept-and-ignore ``update_kind="dense"`` (the default); reject sparse.
+
+        ``update_kind`` / ``num_updates_list`` are part of the weight-update wire
+        format; only dense updates are implemented here.
+        """
+        update_kind = update_info.get("update_kind", "dense")
+        if update_kind != "dense":
+            raise ValueError(
+                f"{what}: unsupported update_kind={update_kind!r}; only 'dense' "
+                "weight updates are supported (sparse updates are not implemented)."
+            )
+
     def _parse_nccl_init(
         self, init_info: dict[str, Any]
     ) -> InitWeightsUpdateGroupReqInput:
@@ -273,8 +287,11 @@ class WeightTransferManager:
             "packed_num_buffers",
             "group_name",
             "flush_cache",
+            "update_kind",
+            "num_updates_list",
         )
         self._require_keys(update_info, required, allowed, "NCCL update_info")
+        self._check_dense(update_info, "NCCL update_info")
         names = list(update_info["names"])
         dtype_names = list(update_info["dtype_names"])
         shapes = [list(s) for s in update_info["shapes"]]
@@ -311,8 +328,11 @@ class WeightTransferManager:
             "ipc_handles_pickled",
             "tensor_sizes",
             "packed",
+            "update_kind",
+            "num_updates_list",
         )
         self._require_keys(update_info, required, allowed, "IPC update_info")
+        self._check_dense(update_info, "IPC update_info")
         names = list(update_info["names"])
         dtype_names = list(update_info["dtype_names"])
         shapes = [list(s) for s in update_info["shapes"]]

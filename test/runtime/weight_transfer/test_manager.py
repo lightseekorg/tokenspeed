@@ -198,6 +198,28 @@ class TestNcclParsing:
         with pytest.raises(ValueError, match="equal length"):
             asyncio.run(body())
 
+    def test_update_kind_dense_accepted(self):
+        a, mgr = _mgr()
+
+        async def body():
+            await mgr.init_engine(_nccl_init())
+            await mgr.start_update()
+            await mgr.update(_nccl_update(update_kind="dense"))
+
+        asyncio.run(body())
+        assert any(c[0] == "update" for c in a.calls)
+
+    def test_update_kind_sparse_rejected(self):
+        a, mgr = _mgr()
+
+        async def body():
+            await mgr.init_engine(_nccl_init())
+            await mgr.start_update()
+            await mgr.update(_nccl_update(update_kind="sparse_flat"))
+
+        with pytest.raises(ValueError, match="update_kind"):
+            asyncio.run(body())
+
 
 class TestIpcParsing:
     def test_init_noop(self):
@@ -228,6 +250,12 @@ class TestIpcParsing:
         _, mgr = self._started()
         upd = _nccl_update(ipc_handles=[{"u": ()}], ipc_handles_pickled="x")
         with pytest.raises(ValueError, match="Cannot specify both"):
+            asyncio.run(mgr.update(upd))
+
+    def test_update_kind_sparse_rejected(self):
+        _, mgr = self._started()
+        upd = _nccl_update(ipc_handles=[{"u": ()}], update_kind="sparse_flat")
+        with pytest.raises(ValueError, match="update_kind"):
             asyncio.run(mgr.update(upd))
 
     def test_pickled_requires_insecure_optin(self):
