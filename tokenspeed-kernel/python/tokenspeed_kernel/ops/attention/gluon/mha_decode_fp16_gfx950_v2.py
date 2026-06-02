@@ -62,7 +62,7 @@ class AttentionConfig:
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     GROUP_SIZE: gl.constexpr
-    GROUP_BLOCKS: gl.constexpr
+    NUM_GROUPS: gl.constexpr
     q_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -134,7 +134,7 @@ class AttentionConfig:
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
-        self.GROUP_BLOCKS = gl.constexpr(cdiv(self.GROUP_SIZE, BLOCK_M))
+        self.NUM_GROUPS = gl.constexpr(cdiv(self.GROUP_SIZE, BLOCK_M))
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
@@ -223,8 +223,8 @@ class AttentionProgram:
     ):
         batch = gl.program_id(0)
         head_block = gl.program_id(1)
-        kv_head = head_block // cfg.GROUP_BLOCKS
-        group_block = head_block - kv_head * cfg.GROUP_BLOCKS
+        kv_head = head_block // cfg.NUM_GROUPS
+        group_block = head_block - kv_head * cfg.NUM_GROUPS
         group_start = group_block * cfg.BLOCK_M
         split_id = gl.program_id(2)
         cache_len = gl.load(cache_seqlens_ptr + batch)
@@ -809,7 +809,7 @@ def _mha_decode_reduce_fp16(
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
-    group_blocks: int
+    num_groups: int
     head_dim: int
     page_size: int
     num_kv_splits: int
@@ -832,14 +832,14 @@ def get_config(
     block_m = 16
     block_n = 64
     group_size = q.shape[1] // k_cache.shape[2]
-    group_blocks = cdiv(group_size, block_m)
+    num_groups = cdiv(group_size, block_m)
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     sm_scale = 1.0 / math.sqrt(head_dim)
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
-        group_blocks=group_blocks,
+        num_groups=num_groups,
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=8,
@@ -900,7 +900,7 @@ def gluon_mha_decode_fp16_gfx950_v2(
 
     if config.is_sliding:
         # No split-k for sliding window attention
-        grid = (batch, config.num_kv_heads * config.group_blocks, 1)
+        grid = (batch, config.num_kv_heads * config.num_groups, 1)
         _mha_decode_sliding_fp16[grid](
             q,
             k_cache,
@@ -940,7 +940,7 @@ def gluon_mha_decode_fp16_gfx950_v2(
 
         grid = (
             batch,
-            config.num_kv_heads * config.group_blocks,
+            config.num_kv_heads * config.num_groups,
             config.num_kv_splits,
         )
         _mha_decode_fp16[grid](
