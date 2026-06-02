@@ -25,10 +25,11 @@ import os
 from typing import Any
 
 import torch
-from tokenspeed_kernel._triton import (  # noqa: F401
+from tokenspeed_kernel._triton import (
+    aggregate,
+    gl,
+    gluon,
     redirect_triton_to_tokenspeed_triton,
-    tl,
-    triton,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -38,16 +39,18 @@ from tokenspeed_kernel.signature import (
     format_signature,
     tensor_format,
 )
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.experimental.gluon import language as gl
-from tokenspeed_triton.language.core import _aggregate as aggregate
 
 with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.matmul import FnSpecs, FusedActivation
-    from triton_kernels.matmul import matmul as _upstream_matmul
     from triton_kernels.swiglu import swiglu_fn
-    from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
-    from triton_kernels.tensor import Tensor as _UpstreamWrappedTensor  # noqa: F401
+    from triton_kernels.tensor import RaggedTensorMetadata, Tensor
+
+__all__ = [
+    "_gluon_mxfp_fused_moe",
+    "_gluon_mxfp_ragged_matmul",
+    "gluon_mxfp_combine",
+    "gluon_mxfp_dispatch_swiglu",
+]
 
 _GLUON_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
 _GLUON_DISABLED_ENV = (
@@ -162,11 +165,11 @@ _CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
 
 
 def shuffle_weight_for_gluon_dot_layout(
-    w: "torch.Tensor",
+    w: torch.Tensor,
     *,
     block_k_pk: int = 128,
     block_n: int = 128,
-) -> "torch.Tensor":
+) -> torch.Tensor:
     K_pk, N = w.shape[-2], w.shape[-1]
 
     if block_k_pk <= 0 or block_k_pk % _GLUON_DOT_SUB_TILE_K != 0:
@@ -3641,7 +3644,6 @@ def _launch_kernel(
         else:
             x_global_scale_buf = scale_view.to(device=x.device, dtype=torch.float32)
     else:
-        # Tests / microbenchmarks: not graph-safe (torch.tensor sync).
         x_global_scale_buf = torch.tensor(
             [float(x_global_scale)], dtype=torch.float32, device=x.device
         )
@@ -4269,7 +4271,7 @@ def _extract_gluon_raw_w(w):
         if shuffled is not None:
             return shuffled
         return w
-    if not isinstance(w, _UpstreamWrappedTensor):
+    if not isinstance(w, Tensor):
         return w
     raw = w.storage.data
     shuffled = getattr(raw, "_gluon_shuffled", None)
@@ -4283,7 +4285,7 @@ def _extract_gluon_raw_s(s):
     (bit-equivalent to upstream CDNA4MXScaleLayout.swizzle_data)."""
     if isinstance(s, torch.Tensor):
         return s
-    if not isinstance(s, _UpstreamWrappedTensor):
+    if not isinstance(s, Tensor):
         return s
     return s.storage.data
 
@@ -4313,227 +4315,6 @@ def _global_scale_passthrough(scale):
     if isinstance(scale, torch.Tensor):
         return scale
     return float(scale)
-
-
-def _try_dispatch_mxfp(
-    x: torch.Tensor,
-    w,
-    bias: torch.Tensor | None,
-    *,
-    a_ragged_metadata,
-    gather_indx,
-    scatter_indx,
-    precision_config,
-    fused_activation,
-    n_tokens,
-    n_expts_act,
-    **extra_kwargs,
-) -> tuple[torch.Tensor | None, bool]:
-    if precision_config is None:
-        return None, False
-    w_mx_scale = getattr(precision_config, "b_mx_scale", None)
-    if w_mx_scale is None:
-        return None, False
-
-    flex = getattr(precision_config, "flex_ctx", None)
-    lhs = getattr(flex, "lhs_data", None) if flex is not None else None
-    fp8_dtype = getattr(lhs, "dtype", None) if lhs is not None else None
-    fp8_scale = getattr(lhs, "scale", None) if lhs is not None else None
-
-    x_mx_scale = getattr(precision_config, "a_mx_scale", None)
-    if fp8_dtype is not None and x_mx_scale is not None:
-        return None, False
-
-    if fp8_dtype is not None:
-        x_format = "e4m3"
-        x_global_scale = _global_scale_passthrough(fp8_scale)
-        x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
-        x_scale = None
-    elif x_mx_scale is not None:
-        x_format = "e2m1"
-        x_global_scale = 1.0
-        x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
-        x_scale = _extract_gluon_raw_s(x_mx_scale)
-        if not isinstance(x_scale, torch.Tensor):
-            return None, False
-    else:
-        return None, False
-
-    if precision_config.out_dtype is not None:
-        out_dtype = precision_config.out_dtype
-    elif x.dtype.is_floating_point:
-        out_dtype = x.dtype
-    else:
-        out_dtype = torch.bfloat16
-
-    w_raw = _extract_gluon_raw_w(w)
-    s_raw = _extract_gluon_raw_s(w_mx_scale)
-
-    if not isinstance(w_raw, torch.Tensor) or not isinstance(s_raw, torch.Tensor):
-        return None, False
-    if w_raw.ndim != 3:
-        return None, False
-
-    # Wrap bare tensors into ``.<attr>``-typed adapters; the launcher
-    # consults gather_indx.src_indx / scatter_indx.dst_indx.
-    def _adapt_indx(obj, attr):
-        if obj is None:
-            return None
-        if hasattr(obj, attr):
-            return obj
-        if isinstance(obj, torch.Tensor):
-            return type("IndxAdapter", (), {attr: obj})()
-        return obj
-
-    gather_indx = _adapt_indx(gather_indx, "src_indx")
-    scatter_indx = _adapt_indx(scatter_indx, "dst_indx")
-
-    swiglu_args = _maybe_extract_swiglu_args(fused_activation)
-    has_gather = gather_indx is not None
-    has_scatter = scatter_indx is not None
-
-    if fused_activation is not None and swiglu_args is None:
-        return None, False
-
-    gammas = extra_kwargs.get("gammas")
-    betas = extra_kwargs.get("betas")
-    out_alpha = extra_kwargs.get("out_alpha")
-    if betas is not None or out_alpha is not None:
-        return None, False
-    epilogue = extra_kwargs.get("epilogue")
-    if epilogue is not None:
-        return None, False
-    fused_comm = extra_kwargs.get("fused_comm")
-    if fused_comm is not None:
-        return None, False
-    c_in = extra_kwargs.get("c") or extra_kwargs.get("c_acc_in")
-    if c_in is not None:
-        return None, False
-
-    out_quant_scale = extra_kwargs.get("out_quant_scale")
-
-    try:
-        if has_scatter and not has_gather:
-            # gemm + combine
-            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
-            out = gluon_mxfp_combine(
-                x_view,
-                w_raw,
-                s_raw,
-                x_scale=x_scale,
-                x_format=x_format,
-                x_global_scale=x_global_scale,
-                bias=bias,
-                a_ragged_metadata=a_ragged_metadata,
-                scatter_indx=scatter_indx,
-                gate_scal=gammas,
-                n_tokens=n_tokens,
-                n_expts_act=n_expts_act,
-                out_dtype=out_dtype,
-                scale_load_mode="swizzle",
-                w_transpose=True,
-                w_preshuffle=w_preshuffle,
-            )
-            return out, True
-
-        if not has_scatter and swiglu_args is not None:
-            swiglu_alpha, swiglu_limit = swiglu_args
-            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
-            out = gluon_mxfp_dispatch_swiglu(
-                x_view,
-                w_raw,
-                s_raw,
-                x_scale=x_scale,
-                x_format=x_format,
-                x_global_scale=x_global_scale,
-                bias=bias,
-                a_ragged_metadata=a_ragged_metadata,
-                gather_indx=gather_indx,
-                out_dtype=out_dtype,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_limit=swiglu_limit,
-                scale_load_mode="swizzle",
-                w_transpose=True,
-                out_quant_scale=out_quant_scale,
-                w_preshuffle=w_preshuffle,
-            )
-            return out, True
-
-    except Exception as exc:  # noqa: BLE001
-        import logging
-        import traceback
-
-        logger = logging.getLogger("tokenspeed_kernel.ops.moe.gluon")
-        logger.warning(
-            "_try_dispatch_mxfp falling back to upstream: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
-        logger.warning(
-            "  full chain:\n%s",
-            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-        )
-        return None, False
-
-    return None, False
-
-
-def _gluon_mxfp_ragged_matmul(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: torch.Tensor | None,
-    *,
-    a_ragged_metadata=None,
-    gather_indx=None,
-    scatter_indx=None,
-    precision_config=None,
-    fused_activation=None,
-    n_tokens=None,
-    n_expts_act=None,
-    **passthrough,
-) -> torch.Tensor:
-    out, ok = _try_dispatch_mxfp(
-        x,
-        w,
-        bias,
-        a_ragged_metadata=a_ragged_metadata,
-        gather_indx=gather_indx,
-        scatter_indx=scatter_indx,
-        precision_config=precision_config,
-        fused_activation=fused_activation,
-        n_tokens=n_tokens,
-        n_expts_act=n_expts_act,
-        **passthrough,
-    )
-    if ok:
-        return out
-
-    out = _upstream_matmul(
-        x,
-        w,
-        bias,
-        a_ragged_metadata=a_ragged_metadata,
-        gather_indx=gather_indx,
-        scatter_indx=scatter_indx,
-        precision_config=precision_config,
-        fused_activation=fused_activation,
-        **{
-            k: v
-            for k, v in passthrough.items()
-            if k not in _TUNING_KW and k not in _GLUON_PRIVATE_KW
-        },
-    )
-    if scatter_indx is not None and n_expts_act is not None and n_expts_act > 1:
-        assert (
-            n_tokens is not None
-        ), "n_tokens required when n_expts_act > 1 for top-k reduction"
-        out = out.view(n_tokens, n_expts_act, out.shape[-1]).sum(dim=1)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
 
 
 def _kernel_priority() -> int:
@@ -4594,30 +4375,167 @@ _common = dict(
     tags={"throughput", "latency"},
 )
 
-register_kernel(
+
+@register_kernel(
     "moe",
     "experts",
     name="gluon_dispatch_gemm",
     features={"ragged_metadata", "dispatch_gemm"},
     **_common,
-)(_gluon_mxfp_ragged_matmul)
-
-register_kernel(
+)
+@register_kernel(
     "moe",
     "experts",
     name="gluon_gemm_combine",
     features={"ragged_metadata", "gemm_combine"},
     **_common,
-)(_gluon_mxfp_ragged_matmul)
+)
+def _gluon_mxfp_ragged_matmul(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    a_ragged_metadata=None,
+    gather_indx=None,
+    scatter_indx=None,
+    precision_config=None,
+    fused_activation=None,
+    n_tokens=None,
+    n_expts_act=None,
+    **extra_kwargs,
+) -> torch.Tensor | None:
+    assert precision_config is not None
+    w_mx_scale = getattr(precision_config, "b_mx_scale", None)
+    assert w_mx_scale is not None
 
-# ---------------------------------------------------------------------------
-# End-to-end fused MoE entry point (route + dispatch_gemm + combine).
-#
-# Targets the ``w-mxfp4 / a-fp8`` Quark export used by models like
-# ``amd/gpt-oss-120b-w-mxfp4-a-fp8``.  Internally re-uses the registered
-# ``triton_kernels_routing`` route kernel and the two gluon experts
-# kernels above, so callers don't have to thread routing state through.
-# ---------------------------------------------------------------------------
+    flex = getattr(precision_config, "flex_ctx", None)
+    lhs = getattr(flex, "lhs_data", None) if flex is not None else None
+    fp8_dtype = getattr(lhs, "dtype", None) if lhs is not None else None
+    fp8_scale = getattr(lhs, "scale", None) if lhs is not None else None
+
+    x_mx_scale = getattr(precision_config, "a_mx_scale", None)
+    if fp8_dtype is not None and x_mx_scale is not None:
+        return
+
+    if fp8_dtype is not None:
+        x_format = "e4m3"
+        x_global_scale = _global_scale_passthrough(fp8_scale)
+        x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
+        x_scale = None
+    elif x_mx_scale is not None:
+        x_format = "e2m1"
+        x_global_scale = 1.0
+        x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
+        x_scale = _extract_gluon_raw_s(x_mx_scale)
+        if not isinstance(x_scale, torch.Tensor):
+            return
+    else:
+        return
+
+    if precision_config.out_dtype is not None:
+        out_dtype = precision_config.out_dtype
+    elif x.dtype.is_floating_point:
+        out_dtype = x.dtype
+    else:
+        out_dtype = torch.bfloat16
+
+    w_raw = _extract_gluon_raw_w(w)
+    s_raw = _extract_gluon_raw_s(w_mx_scale)
+
+    if not isinstance(w_raw, torch.Tensor) or not isinstance(s_raw, torch.Tensor):
+        return
+    if w_raw.ndim != 3:
+        return
+
+    # Wrap bare tensors into ``.<attr>``-typed adapters; the launcher
+    # consults gather_indx.src_indx / scatter_indx.dst_indx.
+    def _adapt_indx(obj, attr):
+        if obj is None:
+            return None
+        if hasattr(obj, attr):
+            return obj
+        if isinstance(obj, torch.Tensor):
+            return type("IndxAdapter", (), {attr: obj})()
+        return obj
+
+    gather_indx = _adapt_indx(gather_indx, "src_indx")
+    scatter_indx = _adapt_indx(scatter_indx, "dst_indx")
+
+    swiglu_args = _maybe_extract_swiglu_args(fused_activation)
+    has_gather = gather_indx is not None
+    has_scatter = scatter_indx is not None
+
+    if fused_activation is not None:
+        assert swiglu_args is not None, "SwiGLU activation requires swiglu_args"
+
+    gammas = extra_kwargs.get("gammas")
+    out_quant_scale = extra_kwargs.get("out_quant_scale")
+
+    try:
+        if has_scatter and not has_gather:
+            # gemm + combine
+            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
+            out = gluon_mxfp_combine(
+                x_view,
+                w_raw,
+                s_raw,
+                x_scale=x_scale,
+                x_format=x_format,
+                x_global_scale=x_global_scale,
+                bias=bias,
+                a_ragged_metadata=a_ragged_metadata,
+                scatter_indx=scatter_indx,
+                gate_scal=gammas,
+                n_tokens=n_tokens,
+                n_expts_act=n_expts_act,
+                out_dtype=out_dtype,
+                scale_load_mode="swizzle",
+                w_transpose=True,
+                w_preshuffle=w_preshuffle,
+            )
+            return out
+
+        if not has_scatter and swiglu_args is not None:
+            swiglu_alpha, swiglu_limit = swiglu_args
+            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
+            out = gluon_mxfp_dispatch_swiglu(
+                x_view,
+                w_raw,
+                s_raw,
+                x_scale=x_scale,
+                x_format=x_format,
+                x_global_scale=x_global_scale,
+                bias=bias,
+                a_ragged_metadata=a_ragged_metadata,
+                gather_indx=gather_indx,
+                out_dtype=out_dtype,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_limit=swiglu_limit,
+                scale_load_mode="swizzle",
+                w_transpose=True,
+                out_quant_scale=out_quant_scale,
+                w_preshuffle=w_preshuffle,
+            )
+            return out
+
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        import traceback
+
+        logger = logging.getLogger("tokenspeed_kernel.ops.moe.gluon")
+        logger.warning(
+            "_gluon_mxfp_ragged_matmul falling back to upstream: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        logger.warning(
+            "  full chain:\n%s",
+            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        )
+        return
+
+    return
+
 
 _GLUON_FUSED_SIGNATURES = frozenset(
     {
@@ -4649,9 +4567,25 @@ _GLUON_FUSED_SIGNATURES = frozenset(
 )
 
 
+@register_kernel(
+    "moe",
+    "fused",
+    name="gluon_mxfp4_fp8_fused_moe",
+    features={"self_routing"},
+    solution="gluon",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=_GLUON_FUSED_SIGNATURES,
+    traits={"activation_dtype": frozenset({"fp8"})},
+    priority=_kernel_priority(),
+    tags={"throughput", "latency"},
+)
 def _gluon_mxfp_fused_moe(
-    hidden_states: "torch.Tensor",
-    router_logits: "torch.Tensor",
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
     w13_weight,
     w2_weight,
     *,
@@ -4659,12 +4593,12 @@ def _gluon_mxfp_fused_moe(
     w2_bias=None,
     w13_precision_config=None,
     w2_precision_config=None,
-    w13_act_scale: "torch.Tensor",
-    w2_act_scale: "torch.Tensor",
+    w13_act_scale: torch.Tensor,
+    w2_act_scale: torch.Tensor,
     top_k: int,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
-) -> "torch.Tensor":
+) -> torch.Tensor:
     """Route + dispatch GEMM + SwiGLU + combine GEMM, all fused for the
     gluon mxfp4 / fp8-activation path.
 
@@ -4764,31 +4698,3 @@ def _gluon_mxfp_fused_moe(
         traits=gluon_traits,
         expected_kernel_name="gluon_gemm_combine",
     )
-
-
-register_kernel(
-    "moe",
-    "fused",
-    name="gluon_mxfp4_fp8_fused_moe",
-    features={"self_routing"},
-    solution="gluon",
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    signatures=_GLUON_FUSED_SIGNATURES,
-    traits={"activation_dtype": frozenset({"fp8"})},
-    priority=_kernel_priority(),
-    tags={"throughput", "latency"},
-)(_gluon_mxfp_fused_moe)
-
-
-__all__ = [
-    "_gluon_mxfp_fused_moe",
-    "_gluon_mxfp_ragged_matmul",
-    "assert_no_spills",
-    "gluon_mxfp_combine",
-    "gluon_mxfp_dispatch_swiglu",
-    "static_profile",
-]
