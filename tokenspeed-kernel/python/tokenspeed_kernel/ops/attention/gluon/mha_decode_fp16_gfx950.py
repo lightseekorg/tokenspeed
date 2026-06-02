@@ -40,6 +40,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
+cdiv = gl.cdiv
 
 
 # ===-----------------------------------------------------------------------===#
@@ -61,7 +62,7 @@ class AttentionConfig:
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     GROUP_SIZE: gl.constexpr
-    GROUP_BLOCKS: gl.constexpr
+    NUM_GROUPS: gl.constexpr
     q_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -133,7 +134,7 @@ class AttentionConfig:
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
-        self.GROUP_BLOCKS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
+        self.NUM_GROUPS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
@@ -222,8 +223,8 @@ class AttentionProgram:
     ):
         batch = gl.program_id(0)
         head_block = gl.program_id(1)
-        kv_head = head_block // cfg.GROUP_BLOCKS
-        group_block = head_block - kv_head * cfg.GROUP_BLOCKS
+        kv_head = head_block // cfg.NUM_GROUPS
+        group_block = head_block - kv_head * cfg.NUM_GROUPS
         group_start = group_block * cfg.BLOCK_M
         split_id = gl.program_id(2)
         cache_len = gl.load(cache_seqlens_ptr + batch)
@@ -233,9 +234,9 @@ class AttentionProgram:
         else:
             kv_start = cache_len - cache_len
         first_page = kv_start // cfg.PAGE_SIZE
-        end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+        end_page = cdiv(cache_len, cfg.PAGE_SIZE)
         num_pages = end_page - first_page
-        pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
+        pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
         split_start_page = first_page + split_id * pages_per_split
         split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
@@ -321,7 +322,7 @@ class AttentionProgram:
         )
 
     @gluon.jit
-    def issue_load_k(self, physical_page, k_smem, buf: gl.constexpr):
+    def issue_load_k(self, physical_page, k_smem):
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
@@ -331,11 +332,11 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
-        async_copy.global_load_to_shared(k_smem.index(buf), self.k_cache_ptr + offsets)
+        async_copy.global_load_to_shared(k_smem, self.k_cache_ptr + offsets)
         async_copy.commit_group()
 
     @gluon.jit
-    def issue_load_v(self, physical_page, v_smem, buf: gl.constexpr):
+    def issue_load_v(self, physical_page, v_smem):
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
@@ -345,16 +346,16 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
-        async_copy.global_load_to_shared(v_smem.index(buf), self.v_cache_ptr + offsets)
+        async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)
         async_copy.commit_group()
 
     @gluon.jit
-    def shared_load_k(self, k_smem, buf: gl.constexpr):
-        return k_smem.index(buf).permute([1, 0]).load(self.cfg.k_layout)
+    def shared_load_k(self, k_smem):
+        return k_smem.permute([1, 0]).load(self.cfg.k_layout)
 
     @gluon.jit
-    def shared_load_v(self, v_smem, buf: gl.constexpr):
-        return v_smem.index(buf).load(self.cfg.v_layout)
+    def shared_load_v(self, v_smem):
+        return v_smem.load(self.cfg.v_layout)
 
     @gluon.jit
     def compute_qk(self, q, k):
@@ -389,28 +390,6 @@ class AttentionProgram:
         p = p.to(self.q_ptr.dtype.element_ty)
         p = gl.convert_layout(p, cfg.p_layout)
         return p, m_new, l_i, acc
-
-    @gluon.jit
-    def softmax_part0(self, qk, m_i):
-        cfg = self.cfg
-        row_max = max(qk, axis=1)
-        row_max = gl.convert_layout(row_max, gl.SliceLayout(1, cfg.pv_layout))
-        m_new = maximum(m_i, row_max)
-        m_new_scaled = m_new * cfg.SM_SCALE
-        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
-        p = gl.exp2(qk_shifted)
-        m_diff = m_i * cfg.SM_SCALE - m_new_scaled
-        alpha = gl.exp2(m_diff)
-        return p, alpha, m_new
-
-    @gluon.jit
-    def softmax_part1(self, p, alpha, l_i, acc):
-        l_ij = gl.sum(p, axis=1)
-        l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None]
-        p = p.to(self.q_ptr.dtype.element_ty)
-        p = gl.convert_layout(p, self.cfg.p_layout)
-        return p, l_i, acc
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
@@ -511,115 +490,28 @@ def _mha_decode_fp16(
         mid_lse_ptr,
     )
     k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty,
-        [2, cfg.BLOCK_N, cfg.HEAD_DIM],
-        cfg.k_smem_layout,
+        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
     )
     v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty,
-        [2, cfg.BLOCK_N, cfg.HEAD_DIM],
-        cfg.v_smem_layout,
+        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
     )
 
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
-    num_tiles = (
-        program.split_end - program.split_start + cfg.BLOCK_N - 1
-    ) // cfg.BLOCK_N
-    pair_tiles = (num_tiles // 2) * 2
-    pair_end = program.split_start + pair_tiles * cfg.BLOCK_N
-
-    if (pair_tiles >= 4) & (pair_end == program.split_end):
-        # pipeline prologue, iter -3
-        start_n0 = program.split_start
-        physical_page0 = program.load_page(start_n0)
-        program.issue_load_k(physical_page0, k_smem, 0)
-
-        # pipeline prologue, iter -2
-        start_n1 = start_n0 + cfg.BLOCK_N
-        physical_page1 = program.load_page(start_n1)
-        program.issue_load_k(physical_page1, k_smem, 1)
-
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        physical_page = program.load_page(start_n)
+        program.issue_load_k(physical_page, k_smem)
+        program.issue_load_v(physical_page, v_smem)
         async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem, 0)
-        program.issue_load_v(physical_page0, v_smem, 0)
-
-        # pipeline prologue, iter -1
+        k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        qk = program.apply_kv_mask(qk, start_n0)
-
-        start_n2 = start_n1 + cfg.BLOCK_N
-        physical_page2 = program.load_page(start_n2)
-        program.issue_load_k(physical_page2, k_smem, 0)
-
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
-
-        async_copy.wait_group(2)
-        k = program.shared_load_k(k_smem, 1)
-        program.issue_load_v(physical_page1, v_smem, 1)
-
-        # main loop from iter 0 to iter end-3
-        for i in range(0, num_tiles - 2):
-            a = i % 2
-            b = 1 - a
-            start_i = program.split_start + i * cfg.BLOCK_N
-            start_i1 = start_i + cfg.BLOCK_N
-            start_i2 = start_i1 + cfg.BLOCK_N
-            start_i3 = start_i2 + cfg.BLOCK_N
-
-            qk = program.compute_qk(q, k)
-            qk = program.apply_kv_mask(qk, start_i1)
-            p, l_i, acc = program.softmax_part1(p, alpha, l_i, acc)
-
-            async_copy.wait_group(2)
-            v = program.shared_load_v(v_smem, a)
-            if start_i3 < program.split_end:
-                physical_page3 = program.load_page(start_i3)
-                program.issue_load_k(physical_page3, k_smem, b)
-
-            acc = program.compute_pv(p, v, acc)
-            p, alpha, m_i = program.softmax_part0(qk, m_i)
-
-            async_copy.wait_group(2)
-            k = program.shared_load_k(k_smem, a)
-            physical_page2 = program.load_page(start_i2)
-            program.issue_load_v(physical_page2, v_smem, a)
-
-        # pipeline epilogue, iter end-2
-        start_end2 = program.split_end - cfg.BLOCK_N * 2
-        start_end1 = start_end2 + cfg.BLOCK_N
-        qk = program.compute_qk(q, k)
-        qk = program.apply_kv_mask(qk, start_end1)
-        p, l_i, acc = program.softmax_part1(p, alpha, l_i, acc)
-
-        async_copy.wait_group(1)
-        v = program.shared_load_v(v_smem, 0)
-
-        acc = program.compute_pv(p, v, acc)
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
-
-        # pipeline epilogue, iter end-1
-        p, l_i, acc = program.softmax_part1(p, alpha, l_i, acc)
+        qk = program.apply_kv_mask(qk, start_n)
+        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem, 1)
-
+        v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
-    else:
-        for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
-            physical_page = program.load_page(start_n)
-            program.issue_load_k(physical_page, k_smem, 0)
-            program.issue_load_v(physical_page, v_smem, 0)
-            async_copy.wait_group(1)
-            k = program.shared_load_k(k_smem, 0)
-            qk = program.compute_qk(q, k)
-            qk = program.apply_kv_mask(qk, start_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-            async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem, 0)
-            acc = program.compute_pv(p, v, acc)
 
     program.store_split(acc, l_i, m_i)
 
@@ -673,14 +565,10 @@ def _mha_decode_sliding_fp16(
         out_ptr,
     )
     k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty,
-        [2, cfg.BLOCK_N, cfg.HEAD_DIM],
-        cfg.k_smem_layout,
+        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
     )
     v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty,
-        [2, cfg.BLOCK_N, cfg.HEAD_DIM],
-        cfg.v_smem_layout,
+        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
     )
 
     q = program.load_q()
@@ -688,16 +576,16 @@ def _mha_decode_sliding_fp16(
 
     for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
         physical_page = program.load_page(start_n)
-        program.issue_load_k(physical_page, k_smem, 0)
-        program.issue_load_v(physical_page, v_smem, 0)
+        program.issue_load_k(physical_page, k_smem)
+        program.issue_load_v(physical_page, v_smem)
         async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem, 0)
+        k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
         qk = program.apply_kv_mask(qk, start_n)
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem, 0)
+        v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
 
     l_i = program.apply_sinks(l_i, m_i, sink_log2, HAS_SINK)
@@ -747,9 +635,9 @@ def _mha_decode_reduce_fp16(
     else:
         kv_start = cache_len - cache_len
     first_page = kv_start // cfg.PAGE_SIZE
-    end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+    end_page = cdiv(cache_len, cfg.PAGE_SIZE)
     num_pages = end_page - first_page
-    pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
+    pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=cfg.reduce_layout)
     if HAS_SINK:
         m_i = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
@@ -790,7 +678,7 @@ def _mha_decode_reduce_fp16(
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
-    group_blocks: int
+    num_groups: int
     head_dim: int
     page_size: int
     num_kv_splits: int
@@ -813,14 +701,14 @@ def get_config(
     block_m = 16
     block_n = 64
     group_size = q.shape[1] // k_cache.shape[2]
-    group_blocks = (group_size + block_m - 1) // block_m
+    num_groups = math.ceil(group_size / block_m)
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     sm_scale = 1.0 / math.sqrt(head_dim)
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
-        group_blocks=group_blocks,
+        num_groups=num_groups,
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=8,
@@ -881,7 +769,7 @@ def gluon_mha_decode_fp16_gfx950(
 
     if config.is_sliding:
         # No split-k for sliding window attention
-        grid = (batch, config.num_kv_heads * config.group_blocks, 1)
+        grid = (batch, config.num_kv_heads * config.num_groups, 1)
         _mha_decode_sliding_fp16[grid](
             q,
             k_cache,
@@ -921,7 +809,7 @@ def gluon_mha_decode_fp16_gfx950(
 
         grid = (
             batch,
-            config.num_kv_heads * config.group_blocks,
+            config.num_kv_heads * config.num_groups,
             config.num_kv_splits,
         )
         _mha_decode_fp16[grid](
