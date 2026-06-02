@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import NamedTuple
 
 import torch
@@ -34,7 +35,11 @@ from tokenspeed_kernel.ops.attention.gluon.utils import (
     max,
     maximum,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -686,6 +691,43 @@ def _mha_decode_reduce_fp16(
     cdna4.buffer_store(output, out_ptr, out_base + offs_d)
 
 
+_WAVE_TARGET = 2
+_MIN_PAGES_PER_SPLIT = 8
+_MIN_PAGE_SPLITS = 8
+
+
+def _select_num_kv_splits(
+    *,
+    batch: int,
+    num_kv_heads: int,
+    num_groups: int,
+    num_pages: int,
+) -> int:
+    """Pick num_kv_splits to balance occupancy against reduce overhead.
+
+    The launch grid is (batch * num_kv_heads * num_groups) * num_kv_splits
+    work-groups. Too few splits under-fill the machine at low batch; too many
+    leave each split with a handful of pages, so the reduce kernel dominates.
+
+    Return the smaller of two candidate counts: splits_for_occupancy (enough to
+    fill ~_WAVE_TARGET waves of CUs) and splits_for_pages (~_MIN_PAGES_PER_SPLIT
+    pages per split, but at least min(_MIN_PAGE_SPLITS, num_pages) so a short
+    context still splits without launching empty work).
+    """
+    override = os.environ.get("TOKENSPEED_NUM_KV_SPLITS")
+    if override is not None:
+        return int(override) if int(override) > 1 else 1
+
+    base_ctas = batch * num_kv_heads * num_groups
+    target_ctas = current_platform().sm_count * _WAVE_TARGET
+    splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas
+    splits_for_pages = num_pages // _MIN_PAGES_PER_SPLIT
+    min_page_splits = min(_MIN_PAGE_SPLITS, num_pages)
+    if splits_for_pages < min_page_splits:
+        splits_for_pages = min_page_splits
+    return min(splits_for_occupancy, splits_for_pages)
+
+
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
@@ -704,7 +746,7 @@ def get_config(
     *,
     q: torch.Tensor,
     k_cache: torch.Tensor,
-    page_table: torch.Tensor,
+    max_seqlen_k: int,
     window_left: int,
 ) -> LaunchConfig:
     head_dim = q.shape[2]
@@ -716,13 +758,21 @@ def get_config(
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     sm_scale = 1.0 / math.sqrt(head_dim)
+    effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
+    num_pages = (effective_seqlen_k + page_size - 1) // page_size
+    num_kv_splits = _select_num_kv_splits(
+        batch=q.shape[0],
+        num_kv_heads=k_cache.shape[2],
+        num_groups=num_groups,
+        num_pages=num_pages,
+    )
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
         num_groups=num_groups,
         head_dim=head_dim,
         page_size=page_size,
-        num_kv_splits=8,
+        num_kv_splits=num_kv_splits,
         block_m=block_m,
         block_n=block_n,
         sm_scale=sm_scale * _INV_LN2_VALUE,
@@ -771,7 +821,7 @@ def gluon_mha_decode_fp16_gfx950(
     config = get_config(
         q=q,
         k_cache=k_cache,
-        page_table=page_table,
+        max_seqlen_k=max_seqlen_k,
         window_left=window_left,
     )
 
