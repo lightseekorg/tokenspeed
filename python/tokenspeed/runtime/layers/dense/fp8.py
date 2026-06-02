@@ -213,31 +213,27 @@ class Fp8LinearMethod(LinearMethodBase):
                 N, K = layer.weight.shape
                 block_n, block_k = self.quant_config.weight_block_size
                 if is_bmm:
-                    # Grouped (batched) projection, e.g. V4 attention wo_a whose
-                    # weight is [groups * n, K] and is consumed per group as
-                    # [n, K]. Transform each group's block scale into the
-                    # deep_gemm MN-major layout so the per-group GEMM can run
-                    # native FP8 instead of dequantizing the weight to FP32.
-                    # Keep the per-group scales as a list (not a stacked tensor):
-                    # stacking re-lays them out row-major and breaks deep_gemm's
-                    # sf.stride(-2) == 1 requirement. weight_scale_inv is left
-                    # untouched so the dequant fallback still works.
+                    # Grouped (batched) projection (V4 attention wo_a, weight
+                    # [groups * n, K], consumed per group as [n, K]). Transform
+                    # the block scale into the deep_gemm MN-major layout with the
+                    # group axis so deep_gemm.fp8_einsum("bhr,hdr->bhd") runs the
+                    # output projection as one native FP8 GEMM (no FP32 dequant).
+                    # recipe is (1, block_n, block_k) at load; the runtime einsum
+                    # uses (1, 1, block_n) on SM100.
                     g = layer.bmm_batch_size
                     n = N // g
                     if n % block_n == 0 and K % block_k == 0:
                         sf = _ceil_to_ue8m0(layer.weight_scale_inv.data).view(
                             g, n // block_n, K // block_k
                         )
-                        layer._deep_gemm_bmm_weight_scales = [
-                            _transform_sf(
-                                sf=sf[i],
-                                mn=n,
-                                k=K,
-                                recipe=(1, block_n, block_k),
-                                is_sfa=False,
-                            )
-                            for i in range(g)
-                        ]
+                        layer.weight_scale_inv.data = _transform_sf(
+                            sf=sf,
+                            mn=n,
+                            k=K,
+                            recipe=(1, block_n, block_k),
+                            num_groups=g,
+                            is_sfa=False,
+                        )
                         layer._deep_gemm_block_size = [block_n, block_k]
                         layer._use_deep_gemm_fp8 = True
                 elif N % 64 == 0 and K % 128 == 0:

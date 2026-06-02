@@ -43,7 +43,6 @@ try:
 except ImportError:
     deep_gemm = None  # type: ignore[assignment]
 
-import tokenspeed_kernel
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -96,8 +95,8 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_compress_kv_cache_insert,
     deepseek_v4_csa_indexer_cache_insert,
+    deepseek_v4_fused_inv_rope_fp8_quant,
     deepseek_v4_hca_compress_kv_cache_insert,
-    deepseek_v4_inv_rope_grouped,
     deepseek_v4_prepare_indexer_q_mxfp4,
     fused_qnorm_rope_kv_insert,
     save_deepseek_v4_compressor_state,
@@ -3341,6 +3340,9 @@ class DeepseekV4Attention(nn.Module):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.num_local_groups
+        # SM100 packs the FP8 output-proj scales as INT32 UE8M0 (fp8_einsum
+        # recipe (1,1,128)); SM90 keeps FP32 block scales (recipe (1,128,128)).
+        self._o_tma_aligned = torch.cuda.get_device_capability()[0] >= 10
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
             config.hidden_size,
@@ -3440,8 +3442,12 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
+        # Inverse RoPE + grouped block-scaled FP8 quant in one Triton kernel,
+        # then a single native FP8 GEMM via deep_gemm.fp8_einsum -- replaces the
+        # inv-rope + per-group online-quant + GEMM chain. wo_a's block scale was
+        # transformed into the deep_gemm MN-major layout at load time.
         heads_per_group = self.num_local_heads // self.num_local_groups
-        grouped = deepseek_v4_inv_rope_grouped(
+        o_fp8, o_scale = deepseek_v4_fused_inv_rope_fp8_quant(
             attn_output,
             positions,
             cos_sin_cache,
@@ -3449,30 +3455,23 @@ class DeepseekV4Attention(nn.Module):
             heads_per_group=heads_per_group,
             nope_dim=self.nope_head_dim,
             rope_dim=self.qk_rope_head_dim,
+            tma_aligned_scales=self._o_tma_aligned,
         )
         in_dim = self.num_heads * self.head_dim // self.o_groups
-        # Native FP8 block-scale GEMM per group (deep_gemm), replacing the
-        # FP32 weight dequant + FP32 torch.bmm. wo_a's block scale was
-        # transformed into the deep_gemm layout at load time; activations
-        # are quantized online by tokenspeed_kernel.mm.
         weight = self.wo_a.weight.view(self.num_local_groups, self.o_lora_rank, in_dim)
-        scales = self.wo_a._deep_gemm_bmm_weight_scales
-        block_size = self.wo_a._deep_gemm_block_size
-        grouped = grouped.transpose(0, 1).contiguous()
-        z = torch.stack(
-            [
-                tokenspeed_kernel.mm(
-                    grouped[g],
-                    weight[g],
-                    B_scales=scales[g],
-                    out_dtype=attn_output.dtype,
-                    quant="mxfp8",
-                    block_size=block_size,
-                    override="deep_gemm_mm_fp8_blockscale",
-                )
-                for g in range(self.num_local_groups)
-            ],
-            dim=1,
+        block_n, block_k = self.wo_a._deep_gemm_block_size
+        recipe = (1, 1, block_n) if self._o_tma_aligned else (1, block_n, block_k)
+        z = torch.empty(
+            (attn_output.shape[0], self.num_local_groups, self.o_lora_rank),
+            device=attn_output.device,
+            dtype=torch.bfloat16,
+        )
+        deep_gemm.fp8_einsum(
+            "bhr,hdr->bhd",
+            (o_fp8, o_scale),
+            (weight, self.wo_a.weight_scale_inv),
+            z,
+            recipe=recipe,
         )
         out, _ = self.wo_b(z.flatten(1))
         return out

@@ -47,6 +47,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4 as _triton_fused_indexer_q_rope_hadamard_mxfp4,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_fused_inv_rope_fp8_quant,
+)
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
