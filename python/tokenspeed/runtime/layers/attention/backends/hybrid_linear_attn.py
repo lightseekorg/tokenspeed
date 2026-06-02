@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from tokenspeed_kernel.ops.gated_delta_rule import flashinfer as gdn_flashinfer
+from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as gdn_flashinfer
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
