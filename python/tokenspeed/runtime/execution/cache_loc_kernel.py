@@ -236,6 +236,101 @@ def compute_out_cache_loc(
     )
 
 
+@triton.jit
+def fused_decode_input_prep_kernel(
+    # Inputs
+    req_pool_indices_ptr,  # [batch_size]
+    valid_cache_lengths_ptr,  # [req_pool_size+1]
+    req_to_pages_ptr,  # [req_pool_size+1, max_pages]
+    # Outputs
+    out_cache_loc_ptr,  # [batch_size * uniform_input_length]
+    positions_ptr,  # [batch_size * uniform_input_length]
+    seq_lens_out_ptr,  # [batch_size]
+    # Scalars
+    uniform_input_length,
+    page_size: tl.constexpr,
+    max_pages: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One launch fuses the decode-uniform path's four small kernels.
+
+    Replaces:
+      valid_cache_lengths.index_select(0, req_pool_indices)
+      compute_out_cache_loc_uniform
+      compute_position_triton (decode branch)
+      torch.add(input_lengths, valid_cache_lengths, out=seq_lens)
+
+    Each program handles one request. We do one GMEM read of
+    `valid_cache_lengths[pool_idx]` and reuse it for the seq_lens write,
+    the position writes, and the out_cache_loc page-table lookup.
+    """
+    req_idx = tl.program_id(0)
+    pool_idx = tl.load(req_pool_indices_ptr + req_idx)
+    cache_start = tl.load(valid_cache_lengths_ptr + pool_idx)
+
+    # seq_lens[req_idx] = cache_start + uniform_input_length
+    tl.store(seq_lens_out_ptr + req_idx, cache_start + uniform_input_length)
+
+    output_offset = req_idx * uniform_input_length
+
+    num_blocks = tl.cdiv(uniform_input_length, BLOCK_SIZE)
+    for block_idx in range(num_blocks):
+        block_start = block_idx * BLOCK_SIZE
+        token_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = token_offsets < uniform_input_length
+
+        positions_local = cache_start + token_offsets
+        page_indices = positions_local // page_size
+        offsets_in_page = positions_local % page_size
+
+        page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
+        page_ids = tl.load(page_ptrs, mask=mask, other=0)
+        cache_locs = page_ids * page_size + offsets_in_page
+
+        tl.store(
+            out_cache_loc_ptr + output_offset + token_offsets,
+            cache_locs,
+            mask=mask,
+        )
+        tl.store(
+            positions_ptr + output_offset + token_offsets,
+            positions_local,
+            mask=mask,
+        )
+
+
+def fused_decode_input_prep(
+    out_cache_loc_ptr,
+    positions_ptr,
+    seq_lens_out_ptr,
+    req_pool_indices: torch.Tensor,  # [batch_size]
+    valid_cache_lengths: torch.Tensor,  # [req_pool_size+1]
+    uniform_input_length: int,
+    req_to_pages: torch.Tensor,  # [req_pool_size+1, max_pages]
+    page_size: int,
+) -> None:
+    """Decode-only fast path: one Triton launch writes out_cache_loc,
+    positions, and seq_lens, reading `valid_cache_lengths[pool_idx]`
+    directly so the per-iter indexSelect + add are gone too.
+    """
+    batch_size = req_pool_indices.shape[0]
+    max_pages = req_to_pages.shape[1]
+    BLOCK_SIZE = 128
+    grid = (batch_size,)
+    fused_decode_input_prep_kernel[grid](
+        req_pool_indices,
+        valid_cache_lengths,
+        req_to_pages,
+        out_cache_loc_ptr,
+        positions_ptr,
+        seq_lens_out_ptr,
+        uniform_input_length,
+        page_size=page_size,
+        max_pages=max_pages,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
 def compute_out_cache_loc_uniform(
     out_cache_loc_ptr,
     req_pool_indices: torch.Tensor,  # [batch_size]

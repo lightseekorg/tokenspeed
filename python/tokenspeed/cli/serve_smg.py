@@ -281,6 +281,48 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
+async def _start_control_server(
+    *,
+    gateway_url: str,
+    engine_grpc_addr: str,
+    host: str,
+    port: int,
+    timeout: float = 30.0,
+) -> bool:
+    """Start the control HTTP server in a daemon thread and wait for it to bind.
+
+    Runs uvicorn alongside smg without blocking the orchestrator event loop.
+    Returns True once the server is accepting connections, or False if it
+    failed to bind (e.g. the port is already in use) or did not come up within
+    ``timeout`` seconds. Non-fatal: the smg gateway runs independently.
+    """
+    import threading
+
+    from tokenspeed.runtime.entrypoints.http_server import build_server
+
+    server = build_server(
+        gateway_url=gateway_url,
+        engine_grpc_addr=engine_grpc_addr,
+        host=host,
+        port=port,
+    )
+    thread = threading.Thread(target=server.run, daemon=True, name="ts-http-server")
+    thread.start()
+
+    # uvicorn sets `started = True` only after the socket is bound and serving.
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    deadline = start + timeout
+    while not server.started:
+        if not thread.is_alive():
+            return False  # uvicorn raised during startup (e.g. AddrInUse)
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    logger.info("control server bound in %.2fs", loop.time() - start)
+    return True
+
+
 async def _stream_to(proc, tag: str) -> None:
     await asyncio.gather(
         tag_stream(proc.stdout, tag, sys.stdout),
@@ -391,6 +433,27 @@ async def run_smg(
         )
 
         sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
+        sys.stdout.flush()
+
+        control_port = (
+            opts.control_port if opts.control_port is not None else user_port + 1
+        )
+        control_ok = await _start_control_server(
+            gateway_url=f"http://{user_host}:{user_port}",
+            engine_grpc_addr=f"127.0.0.1:{engine_port}",
+            host=user_host,
+            port=control_port,
+        )
+        if control_ok:
+            sys.stdout.write(
+                f"ts control server ready on http://{user_host}:{control_port}\n"
+            )
+        else:
+            sys.stderr.write(
+                f"WARNING: ts control server failed to bind on "
+                f"http://{user_host}:{control_port} (port in use?); "
+                f"serving continues without it\n"
+            )
         sys.stdout.flush()
 
         engine_wait = asyncio.create_task(engine.wait())

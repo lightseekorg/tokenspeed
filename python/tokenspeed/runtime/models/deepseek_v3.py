@@ -86,7 +86,11 @@ from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.layers.quantization.utils import (
+    block_dequant,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -395,6 +399,20 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
+        # ModelOpt NVFP4 checkpoints (e.g. DeepSeek-R1-0528-NVFP4-v2) keep the
+        # q_a_proj / kv_a_proj_with_mqa weights as bf16 via exclude_modules.
+        # exclude_modules matches by component name, not by the fused parent
+        # prefix, so the fused layer would otherwise allocate an NVFP4-packed
+        # buffer and crash when bf16 weights are copied in.
+        if isinstance(quant_config, Nvfp4Config) and prefix:
+            q_a_prefix = prefix.replace("fused_qkv_a_proj_with_mqa", "q_a_proj")
+            kv_a_prefix = prefix.replace(
+                "fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa"
+            )
+            if quant_config.is_layer_excluded(
+                q_a_prefix
+            ) or quant_config.is_layer_excluded(kv_a_prefix):
+                quant_config = None
         super().__init__(
             input_size,
             output_size,
