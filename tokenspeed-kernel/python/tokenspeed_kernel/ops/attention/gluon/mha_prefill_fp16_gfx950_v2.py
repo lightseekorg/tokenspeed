@@ -436,47 +436,52 @@ class AttentionProgram:
 
 @gluon.aggregate
 class ProgramScheduler:
+    # ProgramScheduler only controls the persistent work order. Attention
+    # semantics such as sliding-window masking remain in AttentionConfig.
     cfg: gl.constexpr
+    swizzled_order: gl.constexpr
     work: gl.tensor
     total_work: gl.tensor
     num_q_blocks: gl.tensor
-    lane_valid: gl.tensor
+    slot_valid: gl.tensor
     batch_slot: gl.tensor
     q_head: gl.tensor
-    q_lane: gl.tensor
-    q_rounds_per_wave: gl.tensor
+    q_slot: gl.tensor
+    q_cycles_per_batch_group: gl.tensor
     batch_slots: gl.constexpr
-    q_lanes: gl.constexpr
+    q_slots: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
         self,
         cfg,
+        swizzled_order,
         work,
         total_work,
         num_q_blocks,
-        lane_valid,
+        slot_valid,
         batch_slot,
         q_head,
-        q_lane,
-        q_rounds_per_wave,
+        q_slot,
+        q_cycles_per_batch_group,
         batch_slots,
-        q_lanes,
+        q_slots,
     ):
         self.cfg = gl.constexpr(cfg)
+        self.swizzled_order = gl.constexpr(swizzled_order)
         self.work = work
         self.total_work = total_work
         self.num_q_blocks = num_q_blocks
-        self.lane_valid = lane_valid
+        self.slot_valid = slot_valid
         self.batch_slot = batch_slot
         self.q_head = q_head
-        self.q_lane = q_lane
-        self.q_rounds_per_wave = q_rounds_per_wave
+        self.q_slot = q_slot
+        self.q_cycles_per_batch_group = q_cycles_per_batch_group
         self.batch_slots = gl.constexpr(batch_slots)
-        self.q_lanes = gl.constexpr(q_lanes)
+        self.q_slots = gl.constexpr(q_slots)
 
     @gluon.jit
-    def create(cfg, batch_size, max_seqlen_q):
+    def create(cfg, batch_size, max_seqlen_q, swizzled_order: gl.constexpr):
         num_q_blocks = (max_seqlen_q + cfg.BLOCK_M - 1) // cfg.BLOCK_M
 
         start_pid = gl.program_id(axis=0)
@@ -485,53 +490,54 @@ class ProgramScheduler:
         local_pid = start_pid // cfg.NUM_XCDS
         logical_pid = xcd * pids_per_xcd + local_pid
 
-        if cfg.IS_SLIDING:
-            total_work = batch_size * cfg.N_HEADS * num_q_blocks
-            zero = logical_pid - logical_pid
-            batch_slots: gl.constexpr = 1
-            q_lanes: gl.constexpr = 1
-            lane_valid = logical_pid >= 0
-            batch_slot = zero
-            q_head = zero
-            q_lane = zero
-            q_rounds_per_wave = num_q_blocks
-            work = logical_pid
-        else:
+        if swizzled_order:
             max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
             if cfg.BATCH_SIZE < max_batch_slots:
                 batch_slots: gl.constexpr = cfg.BATCH_SIZE
             else:
                 batch_slots: gl.constexpr = max_batch_slots
-            q_lanes: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
+            q_slots: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
 
-            q_rounds_per_wave = (num_q_blocks + q_lanes - 1) // q_lanes
-            num_batch_waves: gl.constexpr = (
+            q_cycles_per_batch_group = (num_q_blocks + q_slots - 1) // q_slots
+            num_batch_groups: gl.constexpr = (
                 cfg.BATCH_SIZE + batch_slots - 1
             ) // batch_slots
-            total_work = num_batch_waves * q_rounds_per_wave
+            total_work = num_batch_groups * q_cycles_per_batch_group
 
-            active_lanes: gl.constexpr = batch_slots * cfg.N_HEADS * q_lanes
-            lane_valid = logical_pid < active_lanes
-            safe_pid = gl.where(lane_valid, logical_pid, 0)
-            q_lane = safe_pid % q_lanes
-            head_batch_slot = safe_pid // q_lanes
+            active_slots: gl.constexpr = batch_slots * cfg.N_HEADS * q_slots
+            slot_valid = logical_pid < active_slots
+            safe_pid = gl.where(slot_valid, logical_pid, 0)
+            q_slot = safe_pid % q_slots
+            head_batch_slot = safe_pid // q_slots
             q_head = head_batch_slot % cfg.N_HEADS
             batch_slot = head_batch_slot // cfg.N_HEADS
             zero = logical_pid - logical_pid
             work = zero
+        else:
+            total_work = batch_size * cfg.N_HEADS * num_q_blocks
+            zero = logical_pid - logical_pid
+            batch_slots: gl.constexpr = 1
+            q_slots: gl.constexpr = 1
+            slot_valid = logical_pid >= 0
+            batch_slot = zero
+            q_head = zero
+            q_slot = zero
+            q_cycles_per_batch_group = num_q_blocks
+            work = logical_pid
 
         return ProgramScheduler(
             gl.constexpr(cfg),
+            swizzled_order,
             work,
             total_work,
             num_q_blocks,
-            lane_valid,
+            slot_valid,
             batch_slot,
             q_head,
-            q_lane,
-            q_rounds_per_wave,
+            q_slot,
+            q_cycles_per_batch_group,
             batch_slots,
-            q_lanes,
+            q_slots,
         )
 
     @gluon.jit
@@ -541,22 +547,23 @@ class ProgramScheduler:
     @gluon.jit
     def advance(self):
         cfg = self.cfg
-        if cfg.IS_SLIDING:
-            next_work = self.work + cfg.NUM_BLOCKS
-        else:
+        if self.swizzled_order:
             next_work = self.work + 1
+        else:
+            next_work = self.work + cfg.NUM_BLOCKS
         return ProgramScheduler(
             gl.constexpr(cfg),
+            self.swizzled_order,
             next_work,
             self.total_work,
             self.num_q_blocks,
-            self.lane_valid,
+            self.slot_valid,
             self.batch_slot,
             self.q_head,
-            self.q_lane,
-            self.q_rounds_per_wave,
+            self.q_slot,
+            self.q_cycles_per_batch_group,
             self.batch_slots,
-            self.q_lanes,
+            self.q_slots,
         )
 
     @gluon.jit
@@ -571,7 +578,45 @@ class ProgramScheduler:
         cu_seqlens_ptr,
     ):
         cfg = self.cfg
-        if cfg.IS_SLIDING:
+        if self.swizzled_order:
+            q_cycle_global = self.work
+            batch_group = q_cycle_global // self.q_cycles_per_batch_group
+            q_cycle = q_cycle_global - batch_group * self.q_cycles_per_batch_group
+
+            # Swizzled order balances full-causal work across q slots. Later query
+            # blocks attend more KV tiles than earlier query blocks, so assigning
+            # q slots in strictly increasing q-block order can leave some slots
+            # with mostly expensive work. Each q-cycle alternates slot direction:
+            #   q_slots = 4
+            #   q_cycle 0: slots 0,1,2,3 -> q blocks 0,1,2,3
+            #   q_cycle 1: slots 0,1,2,3 -> q blocks 7,6,5,4
+            #   q_cycle 2: slots 0,1,2,3 -> q blocks 8,9,10,11
+            query_block_inc = q_cycle * self.q_slots + self.q_slot
+            query_block_dec = q_cycle * self.q_slots + (self.q_slots - 1 - self.q_slot)
+            query_block = gl.where(q_cycle % 2 == 0, query_block_inc, query_block_dec)
+            batch = batch_group * self.batch_slots + self.batch_slot
+            valid = self.slot_valid & (query_block < self.num_q_blocks)
+
+            safe_batch = gl.where(valid, batch, 0)
+            seq_base = gl.load(cu_seqlens_ptr + safe_batch)
+            seq_end = gl.load(cu_seqlens_ptr + safe_batch + 1)
+            seq_len = seq_end - seq_base
+            program = AttentionProgram.initialize_from_state(
+                cfg,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                output_ptr,
+                sink_ptr,
+                lse_ptr,
+                seq_base,
+                seq_len,
+                query_block,
+                self.q_head,
+            )
+            return program, valid & (program.q_start < program.seq_len)
+
+        else:
             query_block = self.work % self.num_q_blocks
             head_batch = self.work // self.num_q_blocks
             q_head = head_batch % cfg.N_HEADS
@@ -593,34 +638,6 @@ class ProgramScheduler:
                 q_head,
             )
             return program, program.q_start < program.seq_len
-
-        q_round = self.work
-        batch_wave = q_round // self.q_rounds_per_wave
-        wave_round = q_round - batch_wave * self.q_rounds_per_wave
-        query_block_inc = wave_round * self.q_lanes + self.q_lane
-        query_block_dec = wave_round * self.q_lanes + (self.q_lanes - 1 - self.q_lane)
-        query_block = gl.where(wave_round % 2 == 0, query_block_inc, query_block_dec)
-        batch = batch_wave * self.batch_slots + self.batch_slot
-        valid = self.lane_valid & (query_block < self.num_q_blocks)
-
-        safe_batch = gl.where(valid, batch, 0)
-        seq_base = gl.load(cu_seqlens_ptr + safe_batch)
-        seq_end = gl.load(cu_seqlens_ptr + safe_batch + 1)
-        seq_len = seq_end - seq_base
-        program = AttentionProgram.initialize_from_state(
-            cfg,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            output_ptr,
-            sink_ptr,
-            lse_ptr,
-            seq_base,
-            seq_len,
-            query_block,
-            self.q_head,
-        )
-        return program, valid & (program.q_start < program.seq_len)
 
 
 @gluon.jit
@@ -852,50 +869,111 @@ def _mha_prefill_fp16(
         cfg.v_smem_layout,
     )
 
-    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q)
-    if cfg.IS_SLIDING:
-        while scheduler.has_work():
-            program, active = scheduler.get_program(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                output_ptr,
-                sink_ptr,
-                lse_ptr,
-                cu_seqlens_ptr,
-            )
-            if active:
-                if program.seq_len < cfg.BLOCK_N:
-                    if program.q_start == 0:
-                        process_single_attention_tile(program, k_smem, v_smem)
-                else:
-                    process_attention_tile(program, k_smem, v_smem)
-            scheduler = scheduler.advance()
-    else:
-        mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-        mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
-        boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
-        boundary_mask1 = (mask_offs_n[None, :] + cfg.BLOCK_N) <= mask_offs_m[:, None]
+    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, True)
+    mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
+    mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
+    boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
+    boundary_mask1 = (mask_offs_n[None, :] + cfg.BLOCK_N) <= mask_offs_m[:, None]
 
-        while scheduler.has_work():
-            program, active = scheduler.get_program(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                output_ptr,
-                sink_ptr,
-                lse_ptr,
-                cu_seqlens_ptr,
-            )
-            if active:
-                if program.seq_len < cfg.BLOCK_N:
-                    if program.q_start == 0:
-                        process_single_attention_tile(program, k_smem, v_smem)
-                else:
-                    process_attention_tile(
-                        program, k_smem, v_smem, boundary_mask0, boundary_mask1
-                    )
-            scheduler = scheduler.advance()
+    while scheduler.has_work():
+        program, active = scheduler.get_program(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            output_ptr,
+            sink_ptr,
+            lse_ptr,
+            cu_seqlens_ptr,
+        )
+        if active:
+            if program.seq_len < cfg.BLOCK_N:
+                if program.q_start == 0:
+                    process_single_attention_tile(program, k_smem, v_smem)
+            else:
+                process_attention_tile(
+                    program, k_smem, v_smem, boundary_mask0, boundary_mask1
+                )
+        scheduler = scheduler.advance()
+
+
+@gluon.jit
+def _mha_prefill_sliding_fp16(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    cu_seqlens_ptr,
+    output_ptr,
+    sink_ptr,
+    lse_ptr,
+    Q_STRIDE_T: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    K_STRIDE_T: gl.constexpr,
+    K_STRIDE_H: gl.constexpr,
+    K_STRIDE_D: gl.constexpr,
+    V_STRIDE_T: gl.constexpr,
+    V_STRIDE_H: gl.constexpr,
+    V_STRIDE_D: gl.constexpr,
+    N_HEADS: gl.constexpr,
+    N_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    BATCH_SIZE: gl.constexpr,
+    max_seqlen_q,
+    HAS_SINK: gl.constexpr,
+    HAS_LSE: gl.constexpr,
+    IS_SLIDING: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+):
+    cfg = AttentionConfig(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        SM_SCALE,
+        BLOCK_M,
+        BLOCK_N,
+        NUM_WARPS,
+        BATCH_SIZE,
+        HAS_SINK,
+        HAS_LSE,
+        IS_SLIDING,
+        WINDOW_LEFT,
+        InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
+        InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
+        InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
+    )
+    k_smem = gl.allocate_shared_memory(
+        k_ptr.dtype.element_ty,
+        [cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.k_smem_layout,
+    )
+    v_smem = gl.allocate_shared_memory(
+        v_ptr.dtype.element_ty,
+        [cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.v_smem_layout,
+    )
+
+    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, False)
+    while scheduler.has_work():
+        program, active = scheduler.get_program(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            output_ptr,
+            sink_ptr,
+            lse_ptr,
+            cu_seqlens_ptr,
+        )
+        if active:
+            if program.seq_len < cfg.BLOCK_N:
+                if program.q_start == 0:
+                    process_single_attention_tile(program, k_smem, v_smem)
+            else:
+                process_attention_tile(program, k_smem, v_smem)
+        scheduler = scheduler.advance()
 
 
 class LaunchConfig(NamedTuple):
@@ -1000,7 +1078,8 @@ def gluon_mha_prefill_fp16_gfx950_v2(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    _mha_prefill_fp16[config.grid](
+    kernel = _mha_prefill_sliding_fp16 if config.is_sliding else _mha_prefill_fp16
+    kernel[config.grid](
         q,
         k,
         v,
