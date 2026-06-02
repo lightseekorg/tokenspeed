@@ -171,7 +171,9 @@ class GreedySamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        logits = logits_output.next_token_logits
+        logits = nan_guard_logits(
+            logits_output.next_token_logits, self.config.enable_nan_detection
+        )
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones
         # so apply is a no-op.

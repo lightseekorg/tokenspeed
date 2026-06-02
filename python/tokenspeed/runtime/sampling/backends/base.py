@@ -44,6 +44,8 @@ SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 @dataclass
 class SamplingBackendConfig:
 
+    enable_nan_detection: bool = False
+
     # Optional logprob features — OFF by default. These are checked at server
     # start / graph capture time so the fast path has zero extra compute.
     # Enabling any of these enlarges the captured graph footprint.
@@ -55,8 +57,8 @@ class SamplingBackendConfig:
     max_draft_tokens_per_req: int = 1
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
-    # for full sampling backends). Indexed by req_pool_idx, not batch row,
-    # so the data survives batch membership changes.
+    # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
+    # batch row, so the data survives batch membership changes.
     max_req_pool_size: int = 0
     vocab_size: int = 0
 
@@ -285,60 +287,3 @@ class SamplingBackend(ABC):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-
-class PoolSamplingBackend(SamplingBackend):
-    """Sampling backend base for TokenSpeed request-pool state.
-
-    This owns the backend-neutral state shared by probability-route and
-    Gumbel-route samplers: per-pool scalar knobs and common output buffers.
-    Backend-specific RNG/probability state stays in the concrete backend.
-    """
-
-    _HAS_POOL_STATE = True
-
-    def __init__(self, config: SamplingBackendConfig) -> None:
-        super().__init__(config)
-        self._init_sampling_pool_scalars(config)
-        self._init_sampling_output_buffers(config)
-
-    def _init_sampling_pool_scalars(self, config: SamplingBackendConfig) -> None:
-        pool_rows = config.max_req_pool_size + 1
-        self._temperature_pool = torch.ones(
-            (pool_rows,), dtype=torch.float32, device=config.device
-        )
-        self._top_k_pool = torch.ones(
-            (pool_rows,), dtype=torch.int32, device=config.device
-        )
-        self._top_p_pool = torch.ones(
-            (pool_rows,), dtype=torch.float32, device=config.device
-        )
-        self._seed_pool = torch.zeros(
-            (pool_rows,), dtype=torch.int64, device=config.device
-        )
-
-    def _init_sampling_output_buffers(self, config: SamplingBackendConfig) -> None:
-        self._ones_buf = torch.ones(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
-        self._predict_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
-        # (required by maybe_broadcast / NCCL).
-        self._accept_index_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._accept_length_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
-
-    def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
-        self._temperature_pool[pool_idx].fill_(float(sp.temperature))
-        self._top_k_pool[pool_idx].fill_(int(sp.top_k))
-        self._top_p_pool[pool_idx].fill_(float(sp.top_p))
-        self._seed_pool[pool_idx].fill_(int(sp.seed))

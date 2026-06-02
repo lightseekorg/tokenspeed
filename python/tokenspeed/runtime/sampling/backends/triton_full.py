@@ -47,7 +47,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
-    PoolSamplingBackend,
+    SamplingBackend,
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.backends.triton import (
@@ -171,7 +171,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         if variant == CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P:
             self._full_has_min_p = True
             self._sample_route = _SAMPLE_ROUTE_GUMBEL_NO_FILTER
-            PoolSamplingBackend.prepare_capture(
+            SamplingBackend.prepare_capture(
                 self,
                 bs=bs,
                 num_tokens_per_req=num_tokens_per_req,
@@ -180,8 +180,8 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         if variant == CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P:
             self._full_has_min_p = True
             self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P
-            self._top_k_top_p_pad = 128
-            PoolSamplingBackend.prepare_capture(
+            self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
+            SamplingBackend.prepare_capture(
                 self,
                 bs=bs,
                 num_tokens_per_req=num_tokens_per_req,

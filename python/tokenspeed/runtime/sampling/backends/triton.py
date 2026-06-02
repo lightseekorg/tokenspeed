@@ -45,7 +45,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
-    PoolSamplingBackend,
+    SamplingBackend,
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
@@ -87,20 +87,51 @@ CUDA_GRAPH_VARIANT_TRITON_TOP_P = "triton_top_p"
 CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER = "triton_verify_no_filter"
 
 
-class TritonSamplingBackend(PoolSamplingBackend):
-    """MRV2-style Triton Gumbel sampling backend.
+class TritonSamplingBackend(SamplingBackend):
+    """TokenSpeed pool-state backend using Triton Gumbel-Max kernels."""
 
-    This backend keeps the TokenSpeed pool-state lifecycle but routes normal
-    single-step stochastic sampling through logits/candidate-space Triton
-    Gumbel-Max kernels. Speculative verify samples target tokens with the
-    same Gumbel route and then verifies the draft chain by token-id compare.
-    """
+    _HAS_POOL_STATE = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
+        self._init_triton_pool_state(config)
         self._init_triton_buffers(config)
         self._sample_route = _SAMPLE_ROUTE_GUMBEL_GENERIC
         self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
+
+    def _init_triton_pool_state(self, config: SamplingBackendConfig) -> None:
+        pool_rows = config.max_req_pool_size + 1
+        self._temperature_pool = torch.ones(
+            (pool_rows,), dtype=torch.float32, device=config.device
+        )
+        self._top_k_pool = torch.ones(
+            (pool_rows,), dtype=torch.int32, device=config.device
+        )
+        self._top_p_pool = torch.ones(
+            (pool_rows,), dtype=torch.float32, device=config.device
+        )
+        self._seed_pool = torch.zeros(
+            (pool_rows,), dtype=torch.int64, device=config.device
+        )
+
+        self._ones_buf = torch.ones(
+            (config.max_bs,), dtype=torch.int32, device=config.device
+        )
+        self._predict_buf = torch.zeros(
+            (config.max_bs * config.max_draft_tokens_per_req,),
+            dtype=torch.int32,
+            device=config.device,
+        )
+        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
+        # (required by maybe_broadcast / NCCL).
+        self._accept_index_buf = torch.zeros(
+            (config.max_bs * config.max_draft_tokens_per_req,),
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self._accept_length_buf = torch.zeros(
+            (config.max_bs,), dtype=torch.int32, device=config.device
+        )
 
     def _init_triton_buffers(self, config: SamplingBackendConfig) -> None:
         pool_rows = config.max_req_pool_size + 1
@@ -293,6 +324,12 @@ class TritonSamplingBackend(PoolSamplingBackend):
             return _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P
         return _SAMPLE_ROUTE_GUMBEL_GENERIC
 
+    def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
+        self._temperature_pool[pool_idx].fill_(float(sp.temperature))
+        self._top_k_pool[pool_idx].fill_(int(sp.top_k))
+        self._top_p_pool[pool_idx].fill_(float(sp.top_p))
+        self._seed_pool[pool_idx].fill_(int(sp.seed))
+
     def prepare_step(
         self,
         request_ids: list[str],
@@ -300,7 +337,7 @@ class TritonSamplingBackend(PoolSamplingBackend):
         sampling_params_list: list[SamplingParams],
         num_tokens_per_req: int = 1,
     ) -> None:
-        PoolSamplingBackend.prepare_step(
+        SamplingBackend.prepare_step(
             self,
             request_ids=request_ids,
             request_pool_indices=request_pool_indices,
@@ -342,7 +379,7 @@ class TritonSamplingBackend(PoolSamplingBackend):
     def prepare_capture(self, bs: int, num_tokens_per_req: int = 1) -> None:
         self._sample_route = _SAMPLE_ROUTE_GUMBEL_GENERIC
         self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
-        PoolSamplingBackend.prepare_capture(
+        SamplingBackend.prepare_capture(
             self, bs=bs, num_tokens_per_req=num_tokens_per_req
         )
 
@@ -365,43 +402,15 @@ class TritonSamplingBackend(PoolSamplingBackend):
         num_tokens_per_req: int,
         variant: str,
     ) -> None:
-        if variant == CUDA_GRAPH_VARIANT_TRITON_NO_FILTER:
-            self._sample_route = _SAMPLE_ROUTE_GUMBEL_NO_FILTER
-            PoolSamplingBackend.prepare_capture(
-                self,
-                bs=bs,
-                num_tokens_per_req=num_tokens_per_req,
-            )
-            return
-        if variant == CUDA_GRAPH_VARIANT_TRITON_TOP_K:
-            self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K
-            self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
-            PoolSamplingBackend.prepare_capture(
-                self,
-                bs=bs,
-                num_tokens_per_req=num_tokens_per_req,
-            )
-            return
-        if variant == CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P:
-            self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P
-            self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
-            PoolSamplingBackend.prepare_capture(
-                self,
-                bs=bs,
-                num_tokens_per_req=num_tokens_per_req,
-            )
-            return
-        if variant == CUDA_GRAPH_VARIANT_TRITON_TOP_P:
-            self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_P
-            PoolSamplingBackend.prepare_capture(
-                self,
-                bs=bs,
-                num_tokens_per_req=num_tokens_per_req,
-            )
-            return
-        if variant == CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER:
-            self._sample_route = _SAMPLE_ROUTE_GUMBEL_NO_FILTER
-            PoolSamplingBackend.prepare_capture(
+        sample_route = _CUDA_GRAPH_VARIANT_SAMPLE_ROUTES.get(variant)
+        if sample_route is not None:
+            self._sample_route = sample_route
+            if sample_route in (
+                _SAMPLE_ROUTE_GUMBEL_TOP_K,
+                _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+            ):
+                self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
+            SamplingBackend.prepare_capture(
                 self,
                 bs=bs,
                 num_tokens_per_req=num_tokens_per_req,

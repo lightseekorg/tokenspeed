@@ -18,12 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared Triton sampling helpers and constants."""
-
-# Contains TokenSpeed compatibility helpers plus constants used by the
-# Qrita-style top-k/top-p sampler adapted from vLLM:
-#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/ops/topk_topp_triton.py
-#   https://arxiv.org/abs/2602.01518
+"""Triton sampling helper kernels."""
 
 from __future__ import annotations
 
