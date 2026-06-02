@@ -91,6 +91,7 @@ class InputBuffers:
             self.out_cache_loc_buf = torch.full(
                 (max_num_tokens,), dummy_kv_slot, dtype=torch.int32
             )
+            self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             if has_mamba:
@@ -193,6 +194,7 @@ class InputBuffers:
         def write_decode_input_ids(
             decode_req_pool_indices: torch.Tensor,
             decode_input_ids: list[int],
+            row_offset: int,
             expected_count: int,
             context: str,
         ) -> None:
@@ -231,9 +233,9 @@ class InputBuffers:
                 runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
                     torch.where(force_single_token.unsqueeze(1), dummy_tail, tail)
                 )
-            runtime_states.force_single_token_verify[decode_req_pool_indices] = (
-                force_single_token
-            )
+            self.force_single_token_verify_buf[
+                row_offset : row_offset + expected_count
+            ] = force_single_token
             runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = False
 
         # Decode-only fast path: one fused Triton kernel writes out_cache_loc,
@@ -311,6 +313,7 @@ class InputBuffers:
                     write_decode_input_ids(
                         decode_req_pool_indices,
                         decode_input_ids,
+                        num_extends,
                         batch_size - num_extends,
                         "mixed forward",
                     )
@@ -333,6 +336,7 @@ class InputBuffers:
                 write_decode_input_ids(
                     req_pool_indices_device,
                     decode_input_ids,
+                    0,
                     batch_size,
                     "decode forward",
                 )
@@ -418,6 +422,8 @@ class InputBuffers:
                 self.mamba_cow_src_indices_buf[batch_size:].fill_(-1)
                 self.mamba_branching_seqlens_buf[batch_size:].fill_(-1)
                 self.mamba_track_pool_indices_buf[batch_size:].fill_(-1)
+
+        return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):
         """Prepare padded decode graph inputs for a rank with no real tokens."""

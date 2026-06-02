@@ -399,22 +399,14 @@ class ModelExecutor:
         accept_lengths: torch.Tensor,
         row_offset: int,
         row_count: int,
+        decode_input_ids: list[int] | None,
     ) -> torch.Tensor:
-        force_pool = getattr(self.runtime_states, "force_single_token_verify", None)
-        if force_pool is None or row_count <= 0:
+        if decode_input_ids is None or row_count <= 0:
             return accept_lengths
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[
+        force_mask = self.input_buffers.force_single_token_verify_buf[
             row_offset : row_offset + row_count
         ]
-        force_mask = force_pool.index_select(0, req_pool_indices)
         return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
-
-    def _clear_force_single_token_verify(self, row_count: int) -> None:
-        force_pool = getattr(self.runtime_states, "force_single_token_verify", None)
-        if force_pool is None or row_count <= 0:
-            return
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[:row_count]
-        force_pool[req_pool_indices] = False
 
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
@@ -438,7 +430,7 @@ class ModelExecutor:
                 logits_output, sampling_info, candidates
             )
             accept_lengths = self._apply_force_single_token_verify(
-                accept_lengths, 0, num_decodes
+                accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
             return output_tokens, accept_lengths
 
@@ -452,7 +444,7 @@ class ModelExecutor:
             decode_out, sampling_info[num_extends:], candidates
         )
         decode_accept = self._apply_force_single_token_verify(
-            decode_accept, num_extends, num_decodes
+            decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
         if (
             prefill_out.next_token_logprobs is not None
@@ -1162,7 +1154,7 @@ class ModelExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
-            self.input_buffers.fill_input_buffers(
+            decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
@@ -1277,6 +1269,7 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
+                    decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -1374,9 +1367,6 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
-
-                if self.drafter is not None and num_extends < bs:
-                    self._clear_force_single_token_verify(bs)
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

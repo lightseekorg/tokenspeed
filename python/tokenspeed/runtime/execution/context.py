@@ -52,6 +52,8 @@ class ForwardContext:
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Spec decode draft head's first step prunes to one live row per request.
     draft_first_step_reduce: bool = False
+    # Normalized explicit decode input overrides for this forward, if any.
+    decode_input_ids: list[int] | None = None
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
