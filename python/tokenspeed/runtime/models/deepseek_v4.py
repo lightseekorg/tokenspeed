@@ -3552,7 +3552,14 @@ class DeepseekV4Attention(nn.Module):
                     )
                 with fork.branch():
                     insert_swa_cache()
-                    run_compressor()
+                # Run the attention compressor on the MAIN stream. The indexer
+                # (above, main stream) internally runs its own compressor; a
+                # second compressor concurrently on the aux stream races over
+                # shared state and intermittently faults with an illegal memory
+                # access (surfaces async in _group_slot_mapping_from_raw). Only
+                # insert_swa stays on the aux branch -- that overlap is safe and
+                # is preserved. Mirrors the elif structure below.
+                run_compressor()
         elif self.compressor is not None:
             with self.stream_fork.scope(
                 enable=self.stream_fork.aux_stream is not None
