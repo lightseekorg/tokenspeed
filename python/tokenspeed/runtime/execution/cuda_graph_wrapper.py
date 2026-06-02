@@ -455,7 +455,7 @@ class CudaGraphWrapper:
         for _ in range(4):
             torch.cuda.synchronize()
             dist.barrier()
-            self._prepare_sampling_capture(bs=bs, variant=graph_variant)
+            self._prepare_sampling_capture(bs=bs, variant=variant)
             self._init_capture_metadata(bs)
             run_once()
 
@@ -473,7 +473,7 @@ class CudaGraphWrapper:
         self._init_capture_metadata(bs)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
-        self._prepare_sampling_capture(bs=bs, variant=graph_variant)
+        self._prepare_sampling_capture(bs=bs, variant=variant)
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
         self._init_capture_metadata(bs)
