@@ -270,27 +270,7 @@ class AttentionProgram:
         return cdna4.buffer_load(self.q_ptr, offsets, mask=valid[:, None], other=0.0)
 
     @gluon.jit
-    def init_state(self):
-        cfg = self.cfg
-        m_i = gl.full(
-            [cfg.BLOCK_M],
-            value=-float("inf"),
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, cfg.pv_layout),
-        )
-        l_i = gl.full(
-            [cfg.BLOCK_M],
-            value=0.0,
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, cfg.pv_layout),
-        )
-        acc = gl.zeros(
-            [cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout
-        )
-        return m_i, l_i, acc
-
-    @gluon.jit
-    def init_sliding_state(self, sink_ptr, has_sink: gl.constexpr):
+    def init_state(self, sink_ptr, has_sink: gl.constexpr):
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
         q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
@@ -542,7 +522,7 @@ def _mha_decode_fp16(
     )
 
     q = program.load_q()
-    m_i, l_i, acc = program.init_state()
+    m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
     num_tiles = (
         program.split_end - program.split_start + cfg.BLOCK_N - 1
@@ -704,7 +684,7 @@ def _mha_decode_sliding_fp16(
     )
 
     q = program.load_q()
-    m_i, l_i, acc, sink_log2 = program.init_sliding_state(sink_ptr, HAS_SINK)
+    m_i, l_i, acc, sink_log2 = program.init_state(sink_ptr, HAS_SINK)
 
     for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
         physical_page = program.load_page(start_n)
