@@ -25,7 +25,7 @@ import os
 from typing import Any
 
 import torch
-from tokenspeed_kernel._triton import (  # noqa: F401  (kept for parity)
+from tokenspeed_kernel._triton import (  # noqa: F401
     redirect_triton_to_tokenspeed_triton,
     tl,
     triton,
@@ -49,44 +49,10 @@ with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.tensor import RaggedTensorMetadata  # noqa: F401
     from triton_kernels.tensor import Tensor as _UpstreamWrappedTensor  # noqa: F401
 
-# ---------------------------------------------------------------------------
-# Env knob
-# ---------------------------------------------------------------------------
-
 _GLUON_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
 _GLUON_DISABLED_ENV = (
     os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
 )
-
-# Default-on; A/B knob to disable the W direct prefetch (1 iter ahead)
-# in the W_VIA_VGPR pipeline. Useful for measuring the prefetch's
-# isolated impact vs the same kernel without prefetch.
-_W_PREFETCH_DEFAULT = (
-    os.environ.get("TOKENSPEED_MOE_GLUON_W_PREFETCH", "1").strip().lower()
-    not in _GLUON_DISABLE_VALUES
-)
-
-
-# AMD ``waves_per_eu`` launch hint (waves per SIMD = occupancy cap).
-# Unset by default (compiler picks based on VGPR usage). With NW=4
-# every CTA contributes 1 wave/SIMD, so ``waves_per_eu=N`` caps
-# occupancy to N CTAs per CU. Lower values free per-CTA TCP/VMEM-FIFO
-# budget at the cost of less HBM-latency parallelism. Set via env to
-# explore the buffer_load TCP backpressure axis.
-def _parse_waves_per_eu():
-    val = os.environ.get("TOKENSPEED_MOE_GLUON_WAVES_PER_EU", "").strip()
-    if not val:
-        return None
-    try:
-        n = int(val)
-    except ValueError:
-        return None
-    if n <= 0:
-        return None
-    return n
-
-
-_WAVES_PER_EU = _parse_waves_per_eu()
 
 
 def _as_int32(t):
@@ -95,8 +61,6 @@ def _as_int32(t):
     return t.to(torch.int32)
 
 
-# Snapshot block_sizes() at import so launcher lookups skip the
-# per-call list allocation + linear scan.
 _BLOCK_SIZES_TUPLE = tuple(RaggedTensorMetadata.block_sizes())
 _BLOCK_SIZES_FROZEN = frozenset(_BLOCK_SIZES_TUPLE)
 _BLOCK_SIZE_TO_IDX = {bs: i for i, bs in enumerate(_BLOCK_SIZES_TUPLE)}
@@ -123,17 +87,6 @@ def composition(cls):
 
     cls.__getattr__ = __getattr__
     return cls
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-_DEFAULT_NUM_BUFFERS = 2
-
-
-_CDNA4_LDS_BYTES = 160 * 1024
-_CDNA4_LDS_BUDGET_BYTES = 158 * 1024
 
 
 def _estimate_pipeline_lds_per_buffer(
@@ -190,7 +143,7 @@ def _default_num_buffers(
             scale_load_mode=scale_load_mode,
         )
         if per_buf > 0:
-            max_nb = max(1, _CDNA4_LDS_BUDGET_BYTES // per_buf)
+            max_nb = max(1, 160 * 1024 // per_buf)
             nb = min(nb, max_nb)
     return nb
 
@@ -199,22 +152,10 @@ _CDNA4_NUM_CUS = 256
 _PERSISTENT_OVERSUBSCRIBE = 2
 _PERSISTENT_TILES_THRESHOLD = _CDNA4_NUM_CUS * 3
 
-# MFMA-imposed inner dims for the scaled 16x16x128 instruction on CDNA4.
-# Per-CTA tile sizes ``block_k_pk`` / ``block_n`` (host-shuffle args)
-# layer on top and must be multiples of ``K_QUAD*K_WIDTH = 64`` and
-# ``N_LANE = 16``. See ``issue_global_load_to_vgpr`` for the matching
-# in-register unshuffle.
 _GLUON_DOT_K_WIDTH = 16
 _GLUON_DOT_N_LANE = 16
 _GLUON_DOT_K_QUAD = 4
 _GLUON_DOT_SUB_TILE_K = _GLUON_DOT_K_QUAD * _GLUON_DOT_K_WIDTH  # = 64
-
-
-# Default tile for W_VIA_VGPR; ``_pipelined_moe_kernel_scaled``
-# static_asserts ``BLOCK_K_W == 128 and BLOCK_N == 128`` -- changing
-# these defaults requires re-deriving the LOAD_W_LAYOUT bases.
-_GLUON_DOT_DEFAULT_BLOCK_K_PK = 128
-_GLUON_DOT_DEFAULT_BLOCK_N = 128
 
 _TCP_INFLIGHT_CAP_BYTES = 32 * 1024  # gfx9 L1/TCP per-CU in-flight cap
 _CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
@@ -223,8 +164,8 @@ _CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
 def shuffle_weight_for_gluon_dot_layout(
     w: "torch.Tensor",
     *,
-    block_k_pk: int = _GLUON_DOT_DEFAULT_BLOCK_K_PK,
-    block_n: int = _GLUON_DOT_DEFAULT_BLOCK_N,
+    block_k_pk: int = 128,
+    block_n: int = 128,
 ) -> "torch.Tensor":
     K_pk, N = w.shape[-2], w.shape[-1]
 
@@ -534,14 +475,7 @@ class MoEConfig:
     DTYPE_W: gl.constexpr
 
     W_TRANSPOSE: gl.constexpr
-    # Host pre-shuffles W into the 5-D MFMA byte order; K-loop bypasses
-    # W's LDS round-trip and delivers MFMA-ready B operands straight
-    # into VGPRs. Only MoEPipelinedProgram honours this; sliceN/sliceMN
-    # ignore it.
     W_VIA_VGPR: gl.constexpr
-    # When True (and ``W_VIA_VGPR``), pipeline issues iter k+1's W
-    # direct buffer_load BEFORE iter k's ``async_wait``. Default True;
-    # set ``TOKENSPEED_MOE_GLUON_W_PREFETCH=0`` to disable for A/B.
     W_PREFETCH: gl.constexpr
     NUM_BUFFERS: gl.constexpr
 
@@ -644,8 +578,6 @@ class MoEConfig:
         )
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
 
-        # Async commit_groups per K-iter; W_VIA_VGPR drops W from the
-        # batch (direct HBM->VGPR), scales only counted with SCALE_VIA_LDS.
         num_loads = 1  # x
         if not W_VIA_VGPR:
             num_loads += 1  # w (LDS path)
@@ -702,10 +634,6 @@ class MoEConfig:
             self.layout_w_scale = gl.constexpr(0)
         self.acc_layout = gl.constexpr(MFMA_LAYOUT)
 
-        # PaddedSharedLayout ``[[1024, 32]]`` (gfx950 a4w4 pattern):
-        # 32 B pad spreads ``ds_read_b128`` across 8 LDS banks; one
-        # spec covers fp8 + mxfp4 X / W. Offsets + block_shape must
-        # match the allocated slot exactly.
         BLOCK_K_PACKED_X_HOST = BLOCK_K // self.DIV_FACTOR_X
         BLOCK_K_PACKED_W_HOST = BLOCK_K // self.DIV_FACTOR_W
 
@@ -737,8 +665,6 @@ class MoEConfig:
             )
         )
 
-        # Half-N variant for :class:`MoESliceNProgram` (two LDS slots,
-        # one per W half) keeping each train under the 32 KB TCP cap.
         if W_TRANSPOSE:
             w_half_shape = [BLOCK_N // 2, BLOCK_K_PACKED_W_HOST]
         else:
@@ -753,11 +679,8 @@ class MoEConfig:
                 )
             )
         else:
-            # Type-check fallback; sliceN is gated to BN>=128 elsewhere.
             self.shared_layout_w_half_n = gl.constexpr(0)
 
-        # Half-M variant for :class:`MoESliceMNProgram` (complements
-        # the half-N W split so the 4-region pipeline can stagger).
         if (BLOCK_M // 2) >= 1 and BLOCK_K_PACKED_X_HOST >= 1:
             self.shared_layout_x_half_m = gl.constexpr(
                 gl.PaddedSharedLayout(
@@ -770,9 +693,6 @@ class MoEConfig:
         else:
             self.shared_layout_x_half_m = gl.constexpr(0)
 
-        # SCALE_VIA_LDS slot: vec=4 (32-bit, smallest CDNA4 direct-to-LDS
-        # unit), max_phase=1 = no swizzle so the 5-D unswizzle is a
-        # pure address remap.
         if _scale_via_lds:
             self.shared_layout_x_scale = gl.constexpr(
                 gl.SwizzledSharedLayout(4, 1, 1, order=[1, 0])
@@ -822,9 +742,6 @@ class MoEProgramBase:
     def issue_global_loads(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
         cfg = self.cfg
         self.x_desc.issue_async_load(load_idx, self.x_buffer, pred, USE_MASK=USE_MASK)
-        # W_VIA_VGPR: W is loaded HBM->VGPR directly inside the K-loop body
-        # (see `_load_xw`), not via async_copy.buffer_load_to_shared. Skip
-        # W's async LDS load here.
         if not cfg.W_VIA_VGPR:
             self.w_desc.issue_async_load(
                 load_idx, self.w_buffer, pred, USE_MASK=USE_MASK
@@ -899,7 +816,6 @@ class AsyncCopyDescriptor:
     k_limit: gl.tensor
     base_offset: gl.tensor
     BLOCK_K: gl.constexpr
-    # AMD vmem cache modifier; ``".cg"`` = non-temporal (skip L1).
     cache_modifier: gl.constexpr
 
     @gluon.constexpr_function
@@ -1338,11 +1254,7 @@ class MoEPipelinedProgram:
 
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
 
-        # Scales only consumed by mfma_scaled; the plain-MFMA branch is
-        # dead code on this scaled-only kernel but kept for the constexpr.
         if cfg.USE_MFMA_SCALED:
-            # Dummy scales use e8m0=127 (== 2^0 = 1.0) so the dot is identity-
-            # scaled when the operand has no real block scale (fp8 path).
             if cfg.WITH_X_MX_SCALE:
                 if cfg.SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
@@ -1459,7 +1371,7 @@ class MoEPipelinedProgram:
         cfg = self.cfg
         gl.static_assert(
             cfg.NUM_BUFFERS >= 3,
-            "warp_pipeline requires NUM_BUFFERS >= 3 (LDS slot reuse race)",
+            "warp_pipeline requires NUM_BUFFERS >= 3",
         )
         load_idx = 0
         mfma_idx = 0
@@ -2414,9 +2326,6 @@ def _pipelined_moe_tile_compute(
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
 
-    # Decode (BM<=32) hits each W tile once per CTA, so streaming-skip
-    # the L1 to preserve X / scale cache lines. ``.cg`` lowers to
-    # ``sc0=1, nt=1`` on gfx950 ``buffer_load_to_lds``.
     W_CACHE_MODIFIER: gl.constexpr = ".cg" if BLOCK_M <= 32 else ""
 
     X_ELEM_BITS: gl.constexpr = x_ptr.dtype.element_ty.primitive_bitwidth
@@ -2431,9 +2340,6 @@ def _pipelined_moe_tile_compute(
             "BLOCK_N=128 (or USE_SLICE_N=True for half-tile path), "
             "NUM_WARPS=4. Re-derive bases for other shapes.",
         )
-        # Use SUB_BN for the layout shape under sliceN so the static
-        # assert + downstream offs_wn/offs_wk arithmetic stays
-        # consistent with the half-tile loads we issue.
         BLOCK_N_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
         if cfg.SCALE_VIA_LDS:
             # tpw=[2,2]
@@ -2542,9 +2448,6 @@ def _pipelined_moe_tile_compute(
     else:
         mask_n = (off_n + offs_wn) < N
 
-    # Hint K_phys divisibility so the non-even-K alignment doesn't cap
-    # mxfp4 direct-to-LDS at 64b (CDNA4 rejects); ``multiple_of`` only
-    # binds on an SSA def, hence the divsi target here.
     k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
     x_desc = AsyncCopyDescriptor.initialize(
@@ -2934,36 +2837,10 @@ def _pipelined_moe_tile_compute(
             offsets_h = gl.expand_dims(offs_wk_h, 0) + gl.expand_dims(offs_wn_h, 1) * (
                 BLOCK_K_W * 16
             )
-            # 5-D shuffle CTA-tile bytes for ONE 128-N-block. Two
-            # consecutive tiles per BN=256 CTA: top at 2*pid_n, bot
-            # at 2*pid_n+1 (in the per-K-iter "row" of N tiles).
             TILE_BYTES_HALF: gl.constexpr = 128 * 128
-            # When N is 128-aligned but NOT 256-aligned (e.g.
-            # gpt-oss-120b W13: N=5760, ceil(N/128)=45 odd), the
-            # last CTA's bot tile (2*pid_n+1 = 45) is OOB. Clamp
-            # bot's base to top's byte address so buffer_load stays
-            # in bounds; the corresponding acc columns
-            # (y_n in [pid_n*256+128, pid_n*256+256)) are entirely
-            # past the logical N boundary and get dropped by the
-            # epilogue's ``offs_y_n < actual_n`` store mask, so the
-            # garbage acc value is harmless.
             n_block_count = (N + 127) // 128
             bot_valid = (2 * pid_n + 1) < n_block_count
             base_off_top = w_base_offset + 2 * pid_n * TILE_BYTES_HALF
-            # Top is always in-bounds (top idx = 2*pid_n <=
-            # 2*(grid_n-1) and grid_n*256 covers up to N rounded up
-            # to 256, but top only consumes the lower half so it
-            # never goes past the last valid 128-aligned tile).
-            # Bot is OOB at the last pid_n when N is 128-aligned
-            # but NOT 256-aligned (e.g. W13 N=5760, ceil(N/128)=45,
-            # last bot tile idx=45 OOB). Pred=bot_valid masks the
-            # bot buffer_load so OOB lanes return 0 (AMD HW
-            # out-of-bound masking) instead of reading whatever HBM
-            # bytes happen to lie past W's per-expert range; the
-            # acc columns produced by bot at pid_n=last are dropped
-            # by the epilogue's ``offs_y_n < actual_n`` store mask
-            # so this is numerically equivalent to skipping the
-            # contribution entirely.
             base_off_bot = base_off_top + TILE_BYTES_HALF
             w_desc_top = WVgprDescriptor(
                 cfg,
@@ -3143,11 +3020,6 @@ def _pipelined_moe_tile_compute(
     gl.store(y_ptr + y_offs, out, mask=mask_y)
 
 
-# ---------------------------------------------------------------------------
-# Grid-walk swizzles (Update 9 / 10): XCD chiplet swizzle + GROUP_M for L2 reuse
-# ---------------------------------------------------------------------------
-
-
 @gluon.jit
 def _xcd_chiplet_swizzle(pid, num_pids, XCD_SWIZZLE: gl.constexpr):
     if XCD_SWIZZLE == 1:
@@ -3268,8 +3140,6 @@ def _pipelined_moe_kernel_scaled(
         tiles_per_expert = BLOCKS_PER_EXPERT * grid_n
 
     if USE_BLOCK_SCHEDULE:
-        # Post-swizzle bound; can't check tile_idx directly because
-        # GROUP_M/XCD_SWIZZLE permute it.
         unpadded_m = gl.load(block_offs_ptr + N_EXPTS_TOT).to(gl.int32)
 
     for tile_idx in range(gl.program_id(0), NUM_TILES, gl.num_programs(0)):
@@ -3446,11 +3316,6 @@ def assert_no_spills(profile: dict, *, allow_scratch: int = 0) -> None:
             f"Gluon MoE kernel '{profile.get('label', '?')}' "
             f"shows static spills: {', '.join(msg)}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Helpers shared by all three Python-side launchers
-# ---------------------------------------------------------------------------
 
 
 def _dense_grid_dims(M: int, block_m: int) -> tuple[int, int]:
@@ -3678,8 +3543,6 @@ def _launch_kernel(
         block_schedule_buf = _make_dummy(x.device, torch.int32)
         n_slices = 0
 
-    # Unified 1-D grid: persistent (CTAs stride through tiles) or
-    # one-CTA-per-tile (padded entries cheap-skip via ``if do_tile``).
     if persistent:
         if num_ctas is None:
             num_ctas = _persistent_grid_size(num_tiles_total)
@@ -3689,9 +3552,6 @@ def _launch_kernel(
         num_ctas = max(1, num_tiles_total)
     grid = (num_ctas, 1)
 
-    # GROUP_M + XCD_SWIZZLE grid-walk permutation (caller kwargs
-    # override the heuristic). Both must divide their respective
-    # domain to stay a permutation; otherwise fall back to 1.
     grid_m_for_swizzle = num_tiles_total // grid_n
     auto_group_m, auto_xcd = _autotune_pid_swizzle(
         num_tiles_total=num_tiles_total,
@@ -3883,28 +3743,15 @@ def _launch_kernel(
         USE_SLICE_N=use_slice_n,
         HAS_FP8_QUANT_OUT=has_fp8_quant_out,
         W_VIA_VGPR=w_preshuffle,
-        W_PREFETCH=_W_PREFETCH_DEFAULT,
+        W_PREFETCH=False,
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
         num_warps=num_warps,
     )
 
-    # ``waves_per_eu`` AMD launch hint: forces the compiler to allocate
-    # registers so AT MOST this many waves run per SIMD. With NW=4 each
-    # CTA uses 1 wave/SIMD; ``waves_per_eu=N`` therefore caps occupancy
-    # to N CTAs/CU. Lower values free per-CTA TCP / VMEM-FIFO budget
-    # (the per-CU resources are shared across all resident waves), at
-    # the cost of fewer parallel waves to hide HBM latency. The
-    # W_VIA_VGPR + W_PREFETCH path benefits from this trade-off because
-    # most HBM latency is already hidden by the 1-iter-ahead W issue;
-    # the residual bottleneck is buffer_load TCP backpressure, which
-    # scales linearly with co-resident CTAs.
-    if _WAVES_PER_EU is not None:
-        common_kwargs["waves_per_eu"] = _WAVES_PER_EU
+    common_kwargs["waves_per_eu"] = num_warps // 4
 
-    # Schedule path is the production specialization; rocprof name
-    # is ``_pipelined_moe_kernel_scaled_block_schedule`` in that case.
     k = _pipelined_moe_kernel_scaled[grid](
         *common_args,
         block_offs_buf,
@@ -3919,13 +3766,7 @@ def _launch_kernel(
     _capture_launch_profile(k)
 
 
-# ---------------------------------------------------------------------------
-# Public Python entry points (one per kernel that TASKS.md asks for)
-# ---------------------------------------------------------------------------
-
-
-# CDNA4 MFMA: regular = 16x16x32, scaled = 16x16x128 (BLOCK_K constraint).
-_MFMA_K = 32
+# CDNA4 MFMA scaled = 16x16x128.
 _MFMA_SCALED_K = 128
 _MFMA_M = 16
 
@@ -4023,13 +3864,6 @@ def _autotune_pid_swizzle(
     grid_m_padded: int,
     block_m: int,
 ) -> tuple[int, int]:
-    """Pick ``(GROUP_M, XCD_SWIZZLE)`` defaults.
-
-    Returns ``(1, 1)`` on decode-sized launches (no benefit, swizzle
-    overhead dominates) and small-BM tiles. Otherwise picks GROUP_M
-    by grid_m_padded divisibility (bpe>=8 -> GM=4, bpe>=2 -> GM=2)
-    and XCD_SWIZZLE = 8 when it divides num_tiles_total.
-    """
     if num_tiles_total < 256:
         return 1, 1
     if block_m < 32:
@@ -4045,9 +3879,6 @@ def _autotune_pid_swizzle(
 
 
 def _persistent_grid_size(num_tiles_total: int) -> int:
-    """CTA count for the persistent kernel, capped at num_tiles_total
-    and at ``num_cus * oversubscribe`` (over-subscribing past this
-    just queues CTAs on the same CU)."""
     if num_tiles_total <= 0:
         return 1
     return max(1, min(num_tiles_total, _CDNA4_NUM_CUS * _PERSISTENT_OVERSUBSCRIBE))
@@ -4089,7 +3920,7 @@ def _resolve_use_slice_n(
     if use_slice_n is not None:
         enabled = bool(use_slice_n)
     else:
-        w_bytes = (bn * bk) // 2  # mxfp4 W is 0.5 byte/elem
+        w_bytes = (bn * bk) // 2
         enabled = bn >= 256 and bm <= 64 and w_bytes >= _TCP_INFLIGHT_CAP_BYTES
     return enabled and _can_use_slice_n(
         bm,
@@ -4368,8 +4199,6 @@ def gluon_mxfp_combine(
         has_w_block_scale=True,
         bk=block_k,
     )
-    # Scatter writeback is flat (n_tokens * n_expts_act, N); reduce
-    # the top-k axis below. ``n_tokens=None`` (bench) defaults to M.
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
     if n_tokens is None:
         n_rows = M
@@ -4377,9 +4206,6 @@ def gluon_mxfp_combine(
     else:
         n_tokens_eff = int(n_tokens)
         n_rows = n_tokens_eff * n_act_eff
-    # ``empty`` -- gpt-oss routing is dense (no -1 drops), so every
-    # row is written before the sum. Callers that allow drops must
-    # pre-zero ``y`` themselves.
     y = torch.empty((n_rows, N), device=x.device, dtype=out_dtype)
     _launch_kernel(
         x,
@@ -4421,12 +4247,6 @@ def gluon_mxfp_combine(
     return y
 
 
-# ---------------------------------------------------------------------------
-# Adapter that matches ``triton_kernels.matmul`` signature (for the
-# kernel registry / selector)
-# ---------------------------------------------------------------------------
-
-
 _TUNING_KW = frozenset(
     {"block_m", "block_n", "block_k", "num_warps", "num_buffers", "dtype"}
 )
@@ -4436,7 +4256,7 @@ _GLUON_PRIVATE_KW = frozenset({"out_quant_scale"})
 
 
 def _extract_gluon_raw_w(w):
-    """Return the raw ``(E, K_packed, N) uint8`` W tensor (zero-copy).
+    """Return the raw ``(E, K_packed, N) uint8`` W tensor.
 
     The upstream wrapper's ``storage.data`` is already K-contiguous
     so we pass it through. If a ``_gluon_shuffled`` attribute is
