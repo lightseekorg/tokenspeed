@@ -2703,6 +2703,7 @@ class DeepseekV4Compressor(nn.Module):
         state_block_table: torch.Tensor | None = None,
         state_block_size: int | None = None,
         state_base_logical_page: torch.Tensor | None = None,
+        state_slot_mapping: torch.Tensor | None = None,
         write_compressed_cache: bool = True,
         compressor_slot_cache: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2755,31 +2756,32 @@ class DeepseekV4Compressor(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        state_hit = (
-            memo.get(("state", self.compress_ratio)) if memo is not None else None
-        )
-        if state_hit is not None:
-            state_slot_mapping, state_block_table = state_hit
-        elif state_block_table is not None:
-            state_slot_mapping = _group_slot_mapping_from_raw(
-                positions,
-                metadata.token_to_req_indices[: positions.numel()],
-                state_block_table,
-                state_block_size,
-                base_offsets=state_base_logical_page,
+        if state_slot_mapping is None:
+            state_hit = (
+                memo.get(("state", self.compress_ratio)) if memo is not None else None
             )
-        else:
-            state_block_table = cache_metadata.block_table
-            state_slot_mapping = out_cache_loc
-        state_slot_mapping = _mask_invalid_graph_tokens(
-            state_slot_mapping,
-            valid_token,
-        )
-        if memo is not None and state_hit is None:
-            memo[("state", self.compress_ratio)] = (
+            if state_hit is not None:
+                state_slot_mapping, state_block_table = state_hit
+            elif state_block_table is not None:
+                state_slot_mapping = _group_slot_mapping_from_raw(
+                    positions,
+                    metadata.token_to_req_indices[: positions.numel()],
+                    state_block_table,
+                    state_block_size,
+                    base_offsets=state_base_logical_page,
+                )
+            else:
+                state_block_table = cache_metadata.block_table
+                state_slot_mapping = out_cache_loc
+            state_slot_mapping = _mask_invalid_graph_tokens(
                 state_slot_mapping,
-                state_block_table,
+                valid_token,
             )
+            if memo is not None and state_hit is None:
+                memo[("state", self.compress_ratio)] = (
+                    state_slot_mapping,
+                    state_block_table,
+                )
         with nvtx_range(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
                 kv=kv,
@@ -3155,6 +3157,7 @@ class DeepseekV4Indexer(nn.Module):
         out_cache_loc: torch.Tensor,
         layer_index: int,
         cos_sin_cache: torch.Tensor,
+        compressor_slot_cache: dict,
     ) -> torch.Tensor:
         pool = ctx.token_to_kv_pool
         metadata = _deepseek_v4_forward_metadata(ctx)
@@ -3162,31 +3165,55 @@ class DeepseekV4Indexer(nn.Module):
             raise RuntimeError("DeepSeek V4 indexer requires forward metadata")
         cache_metadata = metadata.cache
         indexer_state = pool.get_indexer_state_buffer(layer_index)
-        indexer_state_block_table = cache_metadata.indexer_state_block_table
-        indexer_state_base_logical_page = cache_metadata.indexer_state_base_logical_page
         valid_token = (
             metadata.is_valid_token[: positions.numel()]
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        if indexer_state_block_table is not None:
-            indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
-            indexer_state_slot_mapping = _group_slot_mapping_from_raw(
-                positions,
-                metadata.token_to_req_indices[: positions.numel()],
+        idx_hit = (
+            compressor_slot_cache.get("indexer_state")
+            if compressor_slot_cache is not None
+            else None
+        )
+        if idx_hit is not None:
+            (
+                indexer_state_slot_mapping,
                 indexer_state_block_table,
                 indexer_state_block_size,
-                base_offsets=indexer_state_base_logical_page,
-            )
+                indexer_state_base_logical_page,
+            ) = idx_hit
         else:
-            indexer_state_block_table = cache_metadata.block_table
-            indexer_state_block_size = pool.state_block_size
-            indexer_state_slot_mapping = out_cache_loc
-            indexer_state_base_logical_page = None
-        indexer_state_slot_mapping = _mask_invalid_graph_tokens(
-            indexer_state_slot_mapping,
-            valid_token,
-        )
+            indexer_state_block_table = cache_metadata.indexer_state_block_table
+            indexer_state_base_logical_page = (
+                cache_metadata.indexer_state_base_logical_page
+            )
+            if indexer_state_block_table is not None:
+                indexer_state_block_size = pool.get_indexer_state_block_size(
+                    layer_index
+                )
+                indexer_state_slot_mapping = _group_slot_mapping_from_raw(
+                    positions,
+                    metadata.token_to_req_indices[: positions.numel()],
+                    indexer_state_block_table,
+                    indexer_state_block_size,
+                    base_offsets=indexer_state_base_logical_page,
+                )
+            else:
+                indexer_state_block_table = cache_metadata.block_table
+                indexer_state_block_size = pool.state_block_size
+                indexer_state_slot_mapping = out_cache_loc
+                indexer_state_base_logical_page = None
+            indexer_state_slot_mapping = _mask_invalid_graph_tokens(
+                indexer_state_slot_mapping,
+                valid_token,
+            )
+            if compressor_slot_cache is not None:
+                compressor_slot_cache["indexer_state"] = (
+                    indexer_state_slot_mapping,
+                    indexer_state_block_table,
+                    indexer_state_block_size,
+                    indexer_state_base_logical_page,
+                )
         with nvtx_range("indexer_compressor_total"):
             self.compressor(
                 hidden_states=hidden_states,
@@ -3199,6 +3226,7 @@ class DeepseekV4Indexer(nn.Module):
                 state_block_table=indexer_state_block_table,
                 state_block_size=indexer_state_block_size,
                 state_base_logical_page=indexer_state_base_logical_page,
+                state_slot_mapping=indexer_state_slot_mapping,
                 write_compressed_cache=False,
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
@@ -3582,6 +3610,7 @@ class DeepseekV4Attention(nn.Module):
                         out_cache_loc=out_cache_loc,
                         layer_index=self.cache_layer_index,
                         cos_sin_cache=cos_sin_cache,
+                        compressor_slot_cache=compressor_slot_cache,
                     )
                 with fork.branch():
                     insert_swa_cache()
