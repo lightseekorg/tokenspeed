@@ -55,6 +55,9 @@ class RuntimeStates:
         self.remote_spec_candidate_ready = torch.zeros(
             req_pool_size + 1, dtype=torch.bool, device=device
         )
+        self.force_single_token_verify = torch.zeros(
+            req_pool_size + 1, dtype=torch.bool, device=device
+        )
         self.linear_penalties = torch.zeros(
             (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
         )
@@ -77,6 +80,7 @@ class RuntimeStates:
         self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
         self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
         self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+        self.force_single_token_verify[extend_request_pool_indices] = False
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]
@@ -94,6 +98,7 @@ class RuntimeStates:
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
         self.remote_spec_candidate_ready[req_pool_idx] = True
+        self.force_single_token_verify[req_pool_idx] = False
 
     def copy_mamba_states(
         self,

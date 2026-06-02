@@ -392,6 +392,28 @@ class ModelExecutor:
             multimodal_context=self._active_multimodal_context,
         )
 
+    def _apply_force_single_token_verify(
+        self,
+        accept_lengths: torch.Tensor,
+        row_offset: int,
+        row_count: int,
+    ) -> torch.Tensor:
+        force_pool = getattr(self.runtime_states, "force_single_token_verify", None)
+        if force_pool is None or row_count <= 0:
+            return accept_lengths
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[
+            row_offset : row_offset + row_count
+        ]
+        force_mask = force_pool.index_select(0, req_pool_indices)
+        return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
+
+    def _clear_force_single_token_verify(self, row_count: int) -> None:
+        force_pool = getattr(self.runtime_states, "force_single_token_verify", None)
+        if force_pool is None or row_count <= 0:
+            return
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[:row_count]
+        force_pool[req_pool_indices] = False
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -410,9 +432,13 @@ class ModelExecutor:
             return self.sampling_backend.sample(logits_output, sampling_info)
 
         if num_extends == 0:
-            return self.sampling_backend.verify(
+            output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
+            accept_lengths = self._apply_force_single_token_verify(
+                accept_lengths, 0, num_decodes
+            )
+            return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
         prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
@@ -422,6 +448,9 @@ class ModelExecutor:
         decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
         decode_tokens, decode_accept = self.sampling_backend.verify(
             decode_out, sampling_info[num_extends:], candidates
+        )
+        decode_accept = self._apply_force_single_token_verify(
+            decode_accept, num_extends, num_decodes
         )
         if (
             prefill_out.next_token_logprobs is not None
@@ -1331,6 +1360,9 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
+
+                if self.drafter is not None and num_extends < bs:
+                    self._clear_force_single_token_verify(bs)
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

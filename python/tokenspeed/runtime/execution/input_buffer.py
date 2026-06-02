@@ -193,32 +193,26 @@ class InputBuffers:
             runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
                 mask, ids, first_slot
             )
-            # Cols 1..: future_input_map is torch.empty-initialized and never
-            # reset on slot reuse. Retract-recovery rows have no candidate
-            # source, so stale tails must be hidden behind a reject sentinel.
-            # Remote-prefill rows carry real P-side draft candidates, and
-            # drafter-owned rows (mask False) keep their tail intact.
+            # Cols 1.. are real candidates only when the local drafter or the
+            # remote P-side path populated them. Bootstrap/recovery rows with
+            # no candidate source still feed a full-width target forward, so
+            # use a valid dummy token in model inputs and force the verifier to
+            # consume only the first target token for those rows.
             width = runtime_states.future_input_map.shape[1]
             remote_candidate_ready = runtime_states.remote_spec_candidate_ready[
                 decode_req_pool_indices
             ]
+            force_single_token = mask.squeeze(1) & ~remote_candidate_ready
             if width > 1:
                 tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
-                # Remote prefill can write real P-side draft candidates before
-                # the scheduler supplies the verified bootstrap token. Preserve
-                # that one real tail; sentinel-fill only rows that have no
-                # candidate source, such as retract recovery.
-                sentinel_mask = mask & ~remote_candidate_ready.unsqueeze(1)
+                dummy_tail = ids.expand(-1, width - 1)
                 runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
-                    torch.where(sentinel_mask, torch.full_like(tail, -1), tail)
+                    torch.where(force_single_token.unsqueeze(1), dummy_tail, tail)
                 )
-            runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = (
-                torch.where(
-                    mask.squeeze(1),
-                    torch.zeros_like(remote_candidate_ready),
-                    remote_candidate_ready,
-                )
+            runtime_states.force_single_token_verify[decode_req_pool_indices] = (
+                force_single_token
             )
+            runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = False
 
         valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
             0, req_pool_indices_device
