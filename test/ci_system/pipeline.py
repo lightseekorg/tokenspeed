@@ -1344,8 +1344,11 @@ def execute_task(
     command_results: List[Dict[str, Any]] = []
     eval_score_check: Dict[str, Any] | None = None
     eval_accept_rate: Dict[str, Any] | None = None
+    perf_reference_check: Dict[str, Any] | None = None
     server_process = None
     server_log_path: Path | None = None
+    error: str | None = None
+    error_reported = False
 
     try:
         if enable_perf_diagnostics:
@@ -1429,52 +1432,8 @@ def execute_task(
                 f"eval score {eval_score_check['score']:g} does not satisfy "
                 f"threshold {eval_score_check['threshold']}"
             )
-        perf_reference_check = check_perf_reference(task, command_results, stages_run)
-        if perf_reference_check is not None and not perf_reference_check["passed"]:
-            raise RuntimeError(
-                "perf_reference check failed: "
-                + "; ".join(perf_reference_check["failures"])
-            )
-
-        result = {
-            "ok": True,
-            "task": task["name"],
-            "type": task["type"],
-            "runner": runner,
-            "executed_stages": stages_run,
-            "targets": targets,
-            "command_results": command_results,
-        }
-        if eval_score_check is not None:
-            result["eval_score_check"] = eval_score_check
-        if perf_reference_check is not None:
-            result["perf_reference_check"] = perf_reference_check
-        if eval_accept_rate is not None:
-            result["eval_accept_rate"] = eval_accept_rate
-        if task.get("report", {}).get("github_step_summary"):
-            write_detailed_step_summary(result)
-        write_result(result_json, result)
-        return 0
     except Exception as exc:
-        result = {
-            "ok": False,
-            "task": task["name"],
-            "type": task["type"],
-            "runner": runner,
-            "executed_stages": stages_run,
-            "targets": targets,
-            "command_results": command_results,
-            "error": str(exc),
-        }
-        if eval_score_check is not None:
-            result["eval_score_check"] = eval_score_check
-        if eval_accept_rate is not None:
-            result["eval_accept_rate"] = eval_accept_rate
-        if task.get("report", {}).get("github_step_summary"):
-            write_detailed_step_summary(result)
-        write_result(result_json, result)
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        error = str(exc)
     finally:
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
@@ -1486,6 +1445,45 @@ def execute_task(
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
+
+    if error is None:
+        try:
+            perf_reference_check = check_perf_reference(
+                task, command_results, stages_run
+            )
+            if perf_reference_check is not None and not perf_reference_check["passed"]:
+                error = "perf_reference check failed: " + "; ".join(
+                    perf_reference_check["failures"]
+                )
+                error_reported = True
+        except Exception as exc:
+            error = str(exc)
+
+    result = {
+        "ok": error is None,
+        "task": task["name"],
+        "type": task["type"],
+        "runner": runner,
+        "executed_stages": stages_run,
+        "targets": targets,
+        "command_results": command_results,
+    }
+    if error is not None:
+        result["error"] = error
+    if eval_score_check is not None:
+        result["eval_score_check"] = eval_score_check
+    if perf_reference_check is not None:
+        result["perf_reference_check"] = perf_reference_check
+    if eval_accept_rate is not None:
+        result["eval_accept_rate"] = eval_accept_rate
+    if task.get("report", {}).get("github_step_summary"):
+        write_detailed_step_summary(result)
+    write_result(result_json, result)
+    if error is not None:
+        if not error_reported:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
