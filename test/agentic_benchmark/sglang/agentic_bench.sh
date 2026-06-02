@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-# Tested on TensorRT-LLM tag: v1.3.0rc13
+# Tested on SGLang tag: 0.5.12.post1
 
 set -euo pipefail
 
@@ -26,10 +26,6 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 CONFIGS=(
     attn_tp4_moe_tp4
     attn_tp4_moe_ep4
-    attn_tp8_moe_tp8
-    attn_tp8_moe_ep8
-    attn_dp8_moe_tp8
-    attn_dp8_moe_ep8
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,23 +34,15 @@ SERVER_LOG=
 
 launch_server() {
     local config=$1
-    SERVER_LOG=/tmp/trtllm_server_${config}.log
-    setsid trtllm-serve nvidia/Kimi-K2.5-NVFP4 \
-        --max_num_tokens 8192 \
-        --max_seq_len 80000 \
-        --enable_chunked_prefill \
-        --trust_remote_code \
-        --config "${SCRIPT_DIR}/configs/${config}.yaml" \
-        --host 127.0.0.1 \
-        --port 8001 \
-        > "$SERVER_LOG" 2>&1 &
+    SERVER_LOG=/tmp/sglang_server_${config}.log
+    setsid ${SCRIPT_DIR}/configs/${config}.sh > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 }
 
 wait_for_ready() {
-    local TIMEOUT=600
+    local TIMEOUT=1200
     local START=$SECONDS
-    until curl -sf -o /dev/null http://127.0.0.1:8001/health; do
+    until curl -sf -o /dev/null http://127.0.0.1:8003/health; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "Server died early. Last log lines:" >&2
             tail -100 "$SERVER_LOG" >&2
@@ -76,7 +64,7 @@ wait_for_ready() {
 
 stop_server() {
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "Stopping trtllm-serve (pgid $SERVER_PID)..."
+        echo "Stopping sglang serve (pgid $SERVER_PID)..."
         kill -TERM -"$SERVER_PID" 2>/dev/null || true
         for _ in {1..20}; do
             kill -0 "$SERVER_PID" 2>/dev/null || break
@@ -88,7 +76,7 @@ stop_server() {
 }
 
 wait_for_port_free() {
-    local port=${1:-8001}
+    local port=${1:-8003}
     local timeout=${2:-90}
     local start=$SECONDS
     while ! python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1', $port)); s.close()" 2>/dev/null; do
@@ -102,8 +90,8 @@ wait_for_port_free() {
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
-# Preflight: bail out if port 8001 is already in use
-wait_for_port_free 8001
+# Preflight: bail out if port 8003 is already in use
+wait_for_port_free 8003
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
 SWEEP_DIR="${SCRIPT_DIR}/outputs/${SWEEP_TS}"
@@ -121,7 +109,7 @@ for CONFIG in "${CONFIGS[@]}"; do
     echo "Warmup..."
     evalscope perf \
         --model nvidia/Kimi-K2.5-NVFP4 \
-        --url http://127.0.0.1:8001/v1/chat/completions \
+        --url http://127.0.0.1:8003/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
         --dataset-path agentic_dataset.json \
@@ -136,7 +124,7 @@ for CONFIG in "${CONFIGS[@]}"; do
     echo "Benchmark..."
     evalscope perf \
         --model nvidia/Kimi-K2.5-NVFP4 \
-        --url http://127.0.0.1:8001/v1/chat/completions \
+        --url http://127.0.0.1:8003/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
         --dataset-path agentic_dataset.json \
@@ -150,5 +138,5 @@ for CONFIG in "${CONFIGS[@]}"; do
         --no-timestamp
 
     stop_server
-    wait_for_port_free 8001
+    wait_for_port_free 8003
 done

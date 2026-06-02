@@ -286,8 +286,7 @@ def _ensure_cuda_compiler() -> None:
 # Format: (name, [source_files], extra_ldflags) or
 #         (name, [source_files], extra_ldflags, extra_cflags)
 # The 4-tuple form lets a kernel append nvcc flags on top of the global set —
-# e.g. merge_state needs ``-O3 -use_fast_math`` to match flashinfer's bundled
-# build. extra_cflags defaults to [] when omitted.
+# e.g., fused_topk_topp needs ``--expt-extended-lambda`` for CUB lambdas.
 KERNEL_GROUPS = [
     (
         "rope",
@@ -354,10 +353,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "fused_topk_topp" / "fused_topk_topp_binding.cu",
         ],
         [],
-        # Match the standalone build's flags. --use_fast_math + relaxed-constexpr
-        # are mostly redundant with the global -DFLASHINFER_ENABLE_* set, but
         # --expt-extended-lambda is required by air_topk_stable.cuh's CUB usage.
-        ["-O3", "--use_fast_math", "--expt-extended-lambda"],
+        ["--expt-extended-lambda"],
     ),
     (
         "rmsnorm_fused_parallel",
@@ -373,9 +370,6 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "merge_state.cu",
         ],
         [],
-        # flashinfer compiles cascade.cuh with -O3 -use_fast_math; -O2 alone
-        # leaves ~14% on the table at large T (kernel_only), so match upstream.
-        ["-O3", "-DNDEBUG", "-use_fast_math"],
     ),
     (
         "flashinfer_softmax",
@@ -383,8 +377,6 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "flashinfer_softmax.cu",
         ],
         [],
-        # Match flashinfer's stock sampling.cuh build flags.
-        ["-O3", "-DNDEBUG", "-use_fast_math"],
     ),
     (
         "silu_fuse_block_quant",
@@ -662,7 +654,9 @@ class CudaKernelBuilder:
         ]
         nvcc_flags = [
             "-std=c++17",
-            "-O2",
+            "-O3",
+            "-DNDEBUG",
+            "-use_fast_math",
             "--expt-relaxed-constexpr",
             "--compiler-options=-fPIC",
             "-DFLASHINFER_ENABLE_BF16",

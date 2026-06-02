@@ -55,6 +55,58 @@ also be bumped to 256.)
 - `--deepseek-v4-indexer-prefill-max-logits-mb N`: caps the FP4 indexer
   prefill logits buffer in MB (default 512).
 
+## MTP speculative decoding
+
+DeepSeek V4 can use the checkpoint's NextN/MTP draft layers through the standard
+speculative flags. For `num_steps > 1`, keep the main V4 launch flags and add:
+
+```bash
+--speculative-algorithm MTP \
+--speculative-num-steps 3
+```
+
+When `--speculative-draft-model-path` is omitted for MTP, TokenSpeed uses the
+same V4 checkpoint as the draft source and loads the `DeepseekV4ForCausalLMNextN`
+architecture.
+
+For multi-step MTP, draft decode metadata must advance from the accepted prefix
+length (`valid_cache_len + accept_len`), not from the full verify width. This
+keeps later draft steps from attending over rejected verify-tail KV after partial
+accepts.
+
+DeepSeek V4 attention also carries separate paged cache groups for SWA,
+compressed KV, compressor state, and CSA indexer state. Speculative target and
+draft metadata paths must forward those group block tables and base logical-page
+offsets together; falling back to the ordinary request page table is not a valid
+V4 MTP cache layout. Compressed attention reads, compressed KV/indexer inserts,
+and indexer decode plans must treat compact group tables as `logical_page -
+base_offset`. Multi-token decode metadata should derive compressed cache slots
+from each token's position within the verify span.
+
+Draft decode SWA metadata has the same requirement. The drafter cache uses V4
+compact SWA pages (64 rows in the default layout), while ordinary request pages
+can be larger. Multi-step draft decode must keep the compact SWA block table from
+the draft-extend/prefill metadata and refresh `decode_swa_indices`/`decode_swa_lens`
+after each accepted-prefix advance; otherwise later draft steps can read stale or
+out-of-range SWA rows.
+
+Do not enable scheduler prefix caching for V4 MTP yet. The current scheduler
+prefix cache reuses ordinary KV pages only; it does not restore SWA, compressed
+KV, compressor state, or CSA indexer group pages for prefix-hit requests, so a
+prefix hit could skip tokens whose group cache state is not actually populated.
+
+SWA cache insert slot mappings are validated against the current SWA group cache
+capacity before invoking fused cache writers. Multi-step MTP can carry padded or
+draft-tail slot entries that are valid as ignored tokens but not valid physical
+SWA cache locations; these entries must stay negative or be masked before the
+writer touches paged cache memory.
+
+Do not enable mixed prefill/decode batches for V4 MTP yet. MTP advances each
+request by the sampled accepted length, not by a fixed verify width; the next
+target-verify step must therefore wait for the scheduler to observe the previous
+accepted length before it builds group block tables and base logical-page
+offsets.
+
 ## Hardware / dependency requirements
 
 - 4× NVIDIA Blackwell SM100 (B200) GPUs.

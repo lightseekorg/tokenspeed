@@ -13,7 +13,9 @@ from pipeline import (
     extract_perf_summary_rows,
     format_perf_reference_markdown_table,
     format_perf_reference_table,
+    is_gb200_runner,
     resolve_score_threshold_for_runner,
+    should_run_nvidia_gpu_cleanup,
     validate_task,
 )
 
@@ -43,6 +45,19 @@ def test_stale_process_patterns_match_existing_targets():
         assert any(
             re.search(pat, cmdline) for pat in STALE_PROCESS_PATTERNS
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
+
+
+def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
+    assert is_gb200_runner("gb200-1gpu")
+    assert is_gb200_runner("gb200-4gpu-perf")
+    assert not is_gb200_runner("b300-4gpu")
+
+    assert should_run_nvidia_gpu_cleanup("gb200-1gpu")
+    assert should_run_nvidia_gpu_cleanup("gb200-4gpu-perf")
+    assert should_run_nvidia_gpu_cleanup("b300-4gpu")
+    assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
+    assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
+    assert not should_run_nvidia_gpu_cleanup("linux-mi355-2gpu-lightseek")
 
 
 def test_extract_evalscope_score_from_pipe_table():

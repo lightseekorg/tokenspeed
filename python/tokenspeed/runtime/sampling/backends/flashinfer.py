@@ -169,20 +169,22 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._ones_buf = torch.ones(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
-        self._predict_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
+        # predict + accept_length share one packed backing store.
+        # Layout: [0, max_bs * max_n) is predict, [max_bs * max_n, total)
+        # is accept_length.
+        self._predict_max = config.max_bs * config.max_draft_tokens_per_req
+        self._output_pack_buf = torch.zeros(
+            (self._predict_max + config.max_bs,),
             dtype=torch.int32,
             device=config.device,
         )
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
-        # (required by maybe_broadcast / NCCL).
+        self._predict_buf = self._output_pack_buf[: self._predict_max]
+        self._accept_length_buf = self._output_pack_buf[self._predict_max :]
+        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n.
         self._accept_index_buf = torch.zeros(
             (config.max_bs * config.max_draft_tokens_per_req,),
             dtype=torch.int32,
             device=config.device,
-        )
-        self._accept_length_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -397,6 +399,36 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
 
         return predict, accept_length
+
+    def get_packed_output_d2h(
+        self,
+        output_tokens: torch.Tensor,
+        output_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """One D2H of the packed predict+accept_length region.
+
+        Only applies when both outputs alias into ``_output_pack_buf`` (the
+        verify() path). For ``sample()``, ``output_tokens`` is a fresh
+        argmax/top_k_top_p result and ``output_lengths`` is ``_ones_buf``,
+        neither of which lives in the pack. We fall back to two D2Hs.
+        """
+        if (
+            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
+            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+        ):
+            return None
+        n_t = output_tokens.numel()
+        n_l = output_lengths.numel()
+        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
+        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
+        # the saved launch beats the wasted bandwidth.
+        size = self._predict_max + n_l
+        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
+        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
+        return (
+            cpu_pack[:n_t].view(output_tokens.shape),
+            cpu_pack[self._predict_max : self._predict_max + n_l],
+        )
 
 
 register_backend("flashinfer", FlashInferSamplingBackend)

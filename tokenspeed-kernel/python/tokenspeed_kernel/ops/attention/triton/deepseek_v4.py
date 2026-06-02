@@ -1696,6 +1696,7 @@ def _deepseek_v4_indexer_decode_metadata_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride,
+    block_table_base_offsets_ptr,
     rows: tl.constexpr,
     cols: tl.constexpr,
     compress_ratio: tl.constexpr,
@@ -1705,10 +1706,18 @@ def _deepseek_v4_indexer_decode_metadata_kernel(
 ):
     token_idx = tl.program_id(0)
     pos = tl.load(positions_ptr + token_idx).to(tl.int64)
-    compressed_lens = tl.maximum((pos + 1) // compress_ratio, 0)
     req = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int32)
     req_valid = (req >= 0) & (req < rows)
     safe_req = tl.maximum(0, tl.minimum(req, rows - 1))
+    base_logical_page = tl.zeros((), dtype=tl.int64)
+    if block_table_base_offsets_ptr is not None:
+        base_logical_page = tl.load(block_table_base_offsets_ptr + safe_req).to(
+            tl.int64
+        )
+    compressed_lens = tl.maximum(
+        ((pos + 1) // compress_ratio) - base_logical_page * cache_block_size,
+        0,
+    )
     num_valid_pages = tl.zeros((), dtype=tl.int64)
     for col_start in range(0, max_blocks, candidate_block):
         col_offsets = col_start + tl.arange(0, candidate_block)
@@ -1746,6 +1755,7 @@ def deepseek_v4_indexer_decode_metadata_compute(
     max_blocks: int,
     out_context_lens: torch.Tensor,
     out_block_tables: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> None:
     """Build decode-indexer context lengths and block tables in one Triton pass."""
     num_tokens = int(positions.shape[0]) if positions.ndim >= 1 else 0
@@ -1767,6 +1777,11 @@ def deepseek_v4_indexer_decode_metadata_compute(
         token_to_req_indices_i32,
         block_table_i32,
         block_table_i32.stride(0),
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
         rows=rows,
         cols=cols,
         compress_ratio=int(compress_ratio),
