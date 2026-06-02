@@ -1448,8 +1448,9 @@ class ModelExecutor:
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]
     ) -> None:
-        torch.cuda.current_stream().wait_stream(self.execution_stream)
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
+        # Remote spec candidates are CPU materialized; enqueue the H2D copy and
+        # future_input_map update on execution_stream. The next forward's input
+        # prep already waits on execution_stream before reading runtime state.
         with torch.cuda.stream(self.execution_stream):
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
