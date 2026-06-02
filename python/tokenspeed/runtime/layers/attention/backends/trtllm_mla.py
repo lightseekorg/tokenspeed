@@ -371,7 +371,10 @@ class TRTLLMMLABackend(AttentionBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         # seq_lens_k aliases seq_lens_buf; only block indices need refresh.
-        if req_to_page is not None:
+        # When the buffer is aliased to a peer backend (e.g. drafter aliasing
+        # the target's kv_indices), the peer's replay has already populated it
+        # with identical content.
+        if req_to_page is not None and not getattr(self, "_block_table_aliased", False):
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],

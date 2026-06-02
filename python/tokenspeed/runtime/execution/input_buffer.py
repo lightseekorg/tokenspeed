@@ -24,7 +24,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.execution.cache_loc_kernel import compute_out_cache_loc
+from tokenspeed.runtime.execution.cache_loc_kernel import (
+    compute_out_cache_loc,
+    compute_out_cache_loc_uniform,
+    fused_decode_input_prep,
+)
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -62,11 +66,20 @@ class InputBuffers:
         self.has_mamba = has_mamba
 
         with torch.device(device):
+            # Initialise buffers to the *padding* values the captured graph
+            # expects for padded rows (input_ids=1, positions=0, req_pool=0,
+            # seq_lens=1, out_cache_loc=dummy_kv_slot). Each iteration overwrites
+            # the active prefix [:total_tokens]; fill_input_buffers refreshes the
+            # padding tail [total_tokens:] back to these defaults every step,
+            # because a larger prior iter can leave stale values past the
+            # current prefix.
             self.input_ids_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
-            self.positions_buf = torch.arange(0, max_num_tokens, dtype=torch.int64)
+            # Zero (not arange) so padded positions read a consistent, in-range
+            # value; the tail is re-zeroed every iteration by fill_input_buffers.
+            self.positions_buf = torch.zeros(max_num_tokens, dtype=torch.int64)
             self.mrope_positions_buf = torch.zeros(
                 (3, max_num_tokens), dtype=torch.int64
             )
@@ -125,6 +138,12 @@ class InputBuffers:
         batch_size = len(forward_op.request_ids)
         assert batch_size >= 0
         num_extends = forward_op.num_extends()
+
+        # CPU-side fast path: when the scheduler always emits a decode_input_ids
+        # list (even though every entry is -1, meaning "no override").
+        decode_input_ids = forward_op.decode_input_ids
+        if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
+            decode_input_ids = None
         req_pool_indices_cpu = torch.tensor(
             forward_op.request_pool_indices, device="cpu", pin_memory=True
         )
@@ -133,7 +152,10 @@ class InputBuffers:
             non_blocking=True,
         )
         input_lengths_cpu = torch.tensor(
-            forward_op.input_lengths, device="cpu", pin_memory=True
+            forward_op.input_lengths,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
         )
         self.input_lengths_buf[:batch_size].copy_(
             input_lengths_cpu,
@@ -168,36 +190,55 @@ class InputBuffers:
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
 
-        valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
-            0, req_pool_indices_device
-        )
-
-        # Compute out_cache_loc using Triton kernel
-        compute_out_cache_loc(
-            out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-            req_pool_indices=req_pool_indices_device,
-            input_lengths=input_lengths_device,
-            cache_start=valid_cache_lengths,
-            req_to_pages=req_to_page,
-            page_size=self.page_size,
-        )
-
-        # Compute positions. In mixed batches, prefill rows use their extend
-        # prefix lengths while decode rows use the current valid cache lengths.
-        prefill_prefix_lens = self.extend_prefix_lens_buf[:num_extends]
-        if num_extends == 0:
-            prefix_lens = valid_cache_lengths
-        elif num_extends == batch_size:
-            prefix_lens = prefill_prefix_lens
+        # Decode-only fast path: one fused Triton kernel writes out_cache_loc,
+        # positions, and seq_lens in a single launch and reads
+        # valid_cache_lengths[pool_idx] directly, so the indexSelect + cumsum
+        # path + compute_position + seq_lens add are all gone.
+        if num_extends == 0 and batch_size > 0:
+            fused_decode_input_prep(
+                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
+                positions_ptr=self.positions_buf[:total_tokens],
+                seq_lens_out_ptr=self.seq_lens_buf[:batch_size],
+                req_pool_indices=req_pool_indices_device,
+                valid_cache_lengths=runtime_states.valid_cache_lengths,
+                uniform_input_length=total_tokens // batch_size,
+                req_to_pages=req_to_page,
+                page_size=self.page_size,
+            )
+            # Decode path's seq_lens / positions / out_cache_loc are done.
+            valid_cache_lengths = None
         else:
-            prefix_lens = valid_cache_lengths.clone()
-            prefix_lens[:num_extends].copy_(prefill_prefix_lens)
-        positions, _ = compute_position_triton(
-            extend_prefix_lens=prefix_lens,
-            extend_seq_lens=input_lengths_device,
-            extend_seq_lens_sum=total_tokens,
-        )
-        self.positions_buf[:total_tokens].copy_(positions)
+            # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
+            # for valid_cache_lengths is required because compute_position and
+            # the seq_lens add use it.
+            valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
+                0, req_pool_indices_device
+            )
+            compute_out_cache_loc(
+                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
+                req_pool_indices=req_pool_indices_device,
+                input_lengths=input_lengths_device,
+                cache_start=valid_cache_lengths,
+                req_to_pages=req_to_page,
+                page_size=self.page_size,
+            )
+
+            # Compute positions. In mixed batches, prefill rows use their extend
+            # prefix lengths while decode rows use the current valid cache lengths.
+            prefill_prefix_lens = self.extend_prefix_lens_buf[:num_extends]
+            if num_extends == batch_size:
+                prefix_lens = prefill_prefix_lens
+            else:
+                prefix_lens = valid_cache_lengths.clone()
+                prefix_lens[:num_extends].copy_(prefill_prefix_lens)
+            # Write positions directly into the persistent buffer to skip the
+            # otherwise-required DtoD copy.
+            compute_position_triton(
+                extend_prefix_lens=prefix_lens,
+                extend_seq_lens=input_lengths_device,
+                extend_seq_lens_sum=total_tokens,
+                out=self.positions_buf[:total_tokens],
+            )
 
         # Determine input_ids and forward_mode
         if num_extends > 0:
@@ -220,16 +261,16 @@ class InputBuffers:
                 decode_req_pool_indices = req_pool_indices_device[
                     num_extends:batch_size
                 ]
-                if forward_op.decode_input_ids is not None:
+                if decode_input_ids is not None:
                     decode_count = batch_size - num_extends
-                    if len(forward_op.decode_input_ids) != decode_count:
+                    if len(decode_input_ids) != decode_count:
                         raise RuntimeError(
                             "mixed forward decode_input_ids length mismatch: "
-                            f"got {len(forward_op.decode_input_ids)}, "
+                            f"got {len(decode_input_ids)}, "
                             f"expected {decode_count}"
                         )
                     decode_input_ids_tensor = torch.tensor(
-                        forward_op.decode_input_ids,
+                        decode_input_ids,
                         dtype=torch.int32,
                         device="cpu",
                         pin_memory=True,
@@ -254,9 +295,9 @@ class InputBuffers:
             # If the scheduler provides explicit decode input ids (!= -1), write
             # them into future_input_map before reading, so that they take effect
             # as the input for this decode step.
-            if forward_op.decode_input_ids is not None:
+            if decode_input_ids is not None:
                 decode_input_ids_tensor = torch.tensor(
-                    forward_op.decode_input_ids,
+                    decode_input_ids,
                     dtype=torch.int32,
                     device="cpu",
                     pin_memory=True,
@@ -273,18 +314,47 @@ class InputBuffers:
                 non_blocking=True,
             )
 
-        self.seq_lens_buf[:batch_size].copy_(input_lengths_device + valid_cache_lengths)
+        # Defensive clamp into the valid vocab range. The decode input ids come
+        # from future_input_map, written by the previous iteration's
+        # sampler/drafter; the intermittent spec-decode decode-state race can
+        # surface a stale/corrupt out-of-range id there. Feeding an out-of-range
+        # id to the captured graph's embedding gather trips a device-side assert
+        # (`vectorized_gather_kernel index out of bounds`) that tears the whole
+        # server down. Clamp the active prefix before the graph reads these
+        # buffers (a no-op for legitimate ids). Mirrors the post-graph
+        # output_tokens clamp in the output_d2h step of
+        # ModelExecutor.execute_forward_op.
+        vocab_size = runtime_states.vocab_size
+        self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
+        self.shifted_prefill_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 
-        # Reset positions beyond total_tokens to the dummy KV slot so that any
-        # CUDA graph replay with a larger (padded) batch size writes padding
-        # tokens to the reserved dummy slot instead of corrupting real KV cache.
+        if valid_cache_lengths is not None:
+            torch.add(
+                input_lengths_device,
+                valid_cache_lengths,
+                out=self.seq_lens_buf[:batch_size],
+            )
+
+        # Refresh the padding tail of the persistent buffers every iteration.
+        # The captured graph replays at a padded batch size and DOES read the
+        # padded rows; a previous iter with a *larger* total_tokens / batch_size
+        # leaves stale values in the tail (real cache locations, per-request seq
+        # lengths, positions, token ids, req-pool slots). Reusing those for
+        # padded tokens routes KV writes into real cache slots (corruption),
+        # forces attention to scan oversize ranges, and -- for a stale
+        # out-of-range token id -- trips the embedding gather's device-side
+        # assert that tears the server down. The __init__ safe defaults
+        # (input_ids=1, req_pool=0, positions=0) are not enough on their own
+        # once a larger iter has overwritten the tail, so scrub it back here
+        # (cheap tail-only fills; the active prefix was written above).
         if total_tokens < self.max_num_tokens:
             self.input_ids_buf[total_tokens:].fill_(1)
             self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
-            self.req_pool_indices_buf[batch_size:].fill_(0)
-            self.seq_lens_buf[batch_size:].fill_(1)
             self.positions_buf[total_tokens:].fill_(0)
             self.mrope_positions_buf[:, total_tokens:].zero_()
+        if batch_size < self.max_bs:
+            self.req_pool_indices_buf[batch_size:].fill_(0)
+            self.seq_lens_buf[batch_size:].fill_(1)
 
         if (
             self.has_mamba
