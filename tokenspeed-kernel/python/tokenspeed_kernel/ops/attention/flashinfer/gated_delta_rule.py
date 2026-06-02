@@ -45,12 +45,19 @@ _AVAILABLE = False
 
 if current_platform().is_nvidia:
     try:
+        from flashinfer.gdn_kernels import (
+            _has_blackwell_prefill as _fi_has_blackwell_prefill,
+        )
         from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
 
         _chunk_gated_delta_rule = _fi_chunk
         _p = current_platform()
         _sm = _p.arch_version.major * 10 + _p.arch_version.minor
-        _AVAILABLE = _sm == 100
+        _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        # flashinfer raises NotImplementedError on sm100 when CUDA<13 or the
+        # wheel lacks the Blackwell prefill kernel; gate here so the caller
+        # does not commit to a fast-path that crashes at call time.
+        _AVAILABLE = _sm == 100 and _cuda_major >= 13 and _fi_has_blackwell_prefill
     except ImportError:
         _AVAILABLE = False
 
