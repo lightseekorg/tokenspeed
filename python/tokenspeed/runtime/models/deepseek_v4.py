@@ -43,6 +43,7 @@ try:
 except ImportError:
     deep_gemm = None  # type: ignore[assignment]
 
+import tokenspeed_kernel
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -3325,9 +3326,9 @@ class DeepseekV4Attention(nn.Module):
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.fused_qkv_norm = FusedRMSNorm(self.q_norm, self.kv_norm)
-        # Fused QKV-RMSNorm is opt-in; the unfused path is the default until
-        # a wider correctness sweep confirms the fused kernel.
-        self.use_fused_qkv_rmsnorm = False
+        # Fused QKV-RMSNorm: fuses q_a/kv_a RMSNorm into one kernel instead of two
+        # sequential RMSNorm + a kv.contiguous() copy. Validated via GSM8K.
+        self.use_fused_qkv_rmsnorm = True
         self.wo_a = ColumnParallelLinear(
             self.num_heads * self.head_dim // self.o_groups,
             self.o_groups * self.o_lora_rank,
@@ -3450,15 +3451,29 @@ class DeepseekV4Attention(nn.Module):
             rope_dim=self.qk_rope_head_dim,
         )
         in_dim = self.num_heads * self.head_dim // self.o_groups
-        weight = _dequant_fp8_weight(
-            self.wo_a,
-            (self.num_local_groups, self.o_lora_rank, in_dim),
+        # Native FP8 block-scale GEMM per group (deep_gemm), replacing the
+        # FP32 weight dequant + FP32 torch.bmm. wo_a's block scale was
+        # transformed into the deep_gemm layout at load time; activations
+        # are quantized online by tokenspeed_kernel.mm.
+        weight = self.wo_a.weight.view(self.num_local_groups, self.o_lora_rank, in_dim)
+        scales = self.wo_a._deep_gemm_bmm_weight_scales
+        block_size = self.wo_a._deep_gemm_block_size
+        grouped = grouped.transpose(0, 1).contiguous()
+        z = torch.stack(
+            [
+                tokenspeed_kernel.mm(
+                    grouped[g],
+                    weight[g],
+                    B_scales=scales[g],
+                    out_dtype=attn_output.dtype,
+                    quant="mxfp8",
+                    block_size=block_size,
+                    override="deep_gemm_mm_fp8_blockscale",
+                )
+                for g in range(self.num_local_groups)
+            ],
+            dim=1,
         )
-        z = torch.bmm(
-            grouped.float().transpose(0, 1),
-            weight.transpose(1, 2),
-        ).transpose(0, 1)
-        z = z.to(attn_output.dtype).contiguous()
         out, _ = self.wo_b(z.flatten(1))
         return out
 
