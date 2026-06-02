@@ -3482,6 +3482,7 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        swa_slot_mapping: torch.Tensor,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -3495,17 +3496,8 @@ class DeepseekV4Attention(nn.Module):
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
-        cache_metadata = metadata.cache
-        if cache_metadata.swa_block_table is not None:
-            swa_slot_mapping = _group_slot_mapping_from_raw(
-                positions,
-                metadata.token_to_req_indices[: positions.numel()],
-                cache_metadata.swa_block_table,
-                pool.swa_block_size,
-                base_offsets=cache_metadata.swa_base_logical_page,
-            )
-        else:
-            swa_slot_mapping = out_cache_loc
+        # swa_slot_mapping is computed once per step in DeepseekV4Model.forward
+        # (it is identical across all layers) and threaded in here.
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -3745,6 +3737,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         input_ids: torch.Tensor,
+        swa_slot_mapping: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
         with nvtx_range("hc_attn_pre"):
@@ -3760,7 +3753,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         with nvtx_range("attn_norm"):
             hidden_states = self.attn_norm(hidden_states)
         with nvtx_range("attn_total"):
-            hidden_states = self.attn(positions, hidden_states, ctx, out_cache_loc)
+            hidden_states = self.attn(
+                positions, hidden_states, ctx, out_cache_loc, swa_slot_mapping
+            )
         with nvtx_range("hc_attn_post"):
             hidden_states = mhc_post(hidden_states, residual, post, comb)
 
@@ -3880,9 +3875,37 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
         with nvtx_range("hc_repeat"):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        # The SWA write-slot mapping is identical across all layers, so compute
+        # it once per step here instead of recomputing it in every attention
+        # layer (DeepSeek-V3 likewise derives its slot mapping once per step).
+        # On an empty batch (e.g. the DP idle fallback) the attention layers
+        # early-return without touching metadata, so skip the metadata read here
+        # too to preserve that behavior on a fresh backend.
+        if hidden_states.shape[0] == 0:
+            swa_slot_mapping = out_cache_loc
+        else:
+            metadata = ctx.attn_backend.forward_metadata
+            if metadata is None:
+                raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+            cache_metadata = metadata.cache
+            if cache_metadata.swa_block_table is not None:
+                swa_slot_mapping = _group_slot_mapping_from_raw(
+                    positions,
+                    metadata.token_to_req_indices[: positions.numel()],
+                    cache_metadata.swa_block_table,
+                    ctx.token_to_kv_pool.swa_block_size,
+                    base_offsets=cache_metadata.swa_base_logical_page,
+                )
+            else:
+                swa_slot_mapping = out_cache_loc
         for layer in self.layers:
             hidden_states = layer(
-                positions, hidden_states, ctx, out_cache_loc, input_ids
+                positions,
+                hidden_states,
+                ctx,
+                out_cache_loc,
+                input_ids,
+                swa_slot_mapping,
             )
         aux_hidden_states = None
         if (
