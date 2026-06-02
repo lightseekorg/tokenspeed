@@ -353,10 +353,38 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
+def _maybe_add_weight_transfer_port(engine_args: list[str]) -> tuple[list[str], str]:
+    """Wire the in-engine weight-transfer control plane port, if enabled.
+
+    When ``--enable-weight-transfer`` (or ``TOKENSPEED_SERVER_DEV_MODE=1``) is in
+    effect, ensure ``--weight-transfer-port`` is present in the engine argv
+    (allocating a free port if the user did not pin one) and return the matching
+    ``engine_http_url`` for the sidecar to proxy to. Otherwise return the argv
+    unchanged and an empty URL (weight routes report 503).
+    """
+    from tokenspeed.runtime.utils.env import envs
+
+    enabled = (
+        "--enable-weight-transfer" in engine_args
+        or envs.TOKENSPEED_SERVER_DEV_MODE.get()
+    )
+    if not enabled:
+        return engine_args, ""
+    if "--weight-transfer-port" in engine_args:
+        idx = engine_args.index("--weight-transfer-port")
+        port = int(engine_args[idx + 1])
+        return engine_args, f"http://127.0.0.1:{port}"
+    port = get_free_port()
+    return [*engine_args, "--weight-transfer-port", str(port)], (
+        f"http://127.0.0.1:{port}"
+    )
+
+
 async def _start_control_server(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
+    engine_http_url: str = "",
     host: str,
     port: int,
     timeout: float = 30.0,
@@ -375,6 +403,7 @@ async def _start_control_server(
     server = build_server(
         gateway_url=gateway_url,
         engine_grpc_addr=engine_grpc_addr,
+        engine_http_url=engine_http_url,
         host=host,
         port=port,
     )
@@ -476,6 +505,10 @@ async def run_smg(
     try:
         engine_port = get_free_port()
 
+        # Wire the in-engine weight-transfer control plane port (no-op unless
+        # --enable-weight-transfer is set). Must happen before spawn_engine.
+        engine_args, engine_http_url = _maybe_add_weight_transfer_port(engine_args)
+
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))
 
@@ -513,6 +546,7 @@ async def run_smg(
         control_ok = await _start_control_server(
             gateway_url=f"http://{user_host}:{user_port}",
             engine_grpc_addr=f"127.0.0.1:{engine_port}",
+            engine_http_url=engine_http_url,
             host=user_host,
             port=control_port,
         )

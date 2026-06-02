@@ -229,6 +229,15 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
+    # RL weight-transfer dev mode (vLLM parity: VLLM_SERVER_DEV_MODE). When set,
+    # the weight-transfer HTTP control plane is enabled even if
+    # --enable-weight-transfer was not passed explicitly.
+    TOKENSPEED_SERVER_DEV_MODE = EnvBool(False)
+    # Opt-in for deserializing CUDA-IPC handles sent as base64 pickled blobs
+    # (vLLM parity: VLLM_ALLOW_INSECURE_SERIALIZATION). Required by the IPC
+    # weight-transfer backend because the payload is unpickled.
+    TOKENSPEED_ALLOW_INSECURE_SERIALIZATION = EnvBool(False)
+
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")

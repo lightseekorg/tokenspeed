@@ -188,6 +188,19 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.model_update_result: Awaitable[UpdateWeightFromDiskReqOutput] | None = None
         self.asyncio_tasks = set()
 
+        # RL weight-transfer admission gate (vLLM-compatible pause/resume). Set
+        # means new requests may be admitted; WeightTransferManager.pause()
+        # clears it and resume() sets it. Generation awaits it at intake so a
+        # pause halts new work; when not paused the hot-path cost is one
+        # ``is_set()`` check. Must be toggled on this object's event loop.
+        self._wt_admit = asyncio.Event()
+        self._wt_admit.set()
+        # Created below once server_args is bound, only when the weight-transfer
+        # control plane is enabled. The in-engine HTTP app is launched lazily on
+        # this object's event loop (see auto_create_handle_loop).
+        self.weight_transfer_manager = None
+        self._wt_server_task = None
+
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -244,6 +257,17 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         self.init_communicators(server_args)
 
+        # RL weight-transfer control plane (vLLM-compatible). Created only when
+        # enabled; the weight-transfer HTTP app reaches it via this attribute.
+        if server_args.weight_transfer_enabled:
+            from tokenspeed.runtime.engine.weight_transfer.manager import (
+                WeightTransferManager,
+            )
+
+            self.weight_transfer_manager = WeightTransferManager(
+                self, server_args.get_weight_transfer_config()
+            )
+
         # Tokenization lives in :class:`InputProcessor`; see
         # :meth:`_tokenize_one_request` for the delegation.
         self.input_processor = InputProcessor(self)
@@ -255,6 +279,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         created_time = time.time()
 
         self.auto_create_handle_loop()
+
+        # RL weight-transfer pause gate: block new admission while paused
+        # (vLLM-compatible /pause). No-op cost when not paused.
+        if not self._wt_admit.is_set():
+            await self._wt_admit.wait()
 
         self.input_processor.validate_request(obj)
 
@@ -488,6 +517,29 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         req = AbortReq(rid)
         self.engine_core_client.send_to_scheduler.send_pyobj(req)
 
+    # ---- RL weight-transfer admission gate ------------------------------
+    # Toggled by WeightTransferManager (pause/resume) to halt new generation
+    # while weights are updated. All of these must run on this object's loop.
+
+    def weight_transfer_admission_paused(self) -> bool:
+        return not self._wt_admit.is_set()
+
+    def weight_transfer_block_admission(self) -> None:
+        self._wt_admit.clear()
+
+    def weight_transfer_allow_admission(self) -> None:
+        self._wt_admit.set()
+
+    def weight_transfer_abort_inflight(self) -> None:
+        for rid in list(self.rid_to_state.keys()):
+            self.abort_request(rid)
+
+    async def weight_transfer_drain_inflight(self) -> None:
+        # Acquiring the writer lock blocks until every in-flight generation
+        # (each holds a reader lock for its full stream) has completed.
+        async with self.model_update_lock.writer_lock:
+            pass
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -643,6 +695,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
+        self._maybe_launch_weight_transfer_server(loop)
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
@@ -661,6 +714,39 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.watch_load_thread))
         )
+
+    def _maybe_launch_weight_transfer_server(self, loop):
+        """Launch the in-engine weight-transfer HTTP control plane on this loop.
+
+        Best-effort: comes up the first time AsyncLLM's loop is active and a
+        ``--weight-transfer-port`` was configured. Runs on AsyncLLM's loop so the
+        manager's loop-bound primitives (admission gate, scheduler communicators)
+        are toggled/awaited correctly. For guaranteed availability before the very
+        first request, an engine bootstrap may call this directly.
+        """
+        if self._wt_server_task is not None:
+            return
+        manager = self.weight_transfer_manager
+        port = getattr(self.server_args, "weight_transfer_port", None)
+        if manager is None or not port:
+            return
+        self._wt_server_task = loop.create_task(
+            self._serve_weight_transfer_control_plane(manager, port)
+        )
+
+    async def _serve_weight_transfer_control_plane(self, manager, port: int):
+        # A control-plane crash must not take down the engine, so this does not
+        # use print_exception_wrapper (which kills the process tree).
+        try:
+            from tokenspeed.runtime.entrypoints.weight_transfer_http import (
+                run_weight_transfer_server,
+            )
+
+            await run_weight_transfer_server(
+                manager, host=self.server_args.host, port=port
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("weight-transfer control plane stopped: %s", e)
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:

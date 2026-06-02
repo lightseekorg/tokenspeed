@@ -353,7 +353,7 @@ class Engine(EngineBase):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
-            dtypes=dtypes,
+            dtype_names=dtypes,
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,

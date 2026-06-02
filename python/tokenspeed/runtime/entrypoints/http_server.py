@@ -53,6 +53,10 @@ app = FastAPI()
 # Set by start() before uvicorn.run().
 _gateway_url: str = ""
 _engine_grpc_addr: str = ""
+# Base URL of the in-engine weight-transfer HTTP control plane (vLLM-compatible
+# RL weight sync). Empty when --enable-weight-transfer is off; the weight routes
+# then return 503 so the public surface still advertises the vLLM paths.
+_engine_http_url: str = ""
 _grpc_channel: grpc.aio.Channel | None = None
 _grpc_stub: pb_grpc.TokenSpeedSchedulerStub | None = None
 
@@ -138,8 +142,11 @@ async def abort(request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_request(request: Request) -> StreamingResponse | Response:
-    url = f"{_gateway_url.rstrip('/')}{request.url.path}"
+async def _proxy_request(
+    request: Request, base_url: str | None = None
+) -> StreamingResponse | Response:
+    base_url = base_url if base_url is not None else _gateway_url
+    url = f"{base_url.rstrip('/')}{request.url.path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
     body = await request.body()
@@ -241,6 +248,69 @@ async def stop_profile(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# RL weight transfer (vLLM-compatible) — proxied to the in-engine control plane
+#
+# These mirror vLLM's RLHF api_router so a trainer written against vLLM drives
+# tokenspeed unchanged. The heavy weight payloads travel out-of-band (NCCL /
+# CUDA-IPC); only metadata flows through here. The control plane runs inside the
+# engine process next to AsyncLLM (see runtime/entrypoints/weight_transfer_http.py);
+# the sidecar proxies to it on _engine_http_url.
+# ---------------------------------------------------------------------------
+
+
+async def _proxy_to_engine(request: Request) -> StreamingResponse | Response:
+    if not _engine_http_url:
+        return JSONResponse(
+            {
+                "error": "weight transfer is not enabled on this server; "
+                "start with --enable-weight-transfer"
+            },
+            status_code=503,
+        )
+    return await _proxy_request(request, base_url=_engine_http_url)
+
+
+@app.post("/init_weight_transfer_engine")
+async def init_weight_transfer_engine(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/start_weight_update")
+async def start_weight_update(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/update_weights")
+async def update_weights(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/finish_weight_update")
+async def finish_weight_update(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/pause")
+async def pause(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/resume")
+async def resume(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.get("/get_world_size")
+async def get_world_size(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.get("/is_paused")
+async def is_paused(request: Request):
+    return await _proxy_to_engine(request)
+
+
+# ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
@@ -249,6 +319,7 @@ def build_server(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
+    engine_http_url: str = "",
     host: str = "127.0.0.1",
     port: int = 8001,
 ) -> uvicorn.Server:
@@ -260,18 +331,24 @@ def build_server(
     Args:
         gateway_url: Base URL of the smg gateway for generation passthrough.
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
+        engine_http_url: Base URL of the in-engine weight-transfer control plane
+            (vLLM-compatible RL weight sync). Empty disables the weight routes
+            (they return 503).
         host: Bind address.
         port: Bind port.
     """
-    global _gateway_url, _engine_grpc_addr
+    global _gateway_url, _engine_grpc_addr, _engine_http_url
     _gateway_url = gateway_url
     _engine_grpc_addr = engine_grpc_addr
+    _engine_http_url = engine_http_url
     logger.info(
-        "Starting TokenSpeed HTTP server on %s:%d " "(gateway: %s, engine gRPC: %s)",
+        "Starting TokenSpeed HTTP server on %s:%d "
+        "(gateway: %s, engine gRPC: %s, weight transfer: %s)",
         host,
         port,
         gateway_url,
         engine_grpc_addr,
+        engine_http_url or "disabled",
     )
     return uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="warning")
@@ -282,6 +359,7 @@ def start(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
+    engine_http_url: str = "",
     host: str = "127.0.0.1",
     port: int = 8001,
 ) -> None:
@@ -289,6 +367,7 @@ def start(
     build_server(
         gateway_url=gateway_url,
         engine_grpc_addr=engine_grpc_addr,
+        engine_http_url=engine_http_url,
         host=host,
         port=port,
     ).run()
