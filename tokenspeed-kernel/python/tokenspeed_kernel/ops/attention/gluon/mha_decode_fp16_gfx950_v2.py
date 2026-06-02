@@ -40,6 +40,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
+cdiv = gl.cdiv
 
 
 # ===-----------------------------------------------------------------------===#
@@ -133,7 +134,7 @@ class AttentionConfig:
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
-        self.GROUP_BLOCKS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
+        self.GROUP_BLOCKS = gl.constexpr(cdiv(self.GROUP_SIZE, BLOCK_M))
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
@@ -233,9 +234,9 @@ class AttentionProgram:
         else:
             kv_start = cache_len - cache_len
         first_page = kv_start // cfg.PAGE_SIZE
-        end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+        end_page = cdiv(cache_len, cfg.PAGE_SIZE)
         num_pages = end_page - first_page
-        pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
+        pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
         split_start_page = first_page + split_id * pages_per_split
         split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
@@ -524,9 +525,7 @@ def _mha_decode_fp16(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
-    num_tiles = (
-        program.split_end - program.split_start + cfg.BLOCK_N - 1
-    ) // cfg.BLOCK_N
+    num_tiles = cdiv(program.split_end - program.split_start, cfg.BLOCK_N)
     pair_tiles = (num_tiles // 2) * 2
     pair_end = program.split_start + pair_tiles * cfg.BLOCK_N
 
@@ -767,9 +766,9 @@ def _mha_decode_reduce_fp16(
     else:
         kv_start = cache_len - cache_len
     first_page = kv_start // cfg.PAGE_SIZE
-    end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+    end_page = cdiv(cache_len, cfg.PAGE_SIZE)
     num_pages = end_page - first_page
-    pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
+    pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=cfg.reduce_layout)
     if HAS_SINK:
         m_i = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
@@ -833,7 +832,7 @@ def get_config(
     block_m = 16
     block_n = 64
     group_size = q.shape[1] // k_cache.shape[2]
-    group_blocks = (group_size + block_m - 1) // block_m
+    group_blocks = cdiv(group_size, block_m)
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     sm_scale = 1.0 / math.sqrt(head_dim)
