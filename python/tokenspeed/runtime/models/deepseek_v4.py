@@ -3559,11 +3559,13 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        swa_slot_mapping: torch.Tensor,
-        compressor_slot_cache: dict,
+        swa_slot_mapping: torch.Tensor | None = None,
+        compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+        if compressor_slot_cache is None:
+            compressor_slot_cache = {}
         profile_prefix = f"attn_{self.attention_kind}"
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != torch.float32:
@@ -3597,8 +3599,14 @@ class DeepseekV4Attention(nn.Module):
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
 
-        # swa_slot_mapping is computed once per step in DeepseekV4Model.forward
-        # (it is identical across all layers) and threaded in here.
+        # When swa_slot_mapping is provided (main model path), use it directly.
+        # When None (MTP draft path), fall back to out_cache_loc.
+        # TODO: MTP draft metadata has token_to_req_indices shaped per-request
+        # (not per-token), so _group_slot_mapping_from_raw cannot compute the
+        # correct paged SWA mapping here. out_cache_loc is not ideal when paged
+        # SWA groups are active; fix once MTP metadata packs per-token indices.
+        if swa_slot_mapping is None:
+            swa_slot_mapping = out_cache_loc
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -3838,8 +3846,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         input_ids: torch.Tensor,
-        swa_slot_mapping: torch.Tensor,
-        compressor_slot_cache: dict,
+        swa_slot_mapping: torch.Tensor | None = None,
+        compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         with nvtx_range("hc_attn_pre"):
