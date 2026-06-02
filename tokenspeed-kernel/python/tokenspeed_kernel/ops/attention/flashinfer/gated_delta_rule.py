@@ -17,10 +17,9 @@
 
 """FlashInfer Blackwell (sm100) gated delta net chunked prefill.
 
-Fast-path for GDN prefill, otherwise run with Triton FLA kernels in the runtime.
-NVIDIA sm100 + head_dim==128 only. The caller gates on ``is_supported`` and keeps
-its own Triton fallback; this module never falls back, so it has no dependency on
-the runtime FLA code.
+Fast-path for GDN prefill on sm100 + CUDA 13 + bf16 + head_dim==128. The caller
+gates on ``is_supported`` and must fail fast when the fast-path is unavailable;
+this module has no Triton fallback.
 
 Convention vs the Triton FLA path (verified equal to bf16 on B200):
 - q, k must be L2-normalized by the caller (the sm100 kernel ignores its own
@@ -70,7 +69,7 @@ def is_available() -> bool:
 def is_supported(
     head_dim: int, dtype: torch.dtype, num_q_heads: int, num_v_heads: int
 ) -> bool:
-    # bf16 is the verified path; fp16 falls back to Triton FLA.
+    # bf16 is the verified path; fp16 is rejected (caller fails fast).
     # flashinfer reads g/beta/state with max(num_q, num_v) heads; the runtime
     # supplies them with num_v heads, so num_v < num_q (e.g. Hk=32, Hv=16) reads
     # out of bounds. Only num_v >= num_q is safe (GVA or equal heads).
