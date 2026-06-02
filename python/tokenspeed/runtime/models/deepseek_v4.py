@@ -2690,6 +2690,25 @@ class DeepseekV4Compressor(nn.Module):
             self.ape.data.copy_(_deepseek_v4_reorder_c4_ape_2604(self.ape.data))
         self._ape_reordered = True
 
+    def compute_kv_score(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Pre-compute the input GEMM (fused_wkv_wgate @ hidden_states).
+
+        Can be launched on an aux stream in parallel with the main Q/KV
+        projection so that ``forward()`` only needs the lightweight state
+        update + cache write phase.
+        """
+        weight_shape = (
+            self.fused_wkv_wgate.output_size_per_partition,
+            self.fused_wkv_wgate.input_size,
+        )
+        weight = self.fused_wkv_wgate.weight.view(*weight_shape)
+        if weight.dtype == torch.float8_e4m3fn:
+            weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
+        kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
+        if kv_score is None:
+            kv_score = torch.matmul(hidden_states.float(), weight.float().T)
+        return kv_score
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2706,6 +2725,7 @@ class DeepseekV4Compressor(nn.Module):
         state_slot_mapping: torch.Tensor | None = None,
         write_compressed_cache: bool = True,
         compressor_slot_cache: dict | None = None,
+        kv_score: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
         metadata = _deepseek_v4_forward_metadata(ctx)
@@ -2716,19 +2736,20 @@ class DeepseekV4Compressor(nn.Module):
             if not write_compressed_cache
             else f"compressor_c{self.compress_ratio}"
         )
-        with nvtx_range(f"{profile_prefix}_dequant_weight"):
-            weight_shape = (
-                self.fused_wkv_wgate.output_size_per_partition,
-                self.fused_wkv_wgate.input_size,
-            )
-            weight = self.fused_wkv_wgate.weight.view(*weight_shape)
-            if weight.dtype == torch.float8_e4m3fn:
-                weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
-        with nvtx_range(f"{profile_prefix}_matmul"):
-            kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
-            if kv_score is None:
-                kv_score = torch.matmul(hidden_states.float(), weight.float().T)
-            kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
+        if kv_score is None:
+            with nvtx_range(f"{profile_prefix}_dequant_weight"):
+                weight_shape = (
+                    self.fused_wkv_wgate.output_size_per_partition,
+                    self.fused_wkv_wgate.input_size,
+                )
+                weight = self.fused_wkv_wgate.weight.view(*weight_shape)
+                if weight.dtype == torch.float8_e4m3fn:
+                    weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
+            with nvtx_range(f"{profile_prefix}_matmul"):
+                kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
+                if kv_score is None:
+                    kv_score = torch.matmul(hidden_states.float(), weight.float().T)
+        kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
         cache_metadata = metadata.cache
@@ -2762,26 +2783,27 @@ class DeepseekV4Compressor(nn.Module):
             )
             if state_hit is not None:
                 state_slot_mapping, state_block_table = state_hit
-            elif state_block_table is not None:
-                state_slot_mapping = _group_slot_mapping_from_raw(
-                    positions,
-                    metadata.token_to_req_indices[: positions.numel()],
-                    state_block_table,
-                    state_block_size,
-                    base_offsets=state_base_logical_page,
-                )
             else:
-                state_block_table = cache_metadata.block_table
-                state_slot_mapping = out_cache_loc
-            state_slot_mapping = _mask_invalid_graph_tokens(
-                state_slot_mapping,
-                valid_token,
-            )
-            if memo is not None and state_hit is None:
-                memo[("state", self.compress_ratio)] = (
+                if state_block_table is not None:
+                    state_slot_mapping = _group_slot_mapping_from_raw(
+                        positions,
+                        metadata.token_to_req_indices[: positions.numel()],
+                        state_block_table,
+                        state_block_size,
+                        base_offsets=state_base_logical_page,
+                    )
+                else:
+                    state_block_table = cache_metadata.block_table
+                    state_slot_mapping = out_cache_loc
+                state_slot_mapping = _mask_invalid_graph_tokens(
                     state_slot_mapping,
-                    state_block_table,
+                    valid_token,
                 )
+                if memo is not None:
+                    memo[("state", self.compress_ratio)] = (
+                        state_slot_mapping,
+                        state_block_table,
+                    )
         with nvtx_range(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
                 kv=kv,
@@ -3158,6 +3180,7 @@ class DeepseekV4Indexer(nn.Module):
         layer_index: int,
         cos_sin_cache: torch.Tensor,
         compressor_slot_cache: dict,
+        indexer_compressor_kv_score: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pool = ctx.token_to_kv_pool
         metadata = _deepseek_v4_forward_metadata(ctx)
@@ -3228,6 +3251,7 @@ class DeepseekV4Indexer(nn.Module):
                 state_base_logical_page=indexer_state_base_logical_page,
                 state_slot_mapping=indexer_state_slot_mapping,
                 write_compressed_cache=False,
+                kv_score=indexer_compressor_kv_score,
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
@@ -3541,8 +3565,6 @@ class DeepseekV4Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         profile_prefix = f"attn_{self.attention_kind}"
-        with nvtx_range(f"{profile_prefix}_project_q_kv"):
-            q, kv, qr = self._project_q_kv(hidden_states)
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != torch.float32:
             cos_sin_cache = cos_sin_cache.float()
@@ -3550,6 +3572,31 @@ class DeepseekV4Attention(nn.Module):
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+
+        # --- Phase 1: pre-compute input GEMMs in parallel ---
+        # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
+        # After this phase, each compressor's forward() receives its
+        # pre-computed kv_score and skips the internal GEMM, removing the
+        # shared-weight dependency that prevents safe multi-stream overlap.
+        compressor_kv_score: torch.Tensor | None = None
+        indexer_compressor_kv_score: torch.Tensor | None = None
+        with self.stream_fork.scope(
+            enable=self.stream_fork.aux_stream is not None
+        ) as fork:
+            with nvtx_range(f"{profile_prefix}_project_q_kv"):
+                q, kv, qr = self._project_q_kv(hidden_states)
+            with fork.branch():
+                if self.compressor is not None:
+                    with nvtx_range(f"{profile_prefix}_compressor_gemm"):
+                        compressor_kv_score = self.compressor.compute_kv_score(
+                            hidden_states
+                        )
+                if self.indexer is not None:
+                    with nvtx_range(f"{profile_prefix}_indexer_compressor_gemm"):
+                        indexer_compressor_kv_score = (
+                            self.indexer.compressor.compute_kv_score(hidden_states)
+                        )
+
         # swa_slot_mapping is computed once per step in DeepseekV4Model.forward
         # (it is identical across all layers) and threaded in here.
 
@@ -3583,8 +3630,12 @@ class DeepseekV4Attention(nn.Module):
                     layer_index=self.cache_layer_index,
                     cos_sin_cache=cos_sin_cache,
                     compressor_slot_cache=compressor_slot_cache,
+                    kv_score=compressor_kv_score,
                 )
 
+        # --- Phase 2: state-update + cache-write overlap ---
+        # With GEMMs already done, the remaining work per stream is lightweight
+        # state updates and paged cache writes — safe to overlap.
         topk_indices = None
         if self.indexer is not None:
             assert self.compressor is not None
@@ -3611,16 +3662,10 @@ class DeepseekV4Attention(nn.Module):
                         layer_index=self.cache_layer_index,
                         cos_sin_cache=cos_sin_cache,
                         compressor_slot_cache=compressor_slot_cache,
+                        indexer_compressor_kv_score=indexer_compressor_kv_score,
                     )
                 with fork.branch():
                     insert_swa_cache()
-                # Run the attention compressor on the MAIN stream. The indexer
-                # (above, main stream) internally runs its own compressor; a
-                # second compressor concurrently on the aux stream races over
-                # shared state and intermittently faults with an illegal memory
-                # access (surfaces async in _group_slot_mapping_from_raw). Only
-                # insert_swa stays on the aux branch -- that overlap is safe and
-                # is preserved. Mirrors the elif structure below.
                 run_compressor()
         elif self.compressor is not None:
             with self.stream_fork.scope(
