@@ -18,20 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""vLLM-compatible weight-transfer lifecycle manager.
+"""Weight-transfer lifecycle manager for RL online weight sync.
 
 ``WeightTransferManager`` is the control-plane state machine that the HTTP
-handlers in ``runtime/entrypoints/weight_transfer_http.py`` call into. It mirrors
-vLLM's ``EngineClient`` weight methods
-(``init_weight_transfer_engine`` / ``start_weight_update`` / ``update_weights`` /
-``finish_weight_update`` / ``pause_generation`` / ``resume_generation`` /
-``is_paused``) so a trainer written against vLLM drives tokenspeed unchanged.
+handlers in ``runtime/entrypoints/weight_transfer_http.py`` call into. It
+implements the weight-update lifecycle that RL trainers drive over HTTP
+(init / start / update / finish / pause / resume / is_paused).
 
 It does NOT move tensors itself: heavy payloads travel out-of-band over NCCL
 broadcast / CUDA-IPC. The manager parses the backend-specific ``init_info`` /
-``update_info`` metadata (byte-compatible with vLLM's ``NCCL*``/``IPC*``
-dataclasses), enforces lifecycle ordering, and delegates the actual transfer to
-``AsyncLLM``'s existing scheduler-control methods.
+``update_info`` metadata, enforces lifecycle ordering, and delegates the actual
+transfer to ``AsyncLLM``'s existing scheduler-control methods.
 """
 
 from __future__ import annotations
@@ -56,7 +53,7 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-# Pause modes, byte-compatible with vLLM's ``PauseMode`` literal.
+# Pause modes accepted by ``/pause``.
 PAUSE_MODES = ("abort", "wait", "keep")
 
 
@@ -69,7 +66,7 @@ class WeightTransferStateError(RuntimeError):
 
 
 class WeightTransferManager:
-    """Lifecycle state machine for vLLM-compatible RL weight transfer."""
+    """Lifecycle state machine for RL weight transfer."""
 
     def __init__(
         self,
@@ -104,9 +101,8 @@ class WeightTransferManager:
 
         Args:
             include_dp: If True (default), return the total world size across
-                data-parallel replicas (TP*CP*DP) -- vLLM's
-                ``world_size_across_dp``. If False, return a single replica's
-                world size (TP*CP) -- vLLM's ``world_size``.
+                data-parallel replicas (TP*CP*DP). If False, return a single
+                replica's world size (TP*CP).
         """
         mapping = self._async_llm.server_args.mapping
         return mapping.world_size_across_dp if include_dp else mapping.world_size_per_dp
@@ -172,7 +168,7 @@ class WeightTransferManager:
             self._parse_ipc_update(update_info)
             # The CUDA-IPC receive path (rebuild_cuda_tensor + load_weights on the
             # colocated worker) is not yet wired through the scheduler. The
-            # metadata is fully parsed/validated above for vLLM parity.
+            # metadata is fully parsed/validated above.
             raise NotImplementedError(
                 "IPC weight receive is not yet implemented on the worker side; "
                 "use backend='nccl' for now."
@@ -185,9 +181,9 @@ class WeightTransferManager:
                 "No active weight update to finish; call /start_weight_update first."
             )
         self._update_active = False
-        # vLLM additionally runs a worker-side layerwise-reload finalize when
-        # is_checkpoint_format is set; that lives on the (deferred) worker path.
-        # Cache invalidation is handled by the update step's flush_cache.
+        # A worker-side layerwise-reload finalize (when is_checkpoint_format is
+        # set) lives on the (deferred) worker path. Cache invalidation is handled
+        # by the update step's flush_cache.
         logger.info("Weight update finished")
 
     # ------------------------------------------------------------------ #
@@ -202,7 +198,7 @@ class WeightTransferManager:
                 ``"wait"`` drains in-flight requests then blocks new ones;
                 ``"keep"`` blocks new requests but preserves in-flight state.
             clear_cache: Flush KV/prefix cache after draining. Ignored for
-                ``mode="keep"`` (parity with vLLM).
+                ``mode="keep"``.
         """
         if mode not in PAUSE_MODES:
             raise ValueError(
@@ -232,7 +228,7 @@ class WeightTransferManager:
         logger.info("Generation resumed")
 
     # ------------------------------------------------------------------ #
-    # Backend-specific parsing (byte-compatible with vLLM dataclasses)
+    # Backend-specific parsing
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -305,7 +301,7 @@ class WeightTransferManager:
         )
 
     def _parse_ipc_init(self, init_info: dict[str, Any]) -> None:
-        # vLLM's IPCWeightTransferInitInfo has no fields.
+        # IPC needs no init payload.
         self._require_keys(init_info, (), (), "IPC init_info")
 
     def _parse_ipc_update(self, update_info: dict[str, Any]) -> dict[str, Any]:
@@ -336,8 +332,8 @@ class WeightTransferManager:
                 "Either `ipc_handles` or `ipc_handles_pickled` must be provided"
             )
         if has_pickled and not envs.TOKENSPEED_ALLOW_INSECURE_SERIALIZATION.get():
-            # Parity with vLLM's VLLM_ALLOW_INSECURE_SERIALIZATION gate: the
-            # payload is unpickled, which is RCE-adjacent.
+            # The payload is unpickled, which is RCE-adjacent, so require an
+            # explicit opt-in.
             raise ValueError(
                 "Refusing to deserialize `ipc_handles_pickled` without "
                 "TOKENSPEED_ALLOW_INSECURE_SERIALIZATION=1"

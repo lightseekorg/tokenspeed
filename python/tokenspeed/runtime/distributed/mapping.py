@@ -371,10 +371,10 @@ class Mapping(MappingBase):
     def world_size_across_dp(self) -> int:
         """Total inference world size across every DP replica.
 
-        vLLM parity: matches ``ParallelConfig.world_size_across_dp``. tokenspeed's
-        ``world_size`` already counts every GPU (TP*CP*DP), so this is an explicit
-        alias used by ``get_world_size(include_dp=True)`` to compute the NCCL
-        weight-update world size (``trainer_ranks + inference_workers``).
+        tokenspeed's ``world_size`` already counts every GPU (TP*CP*DP), so this
+        is an explicit alias used by ``get_world_size(include_dp=True)`` to
+        compute the NCCL weight-update world size
+        (``trainer_ranks + inference_workers``).
         """
         return self.world_size
 
@@ -382,7 +382,6 @@ class Mapping(MappingBase):
     def world_size_per_dp(self) -> int:
         """Inference world size of a single DP replica (TP*CP, excludes DP).
 
-        vLLM parity: matches ``ParallelConfig.world_size`` (which is per-replica).
         Used by ``get_world_size(include_dp=False)``. Equals ``world_size`` when
         ``attn.dp_size == 1`` (the supported weight-sync configuration today).
         """

@@ -133,8 +133,8 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
-    # RL weight transfer (vLLM-compatible online weight sync). Off by default;
-    # see runtime/engine/weight_transfer/ and runtime/entrypoints/weight_transfer_http.py.
+    # RL online weight sync. Off by default; see runtime/engine/weight_transfer/
+    # and runtime/entrypoints/weight_transfer_http.py.
     enable_weight_transfer: bool = False
     weight_transfer_config: str | None = None
     # Port for the in-engine weight-transfer HTTP control plane. Set by the
@@ -1805,22 +1805,21 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
-        # RL weight transfer (vLLM-compatible online weight sync).
+        # RL online weight sync.
         parser.add_argument(
             "--enable-weight-transfer",
             action="store_true",
             default=ServerArgs.enable_weight_transfer,
-            help="Enable the vLLM-compatible weight-transfer HTTP control plane "
-            "for RL online serving (init/start/update/finish/pause/resume). Off "
-            "by default; also enabled via TOKENSPEED_SERVER_DEV_MODE=1.",
+            help="Enable the weight-transfer HTTP control plane for RL online "
+            "serving (init/start/update/finish/pause/resume). Off by default; "
+            "also enabled via TOKENSPEED_SERVER_DEV_MODE=1.",
         )
         parser.add_argument(
             "--weight-transfer-config",
             type=str,
             default=ServerArgs.weight_transfer_config,
             help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
-            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated). "
-            "vLLM parity with --weight-transfer-config.",
+            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
         )
         parser.add_argument(
             "--weight-transfer-port",
@@ -1874,10 +1873,10 @@ class ServerArgs:
 
     @property
     def weight_transfer_enabled(self) -> bool:
-        """Whether the vLLM-compatible weight-transfer control plane is on.
+        """Whether the weight-transfer control plane is on.
 
-        Enabled by ``--enable-weight-transfer`` or, for vLLM parity, the
-        ``TOKENSPEED_SERVER_DEV_MODE=1`` env (mirrors ``VLLM_SERVER_DEV_MODE``).
+        Enabled by ``--enable-weight-transfer`` or the
+        ``TOKENSPEED_SERVER_DEV_MODE=1`` env.
         """
         from tokenspeed.runtime.utils.env import envs
 

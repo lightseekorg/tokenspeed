@@ -18,14 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""vLLM-compatible RL weight-transfer control plane.
+"""RL online weight-transfer control plane.
 
-This package implements the HTTP weight-transfer surface that vLLM exposes
-under ``vllm/entrypoints/serve/rlhf/api_router.py`` so the same RL trainer
-code (verl / slime / AReaL / miles) can drive tokenspeed unchanged.
+Implements the HTTP weight-transfer API that RL trainers (verl / slime / AReaL /
+miles) drive to update model weights in place during online serving.
 
 Modules:
-    config:   ``WeightTransferConfig`` (vLLM parity).
+    config:   ``WeightTransferConfig``.
     manager:  ``WeightTransferManager`` lifecycle state machine that the HTTP
               handlers call into; delegates weight movement to ``AsyncLLM``.
 """

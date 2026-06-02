@@ -188,8 +188,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.model_update_result: Awaitable[UpdateWeightFromDiskReqOutput] | None = None
         self.asyncio_tasks = set()
 
-        # RL weight-transfer admission gate (vLLM-compatible pause/resume). Set
-        # means new requests may be admitted; WeightTransferManager.pause()
+        # RL weight-transfer admission gate (pause/resume). Set means new
+        # requests may be admitted; WeightTransferManager.pause()
         # clears it and resume() sets it. Generation awaits it at intake so a
         # pause halts new work; when not paused the hot-path cost is one
         # ``is_set()`` check. Must be toggled on this object's event loop.
@@ -257,8 +257,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         self.init_communicators(server_args)
 
-        # RL weight-transfer control plane (vLLM-compatible). Created only when
-        # enabled; the weight-transfer HTTP app reaches it via this attribute.
+        # RL weight-transfer control plane. Created only when enabled; the
+        # weight-transfer HTTP app reaches it via this attribute.
         if server_args.weight_transfer_enabled:
             from tokenspeed.runtime.engine.weight_transfer.manager import (
                 WeightTransferManager,
@@ -280,8 +280,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         self.auto_create_handle_loop()
 
-        # RL weight-transfer pause gate: block new admission while paused
-        # (vLLM-compatible /pause). No-op cost when not paused.
+        # RL weight-transfer pause gate: block new admission while paused.
+        # No-op cost when not paused.
         if not self._wt_admit.is_set():
             await self._wt_admit.wait()
 

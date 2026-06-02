@@ -20,8 +20,8 @@
 
 """RL weight sync over CUDA-IPC (colocated trainer + inference, shared GPUs).
 
-Trainer-side client for the vLLM-compatible weight-transfer API. The HTTP
-surface byte-matches vLLM, so this same client drives a vLLM server too.
+Trainer-side client for the weight-transfer API (CUDA-IPC backend). The HTTP
+surface follows the contract common RL trainers speak.
 
 Run a TokenSpeed server with the IPC backend:
 
@@ -36,7 +36,7 @@ group, no init step (IPC ``init_info`` is a no-op).
 
 NOTE: deserializing ``ipc_handles_pickled`` requires
 ``TOKENSPEED_ALLOW_INSECURE_SERIALIZATION=1`` on the server (it unpickles the
-payload), matching vLLM's ``VLLM_ALLOW_INSECURE_SERIALIZATION`` gate.
+payload).
 """
 
 import argparse

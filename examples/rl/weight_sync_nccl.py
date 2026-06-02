@@ -20,9 +20,9 @@
 
 """RL weight sync over NCCL (disaggregated trainer + inference).
 
-This is the **trainer-side client** for TokenSpeed's vLLM-compatible weight
-transfer API. Because the HTTP surface byte-matches vLLM, the exact same client
-drives a vLLM server -- only the base URL changes.
+This is the **trainer-side client** for TokenSpeed's weight-transfer API. The
+HTTP surface follows the contract common RL trainers speak, so the same client
+targets any server that implements it -- only the base URL changes.
 
 Run a TokenSpeed server with the control plane enabled:
 
@@ -44,7 +44,7 @@ import requests
 
 
 class WeightSyncClient:
-    """Minimal client for the vLLM-compatible weight-transfer endpoints."""
+    """Minimal client for the weight-transfer endpoints."""
 
     def __init__(self, url: str, timeout: float = 300.0):
         self.base = url.rstrip("/")

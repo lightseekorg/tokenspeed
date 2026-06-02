@@ -1,14 +1,12 @@
 # RL weight sync examples
 
-Trainer-side client snippets for TokenSpeed's vLLM-compatible weight-transfer
-API. See [docs/serving/weight-transfer.md](../../docs/serving/weight-transfer.md)
-for the full endpoint reference and lifecycle.
+Trainer-side client snippets for TokenSpeed's weight-transfer API. See
+[docs/serving/weight-transfer.md](../../docs/serving/weight-transfer.md) for the
+full endpoint reference and lifecycle.
 
-Because the HTTP surface byte-matches vLLM's
-`vllm/entrypoints/serve/rlhf/api_router.py`, these same clients drive a vLLM
-server unchanged — only the `--url` differs. That is the drop-in compatibility
-goal: a trainer written against vLLM (verl / slime / AReaL / miles) targets
-TokenSpeed without a code change.
+The HTTP surface follows the weight-transfer contract that common RL training
+frameworks already speak, so an existing trainer (verl / slime / AReaL / miles)
+targets TokenSpeed without a code change — only the `--url` differs.
 
 | File | Backend | Topology |
 |---|---|---|

@@ -684,9 +684,8 @@ class UpdateWeightFromDiskReqOutput:
     num_paused_requests: int | None = 0
 
 
-# vLLM packed-tensor framing defaults (parity with
-# vllm.distributed.weight_transfer.packed_tensor). Producer and consumer must
-# agree on these, so they are part of the wire contract.
+# Packed-tensor framing defaults. The trainer (producer) and the worker
+# (consumer) must agree on these, so they are part of the wire contract.
 DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
 DEFAULT_PACKED_NUM_BUFFERS = 2
 
@@ -719,8 +718,7 @@ class FinishWeightUpdateReqOutput:
 
 @dataclass
 class UpdateWeightsFromDistributedReqInput:
-    # vLLM-compatible fields (parity with
-    # vllm.distributed.weight_transfer.nccl_engine.NCCLWeightTransferUpdateInfo).
+    # Weight-update metadata shared with the trainer's NCCL sender.
     names: list[str]
     dtype_names: list[str]
     shapes: list[list[int]]

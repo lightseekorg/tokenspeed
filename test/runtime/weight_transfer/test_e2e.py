@@ -2,7 +2,7 @@
 
 These drive the *real* WeightTransferManager through the *real* FastAPI app over
 a *real* socket (uvicorn in a background thread), with an HTTP client. They
-exercise the full lifecycle, the vLLM-compatible JSON, and -- most importantly --
+exercise the full lifecycle, the response JSON, and -- most importantly --
 the pause/resume admission gate actually blocking a concurrent generation on the
 same event loop (the headline RL-safety behavior).
 

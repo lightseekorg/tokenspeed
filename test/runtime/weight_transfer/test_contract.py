@@ -1,13 +1,10 @@
-"""Phase 0: vLLM HTTP compatibility contract.
+"""Phase 0: RL weight-transfer HTTP contract.
 
-This file is the source of truth for "make sure vLLM compatibility". It encodes
-the exact surface from vLLM's ``vllm/entrypoints/serve/rlhf/api_router.py`` --
-paths, methods, request/response JSON, defaults, and status strings -- and
-asserts the tokenspeed app matches byte-for-byte. If vLLM changes its surface,
-update CONTRACT here and the implementation together.
+This file is the source of truth for the weight-transfer HTTP surface. It encodes
+the exact contract -- paths, methods, request/response JSON, defaults, and status
+strings -- and asserts the tokenspeed app matches it. Update CONTRACT here and the
+implementation together whenever the surface changes.
 """
-
-import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,7 +15,7 @@ from tokenspeed.runtime.entrypoints.weight_transfer_http import (
 )
 
 # --------------------------------------------------------------------------- #
-# The contract (mirrors vLLM api_router.py + weight_transfer dataclasses).
+# The contract: paths, methods, JSON, defaults, status strings.
 # --------------------------------------------------------------------------- #
 
 CONTRACT_ROUTES = {
@@ -110,7 +107,7 @@ def test_start_weight_update_default_is_checkpoint_format(client, manager):
     r = client.post("/start_weight_update", json={})
     assert r.status_code == 200
     assert r.json() == {"message": "Weight update started"}
-    # vLLM default: is_checkpoint_format=True
+    # Default: is_checkpoint_format=True
     assert manager.calls == [("start_update", True)]
 
 
@@ -138,7 +135,7 @@ def test_pause_defaults(client, manager):
     r = client.post("/pause")
     assert r.status_code == 200
     assert r.json() == {"status": "paused"}
-    # vLLM defaults: mode="abort", clear_cache=True
+    # Defaults: mode="abort", clear_cache=True
     assert manager.calls == [("pause", "abort", True)]
 
 
@@ -237,19 +234,3 @@ def test_update_error_mapping(exc, code):
     r = client.post("/update_weights", json={"update_info": {}})
     assert r.status_code == code
     assert "error" in r.json()
-
-
-# --------------------------------------------------------------------------- #
-# Optional: live diff against the installed vLLM router, if importable.
-# --------------------------------------------------------------------------- #
-
-
-def test_parity_with_installed_vllm_if_available():
-    vllm_router = pytest.importorskip("vllm.entrypoints.serve.rlhf.api_router").router
-    vllm_routes = set()
-    for route in vllm_router.routes:
-        for method in getattr(route, "methods", set()):
-            if method in ("GET", "POST"):
-                vllm_routes.add((route.path, method))
-    # Every vLLM weight-transfer route must exist in tokenspeed with same method.
-    assert vllm_routes <= CONTRACT_ROUTES

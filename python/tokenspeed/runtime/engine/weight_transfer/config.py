@@ -18,11 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Weight-transfer configuration (vLLM parity).
-
-Mirrors ``vllm.config.weight_transfer.WeightTransferConfig`` so a trainer
-written against vLLM can target tokenspeed unchanged.
-"""
+"""Weight-transfer configuration for RL online weight sync."""
 
 from __future__ import annotations
 
@@ -30,10 +26,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-# The backends tokenspeed implements. vLLM types the field as
-# ``Literal["nccl", "ipc"] | str`` and validates against its engine registry;
-# we validate up front against the backends we actually support so misuse
-# fails fast with a clear message instead of deep in the worker.
+# The backends tokenspeed implements. Validated up front so misuse fails fast
+# with a clear message instead of deep in the worker.
 SUPPORTED_BACKENDS: tuple[str, ...] = ("nccl", "ipc")
 
 WeightTransferBackend = Literal["nccl", "ipc"]
@@ -41,7 +35,7 @@ WeightTransferBackend = Literal["nccl", "ipc"]
 
 @dataclass
 class WeightTransferConfig:
-    """Configuration for vLLM-compatible RL weight transfer.
+    """Configuration for RL weight transfer.
 
     Attributes:
         backend: Transport used to move weights out-of-band from the trainer
@@ -63,8 +57,7 @@ class WeightTransferConfig:
     def from_json(cls, raw: str | None) -> "WeightTransferConfig":
         """Parse a ``--weight-transfer-config`` JSON string into a config.
 
-        ``None`` / empty string yields the default (``backend="nccl"``), which
-        matches vLLM's default when the flag is omitted.
+        ``None`` / empty string yields the default (``backend="nccl"``).
         """
         if not raw:
             return cls()

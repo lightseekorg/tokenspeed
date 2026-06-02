@@ -1,11 +1,10 @@
 # Weight Transfer (RL online weight sync)
 
-TokenSpeed exposes a **vLLM-compatible** HTTP control plane for updating model
-weights in place during online serving. The endpoint paths, methods, and
-request/response JSON byte-match vLLM's
-[`weight_transfer` API](https://docs.vllm.ai/en/latest/training/weight_transfer/),
-so the same RL trainer code (verl / slime / AReaL / miles) that drives vLLM can
-drive TokenSpeed **unchanged**.
+TokenSpeed exposes an HTTP control plane for updating model weights in place
+during online serving. The endpoint paths, methods, and request/response JSON
+follow the weight-transfer HTTP contract that common RL training frameworks
+(verl / slime / AReaL / miles) already speak, so existing trainer code drives
+TokenSpeed **unchanged**.
 
 The heavy weight payloads travel **out-of-band** (NCCL broadcast or CUDA-IPC);
 the HTTP path only carries metadata (parameter names, shapes, dtypes, handles).
@@ -13,7 +12,7 @@ the HTTP path only carries metadata (parameter names, shapes, dtypes, handles).
 ## Enabling
 
 The control plane is **off by default**. Enable it with the server flag (or the
-`TOKENSPEED_SERVER_DEV_MODE=1` env, mirroring vLLM's `VLLM_SERVER_DEV_MODE`):
+`TOKENSPEED_SERVER_DEV_MODE=1` env):
 
 ```bash
 tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
@@ -57,8 +56,7 @@ sidecar proxies them to the in-engine control plane).
   tensor_sizes, packed}`
 
 Sending `ipc_handles_pickled` (base64 of a Python pickle) requires
-`TOKENSPEED_ALLOW_INSECURE_SERIALIZATION=1` (parity with vLLM's
-`VLLM_ALLOW_INSECURE_SERIALIZATION`), because the payload is unpickled.
+`TOKENSPEED_ALLOW_INSECURE_SERIALIZATION=1`, because the payload is unpickled.
 
 ## Lifecycle
 

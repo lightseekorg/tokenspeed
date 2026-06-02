@@ -53,9 +53,9 @@ app = FastAPI()
 # Set by start() before uvicorn.run().
 _gateway_url: str = ""
 _engine_grpc_addr: str = ""
-# Base URL of the in-engine weight-transfer HTTP control plane (vLLM-compatible
-# RL weight sync). Empty when --enable-weight-transfer is off; the weight routes
-# then return 503 so the public surface still advertises the vLLM paths.
+# Base URL of the in-engine weight-transfer HTTP control plane (RL weight sync).
+# Empty when --enable-weight-transfer is off; the weight routes then return 503
+# so the public surface still advertises the paths.
 _engine_http_url: str = ""
 _grpc_channel: grpc.aio.Channel | None = None
 _grpc_stub: pb_grpc.TokenSpeedSchedulerStub | None = None
@@ -248,13 +248,13 @@ async def stop_profile(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# RL weight transfer (vLLM-compatible) — proxied to the in-engine control plane
+# RL weight transfer — proxied to the in-engine control plane
 #
-# These mirror vLLM's RLHF api_router so a trainer written against vLLM drives
-# tokenspeed unchanged. The heavy weight payloads travel out-of-band (NCCL /
-# CUDA-IPC); only metadata flows through here. The control plane runs inside the
-# engine process next to AsyncLLM (see runtime/entrypoints/weight_transfer_http.py);
-# the sidecar proxies to it on _engine_http_url.
+# The weight-update HTTP API that RL trainers drive. The heavy weight payloads
+# travel out-of-band (NCCL / CUDA-IPC); only metadata flows through here. The
+# control plane runs inside the engine process next to AsyncLLM (see
+# runtime/entrypoints/weight_transfer_http.py); the sidecar proxies to it on
+# _engine_http_url.
 # ---------------------------------------------------------------------------
 
 
@@ -332,8 +332,7 @@ def build_server(
         gateway_url: Base URL of the smg gateway for generation passthrough.
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
         engine_http_url: Base URL of the in-engine weight-transfer control plane
-            (vLLM-compatible RL weight sync). Empty disables the weight routes
-            (they return 503).
+            (RL weight sync). Empty disables the weight routes (they return 503).
         host: Bind address.
         port: Bind port.
     """

@@ -18,15 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""vLLM-compatible weight-transfer HTTP control plane.
+"""Weight-transfer HTTP control plane for RL online weight sync.
 
-Byte-compatible with vLLM's ``vllm/entrypoints/serve/rlhf/api_router.py`` so the
-same RL trainer code (verl / slime / AReaL / miles) can drive tokenspeed
-unchanged -- same paths, methods, request/response JSON, and call lifecycle.
+Implements the weight-transfer HTTP API that RL trainers (verl / slime / AReaL /
+miles) drive -- the endpoint paths, methods, request/response JSON, and call
+lifecycle match the contract those trainers expect, so they run unchanged.
 
-The handlers are thin: they parse the vLLM-shaped request, call into a
+The handlers are thin: they parse the request, call into a
 ``WeightTransferManager`` (``runtime/engine/weight_transfer/manager.py``), and
-return the exact vLLM status payloads. Heavy weight payloads travel out-of-band
+return the status payloads. Heavy weight payloads travel out-of-band
 (NCCL broadcast / CUDA-IPC); only metadata flows through here.
 
 Deployment note: this app must run on the same asyncio event loop as the
@@ -76,7 +76,7 @@ def _manager(request: Request) -> "WeightTransferManager":
 
 
 async def _read_json(request: Request) -> dict[str, Any]:
-    """Parse a JSON object body, 400 on invalid JSON (vLLM parity)."""
+    """Parse a JSON object body, 400 on invalid JSON."""
     try:
         body = await request.json()
     except json.JSONDecodeError as e:
@@ -89,7 +89,7 @@ async def _read_json(request: Request) -> dict[str, Any]:
 
 
 async def _run(action: Awaitable[Any], success_content: dict[str, Any]) -> JSONResponse:
-    """Await a manager action and map exceptions to vLLM-compatible status codes.
+    """Await a manager action and map exceptions to HTTP status codes.
 
     - ``WeightTransferStateError`` (lifecycle misuse) -> 409 Conflict
     - ``NotImplementedError`` (backend path not wired) -> 501 Not Implemented
@@ -106,7 +106,7 @@ async def _run(action: Awaitable[Any], success_content: dict[str, Any]) -> JSONR
         )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=HTTPStatus.BAD_REQUEST.value)
-    except Exception as e:  # noqa: BLE001 - defensive, mirrors vLLM
+    except Exception as e:  # noqa: BLE001 - defensive
         logger.exception("Weight transfer action failed")
         return JSONResponse(
             {"error": f"Weight transfer action failed: {e}"},
@@ -184,12 +184,12 @@ async def pause_generation(
 
     Args:
         mode: ``"abort"`` (default), ``"wait"``, or ``"keep"``.
-        wait_for_inflight_requests: DEPRECATED (vLLM parity). When True, treated
-            as ``mode="wait"``.
+        wait_for_inflight_requests: DEPRECATED. When True, treated as
+            ``mode="wait"``.
         clear_cache: Flush KV/prefix cache after draining. Ignored for
             ``mode="keep"``.
     """
-    # vLLM's deprecated knob: honor it as mode="wait" so older trainers work.
+    # Deprecated knob: honor it as mode="wait" so older trainers work.
     if wait_for_inflight_requests:
         mode = "wait"
     if mode not in PAUSE_MODES:
@@ -216,7 +216,7 @@ async def is_paused(raw_request: Request) -> JSONResponse:
         paused = _manager(raw_request).is_paused()
     except HTTPException:
         raise
-    except Exception as e:  # noqa: BLE001 - defensive, mirrors vLLM
+    except Exception as e:  # noqa: BLE001 - defensive
         logger.exception("Failed to fetch pause status")
         return JSONResponse(
             {"error": f"Failed to fetch pause status: {e}"},
@@ -233,8 +233,7 @@ async def get_world_size(
     """Get the inference world size used to size the NCCL group.
 
     Args:
-        include_dp: If True (default), TP*CP*DP (vLLM ``world_size_across_dp``);
-            if False, TP*CP (vLLM ``world_size``).
+        include_dp: If True (default), TP*CP*DP; if False, TP*CP.
     """
     world_size = _manager(raw_request).get_world_size(include_dp=include_dp)
     return JSONResponse(content={"world_size": world_size})
@@ -249,7 +248,7 @@ def build_weight_transfer_app(manager: "WeightTransferManager") -> FastAPI:
     """Return a FastAPI app exposing the weight-transfer endpoints.
 
     The app holds the manager on ``app.state.weight_transfer_manager``; handlers
-    fetch it per request (mirrors vLLM's ``request.app.state.engine_client``).
+    fetch it per request from ``app.state``.
     """
     app = FastAPI(title="tokenspeed weight transfer")
     app.state.weight_transfer_manager = manager
