@@ -559,8 +559,8 @@ def _mha_decode_fp16(
         k = program.shared_load_k(k_smem, 1)
         program.issue_load_v(physical_page1, v_smem, 1)
 
-        # main loop from iter 0 to iter end-3
-        for i in range(0, num_tiles - 2):
+        # main loop from iter 0 to iter end-4; iter end-3 is peeled below.
+        for i in range(0, num_tiles - 3):
             a = i % 2
             b = 1 - a
             start_i = program.split_start + i * cfg.BLOCK_N
@@ -574,9 +574,8 @@ def _mha_decode_fp16(
 
             async_copy.wait_group(2)
             v = program.shared_load_v(v_smem, a)
-            if start_i3 < program.split_end:
-                physical_page3 = program.load_page(start_i3)
-                program.issue_load_k(physical_page3, k_smem, b)
+            physical_page3 = program.load_page(start_i3)
+            program.issue_load_k(physical_page3, k_smem, b)
 
             acc = program.compute_pv(p, v, acc)
             p, alpha, m_i = program.softmax_part0(qk, m_i)
@@ -585,6 +584,27 @@ def _mha_decode_fp16(
             k = program.shared_load_k(k_smem, a)
             physical_page2 = program.load_page(start_i2)
             program.issue_load_v(physical_page2, v_smem, a)
+
+        i = num_tiles - 3
+        a = i % 2
+        start_i = program.split_start + i * cfg.BLOCK_N
+        start_i1 = start_i + cfg.BLOCK_N
+        start_i2 = start_i1 + cfg.BLOCK_N
+
+        qk = program.compute_qk(q, k)
+        qk = program.apply_kv_mask(qk, start_i1)
+        p, l_i, acc = program.softmax_part1(p, alpha, l_i, acc)
+
+        async_copy.wait_group(2)
+        v = program.shared_load_v(v_smem, a)
+
+        acc = program.compute_pv(p, v, acc)
+        p, alpha, m_i = program.softmax_part0(qk, m_i)
+
+        async_copy.wait_group(1)
+        k = program.shared_load_k(k_smem, a)
+        physical_page2 = program.load_page(start_i2)
+        program.issue_load_v(physical_page2, v_smem, a)
 
         # pipeline epilogue, iter end-2
         start_end2 = program.split_end - cfg.BLOCK_N * 2
