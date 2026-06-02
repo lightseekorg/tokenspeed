@@ -55,6 +55,8 @@ class DisaggDecodeExecutor:
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
+        self._request_pool_indices: Dict[str, int] = {}
+        self._remote_spec_candidate_ids: Dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
         self.receivers[request_id] = MooncakeKVReceiver(
@@ -72,6 +74,32 @@ class DisaggDecodeExecutor:
         if slot < 0:
             return None
         return np.array([slot], dtype=np.int64)
+
+    @staticmethod
+    def _mamba_checkpoint_indices(op, index: int):
+        indices = getattr(op, "mamba_checkpoint_dst_indices", None)
+        if indices is None or index >= len(indices):
+            return None
+        slot = int(indices[index])
+        if slot < 0:
+            return None
+        return np.array([slot], dtype=np.int64)
+
+    @classmethod
+    def _mamba_transfer_indices(cls, op, index: int):
+        working = cls._mamba_indices(op, index)
+        if working is None:
+            return None
+        checkpoint = cls._mamba_checkpoint_indices(op, index)
+        if checkpoint is None:
+            return working
+
+        slots = [int(x) for x in working.tolist()]
+        for slot in checkpoint.tolist():
+            slot = int(slot)
+            if slot >= 0 and slot not in slots:
+                slots.append(slot)
+        return np.array(slots, dtype=np.int64)
 
     def _prefill(self, op):
         logger.debug(
@@ -92,7 +120,8 @@ class DisaggDecodeExecutor:
                 dtype=np.int64,
             )
             aux_index = op.request_pool_indices[i]
-            mamba_indices = self._mamba_indices(op, i)
+            mamba_indices = self._mamba_transfer_indices(op, i)
+            self._request_pool_indices[request_id] = aux_index
             self.receivers[request_id].prefill(
                 kv_indices,
                 aux_index,
@@ -131,6 +160,7 @@ class DisaggDecodeExecutor:
                     "[decode][generate_events] rid=%s -> FailedEvent", req_id
                 )
                 events.append(PD.FailedEvent(req_id))
+                to_remove.append(req_id)
             elif (
                 self._local_states[req_id] == KVPoll.Bootstrapped
                 and poll == KVPoll.Success
@@ -141,7 +171,17 @@ class DisaggDecodeExecutor:
                 # message from the prefill side.  bootstrap_room == bootstrap_info.bootstrap_room,
                 # which is the key used in MooncakeKVReceiver.
                 bootstrap_room = self.receivers[req_id].bootstrap_room
-                bootstrap_token = self.kv_manager.pop_bootstrap_token(bootstrap_room)
+                bootstrap_token, spec_candidate_ids = (
+                    self.kv_manager.pop_prefill_metadata(bootstrap_room)
+                )
+                if (
+                    spec_candidate_ids is not None
+                    and req_id in self._request_pool_indices
+                ):
+                    self._remote_spec_candidate_ids[req_id] = (
+                        self._request_pool_indices[req_id],
+                        spec_candidate_ids,
+                    )
                 logger.debug(
                     "[decode][generate_events] rid=%s -> RemotePrefillDoneEvent bootstrap_token=%s",
                     req_id,
@@ -158,9 +198,25 @@ class DisaggDecodeExecutor:
             else:
                 pass
         for req_id in to_remove:
-            del self.receivers[req_id]
+            # Best-effort cleanup mirroring prefill side; request_id is stable
+            # so without explicit pop these dicts would grow unbounded across
+            # failed requests. NOTE: _remote_spec_candidate_ids must NOT be
+            # popped here — its consumer pop_remote_spec_candidate_ids runs
+            # later inside event_loop._process_pd_events, after we return.
+            # That dict is small (one tuple per Success request, between
+            # generate_events emitting RemotePrefillDoneEvent and event_loop
+            # consuming it) and is naturally drained by the pop path; an
+            # eager pop here drops the spec candidates on the floor and the
+            # next decode forward reads uninitialized future_input_map tail,
+            # causing CUDA illegal memory access on embedding lookup.
+            self.receivers.pop(req_id, None)
+            self._request_pool_indices.pop(req_id, None)
+            self._local_states.pop(req_id, None)
 
         return events
+
+    def pop_remote_spec_candidate_ids(self, request_id: str):
+        return self._remote_spec_candidate_ids.pop(request_id, None)
 
     def reset_valid_cache_length(
         self, forward_op, runtime_states, execution_stream, device

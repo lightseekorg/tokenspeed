@@ -40,6 +40,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
+cdiv = gl.cdiv
 
 
 # ===-----------------------------------------------------------------------===#
@@ -61,7 +62,7 @@ class AttentionConfig:
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     GROUP_SIZE: gl.constexpr
-    GROUP_BLOCKS: gl.constexpr
+    NUM_GROUPS: gl.constexpr
     q_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -133,7 +134,7 @@ class AttentionConfig:
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
-        self.GROUP_BLOCKS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
+        self.NUM_GROUPS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
@@ -222,8 +223,8 @@ class AttentionProgram:
     ):
         batch = gl.program_id(0)
         head_block = gl.program_id(1)
-        kv_head = head_block // cfg.GROUP_BLOCKS
-        group_block = head_block - kv_head * cfg.GROUP_BLOCKS
+        kv_head = head_block // cfg.NUM_GROUPS
+        group_block = head_block - kv_head * cfg.NUM_GROUPS
         group_start = group_block * cfg.BLOCK_M
         split_id = gl.program_id(2)
         cache_len = gl.load(cache_seqlens_ptr + batch)
@@ -233,9 +234,9 @@ class AttentionProgram:
         else:
             kv_start = cache_len - cache_len
         first_page = kv_start // cfg.PAGE_SIZE
-        end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+        end_page = cdiv(cache_len, cfg.PAGE_SIZE)
         num_pages = end_page - first_page
-        pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
+        pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
         split_start_page = first_page + split_id * pages_per_split
         split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
@@ -270,14 +271,30 @@ class AttentionProgram:
         return cdna4.buffer_load(self.q_ptr, offsets, mask=valid[:, None], other=0.0)
 
     @gluon.jit
-    def init_state(self):
+    def init_state(self, sink_ptr, has_sink: gl.constexpr):
         cfg = self.cfg
-        m_i = gl.full(
-            [cfg.BLOCK_M],
-            value=-float("inf"),
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, cfg.pv_layout),
-        )
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
+        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
+        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
+        if has_sink:
+            sink_log2 = (
+                gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
+                * _INV_LN2
+            )
+            m_i = sink_log2 / cfg.SM_SCALE
+        else:
+            sink_log2 = gl.full(
+                [cfg.BLOCK_M],
+                value=0.0,
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.pv_layout),
+            )
+            m_i = gl.full(
+                [cfg.BLOCK_M],
+                value=-float("inf"),
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.pv_layout),
+            )
         l_i = gl.full(
             [cfg.BLOCK_M],
             value=0.0,
@@ -287,7 +304,14 @@ class AttentionProgram:
         acc = gl.zeros(
             [cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout
         )
-        return m_i, l_i, acc
+        return m_i, l_i, acc, sink_log2
+
+    @gluon.jit
+    def apply_sinks(self, l_i, m_i, sink_log2, has_sink: gl.constexpr):
+        cfg = self.cfg
+        if has_sink:
+            l_i += gl.exp2(sink_log2 - m_i * cfg.SM_SCALE)
+        return l_i
 
     @gluon.jit
     def load_page(self, start_n):
@@ -298,7 +322,7 @@ class AttentionProgram:
         )
 
     @gluon.jit
-    def issue_buffer_load_k(self, physical_page, k_smem):
+    def issue_load_k(self, physical_page, k_smem):
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
@@ -312,7 +336,7 @@ class AttentionProgram:
         async_copy.commit_group()
 
     @gluon.jit
-    def issue_buffer_load_v(self, physical_page, v_smem):
+    def issue_load_v(self, physical_page, v_smem):
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
@@ -396,6 +420,21 @@ class AttentionProgram:
         cdna4.buffer_store(part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None])
         cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
 
+    @gluon.jit
+    def store_output(self, acc, l_i):
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
+        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
+        acc = gl.convert_layout(acc, cfg.store_layout)
+        l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
+        output = acc * (1.0 / l_i)[:, None]
+        output = output.to(self.mid_o_ptr.dtype.element_ty)
+        offsets = (self.batch * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
+        offsets += offs_d[None, :]
+        cdna4.buffer_store(output, self.mid_o_ptr, offsets, mask=valid[:, None])
+
 
 # ===-----------------------------------------------------------------------===#
 # Entry Point
@@ -458,12 +497,12 @@ def _mha_decode_fp16(
     )
 
     q = program.load_q()
-    m_i, l_i, acc = program.init_state()
+    m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
     for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
         physical_page = program.load_page(start_n)
-        program.issue_buffer_load_k(physical_page, k_smem)
-        program.issue_buffer_load_v(physical_page, v_smem)
+        program.issue_load_k(physical_page, k_smem)
+        program.issue_load_v(physical_page, v_smem)
         async_copy.wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
@@ -475,6 +514,82 @@ def _mha_decode_fp16(
         acc = program.compute_pv(p, v, acc)
 
     program.store_split(acc, l_i, m_i)
+
+
+@gluon.jit
+def _mha_decode_sliding_fp16(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    page_table_ptr,
+    cache_seqlens_ptr,
+    out_ptr,
+    sink_ptr,
+    Q_STRIDE_B: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    PAGE_TABLE_STRIDE: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    NUM_Q_HEADS: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_SLIDING: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+    HAS_SINK: gl.constexpr,
+):
+    cfg = AttentionConfig(
+        SM_SCALE,
+        PAGE_TABLE_STRIDE,
+        PAGE_SIZE,
+        1,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        IS_SLIDING,
+        WINDOW_LEFT,
+        InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
+    )
+    program = AttentionProgram.create(
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        out_ptr,
+        out_ptr,
+    )
+    k_smem = gl.allocate_shared_memory(
+        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+    )
+    v_smem = gl.allocate_shared_memory(
+        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+    )
+
+    q = program.load_q()
+    m_i, l_i, acc, sink_log2 = program.init_state(sink_ptr, HAS_SINK)
+
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        physical_page = program.load_page(start_n)
+        program.issue_load_k(physical_page, k_smem)
+        program.issue_load_v(physical_page, v_smem)
+        async_copy.wait_group(1)
+        k = program.shared_load_k(k_smem)
+        qk = program.compute_qk(q, k)
+        qk = program.apply_kv_mask(qk, start_n)
+        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+        async_copy.wait_group(0)
+        v = program.shared_load_v(v_smem)
+        acc = program.compute_pv(p, v, acc)
+
+    l_i = program.apply_sinks(l_i, m_i, sink_log2, HAS_SINK)
+    program.store_output(acc, l_i)
 
 
 @gluon.jit
@@ -520,9 +635,9 @@ def _mha_decode_reduce_fp16(
     else:
         kv_start = cache_len - cache_len
     first_page = kv_start // cfg.PAGE_SIZE
-    end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+    end_page = cdiv(cache_len, cfg.PAGE_SIZE)
     num_pages = end_page - first_page
-    pages_per_split = (num_pages + cfg.NUM_KV_SPLITS - 1) // cfg.NUM_KV_SPLITS
+    pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=cfg.reduce_layout)
     if HAS_SINK:
         m_i = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
@@ -563,7 +678,7 @@ def _mha_decode_reduce_fp16(
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
-    group_blocks: int
+    num_groups: int
     head_dim: int
     page_size: int
     num_kv_splits: int
@@ -586,14 +701,14 @@ def get_config(
     block_m = 16
     block_n = 64
     group_size = q.shape[1] // k_cache.shape[2]
-    group_blocks = (group_size + block_m - 1) // block_m
+    num_groups = math.ceil(group_size / block_m)
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     sm_scale = 1.0 / math.sqrt(head_dim)
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
-        group_blocks=group_blocks,
+        num_groups=num_groups,
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=8,
@@ -652,62 +767,97 @@ def gluon_mha_decode_fp16_gfx950(
     batch = q.shape[0]
     output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
 
-    mid_o = torch.empty(
-        (batch, config.num_q_heads, config.num_kv_splits, config.head_dim),
-        device=q.device,
-        dtype=torch.float32,
-    )
-    mid_lse = torch.empty(
-        (batch, config.num_q_heads, config.num_kv_splits),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    if config.is_sliding:
+        # No split-k for sliding window attention
+        grid = (batch, config.num_kv_heads * config.num_groups, 1)
+        _mha_decode_sliding_fp16[grid](
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            output,
+            sink_arg,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            config.sm_scale,
+            page_table.stride(0),
+            config.page_size,
+            config.num_q_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.block_m,
+            config.block_n,
+            config.is_sliding,
+            config.window_left,
+            has_sink,
+            num_warps=1,
+        )
+    else:
+        # Always use split-k for full attention
+        mid_o = torch.empty(
+            (batch, config.num_q_heads, config.num_kv_splits, config.head_dim),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        mid_lse = torch.empty(
+            (batch, config.num_q_heads, config.num_kv_splits),
+            device=q.device,
+            dtype=torch.float32,
+        )
 
-    grid = (batch, config.num_kv_heads * config.group_blocks, config.num_kv_splits)
-    _mha_decode_fp16[grid](
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        mid_o,
-        mid_lse,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        config.sm_scale,
-        page_table.stride(0),
-        config.page_size,
-        config.num_kv_splits,
-        config.num_q_heads,
-        config.num_kv_heads,
-        config.head_dim,
-        config.block_m,
-        config.block_n,
-        config.is_sliding,
-        config.window_left,
-        num_warps=1,
-    )
+        grid = (
+            batch,
+            config.num_kv_heads * config.num_groups,
+            config.num_kv_splits,
+        )
+        _mha_decode_fp16[grid](
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            mid_o,
+            mid_lse,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            config.sm_scale,
+            page_table.stride(0),
+            config.page_size,
+            config.num_kv_splits,
+            config.num_q_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.block_m,
+            config.block_n,
+            config.is_sliding,
+            config.window_left,
+            num_warps=1,
+        )
 
-    grid = (batch, config.num_q_heads)
-    _mha_decode_reduce_fp16[grid](
-        mid_o,
-        mid_lse,
-        output,
-        cache_seqlens,
-        sink_arg,
-        config.sm_scale,
-        page_table.stride(0),
-        config.num_kv_splits,
-        config.page_size,
-        config.num_q_heads,
-        config.num_kv_heads,
-        config.head_dim,
-        config.block_m,
-        config.block_n,
-        has_sink,
-        config.is_sliding,
-        config.window_left,
-        num_warps=1,
-    )
+        # Sink is a single global softmax entry, so split-k must merge it once in
+        # reduce. Adding it in each split would count the sink once per split.
+        grid = (batch, config.num_q_heads)
+        _mha_decode_reduce_fp16[grid](
+            mid_o,
+            mid_lse,
+            output,
+            cache_seqlens,
+            sink_arg,
+            config.sm_scale,
+            page_table.stride(0),
+            config.num_kv_splits,
+            config.page_size,
+            config.num_q_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.block_m,
+            config.block_n,
+            has_sink,
+            config.is_sliding,
+            config.window_left,
+            num_warps=1,
+        )
     return output

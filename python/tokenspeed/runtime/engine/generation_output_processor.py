@@ -551,7 +551,20 @@ class OutputProcesser:
             # Notify caller of first output token (used by prefill node to hand off
             # bootstrap token to the KV transfer layer before streaming output).
             if on_first_token is not None and model_output_ids:
-                on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
+                spec_candidate_ids = None
+                if model_execution_results.next_input_ids is not None and i < len(
+                    model_execution_results.next_input_ids
+                ):
+                    spec_candidate_ids = [
+                        int(x)
+                        for x in model_execution_results.next_input_ids[i].tolist()
+                    ]
+                on_first_token(
+                    rid,
+                    forward_op.request_pool_indices[i],
+                    model_output_ids[0],
+                    spec_candidate_ids,
+                )
 
             if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1

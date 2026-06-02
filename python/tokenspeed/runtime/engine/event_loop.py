@@ -602,6 +602,7 @@ class EventLoop:
                     self.model_executor.device,
                 )
                 self.pd_kv_transfer.execute(forward_op)
+                self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
             else:
                 # Path 3b: decode batch — normal forward
@@ -639,6 +640,7 @@ class EventLoop:
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
+                        capture_next_input_ids=True,
                         **stats,
                     ),
                     self.pd_kv_transfer.store_prefill_token,
@@ -956,6 +958,15 @@ class EventLoop:
                 bootstrap_token = event.bootstrap_token
 
                 self.output_processor.on_remote_prefill_done(req_id, bootstrap_token)
+                if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+                    candidate_info = self.pd_kv_transfer.pop_remote_spec_candidate_ids(
+                        req_id
+                    )
+                    if candidate_info is not None:
+                        req_pool_idx, candidate_ids = candidate_info
+                        self.model_executor.write_remote_spec_candidate_ids(
+                            req_pool_idx, candidate_ids
+                        )
 
         return processed
 

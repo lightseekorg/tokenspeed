@@ -394,6 +394,20 @@ class ModelExecutor:
             multimodal_context=self._active_multimodal_context,
         )
 
+    def _apply_force_single_token_verify(
+        self,
+        accept_lengths: torch.Tensor,
+        row_offset: int,
+        row_count: int,
+        decode_input_ids: list[int] | None,
+    ) -> torch.Tensor:
+        if decode_input_ids is None or row_count <= 0:
+            return accept_lengths
+        force_mask = self.input_buffers.force_single_token_verify_buf[
+            row_offset : row_offset + row_count
+        ]
+        return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -412,9 +426,13 @@ class ModelExecutor:
             return self.sampling_backend.sample(logits_output, sampling_info)
 
         if num_extends == 0:
-            return self.sampling_backend.verify(
+            output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
+            accept_lengths = self._apply_force_single_token_verify(
+                accept_lengths, 0, num_decodes, ctx.decode_input_ids
+            )
+            return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
         prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
@@ -424,6 +442,9 @@ class ModelExecutor:
         decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
         decode_tokens, decode_accept = self.sampling_backend.verify(
             decode_out, sampling_info[num_extends:], candidates
+        )
+        decode_accept = self._apply_force_single_token_verify(
+            decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
         if (
             prefill_out.next_token_logprobs is not None
@@ -726,6 +747,7 @@ class ModelExecutor:
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
         self.log_step += 1
 
@@ -764,6 +786,7 @@ class ModelExecutor:
             dp_all_decode_or_idle,
             grammar_inputs=grammar_inputs,
             multimodal_context=multimodal_context,
+            capture_next_input_ids=capture_next_input_ids,
         )
 
         if is_decode and (
@@ -933,6 +956,45 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+    def reset_remote_prefill_mamba_inputs(self, forward_op) -> None:
+        if self.runtime_states.mamba_pool is None:
+            return
+        if not hasattr(self.attn_backend, "reset_current_inputs"):
+            return
+
+        num_extends = forward_op.num_extends()
+        if num_extends <= 0:
+            return
+
+        mamba_indices = list(getattr(forward_op, "mamba_pool_indices", []))
+        if not mamba_indices:
+            return
+
+        req_pool_indices = list(forward_op.request_pool_indices[:num_extends])
+        pairs = [
+            (int(req_pool_idx), int(mamba_idx))
+            for req_pool_idx, mamba_idx in zip(
+                req_pool_indices, mamba_indices[:num_extends]
+            )
+            if int(mamba_idx) >= 0
+        ]
+        if not pairs:
+            return
+
+        req_pool_tensor = torch.tensor(
+            [req_pool_idx for req_pool_idx, _ in pairs],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        mamba_tensor = torch.tensor(
+            [mamba_idx for _, mamba_idx in pairs],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
+
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
 
@@ -1073,6 +1135,7 @@ class ModelExecutor:
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
@@ -1091,7 +1154,7 @@ class ModelExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
-            self.input_buffers.fill_input_buffers(
+            decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
@@ -1206,6 +1269,7 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
+                    decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -1319,6 +1383,16 @@ class ModelExecutor:
                 )
 
             with nvtx_range("output_d2h", color="green"):
+                next_input_ids = None
+                if (
+                    capture_next_input_ids
+                    and self.drafter is not None
+                    and num_extends > 0
+                ):
+                    next_input_ids = self.runtime_states.future_input_map.index_select(
+                        0, self.input_buffers.req_pool_indices_buf[:num_extends]
+                    ).to("cpu", non_blocking=True)
+
                 # Defensive clamp into the valid vocab range (kept from the
                 # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
                 # value surfaced by the intermittent spec-decode decode-state race
@@ -1358,7 +1432,19 @@ class ModelExecutor:
             output_logprobs=output_logprobs,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
+            next_input_ids=next_input_ids,
         )
+
+    def write_remote_spec_candidate_ids(
+        self, req_pool_idx: int, candidate_ids: list[int]
+    ) -> None:
+        # Remote spec candidates are CPU materialized; enqueue the H2D copy and
+        # future_input_map update on execution_stream. The next forward's input
+        # prep already waits on execution_stream before reading runtime state.
+        with torch.cuda.stream(self.execution_stream):
+            self.runtime_states.write_remote_spec_candidate_ids(
+                req_pool_idx, candidate_ids
+            )
 
     def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
         # Cache delta expansion for retracted/chunked requests.

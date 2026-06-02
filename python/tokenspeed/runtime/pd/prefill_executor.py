@@ -59,17 +59,35 @@ class DisaggPrefillExecutor:
         self._local_states = {}
         self._layerwise_enabled = False
         self._layerwise_interval = 1
-        # aux_index -> bootstrap_token, populated by store_prefill_token() after
-        # the prefill forward pass, consumed by _decode() when sending KV.
-        self._aux_token: Dict[int, int] = {}
+        # request_id -> bootstrap metadata, populated after the prefill forward pass.
+        # Request ids and bootstrap rooms are stable across request-pool slot reuse.
+        self._request_token: Dict[str, int] = {}
+        self._request_spec_candidate_ids: Dict[str, list[int]] = {}
         self._layerwise_token_published = set()
 
-    def store_prefill_token(self, aux_index: int, token: int) -> None:
+    def store_prefill_token(
+        self,
+        request_id: str,
+        aux_index: int,
+        token: int,
+        spec_candidate_ids: list[int] | None = None,
+    ) -> None:
         """Called by event_loop after prefill forward to record the first output token."""
-        self._aux_token[aux_index] = token
+        self._request_token[request_id] = token
+        if spec_candidate_ids is not None:
+            self._request_spec_candidate_ids[request_id] = spec_candidate_ids
         if self._layerwise_enabled:
-            self.kv_manager.set_bootstrap_token(aux_index, token)
-            self._layerwise_token_published.add(aux_index)
+            sender = self.senders.get(request_id)
+            if sender is None:
+                logger.warning(
+                    "Prefill token arrived before sender registration for request_id=%s",
+                    request_id,
+                )
+                return
+            self.kv_manager.set_prefill_metadata(
+                sender.bootstrap_room, token, spec_candidate_ids
+            )
+            self._layerwise_token_published.add(request_id)
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
         self._layerwise_enabled = True
@@ -144,6 +162,7 @@ class DisaggPrefillExecutor:
             kv_indices, index_slice, is_last = self._prefill_page_window(op, i, sender)
             if len(kv_indices) == 0 and not is_last:
                 continue
+            mamba_indices = self._mamba_indices(op, i) if is_last else None
             sender.send_layerwise(
                 kv_indices,
                 index_slice,
@@ -152,7 +171,7 @@ class DisaggPrefillExecutor:
                 begin_cache_step=begin_cache_step,
                 layerwise_interval=self._layerwise_interval,
                 wait_for_bootstrap_token=is_last,
-                mamba_indices=self._mamba_indices(op, i) if is_last else None,
+                mamba_indices=mamba_indices,
             )
 
     def _decode(self, op):
@@ -160,14 +179,18 @@ class DisaggPrefillExecutor:
 
         for i, request_id in enumerate(op.request_ids):
             aux_index = op.request_pool_indices[i]
-            bootstrap_token = self._aux_token.pop(aux_index, -1)
-            if self.senders[request_id].has_layerwise_transfer():
-                if aux_index not in self._layerwise_token_published:
-                    self.kv_manager.set_bootstrap_token(aux_index, bootstrap_token)
-                self._layerwise_token_published.discard(aux_index)
+            bootstrap_token = self._request_token.pop(request_id, -1)
+            spec_candidate_ids = self._request_spec_candidate_ids.pop(request_id, None)
+            sender = self.senders[request_id]
+            if sender.has_layerwise_transfer():
+                if request_id not in self._layerwise_token_published:
+                    self.kv_manager.set_prefill_metadata(
+                        sender.bootstrap_room, bootstrap_token, spec_candidate_ids
+                    )
+                self._layerwise_token_published.discard(request_id)
                 continue
 
-            bootstrap_room = self.senders[request_id].bootstrap_room
+            bootstrap_room = sender.bootstrap_room
             decode_prefix_len = self._decode_prefix_len(bootstrap_room)
             assert (
                 decode_prefix_len % self.page_size == 0
@@ -176,7 +199,7 @@ class DisaggPrefillExecutor:
                 op.occupied_pages[i][decode_prefix_len // self.page_size :],
                 dtype=np.int64,
             )
-
+            mamba_indices = self._mamba_indices(op, i)
             logger.debug(
                 "[prefill][_decode] rid=%s aux_index=%d kv_indices(len=%d)=%s bootstrap_token=%d",
                 request_id,
@@ -185,12 +208,12 @@ class DisaggPrefillExecutor:
                 kv_indices,
                 bootstrap_token,
             )
-            mamba_indices = self._mamba_indices(op, i)
-            self.senders[request_id].send(
+            sender.send(
                 kv_indices,
                 aux_index,
                 is_last,
                 bootstrap_token=bootstrap_token,
+                spec_candidate_ids=spec_candidate_ids,
                 mamba_indices=mamba_indices,
             )
 
@@ -223,6 +246,7 @@ class DisaggPrefillExecutor:
                     "[prefill][generate_events] rid=%s -> FailedEvent", req_id
                 )
                 events.append(PD.FailedEvent(req_id))
+                to_remove.append(req_id)
             elif (
                 self._local_states[req_id] == KVPoll.Bootstrapped
                 and poll == KVPoll.Success
@@ -236,6 +260,16 @@ class DisaggPrefillExecutor:
             else:
                 pass
         for req_id in to_remove:
-            del self.senders[req_id]
+            # Best-effort cleanup of all per-request state so failed/aborted
+            # requests do not leak into the bookkeeping dicts. request_id is
+            # stable (not a reusable slot index), so without explicit pop here
+            # these entries would live until the engine restarts.
+            sender = self.senders.pop(req_id, None)
+            if sender is not None:
+                self.kv_manager.discard_expired_metadata_room(sender.bootstrap_room)
+            self._local_states.pop(req_id, None)
+            self._request_token.pop(req_id, None)
+            self._request_spec_candidate_ids.pop(req_id, None)
+            self._layerwise_token_published.discard(req_id)
 
         return events

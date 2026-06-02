@@ -47,6 +47,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4 as _triton_fused_indexer_q_rope_hadamard_mxfp4,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_fused_inv_rope_fp8_quant,
+)
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -165,27 +168,6 @@ def _apply_gptj_rope_tail_rows(
     return out
 
 
-def _apply_inverse_gptj_rope_tail(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    rope_dim: int,
-) -> torch.Tensor:
-    out = x.float().clone()
-    half_rope = rope_dim // 2
-    nope_dim = x.shape[-1] - rope_dim
-    cos = cos_sin_cache[positions.long(), :half_rope].float()
-    sin = cos_sin_cache[positions.long(), half_rope:rope_dim].float()
-    even = out[..., nope_dim::2].clone()
-    odd = out[..., nope_dim + 1 :: 2].clone()
-    while cos.ndim < even.ndim:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-    out[..., nope_dim::2] = even * cos + odd * sin
-    out[..., nope_dim + 1 :: 2] = odd * cos - even * sin
-    return out
-
-
 def _fp8_e4m3_pow2_bytes(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = max(float(block.detach().abs().max()) / DEEPSEEK_V4_FP8_MAX, 1.0e-10)
     scale = 2.0 ** math.ceil(math.log2(scale))
@@ -219,36 +201,6 @@ def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
         scale=shape[-1] ** -0.5,
     )
     return rotated.reshape(shape)
-
-
-def deepseek_v4_inv_rope_grouped(
-    o: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    n_groups: int,
-    heads_per_group: int,
-    nope_dim: int | None = None,
-    rope_dim: int | None = None,
-) -> torch.Tensor:
-    """Inverse-RoPE and group V4 attention output without FP8 activation rounding."""
-
-    if o.dim() != 3:
-        raise ValueError(f"o must be [tokens, heads, dim], got {tuple(o.shape)}")
-    if rope_dim is None:
-        rope_dim = int(cos_sin_cache.shape[-1])
-    if nope_dim is None:
-        nope_dim = int(o.shape[2]) - rope_dim
-    if o.shape[1] != n_groups * heads_per_group:
-        raise ValueError(
-            f"heads={o.shape[1]} does not match n_groups={n_groups} "
-            f"* heads_per_group={heads_per_group}"
-        )
-    if o.shape[2] != nope_dim + rope_dim:
-        raise ValueError(f"head dim must be {nope_dim + rope_dim}, got {o.shape[2]}")
-
-    inv = _apply_inverse_gptj_rope_tail(o, positions, cos_sin_cache, rope_dim)
-    grouped = inv.reshape(o.shape[0], n_groups, heads_per_group * o.shape[2])
-    return grouped.to(o.dtype)
 
 
 def dequantize_deepseek_v4_fp8_ds_mla_cache(

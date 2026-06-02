@@ -209,15 +209,34 @@ class Fp8LinearMethod(LinearMethodBase):
             layer._use_deep_gemm_fp8 = False
             is_bmm = getattr(layer, "is_bmm", False)
             is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
-            if (
-                _transform_sf is not None
-                and _ceil_to_ue8m0 is not None
-                and not is_bmm
-                and is_ue8m0
-            ):
+            if _transform_sf is not None and _ceil_to_ue8m0 is not None and is_ue8m0:
                 N, K = layer.weight.shape
                 block_n, block_k = self.quant_config.weight_block_size
-                if N % 64 == 0 and K % 128 == 0:
+                if is_bmm:
+                    # Grouped (batched) projection (V4 attention wo_a, weight
+                    # [groups * n, K], consumed per group as [n, K]). Transform
+                    # the block scale into the deep_gemm MN-major layout with the
+                    # group axis so deep_gemm.fp8_einsum("bhr,hdr->bhd") runs the
+                    # output projection as one native FP8 GEMM (no FP32 dequant).
+                    # recipe is (1, block_n, block_k) at load; the runtime einsum
+                    # uses (1, 1, block_n) on SM100.
+                    g = layer.bmm_batch_size
+                    n = N // g
+                    if n % block_n == 0 and K % block_k == 0:
+                        sf = _ceil_to_ue8m0(layer.weight_scale_inv.data).view(
+                            g, n // block_n, K // block_k
+                        )
+                        layer.weight_scale_inv.data = _transform_sf(
+                            sf=sf,
+                            mn=n,
+                            k=K,
+                            recipe=(1, block_n, block_k),
+                            num_groups=g,
+                            is_sfa=False,
+                        )
+                        layer._deep_gemm_block_size = [block_n, block_k]
+                        layer._use_deep_gemm_fp8 = True
+                elif N % 64 == 0 and K % 128 == 0:
                     sf = _ceil_to_ue8m0(layer.weight_scale_inv.data)
                     layer.weight_scale_inv.data = _transform_sf(
                         sf=sf,
@@ -227,6 +246,17 @@ class Fp8LinearMethod(LinearMethodBase):
                         is_sfa=False,
                     )
                     layer._use_deep_gemm_fp8 = True
+            if is_bmm and not layer._use_deep_gemm_fp8:
+                # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
+                # fallback, so fail fast at load with a clear message instead of
+                # a cryptic AttributeError on the first forward.
+                raise RuntimeError(
+                    "is_bmm weight requires the deep_gemm FP8 block-scale path "
+                    "but it could not be prepared (deep_gemm_available="
+                    f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
+                    f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
+                    "ue8m0 weights with block-aligned dims and deep_gemm installed."
+                )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
