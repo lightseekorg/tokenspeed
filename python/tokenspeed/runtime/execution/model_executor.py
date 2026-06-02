@@ -309,6 +309,11 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
         )
 
+        # CUDA graph warmup runs the drafter with dummy data whose
+        # uninitialized KV cache produces NaN → argmax sentinel -1.
+        # Clear the residue so pool slots reused by real requests start clean.
+        self.runtime_states.future_input_map.zero_()
+
         # Encoder CUDA graph: install the model-built wrapper by overriding
         # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
         # ``CudaGraphWrapper``.
