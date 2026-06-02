@@ -2704,6 +2704,7 @@ class DeepseekV4Compressor(nn.Module):
         state_block_size: int | None = None,
         state_base_logical_page: torch.Tensor | None = None,
         write_compressed_cache: bool = True,
+        compressor_slot_cache: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
         metadata = _deepseek_v4_forward_metadata(ctx)
@@ -2730,6 +2731,10 @@ class DeepseekV4Compressor(nn.Module):
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
         cache_metadata = metadata.cache
+        # state/compressed slot mappings depend only on (per-step state, ratio), so reuse
+        # them across layers of the same ratio within a step. Attn-compressor path only:
+        # the indexer-compressor passes an explicit state_block_table and is excluded.
+        memo = compressor_slot_cache if state_block_table is None else None
         if state_block_table is None:
             state_block_table = cache_metadata.compressor_state_block_tables.get(
                 self.compress_ratio
@@ -2750,7 +2755,12 @@ class DeepseekV4Compressor(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        if state_block_table is not None:
+        state_hit = (
+            memo.get(("state", self.compress_ratio)) if memo is not None else None
+        )
+        if state_hit is not None:
+            state_slot_mapping, state_block_table = state_hit
+        elif state_block_table is not None:
             state_slot_mapping = _group_slot_mapping_from_raw(
                 positions,
                 metadata.token_to_req_indices[: positions.numel()],
@@ -2765,6 +2775,11 @@ class DeepseekV4Compressor(nn.Module):
             state_slot_mapping,
             valid_token,
         )
+        if memo is not None and state_hit is None:
+            memo[("state", self.compress_ratio)] = (
+                state_slot_mapping,
+                state_block_table,
+            )
         with nvtx_range(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
                 kv=kv,
@@ -2780,19 +2795,29 @@ class DeepseekV4Compressor(nn.Module):
             return kv, score
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
-        with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
-            compressed_slots = cache_metadata.compressed_slot_mapping(
-                positions,
-                self.compress_ratio,
-                token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
-                query_start_loc=metadata.query_start_loc,
-                seq_lens=metadata.seq_lens,
-                kv_cache_block_size=kv_cache_block_size,
-                use_decode_cache=(
-                    ctx.forward_mode is not None and ctx.forward_mode.is_decode()
-                ),
-                is_valid_token=valid_token,
-            )
+        compressed_hit = (
+            memo.get(("compressed", self.compress_ratio)) if memo is not None else None
+        )
+        if compressed_hit is not None:
+            compressed_slots = compressed_hit
+        else:
+            with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
+                compressed_slots = cache_metadata.compressed_slot_mapping(
+                    positions,
+                    self.compress_ratio,
+                    token_to_req_indices=metadata.token_to_req_indices[
+                        : positions.numel()
+                    ],
+                    query_start_loc=metadata.query_start_loc,
+                    seq_lens=metadata.seq_lens,
+                    kv_cache_block_size=kv_cache_block_size,
+                    use_decode_cache=(
+                        ctx.forward_mode is not None and ctx.forward_mode.is_decode()
+                    ),
+                    is_valid_token=valid_token,
+                )
+            if memo is not None:
+                memo[("compressed", self.compress_ratio)] = compressed_slots
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -3483,6 +3508,7 @@ class DeepseekV4Attention(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         swa_slot_mapping: torch.Tensor,
+        compressor_slot_cache: dict,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -3528,6 +3554,7 @@ class DeepseekV4Attention(nn.Module):
                     out_cache_loc=out_cache_loc,
                     layer_index=self.cache_layer_index,
                     cos_sin_cache=cos_sin_cache,
+                    compressor_slot_cache=compressor_slot_cache,
                 )
 
         topk_indices = None
@@ -3738,6 +3765,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         input_ids: torch.Tensor,
         swa_slot_mapping: torch.Tensor,
+        compressor_slot_cache: dict,
     ) -> torch.Tensor:
         residual = hidden_states
         with nvtx_range("hc_attn_pre"):
@@ -3754,7 +3782,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = self.attn_norm(hidden_states)
         with nvtx_range("attn_total"):
             hidden_states = self.attn(
-                positions, hidden_states, ctx, out_cache_loc, swa_slot_mapping
+                positions,
+                hidden_states,
+                ctx,
+                out_cache_loc,
+                swa_slot_mapping,
+                compressor_slot_cache,
             )
         with nvtx_range("hc_attn_post"):
             hidden_states = mhc_post(hidden_states, residual, post, comb)
@@ -3898,6 +3931,10 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 swa_slot_mapping = out_cache_loc
+        # Per-(step, ratio) compressor slot mappings are identical across layers of the
+        # same ratio; memoize within the step (filled lazily by the first compressor of
+        # each ratio, reused by the rest).
+        compressor_slot_cache: dict = {}
         for layer in self.layers:
             hidden_states = layer(
                 positions,
@@ -3906,6 +3943,7 @@ class DeepseekV4Model(nn.Module):
                 out_cache_loc,
                 input_ids,
                 swa_slot_mapping,
+                compressor_slot_cache,
             )
         aux_hidden_states = None
         if (
