@@ -691,32 +691,6 @@ DEFAULT_PACKED_NUM_BUFFERS = 2
 
 
 @dataclass
-class StartWeightUpdateReqInput:
-    # When True, weights arrive in checkpoint format and the worker does a
-    # layerwise reload (init/finalize); otherwise a direct in-place copy.
-    is_checkpoint_format: bool = True
-
-
-@dataclass
-class StartWeightUpdateReqOutput:
-    success: bool
-    message: str
-
-
-@dataclass
-class FinishWeightUpdateReqInput:
-    # Flush KV/prefix cache after the update completes so subsequent
-    # generations reflect the new weights.
-    flush_cache: bool = True
-
-
-@dataclass
-class FinishWeightUpdateReqOutput:
-    success: bool
-    message: str
-
-
-@dataclass
 class UpdateWeightsFromDistributedReqInput:
     # Weight-update metadata shared with the trainer's NCCL sender.
     names: list[str]

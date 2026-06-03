@@ -31,18 +31,18 @@ return the status payloads. Heavy weight payloads travel out-of-band
 
 Deployment note: this app must run on the same asyncio event loop as the
 ``AsyncLLM`` it controls -- the manager toggles a loop-bound admission event and
-awaits loop-bound scheduler communicators. Use :func:`run_weight_transfer_server`
-from the engine process (see ``runtime/entrypoints/engine.py``), or mount
-:data:`router` onto an app whose ``state.weight_transfer_manager`` is set.
+awaits loop-bound scheduler communicators. It is built and served from the
+engine process by :meth:`AsyncLLM._serve_rl_control_plane` (via
+:func:`build_weight_transfer_app`), which also mounts the SGLang-compatible
+router onto the same app/port.
 """
 
 from __future__ import annotations
 
 import json
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
-import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
@@ -229,7 +229,7 @@ async def get_world_size(
 
 
 # --------------------------------------------------------------------------- #
-# App construction / server lifecycle
+# App construction
 # --------------------------------------------------------------------------- #
 
 
@@ -237,52 +237,11 @@ def build_weight_transfer_app(manager: "WeightTransferManager") -> FastAPI:
     """Return a FastAPI app exposing the weight-transfer endpoints.
 
     The app holds the manager on ``app.state.weight_transfer_manager``; handlers
-    fetch it per request from ``app.state``.
+    fetch it per request from ``app.state``. In production it is built and served
+    by :meth:`AsyncLLM._serve_rl_control_plane`, which also mounts the
+    SGLang-compatible router onto the same app/port.
     """
     app = FastAPI(title="tokenspeed weight transfer")
     app.state.weight_transfer_manager = manager
     app.include_router(router)
     return app
-
-
-def build_weight_transfer_server(
-    manager: "WeightTransferManager",
-    *,
-    host: str = "127.0.0.1",
-    port: int = 0,
-) -> uvicorn.Server:
-    """Build an unstarted ``uvicorn.Server`` for the weight-transfer app."""
-    app = build_weight_transfer_app(manager)
-    logger.info("Configuring weight-transfer HTTP control plane on %s:%d", host, port)
-    return uvicorn.Server(
-        uvicorn.Config(app, host=host, port=port, log_level="warning")
-    )
-
-
-async def run_weight_transfer_server(
-    manager: "WeightTransferManager",
-    *,
-    host: str = "127.0.0.1",
-    port: int,
-) -> None:
-    """Serve the weight-transfer app on the current event loop.
-
-    Call this from the engine process on the SAME loop that runs ``AsyncLLM`` so
-    the manager's loop-bound primitives (admission event, scheduler
-    communicators) are toggled/awaited correctly.
-    """
-    await build_weight_transfer_server(manager, host=host, port=port).serve()
-
-
-def attach_to_main_loop(
-    manager: "WeightTransferManager",
-    *,
-    host: str,
-    port: int,
-    create_task: Callable[[Awaitable[Any]], Any],
-) -> Any:
-    """Schedule the server as a task via ``create_task`` (e.g. ``loop.create_task``).
-
-    Returns the created task so the caller can track/cancel it on shutdown.
-    """
-    return create_task(run_weight_transfer_server(manager, host=host, port=port))
