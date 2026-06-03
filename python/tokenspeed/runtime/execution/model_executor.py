@@ -477,6 +477,18 @@ class ModelExecutor:
             logits_output, sampling_info, ctx, candidates
         )
 
+        # Single choke point for every (sample/verify) x (greedy/flashinfer)
+        # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
+        # make cute_argmax emit the -1 sentinel. Left unclamped, that -1 poisons
+        # both consumers below -- it flows into output_ids -> detokenizer (the
+        # HF Rust tokenizer raises OverflowError on a negative id and kills the
+        # engine) and, via the drafter, back into future_input_map as the next
+        # round's input_ids (negative embedding index -> garbage / CUDA illegal
+        # access). Clamp in place (this runs inside the CUDA graph) so grammar,
+        # drafter, and the return value all observe clean ids. Mirror of the
+        # draft-side draft_ids.clamp_(min=0) guard.
+        output_tokens.clamp_(min=0)
+
         # Fork sampler-output D2H onto the grammar side stream so the
         # next step's build hostfunc can advance the matcher.
         if self.capturable_grammar is not None:
