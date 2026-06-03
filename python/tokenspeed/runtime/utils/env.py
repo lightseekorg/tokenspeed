@@ -229,11 +229,6 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
-    # Opt-in for deserializing CUDA-IPC handles sent as base64 pickled blobs.
-    # Required by the IPC weight-transfer backend because the payload is
-    # unpickled (RCE-adjacent).
-    TOKENSPEED_ALLOW_INSECURE_SERIALIZATION = EnvBool(False)
-
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")

@@ -46,7 +46,6 @@ from tokenspeed.runtime.engine.weight_transfer.config import (
     WeightTransferConfig,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -105,7 +104,11 @@ class WeightTransferManager:
                 replica's world size (TP*CP).
         """
         mapping = self._async_llm.server_args.mapping
-        return mapping.world_size_across_dp if include_dp else mapping.world_size_per_dp
+        if include_dp:
+            # tokenspeed's world_size already counts every GPU (TP*CP*DP).
+            return mapping.world_size
+        # A single DP replica (TP*CP).
+        return mapping.world_size // mapping.attn.dp_size
 
     # ------------------------------------------------------------------ #
     # Weight-update lifecycle
@@ -169,6 +172,12 @@ class WeightTransferManager:
             # The CUDA-IPC receive path (rebuild_cuda_tensor + load_weights on the
             # colocated worker) is not yet wired through the scheduler. The
             # metadata is fully parsed/validated above.
+            #
+            # SECURITY: when wiring the worker-side receive, prefer the structured
+            # `ipc_handles` form (JSON-safe handle fields) and avoid
+            # ``pickle.loads`` on ``ipc_handles_pickled`` — the control plane is
+            # reachable by anything that can reach rl_control_port, so unpickling
+            # caller-supplied bytes there is an RCE vector.
             raise NotImplementedError(
                 "IPC weight receive is not yet implemented on the worker side; "
                 "use backend='nccl' for now."
@@ -350,13 +359,6 @@ class WeightTransferManager:
         if not has_handles and not has_pickled:
             raise ValueError(
                 "Either `ipc_handles` or `ipc_handles_pickled` must be provided"
-            )
-        if has_pickled and not envs.TOKENSPEED_ALLOW_INSECURE_SERIALIZATION.get():
-            # The payload is unpickled, which is RCE-adjacent, so require an
-            # explicit opt-in.
-            raise ValueError(
-                "Refusing to deserialize `ipc_handles_pickled` without "
-                "TOKENSPEED_ALLOW_INSECURE_SERIALIZATION=1"
             )
         packed = bool(update_info.get("packed", False))
         if packed and update_info.get("tensor_sizes") is None:

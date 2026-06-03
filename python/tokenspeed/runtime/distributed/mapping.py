@@ -368,26 +368,6 @@ class Mapping(MappingBase):
         return self.attn.has_dp
 
     @cached_property
-    def world_size_across_dp(self) -> int:
-        """Total inference world size across every DP replica.
-
-        tokenspeed's ``world_size`` already counts every GPU (TP*CP*DP), so this
-        is an explicit alias used by ``get_world_size(include_dp=True)`` to
-        compute the NCCL weight-update world size
-        (``trainer_ranks + inference_workers``).
-        """
-        return self.world_size
-
-    @cached_property
-    def world_size_per_dp(self) -> int:
-        """Inference world size of a single DP replica (TP*CP, excludes DP).
-
-        Used by ``get_world_size(include_dp=False)``. Equals ``world_size`` when
-        ``attn.dp_size == 1`` (the supported weight-sync configuration today).
-        """
-        return self.world_size // self.attn.dp_size
-
-    @cached_property
     def node_rank(self) -> int:
         return self.rank // self.nprocs_per_node
 
