@@ -81,7 +81,6 @@ class WeightTransferManager:
         # Lifecycle state.
         self._engine_inited = False
         self._update_active = False
-        self._is_checkpoint_format = True
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -132,7 +131,7 @@ class WeightTransferManager:
         self._engine_inited = True
         logger.info("Weight transfer engine initialized (backend=%s)", self.backend)
 
-    async def start_update(self, is_checkpoint_format: bool = True) -> None:
+    async def start_update(self) -> None:
         """Begin a weight update. Trainers call this once per RL step."""
         if not self._engine_inited:
             raise WeightTransferStateError(
@@ -145,11 +144,7 @@ class WeightTransferManager:
                 "/finish_weight_update before starting another."
             )
         self._update_active = True
-        self._is_checkpoint_format = bool(is_checkpoint_format)
-        logger.info(
-            "Weight update started (is_checkpoint_format=%s)",
-            self._is_checkpoint_format,
-        )
+        logger.info("Weight update started")
 
     async def update(self, update_info: dict[str, Any]) -> None:
         """Receive one chunk of weights (metadata in ``update_info``)."""
@@ -190,9 +185,10 @@ class WeightTransferManager:
                 "No active weight update to finish; call /start_weight_update first."
             )
         self._update_active = False
-        # A worker-side layerwise-reload finalize (when is_checkpoint_format is
-        # set) lives on the (deferred) worker path. Cache invalidation is handled
-        # by the update step's flush_cache.
+        # A worker-side layerwise-reload finalize lives on the (deferred) worker
+        # path; the checkpoint-format flag will be threaded through start_update
+        # when that lands. Cache invalidation is handled by the update step's
+        # flush_cache.
         logger.info("Weight update finished")
 
     # ------------------------------------------------------------------ #

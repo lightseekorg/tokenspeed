@@ -109,9 +109,10 @@ async def init_weight_transfer_engine(raw_request: Request) -> JSONResponse:
 
 @router.post("/start_weight_update")
 async def start_weight_update(raw_request: Request) -> JSONResponse:
-    body = await _read_json(raw_request)
-    is_checkpoint_format = body.get("is_checkpoint_format", True)
-    await _manager(raw_request).start_update(is_checkpoint_format=is_checkpoint_format)
+    # The body may carry `is_checkpoint_format`; it is accepted for API
+    # compatibility and ignored (the worker-side layerwise reload it would drive
+    # is deferred), so the body is not inspected.
+    await _manager(raw_request).start_update()
     return JSONResponse(content={"message": "Weight update started"})
 
 
