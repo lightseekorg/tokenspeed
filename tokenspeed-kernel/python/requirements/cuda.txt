@@ -1,7 +1,7 @@
 -r common.txt
 nvidia-cutlass-dsl
 torch==2.11.0
-flashinfer-python==0.6.11
-flashinfer-cubin==0.6.11
+flashinfer-python==0.6.11.post3
+flashinfer-cubin==0.6.11.post3
 nvidia-ml-py==13.580.82
 nvtx
