@@ -1113,8 +1113,8 @@ class MambaAttnBackend(AttentionBackend):
                         and head_v_dim == head_k_dim
                     ):
                         raise RuntimeError(
-                            "GDN prefill requires the flashinfer sm100 fast-path "
-                            "(sm100 + CUDA 13 + bf16 + head_dim=128 + "
+                            "GDN prefill requires the flashinfer Blackwell fast-path "
+                            "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
                             "head_v == head_k + num_v >= num_q). Got "
                             f"dtype={query.dtype}, head_k={head_k_dim}, "
                             f"head_v={head_v_dim}, num_q={num_heads}, "

@@ -17,8 +17,9 @@
 
 """FlashInfer Blackwell (sm100) gated delta net chunked prefill.
 
-Fast-path for GDN prefill on sm100 + CUDA 13 + bf16 + head_dim==128. The caller
-gates on ``is_supported`` and must fail fast when the fast-path is unavailable;
+Fast-path for GDN prefill on Blackwell (sm100/sm103) + CUDA 13 + bf16 +
+head_dim==128. The caller gates on ``is_supported`` and must fail fast when the
+fast-path is unavailable;
 this module has no Triton fallback.
 
 Convention vs the Triton FLA path (verified equal to bf16 on B200):
@@ -51,12 +52,16 @@ if current_platform().is_nvidia:
 
         _chunk_gated_delta_rule = _fi_chunk
         _p = current_platform()
-        _sm = _p.arch_version.major * 10 + _p.arch_version.minor
         _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-        # flashinfer raises NotImplementedError on sm100 when CUDA<13 or the
-        # wheel lacks the Blackwell prefill kernel; gate here so the caller
-        # does not commit to a fast-path that crashes at call time.
-        _AVAILABLE = _sm == 100 and _cuda_major >= 13 and _fi_has_blackwell_prefill
+        # flashinfer's gdn_prefill treats any compute-capability major 10 as the
+        # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
+        # prefill kernel being present; it raises NotImplementedError otherwise.
+        # Mirror that here so the caller does not commit to a crashing fast-path.
+        _AVAILABLE = (
+            _p.arch_version.major == 10
+            and _cuda_major >= 13
+            and _fi_has_blackwell_prefill
+        )
     except ImportError:
         _AVAILABLE = False
 
