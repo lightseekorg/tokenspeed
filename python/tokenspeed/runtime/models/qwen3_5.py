@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -95,7 +96,10 @@ from tokenspeed.runtime.multimodal.embedder import (
     VisionEmbedder,
     pad_input_tokens,
 )
-from tokenspeed.runtime.multimodal.encoder_cudagraph import EncoderCudaGraphWrapper
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+    EncoderCudaGraphWrapper,
+    VisionEncoderCudaGraphAdapter,
+)
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -106,6 +110,8 @@ from tokenspeed.runtime.utils import (
     make_layers,
     set_weight_attrs,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
 
@@ -1179,7 +1185,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             )
             self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
+            # Encoder callables may be swapped to cudagraph wrappers by
+            # ModelExecutor.
             self.vision_embedder = VisionEmbedder()
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
@@ -1207,7 +1214,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         return self.post_encode([encoded], grid)
 
     def get_video_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
-        """Eager video encode; videos never go through the cudagraph wrapper."""
+        """Eager video encode; the cudagraph path uses the same pre/post hooks."""
         tokens, grid = self.pre_encode(items, grid_attr="video_grid_thw")
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
@@ -1238,22 +1245,62 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         """Eager step after the captured region; returns features."""
         return torch.cat(encoder_outs, dim=0)
 
-    def make_encoder_cudagraph_wrapper(self, mapping):
+    def _build_encoder_cudagraph_wrapper(
+        self,
+        mapping,
+        *,
+        modality_name: str,
+        grid_attr: str,
+        max_metadata_sequences_per_batch: int | None = None,
+        metadata_sequence_budget_from_encoder_output_budget: bool = False,
+    ):
         # Captured region is ``Qwen3VLMoeVisionModel.forward_blocks`` (blocks +
         # deepstack mergers + merger); the merger applies a
         # ``spatial_merge_size ** 2`` token reduction, so budgets count
         # post-merge tokens while the capture input buffer holds
         # ``spatial_merge_size ** 2 * budget`` patches.
-        return EncoderCudaGraphWrapper(
-            mapping=mapping,
+        adapter = VisionEncoderCudaGraphAdapter(
             tower=self.visual,
-            pre_encode=self.pre_encode,
+            pre_encode=partial(self.pre_encode, grid_attr=grid_attr),
             post_encode=self.post_encode,
             out_div=self.visual.spatial_merge_size**2,
             merge=self.visual.spatial_merge_size,
-            budget_range=(64, 4096),
             input_feature_shape=(1, self.visual.hidden_size),
+            modality_name=modality_name,
+            capture_tp_size=mapping.vision.tp_size,
+            capture_tp_group=mapping.vision.tp_group,
         )
+        return EncoderCudaGraphWrapper(
+            adapter=adapter,
+            budget_range=(64, 4096),
+            max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
+            metadata_sequence_budget_from_encoder_output_budget=(
+                metadata_sequence_budget_from_encoder_output_budget
+            ),
+        )
+
+    def make_encoder_cudagraph_wrappers(self, mapping):
+        max_video_metadata_sequences = (
+            envs.TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH.get()
+        )
+        if max_video_metadata_sequences is not None:
+            max_video_metadata_sequences = max(1, max_video_metadata_sequences)
+        return {
+            "image_encoder": self._build_encoder_cudagraph_wrapper(
+                mapping,
+                modality_name="image",
+                grid_attr="image_grid_thw",
+            ),
+            "video_encoder": self._build_encoder_cudagraph_wrapper(
+                mapping,
+                modality_name="video",
+                grid_attr="video_grid_thw",
+                max_metadata_sequences_per_batch=max_video_metadata_sequences,
+                metadata_sequence_budget_from_encoder_output_budget=(
+                    max_video_metadata_sequences is None
+                ),
+            ),
+        }
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

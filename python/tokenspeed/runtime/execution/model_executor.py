@@ -407,21 +407,33 @@ class ModelExecutor:
         # Clear the residue so pool slots reused by real requests start clean.
         self.runtime_states.future_input_map.zero_()
 
-        # Encoder CUDA graph: install the model-built wrapper by overriding
-        # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
-        # ``CudaGraphWrapper``.
-        self.encoder_graph_wrapper = None
+        # Encoder CUDA graph: install model-built wrappers by overriding
+        # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
+        # Multimodal-encoder analogue of ``forward_step``'s ``CudaGraphWrapper``.
+        self.encoder_graph_wrappers = {}
         _mm_model = self.model_runner.model
         if (
-            hasattr(_mm_model, "make_encoder_cudagraph_wrapper")
+            hasattr(_mm_model, "make_encoder_cudagraph_wrappers")
             and getattr(_mm_model, "is_multimodal_active", True)
             and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
             and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
         ):
-            self.encoder_graph_wrapper = _mm_model.make_encoder_cudagraph_wrapper(
+            self.encoder_graph_wrappers = _mm_model.make_encoder_cudagraph_wrappers(
                 _mm_model.mapping
             )
-            _mm_model.image_encoder = self.encoder_graph_wrapper
+
+            active_encoder_graph_wrappers = {}
+            for encoder_attr, wrapper in self.encoder_graph_wrappers.items():
+                if not hasattr(_mm_model, encoder_attr):
+                    logger.warning(
+                        "Skipping encoder CUDA graph wrapper for missing attribute %s",
+                        encoder_attr,
+                    )
+                    continue
+                setattr(_mm_model, encoder_attr, wrapper)
+                active_encoder_graph_wrappers[encoder_attr] = wrapper
+
+            self.encoder_graph_wrappers = active_encoder_graph_wrappers
 
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
