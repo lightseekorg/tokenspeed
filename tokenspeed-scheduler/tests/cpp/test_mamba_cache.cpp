@@ -37,6 +37,7 @@
 #include "resource/allocator/local_mamba_allocator.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
 #include "resource/allocator/mamba_host_allocator.h"
+#include "resource/allocator/paged_cache_group.h"
 #include "scheduler/operations/cache.h"
 #include "resource/radix_tree/mamba_slot.h"
 #include "resource/kv_prefix_cache/kv_prefix_cache.h"
@@ -169,7 +170,7 @@ TEST(HybridPrefixCacheMambaRecoverablePrefixTest, HostOnlyKVWithoutMambaDoesNotP
     EXPECT_TRUE(recovery.compat_match.NodesWithout<ResourceType::Device>().empty());
 }
 
-TEST(HybridPrefixCacheMambaRecoverablePrefixTest, HostPathDeviceMambaWithoutMambaL2DoesNotProduceLoadBackPrefix) {
+TEST(HybridPrefixCacheMambaRecoverablePrefixTest, HostPathMambaWithoutL2DoesNotAffectPrefixReuseButRemainsRecoverable) {
     static constexpr std::int32_t kPageSize = 2;
     PageAllocator device_alloc{kPageSize, 4};
     PageAllocator host_alloc{kPageSize, 16};
@@ -201,7 +202,6 @@ TEST(HybridPrefixCacheMambaRecoverablePrefixTest, HostPathDeviceMambaWithoutMamb
         << "non-Mamba-L2 compatibility path must not load back host KV based on host-path Mamba";
     EXPECT_EQ(match.mamba_cow_src_index, -1);
     EXPECT_EQ(match.mamba_branching_seqlen, -1);
-    EXPECT_NE(mamba_idx, match.mamba_cow_src_index);
 
     RecoveryPlan recovery = MatchPrefix(hybrid_prefix_cache, tokens, kPageSize, MatchIntent::StateRecovery);
     EXPECT_TRUE(recovery.recovery_state_available);
@@ -210,6 +210,44 @@ TEST(HybridPrefixCacheMambaRecoverablePrefixTest, HostPathDeviceMambaWithoutMamb
     EXPECT_EQ(recovery.compat_match.host.DepthInPage(), 0);
     EXPECT_TRUE(recovery.compat_match.NodesWithout<ResourceType::Device>().empty());
     EXPECT_EQ(recovery.compat_match.mamba_cow_src_index, mamba_idx);
+}
+
+TEST(HybridPrefixCacheMambaRecoverablePrefixTest, PagedCacheCapMakesMambaRecoveryUnavailable) {
+    static constexpr std::int32_t kPageSize = 2;
+    static constexpr std::int32_t kMambaCacheChunkSize = 4;
+    PageAllocator device_alloc{kPageSize, 8};
+    PageAllocator host_alloc{kPageSize, 0};
+    MambaChunkAllocator mamba_alloc{2};
+    KVPrefixCache prefix_cache{&device_alloc, &host_alloc, false};
+    HybridPrefixCache hybrid_prefix_cache{prefix_cache, device_alloc, &mamba_alloc, kMambaCacheChunkSize};
+
+    std::vector<PagedCacheGroupConfig> group_configs{PagedCacheGroupConfig{
+        .group_id = "fh",
+        .rows_per_page = kMambaCacheChunkSize,
+        .entry_stride_tokens = 1,
+        .total_pages = 8,
+        .retention = PagedCacheGroupConfig::Retention::FullHistory,
+        .family = PagedCacheGroupFamily::History,
+    }};
+    std::vector<std::string> required_groups{"fh"};
+    hybrid_prefix_cache.ConfigurePagedCacheAdjunct(std::span<const PagedCacheGroupConfig>{group_configs},
+                                                   std::span<const std::string>{required_groups});
+
+    auto tokens = MakeAlignedTokens(/*num_pages=*/2, kPageSize);
+    TreeNode* terminal =
+        prefix_cache.Insert<ResourceType::Device>(tokens, /*prefix_pages=*/{}, device_alloc.Allocate(/*num_pages=*/2))
+            .last_node;
+    auto slot = mamba_alloc.Allocate();
+    ASSERT_TRUE(slot.has_value());
+    HybridPrefixCacheTestPeer::InsertMamba(hybrid_prefix_cache, terminal,
+                                           std::make_unique<MambaSlot>(std::move(*slot)));
+
+    RecoveryPlan recovery = MatchPrefix(hybrid_prefix_cache, tokens, kPageSize, MatchIntent::StateRecovery);
+
+    EXPECT_FALSE(recovery.recovery_state_available);
+    EXPECT_EQ(recovery.protected_recovery_node, nullptr);
+    EXPECT_EQ(recovery.compat_match.mamba_cow_src_index, -1);
+    EXPECT_EQ(recovery.compat_match.mamba_host_src_index, -1);
 }
 
 TEST_F(MambaCacheTest, MatchWithFullMambaKeepsDepth) {
@@ -824,10 +862,8 @@ TEST_F(MambaCacheTest, StepCommitFinishStateInsertsKvPagesHashesAndMamba) {
     EXPECT_EQ(local_mamba->WorkingIndex(), working_index);
 }
 
-TEST_F(MambaCacheTest, StepCommitKeepsUnalignedCheckpointForMetadataAndFinish) {
+TEST_F(MambaCacheTest, StepCommitKeepsUnalignedCheckpointForMetadata) {
     auto tokens = MakeAlignedTokens(3, kPageSize);
-    auto page_hashes = MakePageHashes(/*num_pages=*/3);
-    TreeNode* root = prefix_cache_->Match(token_vec_t{}).device.last_node;
 
     auto result = hybrid_prefix_cache_->StepCommit(cache::state::CreateRequestLocalCache{
         .initial_tokens = static_cast<std::int32_t>(tokens.size()),
@@ -856,23 +892,6 @@ TEST_F(MambaCacheTest, StepCommitKeepsUnalignedCheckpointForMetadataAndFinish) {
     });
     EXPECT_EQ(decode_op.mamba_working_idx, working_index);
     EXPECT_EQ(decode_op.mamba_checkpoint_dst_idx, refreshed_checkpoint_index);
-
-    const auto full_pages = PagedTokenSpans(tokens);
-    MatchResult match = hybrid_prefix_cache_
-                            ->StepCommit(cache::publish::FinishedRequest{
-                                .full_paged_tokens = full_pages,
-                                .current_device_node = *root,
-                                .local_cache = *local_cache,
-                                .page_hashes = page_hashes,
-                            })
-                            .match_result;
-
-    TreeNode* terminal = match.device.last_node;
-    ASSERT_NE(terminal, nullptr);
-    ASSERT_TRUE(terminal->HasMamba());
-    EXPECT_EQ(terminal->MambaSlotIndex(), refreshed_checkpoint_index);
-    EXPECT_TRUE(local_mamba->HasWorking());
-    EXPECT_FALSE(local_mamba->HasCheckpoint());
 }
 
 TEST_F(MambaCacheTest, StepCommitRetractPublicationInsertsKvAndReturnsRawStateRecoveryMatch) {

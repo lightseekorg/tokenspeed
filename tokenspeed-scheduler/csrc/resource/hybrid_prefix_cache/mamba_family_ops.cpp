@@ -65,6 +65,9 @@ HybridPrefixCache::DecodeFromRetractedRecovery HybridPrefixCache::PrepareDecodeF
     MatchResult& match_result) const {
     if (!HasMambaAdjunct()) return {};
 
+    match_result.mamba_cow_src_index = -1;
+    match_result.mamba_host_src_index = -1;
+
     const std::int32_t page_size =
         match_result.device.page_size > 0 ? match_result.device.page_size : match_result.host.page_size;
     TreeNode* mamba_recovery_node = FindLastMambaNode(match_result.device.last_node);

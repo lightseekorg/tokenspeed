@@ -132,11 +132,12 @@ RecoveryPlan HybridPrefixCache::BuildRecoveryPlan(MatchResult raw_match, MatchIn
         augmentMatch(plan.compat_match);
         augmentMatchPagedCache(plan.compat_match);
 
-        const DecodeFromRetractedRecovery recovery = PrepareDecodeFromRetractedRecovery(raw_recovery_match);
+        MatchResult& recovery_match = HasPagedCacheAdjunct() ? plan.compat_match : raw_recovery_match;
+        const DecodeFromRetractedRecovery recovery = PrepareDecodeFromRetractedRecovery(recovery_match);
         plan.recovery_state_available = recovery.ok;
         plan.protected_recovery_node = recovery.protected_source_node;
-        plan.compat_match.mamba_cow_src_index = raw_recovery_match.mamba_cow_src_index;
-        plan.compat_match.mamba_host_src_index = raw_recovery_match.mamba_host_src_index;
+        plan.compat_match.mamba_cow_src_index = recovery_match.mamba_cow_src_index;
+        plan.compat_match.mamba_host_src_index = recovery_match.mamba_host_src_index;
         return plan;
     }
 
