@@ -166,3 +166,71 @@ class ModelRunner:
             out_cache_loc,
             **kwargs,
         )
+
+    # ------------------------------------------------------------------ #
+    # RL online weight sync: receive NCCL-broadcast weights from a trainer.
+    #
+    # Mirrors the slime/SGLang sender contract: the trainer occupies ranks
+    # ``0..rank_offset-1`` and each inference worker joins at
+    # ``rank_offset + global_rank``. The trainer broadcasts each named weight
+    # from rank 0 (in ``names`` order); this worker receives in the same order
+    # and applies via the model's ``load_weights`` (the same name->param mapping,
+    # including fused/stacked params, used by the initial load).
+    # ------------------------------------------------------------------ #
+
+    def init_weights_update_group(self, obj) -> tuple[bool, str]:
+        """Join the trainer's NCCL weight-update group (stateless, out-of-band)."""
+        from tokenspeed.runtime.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator,
+        )
+        from tokenspeed.runtime.distributed.utils import StatelessProcessGroup
+
+        try:
+            rank = int(obj.rank_offset) + self.global_rank
+            device = torch.device(f"cuda:{self.gpu_id}")
+            pg = StatelessProcessGroup.create(
+                host=str(obj.master_address),
+                port=int(obj.master_port),
+                rank=rank,
+                world_size=int(obj.world_size),
+            )
+            self._weight_update_comm = PyNcclCommunicator(group=pg, device=device)
+            logger.info(
+                "weight-update group joined: rank=%d world_size=%d device=%s",
+                rank,
+                obj.world_size,
+                device,
+            )
+            return True, "weight update group initialized"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("init_weights_update_group failed")
+            return False, str(e)
+
+    def update_weights_from_distributed(self, obj) -> tuple[bool, str]:
+        """Receive broadcast weights from the trainer and load them in place."""
+        comm = getattr(self, "_weight_update_comm", None)
+        if comm is None:
+            return False, "weight update group not initialized"
+        try:
+            names = list(obj.names)
+            dtype_names = list(obj.dtype_names)
+            shapes = [tuple(s) for s in obj.shapes]
+
+            def _recv():
+                # NCCL broadcasts are ordered collectives: issue them in the same
+                # order as the trainer's sender, and sync the comm stream before
+                # yielding so load_weights reads fully-received data.
+                with comm.change_state(enable=True):
+                    for name, dtype_name, shape in zip(names, dtype_names, shapes):
+                        buf = torch.empty(
+                            shape, dtype=getattr(torch, dtype_name), device=comm.device
+                        )
+                        comm.broadcast(buf, src=0)
+                        comm.stream.synchronize()
+                        yield name, buf
+
+            self.model.load_weights(_recv())
+            return True, f"updated {len(names)} weights"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_distributed failed")
+            return False, str(e)
