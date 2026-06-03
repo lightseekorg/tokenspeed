@@ -265,6 +265,12 @@ private:
     // Commit newly-written full LCM segments into TreeNode PagedCacheSnapshots.
     void CommitChunk(const std::string& request_id, TreeNode* terminal);
 
+    void RefreshPagedCacheSnapshotCompleteness(PagedCacheSnapshot& snapshot) const;
+    bool adoptExistingPagedCacheSnapshot(PagedCacheSnapshot& existing,
+                                         std::map<std::string, PagedCacheGroupTable>& tables, std::int32_t target);
+    bool commitTerminalContinuationSnapshot(std::map<std::string, PagedCacheGroupTable>& tables, TreeNode* terminal,
+                                            std::int32_t target);
+
     // Attach a snapshot to `node`, computing `complete_families` from which
     // required-per-family group ids are present and registering the node in
     // `paged_cache_snapshot_nodes_`. Returns false when either argument is
@@ -325,9 +331,11 @@ private:
     // Subset of `paged_cache_required_groups_` partitioned by family.
     std::vector<std::string> paged_cache_history_groups_;
     std::vector<std::string> paged_cache_state_groups_;
+    std::vector<std::string> paged_cache_continuation_state_groups_;
     // Fast hot-path lookup mirrors of the above (filled in EnablePagedCacheAdjunct).
     std::unordered_set<std::string> paged_cache_history_group_set_;
     std::unordered_set<std::string> paged_cache_state_group_set_;
+    std::unordered_set<std::string> paged_cache_continuation_state_group_set_;
     StateRestorePolicy paged_cache_state_policy_{StateRestorePolicy::kSnapshotRequired};
 
     // Snapshot pruning currently rebuilds an age-ordered candidate list per prune.
