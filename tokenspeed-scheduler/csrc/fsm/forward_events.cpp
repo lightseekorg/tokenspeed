@@ -250,7 +250,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     }
 }
 
-// PrefillDone -> Decoding: transition to decode, publishing hybrid adjunct state when needed.
+// PrefillDone -> Decoding: insert prefill pages into tree, then transition to decode.
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
@@ -263,15 +263,8 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
         paged_tokens.resize(end_of_window_pages);
     }
-    // Non-hybrid requests publish completed prefill chunks above, but keep the
-    // final prefill chunk local until FinishEvent. Publishing it while the
-    // producer is entering decode lets concurrent followers reuse KV that is
-    // still in the producer's live decode path.
-    if (hybrid_prefix_cache_ != nullptr) {
-        InsertPrefixCache(kv_prefix_cache_, hybrid_prefix_cache_, paged_tokens, device_node_ref,
-                          local_kv_allocator.get(), local_mamba_allocator.get(), state.window.begin,
-                          state.window.size, state.GetPageSize());
-    }
+    InsertPrefixCache(kv_prefix_cache_, hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
+                      local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
     // Allocate fresh checkpoint for decode-phase mamba state tracking
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
         if (!local_mamba_allocator->AllocateCheckpoint()) {

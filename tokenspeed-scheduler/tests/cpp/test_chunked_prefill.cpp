@@ -102,7 +102,7 @@ TEST_F(ChunkedPrefillTestSuite, CompletedChunk_IsVisibleToPrefixCacheWithoutHybr
     EXPECT_EQ(fwd->extend_prefix_lens[0], 4);
 }
 
-TEST_F(ChunkedPrefillTestSuite, SamePlanPublishedChunk_IsNotVisibleToNewFirstChunk) {
+TEST_F(ChunkedPrefillTestSuite, SamePlanPublishedChunk_IsDeferredThenImportedNextPlan) {
     Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4, 5, 6}});
     PlanOnce();  // r1 chunk 1
 
@@ -118,54 +118,17 @@ TEST_F(ChunkedPrefillTestSuite, SamePlanPublishedChunk_IsNotVisibleToNewFirstChu
     }
     ASSERT_LT(r2_index, fwd->request_ids.size());
     EXPECT_EQ(fwd->extend_prefix_lens[r2_index], 0);
-}
+    ASSERT_FALSE(fwd->occupied_pages[r2_index].empty());
+    const auto local_first_page = fwd->occupied_pages[r2_index][0];
 
-TEST_F(ChunkedPrefillTestSuite, PrefixDedup_RewritesRequestTableFromFirstChangedPage) {
-    Submit(MakeRequestSpec("warm", 2));
-    PlanOnce();  // Submitted -> PrefillDone, final chunk not published.
-    PlanOnce();  // PrefillDone -> Decoding.
-    SendForwardDone("warm", {42});
-    Submit(MakeRequestSpec("reuse", 4));
-
-    auto first_plan = PlanOnce();
-    auto* first = GetForwardOp(first_plan);
-    ASSERT_NE(first, nullptr);
-    ASSERT_EQ(first->occupied_pages.size(), 1u);
-    ASSERT_GE(first->occupied_pages[0].size(), 2u);
-    const auto local_first_page = first->occupied_pages[0][0];
-
-    SendFinish("warm");
-
-    auto second_plan = PlanOnce();
-    auto* second = GetForwardOp(second_plan);
-    ASSERT_NE(second, nullptr);
-    ASSERT_EQ(second->occupied_pages.size(), 1u);
-    ASSERT_GE(second->occupied_pages[0].size(), 2u);
-
-    EXPECT_EQ(second->begins[0], 0);
-    EXPECT_EQ(second->sizes[0], static_cast<std::int32_t>(second->occupied_pages[0].size()));
-    EXPECT_NE(second->occupied_pages[0][0], local_first_page);
-}
-
-TEST_F(ChunkedPrefillTestSuite, FinalChunk_IsNotPublishedOnDecodeTransitionWithoutHybridCache) {
-    Submit(MakeRequestSpec("warm", 4));  // 8 prompt tokens, two 4-token chunks
-    PlanOnce();                          // chunk 1
-    PlanOnce();                          // chunk 2, publishes chunk 1
-
-    auto decode_plan = PlanOnce();  // transitions to decode without publishing chunk 2
-    auto* decode = GetForwardOp(decode_plan);
-    ASSERT_NE(decode, nullptr);
-    ASSERT_EQ(decode->request_ids.size(), 1u);
-    ASSERT_EQ(decode->request_ids[0], "warm");
-
-    Submit(MakeRequestSpec("reuse", 4));
-    auto reuse_plan = PlanOnce();
-    auto* reuse_forward = GetForwardOp(reuse_plan);
-    ASSERT_NE(reuse_forward, nullptr);
-    ASSERT_EQ(reuse_forward->request_ids.size(), 1u);
-    ASSERT_EQ(reuse_forward->request_ids[0], "reuse");
-    EXPECT_EQ(reuse_forward->extend_prefix_lens[0], 4);
-    EXPECT_EQ(reuse_forward->input_lengths[0], 4);
+    auto next_plan = PlanOnce();  // r2 imports r1's already-published chunk 1.
+    auto* next = GetForwardOp(next_plan);
+    ASSERT_NE(next, nullptr);
+    ASSERT_EQ(next->request_ids.size(), 1u);
+    EXPECT_EQ(next->request_ids[0], "r2");
+    EXPECT_EQ(next->begins[0], 0);
+    EXPECT_EQ(next->sizes[0], static_cast<std::int32_t>(next->occupied_pages[0].size()));
+    EXPECT_NE(next->occupied_pages[0][0], local_first_page);
 }
 
 TEST_F(ChunkedPrefillTestSuite, InputIds_CorrectPerChunk) {

@@ -36,7 +36,7 @@ public:
     };
 
     TokenContainer(const std::vector<std::int32_t>& new_tokens)
-        : tokens_{new_tokens}, num_prefill_tokens_(new_tokens.size()){};
+        : tokens_{new_tokens}, num_prefill_tokens_(new_tokens.size()) {};
 
     TokenContainer(const TokenContainer&) = delete;
     TokenContainer& operator=(const TokenContainer&) = delete;

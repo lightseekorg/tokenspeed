@@ -91,12 +91,8 @@ struct StableMatch {
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
-    std::map<std::string, std::int32_t>& simulated_free, const MatchResult* stable_match) {
+    std::map<std::string, std::int32_t>& simulated_free, MatchResult match_result) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    MatchResult match_result = stable_match != nullptr
-                                   ? *stable_match
-                                   : (hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
-                                                           : kv_prefix_cache_.Match(request->GetFullPagedTokens(true)));
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
@@ -627,10 +623,9 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
             std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
 
-            auto match = stable_matches.find(request);
-            const MatchResult* stable_match = match == stable_matches.end() ? nullptr : &match->second.match;
-            if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
-                                                    config_.disable_l2_cache, simulated_free, stable_match)) {
+            if (auto ev =
+                    schedulePrefillFirstChunk(request, token_budget, decode_input_tokens, config_.disable_l2_cache,
+                                              simulated_free, stable_matches.at(request).match)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
