@@ -358,7 +358,7 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
 
     The control plane is ungated (always on); ensure ``--rl-control-port``
     is present in the engine argv (allocating a free port if the user did not pin
-    one) and return the matching ``engine_http_url``.
+    one) and return the matching ``rl_control_url``.
     """
     if "--rl-control-port" in engine_args:
         idx = engine_args.index("--rl-control-port")
@@ -372,7 +372,7 @@ async def _start_control_server(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
-    engine_http_url: str = "",
+    rl_control_url: str = "",
     host: str,
     port: int,
     timeout: float = 30.0,
@@ -391,7 +391,7 @@ async def _start_control_server(
     server = build_server(
         gateway_url=gateway_url,
         engine_grpc_addr=engine_grpc_addr,
-        engine_http_url=engine_http_url,
+        rl_control_url=rl_control_url,
         host=host,
         port=port,
     )
@@ -495,7 +495,7 @@ async def run_smg(
 
         # Wire the in-engine RL control-plane port (always on). Must happen
         # before spawn_engine.
-        engine_args, engine_http_url = _add_rl_control_port(engine_args)
+        engine_args, rl_control_url = _add_rl_control_port(engine_args)
 
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))
@@ -534,7 +534,7 @@ async def run_smg(
         control_ok = await _start_control_server(
             gateway_url=f"http://{user_host}:{user_port}",
             engine_grpc_addr=f"127.0.0.1:{engine_port}",
-            engine_http_url=engine_http_url,
+            rl_control_url=rl_control_url,
             host=user_host,
             port=control_port,
         )

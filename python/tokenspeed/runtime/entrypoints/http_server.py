@@ -56,7 +56,7 @@ _engine_grpc_addr: str = ""
 # Base URL of the in-engine RL weight-sync control plane. The orchestrator
 # always sets this for `ts serve`; if it is ever empty the weight routes return
 # 503 (the public surface still advertises the paths).
-_engine_http_url: str = ""
+_rl_control_url: str = ""
 _grpc_channel: grpc.aio.Channel | None = None
 _grpc_stub: pb_grpc.TokenSpeedSchedulerStub | None = None
 
@@ -254,57 +254,57 @@ async def stop_profile(request: Request):
 # travel out-of-band (NCCL / CUDA-IPC); only metadata flows through here. The
 # control plane runs inside the engine process next to AsyncLLM (see
 # runtime/entrypoints/weight_transfer_http.py); the sidecar proxies to it on
-# _engine_http_url.
+# _rl_control_url.
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_to_engine(request: Request) -> StreamingResponse | Response:
-    if not _engine_http_url:
+async def _proxy_to_rl_control(request: Request) -> StreamingResponse | Response:
+    if not _rl_control_url:
         return JSONResponse(
             {"error": "weight-sync control plane is unavailable on this server"},
             status_code=503,
         )
-    return await _proxy_request(request, base_url=_engine_http_url)
+    return await _proxy_request(request, base_url=_rl_control_url)
 
 
 @app.post("/init_weight_transfer_engine")
 async def init_weight_transfer_engine(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/start_weight_update")
 async def start_weight_update(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/update_weights")
 async def update_weights(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/finish_weight_update")
 async def finish_weight_update(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/pause")
 async def pause(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/resume")
 async def resume(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.get("/get_world_size")
 async def get_world_size(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.get("/is_paused")
 async def is_paused(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 # ---------------------------------------------------------------------------
@@ -312,71 +312,71 @@ async def is_paused(request: Request):
 #
 # These routes are mounted on the same in-engine RL control app as the
 # vLLM-native endpoints (runtime/entrypoints/sglang_compat_http.py), so they
-# proxy to the same _engine_http_url. Endpoint names/fields match SGLang so
+# proxy to the same _rl_control_url. Endpoint names/fields match SGLang so
 # slime/miles and verl's SGLang rollout drive tokenspeed unchanged.
 # ---------------------------------------------------------------------------
 
 
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/destroy_weights_update_group")
 async def destroy_weights_update_group(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/update_weights_from_distributed")
 async def update_weights_from_distributed(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/update_weights_from_tensor")
 async def update_weights_from_tensor(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/pause_generation")
 async def pause_generation(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/continue_generation")
 async def continue_generation(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/release_memory_occupation")
 async def release_memory_occupation(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/resume_memory_occupation")
 async def resume_memory_occupation(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.post("/abort_request")
 async def abort_request(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 # GET /flush_cache is SGLang's verb; POST /flush_cache (above) proxies to the
 # gateway. Both coexist on distinct methods.
 @app.get("/flush_cache")
 async def flush_cache_get(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 @app.get("/health_generate")
 async def health_generate(request: Request):
-    return await _proxy_to_engine(request)
+    return await _proxy_to_rl_control(request)
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +388,7 @@ def build_server(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
-    engine_http_url: str = "",
+    rl_control_url: str = "",
     host: str = "127.0.0.1",
     port: int = 8001,
 ) -> uvicorn.Server:
@@ -400,16 +400,16 @@ def build_server(
     Args:
         gateway_url: Base URL of the smg gateway for generation passthrough.
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
-        engine_http_url: Base URL of the in-engine RL control plane (vLLM-native
+        rl_control_url: Base URL of the in-engine RL control plane (vLLM-native
             + SGLang-compatible weight sync). Empty disables those routes (they
             return 503).
         host: Bind address.
         port: Bind port.
     """
-    global _gateway_url, _engine_grpc_addr, _engine_http_url
+    global _gateway_url, _engine_grpc_addr, _rl_control_url
     _gateway_url = gateway_url
     _engine_grpc_addr = engine_grpc_addr
-    _engine_http_url = engine_http_url
+    _rl_control_url = rl_control_url
     logger.info(
         "Starting TokenSpeed HTTP server on %s:%d "
         "(gateway: %s, engine gRPC: %s, weight transfer: %s)",
@@ -417,7 +417,7 @@ def build_server(
         port,
         gateway_url,
         engine_grpc_addr,
-        engine_http_url or "disabled",
+        rl_control_url or "disabled",
     )
     return uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="warning")
@@ -428,7 +428,7 @@ def start(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
-    engine_http_url: str = "",
+    rl_control_url: str = "",
     host: str = "127.0.0.1",
     port: int = 8001,
 ) -> None:
@@ -436,7 +436,7 @@ def start(
     build_server(
         gateway_url=gateway_url,
         engine_grpc_addr=engine_grpc_addr,
-        engine_http_url=engine_http_url,
+        rl_control_url=rl_control_url,
         host=host,
         port=port,
     ).run()
