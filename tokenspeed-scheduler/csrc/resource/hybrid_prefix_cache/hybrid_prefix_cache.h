@@ -43,6 +43,7 @@ namespace tokenspeed {
 class MambaChunkAllocator;
 class MambaHostAllocator;
 class ForwardOperationBase;
+struct PagedCacheSnapshot;
 
 class HybridPrefixCache {
 public:
@@ -75,8 +76,7 @@ public:
     // groups; state groups only need the trailing window. Sliding groups must
     // have a window entry; full-history groups must not.
     void EnablePagedCacheAdjunct(std::vector<std::string> required_groups,
-                                 std::unordered_map<std::string, std::int32_t> sliding_window_per_group,
-                                 StateRestorePolicy policy = StateRestorePolicy::kSnapshotRequired);
+                                 std::unordered_map<std::string, std::int32_t> sliding_window_per_group);
 
     bool HasMambaAdjunct() const { return mamba_allocator_ != nullptr; }
     bool HasPagedCacheAdjunct() const { return paged_cache_history_alignment_tokens_ > 0; }
@@ -152,6 +152,7 @@ private:
 
     struct PagedCacheGroupAdmission {
         bool ok{true};
+        std::unordered_set<std::string> failed_groups{};
         std::map<std::string, std::int32_t> releasable_owned_pages{};
         std::map<std::string, std::int32_t> new_pages_needed{};
     };
@@ -167,6 +168,12 @@ private:
     // Drop only state-family groups from `node`'s snapshot; history portion
     // remains and the node stays registered. Returns true iff state groups removed.
     bool DetachStateSnapshotFromNode(TreeNode* node);
+
+    void RefreshPagedCacheSnapshotCompleteness(PagedCacheSnapshot& snapshot) const;
+    bool adoptExistingPagedCacheSnapshot(PagedCacheSnapshot& existing,
+                                         std::map<std::string, PagedCacheGroupTable>& tables, std::int32_t target);
+    bool commitTerminalContinuationSnapshot(std::map<std::string, PagedCacheGroupTable>& tables, TreeNode* terminal,
+                                            std::int32_t target);
 
     void augmentMatch(MatchResult& match) const;
     void augmentMatchPagedCache(MatchResult& match) const;
@@ -212,10 +219,11 @@ private:
     // Subset of `paged_cache_required_groups_` partitioned by family.
     std::vector<std::string> paged_cache_history_groups_;
     std::vector<std::string> paged_cache_state_groups_;
+    std::vector<std::string> paged_cache_continuation_state_groups_;
     // Fast hot-path lookup mirrors of the above (filled in EnablePagedCacheAdjunct).
     std::unordered_set<std::string> paged_cache_history_group_set_;
     std::unordered_set<std::string> paged_cache_state_group_set_;
-    StateRestorePolicy paged_cache_state_policy_{StateRestorePolicy::kSnapshotRequired};
+    std::unordered_set<std::string> paged_cache_continuation_state_group_set_;
 
     // TODO(snapshot-lru-perf): O(N log N) per prune; swap in LRU index if profiling shows it matters.
     std::unordered_set<TreeNode*> paged_cache_snapshot_nodes_;

@@ -42,6 +42,10 @@ struct PagedCacheSnapshot {
     // Filled by HybridPrefixCache::AttachPagedCacheSnapshotToNode based on
     // which group ids landed in `groups` vs required-per-family lists.
     std::set<PagedCacheGroupFamily> complete_families;
+    // Terminal-only continuation state is independent from replay seed
+    // completeness: seed state can restore replay anchors, while this flag
+    // means the terminal chain can restore continuation-only State groups.
+    bool continuation_state_complete{false};
 
     bool IsCompleteFor(PagedCacheGroupFamily f) const { return complete_families.find(f) != complete_families.end(); }
 };

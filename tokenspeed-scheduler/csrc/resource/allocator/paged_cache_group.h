@@ -37,14 +37,10 @@ inline std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
     return (numer + denom - 1) / denom;
 }
 
-// Paged-cache group families for V4 prefix-cache reuse.
+// Paged-cache group families for paged-cache prefix reuse.
 // History: every page on [0, P) required (chain).
 // State: only the trailing window at the hit depth required.
 enum class PagedCacheGroupFamily { History, State };
-
-// Phase 1 only has kSnapshotRequired; kReplayTail / kCheckpointThenReplay
-// reserved for Phase 2 RecoveryPlan work.
-enum class StateRestorePolicy { kSnapshotRequired };
 
 // One model-defined paged cache group; scheduler treats group_id as opaque.
 struct PagedCacheGroupConfig {
@@ -135,11 +131,20 @@ public:
     // borrowed_page_ids_. Throws for non-History family groups.
     CommitResult CommitHistoryToSnapshot(std::int32_t target_raw_tokens);
 
+    // History adoption: discard local duplicate pages for [committed, target)
+    // and replace them with the canonical snapshot segment.
+    void AdoptSnapshotSegment(const std::vector<std::int32_t>& ids, std::int32_t target_raw_tokens);
+
     // State checkpoint: snapshot the live trailing window [max(0,target-W),
     // target); drop stale prefix from both owned (back to pool) and borrowed
     // (index drop only; physical pages live on earlier snapshots). Throws for
     // non-State family groups or when sliding_window_tokens is missing/non-positive.
     CommitResult CheckpointStateToSnapshot(std::int32_t target_raw_tokens);
+
+    // State adoption: replace local duplicate pages for the snapshot segment
+    // with canonical borrowed ids.
+    void AdoptStateSnapshotSegment(const std::vector<std::int32_t>& ids, std::int32_t base_logical_page,
+                                   std::int32_t target_raw_tokens);
 
     // Adopt borrowed page ids from a prefix-cache hit on a fresh-empty table.
     // Throws std::logic_error if called after Acquire/Import/Commit.
@@ -147,7 +152,8 @@ public:
                               std::int32_t raw_tokens_covered);
 
     // Sliding-only: drop front pages strictly below `window_lower_bound`.
-    // Bumps base_logical_page_; commit cursor untouched. Idempotent.
+    // On an empty table, advances base_logical_page_ so first allocation starts
+    // at the live sliding window. Commit cursor untouched. Idempotent.
     std::vector<std::int32_t> ReleaseSkipped(std::int32_t window_lower_bound);
 
     // Release everything; owned via RAII, borrowed by clearing. Used by finish/abort/retract.

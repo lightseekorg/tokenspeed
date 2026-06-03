@@ -840,6 +840,7 @@ class ModelExecutor:
                     gen_throughput,
                     num_queue_reqs,
                 )
+            self.token_to_kv_pool.maybe_log_paged_cache_group_pages()
             self.num_generated_tokens = 0
             self.num_decode_steps = 0
             self.last_decode_stats_tic = now

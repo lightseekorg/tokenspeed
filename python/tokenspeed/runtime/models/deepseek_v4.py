@@ -2784,17 +2784,18 @@ class DeepseekV4Compressor(nn.Module):
             if state_hit is not None:
                 state_slot_mapping, state_block_table = state_hit
             else:
-                if state_block_table is not None:
-                    state_slot_mapping = _group_slot_mapping_from_raw(
-                        positions,
-                        metadata.token_to_req_indices[: positions.numel()],
-                        state_block_table,
-                        state_block_size,
-                        base_offsets=state_base_logical_page,
+                if state_block_table is None:
+                    raise RuntimeError(
+                        "DeepSeek V4 missing paged-cache block table for compressor "
+                        f"state ratio={self.compress_ratio}"
                     )
-                else:
-                    state_block_table = cache_metadata.block_table
-                    state_slot_mapping = out_cache_loc
+                state_slot_mapping = _group_slot_mapping_from_raw(
+                    positions,
+                    metadata.token_to_req_indices[: positions.numel()],
+                    state_block_table,
+                    state_block_size,
+                    base_offsets=state_base_logical_page,
+                )
                 state_slot_mapping = _mask_invalid_graph_tokens(
                     state_slot_mapping,
                     valid_token,
@@ -3210,22 +3211,19 @@ class DeepseekV4Indexer(nn.Module):
             indexer_state_base_logical_page = (
                 cache_metadata.indexer_state_base_logical_page
             )
-            if indexer_state_block_table is not None:
-                indexer_state_block_size = pool.get_indexer_state_block_size(
-                    layer_index
+            if indexer_state_block_table is None:
+                raise RuntimeError(
+                    "DeepSeek V4 missing paged-cache block table for indexer "
+                    "compressor state"
                 )
-                indexer_state_slot_mapping = _group_slot_mapping_from_raw(
-                    positions,
-                    metadata.token_to_req_indices[: positions.numel()],
-                    indexer_state_block_table,
-                    indexer_state_block_size,
-                    base_offsets=indexer_state_base_logical_page,
-                )
-            else:
-                indexer_state_block_table = cache_metadata.block_table
-                indexer_state_block_size = pool.state_block_size
-                indexer_state_slot_mapping = out_cache_loc
-                indexer_state_base_logical_page = None
+            indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
+            indexer_state_slot_mapping = _group_slot_mapping_from_raw(
+                positions,
+                metadata.token_to_req_indices[: positions.numel()],
+                indexer_state_block_table,
+                indexer_state_block_size,
+                base_offsets=indexer_state_base_logical_page,
+            )
             indexer_state_slot_mapping = _mask_invalid_graph_tokens(
                 indexer_state_slot_mapping,
                 valid_token,

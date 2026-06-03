@@ -261,13 +261,10 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
-        is_deepseek_v4_pool = (
-            type(token_to_kv_pool).__name__ == "DeepseekV4TokenToKVPool"
-        )
-        if is_deepseek_v4_pool:
+        if not token_to_kv_pool.supports_hierarchical_kv_cache:
             if server_args.enable_kvstore:
                 raise NotImplementedError(
-                    "DeepSeek V4 baseline does not support hierarchical cache "
+                    "This KV cache pool does not support hierarchical cache "
                     "(kvstore); pass --disable-kvstore."
                 )
             self.memory_executor = None
@@ -353,6 +350,7 @@ class EventLoop:
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
                 server_args.kv_events_config,
