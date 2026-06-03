@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import NamedTuple
 
 import torch
@@ -691,11 +690,6 @@ def _mha_decode_reduce_fp16(
     cdna4.buffer_store(output, out_ptr, out_base + offs_d)
 
 
-_WAVE_TARGET = 2
-_MIN_PAGES_PER_SPLIT = 8
-_MIN_PAGE_SPLITS = 8
-
-
 def _select_num_kv_splits(
     *,
     batch: int,
@@ -710,21 +704,21 @@ def _select_num_kv_splits(
     leave each split with a handful of pages, so the reduce kernel dominates.
 
     Return the smaller of two candidate counts: splits_for_occupancy (enough to
-    fill ~_WAVE_TARGET waves of CUs) and splits_for_pages (~_MIN_PAGES_PER_SPLIT
-    pages per split, but at least min(_MIN_PAGE_SPLITS, num_pages) so a short
+    fill ~wave_target waves of CUs) and splits_for_pages (~min_pages_per_split
+    pages per split, but at least min(min_page_splits, num_pages) so a short
     context still splits without launching empty work).
     """
-    override = os.environ.get("TOKENSPEED_NUM_KV_SPLITS")
-    if override is not None:
-        return int(override) if int(override) > 1 else 1
+    wave_target = 2
+    min_pages_per_split = 8
+    min_page_splits = 8
 
     base_ctas = batch * num_kv_heads * num_groups
-    target_ctas = current_platform().sm_count * _WAVE_TARGET
+    target_ctas = current_platform().sm_count * wave_target
     splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas
-    splits_for_pages = num_pages // _MIN_PAGES_PER_SPLIT
-    min_page_splits = min(_MIN_PAGE_SPLITS, num_pages)
-    if splits_for_pages < min_page_splits:
-        splits_for_pages = min_page_splits
+    splits_for_pages = num_pages // min_pages_per_split
+    page_splits_floor = min(min_page_splits, num_pages)
+    if splits_for_pages < page_splits_floor:
+        splits_for_pages = page_splits_floor
     return min(splits_for_occupancy, splits_for_pages)
 
 
