@@ -34,7 +34,11 @@ from tokenspeed_kernel.ops.attention.gluon.utils import (
     max,
     maximum,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -317,8 +321,11 @@ class AttentionProgram:
     def load_page(self, start_n):
         cfg = self.cfg
         page_index = start_n // cfg.PAGE_SIZE
+        valid = start_n < self.split_end
         return gl.load(
-            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index
+            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index,
+            mask=valid,
+            other=0,
         )
 
     @gluon.jit
@@ -332,6 +339,7 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
+        # can't use buffer_load: paged KV offsets may exceed its 32-bit range.
         async_copy.global_load_to_shared(k_smem, self.k_cache_ptr + offsets)
         async_copy.commit_group()
 
@@ -346,6 +354,7 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
+        # can't use buffer_load: paged KV offsets may exceed its 32-bit range.
         async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)
         async_copy.commit_group()
 
@@ -499,19 +508,25 @@ def _mha_decode_fp16(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
-    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
-        physical_page = program.load_page(start_n)
-        program.issue_load_k(physical_page, k_smem)
-        program.issue_load_v(physical_page, v_smem)
-        async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-        qk = program.apply_kv_mask(qk, start_n)
-        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+    physical_page = program.load_page(program.split_start)
 
-        async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem)
-        acc = program.compute_pv(p, v, acc)
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        with gl.amd.warp_pipeline_stage("load", priority=1):
+            program.issue_load_k(physical_page, k_smem)
+            program.issue_load_v(physical_page, v_smem)
+            physical_page = program.load_page(start_n + cfg.BLOCK_N)
+
+        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
+            async_copy.wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            qk = program.apply_kv_mask(qk, start_n)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+        with gl.amd.warp_pipeline_stage("pv", priority=1):
+            async_copy.wait_group(0)
+            v = program.shared_load_v(v_smem)
+            acc = program.compute_pv(p, v, acc)
 
     program.store_split(acc, l_i, m_i)
 
@@ -675,6 +690,38 @@ def _mha_decode_reduce_fp16(
     cdna4.buffer_store(output, out_ptr, out_base + offs_d)
 
 
+def _select_num_kv_splits(
+    *,
+    batch: int,
+    num_kv_heads: int,
+    num_groups: int,
+    num_pages: int,
+) -> int:
+    """Pick num_kv_splits to balance occupancy against reduce overhead.
+
+    The launch grid is (batch * num_kv_heads * num_groups) * num_kv_splits
+    work-groups. Too few splits under-fill the machine at low batch; too many
+    leave each split with a handful of pages, so the reduce kernel dominates.
+
+    Return the smaller of two candidate counts: splits_for_occupancy (enough to
+    fill ~wave_target waves of CUs) and splits_for_pages (~min_pages_per_split
+    pages per split, but at least min(min_page_splits, num_pages) so a short
+    context still splits without launching empty work).
+    """
+    wave_target = 2
+    min_pages_per_split = 8
+    min_page_splits = 8
+
+    base_ctas = batch * num_kv_heads * num_groups
+    target_ctas = current_platform().sm_count * wave_target
+    splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas
+    splits_for_pages = num_pages // min_pages_per_split
+    page_splits_floor = min(min_page_splits, num_pages)
+    if splits_for_pages < page_splits_floor:
+        splits_for_pages = page_splits_floor
+    return min(splits_for_occupancy, splits_for_pages)
+
+
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
@@ -693,7 +740,7 @@ def get_config(
     *,
     q: torch.Tensor,
     k_cache: torch.Tensor,
-    page_table: torch.Tensor,
+    max_seqlen_k: int,
     window_left: int,
 ) -> LaunchConfig:
     head_dim = q.shape[2]
@@ -705,13 +752,21 @@ def get_config(
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     sm_scale = 1.0 / math.sqrt(head_dim)
+    effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
+    num_pages = (effective_seqlen_k + page_size - 1) // page_size
+    num_kv_splits = _select_num_kv_splits(
+        batch=q.shape[0],
+        num_kv_heads=k_cache.shape[2],
+        num_groups=num_groups,
+        num_pages=num_pages,
+    )
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
         num_groups=num_groups,
         head_dim=head_dim,
         page_size=page_size,
-        num_kv_splits=8,
+        num_kv_splits=num_kv_splits,
         block_m=block_m,
         block_n=block_n,
         sm_scale=sm_scale * _INV_LN2_VALUE,
@@ -760,7 +815,7 @@ def gluon_mha_decode_fp16_gfx950(
     config = get_config(
         q=q,
         k_cache=k_cache,
-        page_table=page_table,
+        max_seqlen_k=max_seqlen_k,
         window_left=window_left,
     )
 

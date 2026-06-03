@@ -363,6 +363,7 @@ class Eagle(BaseDrafter):
 
             with nvtx_range("draft_sample", color="yellow"):
                 draft_ids = cute_argmax(logits_output.next_token_logits)
+                draft_ids.clamp_(min=0)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
@@ -432,6 +433,7 @@ class Eagle(BaseDrafter):
         logits_output = self._run_first_step(bs, draft_input)
 
         draft_ids = cute_argmax(logits_output.next_token_logits)
+        draft_ids.clamp_(min=0)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         if self.spec_num_steps <= 1:
