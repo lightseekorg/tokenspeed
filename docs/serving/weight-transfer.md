@@ -14,10 +14,11 @@ Both dialects map to the same `AsyncLLM` weight methods. The heavy weight
 payloads travel **out-of-band** (NCCL broadcast or CUDA-IPC); the HTTP path only
 carries metadata (parameter names, shapes, dtypes, handles).
 
-## Enabling
+## Configuration
 
-The control plane is **on by default** and served on the public control port
-(the `ts serve` sidecar proxies it to the in-engine app):
+The control plane is **always on (ungated)** and served on the public control
+port (the `ts serve` sidecar proxies it to the in-engine app). There is no
+enable flag:
 
 ```bash
 tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
@@ -31,9 +32,9 @@ tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
 
 > ⚠️ **Security.** These endpoints can overwrite the served weights, reload a
 > checkpoint from any on-disk path, dial an arbitrary NCCL master, and
-> pause/abort serving. They are exposed on the control port by default. On an
-> untrusted network, disable them with **`--no-enable-weight-transfer`** or put
-> the control port behind auth / network controls.
+> pause/abort serving. They are **always exposed** on the control port (there is
+> no in-app disable). On an untrusted network, restrict the control port with
+> network controls / a reverse proxy with auth.
 
 ## Endpoints
 

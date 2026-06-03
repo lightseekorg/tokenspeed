@@ -50,15 +50,12 @@ class TestWeightTransferConfig:
             WeightTransferConfig.from_json('{"backend":"bogus"}')
 
 
-class TestServerArgsGating:
-    def test_enabled_by_default(self):
+class TestServerArgsConfig:
+    # The control plane is ungated (always on); no enable flag.
+    def test_no_enable_flag_attribute(self):
         sa = ServerArgs(model="m")
-        assert sa.enable_weight_transfer is True
-        assert sa.weight_transfer_enabled is True
-
-    def test_disabled_by_opt_out(self):
-        sa = ServerArgs(model="m", enable_weight_transfer=False)
-        assert sa.weight_transfer_enabled is False
+        assert not hasattr(sa, "enable_weight_transfer")
+        assert not hasattr(sa, "weight_transfer_enabled")
 
     def test_get_weight_transfer_config_default(self):
         sa = ServerArgs(model="m")
@@ -75,24 +72,19 @@ class TestServerArgsCli:
         ServerArgs.add_cli_args(parser)
         return ServerArgs.from_cli_args(parser.parse_args(argv))
 
-    def test_cli_flag_and_config(self):
+    def test_cli_config(self):
         sa = self._parse(
-            [
-                "--model",
-                "m",
-                "--weight-transfer-config",
-                '{"backend":"nccl"}',
-            ]
+            ["--model", "m", "--weight-transfer-config", '{"backend":"nccl"}']
         )
-        assert sa.enable_weight_transfer is True
-        assert sa.weight_transfer_enabled is True
         assert sa.get_weight_transfer_config().backend == "nccl"
 
-    def test_cli_default_on(self):
+    def test_cli_default_no_config(self):
         sa = self._parse(["--model", "m"])
-        assert sa.enable_weight_transfer is True
         assert sa.weight_transfer_config is None
 
-    def test_cli_opt_out(self):
-        sa = self._parse(["--model", "m", "--no-enable-weight-transfer"])
-        assert sa.enable_weight_transfer is False
+    def test_no_enable_flag_registered(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        opts = {o for a in parser._actions for o in a.option_strings}
+        assert "--enable-weight-transfer" not in opts
+        assert "--no-enable-weight-transfer" not in opts

@@ -353,25 +353,19 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
-def _maybe_add_weight_transfer_port(engine_args: list[str]) -> tuple[list[str], str]:
+def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     """Wire the in-engine RL control-plane port for the sidecar to proxy.
 
-    The control plane is **on by default**; ensure ``--weight-transfer-port`` is
-    present in the engine argv (allocating a free port if the user did not pin
-    one) and return the matching ``engine_http_url``. Disabled by
-    ``--no-enable-weight-transfer``, in which case the argv is returned unchanged
-    and an empty URL (weight routes report 503).
+    The control plane is ungated (always on); ensure ``--rl-control-port``
+    is present in the engine argv (allocating a free port if the user did not pin
+    one) and return the matching ``engine_http_url``.
     """
-    if "--no-enable-weight-transfer" in engine_args:
-        return engine_args, ""
-    if "--weight-transfer-port" in engine_args:
-        idx = engine_args.index("--weight-transfer-port")
+    if "--rl-control-port" in engine_args:
+        idx = engine_args.index("--rl-control-port")
         port = int(engine_args[idx + 1])
         return engine_args, f"http://127.0.0.1:{port}"
     port = get_free_port()
-    return [*engine_args, "--weight-transfer-port", str(port)], (
-        f"http://127.0.0.1:{port}"
-    )
+    return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
 
 async def _start_control_server(
@@ -499,9 +493,9 @@ async def run_smg(
     try:
         engine_port = get_free_port()
 
-        # Wire the in-engine weight-transfer control plane port (no-op unless
-        # --enable-weight-transfer is set). Must happen before spawn_engine.
-        engine_args, engine_http_url = _maybe_add_weight_transfer_port(engine_args)
+        # Wire the in-engine RL control-plane port (always on). Must happen
+        # before spawn_engine.
+        engine_args, engine_http_url = _add_rl_control_port(engine_args)
 
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))

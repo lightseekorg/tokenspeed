@@ -53,9 +53,9 @@ app = FastAPI()
 # Set by start() before uvicorn.run().
 _gateway_url: str = ""
 _engine_grpc_addr: str = ""
-# Base URL of the in-engine weight-transfer HTTP control plane (RL weight sync).
-# Empty when --enable-weight-transfer is off; the weight routes then return 503
-# so the public surface still advertises the paths.
+# Base URL of the in-engine RL weight-sync control plane. The orchestrator
+# always sets this for `ts serve`; if it is ever empty the weight routes return
+# 503 (the public surface still advertises the paths).
 _engine_http_url: str = ""
 _grpc_channel: grpc.aio.Channel | None = None
 _grpc_stub: pb_grpc.TokenSpeedSchedulerStub | None = None
@@ -261,10 +261,7 @@ async def stop_profile(request: Request):
 async def _proxy_to_engine(request: Request) -> StreamingResponse | Response:
     if not _engine_http_url:
         return JSONResponse(
-            {
-                "error": "weight transfer is not enabled on this server; "
-                "start with --enable-weight-transfer"
-            },
+            {"error": "weight-sync control plane is unavailable on this server"},
             status_code=503,
         )
     return await _proxy_request(request, base_url=_engine_http_url)

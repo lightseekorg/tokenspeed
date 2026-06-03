@@ -133,17 +133,16 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
-    # RL online weight sync. On by default; disable with
-    # --no-enable-weight-transfer. NOTE: these endpoints can overwrite model
-    # weights, reload checkpoints from disk, and pause/abort serving, and are
-    # exposed on the public control port. See runtime/engine/weight_transfer/
-    # and runtime/entrypoints/weight_transfer_http.py.
-    enable_weight_transfer: bool = True
+    # RL online weight sync (always on / ungated). NOTE: these endpoints can
+    # overwrite model weights, reload checkpoints from disk, and pause/abort
+    # serving, and are exposed on the public control port. See
+    # runtime/engine/weight_transfer/ and runtime/entrypoints/weight_transfer_http.py.
     weight_transfer_config: str | None = None
-    # Port for the in-engine weight-transfer HTTP control plane. Set by the
-    # ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
+    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
+    # + memory occupation, both the native and SGLang-compatible dialects). Set by
+    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
     # disables the in-engine app.
-    weight_transfer_port: int | None = None
+    rl_control_port: int | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -1808,16 +1807,7 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
-        # RL online weight sync.
-        parser.add_argument(
-            "--enable-weight-transfer",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.enable_weight_transfer,
-            help="RL weight-sync HTTP control plane (vLLM-native + "
-            "SGLang-compatible endpoints, one port). On by default; disable with "
-            "--no-enable-weight-transfer. WARNING: these endpoints can overwrite "
-            "weights, reload checkpoints from disk, and pause/abort serving.",
-        )
+        # RL online weight sync (always on / ungated).
         parser.add_argument(
             "--weight-transfer-config",
             type=str,
@@ -1826,11 +1816,12 @@ class ServerArgs:
             "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
         )
         parser.add_argument(
-            "--weight-transfer-port",
+            "--rl-control-port",
             type=int,
-            default=ServerArgs.weight_transfer_port,
-            help="Port for the in-engine weight-transfer HTTP control plane. "
-            "Normally allocated automatically by the `ts serve` orchestrator.",
+            default=ServerArgs.rl_control_port,
+            help="Port for the in-engine RL control-plane HTTP app (weight sync, "
+            "pause/resume, memory occupation). Normally allocated automatically "
+            "by the `ts serve` orchestrator.",
         )
 
     @classmethod
@@ -1874,14 +1865,6 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
-
-    @property
-    def weight_transfer_enabled(self) -> bool:
-        """Whether the RL weight-sync control plane is on (default True).
-
-        On by default; disable with ``--no-enable-weight-transfer``.
-        """
-        return self.enable_weight_transfer
 
     def get_weight_transfer_config(self):
         """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""

@@ -8,7 +8,7 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from tokenspeed.cli.serve_smg import _maybe_add_weight_transfer_port
+from tokenspeed.cli.serve_smg import _add_rl_control_port
 from tokenspeed.runtime.entrypoints import http_server
 from tokenspeed.runtime.entrypoints.weight_transfer_http import (
     build_weight_transfer_app,
@@ -32,23 +32,17 @@ WEIGHT_ROUTES = {
 # --------------------------------------------------------------------------- #
 
 
-class TestMaybeAddWeightTransferPort:
-    def test_on_by_default_allocates_port(self):
-        args, url = _maybe_add_weight_transfer_port(["--model", "m"])
-        assert "--weight-transfer-port" in args
+class TestAddWeightTransferPort:
+    def test_always_allocates_port(self):
+        args, url = _add_rl_control_port(["--model", "m"])
+        assert "--rl-control-port" in args
         assert url.startswith("http://127.0.0.1:")
-        port = args[args.index("--weight-transfer-port") + 1]
+        port = args[args.index("--rl-control-port") + 1]
         assert url.endswith(port)
 
-    def test_opt_out_no_change(self):
-        argv = ["--model", "m", "--no-enable-weight-transfer"]
-        args, url = _maybe_add_weight_transfer_port(argv)
-        assert args == argv
-        assert url == ""
-
     def test_respects_pinned_port(self):
-        args, url = _maybe_add_weight_transfer_port(["--weight-transfer-port", "9999"])
-        assert args.count("--weight-transfer-port") == 1
+        args, url = _add_rl_control_port(["--rl-control-port", "9999"])
+        assert args.count("--rl-control-port") == 1
         assert url == "http://127.0.0.1:9999"
 
 

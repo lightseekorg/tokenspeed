@@ -287,13 +287,13 @@ def test_ipc_update_deferred_over_http(server_ipc):
 
 
 # --------------------------------------------------------------------------- #
-# Optional: drive a live `ts serve --enable-weight-transfer` if configured.
+# Optional: drive a live `ts serve` control plane if configured.
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.skipif(
     not os.environ.get("TOKENSPEED_E2E_URL"),
-    reason="set TOKENSPEED_E2E_URL to a running ts-serve with --enable-weight-transfer",
+    reason="set TOKENSPEED_E2E_URL to a running ts serve",
 )
 def test_live_server_lifecycle():
     """Drive a real server. Exercises only the backend-independent surface;
@@ -309,8 +309,8 @@ def test_live_server_lifecycle():
         assert c.post("/resume").json() == {"status": "resumed"}
         assert c.get("/is_paused").json() == {"is_paused": False}
 
-        # Ordering error contract holds on the live server too.
+        # Ordering misuse surfaces as 500 (unwrapped, like the native router).
         assert (
             c.post("/update_weights", json={"update_info": {"names": []}}).status_code
-            == 409
+            == 500
         )

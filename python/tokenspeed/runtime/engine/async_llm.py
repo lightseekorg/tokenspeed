@@ -199,7 +199,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # control plane is enabled. The in-engine HTTP app is launched lazily on
         # this object's event loop (see auto_create_handle_loop).
         self.weight_transfer_manager = None
-        self._wt_server_task = None
+        self._rl_control_task = None
 
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
@@ -257,16 +257,15 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         self.init_communicators(server_args)
 
-        # RL weight-transfer control plane. Created only when enabled; the
-        # weight-transfer HTTP app reaches it via this attribute.
-        if server_args.weight_transfer_enabled:
-            from tokenspeed.runtime.engine.weight_transfer.manager import (
-                WeightTransferManager,
-            )
+        # RL weight-transfer control plane (always on / ungated). The in-engine
+        # HTTP app reaches it via this attribute.
+        from tokenspeed.runtime.engine.weight_transfer.manager import (
+            WeightTransferManager,
+        )
 
-            self.weight_transfer_manager = WeightTransferManager(
-                self, server_args.get_weight_transfer_config()
-            )
+        self.weight_transfer_manager = WeightTransferManager(
+            self, server_args.get_weight_transfer_config()
+        )
 
         # Tokenization lives in :class:`InputProcessor`; see
         # :meth:`_tokenize_one_request` for the delegation.
@@ -695,7 +694,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
-        self._maybe_launch_weight_transfer_server(loop)
+        self._maybe_launch_rl_control_plane(loop)
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
@@ -715,26 +714,27 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             loop.create_task(print_exception_wrapper(self.watch_load_thread))
         )
 
-    def _maybe_launch_weight_transfer_server(self, loop):
-        """Launch the in-engine weight-transfer HTTP control plane on this loop.
+    def _maybe_launch_rl_control_plane(self, loop):
+        """Launch the in-engine RL control-plane HTTP app on this loop.
 
+        Serves both the native and SGLang-compatible weight-sync dialects.
         Best-effort: comes up the first time AsyncLLM's loop is active and a
-        ``--weight-transfer-port`` was configured. Runs on AsyncLLM's loop so the
+        ``--rl-control-port`` was configured. Runs on AsyncLLM's loop so the
         manager's loop-bound primitives (admission gate, scheduler communicators)
         are toggled/awaited correctly. For guaranteed availability before the very
         first request, an engine bootstrap may call this directly.
         """
-        if self._wt_server_task is not None:
+        if self._rl_control_task is not None:
             return
         manager = self.weight_transfer_manager
-        port = getattr(self.server_args, "weight_transfer_port", None)
+        port = getattr(self.server_args, "rl_control_port", None)
         if manager is None or not port:
             return
-        self._wt_server_task = loop.create_task(
-            self._serve_weight_transfer_control_plane(manager, port)
+        self._rl_control_task = loop.create_task(
+            self._serve_rl_control_plane(manager, port)
         )
 
-    async def _serve_weight_transfer_control_plane(self, manager, port: int):
+    async def _serve_rl_control_plane(self, manager, port: int):
         # Serves both the vLLM-native and SGLang-compatible RL endpoints on a
         # single app/port. A control-plane crash must not take down the engine,
         # so this does not use print_exception_wrapper (which kills the tree).
