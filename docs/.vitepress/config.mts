@@ -56,10 +56,7 @@ export default defineConfig({
       },
       {
         text: "Serving",
-        items: [
-          { text: "Parallelism", link: "/serving/parallelism" },
-          { text: "Weight Transfer (RL)", link: "/serving/weight-transfer" }
-        ]
+        items: [{ text: "Parallelism", link: "/serving/parallelism" }]
       }
     ],
     search: {
