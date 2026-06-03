@@ -10,6 +10,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+import tokenspeed_kernel  # noqa: E402, F401
 import torch
 from torch import nn
 

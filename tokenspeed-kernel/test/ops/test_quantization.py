@@ -28,7 +28,10 @@ from tokenspeed_kernel import (
     quantize_mxfp8,
     quantize_nvfp4,
 )
+from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
+
+FP8_E4M3_FNUZ_MAX = 240.0
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -139,6 +142,65 @@ def test_quantize_fp8_scale_tensor(
     out = quantize_fp8(x, scale=scale, solution=solution)
     torch.cuda.synchronize()
 
+    assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    "n",
+    [
+        # gpt-oss-120b: H = 2880 (hidden), I/tp = 2880/2 = 1440 (per-rank
+        # ispp). Both are non-power-of-2, so the n-axis must be masked
+        # both on load and on store for the W4A8 MoE forward path.
+        2880,
+        1440,
+        # ``M`` not divisible by ``BLOCK_M`` exercises the m-axis tail mask
+        # while ``N`` is non-pow2, ruling out a simple "round both up" bug.
+        7,
+        333,
+    ],
+)
+def test_pure_cast_non_pow2_n(device: str, n: int) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(33, n, device=device, dtype=torch.bfloat16) * 50
+    ref = x.to(torch.float8_e4m3fn)
+    out = fp8_quantize(x)
+    torch.cuda.synchronize()
+    assert out.shape == ref.shape
+    assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna3,
+    reason="float8_e4m3fnuz (tl.float8e4b8) is only supported on AMD CDNA3",
+)
+def test_pure_cast_e4m3fnuz(device: str) -> None:
+    """CDNA3-specific fp8 dtype (bias=8). The Triton cast must saturate to
+    ``±240`` to match ``x.to(torch.float8_e4m3fnuz)``."""
+    torch.manual_seed(0)
+    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 50
+    ref = x.to(torch.float8_e4m3fnuz)
+    out = fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
+    torch.cuda.synchronize()
+    assert out.dtype == torch.float8_e4m3fnuz
+    assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna3,
+    reason="float8_e4m3fnuz (tl.float8e4b8) is only supported on AMD CDNA3",
+)
+@pytest.mark.parametrize("scale", [2.0, 0.5, 7.5])
+def test_scaled_cast_e4m3fnuz_matches_reference(device: str, scale: float) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 100
+    inv_scale = 1.0 / scale
+    ref = (
+        (x.to(torch.float32) * inv_scale)
+        .clamp(-FP8_E4M3_FNUZ_MAX, FP8_E4M3_FNUZ_MAX)
+        .to(torch.float8_e4m3fnuz)
+    )
+    out = fp8_quantize(x, scale=scale, fp8_dtype=torch.float8_e4m3fnuz)
+    torch.cuda.synchronize()
     assert _bitwise_equal(out, ref)
 
 

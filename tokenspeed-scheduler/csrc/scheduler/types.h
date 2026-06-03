@@ -42,7 +42,7 @@ enum class DisaggregationMode {
     kPrefill,
     kDecode,
 };
-// `PagedCacheGroupFamily` and `StateRestorePolicy` are defined in
+// `PagedCacheGroupFamily` is defined in
 // resource/allocator/paged_cache_group.h (transitively included above).
 
 template <ResourceType>

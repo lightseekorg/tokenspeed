@@ -757,15 +757,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
 
         cache_metadata = metadata.cache
+        if cache_metadata.swa_block_table is None:
+            raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
+        swa_block_table = cache_metadata.swa_block_table
         indices, lens = deepseek_v4_decode_swa_indices_and_lens(
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
-            block_table=(
-                cache_metadata.swa_block_table
-                if cache_metadata.swa_block_table is not None
-                else cache_metadata.block_table
-            ),
+            block_table=swa_block_table,
             block_table_base_offsets=cache_metadata.swa_base_logical_page,
             window_size=window_size,
             block_size=block_size,
@@ -1192,11 +1191,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             prefix_lens,
             torch.full_like(prefix_lens, max(window_size - 1, 0)),
         )
-        swa_block_table = (
-            cache_metadata.swa_block_table
-            if cache_metadata.swa_block_table is not None
-            else cache_metadata.block_table
-        )
+        if cache_metadata.swa_block_table is None:
+            raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
+        swa_block_table = cache_metadata.swa_block_table
         max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
             torch.div(metadata.seq_lens, compress_ratio, rounding_mode="floor")
