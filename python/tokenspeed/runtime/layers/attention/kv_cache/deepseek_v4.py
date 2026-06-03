@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Iterable, Optional, Sequence
@@ -511,10 +512,17 @@ class DeepseekV4CacheMetadata:
         kv_cache_block_size: int | None = None,
     ) -> torch.Tensor:
         del kv_cache_block_size
+        if compress_ratio <= 1:
+            return self.block_table
         table = self.paged_cache_block_tables.get(
             v4_compressed_kv_group_id(compress_ratio)
         )
-        return table if table is not None else self.block_table
+        if table is None:
+            raise RuntimeError(
+                "DeepSeek V4 missing paged-cache block table for compressed "
+                f"KV group {v4_compressed_kv_group_id(compress_ratio)!r}"
+            )
+        return table
 
     @staticmethod
     def safe_page_ids(
@@ -747,6 +755,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     group rather than owning a separate group of its own.
     """
 
+    supports_hierarchical_kv_cache = False
+
     def __init__(
         self,
         size: int,
@@ -788,6 +798,15 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         self.paged_cache_group_specs = tuple(
             build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio)
         )
+        self._paged_cache_group_specs_by_id = {
+            spec.group_id: spec for spec in self.paged_cache_group_specs
+        }
+        self._paged_cache_scheduler: object | None = None
+        self._paged_cache_state_group_ids = tuple(
+            str(spec.group_id)
+            for spec in self.paged_cache_group_specs
+            if spec.family == "state"
+        )
         self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
             self.paged_cache_group_specs,
             max_live_requests=max_batch_size,
@@ -795,10 +814,6 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             max_total_tokens=size,
             max_context_len=max_context_len,
         )
-
-        self._paged_cache_group_specs_by_id = {
-            spec.group_id: spec for spec in self.paged_cache_group_specs
-        }
 
         def _group_rows(group_id: str, default: int) -> int:
             spec = self._paged_cache_group_specs_by_id.get(group_id)
@@ -946,8 +961,32 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
 
     @property
     def prefix_cache_required_group_ids(self) -> tuple[str, ...]:
-        """All V4 paged-cache groups must be present for a snapshot to be complete."""
-        return tuple(str(spec.group_id) for spec in self.paged_cache_group_specs)
+        return tuple(
+            str(spec.group_id)
+            for spec in self.paged_cache_group_specs
+            if spec.family == "history"
+        )
+
+    def bind_paged_cache_scheduler(self, scheduler: object) -> None:
+        self._paged_cache_scheduler = scheduler
+
+    def maybe_log_paged_cache_group_pages(self) -> None:
+        scheduler = self._paged_cache_scheduler
+        if self.rank != 0 or scheduler is None or not self._paged_cache_state_group_ids:
+            return
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        parts = []
+        for group_id in self._paged_cache_state_group_ids:
+            total = scheduler.paged_cache_group_total_pages(group_id)
+            available = scheduler.paged_cache_group_available_pages(group_id)
+            failed = scheduler.paged_cache_group_failed_alloc_count(group_id)
+            parts.append(
+                f"{group_id}: used={total - available}/{total}, "
+                f"available={available}, failed_alloc={failed}"
+            )
+        logger.debug("DeepSeek V4 paged-cache state group pages. %s", "; ".join(parts))
 
     def _require(
         self, buffers: list[torch.Tensor | None], layer_id: int, name: str

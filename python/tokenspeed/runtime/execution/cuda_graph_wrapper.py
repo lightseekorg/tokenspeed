@@ -547,7 +547,7 @@ class CudaGraphWrapper:
             out[key] = torch.nn.functional.pad(
                 table,
                 (0, 0, 0, padded_bs - rows),
-                value=0,
+                value=-1,
             )
         return out
 
@@ -569,8 +569,8 @@ class CudaGraphWrapper:
             if rows == padded_bs:
                 out[key] = off
                 continue
-            # Padded rows have no real request — base 0 keeps absolute
-            # indexing aligned to column 0, matching dummy-page row padding.
+            # Padded rows have no real request. Base 0 is only used before
+            # block-table lookup; the paired padded table row is invalid (-1).
             out[key] = torch.nn.functional.pad(
                 off,
                 (0, padded_bs - rows),

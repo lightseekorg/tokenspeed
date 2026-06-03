@@ -168,6 +168,45 @@ PagedCacheGroupTable::CommitResult PagedCacheGroupTable::CommitHistoryToSnapshot
     return CommitResult{std::move(segment), segment_base_logical_page};
 }
 
+void PagedCacheGroupTable::AdoptSnapshotSegment(const std::vector<std::int32_t>& ids, std::int32_t target_raw_tokens) {
+    if (allocator_ == nullptr) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptSnapshotSegment: no allocator bound");
+    }
+    const auto& cfg = allocator_->Config();
+    if (cfg.family != PagedCacheGroupFamily::History) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptSnapshotSegment: requires History family; group=" +
+                               cfg.group_id);
+    }
+    if (target_raw_tokens <= committed_prefix_len_tokens_) {
+        return;
+    }
+    if (target_raw_tokens > raw_token_cursor_) {
+        throw std::invalid_argument(
+            "PagedCacheGroupTable::AdoptSnapshotSegment: target exceeds raw_token_cursor; target=" +
+            std::to_string(target_raw_tokens) + "; cursor=" + std::to_string(raw_token_cursor_));
+    }
+    const std::int32_t raw_per_page = cfg.RawTokensPerPage();
+    if (raw_per_page <= 0) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptSnapshotSegment: invalid group config");
+    }
+    if (committed_prefix_len_tokens_ % raw_per_page != 0 || target_raw_tokens % raw_per_page != 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::AdoptSnapshotSegment: unaligned commit range");
+    }
+    const std::int32_t pages_to_adopt = (target_raw_tokens - committed_prefix_len_tokens_) / raw_per_page;
+    if (static_cast<std::int32_t>(ids.size()) != pages_to_adopt) {
+        throw std::invalid_argument("PagedCacheGroupTable::AdoptSnapshotSegment: snapshot segment size mismatch");
+    }
+    if (pages_to_adopt > owned_pages_.Size()) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptSnapshotSegment: not enough local pages");
+    }
+
+    OwnedPages dropped = owned_pages_.TakeFirst(pages_to_adopt);
+    (void)dropped;
+    borrowed_page_ids_.insert(borrowed_page_ids_.end(), ids.begin(), ids.end());
+    committed_prefix_len_tokens_ = target_raw_tokens;
+    RefreshPageIdsView();
+}
+
 PagedCacheGroupTable::CommitResult PagedCacheGroupTable::CheckpointStateToSnapshot(std::int32_t target_raw_tokens) {
     if (allocator_ == nullptr) {
         throw std::logic_error("PagedCacheGroupTable::CheckpointStateToSnapshot: no allocator bound");
@@ -247,6 +286,81 @@ PagedCacheGroupTable::CommitResult PagedCacheGroupTable::CheckpointStateToSnapsh
     return CommitResult{std::move(segment), segment_base_logical_page};
 }
 
+void PagedCacheGroupTable::AdoptStateSnapshotSegment(const std::vector<std::int32_t>& ids,
+                                                     std::int32_t base_logical_page, std::int32_t target_raw_tokens) {
+    if (allocator_ == nullptr) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptStateSnapshotSegment: no allocator bound");
+    }
+    const auto& cfg = allocator_->Config();
+    if (cfg.family != PagedCacheGroupFamily::State) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptStateSnapshotSegment: requires State family; group=" +
+                               cfg.group_id);
+    }
+    if (target_raw_tokens <= committed_prefix_len_tokens_) {
+        return;
+    }
+    if (target_raw_tokens > raw_token_cursor_) {
+        throw std::invalid_argument(
+            "PagedCacheGroupTable::AdoptStateSnapshotSegment: target exceeds raw_token_cursor; target=" +
+            std::to_string(target_raw_tokens) + "; cursor=" + std::to_string(raw_token_cursor_));
+    }
+    if (base_logical_page < 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::AdoptStateSnapshotSegment: base_logical_page must be >= 0");
+    }
+    const std::int32_t raw_per_page = cfg.RawTokensPerPage();
+    if (raw_per_page <= 0) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptStateSnapshotSegment: invalid group config");
+    }
+    if (target_raw_tokens % raw_per_page != 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::AdoptStateSnapshotSegment: target not page-aligned");
+    }
+    const std::int32_t pages_to_adopt = static_cast<std::int32_t>(ids.size());
+    if (pages_to_adopt <= 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::AdoptStateSnapshotSegment: empty snapshot segment");
+    }
+    if ((base_logical_page + pages_to_adopt) * raw_per_page != target_raw_tokens) {
+        throw std::invalid_argument("PagedCacheGroupTable::AdoptStateSnapshotSegment: segment does not end at target");
+    }
+    if (base_logical_page < base_logical_page_) {
+        throw std::invalid_argument("PagedCacheGroupTable::AdoptStateSnapshotSegment: segment precedes table base");
+    }
+
+    const std::int32_t pages_before_segment = base_logical_page - base_logical_page_;
+    if (pages_before_segment > Size()) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptStateSnapshotSegment: segment starts past table end");
+    }
+    if (pages_before_segment > 0) {
+        const std::int32_t borrowed_to_drop =
+            std::min(pages_before_segment, static_cast<std::int32_t>(borrowed_page_ids_.size()));
+        if (borrowed_to_drop > 0) {
+            borrowed_page_ids_.erase(borrowed_page_ids_.begin(), borrowed_page_ids_.begin() + borrowed_to_drop);
+        }
+        const std::int32_t owned_to_drop = pages_before_segment - borrowed_to_drop;
+        if (owned_to_drop > 0) {
+            OwnedPages dropped = owned_pages_.TakeFirst(owned_to_drop);
+            (void)dropped;
+        }
+        base_logical_page_ = base_logical_page;
+    }
+
+    if (pages_to_adopt > Size()) {
+        throw std::logic_error("PagedCacheGroupTable::AdoptStateSnapshotSegment: not enough local pages to replace");
+    }
+    const std::int32_t borrowed_replace =
+        std::min(pages_to_adopt, static_cast<std::int32_t>(borrowed_page_ids_.size()));
+    if (borrowed_replace > 0) {
+        borrowed_page_ids_.erase(borrowed_page_ids_.begin(), borrowed_page_ids_.begin() + borrowed_replace);
+    }
+    const std::int32_t owned_replace = pages_to_adopt - borrowed_replace;
+    if (owned_replace > 0) {
+        OwnedPages dropped = owned_pages_.TakeFirst(owned_replace);
+        (void)dropped;
+    }
+    borrowed_page_ids_.insert(borrowed_page_ids_.begin(), ids.begin(), ids.end());
+    committed_prefix_len_tokens_ = target_raw_tokens;
+    RefreshPageIdsView();
+}
+
 void PagedCacheGroupTable::ImportPrefixBorrowed(std::vector<std::int32_t> ids, std::int32_t base_logical_page,
                                                 std::int32_t raw_tokens_covered) {
     if (allocator_ == nullptr) {
@@ -270,7 +384,7 @@ void PagedCacheGroupTable::ImportPrefixBorrowed(std::vector<std::int32_t> ids, s
 }
 
 std::vector<std::int32_t> PagedCacheGroupTable::ReleaseSkipped(std::int32_t window_lower_bound) {
-    if (allocator_ == nullptr || Size() == 0 || window_lower_bound <= 0) {
+    if (allocator_ == nullptr || window_lower_bound <= 0) {
         return {};
     }
     const auto& cfg = allocator_->Config();
@@ -283,6 +397,10 @@ std::vector<std::int32_t> PagedCacheGroupTable::ReleaseSkipped(std::int32_t wind
     }
     const std::int32_t target = window_lower_bound / raw_per_page;
     if (target <= base_logical_page_) {
+        return {};
+    }
+    if (Size() == 0) {
+        base_logical_page_ = target;
         return {};
     }
     const std::int32_t to_drop = std::min(target - base_logical_page_, Size());

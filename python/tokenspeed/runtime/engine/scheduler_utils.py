@@ -153,7 +153,7 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
 def pool_to_prefix_cache_adjunct_spec(
     required_group_ids: Sequence[str],
 ) -> "PrefixCacheAdjunctSpec":
-    """Build a PrefixCacheAdjunctSpec from a non-empty required-group-id list."""
+    """Build a PrefixCacheAdjunctSpec from required group ids."""
     if not required_group_ids:
         raise ValueError(
             "pool_to_prefix_cache_adjunct_spec: required_group_ids must be non-empty"
