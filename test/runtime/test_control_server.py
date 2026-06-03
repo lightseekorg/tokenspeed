@@ -1,4 +1,4 @@
-"""Tests for the HTTP server sidecar (``tokenspeed.runtime.entrypoints.http_server``).
+"""Tests for the HTTP server sidecar (``tokenspeed.runtime.entrypoints.control_server``).
 
 These run entirely against a mock smg backend — no engine, smg, or GPU needed.
 They are written as regression guards for the bugs found while building the
@@ -92,7 +92,7 @@ class TestProxyPassthrough(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from tokenspeed.runtime.entrypoints import http_server as hs
+        from tokenspeed.runtime.entrypoints import control_server as hs
 
         cls.hs = hs
         hs._gateway_url = f"http://127.0.0.1:{cls.MOCK_PORT}"
@@ -226,7 +226,7 @@ class TestGrpcDirect(unittest.TestCase):
     """Unit tests for the gRPC-direct path (no live engine)."""
 
     def setUp(self):
-        from tokenspeed.runtime.entrypoints import http_server as hs
+        from tokenspeed.runtime.entrypoints import control_server as hs
 
         self.hs = hs
         # Reset the cached channel/stub between tests.
@@ -270,7 +270,7 @@ class TestProxyTimeout(unittest.TestCase):
     off long but healthy streaming generations (P2 review fix)."""
 
     def test_no_total_cap_but_inactivity_bounded(self):
-        from tokenspeed.runtime.entrypoints import http_server as hs
+        from tokenspeed.runtime.entrypoints import control_server as hs
 
         self.assertIsNone(
             hs._PROXY_TIMEOUT.total,

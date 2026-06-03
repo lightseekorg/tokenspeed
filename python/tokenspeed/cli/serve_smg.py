@@ -386,9 +386,9 @@ async def _start_control_server(
     """
     import threading
 
-    from tokenspeed.runtime.entrypoints.http_server import build_server
+    from tokenspeed.runtime.entrypoints.control_server import build_control_server
 
-    server = build_server(
+    server = build_control_server(
         gateway_url=gateway_url,
         engine_grpc_addr=engine_grpc_addr,
         rl_control_url=rl_control_url,

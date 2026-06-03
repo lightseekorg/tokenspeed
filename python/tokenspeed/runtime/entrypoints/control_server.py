@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""HTTP server sidecar that runs alongside the smg gateway.
+"""Control HTTP server (sidecar) that runs alongside the smg gateway.
 
 Runs automatically on ``main_port + 1`` when ``tokenspeed serve`` starts.
 Override the port with ``--control-port PORT``.
 
 Architecture::
 
-    Client  ──►  http_server  :8001
+    Client  ──►  control_server  :8001
                     ├─ /health, /get_server_info, /get_model_info,
                     │  /health_check, /abort  ──►  gRPC engine  (direct)
                     └─ /generate, /v1/*, /flush_cache
@@ -384,7 +384,7 @@ async def health_generate(request: Request):
 # ---------------------------------------------------------------------------
 
 
-def build_server(
+def build_control_server(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
@@ -433,7 +433,7 @@ def start(
     port: int = 8001,
 ) -> None:
     """Start the HTTP server (blocking)."""
-    build_server(
+    build_control_server(
         gateway_url=gateway_url,
         engine_grpc_addr=engine_grpc_addr,
         rl_control_url=rl_control_url,

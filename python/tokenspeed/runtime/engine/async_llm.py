@@ -662,7 +662,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
     # ---- Server lifecycle / health -------------------------------
     # Intent-revealing wrappers around the private ``server_status``
-    # field. Callers (notably ``http_server.py``) drive transitions
+    # field. Callers (notably ``control_server.py``) drive transitions
     # through these methods so the ``ServerStatus`` enum and the
     # attribute name stay implementation-private.
 
