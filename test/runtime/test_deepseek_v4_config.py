@@ -3681,6 +3681,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 out_cache_loc=torch.zeros(2, dtype=torch.int64),
                 layer_index=0,
                 cos_sin_cache=torch.empty((1, 1)),
+                compressor_slot_cache={},
             )
 
         self.assertEqual(captured["indexer_block_size"], 4)

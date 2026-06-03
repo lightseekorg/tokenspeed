@@ -1864,6 +1864,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata_paged,
             metadata_base_offsets,
         )
+        prior_metadata = self._cuda_graph_metadata.get(bs)
+        prior_slot_mappings = (
+            prior_metadata.cache.decode_compressed_slot_mappings
+            if prior_metadata is not None
+            else {}
+        )
         cache_metadata = DeepseekV4CacheMetadata(
             page_size=self.page_size,
             block_table=self._cuda_graph_block_table[:bs, : self.max_num_pages],
@@ -1875,8 +1881,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressor_state_base_logical_pages=compressor_state_base,
             indexer_state_block_table=indexer_state_block_table,
             indexer_state_base_logical_page=indexer_state_base,
+            decode_compressed_slot_mappings=prior_slot_mappings,
         )
-        metadata = self._cuda_graph_metadata.get(bs)
+        metadata = prior_metadata
         if metadata is None:
             metadata = DeepseekV4ForwardMetadata(
                 req_pool_indices=self._cuda_graph_req_pool_indices[:bs],

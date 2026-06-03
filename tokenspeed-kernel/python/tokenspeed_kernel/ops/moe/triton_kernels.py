@@ -112,6 +112,7 @@ def _matmul(
     y=None,
     n_tokens=None,
     n_expts_act=None,
+    **_ignored,
 ):
     with _maybe_lds_guard(x, w, precision_config):
         out = matmul(
@@ -145,14 +146,6 @@ _matmul_common = dict(
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
 )
-
-register_kernel(
-    "moe",
-    "experts",
-    name="triton_kernels_matmul_ogs",
-    features={"ragged_metadata"},
-    **_matmul_common,
-)(_matmul)
 
 register_kernel(
     "moe",

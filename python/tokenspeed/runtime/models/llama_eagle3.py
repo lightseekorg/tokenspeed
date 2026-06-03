@@ -583,6 +583,11 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
 
     model_cls = Eagle3LlamaModel
 
+    # Eagle3 catch-up pre-slices q to active row before attn; trim must pair.
+    # TODO: remove together with the base flag once Qwen NextN / DeepSeek V3
+    # NextN also pre-slice.
+    pre_attention_trim: bool = True
+
     def __init__(
         self,
         config: LlamaConfig,

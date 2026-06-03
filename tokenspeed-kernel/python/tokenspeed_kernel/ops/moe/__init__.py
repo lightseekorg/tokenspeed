@@ -28,6 +28,7 @@ import tokenspeed_kernel.numerics.reference.moe  # noqa: F401
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
 import tokenspeed_kernel.ops.moe.deepep  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton_kernels  # noqa: F401
 import tokenspeed_kernel.ops.moe.trtllm  # noqa: F401
@@ -127,6 +128,10 @@ _FP8_SCALE = ScaleFormat(
     granularity="block",
     block_shape=(128, 128),
 )
+_FP8_PER_TENSOR_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="tensor",
+)
 _NVFP4_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
@@ -153,6 +158,8 @@ def _moe_dispatch_format_signature(storage_dtype: torch.dtype, traits: Optional[
 def _moe_fused_format_signature(
     storage_dtype: torch.dtype,
     weight_format: str,
+    *,
+    fp8_scale_granularity: str = "block",
 ):
     if weight_format == WEIGHT_FP8:
         weight = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE)
@@ -165,12 +172,19 @@ def _moe_fused_format_signature(
     else:
         raise ValueError(f"Unsupported MoE fused weight_format={weight_format!r}")
 
+    if fp8_scale_granularity == "tensor":
+        fp8_scale_format = _FP8_PER_TENSOR_SCALE
+    elif fp8_scale_granularity == "block":
+        fp8_scale_format = _FP8_SCALE
+    else:
+        raise ValueError(f"Unsupported fp8_scale_granularity={fp8_scale_granularity!r}")
+
     if storage_dtype == torch.uint8 and weight_format == WEIGHT_NVFP4:
         x = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
     elif storage_dtype == torch.uint8 and weight_format == WEIGHT_MXFP4:
         x = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
-    elif storage_dtype == torch.float8_e4m3fn:
-        x = tensor_format("scaled-fp8", storage_dtype, scale=_FP8_SCALE)
+    elif storage_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        x = tensor_format("scaled-fp8", storage_dtype, scale=fp8_scale_format)
     else:
         x = dense_tensor_format(storage_dtype)
 
@@ -236,6 +250,8 @@ def moe_experts(
     *args,
     dtype: torch.dtype = torch.bfloat16,
     features: Optional[Set[str]] = None,
+    weight_format: Optional[str] = None,
+    fp8_scale_granularity: str = "block",
     traits: Optional[dict] = None,
     expected_kernel_name: Optional[str] = None,
     **kwargs,
@@ -253,7 +269,12 @@ def moe_experts(
     * ``{"dispatch_gemm"}``: gather/dispatch tokens then GEMM (uses gather_indx).
     * ``{"gemm_combine"}``: GEMM then scatter/combine results (uses scatter_indx).
     """
-    signature = _single_dense_tensor_format_signature("x", dtype)
+    if weight_format is None:
+        signature = _single_dense_tensor_format_signature("x", dtype)
+    else:
+        signature = _moe_fused_format_signature(
+            dtype, weight_format, fp8_scale_granularity=fp8_scale_granularity
+        )
     kernel = select_kernel(
         "moe",
         "experts",
@@ -291,6 +312,7 @@ def moe_fused(
     dtype: torch.dtype = torch.bfloat16,
     features: Optional[Set[str]] = None,
     weight_format: str = WEIGHT_BF16,
+    fp8_scale_granularity: str = "block",
     traits: Optional[dict] = None,
     expected_kernel_name: Optional[str] = None,
     **kwargs,
@@ -319,7 +341,9 @@ def moe_fused(
             ``dtype=torch.uint8``, ``weight_format`` disambiguates whether the
             input is interpreted as MXFP4 or NVFP4.
     """
-    signature = _moe_fused_format_signature(dtype, weight_format)
+    signature = _moe_fused_format_signature(
+        dtype, weight_format, fp8_scale_granularity=fp8_scale_granularity
+    )
     selection_traits = dict(traits or {})
     kernel = select_kernel(
         "moe",

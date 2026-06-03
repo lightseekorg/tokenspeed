@@ -91,6 +91,7 @@ class InputBuffers:
             self.out_cache_loc_buf = torch.full(
                 (max_num_tokens,), dummy_kv_slot, dtype=torch.int32
             )
+            self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             if has_mamba:
@@ -190,6 +191,53 @@ class InputBuffers:
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
 
+        def write_decode_input_ids(
+            decode_req_pool_indices: torch.Tensor,
+            decode_input_ids: list[int],
+            row_offset: int,
+            expected_count: int,
+            context: str,
+        ) -> None:
+            if len(decode_input_ids) != expected_count:
+                raise RuntimeError(
+                    f"{context} decode_input_ids length mismatch: "
+                    f"got {len(decode_input_ids)}, expected {expected_count}"
+                )
+            decode_input_ids_tensor = torch.tensor(
+                decode_input_ids,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            ).to(req_pool_indices_device.device, non_blocking=True)
+            mask = (decode_input_ids_tensor != -1).unsqueeze(1)
+            ids = decode_input_ids_tensor.unsqueeze(1)
+
+            # Col 0: verified token (mask preserves drafter-owned rows).
+            first_slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
+            runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
+                mask, ids, first_slot
+            )
+            # Cols 1.. are real candidates only when the local drafter or the
+            # remote P-side path populated them. Bootstrap/recovery rows with
+            # no candidate source still feed a full-width target forward, so
+            # use a valid dummy token in model inputs and force the verifier to
+            # consume only the first target token for those rows.
+            width = runtime_states.future_input_map.shape[1]
+            remote_candidate_ready = runtime_states.remote_spec_candidate_ready[
+                decode_req_pool_indices
+            ]
+            force_single_token = mask.squeeze(1) & ~remote_candidate_ready
+            if width > 1:
+                tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
+                dummy_tail = ids.expand(-1, width - 1)
+                runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
+                    torch.where(force_single_token.unsqueeze(1), dummy_tail, tail)
+                )
+            self.force_single_token_verify_buf[
+                row_offset : row_offset + expected_count
+            ] = force_single_token
+            runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = False
+
         # Decode-only fast path: one fused Triton kernel writes out_cache_loc,
         # positions, and seq_lens in a single launch and reads
         # valid_cache_lengths[pool_idx] directly, so the indexSelect + cumsum
@@ -262,23 +310,12 @@ class InputBuffers:
                     num_extends:batch_size
                 ]
                 if decode_input_ids is not None:
-                    decode_count = batch_size - num_extends
-                    if len(decode_input_ids) != decode_count:
-                        raise RuntimeError(
-                            "mixed forward decode_input_ids length mismatch: "
-                            f"got {len(decode_input_ids)}, "
-                            f"expected {decode_count}"
-                        )
-                    decode_input_ids_tensor = torch.tensor(
+                    write_decode_input_ids(
+                        decode_req_pool_indices,
                         decode_input_ids,
-                        dtype=torch.int32,
-                        device="cpu",
-                        pin_memory=True,
-                    ).to(req_pool_indices_device.device, non_blocking=True)
-                    mask = (decode_input_ids_tensor != -1).unsqueeze(1)
-                    slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
-                    runtime_states.future_input_map[decode_req_pool_indices, :1] = (
-                        torch.where(mask, decode_input_ids_tensor.unsqueeze(1), slot)
+                        num_extends,
+                        batch_size - num_extends,
+                        "mixed forward",
                     )
                 decode_ids = runtime_states.future_input_map[
                     decode_req_pool_indices
@@ -296,18 +333,12 @@ class InputBuffers:
             # them into future_input_map before reading, so that they take effect
             # as the input for this decode step.
             if decode_input_ids is not None:
-                decode_input_ids_tensor = torch.tensor(
+                write_decode_input_ids(
+                    req_pool_indices_device,
                     decode_input_ids,
-                    dtype=torch.int32,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(req_pool_indices_device.device, non_blocking=True)
-                mask = (decode_input_ids_tensor != -1).unsqueeze(1)  # (bs, 1)
-                slot = runtime_states.future_input_map[
-                    req_pool_indices_device, :1
-                ]  # (bs, 1)
-                runtime_states.future_input_map[req_pool_indices_device, :1] = (
-                    torch.where(mask, decode_input_ids_tensor.unsqueeze(1), slot)
+                    0,
+                    batch_size,
+                    "decode forward",
                 )
             self.input_ids_buf[:total_tokens].copy_(
                 runtime_states.future_input_map[req_pool_indices_device].flatten(),
@@ -391,6 +422,8 @@ class InputBuffers:
                 self.mamba_cow_src_indices_buf[batch_size:].fill_(-1)
                 self.mamba_branching_seqlens_buf[batch_size:].fill_(-1)
                 self.mamba_track_pool_indices_buf[batch_size:].fill_(-1)
+
+        return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):
         """Prepare padded decode graph inputs for a rank with no real tokens."""
