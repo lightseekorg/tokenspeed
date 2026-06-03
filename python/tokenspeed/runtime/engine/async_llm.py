@@ -735,18 +735,33 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         )
 
     async def _serve_weight_transfer_control_plane(self, manager, port: int):
-        # A control-plane crash must not take down the engine, so this does not
-        # use print_exception_wrapper (which kills the process tree).
+        # Serves both the vLLM-native and SGLang-compatible RL endpoints on a
+        # single app/port. A control-plane crash must not take down the engine,
+        # so this does not use print_exception_wrapper (which kills the tree).
         try:
+            import uvicorn
+
+            from tokenspeed.runtime.entrypoints.sglang_compat_http import (
+                router as sglang_router,
+            )
             from tokenspeed.runtime.entrypoints.weight_transfer_http import (
-                run_weight_transfer_server,
+                build_weight_transfer_app,
             )
 
-            await run_weight_transfer_server(
-                manager, host=self.server_args.host, port=port
+            # vLLM-native endpoints (driven by the manager) + SGLang-compatible
+            # endpoints (driven by AsyncLLM directly), on one app/port.
+            app = build_weight_transfer_app(manager)
+            app.state.async_llm = self
+            app.include_router(sglang_router)
+
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app, host=self.server_args.host, port=port, log_level="warning"
+                )
             )
+            await server.serve()
         except Exception as e:  # noqa: BLE001
-            logger.error("weight-transfer control plane stopped: %s", e)
+            logger.error("RL control plane stopped: %s", e)
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:

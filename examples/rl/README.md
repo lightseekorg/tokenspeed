@@ -20,12 +20,12 @@ Start a server with the control plane enabled:
 ```bash
 # NCCL (disaggregated)
 tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
-    --enable-weight-transfer --weight-transfer-config '{"backend":"nccl"}'
+    --weight-transfer-config '{"backend":"nccl"}'
 
 # IPC (colocated)
 TOKENSPEED_ALLOW_INSECURE_SERIALIZATION=1 \
 tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
-    --enable-weight-transfer --weight-transfer-config '{"backend":"ipc"}'
+    --weight-transfer-config '{"backend":"ipc"}'
 ```
 
 Then drive it:

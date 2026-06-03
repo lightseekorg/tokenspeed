@@ -1,22 +1,26 @@
 # Weight Transfer (RL online weight sync)
 
 TokenSpeed exposes an HTTP control plane for updating model weights in place
-during online serving. The endpoint paths, methods, and request/response JSON
-follow the weight-transfer HTTP contract that common RL training frameworks
-(verl / slime / AReaL / miles) already speak, so existing trainer code drives
-TokenSpeed **unchanged**.
+during online serving. It serves **two request dialects on the same port**, so
+RL trainers that speak either one drive TokenSpeed unchanged:
 
-The heavy weight payloads travel **out-of-band** (NCCL broadcast or CUDA-IPC);
-the HTTP path only carries metadata (parameter names, shapes, dtypes, handles).
+- a **native lifecycle** — `init_weight_transfer_engine` → `start`/`update`/
+  `finish` + `pause`/`resume` + `get_world_size` (e.g. SkyRL);
+- a **SGLang-compatible** surface — `init_weights_update_group`,
+  `update_weights_from_distributed` / `_from_tensor`, `pause_generation` /
+  `continue_generation`, … (e.g. slime / miles, and verl's SGLang rollout).
+
+Both dialects map to the same `AsyncLLM` weight methods. The heavy weight
+payloads travel **out-of-band** (NCCL broadcast or CUDA-IPC); the HTTP path only
+carries metadata (parameter names, shapes, dtypes, handles).
 
 ## Enabling
 
-The control plane is **off by default**. Enable it with the server flag (or the
-`TOKENSPEED_SERVER_DEV_MODE=1` env):
+The control plane is **on by default** and served on the public control port
+(the `ts serve` sidecar proxies it to the in-engine app):
 
 ```bash
 tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
-    --enable-weight-transfer \
     --weight-transfer-config '{"backend":"nccl"}'
 ```
 
@@ -25,8 +29,11 @@ tokenspeed serve <model> --host 0.0.0.0 --port 8000 \
 - `nccl` — **disaggregated**: trainer and inference run on separate GPUs.
 - `ipc` — **colocated**: trainer and inference share GPUs (CUDA-IPC handles).
 
-When enabled, the endpoints below are served on the public port (the `ts serve`
-sidecar proxies them to the in-engine control plane).
+> ⚠️ **Security.** These endpoints can overwrite the served weights, reload a
+> checkpoint from any on-disk path, dial an arbitrary NCCL master, and
+> pause/abort serving. They are exposed on the control port by default. On an
+> untrusted network, disable them with **`--no-enable-weight-transfer`** or put
+> the control port behind auth / network controls.
 
 ## Endpoints
 
@@ -78,6 +85,30 @@ init_weight_transfer_engine          # once per run (nccl: build group; ipc: no-
 - `abort` — abort in-flight requests and block new ones (default).
 - `wait` — drain in-flight requests, then block new ones.
 - `keep` — block new requests but preserve in-flight request state.
+
+## SGLang-compatible endpoints
+
+Served on the **same control plane / port** as the native dialect (same flag),
+with endpoint names, methods, and JSON field names matching SGLang's HTTP
+server. A trainer that drives an SGLang rollout (slime, miles, verl's SGLang
+backend) drives TokenSpeed unchanged. Each maps to the same `AsyncLLM` weight
+methods as the native dialect.
+
+| Endpoint | Method | Request |
+|---|---|---|
+| `/init_weights_update_group` | POST | `{master_address, master_port, rank_offset, world_size, group_name, backend}` |
+| `/update_weights_from_distributed` | POST | `{names, dtypes, shapes, group_name, flush_cache}` (NCCL) |
+| `/update_weights_from_tensor` | POST | `{serialized_named_tensors, load_format, flush_cache}` (serialized / CUDA-IPC) |
+| `/update_weights_from_disk` | POST | `{model_path, load_format}` |
+| `/pause_generation`, `/continue_generation` | POST | block / unblock new admission |
+| `/flush_cache` | GET | flush KV/prefix cache |
+| `/release_memory_occupation`, `/resume_memory_occupation` | POST | offload / restore (colocated) |
+| `/abort_request` | POST | `{rid}` or `{abort_all: true}` |
+| `/health_generate` | GET | health check |
+| `/destroy_weights_update_group` | POST | no-op (group torn down with the engine) |
+
+Note the field-name difference from the native dialect: SGLang uses `dtypes`
+(the shim translates to the internal `dtype_names`).
 
 ## Status & limitations
 

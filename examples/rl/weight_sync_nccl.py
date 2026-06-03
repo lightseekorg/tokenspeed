@@ -27,7 +27,7 @@ targets any server that implements it -- only the base URL changes.
 Run a TokenSpeed server with the control plane enabled:
 
     tokenspeed serve <model> --host 0.0.0.0 --port 8000 \\
-        --enable-weight-transfer --weight-transfer-config '{"backend":"nccl"}'
+        --weight-transfer-config '{"backend":"nccl"}'
 
 then point this script at it:
 

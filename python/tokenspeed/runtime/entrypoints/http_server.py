@@ -311,6 +311,78 @@ async def is_paused(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# RL weight transfer — SGLang dialect, proxied to the same in-engine control app
+#
+# These routes are mounted on the same in-engine RL control app as the
+# vLLM-native endpoints (runtime/entrypoints/sglang_compat_http.py), so they
+# proxy to the same _engine_http_url. Endpoint names/fields match SGLang so
+# slime/miles and verl's SGLang rollout drive tokenspeed unchanged.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/init_weights_update_group")
+async def init_weights_update_group(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/destroy_weights_update_group")
+async def destroy_weights_update_group(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/update_weights_from_distributed")
+async def update_weights_from_distributed(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/update_weights_from_tensor")
+async def update_weights_from_tensor(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/update_weights_from_disk")
+async def update_weights_from_disk(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/pause_generation")
+async def pause_generation(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/continue_generation")
+async def continue_generation(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/release_memory_occupation")
+async def release_memory_occupation(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/resume_memory_occupation")
+async def resume_memory_occupation(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.post("/abort_request")
+async def abort_request(request: Request):
+    return await _proxy_to_engine(request)
+
+
+# GET /flush_cache is SGLang's verb; POST /flush_cache (above) proxies to the
+# gateway. Both coexist on distinct methods.
+@app.get("/flush_cache")
+async def flush_cache_get(request: Request):
+    return await _proxy_to_engine(request)
+
+
+@app.get("/health_generate")
+async def health_generate(request: Request):
+    return await _proxy_to_engine(request)
+
+
+# ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
@@ -331,8 +403,9 @@ def build_server(
     Args:
         gateway_url: Base URL of the smg gateway for generation passthrough.
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
-        engine_http_url: Base URL of the in-engine weight-transfer control plane
-            (RL weight sync). Empty disables the weight routes (they return 503).
+        engine_http_url: Base URL of the in-engine RL control plane (vLLM-native
+            + SGLang-compatible weight sync). Empty disables those routes (they
+            return 503).
         host: Bind address.
         port: Bind port.
     """

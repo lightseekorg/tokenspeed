@@ -13,7 +13,6 @@ from tokenspeed.runtime.entrypoints import http_server
 from tokenspeed.runtime.entrypoints.weight_transfer_http import (
     build_weight_transfer_app,
 )
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import get_free_port
 
 WEIGHT_ROUTES = {
@@ -34,32 +33,23 @@ WEIGHT_ROUTES = {
 
 
 class TestMaybeAddWeightTransferPort:
-    def test_disabled_no_change(self):
+    def test_on_by_default_allocates_port(self):
         args, url = _maybe_add_weight_transfer_port(["--model", "m"])
-        assert args == ["--model", "m"]
-        assert url == ""
-
-    def test_enabled_allocates_port(self):
-        args, url = _maybe_add_weight_transfer_port(
-            ["--model", "m", "--enable-weight-transfer"]
-        )
         assert "--weight-transfer-port" in args
         assert url.startswith("http://127.0.0.1:")
         port = args[args.index("--weight-transfer-port") + 1]
         assert url.endswith(port)
 
-    def test_enabled_respects_pinned_port(self):
-        args, url = _maybe_add_weight_transfer_port(
-            ["--enable-weight-transfer", "--weight-transfer-port", "9999"]
-        )
+    def test_opt_out_no_change(self):
+        argv = ["--model", "m", "--no-enable-weight-transfer"]
+        args, url = _maybe_add_weight_transfer_port(argv)
+        assert args == argv
+        assert url == ""
+
+    def test_respects_pinned_port(self):
+        args, url = _maybe_add_weight_transfer_port(["--weight-transfer-port", "9999"])
         assert args.count("--weight-transfer-port") == 1
         assert url == "http://127.0.0.1:9999"
-
-    def test_env_enables(self):
-        with envs.TOKENSPEED_SERVER_DEV_MODE.override(True):
-            args, url = _maybe_add_weight_transfer_port(["--model", "m"])
-        assert "--weight-transfer-port" in args
-        assert url.startswith("http://127.0.0.1:")
 
 
 # --------------------------------------------------------------------------- #

@@ -354,21 +354,15 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
 
 
 def _maybe_add_weight_transfer_port(engine_args: list[str]) -> tuple[list[str], str]:
-    """Wire the in-engine weight-transfer control plane port, if enabled.
+    """Wire the in-engine RL control-plane port for the sidecar to proxy.
 
-    When ``--enable-weight-transfer`` (or ``TOKENSPEED_SERVER_DEV_MODE=1``) is in
-    effect, ensure ``--weight-transfer-port`` is present in the engine argv
-    (allocating a free port if the user did not pin one) and return the matching
-    ``engine_http_url`` for the sidecar to proxy to. Otherwise return the argv
-    unchanged and an empty URL (weight routes report 503).
+    The control plane is **on by default**; ensure ``--weight-transfer-port`` is
+    present in the engine argv (allocating a free port if the user did not pin
+    one) and return the matching ``engine_http_url``. Disabled by
+    ``--no-enable-weight-transfer``, in which case the argv is returned unchanged
+    and an empty URL (weight routes report 503).
     """
-    from tokenspeed.runtime.utils.env import envs
-
-    enabled = (
-        "--enable-weight-transfer" in engine_args
-        or envs.TOKENSPEED_SERVER_DEV_MODE.get()
-    )
-    if not enabled:
+    if "--no-enable-weight-transfer" in engine_args:
         return engine_args, ""
     if "--weight-transfer-port" in engine_args:
         idx = engine_args.index("--weight-transfer-port")

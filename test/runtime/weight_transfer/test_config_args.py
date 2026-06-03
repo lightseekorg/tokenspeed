@@ -8,7 +8,6 @@ from tokenspeed.runtime.engine.weight_transfer.config import (
     SUPPORTED_BACKENDS,
     WeightTransferConfig,
 )
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -52,19 +51,13 @@ class TestWeightTransferConfig:
 
 
 class TestServerArgsGating:
-    def test_disabled_by_default(self):
+    def test_enabled_by_default(self):
         sa = ServerArgs(model="m")
-        assert sa.enable_weight_transfer is False
-        assert sa.weight_transfer_enabled is False
-
-    def test_enabled_by_flag(self):
-        sa = ServerArgs(model="m", enable_weight_transfer=True)
+        assert sa.enable_weight_transfer is True
         assert sa.weight_transfer_enabled is True
 
-    def test_enabled_by_env(self):
-        sa = ServerArgs(model="m")
-        with envs.TOKENSPEED_SERVER_DEV_MODE.override(True):
-            assert sa.weight_transfer_enabled is True
+    def test_disabled_by_opt_out(self):
+        sa = ServerArgs(model="m", enable_weight_transfer=False)
         assert sa.weight_transfer_enabled is False
 
     def test_get_weight_transfer_config_default(self):
@@ -87,7 +80,6 @@ class TestServerArgsCli:
             [
                 "--model",
                 "m",
-                "--enable-weight-transfer",
                 "--weight-transfer-config",
                 '{"backend":"nccl"}',
             ]
@@ -96,7 +88,11 @@ class TestServerArgsCli:
         assert sa.weight_transfer_enabled is True
         assert sa.get_weight_transfer_config().backend == "nccl"
 
-    def test_cli_default_off(self):
+    def test_cli_default_on(self):
         sa = self._parse(["--model", "m"])
-        assert sa.enable_weight_transfer is False
+        assert sa.enable_weight_transfer is True
         assert sa.weight_transfer_config is None
+
+    def test_cli_opt_out(self):
+        sa = self._parse(["--model", "m", "--no-enable-weight-transfer"])
+        assert sa.enable_weight_transfer is False

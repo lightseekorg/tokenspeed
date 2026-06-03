@@ -229,9 +229,6 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
-    # RL weight-transfer dev mode. When set, the weight-transfer HTTP control
-    # plane is enabled even if --enable-weight-transfer was not passed explicitly.
-    TOKENSPEED_SERVER_DEV_MODE = EnvBool(False)
     # Opt-in for deserializing CUDA-IPC handles sent as base64 pickled blobs.
     # Required by the IPC weight-transfer backend because the payload is
     # unpickled (RCE-adjacent).

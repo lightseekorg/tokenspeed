@@ -133,9 +133,12 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
-    # RL online weight sync. Off by default; see runtime/engine/weight_transfer/
+    # RL online weight sync. On by default; disable with
+    # --no-enable-weight-transfer. NOTE: these endpoints can overwrite model
+    # weights, reload checkpoints from disk, and pause/abort serving, and are
+    # exposed on the public control port. See runtime/engine/weight_transfer/
     # and runtime/entrypoints/weight_transfer_http.py.
-    enable_weight_transfer: bool = False
+    enable_weight_transfer: bool = True
     weight_transfer_config: str | None = None
     # Port for the in-engine weight-transfer HTTP control plane. Set by the
     # ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
@@ -1808,11 +1811,12 @@ class ServerArgs:
         # RL online weight sync.
         parser.add_argument(
             "--enable-weight-transfer",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_weight_transfer,
-            help="Enable the weight-transfer HTTP control plane for RL online "
-            "serving (init/start/update/finish/pause/resume). Off by default; "
-            "also enabled via TOKENSPEED_SERVER_DEV_MODE=1.",
+            help="RL weight-sync HTTP control plane (vLLM-native + "
+            "SGLang-compatible endpoints, one port). On by default; disable with "
+            "--no-enable-weight-transfer. WARNING: these endpoints can overwrite "
+            "weights, reload checkpoints from disk, and pause/abort serving.",
         )
         parser.add_argument(
             "--weight-transfer-config",
@@ -1873,14 +1877,11 @@ class ServerArgs:
 
     @property
     def weight_transfer_enabled(self) -> bool:
-        """Whether the weight-transfer control plane is on.
+        """Whether the RL weight-sync control plane is on (default True).
 
-        Enabled by ``--enable-weight-transfer`` or the
-        ``TOKENSPEED_SERVER_DEV_MODE=1`` env.
+        On by default; disable with ``--no-enable-weight-transfer``.
         """
-        from tokenspeed.runtime.utils.env import envs
-
-        return self.enable_weight_transfer or envs.TOKENSPEED_SERVER_DEV_MODE.get()
+        return self.enable_weight_transfer
 
     def get_weight_transfer_config(self):
         """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""

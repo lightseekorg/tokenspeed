@@ -27,7 +27,7 @@ Run a TokenSpeed server with the IPC backend:
 
     TOKENSPEED_ALLOW_INSECURE_SERIALIZATION=1 \\
     tokenspeed serve <model> --host 0.0.0.0 --port 8000 \\
-        --enable-weight-transfer --weight-transfer-config '{"backend":"ipc"}'
+        --weight-transfer-config '{"backend":"ipc"}'
 
 The trainer exports CUDA-IPC handles for its tensors and ships them as a
 base64-encoded pickle under ``update_info.ipc_handles_pickled``. The inference
