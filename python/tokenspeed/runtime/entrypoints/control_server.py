@@ -422,21 +422,3 @@ def build_control_server(
     return uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="warning")
     )
-
-
-def start(
-    *,
-    gateway_url: str,
-    engine_grpc_addr: str,
-    rl_control_url: str = "",
-    host: str = "127.0.0.1",
-    port: int = 8001,
-) -> None:
-    """Start the HTTP server (blocking)."""
-    build_control_server(
-        gateway_url=gateway_url,
-        engine_grpc_addr=engine_grpc_addr,
-        rl_control_url=rl_control_url,
-        host=host,
-        port=port,
-    ).run()

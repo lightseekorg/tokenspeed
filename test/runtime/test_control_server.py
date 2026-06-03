@@ -229,10 +229,23 @@ class TestGrpcDirect(unittest.TestCase):
         from tokenspeed.runtime.entrypoints import control_server as hs
 
         self.hs = hs
+        # Give this test a fresh, current event loop so ``grpc.aio.insecure_channel``
+        # binds to a live loop regardless of loop state left behind by earlier
+        # tests in the suite (e.g. asyncio.run / uvicorn threads elsewhere).
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         # Reset the cached channel/stub between tests.
         hs._grpc_channel = None
         hs._grpc_stub = None
         hs._engine_grpc_addr = "127.0.0.1:1"
+
+    def tearDown(self):
+        # Drop the cached channel/stub and restore loop state so we neither leak
+        # the channel nor leave a closed loop as "current" for later tests.
+        self.hs._grpc_channel = None
+        self.hs._grpc_stub = None
+        asyncio.set_event_loop(None)
+        self._loop.close()
 
     # -- bug 3: gRPC channel reuse ------------------------------------------
 
