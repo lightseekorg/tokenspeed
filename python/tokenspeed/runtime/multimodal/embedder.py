@@ -53,7 +53,6 @@ first item's ``encoded`` tensor.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -69,15 +68,12 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
+from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[List[MultimodalDataItem]], torch.Tensor]
 
 logger = logging.getLogger(__name__)
-LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 @dataclass

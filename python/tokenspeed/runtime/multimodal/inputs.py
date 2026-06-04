@@ -136,11 +136,6 @@ class MultimodalInputs:
             if isinstance(item.feature, ShmTensorHandle):
                 item.feature.attach()
 
-    def consume_shm_features(self) -> None:
-        for item in self.mm_items:
-            if isinstance(item.feature, ShmTensorHandle):
-                item.feature = item.feature.consume()
-
     def release_shm_features(self) -> None:
         for item in self.mm_items:
             if isinstance(item.feature, ShmTensorHandle):

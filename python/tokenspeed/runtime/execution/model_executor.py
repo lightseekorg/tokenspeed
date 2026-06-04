@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -73,12 +72,7 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
-LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -447,12 +441,17 @@ class ModelExecutor:
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
-        self._mrope_decode_deltas_cpu = self._make_mrope_decode_deltas_cpu(
-            config.chunked_prefill_size
-        )
-        self._mrope_decode_deltas_buf = torch.zeros(
-            config.chunked_prefill_size, device=self.device, dtype=torch.int64
-        )
+        if config.model_is_mrope:
+            mrope_decode_capacity = self.input_buffers.max_num_tokens
+            self._mrope_decode_deltas_cpu = self._make_mrope_decode_deltas_cpu(
+                mrope_decode_capacity
+            )
+            self._mrope_decode_deltas_buf = torch.zeros(
+                mrope_decode_capacity, device=self.device, dtype=torch.int64
+            )
+        else:
+            self._mrope_decode_deltas_cpu = None
+            self._mrope_decode_deltas_buf = None
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
         self.num_decode_steps = 0
@@ -1571,13 +1570,15 @@ class ModelExecutor:
                         num_reqs=bs,
                     )
                     self._log_dp_sampling_route(bs, ctx)
-                    graph_capable = self.forward_step.can_run(bs, ctx)
-                    graph_padded_bs = (
-                        self.forward_step.padded_bs(bs, ctx) if graph_capable else bs
-                    )
-                    forward_step_start = (
-                        time.perf_counter() if timing_enabled else 0.0
-                    )
+                    forward_step_start = 0.0
+                    if timing_enabled:
+                        graph_capable = self.forward_step.can_run(bs, ctx)
+                        graph_padded_bs = (
+                            self.forward_step.padded_bs(bs, ctx)
+                            if graph_capable
+                            else bs
+                        )
+                        forward_step_start = time.perf_counter()
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -1755,6 +1756,14 @@ class ModelExecutor:
         mm_inputs,
         total_tokens: int,
     ) -> torch.Tensor:
+        if (
+            self._mrope_decode_deltas_cpu is None
+            or self._mrope_decode_deltas_buf is None
+        ):
+            raise RuntimeError(
+                "M-RoPE decode buffers were not initialized for this model"
+            )
+
         base_positions = self.input_buffers.positions_buf[:total_tokens]
         token_deltas_cpu = self._mrope_decode_deltas_cpu[:total_tokens]
 

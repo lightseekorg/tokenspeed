@@ -31,19 +31,16 @@ large payload copy happens:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 
 import torch
 
+from tokenspeed.runtime.utils.env import envs
+
 logger = logging.getLogger(__name__)
-LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 @dataclass
