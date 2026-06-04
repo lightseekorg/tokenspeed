@@ -33,11 +33,6 @@ from tokenspeed.runtime.layers.quantization import (
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
 _AUTO_IMPL_PREFERENCE = {
-    "unquantized": (
-        "flashinfer_trtllm",
-        "flashinfer_cutlass",
-        "triton",
-    ),
     "nvfp4": (
         "flashinfer_trtllm",
         "flashinfer_cutedsl",
@@ -56,12 +51,11 @@ _AUTO_IMPL_PREFERENCE = {
 
 
 def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
-    # Handle ignored layers or no quantization
     if quant_config is None or should_ignore_quant_layer(
         prefix=prefix,
         ignored_layers=getattr(quant_config, "ignored_layers", []),
     ):
-        return "unquantized"
+        raise RuntimeError("Unquantized MoE backends are no longer supported")
 
     # ModelOpt FP4 quantization
     if isinstance(quant_config, Nvfp4Config):
@@ -96,7 +90,7 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
     auto_candidates = _AUTO_IMPL_PREFERENCE.get(quant_kind, ())
     platform = current_platform()
     if backend.is_auto() and platform.is_amd:
-        if quant_kind in {"unquantized", "fp8"}:
+        if quant_kind == "fp8":
             auto_candidates = tuple(
                 impl for impl in auto_candidates if impl == "triton"
             )
@@ -110,8 +104,7 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
     if not backend.is_auto():
         # If a specific MoE backend is forced globally, only honor it
         # when it is actually registered for this quant_kind. Otherwise
-        # fallback to the auto preference (e.g. draft model is unquantized
-        # but target model is configured with flashinfer_cutedsl).
+        # fallback to the auto preference for this quantization kind.
         if backend.value in auto_candidates:
             return (backend.value,)
 
@@ -129,9 +122,6 @@ def select_backend(
     from tokenspeed.runtime.layers.moe.backends import ensure_backend_family_registered
 
     quant_kind = _normalize_quant_kind(quant_config, prefix=spec.prefix)
-    if quant_kind == "unquantized":
-        quant_config = None
-
     arch = _detect_arch()
     tried = []
 
