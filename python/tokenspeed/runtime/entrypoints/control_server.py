@@ -34,6 +34,8 @@ Architecture::
 
 from __future__ import annotations
 
+import json
+
 import aiohttp
 import grpc
 import grpc.aio
@@ -143,13 +145,15 @@ async def abort(request: Request):
 
 
 async def _proxy_request(
-    request: Request, base_url: str | None = None
+    request: Request,
+    base_url: str | None = None,
+    body_override: bytes | None = None,
 ) -> StreamingResponse | Response:
     base_url = base_url if base_url is not None else _gateway_url
     url = f"{base_url.rstrip('/')}{request.url.path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
-    body = await request.body()
+    body = body_override if body_override is not None else await request.body()
     headers = {
         k: v
         for k, v in request.headers.items()
@@ -202,9 +206,134 @@ async def _proxy_request(
         await session.close()
 
 
+# sglang-native /generate clients (e.g. slime, verl) post {"text"|"input_ids",
+# "sampling_params"} with no `model` field; the smg gateway needs `model` to
+# select a tokenizer/worker (else `tokenizer_not_found`). Default it to the
+# single served model so tokenspeed is a drop-in sglang generation endpoint.
+_served_model_id: str | None = None
+
+
+async def _served_model() -> str | None:
+    """Lazily fetch + cache the served model id from the engine (gRPC)."""
+    global _served_model_id
+    if _served_model_id is None:
+        try:
+            resp = await _stub().GetModelInfo(pb.GetModelInfoRequest())
+        except grpc.aio.AioRpcError:
+            return None
+        info = MessageToDict(resp, preserving_proto_field_name=True)
+        _served_model_id = info.get("served_model_name") or info.get("model_path")
+    return _served_model_id
+
+
+async def _inject_default_model(body: bytes) -> bytes:
+    """Return ``body`` with ``model`` set to the served model when the JSON
+    body omits it. Non-JSON or already-populated bodies pass through."""
+    if not body:
+        return body
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(data, dict) or data.get("model"):
+        return body
+    model_id = await _served_model()
+    if not model_id:
+        return body
+    data["model"] = model_id
+    return json.dumps(data).encode()
+
+
+def _is_single_prompt(body: bytes) -> bool:
+    """True if the sglang /generate body carries a *single* prompt (text=str or
+    input_ids=list[int]) rather than a batch (text=list / input_ids=list[list])."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if isinstance(data.get("text"), str):
+        return True
+    ids = data.get("input_ids")
+    return isinstance(ids, list) and (not ids or isinstance(ids[0], int))
+
+
+def _wants_logprob(body: bytes) -> bool:
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and bool(data.get("return_logprob"))
+
+
+_warned_placeholder_logprobs = False
+
+
+def _add_output_token_logprobs(obj: dict) -> bool:
+    """Fallback so RL rollout clients always get response token ids.
+
+    RL trainers (slime/verl) recover the response token ids from
+    ``meta_info.output_token_logprobs`` (``[[logprob, token_id, ...], ...]``).
+    When the engine is started with ``--enable-output-logprobs`` it already fills
+    this with *real* per-token logprobs and we leave it untouched. Otherwise it is
+    absent (empty logprobs), which would leave the trainer with zero response
+    tokens and no gradient — so synthesize the field from the real top-level
+    ``output_ids`` with a placeholder logprob (0.0). The placeholder is safe only
+    when the trainer recomputes logprobs (slime with ``use_rollout_logprobs=False``)
+    and would be wrong for off-policy correction, so warn once. Returns True if the
+    object was modified."""
+    global _warned_placeholder_logprobs
+    mi = obj.get("meta_info")
+    if not isinstance(mi, dict) or mi.get("output_token_logprobs"):
+        return False  # real logprobs present (engine has --enable-output-logprobs)
+    out_ids = obj.get("output_ids")
+    if not (isinstance(out_ids, list) and out_ids and isinstance(out_ids[0], int)):
+        return False
+    if not _warned_placeholder_logprobs:
+        logger.warning(
+            "synthesizing placeholder output_token_logprobs from output_ids; start "
+            "the engine with --enable-output-logprobs for real per-token logprobs"
+        )
+        _warned_placeholder_logprobs = True
+    mi["output_token_logprobs"] = [[0.0, int(t), None] for t in out_ids]
+    return True
+
+
 @app.api_route("/generate", methods=["GET", "POST"])
 async def generate(request: Request):
-    return await _proxy_request(request)
+    if request.method != "POST":
+        return await _proxy_request(request)
+    body = await _inject_default_model(await request.body())
+    resp = await _proxy_request(request, body_override=body)
+    if not (isinstance(resp, Response) and resp.body):
+        return resp  # streaming or empty: pass through
+    try:
+        parsed = json.loads(resp.body)
+    except (ValueError, TypeError):
+        return resp
+
+    changed = False
+    # sglang /generate returns a single object for a single prompt; the smg
+    # gateway always wraps results in a list. slime/verl index
+    # ``output["meta_info"]``, so unwrap a 1-element list for single prompts.
+    if _is_single_prompt(body) and isinstance(parsed, list) and len(parsed) == 1:
+        parsed = parsed[0]
+        changed = True
+    # When logprobs were requested, expose the response token ids in the
+    # sglang ``meta_info.output_token_logprobs`` shape RL trainers consume.
+    if _wants_logprob(body):
+        for o in parsed if isinstance(parsed, list) else [parsed]:
+            if isinstance(o, dict) and _add_output_token_logprobs(o):
+                changed = True
+
+    if not changed:
+        return resp
+    return Response(
+        content=json.dumps(parsed).encode(),
+        status_code=resp.status_code,
+        media_type=resp.media_type or "application/json",
+    )
 
 
 @app.api_route("/v1/completions", methods=["POST"])

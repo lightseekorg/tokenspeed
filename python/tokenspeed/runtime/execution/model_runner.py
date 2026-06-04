@@ -179,27 +179,68 @@ class ModelRunner:
     # ------------------------------------------------------------------ #
 
     def init_weights_update_group(self, obj) -> tuple[bool, str]:
-        """Join the trainer's NCCL weight-update group (stateless, out-of-band)."""
-        from tokenspeed.runtime.distributed.device_communicators.pynccl import (
-            PyNcclCommunicator,
+        """Join the trainer's ``torch.distributed`` NCCL weight-update group.
+
+        The trainer (slime/sglang dialect) creates the peer group with
+        ``init_process_group(init_method="tcp://addr:port", rank=0, world_size)``
+        and pushes weights via ``dist.broadcast(..., src=0)``. We must rendezvous
+        through the *same* torch TCP-store + NCCL-unique-id handshake — a
+        ``StatelessProcessGroup``/``PyNcclCommunicator`` keys its store
+        differently and never forms a joint communicator with a torch group, so
+        the broadcast would deadlock. Build a standalone, non-default group (via
+        the same private helper torch's own ``init_process_group`` uses) so it
+        never collides with the engine's own world.
+        """
+        from packaging.version import parse as _parse_version
+        from torch.distributed.distributed_c10d import (
+            Backend,
+            PrefixStore,
+            _new_process_group_helper,
+            _world,
+            default_pg_timeout,
+            rendezvous,
         )
-        from tokenspeed.runtime.distributed.utils import StatelessProcessGroup
 
         try:
             rank = int(obj.rank_offset) + self.global_rank
+            world_size = int(obj.world_size)
+            group_name = str(getattr(obj, "group_name", "weight_update_group"))
+            backend = Backend(str(getattr(obj, "backend", "nccl")))
             device = torch.device(f"cuda:{self.gpu_id}")
-            pg = StatelessProcessGroup.create(
-                host=str(obj.master_address),
-                port=int(obj.master_port),
-                rank=rank,
-                world_size=int(obj.world_size),
+            torch.cuda.set_device(device)
+
+            timeout = default_pg_timeout
+            init_method = f"tcp://{obj.master_address}:{int(obj.master_port)}"
+            store, rank, world_size = next(
+                rendezvous(init_method, rank, world_size, timeout=timeout)
             )
-            self._weight_update_comm = PyNcclCommunicator(group=pg, device=device)
-            logger.info(
-                "weight-update group joined: rank=%d world_size=%d device=%s",
+            store.set_timeout(timeout)
+            store = PrefixStore(group_name, store)
+            opt = (
+                "backend_options"
+                if _parse_version(torch.__version__) >= _parse_version("2.6")
+                else "pg_options"
+            )
+            pg, _ = _new_process_group_helper(
+                world_size,
                 rank,
-                obj.world_size,
+                [],
+                backend,
+                store,
+                group_name=group_name,
+                **{opt: None},
+                timeout=timeout,
+            )
+            _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+
+            self._weight_update_pg = pg
+            self._weight_update_device = device
+            logger.info(
+                "weight-update group joined: rank=%d world_size=%d device=%s group=%s",
+                rank,
+                world_size,
                 device,
+                group_name,
             )
             return True, "weight update group initialized"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
@@ -207,29 +248,32 @@ class ModelRunner:
             return False, str(e)
 
     def update_weights_from_distributed(self, obj) -> tuple[bool, str]:
-        """Receive broadcast weights from the trainer and load them in place."""
-        comm = getattr(self, "_weight_update_comm", None)
-        if comm is None:
+        """Receive trainer-broadcast weights over the NCCL group and load them."""
+        import torch.distributed as dist
+
+        pg = getattr(self, "_weight_update_pg", None)
+        if pg is None:
             return False, "weight update group not initialized"
         try:
             names = list(obj.names)
             dtype_names = list(obj.dtype_names)
             shapes = [tuple(s) for s in obj.shapes]
+            device = self._weight_update_device
 
             def _recv():
-                # NCCL broadcasts are ordered collectives: issue them in the same
-                # order as the trainer's sender, and sync the comm stream before
-                # yielding so load_weights reads fully-received data.
-                with comm.change_state(enable=True):
-                    for name, dtype_name, shape in zip(names, dtype_names, shapes):
-                        buf = torch.empty(
-                            shape, dtype=getattr(torch, dtype_name), device=comm.device
-                        )
-                        comm.broadcast(buf, src=0)
-                        comm.stream.synchronize()
-                        yield name, buf
+                # NCCL broadcasts are ordered collectives: receive each weight in
+                # the trainer's send order (rank 0 is the trainer) and hand it to
+                # the model's loader (the same name->param mapping, including
+                # fused/stacked params, used by the initial load).
+                for name, dtype_name, shape in zip(names, dtype_names, shapes):
+                    buf = torch.empty(
+                        shape, dtype=getattr(torch, dtype_name), device=device
+                    )
+                    dist.broadcast(buf, src=0, group=pg)
+                    yield name, buf
 
             self.model.load_weights(_recv())
+            torch.cuda.synchronize(device)
             return True, f"updated {len(names)} weights"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")
