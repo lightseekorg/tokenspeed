@@ -24,69 +24,13 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.numerics.moe import (
-    canonicalize_align_block_size,
-    compute_align_block_size_buffer_dims,
-)
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import (
-    dense_tensor_format,
-    format_signature,
-    format_signatures,
-)
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.torch_compile import get_compiler_backend
-
-# ---------------------------------------------------------------------------
-# Fused MoE (reference)
-# ---------------------------------------------------------------------------
-
-
-@register_kernel(
-    "moe",
-    "fused",
-    name="reference_moe_fused",
-    features={"pre_routed"},
-    solution="reference",
-    signatures=frozenset(
-        format_signature(
-            x=dense_tensor_format(dtype), weight=dense_tensor_format(torch.bfloat16)
-        )
-        for dtype in {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    priority=Priority.REFERENCE,
-    traits={
-        "tp": frozenset({False}),
-        "ep": frozenset({False}),
-    },
-    tags={"portability", "determinism"},
-)
-def fused_moe_forward_native(
-    x: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    w13_weight: torch.Tensor,
-    w2_weight: torch.Tensor,
-    *,
-    activation: str = "silu",
-) -> torch.Tensor:
-    w13_weights = w13_weight[topk_ids]
-    w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
-    w2_weights = w2_weight[topk_ids]
-    x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
-    if activation == "silu":
-        x1 = F.silu(x1)
-    elif activation == "gelu":
-        x1 = F.gelu(x1)
-    else:
-        raise ValueError(f"Unsupported activation: {activation=}")
-    x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
-    expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
-    return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
-
 
 # ---------------------------------------------------------------------------
 # Routing kernels
@@ -371,70 +315,3 @@ def biased_grouped_topk_gpu(
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
-
-
-# ---------------------------------------------------------------------------
-# Align block size (reference)
-# ---------------------------------------------------------------------------
-
-
-@register_kernel(
-    "moe",
-    "align_block_size",
-    name="torch_moe_align_block_size",
-    solution="reference",
-    signatures=format_signatures("indices", "dense", {torch.int32}),
-    traits={},
-    priority=10,
-    tags={"determinism", "portability"},
-)
-def torch_moe_align_block_size(
-    topk_ids: torch.Tensor,
-    block_size: int,
-    num_experts: int,
-) -> torch.Tensor:
-    """Pure-torch reference for moe_align_block_size.
-
-    Returns the canonical packed tensor (see ``canonicalize_align_block_size``).
-    """
-    assert topk_ids.dtype == torch.int32
-    total_tokens, top_k = topk_ids.shape
-    device = topk_ids.device
-    pad_id = total_tokens * top_k
-
-    max_num_m_blocks, sorted_ids_size = compute_align_block_size_buffer_dims(
-        pad_id, num_experts, block_size
-    )
-
-    # For each (token, k) slot, assign a flat-id 0..pad_id-1; group by expert.
-    flat_token_ids = torch.arange(pad_id, device=device, dtype=torch.int32)
-    flat_expert = topk_ids.flatten()
-
-    # Gather slot ids per expert (e in [0, num_experts) is a real expert; e =
-    # num_experts marks the filtered-out / "no expert" slot in EP setups).
-    sorted_ids = torch.full(
-        (sorted_ids_size,), pad_id, device=device, dtype=torch.int32
-    )
-    expert_ids = torch.zeros((max_num_m_blocks,), device=device, dtype=torch.int32)
-
-    write_pos = 0
-    block_idx = 0
-    for e in range(num_experts + 1):
-        slot_ids = flat_token_ids[flat_expert == e]
-        n_slots = slot_ids.numel()
-        # Pad to multiple of block_size.
-        n_blocks = (n_slots + block_size - 1) // block_size
-        for b in range(n_blocks):
-            block_start = write_pos + b * block_size
-            block_slot_count = min(block_size, n_slots - b * block_size)
-            sorted_ids[block_start : block_start + block_slot_count] = slot_ids[
-                b * block_size : b * block_size + block_slot_count
-            ]
-            expert_ids[block_idx + b] = e
-        write_pos += n_blocks * block_size
-        block_idx += n_blocks
-
-    num_tokens_post_pad = torch.tensor([write_pos], device=device, dtype=torch.int32)
-    return canonicalize_align_block_size(
-        sorted_ids, expert_ids, num_tokens_post_pad, block_size
-    )

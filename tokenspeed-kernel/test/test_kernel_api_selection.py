@@ -49,7 +49,6 @@ import tokenspeed_kernel.ops.moe.deepep as _moe_deepep
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.moe.triton_kernels as _moe_triton_kernels
-import tokenspeed_kernel.ops.moe.trtllm as _moe_trtllm
 import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
@@ -79,7 +78,6 @@ _RELOAD_MODULES = [
     _moe_flashinfer,
     _moe_triton,
     _moe_triton_kernels,
-    _moe_trtllm,
     _moe_pkg,
     # Top-level public API re-exports.
     tokenspeed_kernel,
@@ -419,14 +417,6 @@ def _moe_experts_gemm_combine() -> object:
     )
 
 
-def _moe_fused_self_routing_bf16() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"self_routing"},
-        weight_format="bf16",
-    )
-
-
 def _moe_fused_self_routing_mxfp4() -> object:
     return tokenspeed_kernel.moe_fused(
         dtype=torch.bfloat16,
@@ -458,15 +448,6 @@ def _moe_fused_prerouted_nvfp4_cutedsl() -> object:
             "ep": True,
             "cuda_graph": True,
         },
-    )
-
-
-def _moe_fused_prerouted_bf16_reference() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"pre_routed"},
-        weight_format="bf16",
-        traits={"tp": False, "ep": False},
     )
 
 
@@ -739,14 +720,6 @@ _CASES = [
         "nvidia",
         "moe",
         "fused",
-        "flashinfer_trtllm_bf16_fused_moe",
-        _moe_fused_self_routing_bf16,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
         "flashinfer_trtllm_fp4_fused_moe",
         _moe_fused_self_routing_mxfp4,
     ),
@@ -765,14 +738,6 @@ _CASES = [
         "fused",
         "flashinfer_cutedsl_nvfp4_fused_moe",
         _moe_fused_prerouted_nvfp4_cutedsl,
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "moe",
-        "fused",
-        "reference_moe_fused",
-        _moe_fused_prerouted_bf16_reference,
     ),
 ]
 

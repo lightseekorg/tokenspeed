@@ -31,7 +31,6 @@ import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton_kernels  # noqa: F401
-import tokenspeed_kernel.ops.moe.trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (  # noqa: F401
     ExpertLocationDispatchInfo,
@@ -92,11 +91,10 @@ __all__ = [
 # moe/fused interface features
 FUSED_SELF_ROUTING = "self_routing"  # kernel does routing internally (trtllm)
 FUSED_PRE_ROUTED = (
-    "pre_routed"  # caller provides topk_weights/topk_ids (marlin, cutlass, reference)
+    "pre_routed"  # caller provides topk_weights/topk_ids (cutlass, cutedsl)
 )
 
 # Weight format values used by moe_fused(weight_format=...).
-WEIGHT_BF16 = "bf16"  # dense bfloat16 weights
 WEIGHT_FP8 = "fp8"  # FP8 block-scaled weights
 WEIGHT_MXFP4 = "mxfp4"  # MXFP4 block-scaled weights
 WEIGHT_NVFP4 = "nvfp4"  # NVFP4 block-scaled weights (CuteDSL)
@@ -167,8 +165,6 @@ def _moe_fused_format_signature(
         weight = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
     elif weight_format == WEIGHT_MXFP4:
         weight = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
-    elif weight_format == WEIGHT_BF16:
-        weight = dense_tensor_format(torch.bfloat16)
     else:
         raise ValueError(f"Unsupported MoE fused weight_format={weight_format!r}")
 
@@ -311,7 +307,7 @@ def moe_fused(
     *args,
     dtype: torch.dtype = torch.bfloat16,
     features: Optional[Set[str]] = None,
-    weight_format: str = WEIGHT_BF16,
+    weight_format: Optional[str] = None,
     fp8_scale_granularity: str = "block",
     traits: Optional[dict] = None,
     expected_kernel_name: Optional[str] = None,
@@ -328,7 +324,6 @@ def moe_fused(
         weight_format: Weight tensor encoding used for the expert weights.
             Supported values are:
 
-            * ``"bf16"``: dense bfloat16 weights with no scale tensor.
             * ``"fp8"``: FP8 E4M3 weights with float32 block scales.
               Fused MoE kernels currently register this as a fixed
               ``block_shape=(128, 128)`` format.
@@ -341,6 +336,8 @@ def moe_fused(
             ``dtype=torch.uint8``, ``weight_format`` disambiguates whether the
             input is interpreted as MXFP4 or NVFP4.
     """
+    if weight_format is None:
+        raise ValueError("moe_fused requires an explicit weight_format")
     signature = _moe_fused_format_signature(
         dtype, weight_format, fp8_scale_granularity=fp8_scale_granularity
     )
