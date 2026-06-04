@@ -25,6 +25,11 @@ from contextlib import contextmanager
 
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+from tokenspeed_kernel.ops.moe.fused_routing import (
+    SMALLM_MAX_M,
+    gluon_fused_route,
+    gluon_route_supported,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -189,6 +194,14 @@ def triton_kernels_routing(
     n_tokens, _ = logits.shape
 
     assert sm_first is False, "sm_first=True not supported for triton_kernels_routing"
+
+    # Small-M (decode) Gluon fast path: one fused kernel reproduces the routing
+    # metadata + index tensors bit-for-bit while cutting the generic pipeline's
+    # ~12 launches (decode is launch-overhead bound: ~1.1-1.4x e2e at M<=16).
+    # Larger M and unsupported configs fall through to the generic pipeline.
+    if n_tokens <= SMALLM_MAX_M and gluon_route_supported(logits, n_expts_act, dtype):
+        return gluon_fused_route(logits, n_expts_act, dtype=dtype)
+
     sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
     mask_metadata = sparse.mask_metadata
 
