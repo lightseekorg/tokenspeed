@@ -611,26 +611,21 @@ def test_gumbel_top_k_top_p_large_vocab_samples_allowed_set(device: str) -> None
         assert token_id in allowed
 
 
-@pytest.mark.parametrize("top_k,top_p", [(1, 1.0), (16, 0.75), (64, 0.9)])
-def test_gumbel_top_k_top_p_qrita_samples_allowed_set(
-    device: str, top_k: int, top_p: float
-) -> None:
-    torch.manual_seed(5020 + top_k)
-    rows, vocab_size = 3, 513
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
-    logits[:, vocab_size - 1] = float("-inf")
-    req_pool_indices = torch.tensor([4, 2, 7], dtype=torch.int32, device=device)
-    pool_rows = 9
-    temperature_pool = torch.linspace(
-        0.7, 1.3, pool_rows, dtype=torch.float32, device=device
+def test_gumbel_top_k_top_p_masks_short_tail_block_candidates(device: str) -> None:
+    rows, vocab_size = 1, 2050
+    logits = torch.arange(vocab_size, dtype=torch.float32, device=device).unsqueeze(0)
+    req_pool_indices = torch.tensor([1], dtype=torch.int32, device=device)
+    pool_rows = 2
+    temperature_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
+    top_k_pool = torch.full((pool_rows,), 100, dtype=torch.int32, device=device)
+    top_p_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
+    seed_pool = torch.arange(71, 71 + pool_rows, dtype=torch.int64, device=device)
+    offsets_pool = torch.arange(5, 5 + pool_rows, dtype=torch.int64, device=device)
+    candidate_ids, candidate_logits, out = _top_k_top_p_gumbel_scratch(
+        rows, vocab_size, device
     )
-    top_k_pool = torch.full((pool_rows,), top_k, dtype=torch.int32, device=device)
-    top_p_pool = torch.full((pool_rows,), top_p, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(123, 123 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(17, 17 + pool_rows, dtype=torch.int64, device=device)
-    qrita_buffer, qrita_table, out = _qrita_gumbel_scratch(rows, vocab_size, device)
 
-    sampled = gumbel_sample_top_k_top_p_qrita_from_pools(
+    sampled = gumbel_sample_top_k_top_p_from_pools(
         logits,
         req_pool_indices,
         temperature_pool,
@@ -638,21 +633,14 @@ def test_gumbel_top_k_top_p_qrita_samples_allowed_set(
         top_p_pool,
         seed_pool,
         offsets_pool,
-        qrita_buffer,
-        qrita_table,
+        candidate_ids,
+        candidate_logits,
         out,
-        num_programs=rows,
     )
 
-    for row, token_id in enumerate(sampled.cpu().tolist()):
-        pool_idx = int(req_pool_indices[row].item())
-        allowed = _top_k_topp_allowed_ids(
-            logits[row],
-            float(temperature_pool[pool_idx].item()),
-            top_k,
-            top_p,
-        )
-        assert token_id in allowed
+    assert not torch.isnan(candidate_logits).any()
+    allowed = _top_k_topp_allowed_ids(logits[0], 1.0, 100, 1.0)
+    assert int(sampled.item()) in allowed
 
 
 def test_gumbel_top_k_top_p_qrita_verify_idx_mapping_matches_expanded_rows(

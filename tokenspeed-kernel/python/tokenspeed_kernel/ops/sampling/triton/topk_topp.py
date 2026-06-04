@@ -70,6 +70,7 @@ def _top_k_top_p_candidates_stage1_kernel(
     top_packed = tl.topk(packed, TOPK_PAD)
 
     top_ids = (2147483647 - (top_packed & 2147483647).to(tl.uint32)).to(tl.int32)
+    top_valid = top_ids < vocab_size
     top_ordered_bits = (top_packed >> 31).to(tl.uint32)
     top_sign = top_ordered_bits & 0x80000000
     top_bits = tl.where(
@@ -78,6 +79,8 @@ def _top_k_top_p_candidates_stage1_kernel(
         ~top_ordered_bits,
     )
     top_vals = top_bits.to(tl.float32, bitcast=True)
+    top_vals = tl.where(top_valid, top_vals, float("-inf"))
+    top_ids = tl.where(top_valid, top_ids, 2147483647)
 
     rank_offsets = tl.arange(0, TOPK_PAD)
     out_base = row * candidate_row_stride + block_idx * TOPK_PAD
