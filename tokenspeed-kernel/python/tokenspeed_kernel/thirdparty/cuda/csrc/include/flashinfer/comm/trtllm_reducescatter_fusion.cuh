@@ -55,6 +55,16 @@ static constexpr int kBarrierFlagCount = 256;
 
 }  // namespace details
 
+__device__ __forceinline__ int ld_global_acquire_sys(int* addr) {
+  int val;
+  asm volatile("ld.global.acquire.sys.b32 %0, [%1];" : "=r"(val) : "l"(addr));
+  return val;
+}
+
+__device__ __forceinline__ void st_global_release_sys(int* addr, int val) {
+  asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(val), "l"(addr));
+}
+
 enum class ReduceScatterFusionPattern : int {
   kReduceScatter = 0,
   kRSResidualRMSNorm = 1,
@@ -157,23 +167,24 @@ struct RSyncComm {
   __device__ __forceinline__ RSyncComm(void** workspace) {
     counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[1];
-    flag_value = *flag_ptr;
+    flag_value = ld_global_acquire_sys(flag_ptr);
     for (int r = 0; r < NRanks; ++r) {
       comm_bufs[r] = workspace[r];
       barrier_flags[r] = workspace[NRanks + r];
     }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      atomicAdd(counter_ptr, 1);
-    }
   }
 
   __device__ __forceinline__ void update(int new_flag_value) {
+    __syncthreads();
+    __threadfence_system();
+    if (threadIdx.x == 0) {
+      atomicAdd(counter_ptr, 1);
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x) {
+      while (ld_global_acquire_sys(counter_ptr) != gridDim.x) {
       }
-      *flag_ptr = new_flag_value;
-      *counter_ptr = 0;
+      st_global_release_sys(counter_ptr, 0);
+      st_global_release_sys(flag_ptr, new_flag_value);
     }
   }
 
@@ -187,32 +198,35 @@ struct RSyncComm {
 template <int NRanks>
 struct RLamportComm {
   __device__ __forceinline__ RLamportComm(void** workspace, int rank) {
-    counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
+    // Lamport one-shot and two-shot sync launches can be adjacent in captured
+    // graphs. Keep their CTA-completion counters separate.
+    counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[5];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
-    flag_value = *flag_ptr;
-    int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
-    clear_size = *clear_ptr;
-    int data_offset = flag_value % 3;
+    flag_value = ld_global_acquire_sys(flag_ptr);
+    int comm_size = ld_global_acquire_sys(&reinterpret_cast<int*>(workspace[NRanks * 3])[3]);
+    data_offset = flag_value % 3;
     int clear_offset = (flag_value + 2) % 3;
+    clear_size = ld_global_acquire_sys(clear_ptr);
     for (int r = 0; r < NRanks; ++r) {
       data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) +
                      static_cast<int64_t>(data_offset) * comm_size;
     }
     clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      atomicAdd(counter_ptr, 1);
-    }
   }
 
   __device__ __forceinline__ void update(int new_clear_size) {
+    __syncthreads();
+    __threadfence_system();
+    if (threadIdx.x == 0) {
+      atomicAdd(counter_ptr, 1);
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x) {
+      while (ld_global_acquire_sys(counter_ptr) != gridDim.x) {
       }
-      *flag_ptr = (flag_value + 1) % 3;
-      *clear_ptr = new_clear_size;
-      *counter_ptr = 0;
+      st_global_release_sys(counter_ptr, 0);
+      st_global_release_sys(clear_ptr, clear_size > new_clear_size ? clear_size : new_clear_size);
+      st_global_release_sys(flag_ptr, (flag_value + 1) % 3);
     }
   }
 
@@ -223,6 +237,7 @@ struct RLamportComm {
   uint8_t* clear_buf;
   int clear_size;
   int flag_value;
+  int data_offset;
 };
 
 template <int NRanks>
@@ -241,6 +256,7 @@ class RBarrier {
 
   __device__ __forceinline__ void sync() {
     __syncthreads();
+    __threadfence_system();
     if (threadIdx.x < NRanks) {
       m_flag_value = next_flag(m_flag_value);
       for (int flag_idx = blockIdx.x; flag_idx < details::kBarrierFlagCount;
@@ -1047,9 +1063,6 @@ __global__ void reducescatter_fusion_kernel_oneshot_lamport(ReduceScatterFusionP
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
-  if constexpr (!TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
 #endif
   RLamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / VEC_SIZE;
@@ -1072,47 +1085,48 @@ __global__ void reducescatter_fusion_kernel_oneshot_lamport(ReduceScatterFusionP
         target_rank = remaining_tokens + (current_token_idx - threshold) / tokens_per_rank;
       }
     }
-    val.store(reinterpret_cast<T*>(comm.data_bufs[target_rank]) +
-              (params.rank * tot_access + idx) * VEC_SIZE);
+    val.store_global_release(reinterpret_cast<T*>(comm.data_bufs[target_rank]) +
+                             (params.rank * tot_access + idx) * VEC_SIZE);
   }
+  __threadfence_system();
 
-    for (int idx = access_id; idx < clear_access; idx += access_stride) {
-      clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
-    }
+  for (int idx = access_id; idx < clear_access; idx += access_stride) {
+    // Clear the Lamport slot used by the previous Lamport launch.
+    clear_vec.store_global_release(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+  }
+  __threadfence_system();
 
-    int start_idx = start_token_idx * access_per_token;
-    int end_idx = start_idx + token_count_this_rank * access_per_token;
+  int start_idx = start_token_idx * access_per_token;
+  int end_idx = start_idx + token_count_this_rank * access_per_token;
 
-    // idx:输入数据的全局地址(从所有 rank 的view获取); out_idx:输出地址
-    for (int idx = access_id + start_idx, out_idx = access_id; idx < end_idx;
-        idx += access_stride, out_idx += access_stride) {
-      ReduceScatterFusedOp<Pattern, T> fused_op(params, out_idx, access_id_in_token, token_count_this_rank);
-      fused_op.update(out_idx);
-      vec_t<T, VEC_SIZE> vals[NRanks];
-      bool done = false;
+  // idx:输入数据的全局地址(从所有 rank 的view获取); out_idx:输出地址
+  for (int idx = access_id + start_idx, out_idx = access_id; idx < end_idx;
+       idx += access_stride, out_idx += access_stride) {
+    ReduceScatterFusedOp<Pattern, T> fused_op(params, out_idx, access_id_in_token, token_count_this_rank);
+    fused_op.update(out_idx);
+    vec_t<T, VEC_SIZE> vals[NRanks];
+    bool done = false;
 
-      while (!done) {
-        done = true;
-  #pragma unroll
-        for (int r = 0; r < NRanks; ++r) {
-          vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
-                                      (r * tot_access + idx) * VEC_SIZE);
-          done &= !utils::has_neg_zero(vals[r]);
-        }
+    while (!done) {
+      done = true;
+#pragma unroll
+      for (int r = 0; r < NRanks; ++r) {
+        vals[r].load_global_acquire(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
+                                    (r * tot_access + idx) * VEC_SIZE);
+        done &= !utils::has_neg_zero(vals[r]);
       }
-
-      vec_t<T, VEC_SIZE> sum_val = reducescatter_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
-      int token_id_local = out_idx / (params.hidden_dim / VEC_SIZE);
-      fused_op(sum_val, token_id_local);
     }
 
-    comm.update(params.size * NRanks);
-
-  #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if constexpr (TriggerCompletionAtEnd) {
-      cudaTriggerProgrammaticLaunchCompletion();
+    vec_t<T, VEC_SIZE> sum_val = reducescatter_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
+    int token_id_local = out_idx / (params.hidden_dim / VEC_SIZE);
+    fused_op(sum_val, token_id_local);
     }
-  #endif
+
+  comm.update(params.size * NRanks);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <ReduceScatterFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc,
@@ -1147,8 +1161,10 @@ __global__ void reducescatter_fusion_kernel_twoshot_sync(
     int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
     int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / VEC_SIZE;
     for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-      reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] =
-          reinterpret_cast<float4*>(params.reducescatter_in)[idx];
+      vec_t<T, VEC_SIZE> val;
+      val.load(reinterpret_cast<T*>(params.reducescatter_in) + idx * VEC_SIZE);
+      val.store_global_release(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
+                               idx * VEC_SIZE);
     }
   }
 
@@ -1164,12 +1180,13 @@ __global__ void reducescatter_fusion_kernel_twoshot_sync(
     vec_t<T, VEC_SIZE> vals[NRanks];
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      vals[r].load(reinterpret_cast<T*>(comm.comm_bufs[r]) + idx * VEC_SIZE);
+      vals[r].load_global_acquire(reinterpret_cast<T*>(comm.comm_bufs[r]) + idx * VEC_SIZE);
     }
     vec_t<T, VEC_SIZE> sum_val = reducescatter_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      sum_val.store(reinterpret_cast<T*>(comm.comm_bufs[r]) + (tot_access + idx) * VEC_SIZE);
+      sum_val.store_global_release(reinterpret_cast<T*>(comm.comm_bufs[r]) +
+                                   (tot_access + idx) * VEC_SIZE);
     }
   }
 
@@ -1180,8 +1197,8 @@ __global__ void reducescatter_fusion_kernel_twoshot_sync(
        idx += access_stride, out_idx += access_stride) {
     fused_op.update(out_idx);
     vec_t<T, VEC_SIZE> sum_val;
-    sum_val.load(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
-                 (tot_access + idx) * VEC_SIZE);
+    sum_val.load_global_acquire(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
+                                (tot_access + idx) * VEC_SIZE);
     // out_idx is already relative to this rank's output, so token_id_local should be in [0, token_num/world_size)
     int token_id_local = out_idx / (params.hidden_dim / VEC_SIZE);
     fused_op(sum_val, token_id_local);

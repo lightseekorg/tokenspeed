@@ -126,7 +126,7 @@ def _worker_allreduce(rank, world_size, port, results):
         import tokenspeed_kernel.thirdparty.cuda.trtllm as tk_comm
 
         hidden_dim = 4096
-        max_token_num = 128
+        max_token_num = 192
         eps = 1e-6
         dtype = torch.bfloat16
 
@@ -137,7 +137,25 @@ def _worker_allreduce(rank, world_size, port, results):
         )
 
         all_ok = True
-        for token_num in [1, 8, 16, 64]:
+        # Alternate one-shot and two-shot launches to exercise generation
+        # rotation, clear-size changes, and shared counter reset ordering.
+        token_cases = [
+            (1, True),
+            (64, True),
+            (129, False),
+            (8, True),
+            (160, False),
+            (128, True),
+            (2, True),
+            (192, False),
+            (16, True),
+            (127, True),
+            (136, False),
+            (4, True),
+            (64, True),
+            (1, True),
+        ]
+        for token_num, use_oneshot in token_cases:
             torch.manual_seed(42 + rank)
             ar_in = torch.randn(token_num, hidden_dim, dtype=dtype, device=device)
             res_in = torch.randn(token_num, hidden_dim, dtype=dtype, device=device)
@@ -168,7 +186,7 @@ def _worker_allreduce(rank, world_size, port, results):
                 trigger_completion_at_end=False,
                 fp32_acc=False,
                 pattern_code=tk_comm.AllReduceFusionPattern.kARResidualRMSNorm,
-                use_oneshot=True,
+                use_oneshot=use_oneshot,
                 allreduce_out=None,
                 residual_in=res_in,
                 residual_out=tk_res,
@@ -192,7 +210,7 @@ def _worker_allreduce(rank, world_size, port, results):
                 max_diff_r = (tk_res - ref_res).abs().max().item()
                 max_diff_n = (tk_norm - ref_norm).abs().max().item()
                 print(
-                    f"  allreduce tok={token_num}: {status}"
+                    f"  allreduce tok={token_num} oneshot={use_oneshot}: {status}"
                     f" (res_maxdiff={max_diff_r:.4f}, norm_maxdiff={max_diff_n:.4f})"
                 )
                 if not (res_close and norm_close):

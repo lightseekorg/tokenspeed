@@ -365,9 +365,6 @@ __global__ __launch_bounds__(264, 1) void allgather_fusion_kernel_oneshot_lampor
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
-  if constexpr (!TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
 #endif
 
   flashinfer::trtllm_reducescatter_fusion::RLamportComm<NRanks> comm(params.workspace, params.rank);
@@ -386,15 +383,16 @@ __global__ __launch_bounds__(264, 1) void allgather_fusion_kernel_oneshot_lampor
 
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
-        val.store(reinterpret_cast<T*>(comm.data_bufs[r]) + idx * VEC_SIZE);
+        val.store_global_release(reinterpret_cast<T*>(comm.data_bufs[r]) + idx * VEC_SIZE);
       }
     }
   }
+  __threadfence_system();
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    // Clear comm buffer that previous kernel used
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+    // Clear the Lamport slot used by the previous Lamport launch.
+    clear_vec.store_global_release(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
   }
-  __syncthreads();
+  __threadfence_system();
 
   AllGatherFusedOp<Pattern, T> fused_op(params);
 
@@ -402,8 +400,8 @@ __global__ __launch_bounds__(264, 1) void allgather_fusion_kernel_oneshot_lampor
     vec_t<T, VEC_SIZE> val;
     bool done = false;
     while (!done) {
-      val.load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
-                               idx * VEC_SIZE);
+      val.load_global_acquire(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
+                              idx * VEC_SIZE);
       done = !flashinfer::trtllm_reducescatter_fusion::utils::has_neg_zero(val);
     }
 
@@ -414,9 +412,7 @@ __global__ __launch_bounds__(264, 1) void allgather_fusion_kernel_oneshot_lampor
   comm.update(params.size);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if constexpr (TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -434,9 +430,6 @@ __global__ void allgather_fusion_kernel_twoshot_sync(
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
-  if constexpr (!TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
 #endif
 
   flashinfer::trtllm_reducescatter_fusion::RSyncComm<NRanks> comm(params.workspace);
@@ -445,8 +438,10 @@ __global__ void allgather_fusion_kernel_twoshot_sync(
   int my_access_count = my_token_num * params.hidden_dim / VEC_SIZE;
 
   for (int idx = access_id; idx < my_access_count; idx += access_stride) {
-    reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] =
-        reinterpret_cast<float4*>(params.allgather_in)[idx];
+    vec_t<T, VEC_SIZE> val;
+    val.load(reinterpret_cast<T*>(params.allgather_in) + idx * VEC_SIZE);
+    val.store_global_release(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
+                             idx * VEC_SIZE);
   }
 
   flashinfer::trtllm_reducescatter_fusion::RBarrier<NRanks> barrier(params.rank, comm);
@@ -476,16 +471,15 @@ __global__ void allgather_fusion_kernel_twoshot_sync(
     int local_idx = idx - owner_start_access;
 
     vec_t<T, VEC_SIZE> val;
-    val.load(reinterpret_cast<T*>(comm.comm_bufs[owner_rank]) + local_idx * VEC_SIZE);
+    val.load_global_acquire(reinterpret_cast<T*>(comm.comm_bufs[owner_rank]) +
+                            local_idx * VEC_SIZE);
     fused_op(val, idx);
   }
 
   comm.update(barrier.m_flag_value);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if constexpr (TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 

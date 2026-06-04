@@ -55,6 +55,16 @@ static constexpr int kBarrierFlagCount = 256;
 
 }  // namespace details
 
+__device__ __forceinline__ int ld_global_acquire_sys(int* addr) {
+  int val;
+  asm volatile("ld.global.acquire.sys.b32 %0, [%1];" : "=r"(val) : "l"(addr));
+  return val;
+}
+
+__device__ __forceinline__ void st_global_release_sys(int* addr, int val) {
+  asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(val), "l"(addr));
+}
+
 namespace maths {
 // // ============================== Cast ==============================
 template <typename T_OUT, typename T_IN>
@@ -808,23 +818,24 @@ struct SyncComm {
   __device__ __forceinline__ SyncComm(void** workspace) {
     counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[1];
-    flag_value = *flag_ptr;
+    flag_value = ld_global_acquire_sys(flag_ptr);
     for (int r = 0; r < NRanks; ++r) {
       comm_bufs[r] = workspace[r];
       barrier_flags[r] = workspace[NRanks + r];
     }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      atomicAdd(counter_ptr, 1);
-    }
   }
 
   __device__ __forceinline__ void update(int new_flag_value) {
+    __syncthreads();
+    __threadfence_system();
+    if (threadIdx.x == 0) {
+      atomicAdd(counter_ptr, 1);
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x) {
+      while (ld_global_acquire_sys(counter_ptr) != gridDim.x) {
       }
-      *flag_ptr = new_flag_value;
-      *counter_ptr = 0;
+      st_global_release_sys(counter_ptr, 0);
+      st_global_release_sys(flag_ptr, new_flag_value);
     }
   }
 
@@ -838,32 +849,37 @@ struct SyncComm {
 template <int NRanks>
 struct LamportComm {
   __device__ __forceinline__ LamportComm(void** workspace, int rank) {
-    counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
+    // Lamport one-shot and two-shot sync launches can be adjacent in captured
+    // graphs. Keep their CTA-completion counters separate.
+    counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[5];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
-    flag_value = *flag_ptr;
-    int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
-    clear_size = *clear_ptr;
-    int data_offset = flag_value % 3;
+    flag_value = ld_global_acquire_sys(flag_ptr);
+    int comm_size = ld_global_acquire_sys(&reinterpret_cast<int*>(workspace[NRanks * 3])[3]);
+    data_offset = flag_value % 3;
     int clear_offset = (flag_value + 2) % 3;
+    clear_size = ld_global_acquire_sys(clear_ptr);
     for (int r = 0; r < NRanks; ++r) {
       data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) +
                      static_cast<int64_t>(data_offset) * comm_size;
     }
     clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      atomicAdd(counter_ptr, 1);
-    }
   }
 
   __device__ __forceinline__ void update(int new_clear_size) {
+    __syncthreads();
+    __threadfence_system();
+    if (threadIdx.x == 0) {
+      atomicAdd(counter_ptr, 1);
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x) {
+      while (ld_global_acquire_sys(counter_ptr) != gridDim.x) {
       }
-      *flag_ptr = (flag_value + 1) % 3;
-      *clear_ptr = new_clear_size;
-      *counter_ptr = 0;
+      // The generation flag is the publication point for the next launch. Reset
+      // the CTA counter and publish the next clear size before advancing it.
+      st_global_release_sys(counter_ptr, 0);
+      st_global_release_sys(clear_ptr, clear_size > new_clear_size ? clear_size : new_clear_size);
+      st_global_release_sys(flag_ptr, (flag_value + 1) % 3);
     }
   }
 
@@ -874,6 +890,7 @@ struct LamportComm {
   uint8_t* clear_buf;
   int clear_size;
   int flag_value;
+  int data_offset;
 };
 
 template <int NRanks>
@@ -892,6 +909,7 @@ class Barrier {
 
   __device__ __forceinline__ void sync() {
     __syncthreads();
+    __threadfence_system();
     if (threadIdx.x < NRanks) {
       m_flag_value = next_flag(m_flag_value);
       // To avoid the ABA problem, we need to synchronize the correct flag value to all
@@ -1303,14 +1321,11 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
-  // Load upstream-produced inputs only after gridDepSync, but before releasing
-  // PDL dependents that may reuse those producer buffers.
+  // Load upstream-produced inputs only after gridDepSync.
   fused_op.load_upstream_inputs();
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if constexpr (!TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
+  // This kernel reuses a shared Lamport workspace generation and CTA counter.
+  // Releasing PDL dependents before comm.update() lets a later fusion launch
+  // enter the same generation while this launch is still using it.
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / VEC_SIZE;
   for (int idx = access_id, tidx = token_id; idx < tot_access;
@@ -1328,14 +1343,16 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // Push data to other ranks
-      val.store(reinterpret_cast<T*>(comm.data_bufs[r]) +
-                (params.rank * tot_access + idx) * VEC_SIZE);
+      val.store_global_release(reinterpret_cast<T*>(comm.data_bufs[r]) +
+                               (params.rank * tot_access + idx) * VEC_SIZE);
     }
   }
+  __threadfence_system();
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    // Clear comm buffer that previous kernel used
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+    // Clear the Lamport slot used by the previous Lamport launch.
+    clear_vec.store_global_release(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
   }
+  __threadfence_system();
   for (int idx = access_id, tidx = token_id; idx < tot_access;
        idx += access_stride, tidx += token_stride) {
     fused_op.update(idx, res_add_before_reduce);
@@ -1347,8 +1364,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
-        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
-                                     (r * tot_access + idx) * VEC_SIZE);
+        vals[r].load_global_acquire(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
+                                    (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
     }
@@ -1368,9 +1385,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
   comm.update(params.size * NRanks);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if constexpr (TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1398,8 +1413,10 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
     int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
     int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / VEC_SIZE;
     for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-      reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] =
-          reinterpret_cast<float4*>(params.allreduce_in)[idx];
+      vec_t<T, VEC_SIZE> val;
+      val.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
+      val.store_global_release(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
+                               idx * VEC_SIZE);
     }
   }
   Barrier<NRanks> barrier(params.rank, comm);
@@ -1411,12 +1428,13 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
     vec_t<T, VEC_SIZE> vals[NRanks];
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      vals[r].load(reinterpret_cast<T*>(comm.comm_bufs[r]) + idx * VEC_SIZE);
+      vals[r].load_global_acquire(reinterpret_cast<T*>(comm.comm_bufs[r]) + idx * VEC_SIZE);
     }
     vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      sum_val.store(reinterpret_cast<T*>(comm.comm_bufs[r]) + (tot_access + idx) * VEC_SIZE);
+      sum_val.store_global_release(reinterpret_cast<T*>(comm.comm_bufs[r]) +
+                                   (tot_access + idx) * VEC_SIZE);
     }
   }
   barrier.sync();
@@ -1429,8 +1447,8 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
          idx += access_stride, tidx += token_stride) {
       fused_op.update(idx, false);
       vec_t<T, VEC_SIZE> sum_val;
-      sum_val.load(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
-                   (tot_access + idx) * VEC_SIZE);
+      sum_val.load_global_acquire(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
+                                  (tot_access + idx) * VEC_SIZE);
       fused_op(sum_val, tidx, false, false, true, idx, idx);
     }
   }

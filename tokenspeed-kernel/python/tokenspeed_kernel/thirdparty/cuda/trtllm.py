@@ -209,9 +209,11 @@ def _create_ipc_workspace(
         for rank in range(tp_size):
             workspace.append(ipc_handle[rank])
 
-    # Allocate and initialize flags: [0, 0, 0, lamport_comm_size, 0]
-    flag_ptr = cudart.cudaMalloc(5 * 4)
-    cudart.cudaMemset(flag_ptr, 0, 5 * 4)
+    # Allocate and initialize flags:
+    # [sync_counter, sync_flag, lamport_flag, lamport_comm_size,
+    #  lamport_clear_size, lamport_counter]
+    flag_ptr = cudart.cudaMalloc(6 * 4)
+    cudart.cudaMemset(flag_ptr, 0, 6 * 4)
     lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
     cudart.cudaMemcpy(
         c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
