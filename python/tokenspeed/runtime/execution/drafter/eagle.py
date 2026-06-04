@@ -222,7 +222,7 @@ class Eagle(BaseDrafter):
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
 
-        input_ids, unpadded_input_lengths, gather_ids = self._get_first_step_input(
+        input_ids, _, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
@@ -269,7 +269,6 @@ class Eagle(BaseDrafter):
             input_ids=input_ids,
             positions=buffers.positions_buf[: draft_input.input_num_tokens],
             out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
-            input_lengths=unpadded_input_lengths,  # Used in logits processor
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
@@ -356,7 +355,6 @@ class Eagle(BaseDrafter):
                     input_ids=self._map_hot(draft_ids),
                     positions=positions,
                     out_cache_loc=out_cache_loc,
-                    input_lengths=input_lengths,
                     captured_hidden_states=logits_output.hidden_states,
                     spec_step_idx=i,
                 )
