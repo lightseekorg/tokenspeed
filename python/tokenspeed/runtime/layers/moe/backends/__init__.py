@@ -45,10 +45,6 @@ _BACKEND_SPECS = {
         "tokenspeed.runtime.layers.moe.backends.fp8.flashinfer_cutlass",
         "Fp8FlashinferCutlassBackend",
     ),
-    ("w8a8_fp8", "triton"): (
-        "tokenspeed.runtime.layers.moe.backends.w8a8_fp8.triton",
-        "W8A8PerTokenPerChannelFp8TritonBackend",
-    ),
     ("nvfp4", "flashinfer_cutlass"): (
         "tokenspeed.runtime.layers.moe.backends.nvfp4.flashinfer_cutlass",
         "Nvfp4FlashinferCutlassBackend",
@@ -72,10 +68,6 @@ _BACKEND_SPECS = {
     ("mxfp4", "gluon_kernel"): (
         "tokenspeed.runtime.layers.moe.backends.mxfp4.gluon_kernel",
         "Mxfp4GluonKernelBackend",
-    ),
-    ("wna16", "marlin"): (
-        "tokenspeed.runtime.layers.moe.backends.wna16.marlin",
-        "Wna16MarlinBackend",
     ),
 }
 _REGISTERED = set()

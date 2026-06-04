@@ -26,11 +26,9 @@ from tokenspeed.runtime.layers.moe.core.registry import get_backend_cls
 from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.quantization import (
-    CompressedTensorsConfig,
     Fp8Config,
     Mxfp4Config,
     Nvfp4Config,
-    W8A8Fp8Config,
 )
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
@@ -54,8 +52,6 @@ _AUTO_IMPL_PREFERENCE = {
         "flashinfer_cutlass",
         "triton",
     ),
-    "w8a8_fp8": ("triton",),
-    "wna16": ("marlin",),
 }
 
 
@@ -78,15 +74,6 @@ def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
         and quant_config.weight_block_size is not None
     ):
         return "fp8"
-    # W8A8 quantization configs
-    if isinstance(quant_config, W8A8Fp8Config):
-        return "w8a8_fp8"
-    if isinstance(quant_config, CompressedTensorsConfig):
-        weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
-        input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
-        if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            return "wna16"
-
     raise RuntimeError(f"Unsupported MoE quant_config: {quant_config}")
 
 
@@ -109,7 +96,7 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
     auto_candidates = _AUTO_IMPL_PREFERENCE.get(quant_kind, ())
     platform = current_platform()
     if backend.is_auto() and platform.is_amd:
-        if quant_kind in {"unquantized", "fp8", "w8a8_fp8"}:
+        if quant_kind in {"unquantized", "fp8"}:
             auto_candidates = tuple(
                 impl for impl in auto_candidates if impl == "triton"
             )
