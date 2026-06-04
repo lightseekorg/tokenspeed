@@ -126,13 +126,6 @@ class Eagle(BaseDrafter):
             device=self.device,
         )
 
-        # Per-request input length is always 1 in multi-step decode (one token per request).
-        self.draft_input_lengths_buf = torch.ones(
-            (self.input_buffers.max_bs,),
-            dtype=torch.int32,
-            device=self.device,
-        )
-
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
         self.padded_gather_ids_offsets_buf = (
@@ -311,7 +304,6 @@ class Eagle(BaseDrafter):
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)
 
-        input_lengths = self.draft_input_lengths_buf[:bs]
         positions = cache_start.clone()
 
         for i in range(1, self.spec_num_steps):
