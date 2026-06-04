@@ -96,6 +96,11 @@ class MultimodalDataItem:
         if envs.TOKENSPEED_MM_SKIP_COMPUTE_HASH.get():
             self.hash = uuid.uuid4().int
         elif self.hash is None:
+            if isinstance(self.feature, ShmTensorHandle):
+                raise ValueError(
+                    "SHM-backed multimodal items must carry content hash or "
+                    "pad_value before TokenSpeed consumes them"
+                )
             self.hash = hash_feature(self.feature)
         assert self.hash is not None
         self.pad_value = _MM_PAD_BASE + (self.hash & _MM_PAD_HASH_MASK)
@@ -112,6 +117,10 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+
+    def ensure_pad_values(self) -> None:
+        for item in self.mm_items:
+            item.set_pad_value()
 
     def publish_shm_features(self) -> None:
         for item in self.mm_items:
@@ -130,6 +139,12 @@ class MultimodalInputs:
         for item in self.mm_items:
             if isinstance(item.feature, ShmTensorHandle):
                 item.feature = item.feature.consume()
+
+    def release_shm_features(self) -> None:
+        for item in self.mm_items:
+            if isinstance(item.feature, ShmTensorHandle):
+                item.feature.release()
+                item.feature = None
 
     def has_pending_shm_features(self) -> bool:
         return any(isinstance(item.feature, ShmTensorHandle) for item in self.mm_items)
