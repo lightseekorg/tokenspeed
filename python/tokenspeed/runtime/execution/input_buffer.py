@@ -434,4 +434,7 @@ class InputBuffers:
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:
             self.req_pool_indices_buf[:batch_size].fill_(0)
-            self.seq_lens_buf[:batch_size].fill_(1)
+            # seq_lens must be >= spec_num_tokens so the drafter's prewrite
+            # correction never goes negative.
+            num_tokens_per_req = total_tokens // batch_size if batch_size > 0 else 1
+            self.seq_lens_buf[:batch_size].fill_(max(num_tokens_per_req, 1))
