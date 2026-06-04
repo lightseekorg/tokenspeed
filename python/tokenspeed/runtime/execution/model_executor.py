@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -72,6 +73,12 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -440,6 +447,12 @@ class ModelExecutor:
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
+        self._mrope_decode_deltas_cpu = self._make_mrope_decode_deltas_cpu(
+            config.chunked_prefill_size
+        )
+        self._mrope_decode_deltas_buf = torch.zeros(
+            config.chunked_prefill_size, device=self.device, dtype=torch.int64
+        )
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
         self.num_decode_steps = 0
@@ -448,6 +461,13 @@ class ModelExecutor:
         set_random_seed(48)
 
         logger.info("ModelExecutor initialized")
+
+    @staticmethod
+    def _make_mrope_decode_deltas_cpu(size: int) -> torch.Tensor:
+        try:
+            return torch.zeros(size, dtype=torch.int64, pin_memory=True)
+        except RuntimeError:
+            return torch.zeros(size, dtype=torch.int64)
 
     @property
     def capturable_grammar(self):
@@ -1327,6 +1347,15 @@ class ModelExecutor:
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
         self._active_positions_override = None
+        timing_enabled = LOG_MM_TIMING
+        timing_start = time.perf_counter() if timing_enabled else 0.0
+        input_fill_ms = 0.0
+        mrope_ms = 0.0
+        sampling_prep_ms = 0.0
+        forward_step_ms = 0.0
+        output_d2h_ms = 0.0
+        graph_capable = False
+        graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
             has_retract = num_extends <= 0 and any(
@@ -1348,14 +1377,20 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
             )
+            if timing_enabled:
+                input_fill_done = time.perf_counter()
+                input_fill_ms = (input_fill_done - timing_start) * 1000.0
             skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
                 forward_op, bs
             )
+            mrope_start = time.perf_counter() if timing_enabled else 0.0
             self._active_positions_override = self._build_mrope_positions_override(
                 forward_op=forward_op,
                 multimodal_context=multimodal_context,
                 total_tokens=total_tokens,
             )
+            if timing_enabled:
+                mrope_ms = (time.perf_counter() - mrope_start) * 1000.0
 
             forward_mode = ForwardMode.from_num_extends(
                 num_extends,
@@ -1469,6 +1504,7 @@ class ModelExecutor:
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
                 with nvtx_range("sampling_prep", color="yellow"):
+                    sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
@@ -1494,6 +1530,10 @@ class ModelExecutor:
                         sampling_params_list=sampling_params_list,
                         num_tokens_per_req=self.config.output_length,
                     )
+                    if timing_enabled:
+                        sampling_prep_ms = (
+                            time.perf_counter() - sampling_start
+                        ) * 1000.0
 
                 with nvtx_range(
                     f"forward_step ext={num_extends} dec={bs - num_extends}",
@@ -1531,6 +1571,13 @@ class ModelExecutor:
                         num_reqs=bs,
                     )
                     self._log_dp_sampling_route(bs, ctx)
+                    graph_capable = self.forward_step.can_run(bs, ctx)
+                    graph_padded_bs = (
+                        self.forward_step.padded_bs(bs, ctx) if graph_capable else bs
+                    )
+                    forward_step_start = (
+                        time.perf_counter() if timing_enabled else 0.0
+                    )
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -1555,6 +1602,10 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
+                    if timing_enabled:
+                        forward_step_ms = (
+                            time.perf_counter() - forward_step_start
+                        ) * 1000.0
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(
@@ -1571,6 +1622,7 @@ class ModelExecutor:
                 )
 
             with nvtx_range("output_d2h", color="green"):
+                output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
                 if (
                     capture_next_input_ids
@@ -1615,6 +1667,46 @@ class ModelExecutor:
 
                 copy_event = torch.cuda.Event()
                 copy_event.record()
+                if timing_enabled:
+                    output_d2h_ms = (
+                        time.perf_counter() - output_d2h_start
+                    ) * 1000.0
+
+            if timing_enabled and (
+                num_extends > 0 or self.log_step < 64 or self.log_step % 100 == 0
+            ):
+                has_mm = (
+                    multimodal_context is not None and multimodal_context.has_inputs()
+                )
+                mm_count = 0
+                mm_delta_count = 0
+                if has_mm:
+                    for mm_input in multimodal_context.mm_inputs:
+                        if mm_input is None:
+                            continue
+                        mm_count += 1
+                        if mm_input.mrope_position_delta is not None:
+                            mm_delta_count += 1
+                logger.info(
+                    "mm_timing forward_execute_ms total=%.3f input_fill=%.3f "
+                    "mrope=%.3f sampling=%.3f forward_step=%.3f output_d2h=%.3f "
+                    "mode=%s bs=%s total_tokens=%s graph=%s padded_bs=%s "
+                    "has_mm=%s mm_count=%s mm_delta_count=%s",
+                    (time.perf_counter() - timing_start) * 1000.0,
+                    input_fill_ms,
+                    mrope_ms,
+                    sampling_prep_ms,
+                    forward_step_ms,
+                    output_d2h_ms,
+                    forward_mode.name,
+                    bs,
+                    total_tokens,
+                    graph_capable,
+                    graph_padded_bs,
+                    has_mm,
+                    mm_count,
+                    mm_delta_count,
+                )
 
         return ModelExecutionResult(
             output_tokens=output_tokens,
@@ -1645,6 +1737,58 @@ class ModelExecutor:
             )
         return mm_input.mrope_position_delta_repeated_cache + seq_len
 
+    @staticmethod
+    def _mrope_delta_scalar(mm_input) -> int:
+        delta = getattr(mm_input, "mrope_position_delta_scalar", None)
+        if delta is not None:
+            return int(delta)
+        tensor = getattr(mm_input, "mrope_position_delta", None)
+        if tensor is None:
+            return 0
+        delta = int(tensor.flatten()[0].item())
+        mm_input.mrope_position_delta_scalar = delta
+        return delta
+
+    def _build_decode_mrope_positions_override(
+        self,
+        forward_op,
+        mm_inputs,
+        total_tokens: int,
+    ) -> torch.Tensor:
+        base_positions = self.input_buffers.positions_buf[:total_tokens]
+        token_deltas_cpu = self._mrope_decode_deltas_cpu[:total_tokens]
+
+        offset = 0
+        has_nonzero_delta = False
+        for batch_idx, input_len in enumerate(forward_op.input_lengths):
+            input_len = int(input_len)
+            if input_len <= 0:
+                continue
+
+            delta = 0
+            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
+            if mm_input is not None and mm_input.mrope_position_delta is not None:
+                delta = self._mrope_delta_scalar(mm_input)
+                has_nonzero_delta = has_nonzero_delta or delta != 0
+
+            token_deltas_cpu[offset : offset + input_len].fill_(delta)
+            offset += input_len
+
+        if offset != total_tokens:
+            token_deltas_cpu[offset:total_tokens].zero_()
+
+        if has_nonzero_delta:
+            token_deltas = self._mrope_decode_deltas_buf[:total_tokens]
+            token_deltas.copy_(token_deltas_cpu, non_blocking=True)
+            mrope_base = base_positions + token_deltas
+        else:
+            mrope_base = base_positions
+
+        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(
+            mrope_base.unsqueeze(0).expand(3, -1)
+        )
+        return self.input_buffers.mrope_positions_buf[:, :total_tokens]
+
     def _build_mrope_positions_override(
         self,
         forward_op,
@@ -1656,14 +1800,20 @@ class ModelExecutor:
 
         is_prefill = forward_op.num_extends() > 0
         base_positions = self.input_buffers.positions_buf[:total_tokens]
-        pos_chunks = torch.split(base_positions, list(forward_op.input_lengths), dim=0)
-        mrope_chunks = []
         mm_inputs = (
             multimodal_context.mm_inputs
             if multimodal_context is not None and multimodal_context.has_inputs()
             else []
         )
+        if not is_prefill:
+            return self._build_decode_mrope_positions_override(
+                forward_op=forward_op,
+                mm_inputs=mm_inputs,
+                total_tokens=total_tokens,
+            )
 
+        pos_chunks = torch.split(base_positions, list(forward_op.input_lengths), dim=0)
+        mrope_chunks = []
         for batch_idx, base_chunk in enumerate(pos_chunks):
             mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
             if mm_input is None or mm_input.mrope_positions is None:

@@ -116,6 +116,7 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    mrope_position_delta_scalar: Optional[int] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
 
     def ensure_pad_values(self) -> None:

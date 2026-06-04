@@ -169,6 +169,10 @@ class InputProcessor:
                 )
                 multimodal_inputs.mrope_positions = mrope_positions
                 multimodal_inputs.mrope_position_delta = mrope_position_delta
+                if mrope_position_delta is not None:
+                    multimodal_inputs.mrope_position_delta_scalar = int(
+                        mrope_position_delta.flatten()[0].item()
+                    )
             if input_ids is not None:
                 input_ids_unpadded = list(input_ids)
                 input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
