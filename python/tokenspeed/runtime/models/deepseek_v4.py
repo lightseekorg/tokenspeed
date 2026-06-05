@@ -292,12 +292,13 @@ def _deepseek_v4_fused_select_experts(
     if (
         not router_logits.is_cuda
         or router_logits.dim() != 2
-        or router_logits.shape[1] != 256
         or top_k <= 0
         or top_k > 32
         or router_logits.dtype not in (torch.float32, torch.float16, torch.bfloat16)
     ):
         return None
+
+    num_experts = router_logits.shape[1]
 
     topk_weights = torch.empty(
         router_logits.shape[0],
@@ -312,12 +313,17 @@ def _deepseek_v4_fused_select_experts(
         device=router_logits.device,
     )
 
+    if num_experts not in (256, 384) or top_k != 6 or not renormalize:
+        return None
+
+    logits_f32 = router_logits.float().contiguous()
+
     try:
         if hash_indices_table is not None:
             if input_ids is None:
                 raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
             hash_softplus_sqrt_topk_flash(
-                router_logits.contiguous(),
+                logits_f32,
                 input_ids.reshape(-1).to(device=router_logits.device).contiguous(),
                 hash_indices_table.to(
                     device=router_logits.device, dtype=torch.int32
@@ -329,7 +335,7 @@ def _deepseek_v4_fused_select_experts(
             )
         elif correction_bias is not None:
             softplus_sqrt_topk_flash(
-                router_logits.contiguous(),
+                logits_f32,
                 correction_bias.to(
                     device=router_logits.device, dtype=torch.float32
                 ).contiguous(),

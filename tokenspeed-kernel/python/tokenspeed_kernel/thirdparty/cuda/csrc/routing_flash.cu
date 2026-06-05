@@ -22,6 +22,8 @@
 #include "flashinfer/utils.cuh"
 #include "tvm_ffi_utils.h"
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <limits>
@@ -158,122 +160,148 @@ __device__ __forceinline__ float softplus_sqrt(float value) {
   return sqrtf(softplus);
 }
 
-template <typename InputT, typename IndexT, int NUM_EXPERTS>
-__global__ void softplus_sqrt_topk_kernel(const InputT* __restrict__ input,
-                                          const float* __restrict__ correction_bias,
-                                          IndexT* __restrict__ topk_indices,
-                                          float* __restrict__ topk_weights,
-                                          int num_rows, int topk, bool renormalize,
-                                          float routed_scaling_factor) {
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-  if (row >= num_rows) {
-    return;
+// ---------------------------------------------------------------------------
+// Warp-level top-k via packed value+index reduction.
+// Ported from TRT-LLM moeTopKFuncs.cuh (Apache-2.0).
+// ---------------------------------------------------------------------------
+namespace warp_topk {
+namespace cg = cooperative_groups;
+static constexpr int kWARP_SIZE = 32;
+
+__device__ __forceinline__ uint64_t pack_score_idx(float val, int32_t idx) {
+  uint32_t v;
+  memcpy(&v, &val, 4);
+  // IEEE-754 float: flip sign bit so unsigned compare preserves order.
+  v = (v & 0x80000000u) ? ~v : (v ^ 0x80000000u);
+  return (static_cast<uint64_t>(v) << 32) | static_cast<uint64_t>(0xFFFF - (idx & 0xFFFF));
+}
+
+__device__ __forceinline__ void unpack_score_idx(uint64_t packed, float& val, int32_t& idx) {
+  idx = 0xFFFF - static_cast<int32_t>(packed & 0xFFFF);
+  uint32_t v = static_cast<uint32_t>(packed >> 32);
+  v = (v & 0x80000000u) ? (v ^ 0x80000000u) : ~v;
+  memcpy(&val, &v, 4);
+}
+
+__device__ __forceinline__ uint64_t warp_max_u64(
+    cg::thread_block_tile<kWARP_SIZE> const& warp, uint64_t val) {
+  return cg::reduce(warp, val, cg::greater<uint64_t>{});
+}
+
+template <int K, int N>
+__device__ void reduce_topk(
+    cg::thread_block_tile<kWARP_SIZE> const& warp,
+    float (&out_vals)[K], int32_t (&out_idx)[K],
+    float (&scores)[N], int32_t (&indices)[N],
+    int actual_k) {
+  // Sort candidates per thread (simple insertion sort for small N).
+  uint64_t packed[N];
+#pragma unroll
+  for (int i = 0; i < N; ++i)
+    packed[i] = pack_score_idx(scores[i], indices[i]);
+  // Odd-even transposition sort.
+#pragma unroll
+  for (int pass = 0; pass < N; ++pass) {
+#pragma unroll
+    for (int i = 0; i < N - 1; i += 2)
+      if (packed[i] < packed[i + 1]) { auto t = packed[i]; packed[i] = packed[i + 1]; packed[i + 1] = t; }
+#pragma unroll
+    for (int i = 1; i < N - 1; i += 2)
+      if (packed[i] < packed[i + 1]) { auto t = packed[i]; packed[i] = packed[i + 1]; packed[i + 1] = t; }
   }
 
-  __shared__ float scores[NUM_EXPERTS];
-  __shared__ float choice_scores[NUM_EXPERTS];
-  __shared__ float reduce_scores[NUM_EXPERTS];
-  __shared__ int reduce_indices[NUM_EXPERTS];
-  __shared__ float selected_sum;
-
-  if (tid < NUM_EXPERTS) {
-    const float score =
-        softplus_sqrt(to_float(input[row * NUM_EXPERTS + tid]));
-    scores[tid] = score;
-    choice_scores[tid] =
-        correction_bias == nullptr ? score : score + correction_bias[tid];
-  }
-  if (tid == 0) {
-    selected_sum = 0.0f;
-  }
-  __syncthreads();
-
-  for (int k_idx = 0; k_idx < topk; ++k_idx) {
-    if (tid < NUM_EXPERTS) {
-      reduce_scores[tid] = choice_scores[tid];
-      reduce_indices[tid] = tid;
-    }
-    __syncthreads();
-
-    for (int stride = NUM_EXPERTS / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        const float other_score = reduce_scores[tid + stride];
-        const int other_index = reduce_indices[tid + stride];
-        const bool take_other =
-            other_score > reduce_scores[tid] ||
-            (other_score == reduce_scores[tid] &&
-             other_index < reduce_indices[tid]);
-        if (take_other) {
-          reduce_scores[tid] = other_score;
-          reduce_indices[tid] = other_index;
-        }
-      }
-      __syncthreads();
-    }
-
-    if (tid == 0) {
-      const int expert = reduce_indices[0];
-      const float weight = scores[expert];
-      const int out_idx = row * topk + k_idx;
-      topk_indices[out_idx] = static_cast<IndexT>(expert);
-      topk_weights[out_idx] = weight;
-      selected_sum += weight;
-      choice_scores[expert] = -std::numeric_limits<float>::infinity();
-    }
-    __syncthreads();
-  }
-
-  if (tid < topk) {
-    float scale = routed_scaling_factor;
-    if (renormalize) {
-      scale /= selected_sum > 0.0f ? selected_sum : 1.0f;
-    }
-    topk_weights[row * topk + tid] *= scale;
+  uint64_t prev_max = 0;
+  for (int k = 0; k < actual_k; ++k) {
+    bool dup = k > 0 && prev_max == packed[0];
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+      packed[i] = dup && i == N - 1 ? 0ULL : dup ? packed[i + 1] : packed[i];
+    prev_max = warp_max_u64(warp, packed[0]);
+    unpack_score_idx(prev_max, out_vals[k], out_idx[k]);
   }
 }
 
-template <typename InputT, typename IndexT, typename TokenT, int NUM_EXPERTS>
-__global__ void hash_softplus_sqrt_topk_kernel(
-    const InputT* __restrict__ input, const TokenT* __restrict__ input_ids,
-    const IndexT* __restrict__ hash_indices_table, IndexT* __restrict__ topk_indices,
-    float* __restrict__ topk_weights, int num_rows, int topk, bool renormalize,
-    float routed_scaling_factor) {
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-  if (row >= num_rows) {
-    return;
+} // namespace warp_topk
+
+// ---------------------------------------------------------------------------
+// gate_forward_kernel: warp-level fused softplus-sqrt + top-k.
+// Ported from TRT-LLM customMoeRoutingKernels.cu (Apache-2.0).
+// Supports any nExperts (256, 384, etc.) via template parameter.
+// ---------------------------------------------------------------------------
+template <int nExperts, int topK, bool hash>
+__global__ void gate_forward_kernel(
+    const float* __restrict__ scores_in,
+    const float* __restrict__ bias,
+    const int* __restrict__ input_ids,
+    const int* __restrict__ tid2eid,
+    float* __restrict__ out_weights,
+    int* __restrict__ out_indices,
+    int batch_size, float route_scale) {
+  namespace cg = cooperative_groups;
+  constexpr int kExpertsPerThread = nExperts / warp_topk::kWARP_SIZE;
+  constexpr int kWarpsPerBlock = 4;
+
+  __shared__ float smem_scores[kWarpsPerBlock][nExperts];
+
+  int const global_warp_id =
+      (blockIdx.x * blockDim.x + threadIdx.x) / warp_topk::kWARP_SIZE;
+  int const local_warp_id =
+      (threadIdx.x / warp_topk::kWARP_SIZE) % kWarpsPerBlock;
+  int const lane_id = threadIdx.x % warp_topk::kWARP_SIZE;
+
+  if (global_warp_id >= batch_size) return;
+
+  auto warp = cg::tiled_partition<warp_topk::kWARP_SIZE>(cg::this_thread_block());
+
+  float* my_smem = smem_scores[local_warp_id];
+  const float* scores_row = scores_in + global_warp_id * nExperts;
+
+#pragma unroll
+  for (int e = 0; e < kExpertsPerThread; ++e) {
+    int expert_id = lane_id + e * warp_topk::kWARP_SIZE;
+    float s = scores_row[expert_id];
+    my_smem[expert_id] = softplus_sqrt(s);
   }
+  __syncwarp();
 
-  __shared__ float partial[32];
-  float weight = 0.0f;
+  float my_topk_value = 0.0f;
+  int my_topk_index = 0;
 
-  if (tid < topk) {
-    const TokenT token_id = input_ids[row];
-    const IndexT expert =
-        hash_indices_table[static_cast<int64_t>(token_id) * topk + tid];
-    weight = softplus_sqrt(
-        to_float(input[row * NUM_EXPERTS + static_cast<int>(expert)]));
-    const int out_idx = row * topk + tid;
-    topk_indices[out_idx] = expert;
-    topk_weights[out_idx] = weight;
-  }
-  partial[tid] = tid < topk ? weight : 0.0f;
-  __syncthreads();
-
-  for (int stride = 16; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      partial[tid] += partial[tid + stride];
+  if constexpr (hash) {
+    int token_id = input_ids[global_warp_id];
+    const int* expert_ids = tid2eid + token_id * topK;
+    if (lane_id < topK) {
+      int expert_id = expert_ids[lane_id];
+      my_topk_index = expert_id;
+      my_topk_value = my_smem[expert_id];
     }
-    __syncthreads();
+  } else {
+    float scores[kExpertsPerThread];
+    int32_t indices[kExpertsPerThread];
+#pragma unroll
+    for (int e = 0; e < kExpertsPerThread; ++e) {
+      int expert_id = lane_id + e * warp_topk::kWARP_SIZE;
+      indices[e] = expert_id;
+      scores[e] = my_smem[expert_id] + bias[expert_id];
+    }
+
+    float topk_vals[topK];
+    int32_t topk_idx[topK];
+    warp_topk::reduce_topk<topK, kExpertsPerThread>(
+        warp, topk_vals, topk_idx, scores, indices, topK);
+
+    if (lane_id < topK) {
+      my_topk_index = topk_idx[lane_id];
+      my_topk_value = my_smem[my_topk_index];
+    }
   }
 
-  if (tid < topk) {
-    float scale = routed_scaling_factor;
-    if (renormalize) {
-      scale /= partial[0] > 0.0f ? partial[0] : 1.0f;
-    }
-    topk_weights[row * topk + tid] *= scale;
+  float weight_sum = cg::reduce(warp, my_topk_value, cg::plus<float>{});
+
+  if (lane_id < topK) {
+    out_weights[global_warp_id * topK + lane_id] =
+        (my_topk_value / weight_sum) * route_scale;
+    out_indices[global_warp_id * topK + lane_id] = my_topk_index;
   }
 }
 
@@ -308,6 +336,28 @@ __global__ void hash_softplus_sqrt_topk_kernel(
     }                                                                                     \
   }()
 
+template <int nExperts>
+void launch_gate_forward(
+    const float* scores_in, const float* bias, const int* input_ids,
+    const int* tid2eid, float* out_weights, int* out_indices,
+    int batch_size, float route_scale, bool is_hash, cudaStream_t stream) {
+  constexpr int kTopK = 6;
+  constexpr int warps_per_block = 4;
+  constexpr int threads_per_block = warps_per_block * 32;
+  int const blocks = (batch_size + warps_per_block - 1) / warps_per_block;
+  if (is_hash) {
+    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, true>
+        <<<blocks, threads_per_block, 0, stream>>>(
+            scores_in, nullptr, input_ids, tid2eid,
+            out_weights, out_indices, batch_size, route_scale);
+  } else {
+    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, false>
+        <<<blocks, threads_per_block, 0, stream>>>(
+            scores_in, bias, nullptr, nullptr,
+            out_weights, out_indices, batch_size, route_scale);
+  }
+}
+
 void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
                               TensorView topk_indices, TensorView topk_weights,
                               bool renormalize, float routed_scaling_factor) {
@@ -320,34 +370,42 @@ void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
   const int num_rows = input.size(0);
   const int num_experts = input.size(1);
   const int topk = topk_weights.size(1);
-  TVM_FFI_ICHECK_EQ(num_experts, 256)
-      << "DeepSeek V4 fused router currently supports 256 experts only";
+  TVM_FFI_ICHECK(num_experts == 256 || num_experts == 384)
+      << "DeepSeek V4 fused router supports 256 or 384 experts, got " << num_experts;
+  TVM_FFI_ICHECK_EQ(topk, 6)
+      << "gate_forward_kernel is compiled for top_k=6, got " << topk;
   TVM_FFI_ICHECK_EQ(correction_bias.size(0), num_experts);
   TVM_FFI_ICHECK_EQ(topk_indices.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(1), topk);
-  TVM_FFI_ICHECK(topk > 0 && topk <= 32);
+
+  // The gate_forward_kernel always renormalizes and applies route_scale.
+  TVM_FFI_ICHECK(renormalize)
+      << "gate_forward_kernel always renormalizes; pass renormalize=true";
 
   const cudaStream_t stream = get_stream(input.device());
-  const int64_t input_dtype_code = encode_dlpack_dtype(input.dtype());
-  const int64_t index_dtype_code = encode_dlpack_dtype(topk_indices.dtype());
 
-  DSV4_DISPATCH_INPUT(input_dtype_code, InputT, [&] {
-    DSV4_DISPATCH_INDEX(index_dtype_code, IndexT, [&] {
-      deepseek_v4_routing::softplus_sqrt_topk_kernel<InputT, IndexT, 256>
-          <<<num_rows, 256, 0, stream>>>(
-              static_cast<const InputT*>(input.data_ptr()),
-              static_cast<const float*>(correction_bias.data_ptr()),
-              static_cast<IndexT*>(topk_indices.data_ptr()),
-              static_cast<float*>(topk_weights.data_ptr()), num_rows, topk,
-              renormalize, routed_scaling_factor);
-      return true;
-    });
-    return true;
-  });
+  // gate_forward_kernel requires float32 input.
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_float32)
+      << "gate_forward_kernel requires float32 input scores";
+
+  auto* out_w = static_cast<float*>(topk_weights.data_ptr());
+  auto* out_i = reinterpret_cast<int*>(topk_indices.data_ptr());
+  auto* bias_ptr = static_cast<const float*>(correction_bias.data_ptr());
+  auto* scores = static_cast<const float*>(input.data_ptr());
+
+  if (num_experts == 256) {
+    launch_gate_forward<256>(scores, bias_ptr, nullptr, nullptr,
+                             out_w, out_i, num_rows, routed_scaling_factor,
+                             false, stream);
+  } else {
+    launch_gate_forward<384>(scores, bias_ptr, nullptr, nullptr,
+                             out_w, out_i, num_rows, routed_scaling_factor,
+                             false, stream);
+  }
 
   cudaError_t err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
-      << "Failed to launch DeepSeek V4 softplus-sqrt top-k kernel: "
+      << "Failed to launch DeepSeek V4 gate_forward kernel: "
       << cudaGetErrorString(err);
 }
 
@@ -366,41 +424,41 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
   const int num_rows = input.size(0);
   const int num_experts = input.size(1);
   const int topk = topk_weights.size(1);
-  TVM_FFI_ICHECK_EQ(num_experts, 256)
-      << "DeepSeek V4 fused hash router currently supports 256 experts only";
+  TVM_FFI_ICHECK(num_experts == 256 || num_experts == 384)
+      << "DeepSeek V4 fused hash router supports 256 or 384 experts, got " << num_experts;
+  TVM_FFI_ICHECK_EQ(topk, 6)
+      << "gate_forward_kernel is compiled for top_k=6, got " << topk;
   TVM_FFI_ICHECK_EQ(input_ids.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(hash_indices_table.size(1), topk);
   TVM_FFI_ICHECK_EQ(topk_indices.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(1), topk);
-  TVM_FFI_ICHECK(topk > 0 && topk <= 32);
+
+  TVM_FFI_ICHECK(renormalize)
+      << "gate_forward_kernel always renormalizes; pass renormalize=true";
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_float32)
+      << "gate_forward_kernel requires float32 input scores";
 
   const cudaStream_t stream = get_stream(input.device());
-  const int64_t input_dtype_code = encode_dlpack_dtype(input.dtype());
-  const int64_t index_dtype_code = encode_dlpack_dtype(topk_indices.dtype());
-  const int64_t token_dtype_code = encode_dlpack_dtype(input_ids.dtype());
 
-  DSV4_DISPATCH_INPUT(input_dtype_code, InputT, [&] {
-    DSV4_DISPATCH_INDEX(index_dtype_code, IndexT, [&] {
-      DSV4_DISPATCH_INDEX(token_dtype_code, TokenT, [&] {
-        deepseek_v4_routing::
-            hash_softplus_sqrt_topk_kernel<InputT, IndexT, TokenT, 256>
-            <<<num_rows, 32, 0, stream>>>(
-                static_cast<const InputT*>(input.data_ptr()),
-                static_cast<const TokenT*>(input_ids.data_ptr()),
-                static_cast<const IndexT*>(hash_indices_table.data_ptr()),
-                static_cast<IndexT*>(topk_indices.data_ptr()),
-                static_cast<float*>(topk_weights.data_ptr()), num_rows, topk,
-                renormalize, routed_scaling_factor);
-        return true;
-      });
-      return true;
-    });
-    return true;
-  });
+  auto* out_w = static_cast<float*>(topk_weights.data_ptr());
+  auto* out_i = reinterpret_cast<int*>(topk_indices.data_ptr());
+  auto* scores = static_cast<const float*>(input.data_ptr());
+  auto* ids = static_cast<const int*>(input_ids.data_ptr());
+  auto* tid2eid = static_cast<const int*>(hash_indices_table.data_ptr());
+
+  if (num_experts == 256) {
+    launch_gate_forward<256>(scores, nullptr, ids, tid2eid,
+                             out_w, out_i, num_rows, routed_scaling_factor,
+                             true, stream);
+  } else {
+    launch_gate_forward<384>(scores, nullptr, ids, tid2eid,
+                             out_w, out_i, num_rows, routed_scaling_factor,
+                             true, stream);
+  }
 
   cudaError_t err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
-      << "Failed to launch DeepSeek V4 hash softplus-sqrt top-k kernel: "
+      << "Failed to launch DeepSeek V4 hash gate_forward kernel: "
       << cudaGetErrorString(err);
 }
 
