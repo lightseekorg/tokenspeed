@@ -2041,12 +2041,28 @@ class DeepseekV4MLP(nn.Module):
         if x.shape[0] == 0:
             return x.new_empty((0, self.down_proj.output_size))
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.float().chunk(2, dim=-1)
-        if self.swiglu_limit is not None and self.swiglu_limit > 0:
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-        x = (F.silu(gate) * up).to(x.dtype)
-        out, _ = self.down_proj(x)
+
+        _use_fused_swiglu = (
+            gate_up.ndim == 2
+            and gate_up.shape[-1] % 256 == 0
+            and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
+        )
+        if _use_fused_swiglu:
+            from tokenspeed.runtime.models.deepseek_v4_fused_swiglu import (
+                fused_swiglu_fp8_ue8m0,
+            )
+
+            x_fp8, scale = fused_swiglu_fp8_ue8m0(
+                gate_up, swiglu_limit=self.swiglu_limit or 0.0
+            )
+            out, _ = self.down_proj(x_fp8, scale=scale)
+        else:
+            gate, up = gate_up.float().chunk(2, dim=-1)
+            if self.swiglu_limit is not None and self.swiglu_limit > 0:
+                gate = torch.clamp(gate, max=self.swiglu_limit)
+                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            x = (F.silu(gate) * up).to(x.dtype)
+            out, _ = self.down_proj(x)
         return out
 
 
