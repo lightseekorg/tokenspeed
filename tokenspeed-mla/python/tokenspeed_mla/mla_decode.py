@@ -339,6 +339,7 @@ def tokenspeed_mla_decode(
         torch.Tensor
     ] = None,  # per-request global causal bound; None = local (non-DCP)
     cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
+    cp_rank: int = 0,  # this rank's index in [0, cp_world); subtracted from causal_seqs
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -391,15 +392,22 @@ def tokenspeed_mla_decode(
         Default False keeps the original single-tensor return and emits no
         LSE code in the compiled kernel.
     causal_seqs : Optional[torch.Tensor]
-        DCP support. Per-request *global* causal bound [B] (int32). Under DCP
-        each rank holds a strided 1/cp_world slice of the context, so the
-        causal cutoff must be expressed in global coordinates rather than the
-        rank-local KV length. ``None`` (default) uses the local ``seq_lens``,
-        i.e. ordinary single-rank causal masking.
+        DCP support. Per-request *global* causal bound [B] (int32) -- the full
+        context length, the SAME value on every rank. Under DCP each rank holds a
+        strided 1/cp_world slice of the context, so the causal cutoff is expressed
+        in global coordinates; this function subtracts ``cp_rank`` and the kernel
+        divides by ``cp_world`` to recover this rank's local bound. Required when
+        ``cp_world > 1``. ``None`` (default, non-DCP) uses the local ``seq_lens``.
     cp_world : int
         DCP world size. ``1`` (default) is the non-DCP path and compiles to the
         original masking with no extra work. ``>1`` enables strided
         global-coordinate causal masking (``causal_seqs`` is then required).
+    cp_rank : int
+        This rank's index in ``[0, cp_world)``. Local key ``c`` on this rank maps
+        to global position ``c*cp_world + cp_rank``, so the rank-local causal
+        bound is ``ceil((causal_seqs - cp_rank) / cp_world)``; the wrapper folds
+        ``cp_rank`` in for you, so callers pass the same global ``causal_seqs`` on
+        every rank. Must be 0 when ``cp_world == 1``.
 
     Returns
     -------
@@ -499,9 +507,17 @@ def tokenspeed_mla_decode(
             "causal_seqs (per-request global causal bound) is required when "
             f"cp_world > 1, got cp_world={cp_world} and causal_seqs=None"
         )
-    # DCP: per-request causal bound. Default = cache_seqs (local_K) => identical to
-    # original masking. DCP tail-rank control: caller passes local_K on tail rank, local_K+q_len
-    # elsewhere (k_bound then exceeds local_K so nothing is masked on non-tail ranks).
+    if not 0 <= cp_rank < max(cp_world, 1):
+        raise ValueError(
+            f"cp_rank must be in [0, cp_world), got cp_rank={cp_rank} "
+            f"cp_world={cp_world}"
+        )
+    # DCP: derive this rank's local causal bound from the global one. causal_seqs
+    # is the global cutoff (same on every rank); local key c maps to global
+    # position c*cp_world + cp_rank, so the kernel computes
+    # k_bound = ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world). We
+    # fold cp_rank in here so callers pass the same global bound on every rank.
+    # None (non-DCP) => cache_seqs (local_K, cp_world==1 => bound unchanged).
     if causal_seqs is None:
         causal_seqs_dev = cache_seqs
     else:
@@ -510,6 +526,8 @@ def tokenspeed_mla_decode(
             if causal_seqs.dtype == torch.int32
             else causal_seqs.to(torch.int32)
         )
+        if cp_rank:
+            causal_seqs_dev = causal_seqs_dev - cp_rank
 
     is_var_split_kv = False
     block_split_kvs = None

@@ -63,7 +63,19 @@ def _paged(key_rows, dtype):
     return cache, bt
 
 
-def _decode(query, cache, bt, n, ws, dtype, *, causal_seqs=None, cp_world=1, lse=False):
+def _decode(
+    query,
+    cache,
+    bt,
+    n,
+    ws,
+    dtype,
+    *,
+    causal_seqs=None,
+    cp_world=1,
+    cp_rank=0,
+    lse=False,
+):
     from tokenspeed_mla import tokenspeed_mla_decode
 
     return tokenspeed_mla_decode(
@@ -80,6 +92,7 @@ def _decode(query, cache, bt, n, ws, dtype, *, causal_seqs=None, cp_world=1, lse
         return_lse=lse,
         causal_seqs=causal_seqs,
         cp_world=cp_world,
+        cp_rank=cp_rank,
     )
 
 
@@ -109,6 +122,8 @@ def test_dcp_strided_slices_merge_to_full_context():
     for r in range(W):
         rk = keys[r::W]
         c, b = _paged(rk, dtype)
+        # Clean API: pass the SAME global bound L on every rank; the wrapper folds
+        # in cp_rank=r. (Equivalent to pre-subtracting and passing L - r.)
         o, lse = _decode(
             query,
             c,
@@ -116,8 +131,9 @@ def test_dcp_strided_slices_merge_to_full_context():
             rk.shape[0],
             ws,
             dtype,
-            causal_seqs=torch.tensor([L - r], device="cuda", dtype=torch.int32),
+            causal_seqs=torch.tensor([L], device="cuda", dtype=torch.int32),
             cp_world=W,
+            cp_rank=r,
             lse=True,
         )
         parts.append((o.float(), lse.float()))
@@ -137,6 +153,38 @@ def test_dcp_strided_slices_merge_to_full_context():
     assert (
         rel < tol
     ), f"DCP strided merge != full context: rel max|Δ|={rel:.3e} (tol {tol})"
+
+
+def test_cp_rank_folds_into_causal_seqs():
+    """Passing the global bound + cp_rank must be identical to pre-subtracting the
+    rank (causal_seqs = global - rank, cp_rank=0). Guards the documented contract
+    that callers pass the SAME global causal_seqs on every rank."""
+    dtype = torch.float8_e4m3fn
+    torch.manual_seed(4)
+    L, W, r = 128, 2, 1
+    ws = _workspace()
+    query = torch.randn(1, Q, H, D, device="cuda").to(dtype)
+    rk = (torch.randn(L, D, device="cuda") * 0.3).to(dtype)[r::W]
+    c, b = _paged(rk, dtype)
+
+    def call(cs, rank):
+        return _decode(
+            query,
+            c,
+            b,
+            rk.shape[0],
+            ws,
+            dtype,
+            causal_seqs=torch.tensor([cs], device="cuda", dtype=torch.int32),
+            cp_world=W,
+            cp_rank=rank,
+            lse=True,
+        )
+
+    o_global, lse_global = call(L, r)  # clean API: global bound + cp_rank
+    o_pre, lse_pre = call(L - r, 0)  # pre-subtracted bound
+    torch.testing.assert_close(o_global, o_pre, rtol=0, atol=0)
+    torch.testing.assert_close(lse_global, lse_pre, rtol=0, atol=0)
 
 
 def test_return_lse_toggles_output_shape():
