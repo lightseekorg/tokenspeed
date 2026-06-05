@@ -118,7 +118,7 @@ class AttentionConfig:
         v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
         load_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
         store_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        reduce_layout = gl.BlockedLayout([1, 1], [1, HEAD_DIM], [1, 1], [1, 0])
+        reduce_layout = gl.BlockedLayout([1, 1], [1, 64], [1, 1], [1, 0])
         k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
             [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
@@ -624,8 +624,6 @@ def _mha_decode_reduce_fp16(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
-    IS_SLIDING: gl.constexpr,
-    WINDOW_LEFT: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -637,19 +635,14 @@ def _mha_decode_reduce_fp16(
         HEAD_DIM,
         BLOCK_M,
         BLOCK_N,
-        IS_SLIDING,
-        WINDOW_LEFT,
+        False,  # IS_SLIDING
+        -1,  # WINDOW_LEFT
         InputStrides(1, 1, 1),
     )
     batch = gl.program_id(0)
     q_head = gl.program_id(1)
     cache_len = gl.load(cache_seqlens_ptr + batch)
-    if cfg.IS_SLIDING:
-        window_len = min(cache_len, cfg.WINDOW_LEFT)
-        kv_start = cache_len - window_len
-    else:
-        kv_start = cache_len - cache_len
-    first_page = kv_start // cfg.PAGE_SIZE
+    first_page = 0
     end_page = cdiv(cache_len, cfg.PAGE_SIZE)
     num_pages = end_page - first_page
     pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
@@ -918,8 +911,6 @@ def gluon_mha_decode_fp16_gfx950(
             config.block_m,
             config.block_n,
             has_sink,
-            config.is_sliding,
-            config.window_left,
             num_warps=1,
         )
     return output
