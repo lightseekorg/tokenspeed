@@ -42,6 +42,7 @@ from tokenspeed.cli._proc import (
     wait_grpc_serving,
     wait_http_ready,
 )
+from tokenspeed.runtime.utils import configure_logger
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -53,6 +54,7 @@ DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+DEFAULT_TS_SERVE_LOG_LEVEL = "INFO"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
@@ -177,6 +179,18 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     if "--prometheus-port" in gateway_args:
         return gateway_args
     return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
+
+
+def _configure_cli_logging() -> None:
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return
+
+    configure_logger(
+        argparse.Namespace(
+            log_level=os.environ.get("TS_SERVE_LOG_LEVEL", DEFAULT_TS_SERVE_LOG_LEVEL)
+        )
+    )
 
 
 def _user_model_id(gateway_args: list[str]) -> str | None:
@@ -523,6 +537,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     print_logo()
 
+    _configure_cli_logging()
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
     engine_args, gateway_args = _args_with_default_model_parsers(
