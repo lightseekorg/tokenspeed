@@ -409,6 +409,7 @@ def deepseek_v4_select_experts(
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
+    need_scores: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """DeepSeek V4 MoE routing.
 
@@ -416,6 +417,9 @@ def deepseek_v4_select_experts(
     only affects expert selection; the gathered expert weights come from the
     unbiased scores. Hash-routed layers use checkpoint-provided expert ids but
     still gather weights from the gate scores.
+
+    Set ``need_scores=False`` when the caller discards the third return value
+    (e.g. mega_moe) to skip the redundant sqrt(softplus(logits)) computation.
     """
 
     fused_topk = _deepseek_v4_fused_select_experts(
@@ -428,7 +432,10 @@ def deepseek_v4_select_experts(
     )
     if fused_topk is not None:
         topk_weights, topk_ids = fused_topk
-        scores = torch.sqrt(F.softplus(router_logits.float()))
+        if need_scores:
+            scores = torch.sqrt(F.softplus(router_logits.float()))
+        else:
+            scores = router_logits
         return topk_weights, topk_ids, scores
 
     scores = torch.sqrt(F.softplus(router_logits.float()))
@@ -2530,6 +2537,7 @@ class DeepseekV4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
+        need_scores: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
         return deepseek_v4_select_experts(
@@ -2539,6 +2547,7 @@ class DeepseekV4MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
+            need_scores=need_scores,
         )
 
     def _make_topk_output(
@@ -2594,7 +2603,7 @@ class DeepseekV4MoE(nn.Module):
         else:
             with nvtx_range("moe_select_experts"):
                 topk_weights, topk_ids, _ = self._select_experts(
-                    hidden_states, input_ids
+                    hidden_states, input_ids, need_scores=False
                 )
 
         shared = None
