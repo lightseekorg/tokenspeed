@@ -20,7 +20,11 @@
 
 from __future__ import annotations
 
+import functools
+import json
+import os
 from functools import partial
+from typing import Any
 
 import torch
 import triton.language as tl
@@ -29,19 +33,206 @@ from tokenspeed_kernel.ops.moe.triton import (
     triton_moe_fused_experts,
     triton_moe_sum_reduce,
 )
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.activation import silu_and_mul
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
-from tokenspeed.runtime.layers.moe.backends.triton_config import (
-    try_get_optimal_moe_config,
-)
 from tokenspeed.runtime.layers.moe.backends.weights import (
     create_moe_weight_pair,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.quantization import Fp8Config
-from tokenspeed.runtime.utils import set_weight_attrs
+from tokenspeed.runtime.utils import (
+    get_colorful_logger,
+    get_device_name,
+    set_weight_attrs,
+)
+from tokenspeed.runtime.utils.env import envs
+
+logger = get_colorful_logger(__name__)
+_is_amd = current_platform().is_amd
+
+
+def _get_config_file_name(
+    E: int,
+    inter_size: int,
+    hidden_size: int,
+    dtype: str | None,
+    block_shape: list[int] | tuple[int, int] | None = None,
+    down_moe: bool = False,
+) -> str:
+    device_name = get_device_name().replace(" ", "_")
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    )
+    down_moe_selector = "_down" if down_moe else ""
+    return (
+        f"{E=},{inter_size=},{hidden_size=},device_name={device_name}"
+        f"{dtype_selector}{block_shape_selector}{down_moe_selector}.json"
+    )
+
+
+def _get_config_file_path(
+    E: int,
+    inter_size: int,
+    hidden_size: int,
+    dtype: str | None,
+    block_n: int | None = 0,
+    block_k: int | None = 0,
+    down_moe: bool = False,
+) -> str:
+    json_file_name = _get_config_file_name(
+        E,
+        inter_size,
+        hidden_size,
+        dtype,
+        [block_n, block_k],
+        down_moe=down_moe,
+    )
+    default_config_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    config_dir = envs.TOKENSPEED_MOE_CONFIG_DIR.get_set_value_or(default_config_dir)
+    return os.path.join(config_dir, json_file_name)
+
+
+@functools.lru_cache
+def _get_moe_configs(
+    E: int,
+    inter_size: int,
+    hidden_size: int,
+    dtype: str | None,
+    block_n: int | None = 0,
+    block_k: int | None = 0,
+    down_moe: bool = False,
+) -> dict[int, Any] | None:
+    config_file_path = _get_config_file_path(
+        E,
+        inter_size,
+        hidden_size,
+        dtype,
+        block_n,
+        block_k,
+        down_moe,
+    )
+    if os.path.exists(config_file_path):
+        with open(config_file_path) as f:
+            logger.info("Using MoE kernel config from %s.", config_file_path)
+            return {int(key): val for key, val in json.load(f).items()}
+
+    logger.warning(
+        (
+            "Using default MoE kernel config. Performance might be sub-optimal! "
+            "Config file not found at %s."
+        ),
+        config_file_path,
+    )
+    return None
+
+
+def _get_default_moe_config(
+    M: int,
+    E: int,
+    inter_size: int,
+    hidden_size: int,
+    topk: int,
+    dtype: str | None,
+    block_shape: list[int] | tuple[int, int] | None = None,
+) -> dict[str, int]:
+    del hidden_size, topk
+    if dtype == "fp8_w8a8":
+        if block_shape is None:
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 32,
+                "num_warps": 8,
+                "num_stages": 2 if _is_amd else 4,
+            }
+            if M <= E:
+                config = {
+                    "BLOCK_SIZE_M": 64,
+                    "BLOCK_SIZE_N": 128,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 4,
+                    "num_stages": 2 if _is_amd else 4,
+                }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_shape[0],
+                "BLOCK_SIZE_K": block_shape[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 2 if _is_amd else 3,
+            }
+    else:
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+        }
+        if M <= E:
+            config = {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+            }
+    return config
+
+
+def _try_get_optimal_moe_config(
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
+    top_k: int,
+    dtype: str | None,
+    M: int,
+    block_shape: list[int] | tuple[int, int] | None = None,
+    return_down_config: bool = False,
+):
+    del w1_shape
+    E, hidden_size, inter_size = w2_shape
+    block_n = block_shape[0] if block_shape else 0
+    block_k = block_shape[1] if block_shape else 0
+
+    configs = _get_moe_configs(
+        E, inter_size, hidden_size, dtype, block_n, block_k, down_moe=False
+    )
+    if configs:
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    else:
+        config = _get_default_moe_config(
+            M, E, inter_size, hidden_size, top_k, dtype, block_shape
+        )
+
+    down_config = None
+    max_block_m = None
+    if return_down_config:
+        down_configs = _get_moe_configs(
+            E, inter_size, hidden_size, dtype, block_n, block_k, down_moe=True
+        )
+        if down_configs:
+            down_config = down_configs[
+                min(down_configs.keys(), key=lambda x: abs(x - M))
+            ]
+            down_config = dict(**down_config)
+            max_block_m = max([cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()])
+        else:
+            down_config = _get_default_moe_config(
+                M, E, inter_size, hidden_size, top_k, dtype, block_shape
+            )
+            max_block_m = down_config["BLOCK_SIZE_M"]
+
+    if return_down_config:
+        assert (
+            down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
+        )
+        return config, (down_config, max_block_m)
+    return config
 
 
 def _attach_dense_weight_pair(
@@ -142,7 +333,7 @@ def _build_triton_gemms(
         top_k=1,
     )
     get_config_func = partial(
-        try_get_optimal_moe_config,
+        _try_get_optimal_moe_config,
         (num_local_experts, intermediate_size * 2, hidden_size),
         (num_local_experts, hidden_size, intermediate_size),
         spec.top_k,
