@@ -45,6 +45,7 @@ def _load_w13(
     use_presharded_weights: bool,
     do_transpose: bool,
     load_up_proj_weight_first: bool,
+    tp_size: int = 1,
 ):
     # Index the loaded weight for tp sharding.
     # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
@@ -75,15 +76,23 @@ def _load_w13(
 
     if not use_presharded_weights:
         if not is_bias and do_transpose:
-            # do not transpose for bias
             loaded_weight = loaded_weight.transpose(-2, -1)
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
-        )
+        if tp_size > 1:
+            # Derive the unpadded shard size from the checkpoint tensor.
+            # expert_data may be Blackwell-padded; checkpoint is not.
+            load_shard = loaded_weight.shape[shard_dim] // tp_size
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, load_shard * tp_rank, load_shard
+            )
+        else:
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, shard_size * tp_rank, shard_size
+            )
 
     expert_data = expert_data.narrow(shard_dim, start, shard_size)
-    loaded_weight = _preserve_e8m0_bytes_for_uint8_param(expert_data, loaded_weight)
-    expert_data.copy_(loaded_weight)
+    dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+    loaded_weight = _preserve_e8m0_bytes_for_uint8_param(dst, loaded_weight)
+    dst.copy_(loaded_weight)
 
 
 def _load_w2(
@@ -95,6 +104,7 @@ def _load_w2(
     is_bias: bool,
     use_presharded_weights: bool,
     do_transpose: bool,
+    tp_size: int = 1,
 ):
     if not isinstance(expert_data, torch.Tensor) or not isinstance(
         loaded_weight, torch.Tensor
@@ -118,15 +128,19 @@ def _load_w2(
 
     if not use_presharded_weights:
         if not is_bias and do_transpose:
-            # do not transpose for bias
             loaded_weight = loaded_weight.transpose(-2, -1)
+        if tp_size > 1:
+            load_shard = loaded_weight.shape[shard_dim] // tp_size
+        else:
+            load_shard = shard_size
         loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
+            shard_dim, load_shard * tp_rank, load_shard
         )
 
     # w2, down_proj: Load into only logical weight of w2.
-    loaded_weight = _preserve_e8m0_bytes_for_uint8_param(expert_data, loaded_weight)
-    expert_data.copy_(loaded_weight)
+    dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+    loaded_weight = _preserve_e8m0_bytes_for_uint8_param(dst, loaded_weight)
+    dst.copy_(loaded_weight)
 
 
 def get_shard_dim(param, shard_id, do_transpose):
@@ -150,6 +164,7 @@ def load_model_weight(
     is_bias: bool,
     use_presharded_weights: bool,
     do_transpose: bool,
+    tp_size: int = 1,
 ):
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
@@ -170,6 +185,7 @@ def load_model_weight(
         is_bias,
         use_presharded_weights,
         do_transpose,
+        tp_size=tp_size,
     )
 
 
