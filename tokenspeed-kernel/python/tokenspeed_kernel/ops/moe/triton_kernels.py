@@ -25,7 +25,7 @@ from contextlib import contextmanager
 
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.ops.moe.fused_routing import (
+from tokenspeed_kernel.ops.moe.gluon_decode_routing_gfx950 import (
     SMALLM_MAX_M,
     gluon_fused_route,
     gluon_route_supported,

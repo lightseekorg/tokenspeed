@@ -5,7 +5,7 @@ import tokenspeed_kernel  # noqa: F401  (registers moe kernels)
 import tokenspeed_kernel.ops.moe.triton_kernels as triton_kernels_mod
 import torch
 from tokenspeed_kernel.ops.moe import moe_route
-from tokenspeed_kernel.ops.moe.fused_routing import (
+from tokenspeed_kernel.ops.moe.gluon_decode_routing_gfx950 import (
     SMALLM_MAX_M,
     gluon_fused_route,
     gluon_route_supported,
