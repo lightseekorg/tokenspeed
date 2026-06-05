@@ -18,20 +18,62 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
+import logging
 from enum import Enum, IntEnum, auto
+from typing import Any
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.deepep import Buffer
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    per_token_group_quant_fp8,
-)
 
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.moe.config import ExpertParallelConfig
-from tokenspeed.runtime.utils import get_available_gpu_memory, get_colorful_logger
+__all__ = [
+    "Buffer",
+    "DeepEPBuffer",
+    "DeepEPDispatchMode",
+    "DeepEPDispatcher",
+    "DeepEPMode",
+]
 
-logger = get_colorful_logger(__file__)
+logger = logging.getLogger(__file__)
+
+
+def _raise_deepep_unavailable() -> None:
+    raise ImportError(
+        "DeepEP is not available. Install the `deep_ep` package to use DeepEP "
+        "communication."
+    )
+
+
+class _MissingBufferMeta(type):
+    def __getattr__(cls, name):
+        del name
+        _raise_deepep_unavailable()
+
+
+class _MissingBuffer(metaclass=_MissingBufferMeta):
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+        _raise_deepep_unavailable()
+
+
+try:
+    from deep_ep.buffer import Buffer
+except ImportError:
+    Buffer = _MissingBuffer
+
+
+def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
+    if torch.cuda.current_device() != gpu_id:
+        logger.warning(
+            "current device is not %s, but %s, which may cause useless memory allocation for torch CUDA context.",
+            gpu_id,
+            torch.cuda.current_device(),
+        )
+    if empty_cache:
+        torch.cuda.empty_cache()
+    free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+    return free_gpu_memory / (1 << 30)
 
 
 class DeepEPMode(Enum):
@@ -51,8 +93,7 @@ class DeepEPMode(Enum):
 
         if forward_mode.is_decode():
             return DeepEPMode.low_latency
-        else:
-            return DeepEPMode.normal
+        return DeepEPMode.normal
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -125,9 +166,7 @@ class DeepEPBuffer:
         else:
             raise NotImplementedError
 
-        free_gpu_memory_begin = get_available_gpu_memory(
-            "cuda", torch.cuda.current_device()
-        )
+        free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
@@ -136,9 +175,7 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             allow_mnnvl=True,
         )
-        free_gpu_memory_end = get_available_gpu_memory(
-            "cuda", torch.cuda.current_device()
-        )
+        free_gpu_memory_end = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
             "DeepEPBuffer use memory %s GB", free_gpu_memory_begin - free_gpu_memory_end
         )
@@ -234,6 +271,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+
         hidden_states = per_token_group_quant_fp8(hidden_states, 128)
         topk_idx = topk_idx.to(torch.int64)
         topk_weights = topk_weights.to(torch.float32)
@@ -555,7 +594,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 class DeepEPDispatcher:
     def __init__(
         self,
-        config: ExpertParallelConfig,
+        config: Any,
         deepep_mode: DeepEPMode = DeepEPMode.auto,
         async_finish: bool = True,
         return_recv_hook: bool = True,
@@ -596,7 +635,7 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
+        forward_mode,
     ):
         topk_idx = topk_idx.to(torch.int64)
         inner_state = self._get_impl(forward_mode).dispatch_a(
@@ -620,7 +659,7 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        forward_mode: ForwardMode,
+        forward_mode,
         moe_origin_input: torch.Tensor = None,
     ):
         topk_idx = topk_idx.to(torch.int64)
@@ -647,11 +686,10 @@ class DeepEPDispatcher:
         del self._combine_intermediate_state
         return self._get_impl(forward_mode).combine_b(*inner_state)
 
-    def _get_impl(self, forward_mode: ForwardMode) -> _DeepEPDispatcherImplBase:
+    def _get_impl(self, forward_mode) -> _DeepEPDispatcherImplBase:
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
-        elif resolved_deepep_mode == DeepEPMode.low_latency:
+        if resolved_deepep_mode == DeepEPMode.low_latency:
             return self._low_latency_dispatcher
-        else:
-            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+        raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
