@@ -60,6 +60,7 @@ def main() -> None:
     # don't register the engine's ServerArgs on this parser.
     serve_parser = subparsers.add_parser(
         "serve",
+        add_help=False,
         help="Launch the TokenSpeed inference server.",
     )
     serve_parser.set_defaults(func=_serve)

@@ -42,6 +42,7 @@ from tokenspeed.cli._proc import (
     wait_grpc_serving,
     wait_http_ready,
 )
+from tokenspeed.runtime.utils import configure_logger
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -53,6 +54,7 @@ DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+DEFAULT_TS_SERVE_LOG_LEVEL = "INFO"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
@@ -61,6 +63,63 @@ _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
 )
+
+
+def print_serve_help() -> None:
+    """Render a complete ``ts serve`` help text.
+
+    We keep the top-level ``tokenspeed`` argparse parser intentionally slim and
+    route unknown ``serve`` flags into ``split_argv``. This helper exposes the
+    full engine CLI surface (``ServerArgs``) plus orchestrator/gateway options.
+    """
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser(
+        prog="tokenspeed serve",
+        description=("Launch TokenSpeed through the TokenSpeed engine.\n\n"),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    orch = parser.add_argument_group("orchestrator options")
+    orch.add_argument(
+        "--engine-startup-timeout",
+        type=int,
+        metavar="SECONDS",
+        default=1800,
+        help="Max wait for engine gRPC readiness (default: 1800)",
+    )
+    orch.add_argument(
+        "--gateway-startup-timeout",
+        type=int,
+        metavar="SECONDS",
+        default=60,
+        help="Max wait for gateway HTTP readiness (default: 60)",
+    )
+    orch.add_argument(
+        "--drain-timeout",
+        type=int,
+        metavar="SECONDS",
+        default=30,
+        help="Grace period for shutdown before SIGKILL (default: 30)",
+    )
+    orch.add_argument(
+        "--control-port",
+        type=int,
+        metavar="PORT",
+        default=None,
+        help="Optional control HTTP port",
+    )
+
+    ServerArgs.add_cli_args(parser)
+
+    parser.epilog = (
+        "Routing notes:\n"
+        "  --model / --reasoning-parser are fanned out to engine + gateway.\n"
+        "  --host / --port are treated as gateway-facing in smg mode.\n"
+        "  --chat-template / --tool-call-parser are gateway-only overrides.\n"
+        "  Unknown flags fall through to smg gateway launch arguments."
+    )
+    parser.print_help()
 
 
 def _check_serve_extra_installed() -> None:
@@ -177,6 +236,18 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     if "--prometheus-port" in gateway_args:
         return gateway_args
     return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
+
+
+def _configure_cli_logging() -> None:
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return
+
+    configure_logger(
+        argparse.Namespace(
+            log_level=os.environ.get("TS_SERVE_LOG_LEVEL", DEFAULT_TS_SERVE_LOG_LEVEL)
+        )
+    )
 
 
 def _user_model_id(gateway_args: list[str]) -> str | None:
@@ -514,6 +585,10 @@ async def run_smg(
 
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
+    if "-h" in raw_argv or "--help" in raw_argv:
+        print_serve_help()
+        sys.exit(0)
+
     try:
         import setproctitle
 
@@ -523,6 +598,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     print_logo()
 
+    _configure_cli_logging()
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
     engine_args, gateway_args = _args_with_default_model_parsers(
