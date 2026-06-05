@@ -19,40 +19,21 @@
 # SOFTWARE.
 
 # ===========================================================================
-# Small-M (decode) fused MoE routing, implemented in Gluon.
+# Small-M (decode) fused MoE routing in Gluon.
 #
-# For small token counts (``M <= SMALLM_MAX_M``) this replaces the generic
-# ``triton_kernels_routing`` post-topk pipeline -- bitmatrix metadata
-# stage1/stage2, row-sum, ragged-metadata memset/compute, gather/scatter index
-# build, the ``//topk`` divide, the gate_scal gather and dtype copies (roughly
-# a dozen kernel launches) -- with a SINGLE Gluon kernel. Decode routing is
-# launch-overhead bound, so collapsing ~12 launches into one is a large win
-# (~6x cheaper routing, ~1.1-1.4x end-to-end at M=1..16). Larger M keeps the
-# generic pipeline; the caller gates on the bound (one ``if``).
+# Decode routing is launch-overhead bound. For ``M <= SMALLM_MAX_M`` this
+# replaces the generic ``triton_kernels_routing`` pipeline (~12 kernel
+# launches) with a single Gluon kernel, producing output bit-for-bit identical
+# to the generic path. Larger M falls back; the caller gates on the bound.
 #
-# Routing is a COUNTING SORT: gates ``g in [0, M*topk)`` are bucketed by their
-# selected expert, producing ``RaggedTensorMetadata`` plus the gather/scatter
-# index tensors -- reproducing, field-for-field, the contract that
-# ``moe_route(traits={"output_type": "ragged_metadata"})`` produces:
-#   RaggedTensorMetadata(slice_sizes, slice_offs, block_offs_data,
-#                        block_schedule_data),
-#   gather_indx [G] int32, scatter_indx [G] int32, gate_scal [G] dtype
-#   where G = M * topk.
-# The result is BIT-FOR-BIT identical to the generic pipeline (``M <= 16`` is
-# the single-block-collapse regime, so the index tensors are stable too).
-#
-# The single kernel (``_fused_route_smallM``) fuses: in-kernel top-k (selection
-# + softmax gate, matching ``topk_forward``, so there is no separate topk
-# launch and no ``y_vals``/``y_indx`` global round-trip); the histogram and
-# slice-offset cumsum; the single-block schedule (``col_sum <= M <= 16 == min
-# block size`` so every nonzero expert is exactly one block); and a stable
-# register-only [G,G] rank tile keeping the gather/scatter/gate order
-# bit-identical.
-#
-# Gluon symbols are imported through the project ``_triton`` indirection so the
-# underlying triton distribution can be swapped in one place; block-size counts
-# and ``max_n_blocks`` are queried from ``RaggedTensorMetadata`` so the metadata
-# shapes match ``make_ragged_tensor_metadata`` on HIP and non-HIP alike.
+# Why M <= 16 makes this exact: 16 is the smallest RaggedTensorMetadata block
+# size, so every nonzero expert holds exactly one block (single-block collapse)
+# and the gather/scatter placement is stable. The kernel fuses the in-kernel
+# top-k, histogram/cumsum, single-block schedule, and a register-only counting
+# sort, reproducing ``moe_route(traits={"output_type": "ragged_metadata"})``:
+# ``RaggedTensorMetadata`` + gather_indx/scatter_indx/gate_scal of length
+# ``G = M*topk``. Metadata shapes are queried from ``RaggedTensorMetadata`` so
+# they match ``make_ragged_tensor_metadata`` on HIP and non-HIP alike.
 # ===========================================================================
 from __future__ import annotations
 
@@ -61,13 +42,13 @@ from tokenspeed_kernel._triton import gl, gluon, redirect_triton_to_tokenspeed_t
 
 with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.tensor import RaggedTensorMetadata
-    from triton_kernels.topk import topk_forward
 
 __all__ = [
     "FUSED_ROUTE_MAX_M",
     "SMALLM_MAX_M",
     "GLUON_ROUTE_DTYPES",
     "GLUON_ROUTE_MAX_E",
+    "GLUON_ROUTE_MAX_G",
     "gluon_fused_route",
     "gluon_route_supported",
 ]
@@ -92,6 +73,10 @@ FUSED_ROUTE_MAX_M = SMALLM_MAX_M
 # generic triton_kernels_routing pipeline.
 GLUON_ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 GLUON_ROUTE_MAX_E = 1024  # next_pow2(E) bins / EP-wide tiles stay bounded
+# Upper bound on G = M*topk. The stable-sort rank tile is [GP, GP] and the
+# kernel's layouts assume the single-wavefront regime (GP <= 64); configs that
+# would exceed it fall back to the generic pipeline.
+GLUON_ROUTE_MAX_G = 64
 
 # torch gate dtype -> gluon element type (for the in-kernel softmax cast that
 # reproduces topk_forward's ``softmax(...).to(x_dtype)`` rounding exactly).
@@ -111,7 +96,6 @@ def _add(a, b):
 def _fused_topk(
     Logits,  # [M, E]   X_DTYPE   (raw routing logits)
     stride_lm,  # logits row stride
-    g,  # [GP]      int32    flat gate index (token-major, == arange)
     gmask,  # [GP]   bool     g < G
     tok,  # [GP]      int32    g // TOPK
     slot,  # [GP]     int32    g %  TOPK
@@ -208,7 +192,7 @@ def _fused_route_smallM(
     TKP: gl.constexpr,  # next_pow2(topk)
     MAXBLK: gl.constexpr,  # == M*topk
     MAXBLKP: gl.constexpr,  # next_pow2(MAXBLK)
-    NB_C: gl.constexpr,  # 5 (HIP)
+    NB_C: gl.constexpr,  # number of block-size rows (NB)
     X_DTYPE: gl.constexpr,  # gate element type (logits dtype)
     NW_C: gl.constexpr,  # num_warps (1 for the M<=2 decode hot path, else 4)
     bo_stride: gl.constexpr,  # block_offs row stride  == E+1
@@ -233,7 +217,6 @@ def _fused_route_smallM(
     idx, vals = _fused_topk(
         Logits,
         stride_lm,
-        g,
         gmask,
         tok,
         slot,
@@ -249,67 +232,63 @@ def _fused_route_smallM(
         LT,
     )
 
-    # ---- histogram (col_sum / slice_sizes) --------------------------------
+    # ---- histogram -> slice_sizes -----------------------------------------
     e = gl.arange(0, EP, layout=LE)
     emask = e < E
-    hist = gl.histogram(idx, EP, mask=gmask, layout=LE)  # invalid excluded
+    hist = gl.histogram(idx, EP, mask=gmask, layout=LE)
     gl.store(SliceSizes + e, hist, mask=emask)
 
     # ---- slice_offs = [0] + cumsum(slice_sizes) ---------------------------
-    # Two-store trick: exclusive scan -> indices 0..E-1; inclusive scan shifted
-    # by +1 -> indices 1..E (writes the trailing total at index E).
-    incl = gl.associative_scan(hist, 0, _add)  # inclusive cumsum [EP]
-    col_offs = incl - hist  # exclusive cumsum [EP]
-    gl.store(SliceOffs + e, col_offs, mask=emask)  # idx 0..E-1
-    gl.store(SliceOffs + e + 1, incl, mask=emask)  # idx 1..E
+    # Store exclusive prefixes at 0..E-1; index E (the total) is the only entry
+    # the inclusive scan uniquely supplies, so write just that one element
+    # rather than re-writing 1..E-1 with identical values.
+    incl = gl.associative_scan(hist, 0, _add)
+    col_offs = incl - hist
+    last = e == (E - 1)
+    gl.store(SliceOffs + e, col_offs, mask=emask)
+    gl.store(SliceOffs + e + 1, incl, mask=emask & last)
 
-    # ---- block_offs_data / block_schedule_data (single-block collapse) -----
-    # M <= 16 == smallest block size, so col_sum <= M and every nonzero expert
-    # is exactly ONE block at every block size -- all NB rows are identical and
-    # the packed block value is just the expert id.
-    n_blk = (hist > 0).to(gl.int32)  # 1 per nonzero expert
+    # ---- block_offs_data / block_schedule_data ----------------------------
+    # Single-block collapse: at M <= 16 every nonzero expert is exactly one
+    # block at every block size, so all NB rows are identical and the packed
+    # block value is just the expert id.
+    n_blk = (hist > 0).to(gl.int32)
     blk_incl = gl.associative_scan(n_blk, 0, _add)
-    blk_excl = blk_incl - n_blk  # position of expert's block
-    n_total = gl.sum(n_blk, 0)  # #nonzero experts (scalar)
+    blk_excl = blk_incl - n_blk
+    n_total = gl.sum(n_blk, 0)
     jb = gl.arange(0, MAXBLKP, layout=LB)
     jbmask = jb < MAXBLK
+    neg_fill = gl.full([MAXBLKP], -1, gl.int32, layout=LB)
     for k in gl.static_range(NB_C):
-        # block_offs row k (same two-store trick)
         gl.store(BlockOffs + k * bo_stride + e, blk_excl, mask=emask)
-        gl.store(BlockOffs + k * bo_stride + e + 1, blk_incl, mask=emask)
-        # Fill -1 ONLY in the unused tail (jb >= n_total). This is DISJOINT
-        # from the scatter positions below (0..n_total-1), so the two stores
-        # never alias and the compiler is free to reorder them safely. (A full
-        # 0..MAXBLK-1 fill would overlap the scatter and get reordered after
-        # it, clobbering scattered ids -> wrong rows.)
+        gl.store(BlockOffs + k * bo_stride + e + 1, blk_incl, mask=emask & last)
+        # Fill -1 only in the tail (jb >= n_total). It is disjoint from the
+        # scatter targets [0, n_total) below, so the compiler cannot reorder
+        # the two stores into an alias that clobbers scattered ids.
         gl.store(
             BlockSched + k * bs_stride + jb,
-            gl.full([MAXBLKP], -1, gl.int32, layout=LB),
+            neg_fill,
             mask=jbmask & (jb >= n_total),
         )
-        # scatter packed block ids: blk==0 => packed value == expert id e
+        # Packed value is the bare expert id (single block, so block index 0).
         gl.store(
             BlockSched + k * bs_stride + blk_excl,
             e,
             mask=(hist > 0) & emask,
         )
 
-    # ---- stable sort by expert (rank via register-only 2D all-pairs) ------
-    # rank[g] = #{j : idx[j]==idx[g], j<g}. idx now lives in registers (no
-    # global Idx after the fuse), so compute it as a [GP, GP] comparison tile
-    # reduced over j -- cheap since GP <= 64 in the small-M tier.
+    # ---- stable per-expert rank -------------------------------------------
+    # rank[g] = #{j<g : idx[j]==idx[g]}. idx is in registers post-fuse, so use
+    # a [GP,GP] compare tile reduced over j; cheap since GP <= 64.
     idx_row = gl.expand_dims(gl.convert_layout(idx, gl.SliceLayout(1, LT)), 1)
     idx_col = gl.expand_dims(gl.convert_layout(idx, gl.SliceLayout(0, LT)), 0)
     g_row = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(1, LT)), 1)
     g_col = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(0, LT)), 0)
-    match = ((idx_row == idx_col) & (g_col < g_row)).to(gl.int32)  # [GP,GP]
-    rank = gl.convert_layout(gl.sum(match, axis=1), LG)  # [GP]
+    match = ((idx_row == idx_col) & (g_col < g_row)).to(gl.int32)
+    rank = gl.convert_layout(gl.sum(match, axis=1), LG)
 
-    # ---- destination position = col_offs[expert] + rank -------------------
-    base = gl.gather(col_offs, idx, axis=0)  # [GP]
-    pos = base + rank
-
-    # ---- scatter the three index tensors ----------------------------------
+    # ---- scatter to destination = slice_offs[expert] + rank ---------------
+    pos = gl.gather(col_offs, idx, axis=0) + rank
     gl.store(GatherIndx + pos, tok, mask=gmask)
     gl.store(ScatterIndx + pos, g.to(gl.int32), mask=gmask)
     gl.store(GateScal + pos, vals, mask=gmask)
@@ -332,8 +311,8 @@ def _route_smallM(logits, topk, dtype):
     slice_sizes = torch.empty(E, dtype=torch.int32, device=device)
     slice_offs = torch.empty(E + 1, dtype=torch.int32, device=device)
     block_offs_data = torch.empty(NB, E + 1, dtype=torch.int32, device=device)
-    # max_n_blocks(E, G) == G in the small-M regime (G <= E so every gate is
-    # its own block row); query the library to stay exact on any platform.
+    # Query the library for the block-schedule width so it stays exact on any
+    # platform rather than hardcoding the small-M value.
     maxblk = RaggedTensorMetadata.max_n_blocks(E, G)
     block_schedule_data = torch.empty(NB, maxblk, dtype=torch.int32, device=device)
     gather_indx = torch.empty(G, dtype=torch.int32, device=device)
@@ -402,6 +381,9 @@ def gluon_route_supported(
         return False
     if E < 1 or E > GLUON_ROUTE_MAX_E:
         return False
+    # G = M*topk drives the [GP, GP] rank tile / single-wavefront layouts.
+    if M * topk > GLUON_ROUTE_MAX_G:
+        return False
     return True
 
 
@@ -420,4 +402,11 @@ def gluon_fused_route(
     """
     if dtype is None:
         dtype = logits.dtype
+    M = logits.shape[0]
+    if M > SMALLM_MAX_M:
+        raise ValueError(
+            f"gluon_fused_route requires M <= {SMALLM_MAX_M} "
+            f"(single-block-collapse regime); got M={M}. Route larger M "
+            "through the generic triton_kernels_routing pipeline."
+        )
     return _route_smallM(logits, topk, dtype)

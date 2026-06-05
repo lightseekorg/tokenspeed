@@ -195,10 +195,7 @@ def triton_kernels_routing(
 
     assert sm_first is False, "sm_first=True not supported for triton_kernels_routing"
 
-    # Small-M (decode) Gluon fast path: one fused kernel reproduces the routing
-    # metadata + index tensors bit-for-bit while cutting the generic pipeline's
-    # ~12 launches (decode is launch-overhead bound: ~1.1-1.4x e2e at M<=16).
-    # Larger M and unsupported configs fall through to the generic pipeline.
+    # For small M, route with the single fused Gluon kernel.
     if n_tokens <= SMALLM_MAX_M and gluon_route_supported(logits, n_expts_act, dtype):
         return gluon_fused_route(logits, n_expts_act, dtype=dtype)
 
