@@ -178,3 +178,17 @@ def test_dcp_rejects_non_fp8_dtype():
             causal_seqs=torch.tensor([L], device="cuda", dtype=torch.int32),
             cp_world=2,
         )
+
+
+def test_dcp_requires_causal_seqs():
+    """cp_world>1 without causal_seqs must raise: the kernel divides the bound by
+    cp_world, so falling back to rank-local seq_lens would mask each rank to
+    ~1/cp_world of its slice and silently produce a wrong partial."""
+    torch.manual_seed(3)
+    dtype, L = torch.float8_e4m3fn, 64
+    ws = _workspace()
+    query = torch.randn(1, Q, H, D, device="cuda").to(dtype)
+    cache, bt = _paged(torch.randn(L, D, device="cuda").to(dtype), dtype)
+
+    with pytest.raises(ValueError, match="causal_seqs"):
+        _decode(query, cache, bt, L, ws, dtype, cp_world=2)

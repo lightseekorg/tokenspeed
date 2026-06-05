@@ -490,6 +490,15 @@ def tokenspeed_mla_decode(
             "decode-context-parallel (cp_world > 1 / causal_seqs) is only supported "
             f"on the fp8 decode path, got query dtype {q_dtype}"
         )
+    # causal_seqs is mandatory for DCP: the kernel divides the causal bound by
+    # cp_world, so falling back to the rank-local cache_seqs here would mask each
+    # rank to ~1/cp_world of its slice and produce a wrong partial. Require the
+    # caller to pass the global bound explicitly rather than fail silently.
+    if cp_world > 1 and causal_seqs is None:
+        raise ValueError(
+            "causal_seqs (per-request global causal bound) is required when "
+            f"cp_world > 1, got cp_world={cp_world} and causal_seqs=None"
+        )
     # DCP: per-request causal bound. Default = cache_seqs (local_K) => identical to
     # original masking. DCP tail-rank control: caller passes local_K on tail rank, local_K+q_len
     # elsewhere (k_bound then exceeds local_K so nothing is masked on non-tail ranks).
