@@ -9,9 +9,9 @@ performant kernels for multi-silicon AI inference. It features:
 * A minimal list of curated dependencies for fast iteration
 
 TokenSpeed-kernel is pip-installable on its own and can be directly used by
-others. Importing `tokenspeed_kernel` and its public op packages is intentionally
-lightweight: built-in backend modules are loaded lazily on first API use or by
-calling `tokenspeed_kernel.registry.load_builtin_kernels()`.
+others. Importing `tokenspeed_kernel` exposes the public op wrappers without
+loading built-in backend modules. Backend modules are loaded lazily on first API
+use or by calling `tokenspeed_kernel.registry.load_builtin_kernels()`.
 
 ## Design Goals
 

@@ -43,21 +43,56 @@ def _run_import_check(script: str) -> None:
     )
 
 
-def test_top_level_import_does_not_load_public_ops_or_vendor_modules() -> None:
+def test_top_level_import_does_not_load_builtin_backends_or_vendor_modules() -> None:
     _run_import_check("""
 import sys
 before = set(sys.modules)
 import tokenspeed_kernel
+from tokenspeed_kernel.registry import KernelRegistry
 loaded = set(sys.modules) - before
+
+backend_prefixes = (
+    "tokenspeed_kernel.numerics.reference.",
+    "tokenspeed_kernel.ops.attention.cuda",
+    "tokenspeed_kernel.ops.attention.flash_attn",
+    "tokenspeed_kernel.ops.attention.flashinfer",
+    "tokenspeed_kernel.ops.attention.gluon",
+    "tokenspeed_kernel.ops.attention.triton",
+    "tokenspeed_kernel.ops.embedding.cuda",
+    "tokenspeed_kernel.ops.embedding.triton",
+    "tokenspeed_kernel.ops.gemm.deep_gemm",
+    "tokenspeed_kernel.ops.gemm.flashinfer",
+    "tokenspeed_kernel.ops.gemm.triton",
+    "tokenspeed_kernel.ops.gemm.trtllm",
+    "tokenspeed_kernel.ops.moe.cuda",
+    "tokenspeed_kernel.ops.moe.deepep",
+    "tokenspeed_kernel.ops.moe.flashinfer",
+    "tokenspeed_kernel.ops.moe.gluon",
+    "tokenspeed_kernel.ops.moe.triton",
+    "tokenspeed_kernel.ops.moe.triton_kernels",
+    "tokenspeed_kernel.ops.moe.trtllm",
+    "tokenspeed_kernel.ops.quantization.flashinfer",
+    "tokenspeed_kernel.ops.quantization.triton",
+    "tokenspeed_kernel.ops.quantization.trtllm",
+)
+vendor_modules = {
+    "deep_ep",
+    "deep_gemm",
+    "flash_attn",
+    "flash_attn_interface",
+    "flashinfer",
+    "trtllm_kernel",
+}
 
 unexpected = [
     name
     for name in loaded
-    if name.startswith("tokenspeed_kernel.ops.")
+    if name.startswith(backend_prefixes)
     or name.startswith("tokenspeed_kernel.thirdparty")
-    or name in {"flashinfer", "trtllm_kernel", "deep_gemm", "deep_ep"}
+    or name in vendor_modules
 ]
 assert unexpected == [], unexpected
+assert KernelRegistry.get().list_kernels() == []
 assert callable(tokenspeed_kernel.mm)
 """)
 
@@ -79,11 +114,45 @@ import tokenspeed_kernel.ops.quantization
 from tokenspeed_kernel.registry import KernelRegistry
 loaded = set(sys.modules) - before
 
+backend_prefixes = (
+    "tokenspeed_kernel.numerics.reference.",
+    "tokenspeed_kernel.ops.attention.cuda",
+    "tokenspeed_kernel.ops.attention.flash_attn",
+    "tokenspeed_kernel.ops.attention.flashinfer",
+    "tokenspeed_kernel.ops.attention.gluon",
+    "tokenspeed_kernel.ops.attention.triton",
+    "tokenspeed_kernel.ops.embedding.cuda",
+    "tokenspeed_kernel.ops.embedding.triton",
+    "tokenspeed_kernel.ops.gemm.deep_gemm",
+    "tokenspeed_kernel.ops.gemm.flashinfer",
+    "tokenspeed_kernel.ops.gemm.triton",
+    "tokenspeed_kernel.ops.gemm.trtllm",
+    "tokenspeed_kernel.ops.moe.cuda",
+    "tokenspeed_kernel.ops.moe.deepep",
+    "tokenspeed_kernel.ops.moe.flashinfer",
+    "tokenspeed_kernel.ops.moe.gluon",
+    "tokenspeed_kernel.ops.moe.triton",
+    "tokenspeed_kernel.ops.moe.triton_kernels",
+    "tokenspeed_kernel.ops.moe.trtllm",
+    "tokenspeed_kernel.ops.quantization.flashinfer",
+    "tokenspeed_kernel.ops.quantization.triton",
+    "tokenspeed_kernel.ops.quantization.trtllm",
+)
+vendor_modules = {
+    "deep_ep",
+    "deep_gemm",
+    "flash_attn",
+    "flash_attn_interface",
+    "flashinfer",
+    "trtllm_kernel",
+}
+
 unexpected = [
     name
     for name in loaded
-    if name.startswith("tokenspeed_kernel.thirdparty")
-    or name in {"flashinfer", "trtllm_kernel", "deep_gemm", "deep_ep"}
+    if name.startswith(backend_prefixes)
+    or name.startswith("tokenspeed_kernel.thirdparty")
+    or name in vendor_modules
 ]
 assert unexpected == [], unexpected
 assert KernelRegistry.get().list_kernels() == []

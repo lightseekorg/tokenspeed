@@ -88,7 +88,7 @@ pip install -e ./my-kernels-plugin
 ```
 
 ```python
-import tokenspeed_kernel  # registers built-in kernels
+import tokenspeed_kernel  # noqa: F401  -- exposes public op wrappers
 from tokenspeed_kernel.plugins import discover_plugins, list_plugins
 
 discover_plugins()
@@ -103,7 +103,7 @@ entry points so plugins can override built-ins by registering at a higher
 priority.
 
 ```python
-import tokenspeed_kernel  # noqa: F401  -- optional; top-level import is lazy
+import tokenspeed_kernel  # noqa: F401  -- optional; exposes public op wrappers
 from tokenspeed_kernel.plugins import discover_plugins
 
 discover_plugins()
