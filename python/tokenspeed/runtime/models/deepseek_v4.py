@@ -2243,17 +2243,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             (1, DEEPSEEK_V4_MXFP4_BLOCK_SIZE),
             self.num_local_experts,
         )
-        self._transformed_l1_weights, self._transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(
-                (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-            )
+        l1, l2 = deep_gemm.transform_weights_for_mega_moe(
+            (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
+            (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
         )
+        # L2 data tensor may alias the input .contiguous() buffer — clone
+        # to break the reference so the original weight storage can be freed.
+        self._transformed_l1_weights = l1
+        self._transformed_l2_weights = (l2[0].clone(), l2[1])
 
-        self.w13_weight = None
-        self.w13_weight_scale = None
-        self.w2_weight = None
-        self.w2_weight_scale = None
+        del self.w13_weight
+        del self.w13_weight_scale
+        del self.w2_weight
+        del self.w2_weight_scale
 
     def get_symm_buffer(self):
         if deep_gemm is None:
@@ -4117,7 +4119,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+        del params_dict, moe_loader
         self.post_load_weights()
+        self.warmup_mega_moe()
 
     def post_load_weights(self):
         mega_moe_experts: list[DeepseekV4MegaMoEExperts] = []
@@ -4129,18 +4133,25 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 mega_moe_experts.append(module)
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
-        # Pre-compile the DeepGEMM mega-MoE tiles now so DeepGEMM never JITs on
-        # the serving hot path: a cold mid-serving compile stalls one EP rank
-        # past the NVLink barrier's 30 s timeout and aborts the job. Tiles are
-        # cached by GEMM shape + token count (not by layer), so warming one
-        # experts module covers every layer. Opt out with
-        # TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1.
-        if (
-            mega_moe_experts
-            and os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") != "1"
-        ):
-            logger.info("Pre-compiling DeepGEMM mega-MoE kernel variants...")
-            mega_moe_experts[0].warmup_jit_variants()
+
+    def warmup_mega_moe(self) -> None:
+        """Pre-compile DeepGEMM mega-MoE tiles.
+
+        Called after post_load_weights (not inside it) so that
+        finalize_weights temporaries have been freed by GC and there is
+        enough GPU memory for the symmetric buffer allocation.
+        """
+        if os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") == "1":
+            return
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        for module in self.modules():
+            if isinstance(module, DeepseekV4MegaMoEExperts):
+                logger.info("Pre-compiling DeepGEMM mega-MoE kernel variants...")
+                module.warmup_jit_variants()
+                return
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
