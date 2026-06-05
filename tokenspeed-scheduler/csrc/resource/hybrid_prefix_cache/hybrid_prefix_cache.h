@@ -140,6 +140,16 @@ public:
     // Callback from KV prefix-cache eviction.
     void OnKVEvict(TreeNode* node);
 
+    // Callback from RadixTree just before a node is destroyed by prune. Drops
+    // the dying node from every adjunct bookkeeping set that holds raw
+    // TreeNode* (mamba_leaves_, paged_cache_snapshot_nodes_) so no dangling
+    // pointer survives the free. Unlike OnKVEvict this must NOT detach the
+    // node's slots — the node (and its owned unique_ptr<MambaSlot> /
+    // PagedCacheSnapshot) is being destroyed, so the destructors free them; we
+    // only un-register the membership. Safe to call on a node that was never
+    // tracked (erase is a no-op).
+    void OnNodeDestroyed(TreeNode* node);
+
     std::int32_t AvailableSlots() const;
     KVPrefixCache& GetKVPrefixCache() { return kv_prefix_cache_; }
 

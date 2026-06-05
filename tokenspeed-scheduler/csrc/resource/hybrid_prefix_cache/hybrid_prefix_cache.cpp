@@ -419,6 +419,36 @@ void HybridPrefixCache::OnKVEvict(TreeNode* node) {
     }
 }
 
+void HybridPrefixCache::OnNodeDestroyed(TreeNode* node) {
+    if (node == nullptr) return;
+    // The node is about to be freed by RadixTree::PruneEmptyByNode. Drop it from
+    // every adjunct set that stores a raw TreeNode* so none is left dangling.
+    // Mirror the per-resource eviction callbacks (OnKVEvict / OnKVHostEvict):
+    // detach the node's slots first, then refresh the parent's mamba-leaf
+    // membership. Detaching here (rather than relying on ~TreeNode) is required
+    // so UpdateLeaf(parent) re-derives the parent's status with this node
+    // already mamba-less -- otherwise the still-attached child would mask the
+    // parent and it would never be promoted to a mamba leaf.
+    if (mamba_allocator_ != nullptr && node->HasMamba()) {
+        mamba_eviction_manager_.UntrackNode(node);
+        node->DetachMamba();
+        if (node->Parent() != nullptr) {
+            mamba_eviction_manager_.UpdateLeaf(node->Parent());
+        }
+    }
+    if (node->HasPagedCacheSnapshot()) {
+        DetachPagedCacheSnapshotFromNode(node);
+    }
+    // Host-side Mamba L2 bookkeeping (no-op when the L2 pool is disabled, since
+    // these sets are only populated when mamba_host_allocator_ is present).
+    pending_mamba_host_writebacks_.erase(node);
+    if (node->HasMambaOnHost()) {
+        node->DetachMambaHost();
+        mamba_host_nodes_.erase(node);
+        mamba_host_writeback_done_nodes_.erase(node);
+    }
+}
+
 void HybridPrefixCache::OnKVHostEvict(TreeNode* node) {
     if (node == nullptr || mamba_host_allocator_ == nullptr) return;
     pending_mamba_host_writebacks_.erase(node);
