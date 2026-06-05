@@ -18,9 +18,9 @@ itself.
 2. Your `pyproject.toml` advertises that function under the
    `tokenspeed_kernel.plugins` entry-point group.
 3. The host application (engine, benchmark, notebook, etc.) calls
-   `tokenspeed_kernel.plugins.discover_plugins()` once at startup, after
-   built-in kernels have been imported. Discovery walks the entry-point
-   group and invokes each `register()`.
+   `tokenspeed_kernel.plugins.discover_plugins()` once at startup. Discovery
+   loads built-in kernels first, then walks the entry-point group and invokes
+   each `register()`.
 
 Loading is **fully explicit** — importing `tokenspeed_kernel` or
 `tokenspeed_kernel.plugins` does **not** trigger discovery on its own.
@@ -98,11 +98,12 @@ print(list_plugins())  # -> [PluginInfo(name='my_plugin', ...)]
 ## Host-application integration
 
 Engines and other long-running hosts should call `discover_plugins()`
-exactly once at startup, after built-in kernel modules have been imported
-(so plugins can override built-ins by registering at a higher priority).
+exactly once at startup. It loads built-in kernel modules before plugin
+entry points so plugins can override built-ins by registering at a higher
+priority.
 
 ```python
-import tokenspeed_kernel  # noqa: F401  -- registers built-ins
+import tokenspeed_kernel  # noqa: F401  -- optional; top-level import is lazy
 from tokenspeed_kernel.plugins import discover_plugins
 
 discover_plugins()
@@ -178,11 +179,10 @@ for info in list_plugins():
 
 - **No discovery call → no plugin kernels.** Forgetting to call
   `discover_plugins()` is silent.
-- **Plugin loaded before built-ins.** If you call `discover_plugins()`
-  before `import tokenspeed_kernel`, plugins that intend to override
-  built-ins will appear to win, but the built-in modules will be imported
-  later and may overwrite the plugin's slot. Always import
-  `tokenspeed_kernel` first.
+- **Manual registration before built-ins.** If you bypass
+  `discover_plugins()` and invoke a plugin `register()` directly before
+  built-ins are loaded, later built-in imports may overwrite that slot. Use
+  `discover_plugins()` for entry-point plugins so built-ins load first.
 - **Stale registry.** Calling `KernelRegistry.reset()` clears registered
   kernels but leaves `_loaded_plugins` populated; re-discovery will skip
   already-loaded plugins. Use `discover_plugins(force=True)` after a

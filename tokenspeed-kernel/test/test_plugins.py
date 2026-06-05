@@ -46,8 +46,9 @@ from tokenspeed_kernel.signature import format_signatures
 
 
 @pytest.fixture
-def fresh_plugins():
+def fresh_plugins(monkeypatch):
     """Reset registry and plugin state before/after each test."""
+    monkeypatch.setattr(plugins_mod, "load_builtin_kernels", lambda: None)
     KernelRegistry.reset()
     reset_plugins()
     yield
@@ -197,6 +198,34 @@ class TestDiscovery:
         assert info.num_kernels == 1
         assert info.kernel_names == ("alpha_kernel",)
         assert KernelRegistry.get().get_by_name("alpha_kernel") is not None
+
+    def test_discover_loads_builtins_before_plugins(
+        self, fresh_plugins, patch_entry_points, monkeypatch
+    ):
+        order: list[str] = []
+
+        def load_builtins():
+            order.append("builtins")
+
+        def register():
+            order.append("plugin")
+
+            @register_kernel(
+                "gemm",
+                "mm",
+                name="ordered_kernel",
+                solution="ordered",
+                signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+            )
+            def impl():
+                return None
+
+        monkeypatch.setattr(plugins_mod, "load_builtin_kernels", load_builtins)
+        patch_entry_points([_FakeEntryPoint("ordered", register)])
+
+        discover_plugins()
+
+        assert order == ["builtins", "plugin"]
 
     def test_discover_alphabetical_order(self, fresh_plugins, patch_entry_points):
         order: list[str] = []

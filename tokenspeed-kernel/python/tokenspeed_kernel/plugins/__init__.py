@@ -23,7 +23,7 @@
 Third-party packages register kernel implementations via Python entry points
 in the ``tokenspeed_kernel.plugins`` group. Loading is explicit: the host
 application must call :func:`discover_plugins` (typically once at startup,
-after built-in kernels have been imported) for installed plugins to take
+which loads built-in kernels before plugins) for installed plugins to take
 effect. See ``README.md`` for details.
 """
 
@@ -35,7 +35,7 @@ import os
 import warnings
 from dataclasses import dataclass, field
 
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +153,9 @@ def _check_priority_collisions(
 def discover_plugins(*, force: bool = False) -> list[PluginInfo]:
     """Discover and load installed kernel plugins via entry points.
 
+    Built-in kernels are loaded before plugin entry points so plugins can
+    intentionally override built-ins by registering at a higher priority.
+
     Plugins disabled via :func:`disable_plugin` or the
     ``TOKENSPEED_KERNEL_DISABLE_PLUGINS`` env var are skipped.
 
@@ -160,6 +163,8 @@ def discover_plugins(*, force: bool = False) -> list[PluginInfo]:
     their ``register()`` is invoked again (useful for tests that reset the
     registry).
     """
+    load_builtin_kernels()
+
     disabled = _disabled_plugins | _disabled_from_env()
     registry = KernelRegistry.get()
     loaded: list[PluginInfo] = []
