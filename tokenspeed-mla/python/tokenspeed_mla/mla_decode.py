@@ -129,7 +129,9 @@ def _get_compiled_mla_kernel(
     causal_mask: bool = True,
     num_heads: int = 128,
     seq_len_q: int = 1,
+    cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
     use_pdl: bool = False,
+    return_lse: bool = False,  # DCP: enable LSE output
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -174,6 +176,7 @@ def _get_compiled_mla_kernel(
         kernel_kwargs["is_causal"] = causal_mask
         kernel_kwargs["num_heads"] = num_heads
         kernel_kwargs["seq_len_q"] = seq_len_q
+        kernel_kwargs["cp_world"] = cp_world
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -256,6 +259,12 @@ def _get_compiled_mla_kernel(
         (sym_batch,),
         assumed_align=4,
     )
+    # DCP: per-request causal bound tensor [batch] int32
+    causal_seqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_batch,),
+        assumed_align=4,
+    )
     # block_split_kvs: [batch_size] — int32 (only needed for is_var_split_kv=True)
     if is_var_split_kv:
         block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
@@ -268,7 +277,19 @@ def _get_compiled_mla_kernel(
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    compiled_kernel = cute.compile(
+    # DCP: build an lse_fake when return_lse=True so the compiled kernel
+    # is shaped to emit LSE. Shape per mla_decode_fp8.py:359 = [B, q_len, H] fp32.
+    if return_lse:
+        lse_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (sym_batch, sym_seq_q, sym_heads),
+            stride_order=(2, 1, 0),
+            assumed_align=4,
+        )
+    else:
+        lse_fake = None
+
+    compile_args = [
         kernel_obj,
         q_latent_fake,
         q_rope_fake,
@@ -276,16 +297,23 @@ def _get_compiled_mla_kernel(
         c_rope_fake,
         page_table_fake,
         o_fake,
-        None,  # lse (disabled)
+        lse_fake,
         workspace_fake,
         Int32(1),  # split_kv placeholder
         cache_seqs_fake,
+    ]
+    # DCP causal bound is an fp8-decode-kernel-only argument (see the call site).
+    if is_fp8:
+        compile_args.append(causal_seqs_fake)
+    compile_args += [
         block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
         stream_fake,
         use_pdl,
-        options="--enable-tvm-ffi --opt-level 2",
+    ]
+    compiled_kernel = cute.compile(
+        *compile_args, options="--enable-tvm-ffi --opt-level 2"
     )
 
     return compiled_kernel
@@ -306,6 +334,11 @@ def tokenspeed_mla_decode(
     is_var_seq: bool = True,
     causal_mask: bool = True,
     enable_pdl: bool = False,
+    return_lse: bool = False,  # also return log-sum-exp (DCP cross-rank merge)
+    causal_seqs: Optional[
+        torch.Tensor
+    ] = None,  # per-request global causal bound; None = local (non-DCP)
+    cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -351,11 +384,28 @@ def tokenspeed_mla_decode(
         underlying CuTe DSL decode kernel. Tokenspeed callers wire this from
         ``pdl_enabled()`` so ``--disable-pdl`` propagates through to the
         kernel binary; ``use_pdl`` is part of the kernel cache key.
+    return_lse : bool
+        Decode-context-parallel (DCP) support. When True, also return the
+        per-(B, q_len, head) log-sum-exp so callers can merge the partial
+        attention each rank computes over its KV slice into the full result.
+        Default False keeps the original single-tensor return and emits no
+        LSE code in the compiled kernel.
+    causal_seqs : Optional[torch.Tensor]
+        DCP support. Per-request *global* causal bound [B] (int32). Under DCP
+        each rank holds a strided 1/cp_world slice of the context, so the
+        causal cutoff must be expressed in global coordinates rather than the
+        rank-local KV length. ``None`` (default) uses the local ``seq_lens``,
+        i.e. ordinary single-rank causal masking.
+    cp_world : int
+        DCP world size. ``1`` (default) is the non-DCP path and compiles to the
+        original masking with no extra work. ``>1`` enables strided
+        global-coordinate causal masking (``causal_seqs`` is then required).
 
     Returns
     -------
-    torch.Tensor
-        Output tensor [B, q_len, H, kv_lora_rank].
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        Output tensor [B, q_len, H, kv_lora_rank]. When ``return_lse=True``,
+        returns ``(output, lse)`` with ``lse`` of shape [B, q_len, H] (fp32).
     """
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
@@ -432,6 +482,25 @@ def tokenspeed_mla_decode(
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+    # DCP (strided global-coordinate causal masking) is implemented on the fp8
+    # decode kernel only; the fp16 kernel masks against the local cache length.
+    is_fp8 = q_dtype == torch.float8_e4m3fn
+    if not is_fp8 and (cp_world > 1 or causal_seqs is not None):
+        raise ValueError(
+            "decode-context-parallel (cp_world > 1 / causal_seqs) is only supported "
+            f"on the fp8 decode path, got query dtype {q_dtype}"
+        )
+    # DCP: per-request causal bound. Default = cache_seqs (local_K) => identical to
+    # original masking. DCP tail-rank control: caller passes local_K on tail rank, local_K+q_len
+    # elsewhere (k_bound then exceeds local_K so nothing is masked on non-tail ranks).
+    if causal_seqs is None:
+        causal_seqs_dev = cache_seqs
+    else:
+        causal_seqs_dev = (
+            causal_seqs
+            if causal_seqs.dtype == torch.int32
+            else causal_seqs.to(torch.int32)
+        )
 
     is_var_split_kv = False
     block_split_kvs = None
@@ -470,8 +539,17 @@ def tokenspeed_mla_decode(
         causal_mask=causal_mask,
         num_heads=H,
         seq_len_q=q_len,
+        cp_world=cp_world,
         use_pdl=enable_pdl,
+        return_lse=return_lse,
     )
+
+    # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros
+    # (not empty) so any kernel-unwritten positions are a known value, not garbage.
+    if return_lse:
+        lse_real = torch.zeros((B, q_len, H), dtype=torch.float32, device=query.device)
+    else:
+        lse_real = None
 
     # TVM FFI env stream must be set to PyTorch's current stream so the kernel
     # runs on the same stream as upstream PyTorch ops. CuTe tensors flow through
@@ -479,26 +557,33 @@ def tokenspeed_mla_decode(
     # use_torch_stream() binds it explicitly. Symmetric with mla_prefill.py.
     import tvm_ffi
 
+    call_args = [
+        q_latent_k,
+        q_rope_k,
+        c_latent_k,
+        c_rope_k,
+        page_table_k,
+        o_k,
+        lse_real,
+        workspace_bytes,
+        Int32(split_kv),
+        cache_seqs,
+    ]
+    # DCP: the per-request global causal bound is an fp8-decode-kernel-only
+    # argument; the fp16 kernel masks against the local cache length.
+    if is_fp8:
+        call_args.append(causal_seqs_dev)
+    call_args += [
+        block_split_kvs,
+        Float32(softmax_scale),
+        Float32(output_scale),
+    ]
+
     with tvm_ffi.use_torch_stream():
-        compiled_kernel(
-            q_latent_k,
-            q_rope_k,
-            c_latent_k,
-            c_rope_k,
-            page_table_k,
-            o_k,
-            None,  # lse (disabled)
-            workspace_bytes,
-            Int32(split_kv),
-            cache_seqs,
-            block_split_kvs,
-            Float32(softmax_scale),
-            Float32(output_scale),
-        )
+        compiled_kernel(*call_args)
 
-    # If out was provided, kernel already wrote into it — return directly.
-    if out is not None:
-        return out
-
-    # o_k is [B, q_len, H, D] — return as-is to match trtllm-gen output shape.
-    return o_k
+    # DCP: return (o, lse) tuple when LSE was requested.
+    o_result = out if out is not None else o_k
+    if return_lse:
+        return o_result, lse_real
+    return o_result

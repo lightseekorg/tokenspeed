@@ -173,6 +173,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         is_causal: bool = False,
         num_heads: int = 128,
         seq_len_q: int = 1,
+        cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -218,6 +219,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # row r → (q_tok_in_group = r // num_heads, head = r % num_heads).
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
+        self.cp_world = cp_world
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -328,6 +330,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
+        causal_seqs: Optional[cute.Tensor],  # per-request global causal bound (DCP)
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -824,6 +827,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             acc_lse,
             split_kv,
             cache_seqs,
+            causal_seqs,
             block_split_kvs,
             softmax_scale_log2,
             output_scale,
@@ -929,6 +933,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mAccLSE: Optional[cute.Tensor],
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        causal_seqs: cute.Tensor,  # per-request global causal bound (DCP)
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -1400,6 +1405,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        K_causal=causal_seqs[blk_coord[2]],
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
@@ -1464,6 +1470,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        K_causal=causal_seqs[blk_coord[2]],
                         L=mCL.shape[1],
                         H=mQL.shape[0],
                         tmem_ptr=tmem_ptr,
@@ -2767,7 +2774,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             )
                         else:
                             q_tok = common_params.blk_coord[1]
-                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                        if cutlass.const_expr(self.cp_world == 1):
+                            # Non-DCP: causal bound is the full local context length
+                            # (identical to the pre-DCP behavior; folded at compile time).
+                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                        else:
+                            # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
+                            # the context (key c -> global position c*cp_world + dcp_rank). The
+                            # causal bound is therefore taken over the GLOBAL length passed in
+                            # K_causal (= global_seq - dcp_rank), divided by cp_world.
+                            k_bound = (
+                                common_params.K_causal
+                                - (self.seq_len_q - 1)
+                                + q_tok
+                                + self.cp_world
+                                - 1
+                            ) // self.cp_world
                     else:
                         k_bound = common_params.K
                     tTR_rAcc[i] = (
@@ -2823,7 +2845,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         # effective K(row) = K - (S_q - 1) + q_tok; equivalent to
                         # K - (S_q - 1 - q_tok), written to avoid Python int/CuTe
                         # Int32 __rsub__ quirks when self.seq_len_q==1.
-                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                        if cutlass.const_expr(self.cp_world == 1):
+                            # Non-DCP: causal bound is the full local context length
+                            # (identical to the pre-DCP behavior; folded at compile time).
+                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                        else:
+                            # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
+                            # the context (key c -> global position c*cp_world + dcp_rank). The
+                            # causal bound is therefore taken over the GLOBAL length passed in
+                            # K_causal (= global_seq - dcp_rank), divided by cp_world.
+                            k_bound = (
+                                common_params.K_causal
+                                - (self.seq_len_q - 1)
+                                + q_tok
+                                + self.cp_world
+                                - 1
+                            ) // self.cp_world
                     else:
                         k_bound = common_params.K
                     tTR_rAcc[i] = (
