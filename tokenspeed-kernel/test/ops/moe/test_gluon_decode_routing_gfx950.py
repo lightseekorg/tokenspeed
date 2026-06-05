@@ -10,9 +10,11 @@ from tokenspeed_kernel.ops.moe.gluon_decode_routing_gfx950 import (
     gluon_fused_route,
     gluon_route_supported,
 )
+from tokenspeed_kernel.platform import current_platform
 
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="GPU required for gluon fused routing"
+requires_gfx950 = pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform().is_cdna4),
+    reason="gluon decode routing kernel is gfx950 (CDNA4) only",
 )
 
 E = 128
@@ -49,7 +51,7 @@ def _assert_metadata_exact(rg, rg_ref):
     assert torch.equal(rg.block_schedule_data, rg_ref.block_schedule_data)
 
 
-@requires_cuda
+@requires_gfx950
 @pytest.mark.parametrize("M", SMALL_M)
 def test_small_m_routing_matches_generic(M):
     """Small-M Gluon route == generic pipeline, bit-for-bit.
@@ -71,7 +73,7 @@ def test_small_m_routing_matches_generic(M):
     assert torch.allclose(gs.float(), gs_ref.float(), atol=1e-3)
 
 
-@requires_cuda
+@requires_gfx950
 def test_large_m_uses_generic_pipeline():
     """M > SMALLM_MAX_M falls through to the generic pipeline unchanged."""
     M = SMALLM_MAX_M + 16
@@ -85,7 +87,7 @@ def test_large_m_uses_generic_pipeline():
     assert int(rg.slice_sizes.sum()) == M * TOPK
 
 
-@requires_cuda
+@requires_gfx950
 @pytest.mark.parametrize("M", SMALL_M)
 def test_gluon_fused_route_direct(M):
     """gluon_fused_route returns a well-formed routing result for small M."""
@@ -95,6 +97,7 @@ def test_gluon_fused_route_direct(M):
     assert ga.numel() == M * TOPK == sc.numel() == gs.numel()
 
 
+@requires_gfx950
 def test_gluon_route_supported_guards():
     """Unsupported configs report False so callers fall back safely."""
     logits = torch.randn(16, E, dtype=torch.bfloat16)

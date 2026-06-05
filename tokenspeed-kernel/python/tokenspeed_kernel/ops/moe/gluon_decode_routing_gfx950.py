@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, redirect_triton_to_tokenspeed_triton
+from tokenspeed_kernel.platform import current_platform
 
 with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.tensor import RaggedTensorMetadata
@@ -366,10 +367,14 @@ def gluon_route_supported(
 
     Guards the structural assumptions the Gluon kernels make so unsupported
     configs fall back to the generic ``triton_kernels_routing`` pipeline:
-    a 2D float ``logits`` tensor, a supported gate ``dtype``, a sane ``topk``
+    a 2D float ``logits`` tensor,     a supported gate ``dtype``, a sane ``topk``
     and an expert count whose ``next_pow2`` keeps the histogram bins / EP-wide
     tiles bounded.
     """
+    # The kernel's BlockedLayouts assume a 64-lane wavefront, so the path is
+    # gfx950 (CDNA4) only; every other arch falls back to the generic pipeline.
+    if not current_platform().is_cdna4:
+        return False
     if logits.ndim != 2:
         return False
     if dtype is None:
