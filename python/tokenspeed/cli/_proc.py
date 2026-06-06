@@ -75,8 +75,6 @@ async def spawn_gateway(
         "launch",
         "--worker-urls",
         f"grpc://{engine_host}:{engine_port}",
-        "--disable-retries",
-        "--disable-circuit-breaker",
         *args,
     ]
     logger.info("spawn gateway: %s", " ".join(cmd))
