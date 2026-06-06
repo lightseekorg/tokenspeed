@@ -150,8 +150,8 @@ def test_host_executor_keeps_page_indices_on_cpu_until_flush(monkeypatch):
         pools=[FakePool(CacheKind.KV, page_size=4, num_layers=2)], io_backend="kernel"
     )
 
-    executor.enqueue_writeback(1, src_pages=[2], dst_pages=[5], kind=CacheKind.KV)
-    executor.enqueue_loadback(2, src_pages=[7], dst_pages=[11], kind=CacheKind.KV)
+    executor.enqueue_writeback(1, src_pages=[2], dst_pages=[5], pool_key=CacheKind.KV)
+    executor.enqueue_loadback(2, src_pages=[7], dst_pages=[11], pool_key=CacheKind.KV)
 
     assert seen_devices == ["cpu", "cpu", "cpu", "cpu"]
     assert executor.write_queues[CacheKind.KV][0].src_indices.device.type == "cpu"
@@ -167,10 +167,10 @@ def test_host_executor_batches_writeback_by_cache_kind_and_acks_once(monkeypatch
     executor = HostExecutor(pools=[kv_pool, mamba_pool], io_backend="kernel")
 
     executor.enqueue_writeback(
-        7, src_pages=[2], dst_pages=[5], kind=CacheKind.KV, is_retract=True
+        7, src_pages=[2], dst_pages=[5], pool_key=CacheKind.KV, is_retract=True
     )
     executor.enqueue_writeback(
-        7, src_pages=[11], dst_pages=[13], kind=CacheKind.MAMBA, is_retract=True
+        7, src_pages=[11], dst_pages=[13], pool_key=CacheKind.MAMBA, is_retract=True
     )
 
     executor.flush()
@@ -193,7 +193,7 @@ def test_host_executor_rejects_loadback_during_cuda_graph_capture(monkeypatch):
         io_backend="kernel",
     )
 
-    executor.enqueue_loadback(1, src_pages=[2], dst_pages=[3], kind=CacheKind.MAMBA)
+    executor.enqueue_loadback(1, src_pages=[2], dst_pages=[3], pool_key=CacheKind.MAMBA)
 
     with pytest.raises(AssertionError, match="eager admission iter"):
         executor.flush()
@@ -205,8 +205,10 @@ def test_host_executor_loadback_uses_independent_layer_counters(monkeypatch):
     mamba_pool = FakePool(CacheKind.MAMBA, page_size=1, num_layers=3)
     executor = HostExecutor(pools=[kv_pool, mamba_pool], io_backend="kernel")
 
-    executor.enqueue_loadback(10, src_pages=[4], dst_pages=[8], kind=CacheKind.KV)
-    executor.enqueue_loadback(20, src_pages=[6], dst_pages=[9], kind=CacheKind.MAMBA)
+    executor.enqueue_loadback(10, src_pages=[4], dst_pages=[8], pool_key=CacheKind.KV)
+    executor.enqueue_loadback(
+        20, src_pages=[6], dst_pages=[9], pool_key=CacheKind.MAMBA
+    )
 
     executor.flush()
 
@@ -251,15 +253,21 @@ def test_memory_executor_submit_dispatches_flat_op_by_cache_kind(monkeypatch):
             self.completed_writebacks = []
             self.order = []
 
-        def enqueue_writeback(
-            self, op_id, src_pages, dst_pages, is_retract=False, kind=CacheKind.KV
-        ):
-            self.order.append(("writeback", kind, op_id))
-            self.writebacks.append((kind, op_id, src_pages, dst_pages, is_retract))
+        def loadback_keys(self, kind):
+            return [kind] if kind in self.pools else []
 
-        def enqueue_loadback(self, op_id, src_pages, dst_pages, kind=CacheKind.KV):
-            self.order.append(("loadback", kind, op_id))
-            self.loadbacks.append((kind, op_id, src_pages, dst_pages))
+        def writeback_keys(self, kind):
+            return [kind] if kind in self.pools else []
+
+        def enqueue_writeback(
+            self, op_id, src_pages, dst_pages, is_retract=False, pool_key=CacheKind.KV
+        ):
+            self.order.append(("writeback", pool_key, op_id))
+            self.writebacks.append((pool_key, op_id, src_pages, dst_pages, is_retract))
+
+        def enqueue_loadback(self, op_id, src_pages, dst_pages, pool_key=CacheKind.KV):
+            self.order.append(("loadback", pool_key, op_id))
+            self.loadbacks.append((pool_key, op_id, src_pages, dst_pages))
 
         def flush(self):
             self.order.append(("flush",))
@@ -354,16 +362,22 @@ def test_memory_executor_mamba_layerwise_cow_uses_dedicated_context(monkeypatch)
             self.completed_writebacks = []
             self.loadbacks = []
 
+        def loadback_keys(self, kind):
+            return [kind] if kind in self.pools else []
+
+        def writeback_keys(self, kind):
+            return [kind] if kind in self.pools else []
+
         def enqueue_loadback(
             self,
             op_id,
             src_pages,
             dst_pages,
-            kind=CacheKind.KV,
+            pool_key=CacheKind.KV,
             layerwise_cow_dst_pages_by_src=None,
         ):
             self.loadbacks.append(
-                (kind, op_id, src_pages, dst_pages, layerwise_cow_dst_pages_by_src)
+                (pool_key, op_id, src_pages, dst_pages, layerwise_cow_dst_pages_by_src)
             )
 
         def flush(self):
@@ -390,3 +404,168 @@ def test_memory_executor_mamba_layerwise_cow_uses_dedicated_context(monkeypatch)
         (CacheKind.MAMBA, 9, [30], [40], {40: [400]}),
     ]
     assert executor._pending_mamba_layerwise_cow is None
+
+
+# ---------------------------------------------------------------------------
+# Draft (speculative) model loadback split: the draft KV must load back through
+# its own pool/counter so the target's per-layer loadback wait is never gated on
+# the draft load. See KVCachePool.make_draft_loadback_pool (kind=KV, is_draft=True).
+# ---------------------------------------------------------------------------
+
+
+class FakeKVDevicePool:
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.registered_counter = None
+
+    def register_layer_transfer_counter(self, counter):
+        self.registered_counter = counter
+
+
+class FakeKVHostPool:
+    def __init__(self, page_size: int = 4, layout: str = "layer_first"):
+        self.page_size = page_size
+        self.layout = layout
+        self.loads: list[tuple[int, int]] = []
+        self.backups = 0
+
+    def load_to_device_per_layer(self, device_pool, src, dst, layer_idx, io_backend):
+        self.loads.append((id(device_pool), layer_idx))
+
+    def backup_from_device_all_layer(self, *args, **kwargs):
+        self.backups += 1
+
+
+def _patch_layer_done_counter(monkeypatch):
+    import tokenspeed.runtime.cache.transfer.kv_pool as kv_pool_mod
+
+    class FakeLayerDoneCounter:
+        def __init__(self, num_layers: int):
+            self.num_layers = num_layers
+
+    monkeypatch.setattr(kv_pool_mod, "LayerDoneCounter", FakeLayerDoneCounter)
+
+
+def _make_base_kv_pool(monkeypatch, *, draft_layers: int = 1):
+    _patch_layer_done_counter(monkeypatch)
+    from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
+
+    base_dev = FakeKVDevicePool()
+    base_host = FakeKVHostPool()
+    draft_dev = FakeKVDevicePool() if draft_layers else None
+    draft_host = FakeKVHostPool() if draft_layers else None
+    pool = KVCachePool(
+        device_pool=base_dev,
+        host_pool=base_host,
+        io_backend="kernel",
+        layer_num=4,
+        draft_device_pool=draft_dev,
+        draft_host_pool=draft_host,
+        draft_layer_num=draft_layers,
+    )
+    return pool, base_dev, base_host, draft_dev, draft_host
+
+
+def test_kv_pool_make_draft_loadback_pool_uses_independent_counter(monkeypatch):
+    pool, base_dev, _, draft_dev, _ = _make_base_kv_pool(monkeypatch)
+
+    assert pool.kind == CacheKind.KV
+    assert base_dev.registered_counter is pool._counter
+
+    draft_pool = pool.make_draft_loadback_pool()
+    assert draft_pool is not None
+    # Same cache *kind* (KV), distinguished by the orthogonal is_draft role.
+    assert draft_pool.kind == CacheKind.KV
+    assert draft_pool.is_draft is True
+    assert pool.is_draft is False
+    assert draft_pool.layer_num == 1
+    # The draft pool owns a distinct counter, registered on the draft device
+    # pool -- so draft attention waits on draft loads, independent of the base.
+    assert draft_dev.registered_counter is draft_pool._counter
+    assert draft_pool._counter is not pool._counter
+
+
+def test_kv_pool_make_draft_loadback_pool_none_without_draft(monkeypatch):
+    pool, _, _, _, _ = _make_base_kv_pool(monkeypatch, draft_layers=0)
+    assert pool.make_draft_loadback_pool() is None
+
+
+def test_kv_pool_loadback_is_base_only(monkeypatch):
+    pool, base_dev, base_host, draft_dev, draft_host = _make_base_kv_pool(monkeypatch)
+
+    assert pool.num_layers() == 4
+    src = torch.tensor([0], dtype=torch.int64)
+    dst = torch.tensor([0], dtype=torch.int64)
+    for layer in range(pool.num_layers()):
+        pool.loadback(src, dst, layer)
+    # base pool loadback touches only the base device pool, never the draft.
+    assert [d for d, _ in base_host.loads] == [id(base_dev)] * 4
+    assert draft_host.loads == []
+
+    draft_pool = pool.make_draft_loadback_pool()
+    draft_pool.loadback(src, dst, 0)
+    assert draft_host.loads == [(id(draft_dev), 0)]
+
+
+def test_host_executor_auto_derives_draft_loadback_pool(monkeypatch):
+    HostExecutor = _patch_host_executor_device(monkeypatch)
+    pool, _, _, _, _ = _make_base_kv_pool(monkeypatch)
+
+    executor = HostExecutor(pools=[pool], io_backend="kernel")
+
+    # Base KV before draft KV so base layers load first on the shared stream.
+    assert list(executor.pools.keys()) == ["kv", "kv.draft"]
+    assert executor._counters["kv"] is not executor._counters["kv.draft"]
+    assert "kv.draft" in executor.load_queues
+    # Routing helpers: loadback fans out to both; writeback only to the target.
+    assert executor.loadback_keys(CacheKind.KV) == ["kv", "kv.draft"]
+    assert executor.writeback_keys(CacheKind.KV) == ["kv"]
+
+
+def test_memory_executor_routes_draft_loadback_to_both_kv_pools(monkeypatch):
+    import tokenspeed.runtime.cache.executor.memory_executor as memory_executor
+
+    class FakeCache:
+        class WriteBackOp:
+            pass
+
+        class LoadBackOp:
+            pass
+
+        class PrefetchOp:
+            pass
+
+        class BackUpOp:
+            pass
+
+    class FakeHostExec:
+        def __init__(self):
+            # Two pools of the same KV kind: target + draft.
+            self.pools = {"kv": object(), "kv.draft": object()}
+            self.loadbacks = []
+
+        def loadback_keys(self, kind):
+            return ["kv", "kv.draft"] if CacheKind(kind) == CacheKind.KV else []
+
+        def enqueue_loadback(self, op_id, src_pages, dst_pages, pool_key="kv"):
+            self.loadbacks.append((pool_key, op_id, src_pages, dst_pages))
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(memory_executor, "Cache", FakeCache)
+    executor = object.__new__(memory_executor.MemoryExecutor)
+    executor.host_exec = FakeHostExec()
+    executor.storage_exec = None
+
+    lb = FakeCache.LoadBackOp()
+    lb.op_ids = [9]
+    lb.src_pages = [[10]]
+    lb.dst_pages = [[20]]
+    executor.submit(lb)
+
+    # Draft loadback rides the same pages as the base KV but through its own pool.
+    assert executor.host_exec.loadbacks == [
+        ("kv", 9, [10], [20]),
+        ("kv.draft", 9, [10], [20]),
+    ]

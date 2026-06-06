@@ -18,27 +18,50 @@ class KVCachePool:
         draft_device_pool=None,
         draft_host_pool=None,
         draft_layer_num: int = 0,
+        is_draft: bool = False,
     ):
+        # ``kind`` is the cache *type* (KV); ``is_draft`` is the orthogonal
+        # target-vs-draft role. The executor keys pools by (kind, is_draft) so a
+        # draft KV pool and a (future) draft Mamba pool need no special kinds.
+        self.kind = CacheKind.KV
+        self.is_draft = is_draft
         self.device_pool = device_pool
         self.host_pool = host_pool
         self.io_backend = io_backend
         self.layer_num = layer_num
+        # Draft sub-pools are retained only for whole-pool writeback; draft
+        # *loadback* runs through the separate draft pool from
+        # ``make_draft_loadback_pool`` so the target's per-layer loadback wait is
+        # never gated on draft layer loads.
         self.draft_device_pool = draft_device_pool
         self.draft_host_pool = draft_host_pool
         self.draft_layer_num = draft_layer_num
-        self._counter = LayerDoneCounter(max(layer_num, draft_layer_num, 1))
+        self._counter = LayerDoneCounter(max(layer_num, 1))
         device_pool.register_layer_transfer_counter(self._counter)
-        # The drafter pool needs the same per-layer counter so its
-        # ``get_key_buffer`` waits until its layer's loadback has landed;
-        # otherwise drafter attention races ``load_stream`` and reads
-        # uninitialized KV. ``loadback`` advances the counter per layer after
-        # both base and draft layers are issued, so sharing the counter is safe.
+
+    def make_draft_loadback_pool(self) -> "KVCachePool | None":
+        """A separate draft KV pool (same kind, ``is_draft=True``) that loads
+        back the draft model's KV.
+
+        Giving the draft its own pool/counter (registered on the draft device
+        pool) lets the target and draft models each wait per-layer on only
+        their own loadback, instead of sharing a single counter that would
+        couple the target's layer-0 wait to the draft load.
+        """
         if (
-            draft_device_pool is not None
-            and draft_layer_num > 0
-            and hasattr(draft_device_pool, "register_layer_transfer_counter")
+            self.draft_device_pool is None
+            or self.draft_host_pool is None
+            or self.draft_layer_num <= 0
+            or not hasattr(self.draft_device_pool, "register_layer_transfer_counter")
         ):
-            draft_device_pool.register_layer_transfer_counter(self._counter)
+            return None
+        return KVCachePool(
+            device_pool=self.draft_device_pool,
+            host_pool=self.draft_host_pool,
+            io_backend=self.io_backend,
+            layer_num=self.draft_layer_num,
+            is_draft=True,
+        )
 
     @property
     def device(self):
@@ -52,7 +75,7 @@ class KVCachePool:
         return self.host_pool.page_size
 
     def num_layers(self) -> int:
-        return max(self.layer_num, self.draft_layer_num)
+        return self.layer_num
 
     def supports_layerwise_loadback(self) -> bool:
         return True
@@ -91,14 +114,6 @@ class KVCachePool:
         if layer_idx < self.layer_num:
             self.host_pool.load_to_device_per_layer(
                 self.device_pool,
-                src_indices,
-                dst_indices,
-                layer_idx,
-                self.io_backend,
-            )
-        if self.draft_host_pool is not None and layer_idx < self.draft_layer_num:
-            self.draft_host_pool.load_to_device_per_layer(
-                self.draft_device_pool,
                 src_indices,
                 dst_indices,
                 layer_idx,

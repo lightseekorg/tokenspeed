@@ -105,6 +105,13 @@ class _Ack(NamedTuple):
     op_ids: list[int]
 
 
+def _pool_key(pool) -> str:
+    """Executor key for a pool: cache kind plus a ``.draft`` suffix for draft
+    pools. Decouples the (KV/Mamba) cache type from the target/draft role."""
+    base = CacheKind(pool.kind).value
+    return f"{base}.draft" if getattr(pool, "is_draft", False) else base
+
+
 class HostExecutor:
     def __init__(
         self,
@@ -141,7 +148,27 @@ class HostExecutor:
         if not pools:
             raise ValueError("HostExecutor requires at least one cache pool")
 
-        self.pools = {CacheKind(pool.kind): pool for pool in pools}
+        # Expand any pool that carries a draft model into a base pool followed
+        # by a dedicated draft loadback pool. Ordering matters: the draft pool
+        # is appended right after its base so that on the shared load stream all
+        # base layers load (signalling the base counter) before draft layers,
+        # keeping the target's per-layer loadback wait off the draft critical
+        # path.
+        expanded_pools: list[CachePool] = []
+        for pool in pools:
+            expanded_pools.append(pool)
+            make_draft = getattr(pool, "make_draft_loadback_pool", None)
+            if make_draft is not None:
+                draft_pool = make_draft()
+                if draft_pool is not None:
+                    expanded_pools.append(draft_pool)
+        pools = expanded_pools
+
+        # Pools are keyed by an id that combines the cache *kind* (type) with the
+        # target-vs-draft *role*, e.g. "kv", "kv.draft", "mamba", "mamba.draft".
+        # Page routing keys off the kind; counters / ordering / consumer wiring
+        # key off the full id, so a draft of any kind needs no special CacheKind.
+        self.pools = {_pool_key(pool): pool for pool in pools}
         self.device = next(iter(self.pools.values())).device
 
         write_priority, load_priority = _cache_stream_priorities()
@@ -149,11 +176,11 @@ class HostExecutor:
         self.load_stream = _new_cache_stream(load_priority)
         self._writeback_block_quota: int | None = None
 
-        self.write_queues: dict[CacheKind, list[TransferUnit]] = {
-            kind: [] for kind in self.pools
+        self.write_queues: dict[str, list[TransferUnit]] = {
+            key: [] for key in self.pools
         }
-        self.load_queues: dict[CacheKind, list[TransferUnit]] = {
-            kind: [] for kind in self.pools
+        self.load_queues: dict[str, list[TransferUnit]] = {
+            key: [] for key in self.pools
         }
 
         self.ack_write_queue: list[_Ack] = []
@@ -161,12 +188,28 @@ class HostExecutor:
         self.completed_writebacks: list[int] = []
 
         self._counters = {
-            kind: pool.get_layer_done_counter() for kind, pool in self.pools.items()
+            key: pool.get_layer_done_counter() for key, pool in self.pools.items()
         }
-        self._producer_map: dict[CacheKind, OrderedDict[int, int]] = {
-            kind: OrderedDict() for kind in self.pools
+        self._producer_map: dict[str, OrderedDict[int, int]] = {
+            key: OrderedDict() for key in self.pools
         }
         self._producer_map_limit = 1024
+
+    def loadback_keys(self, kind: CacheKind | str) -> list[str]:
+        """Pool ids that load back a given cache kind (target + draft), target
+        first so the target's KV is signalled before the draft's on the stream."""
+        kind = CacheKind(kind)
+        return [k for k, p in self.pools.items() if CacheKind(p.kind) == kind]
+
+    def writeback_keys(self, kind: CacheKind | str) -> list[str]:
+        """Pool ids that write back a given cache kind. Draft KV is written back
+        by its target pool (whole-pool writeback), so draft pools are excluded."""
+        kind = CacheKind(kind)
+        return [
+            k
+            for k, p in self.pools.items()
+            if CacheKind(p.kind) == kind and not getattr(p, "is_draft", False)
+        ]
 
     def enqueue_writeback(
         self,
@@ -174,19 +217,18 @@ class HostExecutor:
         src_pages,
         dst_pages,
         is_retract: bool = False,
-        kind: CacheKind | str = CacheKind.KV,
+        pool_key: str = "kv",
     ) -> None:
-        kind = CacheKind(kind)
-        pool = self.pools[kind]
+        pool = self.pools[pool_key]
         src_pages, dst_pages = _dedupe_page_pairs(src_pages, dst_pages)
         if not src_pages:
             self.completed_writebacks.append(op_id)
             return
         device_indices = page_ids_to_token_indices(src_pages, pool.page_size(), "cpu")
         host_indices = page_ids_to_token_indices(dst_pages, pool.page_size(), "cpu")
-        self.write_queues[kind].append(
+        self.write_queues[pool_key].append(
             TransferUnit(
-                kind=kind,
+                kind=CacheKind(pool.kind),
                 src_loc=Location.DEVICE,
                 dst_loc=Location.HOST,
                 src_indices=device_indices,
@@ -201,11 +243,10 @@ class HostExecutor:
         op_id,
         src_pages,
         dst_pages,
-        kind: CacheKind | str = CacheKind.KV,
+        pool_key: str = "kv",
         layerwise_cow_dst_pages_by_src: dict[int, list[int]] | None = None,
     ) -> None:
-        kind = CacheKind(kind)
-        pool = self.pools[kind]
+        pool = self.pools[pool_key]
         src_pages, dst_pages = _dedupe_page_pairs(src_pages, dst_pages)
         if not src_pages:
             return
@@ -227,9 +268,9 @@ class HostExecutor:
                 cow_dst_indices = page_ids_to_token_indices(
                     cow_dst_pages, pool.page_size(), "cpu"
                 )
-        self.load_queues[kind].append(
+        self.load_queues[pool_key].append(
             TransferUnit(
-                kind=kind,
+                kind=CacheKind(pool.kind),
                 src_loc=Location.HOST,
                 dst_loc=Location.DEVICE,
                 src_indices=host_indices,
@@ -266,10 +307,10 @@ class HostExecutor:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            for kind, units in self.write_queues.items():
+            for pool_key, units in self.write_queues.items():
                 if not units:
                     continue
-                pool = self.pools[kind]
+                pool = self.pools[pool_key]
                 unit = self._merge_units(units)
                 src_indices, dst_indices = self._prepare_indices(unit, pool)
                 self._pool_writeback(
@@ -291,11 +332,11 @@ class HostExecutor:
         ), "cache loadback must run in eager admission iter"
 
         with device_module.stream(self.load_stream):
-            for kind, units in self.load_queues.items():
+            for pool_key, units in self.load_queues.items():
                 if not units:
                     continue
-                pool = self.pools[kind]
-                counter = self._counters[kind]
+                pool = self.pools[pool_key]
+                counter = self._counters[pool_key]
                 producer_id = counter.update_producer()
                 producer_event = counter.events[producer_id]
                 producer_event.start_event.record()
@@ -332,7 +373,7 @@ class HostExecutor:
 
                 op_ids = _ordered_unique(unit.op_id for unit in units)
                 self.ack_load_queue.append(_Ack(producer_event.finish_event, op_ids))
-                producer_map = self._producer_map[kind]
+                producer_map = self._producer_map[pool_key]
                 for op_id in op_ids:
                     producer_map[op_id] = producer_id
                 while len(producer_map) > self._producer_map_limit:
@@ -472,27 +513,11 @@ class HostExecutor:
         self.ack_load_queue[:] = remaining
         return results
 
-    def get_producer_index(
-        self, kind_or_op_id: CacheKind | str | int, op_id: int | None = None
-    ) -> int | None:
-        if op_id is None:
-            kind = CacheKind.KV
-            op_id = int(kind_or_op_id)
-        else:
-            kind = CacheKind(kind_or_op_id)
-        return self._producer_map[kind].pop(int(op_id), None)
+    def get_producer_index(self, pool_key: str, op_id: int) -> int | None:
+        return self._producer_map[pool_key].pop(int(op_id), None)
 
-    def set_consumer(
-        self,
-        kind_or_producer_index: CacheKind | str | int | Iterable[int],
-        producer_index: int | Iterable[int] | None = None,
-    ) -> None:
-        if producer_index is None:
-            kind = CacheKind.KV
-            producer_index = kind_or_producer_index
-        else:
-            kind = CacheKind(kind_or_producer_index)
-        self._counters[kind].set_consumer(producer_index)
+    def set_consumer(self, pool_key: str, producer_index: int | Iterable[int]) -> None:
+        self._counters[pool_key].set_consumer(producer_index)
 
     def shutdown(self) -> None:
         self.write_stream.synchronize()

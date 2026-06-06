@@ -281,7 +281,8 @@ class MemoryExecutor:
                 op_id = op.op_ids[i]
                 is_retract = bool(getattr(op, "is_retract", [False])[i])
                 for kind, (src_groups, dst_groups) in groups.items():
-                    if kind not in self.host_exec.pools:
+                    keys = self.host_exec.writeback_keys(kind)
+                    if not keys:
                         continue
                     src_pages = src_groups[i] if i < len(src_groups) else []
                     dst_pages = dst_groups[i] if i < len(dst_groups) else []
@@ -298,17 +299,18 @@ class MemoryExecutor:
                             dst_pages[:8],
                             is_retract,
                         )
-                    self.host_exec.enqueue_writeback(
-                        op_id,
-                        src_pages,
-                        dst_pages,
-                        is_retract=is_retract,
-                        kind=kind,
-                    )
+                    for key in keys:
+                        self.host_exec.enqueue_writeback(
+                            op_id,
+                            src_pages,
+                            dst_pages,
+                            is_retract=is_retract,
+                            pool_key=key,
+                        )
                 if all(
                     i >= len(src_groups) or not src_groups[i]
                     for kind, (src_groups, _) in groups.items()
-                    if kind in self.host_exec.pools
+                    if self.host_exec.writeback_keys(kind)
                 ):
                     self.host_exec.completed_writebacks.append(op_id)
         elif isinstance(op, Cache.LoadBackOp):
@@ -322,7 +324,8 @@ class MemoryExecutor:
             for i in range(len(op.op_ids)):
                 op_id = op.op_ids[i]
                 for kind, (src_groups, dst_groups) in groups.items():
-                    if kind not in self.host_exec.pools:
+                    keys = self.host_exec.loadback_keys(kind)
+                    if not keys:
                         continue
                     src_pages = src_groups[i] if i < len(src_groups) else []
                     dst_pages = dst_groups[i] if i < len(dst_groups) else []
@@ -345,9 +348,14 @@ class MemoryExecutor:
                         loadback_kwargs["layerwise_cow_dst_pages_by_src"] = (
                             mamba_layerwise_cow
                         )
-                    self.host_exec.enqueue_loadback(
-                        op_id, src_pages, dst_pages, kind=kind, **loadback_kwargs
-                    )
+                    # One enqueue per pool of this kind: target first, then draft
+                    # (which shares the base page mapping). Each pool has its own
+                    # counter so target and draft waits are independent, and the
+                    # target's KV is signalled before the draft's on the stream.
+                    for key in keys:
+                        self.host_exec.enqueue_loadback(
+                            op_id, src_pages, dst_pages, pool_key=key, **loadback_kwargs
+                        )
 
         elif isinstance(op, Cache.PrefetchOp):
             logger.debug(
@@ -376,17 +384,14 @@ class MemoryExecutor:
                 )
         return results
 
-    def get_producer_index(
-        self, kind_or_op_id: CacheKind | str | int, op_id: int | None = None
-    ) -> Optional[int]:
-        return self.host_exec.get_producer_index(kind_or_op_id, op_id)
+    def loadback_keys(self, kind: CacheKind | str) -> list[str]:
+        return self.host_exec.loadback_keys(kind)
 
-    def set_consumer(
-        self,
-        kind_or_producer_index: CacheKind | str | int | Iterable[int],
-        producer_index: int | Iterable[int] | None = None,
-    ) -> None:
-        self.host_exec.set_consumer(kind_or_producer_index, producer_index)
+    def get_producer_index(self, pool_key: str, op_id: int) -> Optional[int]:
+        return self.host_exec.get_producer_index(pool_key, op_id)
+
+    def set_consumer(self, pool_key: str, producer_index: int | Iterable[int]) -> None:
+        self.host_exec.set_consumer(pool_key, producer_index)
 
     def query_l3_pages(self, hashes: list[str]) -> int:
         return self.storage_exec.query_exists(hashes)

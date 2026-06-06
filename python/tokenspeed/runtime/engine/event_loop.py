@@ -731,24 +731,26 @@ class EventLoop:
         available_pools = (
             getattr(host_exec, "pools", {}) if host_exec is not None else {}
         )
-        consumer_indices_by_kind: dict[CacheKind, list[int]] = {
-            kind: [] for kind in available_pools
+        # Keyed by pool id ("kv", "kv.draft", "mamba", ...) so target and draft
+        # pools get independent consumer indices on their own counters.
+        consumer_indices_by_pool: dict[str, list[int]] = {
+            pool_key: [] for pool_key in available_pools
         }
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
                 for op_id in cache_op.op_ids:
-                    for kind in consumer_indices_by_kind:
+                    for pool_key in consumer_indices_by_pool:
                         producer_idx = self.memory_executor.get_producer_index(
-                            kind, op_id
+                            pool_key, op_id
                         )
                         if (
                             producer_idx is not None
-                            and producer_idx not in consumer_indices_by_kind[kind]
+                            and producer_idx not in consumer_indices_by_pool[pool_key]
                         ):
-                            consumer_indices_by_kind[kind].append(producer_idx)
-        for kind, consumer_indices in consumer_indices_by_kind.items():
+                            consumer_indices_by_pool[pool_key].append(producer_idx)
+        for pool_key, consumer_indices in consumer_indices_by_pool.items():
             self.memory_executor.set_consumer(
-                kind, consumer_indices if consumer_indices else -1
+                pool_key, consumer_indices if consumer_indices else -1
             )
 
     def _flush_mamba_retract_states(self, forward_op) -> None:
