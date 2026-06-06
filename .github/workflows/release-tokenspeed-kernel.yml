@@ -81,8 +81,8 @@ jobs:
           echo "Release version: ${version}"
           echo "Release tag: ${tag_name}"
 
-  build-wheel:
-    name: Build ${{ matrix.cuda.variant }} ${{ matrix.arch.name }} wheel for Python ${{ matrix.python.version }}
+  build-wheel-nvidia:
+    name: Build NVIDIA ${{ matrix.cuda.variant }} ${{ matrix.arch.name }} wheel for Python ${{ matrix.python.version }}
     needs: metadata
     runs-on: ${{ matrix.arch.runner }}
     strategy:
@@ -163,7 +163,7 @@ jobs:
             -f Dockerfile.tokenspeed-kernel-release \
             -t tokenspeed-kernel-release:${{ matrix.cuda.variant }}-${{ matrix.arch.name }} .
 
-      - name: Build wheel
+      - name: Build NVIDIA wheel
         if: inputs.cuda_variant == 'all' || inputs.cuda_variant == matrix.cuda.variant
         run: |
           mkdir -p dist
@@ -211,8 +211,8 @@ jobs:
           name: tokenspeed-kernel-wheel-${{ matrix.cuda.variant }}-${{ matrix.arch.name }}-py${{ matrix.python.version }}
           path: dist/*.whl
 
-  build-pure-wheels:
-    name: Build pure Python split wheels
+  build-wheel-core-and-amd:
+    name: Build core and AMD wheels
     needs: metadata
     runs-on: ubuntu-24.04-32core-x64
     steps:
@@ -240,7 +240,7 @@ jobs:
           done
           python -m twine check ../../dist/*.whl
 
-      - name: Upload pure wheels
+      - name: Upload core and AMD wheels
         uses: actions/upload-artifact@v4
         with:
           name: tokenspeed-kernel-pure-wheels
@@ -279,7 +279,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: [metadata, build-wheel, build-pure-wheels, build-sdist]
+    needs: [metadata, build-wheel-nvidia, build-wheel-core-and-amd, build-sdist]
     runs-on: ubuntu-24.04-32core-x64
     steps:
       - name: Checkout repository
