@@ -23,15 +23,6 @@ from __future__ import annotations
 import logging
 from typing import Optional, Set
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.numerics.reference.moe  # noqa: F401
-import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
-import tokenspeed_kernel.ops.moe.deepep  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton_kernels  # noqa: F401
-import tokenspeed_kernel.ops.moe.trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (  # noqa: F401
     ExpertLocationDispatchInfo,

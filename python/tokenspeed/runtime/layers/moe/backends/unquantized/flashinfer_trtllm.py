@@ -88,7 +88,7 @@ class Bf16FlashinferTrtllmBackend(MoEBackend):
         )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        from tokenspeed_kernel.ops.moe.flashinfer import (
+        from tokenspeed_kernel_nvidia.moe.flashinfer import (
             _maybe_get_cached_w3_w1_permute_indices,
             convert_to_block_layout,
             get_w2_permute_indices_with_cache,
@@ -241,7 +241,7 @@ class Bf16FlashinferTrtllmBackend(MoEBackend):
         router_logits = topk_output.router_logits
 
         try:
-            from tokenspeed_kernel.ops.moe.flashinfer import (
+            from tokenspeed_kernel_nvidia.moe.flashinfer import (
                 autotune as flashinfer_autotune,
             )
         except ImportError:

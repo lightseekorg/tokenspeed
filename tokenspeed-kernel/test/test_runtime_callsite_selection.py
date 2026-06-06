@@ -33,19 +33,18 @@ import pytest
 import tokenspeed_kernel.numerics.reference.gemm
 import tokenspeed_kernel.numerics.reference.moe as _moe_reference
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
-import tokenspeed_kernel.ops.gemm.deep_gemm
-import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 
 # MoE
 import tokenspeed_kernel.ops.moe as _moe_pkg
-import tokenspeed_kernel.ops.moe.cuda
-import tokenspeed_kernel.ops.moe.deepep
-import tokenspeed_kernel.ops.moe.flashinfer
 import tokenspeed_kernel.ops.moe.triton
-import tokenspeed_kernel.ops.moe.triton_kernels
+import tokenspeed_kernel_nvidia.gemm.deep_gemm
+import tokenspeed_kernel_nvidia.gemm.flashinfer as _gemm_flashinfer
+import tokenspeed_kernel_nvidia.moe.cuda
+import tokenspeed_kernel_nvidia.moe.deepep
+import tokenspeed_kernel_nvidia.moe.flashinfer
 import torch
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import FormatSignature
 
@@ -53,21 +52,20 @@ from tokenspeed_kernel.signature import FormatSignature
 
 
 # ---------------------------------------------------------------------------
-# 1. Real kernel registration via importlib.reload
+# 1. Real kernel registration via load_builtin_kernels
 # ---------------------------------------------------------------------------
 
 _RELOAD_MODULES = [
     # MoE
     _moe_reference,
-    tokenspeed_kernel.ops.moe.cuda,
+    tokenspeed_kernel_nvidia.moe.cuda,
     tokenspeed_kernel.ops.moe.triton,
-    tokenspeed_kernel.ops.moe.triton_kernels,
-    tokenspeed_kernel.ops.moe.flashinfer,
-    tokenspeed_kernel.ops.moe.deepep,
+    tokenspeed_kernel_nvidia.moe.flashinfer,
+    tokenspeed_kernel_nvidia.moe.deepep,
     _moe_pkg,  # re-registers _MoEOracle
     # GEMM
     tokenspeed_kernel.numerics.reference.gemm,
-    tokenspeed_kernel.ops.gemm.deep_gemm,
+    tokenspeed_kernel_nvidia.gemm.deep_gemm,
     _gemm_flashinfer,
     _gemm_triton,
     _gemm_pkg,
@@ -77,8 +75,7 @@ _RELOAD_MODULES = [
 @pytest.fixture(autouse=True)
 def _kernel_registry(fresh_registry):
     """Reload real kernel registrations into a clean registry."""
-    for mod in _RELOAD_MODULES:
-        importlib.reload(mod)
+    load_builtin_kernels()
 
 
 # ---------------------------------------------------------------------------

@@ -24,13 +24,13 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.flashinfer import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_nvidia.attention.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,
 )
-from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
 torch.manual_seed(42)

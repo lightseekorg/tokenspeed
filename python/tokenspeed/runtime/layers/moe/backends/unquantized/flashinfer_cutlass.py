@@ -85,7 +85,7 @@ class Bf16FlashinferCutlassBackend(MoEBackend):
             del temp_w
 
     def _call_cutlass_kernel(self, x, layer, topk_output):
-        from tokenspeed_kernel.ops.moe.flashinfer import (
+        from tokenspeed_kernel_nvidia.moe.flashinfer import (
             ActivationType,
         )
 
@@ -133,7 +133,7 @@ class Bf16FlashinferCutlassBackend(MoEBackend):
         assert x.dtype == torch.bfloat16
 
         try:
-            from tokenspeed_kernel.ops.moe.flashinfer import (
+            from tokenspeed_kernel_nvidia.moe.flashinfer import (
                 autotune as flashinfer_autotune,
             )
         except ImportError:

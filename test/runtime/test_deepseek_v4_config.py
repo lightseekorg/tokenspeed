@@ -15,16 +15,16 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_nvidia.attention.cuda.deepseek_v4 import (
     has_fused_qnorm_rope_kv_insert,
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.ops.routing.cuda import (
+from tokenspeed_kernel_nvidia.routing.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_indexer_fp8_row_bytes,
@@ -1222,12 +1222,12 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         try:
-            from tokenspeed_kernel.ops.attention.flash_mla import (
+            from tokenspeed_kernel.registry import error_fn
+            from tokenspeed_kernel_nvidia.attention.flash_mla import (
                 flash_mla_sparse_fwd,
                 flash_mla_with_kvcache,
                 get_mla_metadata,
             )
-            from tokenspeed_kernel.registry import error_fn
         except Exception as exc:
             self.skipTest(f"FlashMLA wrapper unavailable: {exc}")
         if (
@@ -4268,11 +4268,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_mxfp4_flashinfer_uses_gated_permute_for_w13(self):
-        from tokenspeed_kernel.ops.moe.flashinfer import (
+        from tokenspeed_kernel.registry import error_fn
+        from tokenspeed_kernel_nvidia.moe.flashinfer import (
             _maybe_get_cached_w3_w1_permute_indices,
             get_w2_permute_indices_with_cache,
         )
-        from tokenspeed_kernel.registry import error_fn
 
         if (
             _maybe_get_cached_w3_w1_permute_indices is error_fn

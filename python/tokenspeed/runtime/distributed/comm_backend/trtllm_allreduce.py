@@ -29,12 +29,12 @@ reused for every subsequent ``all_reduce`` on that group.
 """
 
 import torch
-from tokenspeed_kernel.ops.communication.trtllm import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_nvidia.communication.trtllm import (
     AllReduceFusionPattern,
     trtllm_allreduce_fusion,
     trtllm_create_ipc_workspace_for_all_reduce_fusion,
 )
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 

@@ -22,7 +22,7 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel_nvidia.quantization.flashinfer import fp4_quantize
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase

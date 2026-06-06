@@ -102,7 +102,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
     try:
         # Importing inside the worker avoids pulling iris into the parent
         # process (which has no distributed context).
-        from tokenspeed_kernel.ops.communication.iris import create_iris_state
+        from tokenspeed_kernel_amd.communication.iris import create_iris_state
 
         max_numel = max(int(torch.tensor(s).prod()) for s in _ar_shape_cases())
         state = create_iris_state(
@@ -118,7 +118,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
 
 
 def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
-    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
+    from tokenspeed_kernel_amd.communication.iris import iris_all_reduce
 
     # Each rank contributes a tensor filled with ``rank + 1``; the reduction
     # is therefore ``sum(1..world_size) = world_size*(world_size+1)/2``.
@@ -185,7 +185,7 @@ def _rsag_worker_main(rank: int, world_size: int, port: int, hidden_size: int) -
     )
 
     try:
-        from tokenspeed_kernel.ops.communication.iris import create_iris_rsag_state
+        from tokenspeed_kernel_amd.communication.iris import create_iris_rsag_state
 
         cases = _rsag_uniform_token_cases(world_size)
         max_tokens = max(sum(tokens) for tokens in cases)
@@ -314,7 +314,7 @@ def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) 
     )
 
     try:
-        from tokenspeed_kernel.ops.communication.iris import (
+        from tokenspeed_kernel_amd.communication.iris import (
             create_iris_ar_rmsnorm_state,
         )
 
@@ -348,7 +348,7 @@ def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) 
 
 
 def _check_arrms_one(state, rank, world_size, tokens, weight, device) -> None:
-    from tokenspeed_kernel.ops.communication.iris import (
+    from tokenspeed_kernel_amd.communication.iris import (
         iris_allreduce_residual_rmsnorm,
     )
 

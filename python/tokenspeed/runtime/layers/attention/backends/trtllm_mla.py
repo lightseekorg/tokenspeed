@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import triton
-from tokenspeed_kernel.ops.attention.flashinfer import (
+from tokenspeed_kernel_nvidia.attention.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,
 )

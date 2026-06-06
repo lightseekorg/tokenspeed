@@ -11,6 +11,26 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own and can be directly used by
 others.
 
+## Wheel Split
+
+TokenSpeed-kernel builds three distributions from this source tree:
+
+* `tokenspeed-kernel` contains the public APIs, registry, selection logic,
+  numerics, benchmarking, plugin tooling, and built-in registration adapters.
+  Installing it installs exact-version `tokenspeed-kernel-nvidia` and
+  `tokenspeed-kernel-amd` wheels.
+* `tokenspeed-kernel-nvidia` contains NVIDIA implementation modules and NVIDIA
+  kernel third-party dependencies. It does not depend on or register
+  `tokenspeed-kernel` by itself.
+* `tokenspeed-kernel-amd` contains AMD implementation modules and AMD kernel
+  third-party dependencies. It also does not depend on or register
+  `tokenspeed-kernel` by itself.
+
+Set `TOKENSPEED_KERNEL_PACKAGE=core`, `nvidia`, or `amd` when building a wheel.
+Built-in kernels are loaded through `tokenspeed_kernel.registry.load_builtin_kernels()`,
+which imports the core registration adapters. External plugins remain separate and
+register through the plugin API.
+
 ## Design Goals
 
 TokenSpeed-kernel is designed with the following functionality goals in mind:

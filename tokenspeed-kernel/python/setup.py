@@ -45,9 +45,17 @@ from setuptools.command.editable_wheel import editable_wheel
 
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
-THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
+THIRDPARTY_DIR = ROOT / "tokenspeed_kernel_nvidia" / "thirdparty"
 BASE_VERSION = "0.1.0"
+PACKAGE_ENV = "TOKENSPEED_KERNEL_PACKAGE"
+VALID_PACKAGE_MODES = {"core", "nvidia", "amd"}
+DIST_NAMES = {
+    "core": "tokenspeed-kernel",
+    "nvidia": "tokenspeed-kernel-nvidia",
+    "amd": "tokenspeed-kernel-amd",
+}
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
+SKIP_NATIVE_ENV = "TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD"
 VALID_BACKENDS = {"cuda", "rocm"}
 
 # CUDA kernels source and output directories
@@ -129,6 +137,38 @@ def _package_version() -> str:
     return f"{BASE_VERSION}.dev{_version_date()}+git{_git_sha()}"
 
 
+def _package_mode() -> str:
+    mode = os.environ.get(PACKAGE_ENV, "core").strip().lower()
+    if mode not in VALID_PACKAGE_MODES:
+        valid = ", ".join(sorted(VALID_PACKAGE_MODES))
+        raise RuntimeError(f"{PACKAGE_ENV} must be one of: {valid}")
+    return mode
+
+
+def _distribution_name() -> str:
+    return DIST_NAMES[_package_mode()]
+
+
+def _vendor_distribution_requirements(version: str) -> list[str]:
+    return [
+        f"{DIST_NAMES['nvidia']}=={version}",
+        f"{DIST_NAMES['amd']}=={version}",
+    ]
+
+
+def _selected_packages() -> list[str]:
+    prefix = {
+        "core": "tokenspeed_kernel",
+        "nvidia": "tokenspeed_kernel_nvidia",
+        "amd": "tokenspeed_kernel_amd",
+    }[_package_mode()]
+    return [
+        package
+        for package in find_packages()
+        if package == prefix or package.startswith(prefix + ".")
+    ]
+
+
 def _is_cuda_platform() -> bool:
     def toolkit_available() -> bool:
         if shutil.which(NVCC) is not None:
@@ -195,7 +235,9 @@ def _selected_backend() -> str:
     )
 
 
-def _read_requirements(path: Path, seen=None) -> list[str]:
+def _read_requirements(
+    path: Path, seen=None, *, include_nested: bool = True
+) -> list[str]:
     seen = seen or set()
     path = path.resolve()
     if path in seen:
@@ -205,23 +247,18 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
     requirements = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or line.startswith("--"):
             continue
         if line.startswith("-r ") or line.startswith("--requirement "):
-            include = line.split(maxsplit=1)[1]
-            requirements.extend(_read_requirements(path.parent / include, seen))
+            if include_nested:
+                include = line.split(maxsplit=1)[1]
+                requirements.extend(_read_requirements(path.parent / include, seen))
             continue
         requirements.append(line)
     return requirements
 
 
-def _selected_install_requires() -> list[str]:
-    backend = _selected_backend()
-    requirements = []
-    requirements.extend(
-        _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
-    )
-
+def _dedupe_requirements(requirements: list[str]) -> list[str]:
     deduped = []
     seen = set()
     for requirement in requirements:
@@ -229,6 +266,30 @@ def _selected_install_requires() -> list[str]:
             deduped.append(requirement)
             seen.add(requirement)
     return deduped
+
+
+def _vendor_requirements(backend: str) -> list[str]:
+    requirements = []
+    requirements.extend(
+        _read_requirements(REQUIREMENTS_DIR / f"{backend}.txt", include_nested=False)
+    )
+    requirements.extend(
+        _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
+    )
+    return requirements
+
+
+def _selected_install_requires() -> list[str]:
+    mode = _package_mode()
+    version = _package_version()
+    if mode == "core":
+        requirements = _read_requirements(REQUIREMENTS_DIR / "common.txt")
+        requirements.extend(_vendor_distribution_requirements(version))
+    elif mode == "nvidia":
+        requirements = _vendor_requirements("cuda")
+    else:
+        requirements = _vendor_requirements("rocm")
+    return _dedupe_requirements(requirements)
 
 
 def _pip_verbose_args(verbose) -> list[str]:
@@ -735,9 +796,18 @@ class CudaKernelBuilder:
 
 
 class BuildKernels(build_ext):
-    """Compile CUDA kernels into .so files for the CUDA backend."""
+    """Compile CUDA kernels into .so files for the NVIDIA package."""
 
     def run(self):
+        if os.environ.get(SKIP_NATIVE_ENV):
+            print(f"{SKIP_NATIVE_ENV} is set; skipping native CUDA build")
+            return
+        if _package_mode() != "nvidia":
+            print(
+                f"NVIDIA package not selected; skipping CUDA kernel build. "
+                f"{self.distribution.get_name()}"
+            )
+            return
         if _selected_backend() != "cuda":
             print(
                 f"CUDA backend not selected; skipping CUDA kernel build. "
@@ -761,6 +831,12 @@ class BuildNative(Command):
         pass
 
     def run(self):
+        if os.environ.get(SKIP_NATIVE_ENV):
+            print(f"{SKIP_NATIVE_ENV} is set; skipping native CUDA build")
+            return
+        if _package_mode() != "nvidia":
+            print("NVIDIA package not selected; skipping native CUDA build")
+            return
         backend = _selected_backend()
         _install_backend_build_requirements(getattr(self, "verbose", False))
         if backend != "cuda":
@@ -795,13 +871,14 @@ class BuildPyWithBuild(build_py):
 
 
 setup(
-    name="tokenspeed_kernel",
+    name=_distribution_name(),
     version=_package_version(),
     install_requires=_selected_install_requires(),
-    packages=find_packages(),
+    packages=_selected_packages(),
     package_data={
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        "tokenspeed_kernel_nvidia.thirdparty.cuda": ["objs/**/*.so"],
     },
+    license_files=["LICENSE", "THIRDPARTYNOTICES"],
     cmdclass={
         "build_native": BuildNative,
         "build_ext": BuildKernels,

@@ -171,8 +171,3 @@ def apply_rope(
 
 
 __all__ = ["FusedSetKVBufferArg", "apply_rope"]
-
-
-# Backend registration (side-effect imports).
-import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
-import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
