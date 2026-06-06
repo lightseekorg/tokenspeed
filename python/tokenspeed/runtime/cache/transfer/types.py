@@ -7,13 +7,6 @@ import torch
 
 
 class CacheKind(str, Enum):
-    """Cache *type* (orthogonal to target-vs-draft model role).
-
-    A draft model has its own pool of the same kind (e.g. a draft KV cache, or a
-    draft Mamba cache); the executor distinguishes target/draft by a separate
-    ``is_draft`` flag / pool id, not by a dedicated kind.
-    """
-
     KV = "kv"
     MAMBA = "mamba"
 
