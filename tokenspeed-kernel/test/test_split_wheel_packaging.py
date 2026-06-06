@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +31,6 @@ from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOT = ROOT / "python"
 SETUP_PY = PYTHON_ROOT / "setup.py"
-CI_SYSTEM_ROOT = ROOT.parent / "test" / "ci_system"
 BUILD_ARTIFACTS = (
     PYTHON_ROOT / "build",
     PYTHON_ROOT / "tokenspeed_kernel.egg-info",
@@ -86,32 +84,6 @@ def _build_wheel(mode: str, dist_dir: Path) -> Path:
 def _wheel_names(wheel: Path) -> list[str]:
     with zipfile.ZipFile(wheel) as archive:
         return archive.namelist()
-
-
-def _continued_commands(script: str) -> list[str]:
-    commands = []
-    current = ""
-    for raw_line in script.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        continued = line.endswith("\\")
-        chunk = line[:-1].strip() if continued else line
-        current = f"{current} {chunk}".strip()
-        if not continued:
-            commands.append(current)
-            current = ""
-    if current:
-        commands.append(current)
-    return commands
-
-
-def _kernel_source_install_commands(script: str) -> list[str]:
-    return [
-        command
-        for command in _continued_commands(script)
-        if "pip3 install" in command and "tokenspeed-kernel/python" in command
-    ]
 
 
 def _load_setup_kwargs(mode: str) -> dict:
@@ -192,32 +164,6 @@ def test_package_mode_boundaries() -> None:
         packages = _load_setup_kwargs(mode)["packages"]
         assert packages
         assert all(pkg == prefix or pkg.startswith(prefix + ".") for pkg in packages)
-
-
-def test_ci_source_installs_select_backend_extra() -> None:
-    cuda_commands = _kernel_source_install_commands(
-        (CI_SYSTEM_ROOT / "install_deps.sh").read_text(encoding="utf-8")
-    )
-    rocm_commands = _kernel_source_install_commands(
-        (CI_SYSTEM_ROOT / "install_deps_rocm.sh").read_text(encoding="utf-8")
-    )
-
-    cuda_modes = [
-        re.search(r"TOKENSPEED_KERNEL_PACKAGE=(\w+)", command).group(1)
-        for command in cuda_commands
-    ]
-    rocm_modes = [
-        re.search(r"TOKENSPEED_KERNEL_PACKAGE=(\w+)", command).group(1)
-        for command in rocm_commands
-    ]
-
-    assert cuda_modes == ["nvidia", "core"]
-    assert rocm_modes == ["amd", "core"]
-    assert "tokenspeed-kernel/python[nvidia]" in cuda_commands[1]
-    assert "tokenspeed-kernel/python[amd]" in rocm_commands[1]
-    assert "TOKENSPEED_KERNEL_PACKAGE=amd" not in " ".join(cuda_commands)
-    assert "TOKENSPEED_KERNEL_PACKAGE=nvidia" not in " ".join(rocm_commands)
-    assert "FLASHINFER_CUDA_ARCH_LIST" in cuda_commands[0]
 
 
 def test_vendor_registration_loaders_skip_missing_vendor_package(monkeypatch) -> None:

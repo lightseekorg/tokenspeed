@@ -19,9 +19,9 @@ public APIs, registry, selection logic, plugin tooling, and other vendor-neutral
 core code. Install the vendor stack you need with extras:
 
 ```bash
-pip install "tokenspeed-kernel[nvidia]"
-pip install "tokenspeed-kernel[amd]"
-pip install "tokenspeed-kernel[all]"
+pip install "tokenspeed-kernel[nvidia]"  # core + nvidia
+pip install "tokenspeed-kernel[amd]"     # core + amd
+pip install "tokenspeed-kernel[all]"     # core + nvidia + amd
 ```
 
 ## Design Goals
