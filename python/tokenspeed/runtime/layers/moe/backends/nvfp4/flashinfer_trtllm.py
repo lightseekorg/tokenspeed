@@ -67,6 +67,7 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
         self.spec = spec
         self.quant_config = quant_config
         self._group_size = quant_config.group_size
+        self._autotuned = False
 
         routing_config = routing_config or {}
         self._n_group = routing_config.get("n_group", 0)
@@ -276,33 +277,18 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
     def supports_deferred_finalize(self) -> bool:
         return True
 
-    def forward(
+    def _call_trtllm_kernel(
         self,
-        layer: nn.Module,
-        hidden_states: torch.Tensor,
-        topk_output: object,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-        do_finalize: bool = True,
-    ) -> torch.Tensor:
-        del num_global_tokens, max_num_tokens_per_gpu
-        from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-
-        x = hidden_states
-        num_tokens = x.shape[0]
-
-        # Quantize input to FP4 using the fused-kernel scale layout.
-        hs_fp4, hs_scale = fp4_quantize(
-            x,
-            layer.w13_input_scale_quant,
-            is_sf_swizzled_layout=False,
-            enable_pdl=pdl_enabled(),
-        )
-
-        routing_logits = topk_output.router_logits.to(self._routing_logits_dtype)
-        routing_bias = self._correction_bias
-
-        result = tokenspeed_kernel.moe_fused(
+        routing_logits,
+        routing_bias,
+        hs_fp4,
+        hs_scale,
+        layer,
+        num_tokens,
+        dtype,
+        do_finalize,
+    ):
+        output = tokenspeed_kernel.moe_fused(
             routing_logits=routing_logits,
             routing_bias=routing_bias,
             hidden_states=hs_fp4,
@@ -334,15 +320,15 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
             routing_method_type=self._routing_method_type,
             do_finalize=do_finalize,
             tune_max_num_tokens=next_power_of_2(num_tokens),
-            dtype=x.dtype,
+            dtype=dtype,
             features={"self_routing"},
             weight_format="nvfp4",
             expected_kernel_name="flashinfer_trtllm_fp4_fused_moe",
         )
         if do_finalize:
-            return result[0]
+            return output[0] if isinstance(output, (list, tuple)) else output
         # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx]
-        gemm2_out, expert_weights, expanded_idx = result
+        gemm2_out, expert_weights, expanded_idx = output
         # Flashinfer's Python wrapper allocates expert_weights with
         # ``routing_logits.dtype`` (fp32 for DSv3), but the C++ routing
         # kernel writes bf16 contiguously for DeepSeekV3 routing
@@ -353,6 +339,67 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
             n, k = expert_weights.size()
             expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
         return (gemm2_out, expert_weights, expanded_idx)
+
+    def forward(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        topk_output: object,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        do_finalize: bool = True,
+    ) -> torch.Tensor:
+        del num_global_tokens, max_num_tokens_per_gpu
+        from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+
+        x = hidden_states
+        num_tokens = x.shape[0]
+
+        # Quantize input to FP4 using the fused-kernel scale layout.
+        hs_fp4, hs_scale = fp4_quantize(
+            x,
+            layer.w13_input_scale_quant,
+            is_sf_swizzled_layout=False,
+            enable_pdl=pdl_enabled(),
+        )
+
+        routing_logits = topk_output.router_logits.to(self._routing_logits_dtype)
+        routing_bias = self._correction_bias
+
+        try:
+            from tokenspeed_kernel.ops.moe.flashinfer import (
+                autotune as flashinfer_autotune,
+            )
+        except ImportError:
+            flashinfer_autotune = None
+
+        if not self._autotuned and flashinfer_autotune is not None:
+            with flashinfer_autotune():
+                # Autotune with do_finalize=True to match the default path.
+                # The deferred path reuses the same underlying kernel up to
+                # the final output step.
+                self._call_trtllm_kernel(
+                    routing_logits,
+                    routing_bias,
+                    hs_fp4,
+                    hs_scale,
+                    layer,
+                    num_tokens,
+                    x.dtype,
+                    do_finalize=True,
+                )
+            self._autotuned = True
+
+        return self._call_trtllm_kernel(
+            routing_logits,
+            routing_bias,
+            hs_fp4,
+            hs_scale,
+            layer,
+            num_tokens,
+            x.dtype,
+            do_finalize,
+        )
 
 
 __all__ = ["Nvfp4FlashinferTrtllmBackend"]
