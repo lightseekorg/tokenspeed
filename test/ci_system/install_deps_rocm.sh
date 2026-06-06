@@ -25,11 +25,18 @@ sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip setuptools wheel
 
-echo "=== Step 3: Install tokenspeed-kernel ==="
+echo "=== Step 3: Install tokenspeed-kernel split packages ==="
 cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"
-pip3 install tokenspeed-kernel/python/ \
-    --no-build-isolation -v
+# Source CI builds unpublished dev versions, so install the local split
+# packages directly instead of asking pip to resolve exact vendor wheels
+# from an index. Only the ROCm package should pull ROCm dependencies here.
+TOKENSPEED_KERNEL_PACKAGE=amd \
+    pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+TOKENSPEED_KERNEL_PACKAGE=nvidia \
+    pip3 install tokenspeed-kernel/python/ --no-build-isolation --no-deps -v
+TOKENSPEED_KERNEL_PACKAGE=core \
+    pip3 install tokenspeed-kernel/python/ --no-build-isolation --no-deps -v
 
 echo "=== Step 4: Install TokenSpeed Scheduler ==="
 pip3 install cmake ninja
