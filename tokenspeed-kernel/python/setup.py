@@ -47,14 +47,14 @@ REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel_nvidia" / "thirdparty"
 BASE_VERSION = "0.1.0"
 PACKAGE_ENV = "TOKENSPEED_KERNEL_PACKAGE"
-VALID_PACKAGE_MODES = {"default", "nvidia", "amd"}
+VALID_PACKAGE_MODES = {"core", "nvidia", "amd"}
 DIST_NAMES = {
-    "default": "tokenspeed-kernel",
+    "core": "tokenspeed-kernel",
     "nvidia": "tokenspeed-kernel-nvidia",
     "amd": "tokenspeed-kernel-amd",
 }
 PACKAGE_BACKENDS = {
-    "default": None,
+    "core": None,
     "nvidia": "cuda",
     "amd": "rocm",
 }
@@ -139,7 +139,7 @@ def _package_version() -> str:
 
 
 def _package_mode() -> str:
-    mode = os.environ.get(PACKAGE_ENV, "default").strip().lower()
+    mode = os.environ.get(PACKAGE_ENV, "core").strip().lower()
     if mode not in VALID_PACKAGE_MODES:
         valid = ", ".join(sorted(VALID_PACKAGE_MODES))
         raise RuntimeError(f"{PACKAGE_ENV} must be one of: {valid}")
@@ -159,7 +159,7 @@ def _vendor_distribution_requirements(version: str) -> list[str]:
 
 def _selected_packages() -> list[str]:
     prefix = {
-        "default": "tokenspeed_kernel",
+        "core": "tokenspeed_kernel",
         "nvidia": "tokenspeed_kernel_nvidia",
         "amd": "tokenspeed_kernel_amd",
     }[_package_mode()]

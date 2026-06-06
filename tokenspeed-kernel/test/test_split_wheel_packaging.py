@@ -124,19 +124,19 @@ def _load_setup_kwargs(mode: str) -> dict:
 
 
 def test_package_mode_distribution_names() -> None:
-    assert _load_setup_kwargs("default")["name"] == "tokenspeed-kernel"
+    assert _load_setup_kwargs("core")["name"] == "tokenspeed-kernel"
     assert _load_setup_kwargs("nvidia")["name"] == "tokenspeed-kernel-nvidia"
     assert _load_setup_kwargs("amd")["name"] == "tokenspeed-kernel-amd"
 
 
 def test_dependency_direction() -> None:
-    default = _load_setup_kwargs("default")
+    core = _load_setup_kwargs("core")
     nvidia = _load_setup_kwargs("nvidia")
     amd = _load_setup_kwargs("amd")
 
-    version = default["version"]
-    assert f"tokenspeed-kernel-nvidia=={version}" in default["install_requires"]
-    assert f"tokenspeed-kernel-amd=={version}" in default["install_requires"]
+    version = core["version"]
+    assert f"tokenspeed-kernel-nvidia=={version}" in core["install_requires"]
+    assert f"tokenspeed-kernel-amd=={version}" in core["install_requires"]
     assert not any(
         req.startswith("tokenspeed-kernel") for req in nvidia["install_requires"]
     )
@@ -158,7 +158,7 @@ def test_package_mode_selects_vendor_requirements() -> None:
 
 def test_package_mode_boundaries() -> None:
     for mode, prefix in (
-        ("default", "tokenspeed_kernel"),
+        ("core", "tokenspeed_kernel"),
         ("nvidia", "tokenspeed_kernel_nvidia"),
         ("amd", "tokenspeed_kernel_amd"),
     ):
@@ -169,21 +169,20 @@ def test_package_mode_boundaries() -> None:
 
 def test_wheel_artifact_boundaries(tmp_path) -> None:
     wheels = {
-        mode: _build_wheel(mode, tmp_path / mode)
-        for mode in ("nvidia", "amd", "default")
+        mode: _build_wheel(mode, tmp_path / mode) for mode in ("nvidia", "amd", "core")
     }
 
-    default_names = _wheel_names(wheels["default"])
-    assert any(name.startswith("tokenspeed_kernel/") for name in default_names)
+    core_names = _wheel_names(wheels["core"])
+    assert any(name.startswith("tokenspeed_kernel/") for name in core_names)
     assert not any(
         name.startswith(("tokenspeed_kernel_nvidia/", "tokenspeed_kernel_amd/"))
-        for name in default_names
+        for name in core_names
     )
     assert not any(
-        name.startswith("tokenspeed_kernel/thirdparty/") for name in default_names
+        name.startswith("tokenspeed_kernel/thirdparty/") for name in core_names
     )
     for forbidden_path in CORE_FORBIDDEN_VENDOR_PATHS:
-        assert forbidden_path not in default_names
+        assert forbidden_path not in core_names
 
     for mode, prefix in (
         ("nvidia", "tokenspeed_kernel_nvidia/"),
