@@ -21,7 +21,7 @@
 """Weight-transfer lifecycle manager for RL online weight sync.
 
 ``WeightTransferManager`` is the control-plane state machine that the HTTP
-handlers in ``runtime/entrypoints/weight_transfer_http.py`` call into. It
+handlers in ``runtime/entrypoints/vllm_compat_http.py`` call into. It
 implements the weight-update lifecycle that RL trainers drive over HTTP
 (init / start / update / finish / pause / resume / is_paused).
 

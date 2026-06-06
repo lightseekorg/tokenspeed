@@ -136,7 +136,7 @@ class ServerArgs:
     # RL online weight sync (always on / ungated). NOTE: these endpoints can
     # overwrite model weights, reload checkpoints from disk, and pause/abort
     # serving, and are exposed on the public control port. See
-    # runtime/engine/weight_transfer/ and runtime/entrypoints/weight_transfer_http.py.
+    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
     weight_transfer_config: str | None = None
     # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
     # + memory occupation, both the native and SGLang-compatible dialects). Set by

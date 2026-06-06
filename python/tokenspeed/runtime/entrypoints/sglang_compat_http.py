@@ -26,7 +26,7 @@ SGLang rollout -- POST to), forwarding each call to ``AsyncLLM``'s existing
 weight-control methods. No new engine logic; only name/field translation.
 
 These routes are mounted on the **same** in-engine RL control-plane app as the
-vLLM-native endpoints (``weight_transfer_http.py``) -- one app, one port. Mount
+vLLM-compatible endpoints (``vllm_compat_http.py``) -- one app, one port. Mount
 ``router`` onto an app whose ``state.async_llm`` is set, or use
 :func:`build_sglang_compat_app` for a standalone app (tests).
 

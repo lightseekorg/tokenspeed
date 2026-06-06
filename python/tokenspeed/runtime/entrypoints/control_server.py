@@ -382,7 +382,7 @@ async def stop_profile(request: Request):
 # The weight-update HTTP API that RL trainers drive. The heavy weight payloads
 # travel out-of-band (NCCL / CUDA-IPC); only metadata flows through here. The
 # control plane runs inside the engine process next to AsyncLLM (see
-# runtime/entrypoints/weight_transfer_http.py); the sidecar proxies to it on
+# runtime/entrypoints/vllm_compat_http.py); the sidecar proxies to it on
 # _rl_control_url.
 # ---------------------------------------------------------------------------
 
@@ -440,7 +440,7 @@ async def is_paused(request: Request):
 # RL weight transfer — SGLang dialect, proxied to the same in-engine control app
 #
 # These routes are mounted on the same in-engine RL control app as the
-# vLLM-native endpoints (runtime/entrypoints/sglang_compat_http.py), so they
+# SGLang-compatible handlers (runtime/entrypoints/sglang_compat_http.py), so they
 # proxy to the same _rl_control_url. Endpoint names/fields match SGLang so
 # slime/miles and verl's SGLang rollout drive tokenspeed unchanged.
 # ---------------------------------------------------------------------------
@@ -529,7 +529,7 @@ def build_control_server(
     Args:
         gateway_url: Base URL of the smg gateway for generation passthrough.
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
-        rl_control_url: Base URL of the in-engine RL control plane (vLLM-native
+        rl_control_url: Base URL of the in-engine RL control plane (vLLM-compatible
             + SGLang-compatible weight sync). Empty disables those routes (they
             return 503).
         host: Bind address.

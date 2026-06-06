@@ -18,11 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Weight-transfer HTTP control plane for RL online weight sync.
+"""vLLM-compatible weight-sync HTTP routes.
 
-Implements the weight-transfer HTTP API that RL trainers (verl / slime / AReaL /
-miles) drive -- the endpoint paths, methods, request/response JSON, and call
-lifecycle match the contract those trainers expect, so they run unchanged.
+The vLLM-dialect half of the in-engine RL weight-sync control plane (its sibling
+``sglang_compat_http.py`` is the SGLang dialect; both mount on one app/port).
+Implements the weight-transfer HTTP API that vLLM-style RL trainers (verl /
+slime / AReaL / miles) drive -- the endpoint paths, methods, request/response
+JSON, and call lifecycle match the contract those trainers expect, so they run
+unchanged.
 
 The handlers are thin: they parse the request, call into a
 ``WeightTransferManager`` (``runtime/engine/weight_transfer/manager.py``), and
@@ -33,7 +36,7 @@ Deployment note: this app must run on the same asyncio event loop as the
 ``AsyncLLM`` it controls -- the manager toggles a loop-bound admission event and
 awaits loop-bound scheduler communicators. It is built and served from the
 engine process by :meth:`AsyncLLM._serve_rl_control_plane` (via
-:func:`build_weight_transfer_app`), which also mounts the SGLang-compatible
+:func:`build_vllm_compat_app`), which also mounts the SGLang-compatible
 router onto the same app/port.
 """
 
@@ -234,7 +237,7 @@ async def get_world_size(
 # --------------------------------------------------------------------------- #
 
 
-def build_weight_transfer_app(manager: "WeightTransferManager") -> FastAPI:
+def build_vllm_compat_app(manager: "WeightTransferManager") -> FastAPI:
     """Return a FastAPI app exposing the weight-transfer endpoints.
 
     The app holds the manager on ``app.state.weight_transfer_manager``; handlers

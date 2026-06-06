@@ -744,13 +744,13 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             from tokenspeed.runtime.entrypoints.sglang_compat_http import (
                 router as sglang_router,
             )
-            from tokenspeed.runtime.entrypoints.weight_transfer_http import (
-                build_weight_transfer_app,
+            from tokenspeed.runtime.entrypoints.vllm_compat_http import (
+                build_vllm_compat_app,
             )
 
-            # vLLM-native endpoints (driven by the manager) + SGLang-compatible
+            # vLLM-compatible endpoints (driven by the manager) + SGLang-compatible
             # endpoints (driven by AsyncLLM directly), on one app/port.
-            app = build_weight_transfer_app(manager)
+            app = build_vllm_compat_app(manager)
             app.state.async_llm = self
             app.include_router(sglang_router)
 
