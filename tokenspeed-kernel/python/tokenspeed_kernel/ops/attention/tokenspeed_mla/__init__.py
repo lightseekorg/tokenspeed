@@ -20,7 +20,7 @@
 
 """TokenSpeed MLA kernels exposed through tokenspeed-kernel."""
 
-from tokenspeed_kernel_nvidia.registration import error_fn
+from tokenspeed_kernel.registry import error_fn
 
 try:
     from tokenspeed_mla import (
