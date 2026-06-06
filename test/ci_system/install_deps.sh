@@ -92,15 +92,17 @@ python3 -m pip install --upgrade pip setuptools wheel
 echo "=== Step 3: Install tokenspeed-kernel split packages ==="
 cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
-# Source CI builds unpublished dev versions. Install the local backend wheel
-# first, then install core with the matching extra so the exact vendor pin is
-# satisfied locally instead of resolved from an index.
+# Source CI builds unpublished dev versions. Install both local vendor
+# packages while runtime code and tests still hard-import both vendor paths.
+# Only the CUDA package should pull CUDA dependencies on CUDA runners.
 pip_install_with_retry env \
     TOKENSPEED_KERNEL_PACKAGE=nvidia \
     FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
     pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+pip_install_with_retry env TOKENSPEED_KERNEL_PACKAGE=amd \
+    pip3 install tokenspeed-kernel/python/ --no-build-isolation --no-deps -v
 pip_install_with_retry env TOKENSPEED_KERNEL_PACKAGE=core \
-    pip3 install "tokenspeed-kernel/python[nvidia]" --no-build-isolation -v
+    pip3 install "tokenspeed-kernel/python[all]" --no-build-isolation -v
 
 # ============================================================
 # Step 4: Install TokenSpeed Scheduler (C++)
