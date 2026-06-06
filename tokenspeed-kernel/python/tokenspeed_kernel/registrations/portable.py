@@ -26,6 +26,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 _MODULES = (
+    # TODO: Replace these reference numerics registrations with Triton-backed
+    # portable kernels so built-ins do not rely on numerics modules long-term.
     "tokenspeed_kernel.numerics.reference.gemm",
     "tokenspeed_kernel.numerics.reference.moe",
     "tokenspeed_kernel.numerics.reference.quantize",
