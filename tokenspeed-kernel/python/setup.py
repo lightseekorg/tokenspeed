@@ -26,7 +26,6 @@ On systems without an NVIDIA CUDA build target, the build is skipped and the
 package installs as a pure-Python stub.
 """
 
-import ctypes
 import importlib
 import os
 import shutil
@@ -54,9 +53,11 @@ DIST_NAMES = {
     "nvidia": "tokenspeed-kernel-nvidia",
     "amd": "tokenspeed-kernel-amd",
 }
-BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
-SKIP_NATIVE_ENV = "TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD"
-VALID_BACKENDS = {"cuda", "rocm"}
+PACKAGE_BACKENDS = {
+    "core": None,
+    "nvidia": "cuda",
+    "amd": "rocm",
+}
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -169,70 +170,8 @@ def _selected_packages() -> list[str]:
     ]
 
 
-def _is_cuda_platform() -> bool:
-    def toolkit_available() -> bool:
-        if shutil.which(NVCC) is not None:
-            return True
-        cuda_home = Path(CUDA_HOME)
-        return (cuda_home / "bin" / "nvcc").exists()
-
-    for lib_name in ("libcuda.so.1", "libcuda.so"):
-        try:
-            libcuda = ctypes.CDLL(lib_name)
-            break
-        except OSError:
-            pass
-    else:
-        return toolkit_available()
-
-    try:
-        if libcuda.cuInit(0) != 0:
-            return toolkit_available()
-        count = ctypes.c_int()
-        if libcuda.cuDeviceGetCount(ctypes.byref(count)) != 0:
-            return toolkit_available()
-        if count.value > 0:
-            return True
-    except AttributeError:
-        pass
-
-    return toolkit_available()
-
-
-def _is_rocm_platform() -> bool:
-    rocm_env_names = (
-        "ROCM_HOME",
-        "ROCM_PATH",
-        "ROCM_VERSION",
-        "HIP_PATH",
-        "HIP_PLATFORM",
-    )
-    if any(os.environ.get(name) for name in rocm_env_names):
-        return True
-    if shutil.which("hipcc") is not None:
-        return True
-    if Path("/dev/kfd").exists():
-        return True
-    return Path("/opt/rocm").exists()
-
-
-def _selected_backend() -> str:
-    override = os.environ.get(BACKEND_ENV, "").strip().lower()
-    if override:
-        if override not in VALID_BACKENDS:
-            valid = ", ".join(sorted(VALID_BACKENDS))
-            raise RuntimeError(f"{BACKEND_ENV} must be one of: {valid}")
-        return override
-
-    if _is_cuda_platform():
-        return "cuda"
-    if _is_rocm_platform():
-        return "rocm"
-
-    raise RuntimeError(
-        "Unable to detect CUDA or ROCm for tokenspeed_kernel dependencies. "
-        f"Set {BACKEND_ENV}=cuda or {BACKEND_ENV}=rocm."
-    )
+def _package_backend() -> str | None:
+    return PACKAGE_BACKENDS[_package_mode()]
 
 
 def _read_requirements(
@@ -280,15 +219,13 @@ def _vendor_requirements(backend: str) -> list[str]:
 
 
 def _selected_install_requires() -> list[str]:
-    mode = _package_mode()
     version = _package_version()
-    if mode == "core":
+    backend = _package_backend()
+    if backend is None:
         requirements = _read_requirements(REQUIREMENTS_DIR / "common.txt")
         requirements.extend(_vendor_distribution_requirements(version))
-    elif mode == "nvidia":
-        requirements = _vendor_requirements("cuda")
     else:
-        requirements = _vendor_requirements("rocm")
+        requirements = _vendor_requirements(backend)
     return _dedupe_requirements(requirements)
 
 
@@ -316,8 +253,7 @@ def _refresh_python_install_paths() -> None:
     importlib.invalidate_caches()
 
 
-def _install_backend_build_requirements(verbose=False) -> None:
-    backend = _selected_backend()
+def _install_backend_build_requirements(backend: str, verbose=False) -> None:
     print(f"Installing {backend} build requirements before native build")
     subprocess.check_call(
         [
@@ -338,9 +274,8 @@ def _install_backend_build_requirements(verbose=False) -> None:
     _refresh_python_install_paths()
 
 
-def _ensure_cuda_compiler() -> None:
-    if shutil.which(NVCC) is None:
-        raise RuntimeError(f"CUDA backend selected but nvcc was not found: {NVCC}")
+def _cuda_compiler_available() -> bool:
+    return shutil.which(NVCC) is not None or Path(NVCC).exists()
 
 
 # Kernel groups: each entry produces one .so file.
@@ -799,23 +734,16 @@ class BuildKernels(build_ext):
     """Compile CUDA kernels into .so files for the NVIDIA package."""
 
     def run(self):
-        if os.environ.get(SKIP_NATIVE_ENV):
-            print(f"{SKIP_NATIVE_ENV} is set; skipping native CUDA build")
-            return
         if _package_mode() != "nvidia":
             print(
                 f"NVIDIA package not selected; skipping CUDA kernel build. "
                 f"{self.distribution.get_name()}"
             )
             return
-        if _selected_backend() != "cuda":
-            print(
-                f"CUDA backend not selected; skipping CUDA kernel build. "
-                f"{self.distribution.get_name()}"
-            )
+        if not _cuda_compiler_available():
+            print(f"nvcc not found ({NVCC}); skipping CUDA kernel build")
             return
 
-        _ensure_cuda_compiler()
         verbose = bool(getattr(self, "verbose", False))
         CudaKernelBuilder(KERNEL_GROUPS, verbose=verbose).run()
 
@@ -831,18 +759,14 @@ class BuildNative(Command):
         pass
 
     def run(self):
-        if os.environ.get(SKIP_NATIVE_ENV):
-            print(f"{SKIP_NATIVE_ENV} is set; skipping native CUDA build")
-            return
         if _package_mode() != "nvidia":
             print("NVIDIA package not selected; skipping native CUDA build")
             return
-        backend = _selected_backend()
-        _install_backend_build_requirements(getattr(self, "verbose", False))
-        if backend != "cuda":
-            print("CUDA backend not selected; skipping CUDA kernel build")
+        if not _cuda_compiler_available():
+            print(f"nvcc not found ({NVCC}); skipping native CUDA build")
             return
 
+        _install_backend_build_requirements("cuda", getattr(self, "verbose", False))
         self.run_command("build_ext")
 
 

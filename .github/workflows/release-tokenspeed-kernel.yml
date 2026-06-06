@@ -64,7 +64,6 @@ jobs:
           version=$(
             cd tokenspeed-kernel/python
             TOKENSPEED_KERNEL_PACKAGE=core \
-            TOKENSPEED_KERNEL_BACKEND=cuda \
             TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
             TOKENSPEED_KERNEL_GIT_SHA="$GITHUB_SHA" \
             TOKENSPEED_KERNEL_GIT_BRANCH="$GITHUB_REF_NAME" \
@@ -172,7 +171,6 @@ jobs:
             -e PYTHON_TAG=${{ matrix.python.tag }} \
             -e TORCH_INDEX_URL=${{ matrix.cuda.torch_index_url }} \
             -e TOKENSPEED_KERNEL_PACKAGE=nvidia \
-            -e TOKENSPEED_KERNEL_BACKEND=cuda \
             -e TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
             -e TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
             -e TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
@@ -235,7 +233,6 @@ jobs:
           for package_mode in amd core; do
             rm -rf build *.egg-info
             TOKENSPEED_KERNEL_PACKAGE="$package_mode" \
-            TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD=1 \
             TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
             TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
             TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
@@ -268,7 +265,6 @@ jobs:
             build twine "setuptools<82" wheel packaging "apache-tvm-ffi>=0.1.5"
           cd tokenspeed-kernel/python
           TOKENSPEED_KERNEL_PACKAGE=core \
-          TOKENSPEED_KERNEL_BACKEND=cuda \
           TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
           TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
           TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \

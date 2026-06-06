@@ -27,9 +27,13 @@ TokenSpeed-kernel builds three distributions from this source tree:
   `tokenspeed-kernel` by itself.
 
 Set `TOKENSPEED_KERNEL_PACKAGE=core`, `nvidia`, or `amd` when building a wheel.
-Built-in kernels are loaded through `tokenspeed_kernel.registry.load_builtin_kernels()`,
-which imports the core registration adapters. External plugins remain separate and
-register through the plugin API.
+The package mode selects the vendor requirement set: `nvidia` uses CUDA
+requirements, `amd` uses ROCm requirements, and `core` depends on exact-version
+vendor wheels. NVIDIA native CUDA objects are built only when `nvcc` is
+available; otherwise the NVIDIA wheel remains Python-only. Built-in kernels are
+loaded through `tokenspeed_kernel.registry.load_builtin_kernels()`, which imports
+the core registration adapters. External plugins remain separate and register
+through the plugin API.
 
 ## Design Goals
 

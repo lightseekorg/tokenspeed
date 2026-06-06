@@ -69,7 +69,6 @@ def _build_wheel(mode: str, dist_dir: Path) -> Path:
     env = os.environ.copy()
     env.update(FIXED_ENV)
     env["TOKENSPEED_KERNEL_PACKAGE"] = mode
-    env["TOKENSPEED_KERNEL_SKIP_NATIVE_BUILD"] = "1"
     try:
         subprocess.run(
             [
@@ -144,6 +143,17 @@ def test_dependency_direction() -> None:
     assert not any(
         req.startswith("tokenspeed-kernel") for req in amd["install_requires"]
     )
+
+
+def test_package_mode_selects_vendor_requirements() -> None:
+    nvidia_requires = _load_setup_kwargs("nvidia")["install_requires"]
+    amd_requires = _load_setup_kwargs("amd")["install_requires"]
+
+    assert any(req.startswith("nvidia-cutlass-dsl==") for req in nvidia_requires)
+    assert any(req.startswith("flashinfer-python==") for req in nvidia_requires)
+    assert not any("+rocm" in req for req in nvidia_requires)
+    assert any("+rocm" in req for req in amd_requires)
+    assert not any(req.startswith("nvidia-cutlass-dsl==") for req in amd_requires)
 
 
 def test_package_mode_boundaries() -> None:

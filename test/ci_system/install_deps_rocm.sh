@@ -28,7 +28,7 @@ python3 -m pip install --upgrade pip setuptools wheel
 echo "=== Step 3: Install tokenspeed-kernel ==="
 cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"
-TOKENSPEED_KERNEL_BACKEND=rocm pip3 install tokenspeed-kernel/python/ \
+pip3 install tokenspeed-kernel/python/ \
     --no-build-isolation -v
 
 echo "=== Step 4: Install TokenSpeed Scheduler ==="
