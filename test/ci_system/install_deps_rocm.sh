@@ -28,15 +28,13 @@ python3 -m pip install --upgrade pip setuptools wheel
 echo "=== Step 3: Install tokenspeed-kernel split packages ==="
 cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"
-# Source CI builds unpublished dev versions. Install both local vendor
-# packages while runtime code and tests still hard-import both vendor paths.
-# Only the ROCm package should pull ROCm dependencies on ROCm runners.
+# Source CI builds unpublished dev versions. Install the local backend wheel
+# first, then install core with the matching extra so the exact vendor pin is
+# satisfied locally instead of resolved from an index.
 TOKENSPEED_KERNEL_PACKAGE=amd \
     pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
-TOKENSPEED_KERNEL_PACKAGE=nvidia \
-    pip3 install tokenspeed-kernel/python/ --no-build-isolation --no-deps -v
 TOKENSPEED_KERNEL_PACKAGE=core \
-    pip3 install "tokenspeed-kernel/python[all]" --no-build-isolation -v
+    pip3 install "tokenspeed-kernel/python[amd]" --no-build-isolation -v
 
 echo "=== Step 4: Install TokenSpeed Scheduler ==="
 pip3 install cmake ninja
