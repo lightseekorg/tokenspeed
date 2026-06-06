@@ -8,32 +8,16 @@ performant kernels for multi-silicon AI inference. It features:
 * Plugin mechanism for multi-silicon extensibility
 * A minimal list of curated dependencies for fast iteration
 
+## Pip packages
+
 TokenSpeed-kernel is pip-installable on its own and can be directly used by
-others.
+others. To provide flexibility, we publish three packages: `tokenspeed-kernel-amd`,
+`tokenspeed-kernel-nvidia`, and` tokenspeed-kernel`.
 
-## Wheel Split
-
-TokenSpeed-kernel builds three distributions from this source tree:
-
-* `tokenspeed-kernel` contains the public APIs, registry, selection logic,
-  numerics, benchmarking, plugin tooling, and built-in registration adapters.
-  Installing it installs exact-version `tokenspeed-kernel-nvidia` and
-  `tokenspeed-kernel-amd` wheels.
-* `tokenspeed-kernel-nvidia` contains NVIDIA implementation modules and NVIDIA
-  kernel third-party dependencies. It does not depend on or register
-  `tokenspeed-kernel` by itself.
-* `tokenspeed-kernel-amd` contains AMD implementation modules and AMD kernel
-  third-party dependencies. It also does not depend on or register
-  `tokenspeed-kernel` by itself.
-
-Set `TOKENSPEED_KERNEL_PACKAGE=core`, `nvidia`, or `amd` when building a wheel.
-The package mode selects the vendor requirement set: `nvidia` uses CUDA
-requirements, `amd` uses ROCm requirements, and `core` depends on exact-version
-vendor wheels. NVIDIA native CUDA objects are built only when `nvcc` is
-available; otherwise the NVIDIA wheel remains Python-only. Built-in kernels are
-loaded through `tokenspeed_kernel.registry.load_builtin_kernels()`, which imports
-the core registration adapters. External plugins remain separate and register
-through the plugin API.
+The first two contains vendor kernel implementations, while the last one builds on
+top of them and additionally contains the public APIs, registry, selection logic,
+plugin tooling, and others to feature smooth complete multi-silicon support
+experience.
 
 ## Design Goals
 
