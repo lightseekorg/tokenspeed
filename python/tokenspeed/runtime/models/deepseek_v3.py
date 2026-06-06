@@ -312,9 +312,6 @@ class DeepseekV3MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
             output_format=self.experts.topk_output_format,
         )
 
@@ -370,8 +367,6 @@ class DeepseekV3MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
         else:
-            if not self.experts.apply_routed_scaling_factor_on_output:
-                routed_expert_output *= self.routed_scaling_factor
             final_hidden_states = (
                 routed_expert_output + shared_output
                 if shared_output is not None

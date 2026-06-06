@@ -230,7 +230,6 @@ def grouped_topk_gpu(
     topk_group: int | None = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: float | None = None,
-    apply_routed_scaling_factor_on_output: bool | None = False,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -271,7 +270,7 @@ def grouped_topk_gpu(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
-        if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
+        if routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
@@ -289,7 +288,6 @@ class TopKConfig:
     correction_bias: torch.Tensor | None = None
     torch_native: bool = False
     routed_scaling_factor: float | None = None
-    apply_routed_scaling_factor_on_output: bool = False
     output_format: TopKOutputFormat | None = None
     zero_expert_num: int | None = 0
     topk_indices_dtype: torch.dtype | None = torch.int32
@@ -345,7 +343,6 @@ class TopK(torch.nn.Module):
         custom_routing_function: Callable | None = None,
         correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
-        apply_routed_scaling_factor_on_output: bool | None = False,
         output_format: TopKOutputFormat | None = None,
         zero_expert_num: int | None = 0,
         topk_indices_dtype=torch.int32,
@@ -365,7 +362,6 @@ class TopK(torch.nn.Module):
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             output_format=output_format,
             zero_expert_num=zero_expert_num,
             topk_indices_dtype=topk_indices_dtype,
@@ -453,9 +449,6 @@ def select_experts(
     correction_bias = topk_config.correction_bias
     torch_native = topk_config.torch_native
     routed_scaling_factor = topk_config.routed_scaling_factor
-    apply_routed_scaling_factor_on_output = (
-        topk_config.apply_routed_scaling_factor_on_output
-    )
 
     router_logits, correction_bias = transform_select_experts_inputs(
         router_logits=router_logits,
@@ -477,7 +470,6 @@ def select_experts(
                 topk_group=topk_group,
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         else:
             mapped_in_kernel = False
@@ -501,7 +493,6 @@ def select_experts(
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 logical_to_physical_map=logical_to_physical_map,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
             if mapped_in_kernel:
                 expert_location_dispatch_info = None
@@ -524,7 +515,7 @@ def select_experts(
             renormalize=renormalize,
             correction_bias=correction_bias,
         )
-        if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
+        if routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
     elif correction_bias is not None:
         # Bias-corrected top-k uses the CUDA fused_topk_bias kernel.
@@ -546,7 +537,7 @@ def select_experts(
             topk_weights,
             num_real_experts,
             routed_scaling_factor,
-            False,
+            True,
         )
     elif custom_routing_function is None:
         topk_weights, topk_ids = torch_native_fused_topk(
@@ -555,7 +546,7 @@ def select_experts(
             topk=top_k,
             renormalize=renormalize,
         )
-        if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
+        if routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,
@@ -575,7 +566,7 @@ def select_experts(
             topk=top_k,
             renormalize=renormalize,
         )
-        if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
+        if routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)

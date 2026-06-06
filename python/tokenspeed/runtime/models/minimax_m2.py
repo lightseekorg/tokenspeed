@@ -163,9 +163,6 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             correction_bias=self.routing_bias,
             routed_scaling_factor=1.0,
             output_format=self.experts.topk_output_format,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
         )
 
     def get_moe_routed_weights(self):

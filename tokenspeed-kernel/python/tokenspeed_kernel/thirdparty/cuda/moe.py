@@ -63,8 +63,8 @@ def moe_finalize_fuse_shared(
 
     Expert-weight scale convention: ``expert_weights`` are read verbatim.
     In the DSv3/K2.5 path they already carry ``routed_scaling_factor``
-    because ``apply_routed_scaling_factor_on_output=True`` folds it in at
-    topk time — so this kernel does not apply any additional scale.
+    because TopK folds it in, so this kernel does not apply any additional
+    scale.
 
     Args:
         gemm2_out: ``[total_num_padded_tokens, hidden_dim_padded]`` bf16 —

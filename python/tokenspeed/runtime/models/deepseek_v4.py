@@ -2502,9 +2502,6 @@ class DeepseekV4MoE(nn.Module):
                 renormalize=config.norm_topk_prob,
                 correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=(
-                    self.experts.apply_routed_scaling_factor_on_output
-                ),
                 output_format=self.experts.topk_output_format,
             )
 

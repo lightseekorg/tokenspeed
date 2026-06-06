@@ -265,9 +265,6 @@ class _RuntimeLongcatMoE(nn.Module):
             renormalize=config.norm_topk_prob,
             correction_bias=self.router.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
             output_format=_TopKOutputFormat.STANDARD,
             zero_expert_num=config.zero_expert_num,
             topk_indices_dtype=(
@@ -350,8 +347,6 @@ class _RuntimeLongcatMoE(nn.Module):
                 enable_pdl=_pdl_enabled(),
             )
 
-        if not self.experts.apply_routed_scaling_factor_on_output:
-            routed_expert_output *= self.routed_scaling_factor
         if zero_expert_output is not None:
             routed_expert_output = routed_expert_output + zero_expert_output
         return routed_expert_output

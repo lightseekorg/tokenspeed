@@ -26,11 +26,6 @@ from tokenspeed.runtime.layers.moe.backends import ensure_backend_family_registe
 from tokenspeed.runtime.layers.moe.core.registry import get_backend_cls
 from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
-from tokenspeed.runtime.layers.quantization import (
-    Fp8Config,
-    Mxfp4Config,
-    Nvfp4Config,
-)
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
 _AUTO_IMPL_PREFERENCE = {
@@ -63,17 +58,11 @@ def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
     ):
         return "fp16"
 
-    # ModelOpt FP4 quantization
-    if isinstance(quant_config, Nvfp4Config):
-        return "nvfp4"
-    # MXFP4 quantization
-    if isinstance(quant_config, Mxfp4Config):
-        return "mxfp4"
-    if (
-        isinstance(quant_config, Fp8Config)
-        and quant_config.weight_block_size is not None
-    ):
-        return "fp8"
+    quant_kind = quant_config.get_name()
+    if quant_kind == "fp8" and quant_config.weight_block_size is None:
+        raise RuntimeError("MoE fp8 requires block-wise weight scales")
+    if quant_kind in _AUTO_IMPL_PREFERENCE:
+        return quant_kind
     raise RuntimeError(f"Unsupported MoE quant_config: {quant_config}")
 
 

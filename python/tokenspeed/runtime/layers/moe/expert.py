@@ -128,10 +128,6 @@ class MoELayer(torch.nn.Module):
         return self.backend.topk_output_format
 
     @property
-    def apply_routed_scaling_factor_on_output(self):
-        return self.backend.apply_routed_scaling_factor_on_output
-
-    @property
     def supports_deferred_finalize(self) -> bool:
         return self.backend.supports_deferred_finalize
 

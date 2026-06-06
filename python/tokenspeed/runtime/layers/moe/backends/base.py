@@ -81,10 +81,6 @@ class MoEBackend(ABC):
         raise NotImplementedError
 
     @property
-    def apply_routed_scaling_factor_on_output(self) -> bool:
-        return True
-
-    @property
     def supports_deferred_finalize(self) -> bool:
         """Whether this backend can return the raw (unfinalized) MoE output
         as a 3-tuple ``(gemm2_out, expert_weights,

@@ -365,9 +365,6 @@ class GptOssSparseMoeBlock(nn.Module):
             top_k=top_k,
             custom_routing_function=routing_function,
             output_format=self.experts.topk_output_format,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
             topk_indices_dtype=(
                 torch.int64 if get_all2all_backend().is_deepep() else torch.int32
             ),

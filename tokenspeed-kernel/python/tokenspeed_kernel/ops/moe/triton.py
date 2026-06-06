@@ -235,7 +235,6 @@ def _minimax_biased_grouped_topk_kernel(
     num_experts: tl.constexpr,
     routed_scaling_factor: tl.constexpr,
     renormalize: tl.constexpr,
-    apply_routed_scaling_factor_on_output: tl.constexpr,
     has_static_expert_map: tl.constexpr,
     BLOCK_E: tl.constexpr,
     TOPK: tl.constexpr,
@@ -284,8 +283,7 @@ def _minimax_biased_grouped_topk_kernel(
         for k in tl.static_range(0, TOPK):
             weight = tl.load(topk_weights_ptr + token_id * stride_wm + k * stride_wk)
             weight = weight / denom
-            if apply_routed_scaling_factor_on_output:
-                weight = weight * routed_scaling_factor
+            weight = weight * routed_scaling_factor
             tl.store(topk_weights_ptr + token_id * stride_wm + k * stride_wk, weight)
 
 
@@ -301,7 +299,6 @@ def _biased_grouped_topk_reference(
     routed_scaling_factor: Optional[float] = 1.0,
     num_token_non_padded: Optional[torch.Tensor] = None,
     logical_to_physical_map: Optional[torch.Tensor] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert (
@@ -351,8 +348,7 @@ def _biased_grouped_topk_reference(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+        topk_weights *= routed_scaling_factor
 
     topk_weights = topk_weights.to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
@@ -376,7 +372,6 @@ def minimax_biased_grouped_topk(
     routed_scaling_factor: Optional[float] = 1.0,
     num_token_non_padded: Optional[torch.Tensor] = None,
     logical_to_physical_map: Optional[torch.Tensor] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     if (
         gating_output.ndim != 2
@@ -403,7 +398,6 @@ def minimax_biased_grouped_topk(
             routed_scaling_factor=routed_scaling_factor,
             num_token_non_padded=num_token_non_padded,
             logical_to_physical_map=logical_to_physical_map,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
 
     num_tokens, num_experts = gating_output.shape
@@ -437,7 +431,6 @@ def minimax_biased_grouped_topk(
         num_experts=num_experts,
         routed_scaling_factor=float(routed_scaling_factor),
         renormalize=renormalize,
-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         has_static_expert_map=logical_to_physical_map is not None,
         BLOCK_E=block_e,
         TOPK=topk,
