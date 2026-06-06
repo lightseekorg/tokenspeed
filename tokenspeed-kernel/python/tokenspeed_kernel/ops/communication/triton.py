@@ -1055,10 +1055,14 @@ def allreduce_residual_rmsnorm(
 
         token_num, hidden_dim = input_tensor.shape
 
-        from . import iris as _iris_mod
+        try:
+            from tokenspeed_kernel_amd.communication import iris as _iris_mod
+        except ImportError:
+            _iris_mod = None
 
         if (
-            input_tensor.is_cuda
+            _iris_mod is not None
+            and input_tensor.is_cuda
             and residual.is_cuda
             and weight.is_cuda
             and input_tensor.is_contiguous()
