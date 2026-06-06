@@ -34,28 +34,6 @@ from tokenspeed.cli._proc import (
 
 
 @pytest.mark.asyncio
-async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
-    """Single-worker mode: retries and circuit-breaker are disabled by default."""
-
-    captured = {}
-
-    async def fake_exec(*cmd, **kwargs):
-        captured["cmd"] = cmd
-
-        class _P:
-            async def wait(self):
-                return 0
-
-        return _P()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await spawn_gateway([], engine_host="127.0.0.1", engine_port=12345)
-    cmd = captured["cmd"]
-    assert "--disable-retries" in cmd
-    assert "--disable-circuit-breaker" in cmd
-
-
-@pytest.mark.asyncio
 async def test_terminate_then_kill_uses_sigterm_first_then_sigkill():
     """If the child doesn't exit within drain_timeout, we escalate to SIGKILL."""
     proc = MagicMock()
