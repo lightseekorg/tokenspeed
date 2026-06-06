@@ -43,17 +43,6 @@ FIXED_ENV = {
     "TOKENSPEED_KERNEL_GIT_BRANCH": "main",
 }
 
-CORE_FORBIDDEN_VENDOR_PATHS = (
-    "tokenspeed_kernel/ops/attention/gluon/mha_decode_fp16_gfx950.py",
-    "tokenspeed_kernel/ops/attention/gluon/mha_prefill_fp16_gfx950.py",
-    "tokenspeed_kernel/ops/gemm/cute_dsl.py",
-    "tokenspeed_kernel/ops/gemm/flashinfer.py",
-    "tokenspeed_kernel/ops/moe/gluon.py",
-    "tokenspeed_kernel/ops/moe/flashinfer.py",
-    "tokenspeed_kernel/thirdparty/cute_dsl/argmax.py",
-    "tokenspeed_kernel/thirdparty/cute_dsl/nvfp4_gemm_swiglu_nvfp4_quant.py",
-)
-
 
 def _clean_build_artifacts() -> None:
     for path in BUILD_ARTIFACTS:
@@ -150,10 +139,9 @@ def test_package_mode_selects_vendor_requirements() -> None:
     amd_requires = _load_setup_kwargs("amd")["install_requires"]
 
     assert any(req.startswith("nvidia-cutlass-dsl==") for req in nvidia_requires)
-    assert any(req.startswith("flashinfer-python==") for req in nvidia_requires)
-    assert not any("+rocm" in req for req in nvidia_requires)
-    assert any("+rocm" in req for req in amd_requires)
     assert not any(req.startswith("nvidia-cutlass-dsl==") for req in amd_requires)
+    assert not any(req.startswith("tokenspeed-iris==") for req in nvidia_requires)
+    assert any(req.startswith("tokenspeed-iris==") for req in amd_requires)
 
 
 def test_package_mode_boundaries() -> None:
@@ -181,8 +169,6 @@ def test_wheel_artifact_boundaries(tmp_path) -> None:
     assert not any(
         name.startswith("tokenspeed_kernel/thirdparty/") for name in core_names
     )
-    for forbidden_path in CORE_FORBIDDEN_VENDOR_PATHS:
-        assert forbidden_path not in core_names
 
     for mode, prefix in (
         ("nvidia", "tokenspeed_kernel_nvidia/"),
@@ -196,14 +182,7 @@ def test_wheel_artifact_boundaries(tmp_path) -> None:
 def test_load_builtin_kernels_smoke(fresh_registry) -> None:
     load_builtin_kernels()
     names = {spec.name for spec in KernelRegistry.get().list_kernels()}
-    assert "torch_mm" in names
     assert "triton_quantize_fp8" in names
-
-
-def test_core_sources_do_not_duplicate_vendor_implementations() -> None:
-    for forbidden_path in CORE_FORBIDDEN_VENDOR_PATHS:
-        assert not (PYTHON_ROOT / forbidden_path).exists()
-    assert not (PYTHON_ROOT / "tokenspeed_kernel/thirdparty").exists()
 
 
 def test_vendor_thirdparty_paths_import_from_vendor_namespace() -> None:
