@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+# Keep package-level re-exports lazy: the implementation modules import
+# CUDA/CuTe-only dependencies at module import time.
 _EXPORTS = {
     "ArgmaxKernel": "tokenspeed_kernel_nvidia.thirdparty.cute_dsl.argmax",
     "CUDAGraphCompatibleWrapper": "tokenspeed_kernel_nvidia.thirdparty.cute_dsl.argmax",
