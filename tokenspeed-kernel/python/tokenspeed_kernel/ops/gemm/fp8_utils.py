@@ -32,19 +32,27 @@ fp8_dtype = platform.fp8e4m3fn.dtype
 fp8_max = platform.fp8e4m3fn.max
 fp8_min = platform.fp8e4m3fn.min
 
+_flashinfer_fp8_blockscale_quantize_runner_sm90 = error_fn
+_trtllm_per_tensor_quant_fp8 = error_fn
+_trtllm_per_token_group_quant_fp8 = error_fn
+_trtllm_per_token_quant_fp8 = error_fn
+
 if _is_nvidia:
-    from tokenspeed_kernel_nvidia.quantization.flashinfer import (
-        fp8_blockscale_quantize_runner_sm90 as _flashinfer_fp8_blockscale_quantize_runner_sm90,
-    )
-    from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
-        per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
-    )
-    from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
-        per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
-    )
-    from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
-        per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
-    )
+    try:
+        from tokenspeed_kernel_nvidia.quantization.flashinfer import (
+            fp8_blockscale_quantize_runner_sm90 as _flashinfer_fp8_blockscale_quantize_runner_sm90,
+        )
+        from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
+            per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
+        )
+        from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
+            per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
+        )
+        from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
+            per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
+        )
+    except ImportError:
+        pass
 
 
 def align(x: int, y: int) -> int:

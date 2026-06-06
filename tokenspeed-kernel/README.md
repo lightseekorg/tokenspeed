@@ -12,12 +12,17 @@ performant kernels for multi-silicon AI inference. It features:
 
 TokenSpeed-kernel is pip-installable on its own and can be directly used by
 others. To provide flexibility, we publish three packages: `tokenspeed-kernel-amd`,
-`tokenspeed-kernel-nvidia`, and` tokenspeed-kernel`.
+`tokenspeed-kernel-nvidia`, and `tokenspeed-kernel`.
 
-The first two contains vendor kernel implementations, while the last one builds on
-top of them and additionally contains the public APIs, registry, selection logic,
-plugin tooling, and others to feature smooth complete multi-silicon support
-experience.
+The first two contain vendor kernel implementations. The last one contains the
+public APIs, registry, selection logic, plugin tooling, and other vendor-neutral
+core code. Install the vendor stack you need with extras:
+
+```bash
+pip install "tokenspeed-kernel[nvidia]"
+pip install "tokenspeed-kernel[amd]"
+pip install "tokenspeed-kernel[all]"
+```
 
 ## Design Goals
 

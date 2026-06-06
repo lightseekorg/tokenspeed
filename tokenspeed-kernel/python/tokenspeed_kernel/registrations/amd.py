@@ -24,7 +24,6 @@ import importlib
 import logging
 
 from tokenspeed_kernel.registrations import apply_vendor_registrations
-from tokenspeed_kernel_amd.registration import REGISTRATIONS
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,14 @@ _MODULES = (
 
 
 def load() -> None:
-    REGISTRATIONS.clear()
+    try:
+        registration = importlib.import_module("tokenspeed_kernel_amd.registration")
+    except ImportError as exc:
+        logger.debug("Skipping AMD registrations: %s", exc)
+        return
+
+    registrations = registration.REGISTRATIONS
+    registrations.clear()
     for module_name in _MODULES:
         try:
             module = importlib.import_module(module_name)
@@ -44,4 +50,4 @@ def load() -> None:
             logger.debug(
                 "Skipping built-in registration module %s: %s", module_name, exc
             )
-    apply_vendor_registrations(REGISTRATIONS)
+    apply_vendor_registrations(registrations)

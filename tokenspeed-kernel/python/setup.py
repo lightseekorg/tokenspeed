@@ -150,11 +150,8 @@ def _distribution_name() -> str:
     return DIST_NAMES[_package_mode()]
 
 
-def _vendor_distribution_requirements(version: str) -> list[str]:
-    return [
-        f"{DIST_NAMES['nvidia']}=={version}",
-        f"{DIST_NAMES['amd']}=={version}",
-    ]
+def _vendor_distribution_requirement(mode: str, version: str) -> str:
+    return f"{DIST_NAMES[mode]}=={version}"
 
 
 def _selected_packages() -> list[str]:
@@ -219,14 +216,26 @@ def _vendor_requirements(backend: str) -> list[str]:
 
 
 def _selected_install_requires() -> list[str]:
-    version = _package_version()
     backend = _package_backend()
     if backend is None:
         requirements = _read_requirements(REQUIREMENTS_DIR / "common.txt")
-        requirements.extend(_vendor_distribution_requirements(version))
     else:
         requirements = _vendor_requirements(backend)
     return _dedupe_requirements(requirements)
+
+
+def _selected_extras_require() -> dict[str, list[str]]:
+    if _package_mode() != "core":
+        return {}
+
+    version = _package_version()
+    nvidia = [_vendor_distribution_requirement("nvidia", version)]
+    amd = [_vendor_distribution_requirement("amd", version)]
+    return {
+        "nvidia": nvidia,
+        "amd": amd,
+        "all": nvidia + amd,
+    }
 
 
 def _pip_verbose_args(verbose) -> list[str]:
@@ -798,6 +807,7 @@ setup(
     name=_distribution_name(),
     version=_package_version(),
     install_requires=_selected_install_requires(),
+    extras_require=_selected_extras_require(),
     packages=_selected_packages(),
     package_data={
         "tokenspeed_kernel_nvidia.thirdparty.cuda": ["objs/**/*.so"],

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOT = ROOT / "python"
 SETUP_PY = PYTHON_ROOT / "setup.py"
+CI_SYSTEM_ROOT = ROOT.parent / "test" / "ci_system"
 BUILD_ARTIFACTS = (
     PYTHON_ROOT / "build",
     PYTHON_ROOT / "tokenspeed_kernel.egg-info",
@@ -86,6 +88,32 @@ def _wheel_names(wheel: Path) -> list[str]:
         return archive.namelist()
 
 
+def _continued_commands(script: str) -> list[str]:
+    commands = []
+    current = ""
+    for raw_line in script.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        continued = line.endswith("\\")
+        chunk = line[:-1].strip() if continued else line
+        current = f"{current} {chunk}".strip()
+        if not continued:
+            commands.append(current)
+            current = ""
+    if current:
+        commands.append(current)
+    return commands
+
+
+def _kernel_source_install_commands(script: str) -> list[str]:
+    return [
+        command
+        for command in _continued_commands(script)
+        if "pip3 install" in command and "tokenspeed-kernel/python" in command
+    ]
+
+
 def _load_setup_kwargs(mode: str) -> dict:
     captured = {}
 
@@ -124,14 +152,25 @@ def test_dependency_direction() -> None:
     amd = _load_setup_kwargs("amd")
 
     version = core["version"]
-    assert f"tokenspeed-kernel-nvidia=={version}" in core["install_requires"]
-    assert f"tokenspeed-kernel-amd=={version}" in core["install_requires"]
+    assert not any(
+        req.startswith("tokenspeed-kernel") for req in core["install_requires"]
+    )
+    assert core["extras_require"] == {
+        "nvidia": [f"tokenspeed-kernel-nvidia=={version}"],
+        "amd": [f"tokenspeed-kernel-amd=={version}"],
+        "all": [
+            f"tokenspeed-kernel-nvidia=={version}",
+            f"tokenspeed-kernel-amd=={version}",
+        ],
+    }
     assert not any(
         req.startswith("tokenspeed-kernel") for req in nvidia["install_requires"]
     )
     assert not any(
         req.startswith("tokenspeed-kernel") for req in amd["install_requires"]
     )
+    assert nvidia["extras_require"] == {}
+    assert amd["extras_require"] == {}
 
 
 def test_package_mode_selects_vendor_requirements() -> None:
@@ -153,6 +192,51 @@ def test_package_mode_boundaries() -> None:
         packages = _load_setup_kwargs(mode)["packages"]
         assert packages
         assert all(pkg == prefix or pkg.startswith(prefix + ".") for pkg in packages)
+
+
+def test_ci_source_installs_select_backend_extra() -> None:
+    cuda_commands = _kernel_source_install_commands(
+        (CI_SYSTEM_ROOT / "install_deps.sh").read_text(encoding="utf-8")
+    )
+    rocm_commands = _kernel_source_install_commands(
+        (CI_SYSTEM_ROOT / "install_deps_rocm.sh").read_text(encoding="utf-8")
+    )
+
+    cuda_modes = [
+        re.search(r"TOKENSPEED_KERNEL_PACKAGE=(\w+)", command).group(1)
+        for command in cuda_commands
+    ]
+    rocm_modes = [
+        re.search(r"TOKENSPEED_KERNEL_PACKAGE=(\w+)", command).group(1)
+        for command in rocm_commands
+    ]
+
+    assert cuda_modes == ["nvidia", "core"]
+    assert rocm_modes == ["amd", "core"]
+    assert "tokenspeed-kernel/python[nvidia]" in cuda_commands[1]
+    assert "tokenspeed-kernel/python[amd]" in rocm_commands[1]
+    assert "TOKENSPEED_KERNEL_PACKAGE=amd" not in " ".join(cuda_commands)
+    assert "TOKENSPEED_KERNEL_PACKAGE=nvidia" not in " ".join(rocm_commands)
+    assert "FLASHINFER_CUDA_ARCH_LIST" in cuda_commands[0]
+
+
+def test_vendor_registration_loaders_skip_missing_vendor_package(monkeypatch) -> None:
+    from tokenspeed_kernel.registrations import amd, nvidia
+
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name: str, *args, **kwargs):
+        if name in {
+            "tokenspeed_kernel_nvidia.registration",
+            "tokenspeed_kernel_amd.registration",
+        }:
+            raise ImportError(name)
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+
+    nvidia.load()
+    amd.load()
 
 
 def test_wheel_artifact_boundaries(tmp_path) -> None:
@@ -203,4 +287,27 @@ def test_vendor_top_level_imports_without_core() -> None:
         "import tokenspeed_kernel_nvidia, tokenspeed_kernel_amd; "
         'assert "tokenspeed_kernel" not in sys.modules'
     )
+    subprocess.run([sys.executable, "-c", code], env=env, check=True)
+
+
+def test_core_imports_without_vendor_packages() -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PYTHON_ROOT)
+    code = """
+import importlib.abc
+import sys
+
+
+class BlockVendorPackages(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "tokenspeed_kernel_nvidia" or fullname.startswith("tokenspeed_kernel_nvidia."):
+            raise ModuleNotFoundError(fullname)
+        if fullname == "tokenspeed_kernel_amd" or fullname.startswith("tokenspeed_kernel_amd."):
+            raise ModuleNotFoundError(fullname)
+        return None
+
+
+sys.meta_path.insert(0, BlockVendorPackages())
+import tokenspeed_kernel
+"""
     subprocess.run([sys.executable, "-c", code], env=env, check=True)
