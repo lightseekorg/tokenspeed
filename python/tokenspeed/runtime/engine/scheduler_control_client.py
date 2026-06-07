@@ -47,6 +47,11 @@ from tokenspeed.runtime.engine.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    IsSchedulerPausedReqInput,
+    IsSchedulerPausedReqOutput,
+    PauseMode,
+    PauseSchedulerReqInput,
+    PauseSchedulerReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -54,6 +59,8 @@ from tokenspeed.runtime.engine.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ResumeSchedulerReqInput,
+    ResumeSchedulerReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -160,6 +167,15 @@ class SchedulerControlClient:
         self.flush_cache_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
+        self.pause_scheduler_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.resume_scheduler_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.is_scheduler_paused_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
@@ -213,6 +229,18 @@ class SchedulerControlClient:
                     self.flush_cache_communicator.handle_recv,
                 ),
                 (
+                    PauseSchedulerReqOutput,
+                    self.pause_scheduler_communicator.handle_recv,
+                ),
+                (
+                    ResumeSchedulerReqOutput,
+                    self.resume_scheduler_communicator.handle_recv,
+                ),
+                (
+                    IsSchedulerPausedReqOutput,
+                    self.is_scheduler_paused_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -237,6 +265,41 @@ class SchedulerControlClient:
 
     async def flush_cache(self: AsyncLLM) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+
+    async def pause_scheduler(self: AsyncLLM, *, mode: PauseMode = "abort") -> bool:
+        """Pause generation to allow model weight updates.
+
+        ``mode`` controls in-flight requests: ``"abort"`` cancels them,
+        ``"wait"`` lets them finish, ``"keep"`` freezes them for ``/resume``.
+        For ``abort``/``wait`` the reply only returns once the scheduler has
+        drained, so on return no forward work is in flight.
+
+        Cache invalidation after a weight swap is the weight-update op's
+        responsibility (``update_weights_*(flush_cache=...)``), not pause's.
+        """
+        # Pause may be the very first call (e.g. weight swap before serving),
+        # so ensure the output-dispatch loop is running to receive the reply.
+        self.auto_create_handle_loop()
+        result = (
+            await self.pause_scheduler_communicator(PauseSchedulerReqInput(mode=mode))
+        )[0]
+        return result.success
+
+    async def resume_scheduler(self: AsyncLLM) -> bool:
+        """Resume generation after :meth:`pause_scheduler`."""
+        self.auto_create_handle_loop()
+        result = (await self.resume_scheduler_communicator(ResumeSchedulerReqInput()))[
+            0
+        ]
+        return result.success
+
+    async def is_scheduler_paused(self: AsyncLLM) -> bool:
+        """Return whether the scheduler is currently paused."""
+        self.auto_create_handle_loop()
+        result = (
+            await self.is_scheduler_paused_communicator(IsSchedulerPausedReqInput())
+        )[0]
+        return result.is_paused
 
     async def start_profile(
         self: AsyncLLM,

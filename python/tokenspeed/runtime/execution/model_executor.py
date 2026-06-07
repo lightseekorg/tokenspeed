@@ -390,7 +390,6 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-            self.input_buffers.input_lengths_buf[:bs],
             req_pool_indices=req_pool_indices,
             seq_lens=self.input_buffers.seq_lens_buf[:bs],
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
@@ -932,7 +931,6 @@ class ModelExecutor:
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -960,7 +958,6 @@ class ModelExecutor:
                     input_ids=empty,
                     positions=empty,
                     out_cache_loc=empty,
-                    input_lengths=empty,
                     spec_step_idx=step_idx,
                 )
 

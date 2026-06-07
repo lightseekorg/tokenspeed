@@ -47,6 +47,8 @@ def load_w13(
     is_bias: bool,
     use_presharded_weights: bool,
     do_transpose: bool,
+    tp_size: int = 1,
+    load_up_proj_weight_first: bool = False,
 ) -> None:
     if shard_id not in {"w1", "w3", "w13"}:
         raise ValueError(f"Unexpected w13 shard_id: {shard_id}")
@@ -59,17 +61,31 @@ def load_w13(
     else:
         shard_size = expert_data.shape[shard_dim]
 
-    start = shard_size if shard_id == "w3" else 0
+    switch_w13 = load_up_proj_weight_first
+    if (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3"):
+        start = shard_size
+    else:
+        start = 0
+
     if not use_presharded_weights:
         if not is_bias and do_transpose:
             loaded_weight = loaded_weight.transpose(-2, -1)
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
-        )
+        if tp_size > 1:
+            # Derive the unpadded shard size from the checkpoint tensor.
+            # expert_data may be Blackwell-padded; checkpoint is not.
+            load_shard = loaded_weight.shape[shard_dim] // tp_size
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, load_shard * tp_rank, load_shard
+            )
+        else:
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, shard_size * tp_rank, shard_size
+            )
 
     expert_data = expert_data.narrow(shard_dim, start, shard_size)
-    loaded_weight = preserve_e8m0_bytes_for_uint8_param(expert_data, loaded_weight)
-    expert_data.copy_(loaded_weight)
+    dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+    loaded_weight = preserve_e8m0_bytes_for_uint8_param(dst, loaded_weight)
+    dst.copy_(loaded_weight)
 
 
 def load_w2(
@@ -81,11 +97,18 @@ def load_w2(
     is_bias: bool,
     use_presharded_weights: bool,
     do_transpose: bool,
+    tp_size: int = 1,
 ) -> None:
+    if not isinstance(expert_data, torch.Tensor) or not isinstance(
+        loaded_weight, torch.Tensor
+    ):
+        raise ValueError("expert_data and loaded_weight must be torch.Tensor")
+
     if shard_id != "w2":
         raise ValueError(f"shard_id must be 'w2', got {shard_id}")
 
     if is_bias:
+        shard_dim = -1
         shard_size = expert_data.shape[-1]
     else:
         shard_size = expert_data.shape[shard_dim]
@@ -93,12 +116,18 @@ def load_w2(
     if not use_presharded_weights:
         if not is_bias and do_transpose:
             loaded_weight = loaded_weight.transpose(-2, -1)
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
-        )
+        if is_bias:
+            load_shard = shard_size
+        elif tp_size > 1:
+            load_shard = loaded_weight.shape[shard_dim] // tp_size
+        else:
+            load_shard = shard_size
+        start = 0 if is_bias else load_shard * tp_rank
+        loaded_weight = loaded_weight.narrow(shard_dim, start, load_shard)
 
-    loaded_weight = preserve_e8m0_bytes_for_uint8_param(expert_data, loaded_weight)
-    expert_data.copy_(loaded_weight)
+    dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+    loaded_weight = preserve_e8m0_bytes_for_uint8_param(dst, loaded_weight)
+    dst.copy_(loaded_weight)
 
 
 def get_shard_dim(param: torch.Tensor, shard_id: str, do_transpose: bool) -> int:
@@ -121,6 +150,7 @@ def load_model_weight(
     is_bias: bool,
     use_presharded_weights: bool,
     do_transpose: bool,
+    tp_size: int = 1,
 ) -> None:
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
@@ -134,8 +164,9 @@ def load_model_weight(
             is_bias,
             use_presharded_weights,
             do_transpose,
+            tp_size=tp_size,
         )
-    else:
+    elif shard_id in {"w1", "w3", "w13"}:
         load_w13(
             expert_data,
             loaded_weight,
@@ -145,7 +176,10 @@ def load_model_weight(
             is_bias,
             use_presharded_weights,
             do_transpose,
+            tp_size=tp_size,
         )
+    else:
+        raise ValueError(f"Unknown shard_id: {shard_id}")
 
 
 def load_group_weight_scale(
@@ -155,6 +189,7 @@ def load_group_weight_scale(
     shard_id: str,
     tp_rank: int,
     do_transpose: bool,
+    tp_size: int = 1,
 ) -> None:
     load_model_weight(
         param,
@@ -165,6 +200,7 @@ def load_group_weight_scale(
         False,
         False,
         do_transpose,
+        tp_size=tp_size,
     )
 
 
@@ -212,6 +248,7 @@ def make_weight_loader(
         is_bias=is_bias,
         use_presharded_weights=use_presharded_weights,
         do_transpose=do_transpose,
+        tp_size=spec.tp_size,
     )
 
 
@@ -224,6 +261,7 @@ def make_group_scale_loader(
         load_group_weight_scale,
         tp_rank=spec.tp_rank,
         do_transpose=do_transpose,
+        tp_size=spec.tp_size,
     )
 
 

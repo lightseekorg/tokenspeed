@@ -330,7 +330,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 input_ids,
                 positions,
                 out_cache_loc,
-                input_lengths,
                 spec_step_idx=0,
             ):
                 self.received_spec_step_idx = spec_step_idx
@@ -349,7 +348,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
             spec_step_idx=2,
         )
 
@@ -364,7 +362,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 input_ids,
                 positions,
                 out_cache_loc,
-                input_lengths,
             ):
                 return "ok"
 
@@ -381,7 +378,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
             spec_step_idx=2,
         )
 
@@ -398,7 +394,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 input_ids,
                 positions,
                 out_cache_loc,
-                input_lengths,
                 **kwargs,
             ):
                 self.received_kwargs = kwargs
@@ -417,7 +412,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
             spec_step_idx=2,
         )
 
