@@ -96,8 +96,6 @@ def mha_prefill(
 
     # Select kernel
     traits = {
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k.shape[1],
         "head_dim": q.shape[-1],
         "sliding_window": window_left >= 0,
         "support_logit_cap": logit_cap != 0.0,
@@ -199,8 +197,6 @@ def mha_extend_with_kvcache(
     """
     # Select kernel
     traits = {
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "is_causal": is_causal,
@@ -307,8 +303,6 @@ def mha_decode_with_kvcache(
 
     # Select kernel
     traits = {
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "sliding_window": window_left >= 0,

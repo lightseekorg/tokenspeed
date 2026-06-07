@@ -130,7 +130,7 @@ class MHAAttnBackend(AttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         **kwargs,
     ):
-        assert bs == num_extends, "mha backend does not support mixed batch"
+        assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
 
         seq_lens = seq_lens[:bs]
         page_table = build_page_table(

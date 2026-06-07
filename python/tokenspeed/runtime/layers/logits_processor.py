@@ -123,7 +123,7 @@ class LogitsMetadata:
     def from_forward_context(
         cls,
         ctx: ForwardContext,
-        input_lengths: torch.Tensor,
+        input_lengths: torch.Tensor | None = None,
     ):
         logits_layout_plan = ctx.logits_layout_plan
         return cls(
@@ -285,16 +285,24 @@ class LogitsProcessor(nn.Module):
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
             gather_ids = logits_metadata.gather_ids
-            # Shapes align iff midlayer already pruned to one row per request
-            # (draft first-step reduce). Other paths emit [N, H] with N > bs.
-            if gather_ids is None or gather_ids.shape[0] == hidden_states.shape[0]:
+            if gather_ids is not None:
+                # Shapes align iff midlayer already pruned to one row per request
+                # (draft first-step reduce). Other paths emit [N, H] with N > bs.
+                if gather_ids.shape[0] == hidden_states.shape[0]:
+                    pruned_states = hidden_states
+                    if aux_hidden_states is not None:
+                        aux_pruned_states = list(aux_hidden_states)
+                else:
+                    pruned_states = hidden_states[gather_ids]
+                    if aux_hidden_states is not None:
+                        aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
+            else:
+                assert (
+                    not logits_metadata.forward_mode.is_extend_or_mixed()
+                ), "EXTEND/MIXED forward must set gather_ids on ForwardContext"
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
-            else:
-                pruned_states = hidden_states[gather_ids]
-                if aux_hidden_states is not None:
-                    aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
 
             sample_indices = None
             input_logprob_indices = None

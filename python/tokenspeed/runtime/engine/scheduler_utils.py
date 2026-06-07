@@ -153,7 +153,7 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
 def pool_to_prefix_cache_adjunct_spec(
     required_group_ids: Sequence[str],
 ) -> "PrefixCacheAdjunctSpec":
-    """Build a PrefixCacheAdjunctSpec from a non-empty required-group-id list."""
+    """Build a PrefixCacheAdjunctSpec from required group ids."""
     if not required_group_ids:
         raise ValueError(
             "pool_to_prefix_cache_adjunct_spec: required_group_ids must be non-empty"
@@ -161,6 +161,24 @@ def pool_to_prefix_cache_adjunct_spec(
     spec = PrefixCacheAdjunctSpec()
     spec.required_groups = [str(gid) for gid in required_group_ids]
     return spec
+
+
+def should_use_overlap_schedule(
+    *,
+    disable_overlap_schedule: bool,
+    disaggregation_mode: str,
+    speculative_algorithm: Any | None,
+    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+) -> bool:
+    """Return whether the runtime can use the overlapped scheduler loop."""
+
+    if disable_overlap_schedule:
+        return False
+    if disaggregation_mode == "prefill":
+        return False
+    if speculative_algorithm is not None and paged_cache_groups:
+        return False
+    return True
 
 
 def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:

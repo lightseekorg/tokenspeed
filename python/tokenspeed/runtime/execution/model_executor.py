@@ -110,6 +110,7 @@ class ModelExecutorConfig:
     spec_num_tokens: int | None = None
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
+    use_target_verify_forward_mode: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -165,6 +166,7 @@ class ModelExecutorConfig:
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
+            use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -359,6 +361,11 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
         )
 
+        # CUDA graph warmup runs the drafter with dummy data whose
+        # uninitialized KV cache produces NaN → argmax sentinel -1.
+        # Clear the residue so pool slots reused by real requests start clean.
+        self.runtime_states.future_input_map.zero_()
+
         # Encoder CUDA graph: install the model-built wrapper by overriding
         # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
         # ``CudaGraphWrapper``.
@@ -444,6 +451,20 @@ class ModelExecutor:
             multimodal_context=self._active_multimodal_context,
         )
 
+    def _apply_force_single_token_verify(
+        self,
+        accept_lengths: torch.Tensor,
+        row_offset: int,
+        row_count: int,
+        decode_input_ids: list[int] | None,
+    ) -> torch.Tensor:
+        if decode_input_ids is None or row_count <= 0:
+            return accept_lengths
+        force_mask = self.input_buffers.force_single_token_verify_buf[
+            row_offset : row_offset + row_count
+        ]
+        return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -462,9 +483,13 @@ class ModelExecutor:
             return self.sampling_backend.sample(logits_output, sampling_info)
 
         if num_extends == 0:
-            return self.sampling_backend.verify(
+            output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
+            accept_lengths = self._apply_force_single_token_verify(
+                accept_lengths, 0, num_decodes, ctx.decode_input_ids
+            )
+            return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
         prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
@@ -474,6 +499,9 @@ class ModelExecutor:
         decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
         decode_tokens, decode_accept = self.sampling_backend.verify(
             decode_out, sampling_info[num_extends:], candidates
+        )
+        decode_accept = self._apply_force_single_token_verify(
+            decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
         if (
             prefill_out.next_token_logprobs is not None
@@ -500,7 +528,9 @@ class ModelExecutor:
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
-            is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
+            is_spec_verify = n > 1 and (
+                ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()
+            )
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
@@ -519,6 +549,18 @@ class ModelExecutor:
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
         )
+
+        # Single choke point for every (sample/verify) x (greedy/flashinfer)
+        # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
+        # make cute_argmax emit the -1 sentinel. Left unclamped, that -1 poisons
+        # both consumers below -- it flows into output_ids -> detokenizer (the
+        # HF Rust tokenizer raises OverflowError on a negative id and kills the
+        # engine) and, via the drafter, back into future_input_map as the next
+        # round's input_ids (negative embedding index -> garbage / CUDA illegal
+        # access). Clamp in place (this runs inside the CUDA graph) so grammar,
+        # drafter, and the return value all observe clean ids. Mirror of the
+        # draft-side draft_ids.clamp_(min=0) guard.
+        output_tokens.clamp_(min=0)
 
         # Fork sampler-output D2H onto the grammar side stream so the
         # next step's build hostfunc can advance the matcher.
@@ -783,6 +825,7 @@ class ModelExecutor:
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
         self.log_step += 1
 
@@ -821,6 +864,7 @@ class ModelExecutor:
             dp_all_decode_or_idle,
             grammar_inputs=grammar_inputs,
             multimodal_context=multimodal_context,
+            capture_next_input_ids=capture_next_input_ids,
         )
 
         if is_decode and (
@@ -874,6 +918,7 @@ class ModelExecutor:
                     gen_throughput,
                     num_queue_reqs,
                 )
+            self.token_to_kv_pool.maybe_log_paged_cache_group_pages()
             self.num_generated_tokens = 0
             self.num_decode_steps = 0
             self.last_decode_stats_tic = now
@@ -892,6 +937,10 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
+        graph_forward_mode = ForwardMode.decode_or_target_verify(
+            has_drafter=self.drafter is not None,
+            use_target_verify=self.config.use_target_verify_forward_mode,
+        )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -899,7 +948,7 @@ class ModelExecutor:
             bs=0,
             num_extends=0,
             input_num_tokens=0,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=graph_forward_mode,
             global_num_tokens=global_num_tokens,
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
@@ -980,6 +1029,7 @@ class ModelExecutor:
                     positions=empty,
                     out_cache_loc=empty,
                     input_lengths=empty,
+                    spec_step_idx=step_idx,
                 )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
@@ -991,6 +1041,45 @@ class ModelExecutor:
                 device=self.device,
                 req_to_page=self.req_to_page,
             )
+
+    def reset_remote_prefill_mamba_inputs(self, forward_op) -> None:
+        if self.runtime_states.mamba_pool is None:
+            return
+        if not hasattr(self.attn_backend, "reset_current_inputs"):
+            return
+
+        num_extends = forward_op.num_extends()
+        if num_extends <= 0:
+            return
+
+        mamba_indices = list(getattr(forward_op, "mamba_pool_indices", []))
+        if not mamba_indices:
+            return
+
+        req_pool_indices = list(forward_op.request_pool_indices[:num_extends])
+        pairs = [
+            (int(req_pool_idx), int(mamba_idx))
+            for req_pool_idx, mamba_idx in zip(
+                req_pool_indices, mamba_indices[:num_extends]
+            )
+            if int(mamba_idx) >= 0
+        ]
+        if not pairs:
+            return
+
+        req_pool_tensor = torch.tensor(
+            [req_pool_idx for req_pool_idx, _ in pairs],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        mamba_tensor = torch.tensor(
+            [mamba_idx for _, mamba_idx in pairs],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
 
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
@@ -1132,6 +1221,7 @@ class ModelExecutor:
         dp_all_decode_or_idle: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
+        capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
@@ -1150,7 +1240,7 @@ class ModelExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
-            self.input_buffers.fill_input_buffers(
+            decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
@@ -1165,7 +1255,12 @@ class ModelExecutor:
                 total_tokens=total_tokens,
             )
 
-            forward_mode = ForwardMode.from_num_extends(num_extends, bs)
+            forward_mode = ForwardMode.from_num_extends(
+                num_extends,
+                bs,
+                has_drafter=self.drafter is not None,
+                use_target_verify=self.config.use_target_verify_forward_mode,
+            )
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs
@@ -1260,6 +1355,7 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
+                    decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -1390,8 +1486,42 @@ class ModelExecutor:
                 )
 
             with nvtx_range("output_d2h", color="green"):
-                output_tokens = output_tokens.to("cpu", non_blocking=True)
-                output_lengths = output_lengths.to("cpu", non_blocking=True)
+                next_input_ids = None
+                if (
+                    capture_next_input_ids
+                    and self.drafter is not None
+                    and num_extends > 0
+                ):
+                    next_input_ids = self.runtime_states.future_input_map.index_select(
+                        0, self.input_buffers.req_pool_indices_buf[:num_extends]
+                    ).to("cpu", non_blocking=True)
+
+                # Defensive clamp into the valid vocab range (kept from the
+                # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
+                # value surfaced by the intermittent spec-decode decode-state race
+                # -- would otherwise reach the detokenizer, whose HF
+                # tokenizer.decode raises a fatal OverflowError on ids outside
+                # [0, vocab) and tears down the whole server process tree.
+                # It must run on-GPU *before* the non_blocking D2H: clamping the
+                # CPU result afterwards would race the in-flight copy. In-place
+                # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
+                # the get_packed_output_d2h data_ptr fast-path still fires -- and
+                # in-place on the forward's inference tensors is only legal inside
+                # inference mode, so re-enter it (maybe_inference_mode mirrors the
+                # forward and reduces to no_grad when inference mode is disabled,
+                # where output_tokens isn't an inference tensor anyway).
+                vocab_size = self.runtime_states.vocab_size
+                with maybe_inference_mode():
+                    output_tokens.clamp_(0, vocab_size - 1)
+
+                packed = self.sampling_backend.get_packed_output_d2h(
+                    output_tokens, output_lengths
+                )
+                if packed is not None:
+                    output_tokens, output_lengths = packed
+                else:
+                    output_tokens = output_tokens.to("cpu", non_blocking=True)
+                    output_lengths = output_lengths.to("cpu", non_blocking=True)
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
@@ -1405,7 +1535,19 @@ class ModelExecutor:
             output_logprobs=output_logprobs,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
+            next_input_ids=next_input_ids,
         )
+
+    def write_remote_spec_candidate_ids(
+        self, req_pool_idx: int, candidate_ids: list[int]
+    ) -> None:
+        # Remote spec candidates are CPU materialized; enqueue the H2D copy and
+        # future_input_map update on execution_stream. The next forward's input
+        # prep already waits on execution_stream before reading runtime state.
+        with torch.cuda.stream(self.execution_stream):
+            self.runtime_states.write_remote_spec_candidate_ids(
+                req_pool_idx, candidate_ids
+            )
 
     def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
         # Cache delta expansion for retracted/chunked requests.

@@ -16,9 +16,8 @@ import torch
 
 from tokenspeed.runtime.layers.logits_processor import fused_softcap
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_softcap_handles_large_logits_without_nan():
     cap = 30.0
     logits = torch.tensor(

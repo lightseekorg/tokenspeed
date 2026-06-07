@@ -52,6 +52,9 @@ class RuntimeStates:
         self.future_input_map = torch.empty(
             (req_pool_size + 1, output_length), dtype=torch.int32, device=device
         )
+        self.remote_spec_candidate_ready = torch.zeros(
+            req_pool_size + 1, dtype=torch.bool, device=device
+        )
         self.linear_penalties = torch.zeros(
             (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
         )
@@ -73,6 +76,24 @@ class RuntimeStates:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
         self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
         self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
+        self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+
+    def write_remote_spec_candidate_ids(
+        self, req_pool_idx: int, candidate_ids: list[int]
+    ) -> None:
+        width = self.future_input_map.shape[1]
+        if len(candidate_ids) != width:
+            raise RuntimeError(
+                f"remote spec candidate width mismatch: got {len(candidate_ids)}, expected {width}"
+            )
+        ids = torch.tensor(
+            candidate_ids,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        self.future_input_map[req_pool_idx, :width] = ids
+        self.remote_spec_candidate_ready[req_pool_idx] = True
 
     def copy_mamba_states(
         self,

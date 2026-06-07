@@ -870,7 +870,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         **kwargs,
     ):
         if self.language_model is None:
@@ -897,7 +896,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
             input_ids,
             positions,
             out_cache_loc,
-            input_lengths,
             **kwargs,
         )
 

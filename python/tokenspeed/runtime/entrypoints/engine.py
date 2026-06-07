@@ -300,6 +300,18 @@ class Engine(EngineBase):
     def flush_cache(self):
         return self.llm.run(self.tokenizer_manager.flush_cache())
 
+    def pause_scheduler(self, mode: str = "abort"):
+        """Pause generation (e.g. to swap weights). See AsyncLLM.pause_scheduler."""
+        return self.llm.run(self.tokenizer_manager.pause_scheduler(mode=mode))
+
+    def resume_scheduler(self):
+        """Resume generation after :meth:`pause_scheduler`."""
+        return self.llm.run(self.tokenizer_manager.resume_scheduler())
+
+    def is_scheduler_paused(self):
+        """Return whether the scheduler is currently paused."""
+        return self.llm.run(self.tokenizer_manager.is_scheduler_paused())
+
     def start_profile(self):
         self.llm.run(self.tokenizer_manager.start_profile())
 

@@ -24,6 +24,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Set, Union
 
+import numpy as np
 import requests
 
 from tokenspeed.runtime.pd.base.conn import (
@@ -53,6 +54,19 @@ class PrefillParallelInfo:
     @property
     def prefill_tp_size_per_dp_rank(self):
         return self.tp_size // self.dp_size
+
+
+def parse_prefill_status_message(
+    parts: list[bytes],
+) -> tuple[int, int, int, int, list[int] | None]:
+    bootstrap_room = int(parts[0].decode("ascii"))
+    status = int(parts[1].decode("ascii"))
+    prefill_rank = int(parts[2].decode("ascii"))
+    bootstrap_token = int(parts[3].decode("ascii")) if len(parts) > 3 else -1
+    spec_candidate_ids = None
+    if len(parts) > 4 and parts[4] != b"":
+        spec_candidate_ids = np.frombuffer(parts[4], dtype=np.int32).copy().tolist()
+    return bootstrap_room, status, prefill_rank, bootstrap_token, spec_candidate_ids
 
 
 class MooncakeKVManagerDecode(MooncakeKVManagerBase):
@@ -96,17 +110,18 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # Populated by decode_thread when a Success message carries a valid token,
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
         self.bootstrap_token_table: Dict[int, int] = {}
+        self.spec_candidate_ids_table: Dict[int, list[int]] = {}
 
         def decode_thread():
             while True:
                 parts = self.server_socket.recv_multipart()
-                bootstrap_room = int(parts[0].decode("ascii"))
-                status = int(parts[1].decode("ascii"))
-                prefill_rank = int(parts[2].decode("ascii"))
-                # 4th field carries bootstrap_token (-1 means unavailable)
-                bootstrap_token = (
-                    int(parts[3].decode("ascii")) if len(parts) > 3 else -1
-                )
+                (
+                    bootstrap_room,
+                    status,
+                    prefill_rank,
+                    bootstrap_token,
+                    spec_candidate_ids,
+                ) = parse_prefill_status_message(parts)
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
@@ -123,6 +138,10 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                             if bootstrap_token != -1:
                                 self.bootstrap_token_table[bootstrap_room] = (
                                     bootstrap_token
+                                )
+                            if spec_candidate_ids is not None:
+                                self.spec_candidate_ids_table[bootstrap_room] = (
+                                    spec_candidate_ids
                                 )
                             self.update_status(bootstrap_room, KVPoll.Success)
                 if status == KVPoll.Failed:
@@ -192,6 +211,12 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
     def pop_bootstrap_token(self, bootstrap_room: int) -> int:
         """Pop and return the bootstrap_token for the given room, or -1 if absent."""
         return self.bootstrap_token_table.pop(bootstrap_room, -1)
+
+    def pop_prefill_metadata(self, bootstrap_room: int) -> tuple[int, list[int] | None]:
+        return (
+            self.bootstrap_token_table.pop(bootstrap_room, -1),
+            self.spec_candidate_ids_table.pop(bootstrap_room, None),
+        )
 
     def get_session_id(self):
         return self.engine.get_session_id()

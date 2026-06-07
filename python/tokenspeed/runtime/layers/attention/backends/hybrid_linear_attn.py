@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from tokenspeed_kernel.ops.attention.flashinfer import (
+    gated_delta_rule as gdn_flashinfer,
+)
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -45,6 +48,7 @@ from tokenspeed.runtime.layers.attention.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
+from tokenspeed.runtime.layers.attention.linear.l2norm import l2norm_fwd
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -412,6 +416,7 @@ class MambaAttnBackend(AttentionBackend):
             config, "speculative_num_draft_tokens", 0
         )
         self.pool: SimpleMambaPool = None
+        self._gdn_fastpath_checked = False
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
@@ -1100,17 +1105,34 @@ class MambaAttnBackend(AttentionBackend):
                     output_h=True,
                 )
             else:
-                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
+                if not self._gdn_fastpath_checked:
+                    if not (
+                        gdn_flashinfer.is_supported(
+                            head_k_dim, query.dtype, num_heads, num_value_heads
+                        )
+                        and head_v_dim == head_k_dim
+                    ):
+                        raise RuntimeError(
+                            "GDN prefill requires the flashinfer Blackwell fast-path "
+                            "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
+                            "head_v == head_k + num_v >= num_q). Got "
+                            f"dtype={query.dtype}, head_k={head_k_dim}, "
+                            f"head_v={head_v_dim}, num_q={num_heads}, "
+                            f"num_v={num_value_heads}, "
+                            f"sm100_available={gdn_flashinfer.is_available()}."
+                        )
+                    self._gdn_fastpath_checked = True
+                # sm100 fast-path. q/k l2norm here since the kernel ignores its
+                # own flag; the wrapper handles the gate/beta/state conventions.
+                core_attn_out, last_recurrent_state = gdn_flashinfer.gdn_chunk_prefill(
+                    l2norm_fwd(query),
+                    l2norm_fwd(key),
+                    value,
+                    g,
+                    beta,
+                    scale=head_k_dim**-0.5,
                     initial_state=recurrent_state,
-                    output_final_state=True,
                     cu_seqlens=query_start_loc,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
                 )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
