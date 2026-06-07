@@ -12,7 +12,7 @@ import torch
 from tokenspeed.runtime.utils import ceil_div
 
 try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
+    from tokenspeed_kernel_nvidia.thirdparty import deep_gemm
 except Exception:
     deep_gemm = None  # type: ignore[assignment]
 

@@ -25,7 +25,7 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from tokenspeed_kernel.ops.moe.deepep import Buffer
+from tokenspeed_kernel_nvidia.moe.deepep import Buffer
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.moe.config import ExpertParallelConfig

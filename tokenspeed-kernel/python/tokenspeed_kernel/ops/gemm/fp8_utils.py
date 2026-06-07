@@ -39,7 +39,7 @@ _trtllm_per_token_quant_fp8 = error_fn
 
 if _is_nvidia:
     try:
-        from tokenspeed_kernel.ops.quantization.flashinfer import (
+        from tokenspeed_kernel_nvidia.quantization.flashinfer import (
             fp8_blockscale_quantize_runner_sm90 as _flashinfer_fp8_blockscale_quantize_runner_sm90,
         )
         from tokenspeed_kernel_nvidia.thirdparty.trtllm import (

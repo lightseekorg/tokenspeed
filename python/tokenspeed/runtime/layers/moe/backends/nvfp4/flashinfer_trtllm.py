@@ -35,14 +35,14 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_nvidia.moe.flashinfer import (
     _maybe_get_cached_w3_w1_permute_indices,
     get_w2_permute_indices_with_cache,
 )
-from tokenspeed_kernel.ops.quantization.flashinfer import (
+from tokenspeed_kernel_nvidia.quantization.flashinfer import (
     nvfp4_block_scale_interleave,
 )
-from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
@@ -288,7 +288,7 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
         do_finalize: bool = True,
     ) -> torch.Tensor:
         del num_global_tokens, max_num_tokens_per_gpu
-        from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+        from tokenspeed_kernel_nvidia.quantization.flashinfer import fp4_quantize
 
         x = hidden_states
         num_tokens = x.shape[0]

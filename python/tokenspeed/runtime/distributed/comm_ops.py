@@ -29,7 +29,7 @@ from enum import IntEnum
 
 import torch
 import torch.distributed
-from tokenspeed_kernel.ops.communication.trtllm import (
+from tokenspeed_kernel_nvidia.communication.trtllm import (
     allgather_dual_rmsnorm,
     allreduce_residual_rmsnorm,
     reducescatter_residual_rmsnorm,

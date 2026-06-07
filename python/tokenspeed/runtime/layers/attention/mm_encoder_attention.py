@@ -58,8 +58,8 @@ _is_nvidia = _platform.is_nvidia
 _is_amd = _platform.is_amd
 
 if _is_nvidia:
-    from tokenspeed_kernel.ops.attention.flash_attn import flash_attn_varlen_func
-    from tokenspeed_kernel.ops.attention.flashinfer import (
+    from tokenspeed_kernel_nvidia.attention.flash_attn import flash_attn_varlen_func
+    from tokenspeed_kernel_nvidia.attention.flashinfer import (
         cudnn_batch_prefill_with_kv_cache,
     )
 

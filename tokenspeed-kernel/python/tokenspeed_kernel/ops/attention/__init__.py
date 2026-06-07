@@ -31,7 +31,7 @@ AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 
 def mha_decode_scheduler_metadata(*args, **kwargs):
-    from tokenspeed_kernel.ops.attention.flash_attn import (
+    from tokenspeed_kernel_nvidia.attention.flash_attn import (
         mha_decode_scheduler_metadata as _mha_decode_scheduler_metadata,
     )
 

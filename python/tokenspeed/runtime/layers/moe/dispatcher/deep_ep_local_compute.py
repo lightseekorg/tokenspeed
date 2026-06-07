@@ -21,13 +21,13 @@
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.activation.flashinfer import silu_and_mul
-from tokenspeed_kernel.ops.gemm.deep_gemm import (
+from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+from tokenspeed_kernel_nvidia.activation.flashinfer import silu_and_mul
+from tokenspeed_kernel_nvidia.gemm.deep_gemm import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_masked,
 )
-from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-from tokenspeed_kernel.ops.moe.deepep import (
+from tokenspeed_kernel_nvidia.moe.deepep import (
     get_tma_aligned_size,
     tma_align_input_scale,
 )
@@ -213,7 +213,7 @@ class DeepExecutor:
             device,
         )
 
-        from tokenspeed_kernel.ops.activation.cuda import (
+        from tokenspeed_kernel_nvidia.activation.cuda import (
             silu_and_mul_fuse_block_quant,
         )
 

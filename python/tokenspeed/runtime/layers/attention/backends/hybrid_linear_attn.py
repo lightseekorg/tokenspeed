@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from tokenspeed_kernel.ops.attention.flashinfer import (
+from tokenspeed_kernel_nvidia.attention.flashinfer import (
     gated_delta_rule as gdn_flashinfer,
 )
 

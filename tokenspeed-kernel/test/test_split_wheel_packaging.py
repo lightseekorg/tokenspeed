@@ -166,29 +166,23 @@ def test_package_mode_boundaries() -> None:
         assert all(pkg == prefix or pkg.startswith(prefix + ".") for pkg in packages)
 
 
-def test_load_builtin_kernels_without_vendor_packages() -> None:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PYTHON_ROOT)
-    code = """
-import importlib.abc
-import sys
+def test_vendor_registration_loaders_skip_missing_vendor_package(monkeypatch) -> None:
+    from tokenspeed_kernel.registrations import amd, nvidia
 
+    real_import_module = importlib.import_module
 
-class BlockVendorPackages(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == "tokenspeed_kernel_nvidia" or fullname.startswith("tokenspeed_kernel_nvidia."):
-            raise ModuleNotFoundError(fullname)
-        if fullname == "tokenspeed_kernel_amd" or fullname.startswith("tokenspeed_kernel_amd."):
-            raise ModuleNotFoundError(fullname)
-        return None
+    def fake_import_module(name: str, *args, **kwargs):
+        if name in {
+            "tokenspeed_kernel_nvidia.registration",
+            "tokenspeed_kernel_amd.registration",
+        }:
+            raise ImportError(name)
+        return real_import_module(name, *args, **kwargs)
 
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
 
-sys.meta_path.insert(0, BlockVendorPackages())
-from tokenspeed_kernel.registry import load_builtin_kernels
-
-load_builtin_kernels()
-"""
-    subprocess.run([sys.executable, "-c", code], env=env, check=True)
+    nvidia.load()
+    amd.load()
 
 
 def test_wheel_artifact_boundaries(tmp_path) -> None:
@@ -202,12 +196,8 @@ def test_wheel_artifact_boundaries(tmp_path) -> None:
         name.startswith(("tokenspeed_kernel_nvidia/", "tokenspeed_kernel_amd/"))
         for name in core_names
     )
-    core_thirdparty_names = [
-        name for name in core_names if name.startswith("tokenspeed_kernel/thirdparty/")
-    ]
-    assert core_thirdparty_names
     assert not any(
-        name.endswith((".cu", ".cuh", ".so")) for name in core_thirdparty_names
+        name.startswith("tokenspeed_kernel/thirdparty/") for name in core_names
     )
 
     for mode, prefix in (

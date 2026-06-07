@@ -24,15 +24,15 @@ import importlib
 import math
 
 import pytest
-import tokenspeed_kernel.ops.attention.flash_attn as flash_attn_module
+import tokenspeed_kernel_nvidia.attention.flash_attn as flash_attn_module
 import torch
-from tokenspeed_kernel.ops.attention.flash_attn import (
-    flash_attn_func,
-    flash_attn_varlen_func,
-)
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel_nvidia.attention.flash_attn import (
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 
 platform = current_platform()
 torch.manual_seed(42)

@@ -36,7 +36,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 _is_amd = current_platform().is_amd
 
 if not _is_amd:
-    from tokenspeed_kernel.ops.activation.flashinfer import (
+    from tokenspeed_kernel_nvidia.activation.flashinfer import (
         silu_and_mul,
     )
 
@@ -67,7 +67,7 @@ class SiluAndMul(torch.nn.Module):
                     output_shape, dtype=torch.float8_e4m3fn, device=x.device
                 )
                 scale = get_tma_aligned_scale(out)
-                from tokenspeed_kernel.ops.activation.cuda import (
+                from tokenspeed_kernel_nvidia.activation.cuda import (
                     silu_and_mul_fuse_block_quant,
                 )
 

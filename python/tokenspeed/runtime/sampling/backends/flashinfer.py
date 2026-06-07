@@ -23,22 +23,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.cuda import (
+from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.torch_compile import get_compiler_backend
+from tokenspeed_kernel_nvidia.sampling.cuda import (
     chain_speculative_sampling_target_only,
     fused_topk_topp_prepare,
     fused_topk_topp_renorm,
     verify_chain_greedy,
 )
-from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
-from tokenspeed_kernel.ops.sampling.flashinfer import (
+from tokenspeed_kernel_nvidia.sampling.cute_dsl import argmax as cute_argmax
+from tokenspeed_kernel_nvidia.sampling.flashinfer import (
     softmax,
     top_k_renorm_prob,
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
 )
-from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 # Resolved once at import: the fused top-k + top-p kernel is NVIDIA-only.
 # On non-NVIDIA platforms (e.g. ROCm) we fall back to the back-to-back

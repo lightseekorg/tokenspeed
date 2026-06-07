@@ -22,15 +22,15 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling.cuda import (
-    fused_topk_topp_renorm,
-    fused_topk_topp_workspace_size,
-)
 from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_nvidia.sampling.cuda import (
+    fused_topk_topp_renorm,
+    fused_topk_topp_workspace_size,
+)
 
 # Sentinel matching tokenspeed.runtime.sampling.sampling_params._TOP_K_DISABLED.
 _TOP_K_DISABLED = 1 << 30

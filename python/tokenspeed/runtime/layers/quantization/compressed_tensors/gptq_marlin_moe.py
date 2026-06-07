@@ -38,7 +38,7 @@ def gptq_marlin_moe_repack(
     size_n: int,
     num_bits: int,
 ) -> torch.Tensor:
-    from tokenspeed_kernel.ops.quantization.cuda import gptq_marlin_repack
+    from tokenspeed_kernel_nvidia.quantization.cuda import gptq_marlin_repack
 
     num_experts = b_q_weight.shape[0]
     assert size_k % 16 == 0

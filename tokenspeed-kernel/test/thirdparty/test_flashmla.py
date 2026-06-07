@@ -24,11 +24,11 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.flash_mla import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_nvidia.attention.flash_mla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
-from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
 torch.manual_seed(42)

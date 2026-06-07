@@ -22,28 +22,32 @@ from __future__ import annotations
 
 import importlib
 import logging
-import sys
+
+from tokenspeed_kernel.registrations import apply_vendor_registrations
 
 logger = logging.getLogger(__name__)
 
 _MODULES = (
-    "tokenspeed_kernel.ops.attention.gluon",
-    "tokenspeed_kernel.ops.moe.gluon",
+    "tokenspeed_kernel_amd.attention.gluon",
+    "tokenspeed_kernel_amd.moe.gluon",
 )
 
 
-def _import_or_reload(module_name: str) -> None:
-    if module_name in sys.modules:
-        importlib.reload(sys.modules[module_name])
-    else:
-        importlib.import_module(module_name)
-
-
 def load() -> None:
+    try:
+        registration = importlib.import_module("tokenspeed_kernel_amd.registration")
+    except ImportError as exc:
+        logger.debug("Skipping AMD registrations: %s", exc)
+        return
+
+    registrations = registration.REGISTRATIONS
+    registrations.clear()
     for module_name in _MODULES:
         try:
-            _import_or_reload(module_name)
+            module = importlib.import_module(module_name)
+            importlib.reload(module)
         except ImportError as exc:
             logger.debug(
                 "Skipping built-in registration module %s: %s", module_name, exc
             )
+    apply_vendor_registrations(registrations)

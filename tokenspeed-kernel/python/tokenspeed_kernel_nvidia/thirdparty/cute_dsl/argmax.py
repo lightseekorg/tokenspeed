@@ -24,7 +24,7 @@
 #
 # This module pulls in ``cuda.bindings.driver`` and ``cutlass``, which are
 # NVIDIA-only Python packages. **Do not import this module directly from the
-# runtime.** Use ``tokenspeed_kernel.ops.sampling.cute_dsl`` instead — that
+# runtime.** Use ``tokenspeed_kernel_nvidia.sampling.cute_dsl`` instead — that
 # wrapper gates on ``current_platform().is_nvidia`` before importing this file
 # and falls back to ``torch.argmax`` on every other platform.
 

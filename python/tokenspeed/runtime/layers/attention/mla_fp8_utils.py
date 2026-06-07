@@ -21,7 +21,7 @@
 """Shared utilities for MLA FP8 attention backends."""
 
 import torch
-from tokenspeed_kernel.ops.embedding.flashinfer import mla_rope_quantize_fp8
+from tokenspeed_kernel_nvidia.embedding.flashinfer import mla_rope_quantize_fp8
 
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
