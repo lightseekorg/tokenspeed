@@ -391,7 +391,6 @@ def mla_prefill(
     max_seqlen_kv: int,
     softmax_scale: float,
     # attention options
-    *,
     seq_lens_kv: torch.Tensor | None = None,
     batch_size: int | None = None,
     is_causal: bool = True,
@@ -459,7 +458,6 @@ def mla_decode_with_kvcache(
     qk_rope_head_dim: int,
     softmax_scale: float,
     # attention options
-    *,
     logit_cap: float = 0.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
