@@ -26,17 +26,7 @@ import tokenspeed_kernel.ops.communication.flashinfer as custom_ar_ops
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import ErrorClass
-
-_platform = current_platform()
-
-if _platform.is_nvidia:
-    try:
-        from tokenspeed_kernel_nvidia.thirdparty.cuda.cuda_ipc import CudaRTLibrary
-    except ImportError:
-        CudaRTLibrary = ErrorClass
-else:
-    CudaRTLibrary = ErrorClass
+from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import CudaRTLibrary
 from torch.distributed import ProcessGroup
 
 from tokenspeed.runtime.distributed.device_communicators.utils import (
@@ -47,7 +37,7 @@ from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
-custom_ar = _platform.is_nvidia
+custom_ar = current_platform().is_nvidia
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:

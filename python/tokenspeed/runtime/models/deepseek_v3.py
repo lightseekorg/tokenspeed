@@ -41,17 +41,7 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
-
-_platform = current_platform()
-
-if _platform.is_nvidia:
-    try:
-        from tokenspeed_kernel_nvidia.thirdparty.cuda.merge_state import merge_state
-    except ImportError:
-        merge_state = error_fn
-else:
-    merge_state = error_fn
+from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -68,6 +58,7 @@ from tokenspeed.runtime.layers.utils import (
     get_layer_id,
 )
 
+_platform = current_platform()
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor

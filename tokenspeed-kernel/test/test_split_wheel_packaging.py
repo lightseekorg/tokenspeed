@@ -202,8 +202,12 @@ def test_wheel_artifact_boundaries(tmp_path) -> None:
         name.startswith(("tokenspeed_kernel_nvidia/", "tokenspeed_kernel_amd/"))
         for name in core_names
     )
+    core_thirdparty_names = [
+        name for name in core_names if name.startswith("tokenspeed_kernel/thirdparty/")
+    ]
+    assert core_thirdparty_names
     assert not any(
-        name.startswith("tokenspeed_kernel/thirdparty/") for name in core_names
+        name.endswith((".cu", ".cuh", ".so")) for name in core_thirdparty_names
     )
 
     for mode, prefix in (

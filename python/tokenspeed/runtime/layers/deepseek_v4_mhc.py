@@ -8,16 +8,12 @@ import math
 from functools import cache
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import ceil_div
 
-if current_platform().is_nvidia:
-    try:
-        from tokenspeed_kernel_nvidia.thirdparty import deep_gemm
-    except Exception:
-        deep_gemm = None  # type: ignore[assignment]
-else:
+try:
+    from tokenspeed_kernel.thirdparty import deep_gemm
+except Exception:
     deep_gemm = None  # type: ignore[assignment]
 
 try:

@@ -58,7 +58,6 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_FP8_MAX,
@@ -186,12 +185,8 @@ def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
 
 
 def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
-    if not current_platform().is_nvidia:
-        raise RuntimeError(
-            "DeepSeek V4 CSA indexer requires the NVIDIA fast_hadamard_transform backend."
-        )
     try:
-        from tokenspeed_kernel_nvidia.thirdparty.fast_hadamard_transform import (
+        from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
             hadamard_transform,
         )
     except Exception as exc:
