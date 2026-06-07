@@ -22,6 +22,7 @@ import tokenspeed_kernel.ops.moe_v2.flashinfer.cutedsl_deep_nvfp4  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.flashinfer.cutlass_fp8  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.flashinfer.cutlass_nvfp4  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.flashinfer.cutlass_unquant  # noqa: F401
+import tokenspeed_kernel.ops.moe_v2.flashinfer.trtllm_mxfp4  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.flashinfer.trtllm_nvfp4  # noqa: F401
 import tokenspeed_kernel.ops.moe_v2.flashinfer.trtllm_unquant  # noqa: F401
 
