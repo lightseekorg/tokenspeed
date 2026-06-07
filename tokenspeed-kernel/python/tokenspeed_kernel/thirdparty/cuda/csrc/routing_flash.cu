@@ -228,11 +228,11 @@ __device__ void reduce_topk(
 // Ported from TRT-LLM customMoeRoutingKernels.cu (Apache-2.0).
 // Supports any nExperts (256, 384, etc.) via template parameter.
 // ---------------------------------------------------------------------------
-template <int nExperts, int topK, bool hash>
+template <int nExperts, int topK, bool hash, typename TokenIdT = int>
 __global__ void gate_forward_kernel(
     const float* __restrict__ scores_in,
     const float* __restrict__ bias,
-    const int* __restrict__ input_ids,
+    const TokenIdT* __restrict__ input_ids,
     const int* __restrict__ tid2eid,
     float* __restrict__ out_weights,
     int* __restrict__ out_indices,
@@ -268,7 +268,7 @@ __global__ void gate_forward_kernel(
   int my_topk_index = 0;
 
   if constexpr (hash) {
-    int token_id = input_ids[global_warp_id];
+    int token_id = static_cast<int>(input_ids[global_warp_id]);
     const int* expert_ids = tid2eid + token_id * topK;
     if (lane_id < topK) {
       int expert_id = expert_ids[lane_id];
@@ -336,9 +336,9 @@ __global__ void gate_forward_kernel(
     }                                                                                     \
   }()
 
-template <int nExperts>
+template <int nExperts, typename TokenIdT = int>
 void launch_gate_forward(
-    const float* scores_in, const float* bias, const int* input_ids,
+    const float* scores_in, const float* bias, const TokenIdT* input_ids,
     const int* tid2eid, float* out_weights, int* out_indices,
     int batch_size, float route_scale, bool is_hash, cudaStream_t stream) {
   constexpr int kTopK = 6;
@@ -346,12 +346,12 @@ void launch_gate_forward(
   constexpr int threads_per_block = warps_per_block * 32;
   int const blocks = (batch_size + warps_per_block - 1) / warps_per_block;
   if (is_hash) {
-    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, true>
+    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, true, TokenIdT>
         <<<blocks, threads_per_block, 0, stream>>>(
             scores_in, nullptr, input_ids, tid2eid,
             out_weights, out_indices, batch_size, route_scale);
   } else {
-    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, false>
+    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, false, TokenIdT>
         <<<blocks, threads_per_block, 0, stream>>>(
             scores_in, bias, nullptr, nullptr,
             out_weights, out_indices, batch_size, route_scale);
@@ -394,13 +394,15 @@ void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
   auto* scores = static_cast<const float*>(input.data_ptr());
 
   if (num_experts == 256) {
-    launch_gate_forward<256>(scores, bias_ptr, nullptr, nullptr,
-                             out_w, out_i, num_rows, routed_scaling_factor,
-                             false, stream);
+    launch_gate_forward<256, int>(scores, bias_ptr,
+                                  static_cast<const int*>(nullptr), nullptr,
+                                  out_w, out_i, num_rows, routed_scaling_factor,
+                                  false, stream);
   } else {
-    launch_gate_forward<384>(scores, bias_ptr, nullptr, nullptr,
-                             out_w, out_i, num_rows, routed_scaling_factor,
-                             false, stream);
+    launch_gate_forward<384, int>(scores, bias_ptr,
+                                  static_cast<const int*>(nullptr), nullptr,
+                                  out_w, out_i, num_rows, routed_scaling_factor,
+                                  false, stream);
   }
 
   cudaError_t err = cudaGetLastError();
@@ -443,17 +445,30 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
   auto* out_w = static_cast<float*>(topk_weights.data_ptr());
   auto* out_i = reinterpret_cast<int*>(topk_indices.data_ptr());
   auto* scores = static_cast<const float*>(input.data_ptr());
-  auto* ids = static_cast<const int*>(input_ids.data_ptr());
   auto* tid2eid = static_cast<const int*>(hash_indices_table.data_ptr());
 
-  if (num_experts == 256) {
-    launch_gate_forward<256>(scores, nullptr, ids, tid2eid,
-                             out_w, out_i, num_rows, routed_scaling_factor,
-                             true, stream);
+  // input_ids holds token ids and is commonly int64 (torch.long); also accept
+  // int32. Dispatch on the real dtype so the kernel reads the ids correctly.
+  auto dispatch = [&](auto* ids) {
+    using TokenIdT = std::remove_const_t<std::remove_pointer_t<decltype(ids)>>;
+    if (num_experts == 256) {
+      launch_gate_forward<256, TokenIdT>(scores, nullptr, ids, tid2eid,
+                                         out_w, out_i, num_rows,
+                                         routed_scaling_factor, true, stream);
+    } else {
+      launch_gate_forward<384, TokenIdT>(scores, nullptr, ids, tid2eid,
+                                         out_w, out_i, num_rows,
+                                         routed_scaling_factor, true, stream);
+    }
+  };
+
+  if (input_ids.dtype() == dl_int32) {
+    dispatch(static_cast<const int32_t*>(input_ids.data_ptr()));
+  } else if (input_ids.dtype() == dl_int64) {
+    dispatch(static_cast<const int64_t*>(input_ids.data_ptr()));
   } else {
-    launch_gate_forward<384>(scores, nullptr, ids, tid2eid,
-                             out_w, out_i, num_rows, routed_scaling_factor,
-                             true, stream);
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "hash router input_ids must be int32 or int64";
   }
 
   cudaError_t err = cudaGetLastError();
