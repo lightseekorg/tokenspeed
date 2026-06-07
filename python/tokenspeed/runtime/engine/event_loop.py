@@ -828,17 +828,40 @@ class EventLoop:
     # Shared step helpers
     # ------------------------------------------------------------------
 
-    def _spec_already_finished(self, spec) -> bool:
-        """True if a buffered request was aborted/finished while paused.
+    def _reap_or_keep_buffered_spec(self, spec) -> bool:
+        """Resolve a buffered spec on resume; return True if it should be admitted.
 
-        A missing state means it was already published and reaped; a finished
-        state means it was aborted in place. Either way it must not be (re)admitted.
+        A buffered spec was already registered in ``rid_to_state`` before it was
+        withheld, so if it was aborted while paused it never reached the
+        scheduler and the forward path can never reap it. Handle that here:
+
+        - state missing  -> already published and reaped; drop silently.
+        - state finished -> aborted in place. Stream a terminating finish for
+          pause-initiated aborts (the passive client is still waiting) and drop
+          the registered state so the rid does not leak; client-initiated aborts
+          already tore down their own state, so just reap.
+        - otherwise      -> still live; admit it.
         """
         state = self.output_processor.rid_to_state.get(spec.request_id)
-        return state is None or state.finished
+        if state is None:
+            return False
+        if state.finished:
+            if state.abort_notify_client:
+                self.output_processor.publish_finished_at_admission(
+                    spec.request_id, state
+                )
+            else:
+                self.output_processor.rid_to_state.pop(spec.request_id, None)
+            return False
+        return True
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
+        # Snapshot the pause state before dispatch: process_requests may flip it
+        # mid-batch. If it was not blocked before but is after, a pause control
+        # message was processed in this very batch — which is what makes the
+        # FIFO edge below detectable (see TODO(pause-fifo)).
+        pause_blocked_before = self._pause.admit_blocked
         new_req_specs, new_req_states, bootstrap_infos, abort_rids = (
             self.request_handler.process_requests(recv_reqs)
         )
@@ -879,14 +902,15 @@ class EventLoop:
         # On resume, flush specs buffered while paused even when no new request
         # arrives this iteration. This must run before the ``if not ready:
         # return`` guard below, which would otherwise strand buffered specs
-        # until the next inbound request. Skip any that were aborted while
-        # paused (state already finished) so they don't burn a scheduler slot
-        # and a forward pass before the output processor reaps them.
+        # until the next inbound request. Specs aborted while paused are reaped
+        # in place (terminating finish + state cleanup) rather than admitted, so
+        # they don't burn a scheduler slot or leak their rid — see
+        # ``_reap_or_keep_buffered_spec``.
         if not self._pause.admit_blocked and self._pause.buffered_specs:
             specs = [
                 spec
                 for spec in self._pause.take_buffered_specs()
-                if not self._spec_already_finished(spec)
+                if self._reap_or_keep_buffered_spec(spec)
             ]
             if specs:
                 self.scheduler.submit_requests(specs)
@@ -956,7 +980,26 @@ class EventLoop:
         # Pause gate: while paused, withhold new requests from the scheduler
         # (running requests keep stepping); buffered specs are flushed on resume
         # above, ahead of any newly-admitted ones, preserving FIFO order.
+        #
+        # TODO(pause-fifo): recv_reqs() drains the socket non-blocking, so a
+        # generate request that arrived *before* a pause control message can be
+        # coalesced into the same batch and reach here after the pause flipped
+        # admit_blocked. Such a pre-pause request is buffered as post-pause work
+        # instead of running (wait) / being aborted (abort). Correct handling
+        # needs the batch processed as an ordered stream that respects the
+        # control request's FIFO position. Tracked as a follow-up; until then we
+        # warn when the coalescing condition is observed so it is not silent.
         if self._pause.admit_blocked:
+            if admitted_specs and not pause_blocked_before:
+                logger.warning(
+                    "Pause engaged in the same recv batch as %d generate "
+                    "request(s) (rids=%s); their FIFO order relative to the "
+                    "pause is not preserved, so a pre-pause request may be "
+                    "buffered as post-pause work and run only after resume. "
+                    "See TODO(pause-fifo).",
+                    len(admitted_specs),
+                    [spec.request_id for spec in admitted_specs],
+                )
             self._pause.buffer_specs(admitted_specs)
             return
 

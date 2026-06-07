@@ -134,6 +134,35 @@ def test_abort_mode_defers_reply_until_drained():
     assert len(sender.items) == 1
 
 
+def test_second_pause_while_draining_is_rejected():
+    # A second abort/wait pause arriving before the first drains must be
+    # rejected: otherwise it would overwrite the deferred reply and strand the
+    # first caller forever on its ZMQ await.
+    ctrl, sender = _controller()
+    ctrl.handle_pause(PauseSchedulerReqInput(mode="abort"))
+    ctrl.consume_abort_all()  # first pause armed its abort-all
+    ctrl.consume_cancel_grammar()  # ...and its grammar-queue cancel
+    assert sender.items == []  # first reply still deferred
+
+    # Second pause (any mode) is rejected with a failure, leaving the first
+    # pause's pending reply intact.
+    for mode in ("abort", "wait", "keep"):
+        sender.items.clear()
+        ctrl.handle_pause(PauseSchedulerReqInput(mode=mode))
+        assert len(sender.items) == 1
+        assert isinstance(sender.items[0], PauseSchedulerReqOutput)
+        assert not sender.items[0].success
+        # Rejected pause does not re-arm abort-all / grammar cancel.
+        assert not ctrl.consume_abort_all()
+        assert not ctrl.consume_cancel_grammar()
+
+    # The original pause still resolves normally once the scheduler drains.
+    sender.items.clear()
+    ctrl.maybe_finish_drain(_FakeScheduler())
+    assert len(sender.items) == 1
+    assert sender.items[0].success
+
+
 # --- wait mode ---------------------------------------------------------------
 
 
@@ -169,10 +198,12 @@ def test_invalid_mode_replies_failure_and_stays_unpaused():
 # --- resume ------------------------------------------------------------------
 
 
-def test_resume_resolves_inflight_pause_then_acks():
+def test_resume_rejects_inflight_pause_then_acks():
     # A resume arriving while a wait/abort pause is still awaiting its drain
     # reply must resolve that pause (separate communicators — resume can't wake
-    # the pause caller), then ack the resume.
+    # the pause caller), then ack the resume. The pause reply must be a FAILURE:
+    # the scheduler had not drained, so acking success would let a weight-swap
+    # caller proceed while pre-pause requests are still in flight.
     ctrl, sender = _controller()
     ctrl.handle_pause(PauseSchedulerReqInput(mode="wait"))
     ctrl.handle_resume(ResumeSchedulerReqInput())
@@ -180,11 +211,10 @@ def test_resume_resolves_inflight_pause_then_acks():
     assert ctrl.state == PauseState.UNPAUSED
     assert not ctrl.is_paused
     assert not ctrl.admit_blocked
-    # Pending pause reply resolved first, then the resume ack.
+    # Pending pause reply resolved (as failure) first, then the resume ack.
     assert len(sender.items) == 2
-    assert (
-        isinstance(sender.items[0], PauseSchedulerReqOutput) and sender.items[0].success
-    )
+    assert isinstance(sender.items[0], PauseSchedulerReqOutput)
+    assert not sender.items[0].success
     assert (
         isinstance(sender.items[1], ResumeSchedulerReqOutput)
         and sender.items[1].success

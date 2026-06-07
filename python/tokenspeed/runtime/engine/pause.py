@@ -142,6 +142,20 @@ class PauseController:
             )
             return
 
+        # Reject any new pause while an abort/wait pause is still draining: its
+        # reply is a single-consumer promise (``_pending_reply``), so a second
+        # pause would overwrite it and strand the first caller forever on its ZMQ
+        # await — only one reply ever fires per pending pause. ``keep`` never sets
+        # ``_pending_reply``, so it can't be the *first* pause here, but it must
+        # not clobber a draining one either.
+        if self._pending_reply is not None:
+            self._send.send_pyobj(
+                PauseSchedulerReqOutput(
+                    success=False, message="a pause is already in progress"
+                )
+            )
+            return
+
         if req.mode == "keep":
             # Freeze in place and reply now — nothing to drain.
             self.state = PauseState.PAUSED_ALL
@@ -158,11 +172,19 @@ class PauseController:
             self._abort_all_pending = True
 
     def handle_resume(self, req: ResumeSchedulerReqInput) -> None:
-        # If a wait/abort pause is still awaiting its drain reply, resolve it
-        # now: resume uses a separate communicator and cannot wake the pause
-        # caller, so dropping the reply would block that caller forever.
+        # If a wait/abort pause is still awaiting its drain reply, it has NOT
+        # drained — ``maybe_finish_drain`` clears ``_pending_reply`` the instant
+        # it does. We must still reply (resume uses a separate communicator and
+        # cannot otherwise wake the pause caller, who would block forever), but
+        # the reply must be a failure: acking success here would tell a
+        # weight-swapping caller it is safe to proceed while pre-pause requests
+        # are still in flight under the old weights.
         if self._pending_reply is not None:
-            self._send.send_pyobj(self._pending_reply)
+            self._send.send_pyobj(
+                PauseSchedulerReqOutput(
+                    success=False, message="resumed before pause drained"
+                )
+            )
             self._pending_reply = None
         # Buffered specs are flushed by the event loop on its next admission
         # pass (state is already UNPAUSED by then).
