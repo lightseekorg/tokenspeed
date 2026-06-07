@@ -26,7 +26,7 @@ torch.ops.tensorrt_llm.
 
 import torch
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_nvidia.registration import error_fn
+from tokenspeed_kernel.registry import error_fn
 
 platform = current_platform()
 

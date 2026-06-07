@@ -49,7 +49,7 @@ def _get_flashinfer_mxfp4_device_permute_indices(
     *,
     kind: str = "w2",
 ) -> torch.Tensor:
-    from tokenspeed_kernel_nvidia.moe.flashinfer import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
@@ -212,7 +212,7 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        from tokenspeed_kernel_nvidia.quantization.flashinfer import (
+        from tokenspeed_kernel.ops.quantization.flashinfer import (
             nvfp4_block_scale_interleave,
         )
 
@@ -445,7 +445,7 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
                     value=0.0,
                 )
         elif self._mxfp4_precision == "default":
-            from tokenspeed_kernel_nvidia.quantization.flashinfer import mxfp8_quantize
+            from tokenspeed_kernel.ops.quantization.flashinfer import mxfp8_quantize
 
             x_quant, x_scale = mxfp8_quantize(x, False, alignment=hidden_padded)
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
@@ -469,7 +469,7 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         )
 
         try:
-            from tokenspeed_kernel_nvidia.moe.flashinfer import (
+            from tokenspeed_kernel.ops.moe.flashinfer import (
                 autotune as flashinfer_autotune,
             )
         except ImportError:

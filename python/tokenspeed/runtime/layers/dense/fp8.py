@@ -40,10 +40,8 @@ from torch.nn.parameter import Parameter
 logger = logging.getLogger(__name__)
 
 try:
-    from tokenspeed_kernel_nvidia.thirdparty.deep_gemm import (
-        ceil_to_ue8m0 as _ceil_to_ue8m0,
-    )
-    from tokenspeed_kernel_nvidia.thirdparty.deep_gemm import (
+    from tokenspeed_kernel.thirdparty.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
+    from tokenspeed_kernel.thirdparty.deep_gemm import (
         transform_sf_into_required_layout as _transform_sf,
     )
 except ImportError:

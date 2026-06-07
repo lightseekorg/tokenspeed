@@ -23,21 +23,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.triton import (
-    gather_and_expand_scalars,
-    min_p_renorm_prob,
-)
-from tokenspeed_kernel.torch_compile import get_compiler_backend
-from tokenspeed_kernel_nvidia.sampling.cuda import (
+from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
     fused_topk_topp_renorm,
 )
-from tokenspeed_kernel_nvidia.sampling.flashinfer import (
+from tokenspeed_kernel.ops.sampling.flashinfer import (
     min_p_sampling_from_probs,
     softmax,
     top_k_renorm_prob,
     top_p_renorm_prob,
 )
+from tokenspeed_kernel.ops.sampling.triton import (
+    gather_and_expand_scalars,
+    min_p_renorm_prob,
+)
+from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,

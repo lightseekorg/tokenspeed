@@ -39,7 +39,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 def quantize_cutedsl_input(
     x: torch.Tensor, input_global_scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from tokenspeed_kernel_nvidia.quantization.flashinfer import (
+    from tokenspeed_kernel.ops.quantization.flashinfer import (
         fp4_quantize as _fp4_quantize,
     )
 
@@ -203,9 +203,7 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
                 max_num_tokens_per_gpu,
             )
 
-        from tokenspeed_kernel_nvidia.moe.flashinfer import (
-            autotune as flashinfer_autotune,
-        )
+        from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
 
         # After dispatch, some ranks may receive 0 tokens. The
         # CuteDSL wrapper cannot handle empty input, so return an empty

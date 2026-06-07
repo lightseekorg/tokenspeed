@@ -15,7 +15,7 @@ import math
 import unittest
 
 import torch
-from tokenspeed_kernel_nvidia.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,
@@ -179,7 +179,7 @@ def _mxfp4_bytes_and_scales(
 
 
 def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
-    from tokenspeed_kernel_nvidia.thirdparty.fast_hadamard_transform import (
+    from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
         hadamard_transform,
     )
 

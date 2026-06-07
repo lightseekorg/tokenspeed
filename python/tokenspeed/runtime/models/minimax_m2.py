@@ -29,12 +29,12 @@ from typing import Any, cast
 import torch
 import triton
 import triton.language as tl
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.torch_compile import get_compiler_backend
-from tokenspeed_kernel_nvidia.communication.trtllm import (
+from tokenspeed_kernel.ops.communication.trtllm import (
     minimax_allreduce_rms_qk,
     trtllm_create_ipc_workspace_for_minimax,
 )
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.torch_compile import get_compiler_backend
 from torch import nn
 
 from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
@@ -81,7 +81,7 @@ logger = logging.getLogger(__name__)
 _is_nvidia = current_platform().is_nvidia
 
 if _is_nvidia:
-    from tokenspeed_kernel_nvidia.routing.cuda import fp32_router_gemm
+    from tokenspeed_kernel.ops.routing.cuda import fp32_router_gemm
 
 from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
 

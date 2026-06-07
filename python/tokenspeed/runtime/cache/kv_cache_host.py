@@ -41,7 +41,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 _is_nvidia = current_platform().is_nvidia
 if _is_nvidia:
-    from tokenspeed_kernel_nvidia.kvcache.cuda import (
+    from tokenspeed_kernel.ops.kvcache.cuda import (
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,

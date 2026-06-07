@@ -22,43 +22,39 @@ from __future__ import annotations
 
 import importlib
 import logging
-
-from tokenspeed_kernel.registrations import apply_vendor_registrations
+import sys
 
 logger = logging.getLogger(__name__)
 
 _MODULES = (
-    "tokenspeed_kernel_nvidia.attention.cuda",
-    "tokenspeed_kernel_nvidia.attention.flash_attn",
-    "tokenspeed_kernel_nvidia.attention.flashinfer",
-    "tokenspeed_kernel_nvidia.embedding.cuda",
-    "tokenspeed_kernel_nvidia.gemm.deep_gemm",
-    "tokenspeed_kernel_nvidia.gemm.flashinfer",
-    "tokenspeed_kernel_nvidia.gemm.trtllm",
-    "tokenspeed_kernel_nvidia.moe.cuda",
-    "tokenspeed_kernel_nvidia.moe.deepep",
-    "tokenspeed_kernel_nvidia.moe.flashinfer",
-    "tokenspeed_kernel_nvidia.moe.trtllm",
-    "tokenspeed_kernel_nvidia.quantization.flashinfer",
-    "tokenspeed_kernel_nvidia.quantization.trtllm",
+    "tokenspeed_kernel.ops.attention.cuda",
+    "tokenspeed_kernel.ops.attention.flash_attn",
+    "tokenspeed_kernel.ops.attention.flashinfer",
+    "tokenspeed_kernel.ops.embedding.cuda",
+    "tokenspeed_kernel.ops.gemm.deep_gemm",
+    "tokenspeed_kernel.ops.gemm.flashinfer",
+    "tokenspeed_kernel.ops.gemm.trtllm",
+    "tokenspeed_kernel.ops.moe.cuda",
+    "tokenspeed_kernel.ops.moe.deepep",
+    "tokenspeed_kernel.ops.moe.flashinfer",
+    "tokenspeed_kernel.ops.moe.trtllm",
+    "tokenspeed_kernel.ops.quantization.flashinfer",
+    "tokenspeed_kernel.ops.quantization.trtllm",
 )
 
 
-def load() -> None:
-    try:
-        registration = importlib.import_module("tokenspeed_kernel_nvidia.registration")
-    except ImportError as exc:
-        logger.debug("Skipping NVIDIA registrations: %s", exc)
-        return
+def _import_or_reload(module_name: str) -> None:
+    if module_name in sys.modules:
+        importlib.reload(sys.modules[module_name])
+    else:
+        importlib.import_module(module_name)
 
-    registrations = registration.REGISTRATIONS
-    registrations.clear()
+
+def load() -> None:
     for module_name in _MODULES:
         try:
-            module = importlib.import_module(module_name)
-            importlib.reload(module)
+            _import_or_reload(module_name)
         except ImportError as exc:
             logger.debug(
                 "Skipping built-in registration module %s: %s", module_name, exc
             )
-    apply_vendor_registrations(registrations)

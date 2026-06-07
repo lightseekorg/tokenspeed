@@ -25,16 +25,16 @@ import torch.nn as nn
 from tokenspeed_kernel.ops.communication.triton import (
     allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
 )
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_nvidia.communication.trtllm import (
+from tokenspeed_kernel.ops.communication.trtllm import (
     allgather_dual_rmsnorm,
 )
-from tokenspeed_kernel_nvidia.communication.trtllm import (
+from tokenspeed_kernel.ops.communication.trtllm import (
     allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
 )
-from tokenspeed_kernel_nvidia.communication.trtllm import (
+from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -50,8 +50,8 @@ _is_amd = current_platform().is_amd
 if _is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
 else:
-    from tokenspeed_kernel_nvidia.layernorm.cuda import rmsnorm_fused_parallel
-    from tokenspeed_kernel_nvidia.layernorm.flashinfer import (
+    from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
+    from tokenspeed_kernel.ops.layernorm.flashinfer import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,

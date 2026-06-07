@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel_nvidia.sampling.cute_dsl import argmax as cute_argmax
+from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (

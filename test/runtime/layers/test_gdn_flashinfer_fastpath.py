@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel_nvidia.attention.flashinfer import gated_delta_rule as gdn
+from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as gdn
 
 pytestmark = pytest.mark.skipif(
     not gdn.is_available(), reason="sm100 GDN kernel unavailable"

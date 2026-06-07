@@ -24,7 +24,7 @@ import torch
 from tokenspeed_kernel.registry import error_fn
 
 try:
-    from tokenspeed_kernel_nvidia.moe.flashinfer import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         grouped_gemm_nt_masked,
         scaled_fp4_grouped_quantize,
         silu_and_mul_scaled_nvfp4_experts_quantize,

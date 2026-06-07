@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
-from tokenspeed_kernel_nvidia.attention.flashinfer import (
+from tokenspeed_kernel.ops.attention.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )

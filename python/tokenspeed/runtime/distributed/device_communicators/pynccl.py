@@ -30,7 +30,7 @@ from contextlib import contextmanager
 # ===================== import region =====================
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel_nvidia.communication.nccl import (
+from tokenspeed_kernel.ops.communication.nccl import (
     NCCLLibrary,
     buffer_type,
     cudaStream_t,

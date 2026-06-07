@@ -31,7 +31,7 @@ from collections.abc import Callable
 
 import torch
 from compressed_tensors.quantization import ActivationOrdering
-from tokenspeed_kernel_nvidia.quantization.cuda import gptq_marlin_repack
+from tokenspeed_kernel.ops.quantization.cuda import gptq_marlin_repack
 
 # yapf conflicts with isort for this block
 # yapf: disable

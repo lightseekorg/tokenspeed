@@ -31,22 +31,22 @@ import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.numerics.reference.moe as _moe_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
+import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
+import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
+import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
+import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
+import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
+import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
+import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
+import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
+import tokenspeed_kernel.ops.moe.deepep as _moe_deepep
+import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel_amd.attention.gluon as _attention_gluon
-import tokenspeed_kernel_nvidia.attention.cuda as _attention_cuda
-import tokenspeed_kernel_nvidia.attention.flash_attn as _attention_flash_attn
-import tokenspeed_kernel_nvidia.attention.flashinfer as _attention_flashinfer
-import tokenspeed_kernel_nvidia.gemm.deep_gemm as _gemm_deep_gemm
-import tokenspeed_kernel_nvidia.gemm.flashinfer as _gemm_flashinfer
-import tokenspeed_kernel_nvidia.gemm.trtllm as _gemm_trtllm
-import tokenspeed_kernel_nvidia.moe.cuda as _moe_cuda
-import tokenspeed_kernel_nvidia.moe.deepep as _moe_deepep
-import tokenspeed_kernel_nvidia.moe.flashinfer as _moe_flashinfer
-import tokenspeed_kernel_nvidia.moe.trtllm as _moe_trtllm
+import tokenspeed_kernel.ops.moe.trtllm as _moe_trtllm
 import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels

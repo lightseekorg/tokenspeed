@@ -19,12 +19,3 @@
 # SOFTWARE.
 
 from __future__ import annotations
-
-from typing import Iterable
-
-from tokenspeed_kernel.registry import register_kernel
-
-
-def apply_vendor_registrations(registrations: Iterable[object]) -> None:
-    for registration in registrations:
-        register_kernel(*registration.args, **registration.kwargs)(registration.impl)
