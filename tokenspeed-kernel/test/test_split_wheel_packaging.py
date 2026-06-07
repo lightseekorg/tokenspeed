@@ -245,9 +245,17 @@ def test_core_vendor_shims_skip_missing_opposite_vendor(monkeypatch) -> None:
         deepseek_v4 = importlib.reload(deepseek_v4)
         flashinfer = importlib.reload(flashinfer)
 
+        import tokenspeed_kernel.ops.gemm.fp8_utils as fp8_utils
+
+        fp8_utils = importlib.reload(fp8_utils)
+
         assert flashinfer.tinygemm_bf16 is error_fn
         assert deepseek_v4.indexer_topk_prefill is error_fn
         assert deepseek_v4.has_indexer_topk_prefill() is False
+        assert fp8_utils._flashinfer_fp8_blockscale_quantize_runner_sm90 is error_fn
+        assert fp8_utils._trtllm_per_tensor_quant_fp8 is error_fn
+        assert fp8_utils._trtllm_per_token_group_quant_fp8 is error_fn
+        assert fp8_utils._trtllm_per_token_quant_fp8 is error_fn
     finally:
         Platform.reset()
 
