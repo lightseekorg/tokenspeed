@@ -439,6 +439,11 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
       << "gate_forward_kernel always renormalizes; pass renormalize=true";
   TVM_FFI_ICHECK_EQ(input.dtype(), dl_float32)
       << "gate_forward_kernel requires float32 input scores";
+  // The hash table is read as int32 (expert ids fit in 32 bits and the model
+  // casts the table to int32). Reject other dtypes loudly instead of silently
+  // misreading e.g. an int64 table as alternating low/high 32-bit halves.
+  TVM_FFI_ICHECK(hash_indices_table.dtype() == dl_int32)
+      << "hash_indices_table must be int32";
 
   const cudaStream_t stream = get_stream(input.device());
 
