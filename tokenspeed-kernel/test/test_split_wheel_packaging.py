@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import shutil
@@ -183,6 +184,72 @@ def test_vendor_registration_loaders_skip_missing_vendor_package(monkeypatch) ->
 
     nvidia.load()
     amd.load()
+
+
+def test_runtime_imports_only_core_kernel_package() -> None:
+    roots = (ROOT.parent / "python" / "tokenspeed", ROOT.parent / "test" / "runtime")
+    violations = []
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module.startswith(
+                        ("tokenspeed_kernel_nvidia", "tokenspeed_kernel_amd")
+                    ):
+                        violations.append(
+                            f"{path.relative_to(ROOT.parent)}:{node.lineno}"
+                        )
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name.startswith(
+                            ("tokenspeed_kernel_nvidia", "tokenspeed_kernel_amd")
+                        ):
+                            violations.append(
+                                f"{path.relative_to(ROOT.parent)}:{node.lineno}"
+                            )
+    assert violations == []
+
+
+def test_core_vendor_shims_skip_missing_opposite_vendor(monkeypatch) -> None:
+    from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
+    from tokenspeed_kernel.registry import error_fn
+
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name: str, *args, **kwargs):
+        if name == "tokenspeed_kernel_nvidia" or name.startswith(
+            "tokenspeed_kernel_nvidia."
+        ):
+            raise ImportError(name)
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    Platform.override(
+        PlatformInfo(
+            vendor="amd",
+            arch_version=ArchVersion(9, 5),
+            device_name="test-amd",
+            device_count=1,
+            total_memory=0,
+            memory_bandwidth=0,
+            sm_count=0,
+            max_threads_per_sm=0,
+            max_shared_memory_per_sm=0,
+        )
+    )
+    try:
+        import tokenspeed_kernel.ops.attention.cuda.deepseek_v4 as deepseek_v4
+        import tokenspeed_kernel.ops.gemm.flashinfer as flashinfer
+
+        deepseek_v4 = importlib.reload(deepseek_v4)
+        flashinfer = importlib.reload(flashinfer)
+
+        assert flashinfer.tinygemm_bf16 is error_fn
+        assert deepseek_v4.indexer_topk_prefill is error_fn
+        assert deepseek_v4.has_indexer_topk_prefill() is False
+    finally:
+        Platform.reset()
 
 
 def test_wheel_artifact_boundaries(tmp_path) -> None:

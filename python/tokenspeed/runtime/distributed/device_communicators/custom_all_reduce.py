@@ -22,11 +22,11 @@
 import ctypes
 from contextlib import contextmanager
 
-import tokenspeed_kernel_nvidia.communication.flashinfer as custom_ar_ops
+import tokenspeed_kernel.ops.communication.flashinfer as custom_ar_ops
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.cuda_ipc import CudaRTLibrary
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_nvidia.thirdparty.cuda.cuda_ipc import CudaRTLibrary
 from torch.distributed import ProcessGroup
 
 from tokenspeed.runtime.distributed.device_communicators.utils import (

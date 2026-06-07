@@ -5,12 +5,12 @@ from functools import wraps
 from typing import Optional
 
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_nvidia.kvcache.cuda import (
+from tokenspeed_kernel.ops.kvcache.cuda import (
     transfer_kv_all_layer_mla,
     transfer_kv_direct,
     transfer_kv_per_layer_mla,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     SimpleMambaPool,

@@ -23,6 +23,7 @@ from __future__ import annotations
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
@@ -39,7 +40,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 def quantize_cutedsl_input(
     x: torch.Tensor, input_global_scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from tokenspeed_kernel_nvidia.quantization.flashinfer import (
+    from tokenspeed_kernel.ops.quantization.flashinfer import (
         fp4_quantize as _fp4_quantize,
     )
 
@@ -203,9 +204,7 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
                 max_num_tokens_per_gpu,
             )
 
-        from tokenspeed_kernel_nvidia.moe.flashinfer import (
-            autotune as flashinfer_autotune,
-        )
+        from tokenspeed_kernel.ops.moe.flashinfer import autotune as flashinfer_autotune
 
         # After dispatch, some ranks may receive 0 tokens. The
         # CuteDSL wrapper cannot handle empty input, so return an empty
@@ -232,7 +231,7 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
         wrapper_capacity = max(int(max_num_tokens_per_gpu or 0), x.shape[0])
         capacity = max(1, int(wrapper_capacity))
 
-        if not self._autotuned:
+        if not self._autotuned and flashinfer_autotune is not error_fn:
             # Avoid profiling through the persistent CUDA-graph wrapper. Its
             # preallocated buffers are sized for the current graph capacity,
             # while autotune may profile larger internal token buckets.

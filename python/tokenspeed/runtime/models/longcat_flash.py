@@ -25,11 +25,11 @@ from collections.abc import Iterable as _Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as _F
-from tokenspeed_kernel.platform import current_platform as _current_platform
-from tokenspeed_kernel_nvidia.moe.cuda import (
+from tokenspeed_kernel.ops.moe.cuda import (
     moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
 )
-from tokenspeed_kernel_nvidia.routing.cuda import dsv3_router_gemm as _dsv3_router_gemm
+from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm as _dsv3_router_gemm
+from tokenspeed_kernel.platform import current_platform as _current_platform
 from transformers import PretrainedConfig as _PretrainedConfig
 
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta

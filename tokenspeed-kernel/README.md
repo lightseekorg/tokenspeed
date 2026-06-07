@@ -16,7 +16,11 @@ others. To provide flexibility, we publish three packages: `tokenspeed-kernel-am
 
 The first two contain vendor kernel implementations. The last one contains the
 public APIs, registry, selection logic, plugin tooling, and other vendor-neutral
-core code. Install the vendor stack you need with extras:
+core code. Runtime integrations should import vendor-specific symbols through
+`tokenspeed_kernel.ops.*` core shims, not through `tokenspeed_kernel_nvidia`
+or `tokenspeed_kernel_amd`; those shims guard imports by `current_platform()`
+and expose `error_fn` for unavailable platform-specific implementations.
+Install the vendor stack you need with extras:
 
 ```bash
 pip install "tokenspeed-kernel[nvidia]"  # core + nvidia

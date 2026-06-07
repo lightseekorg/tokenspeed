@@ -36,7 +36,7 @@ from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 try:
-    from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
+    from tokenspeed_kernel.ops.routing.trtllm import (
         moe_align_block_size as _moe_align_block_size,
     )
 except ImportError:

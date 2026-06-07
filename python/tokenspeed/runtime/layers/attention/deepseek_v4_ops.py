@@ -25,6 +25,12 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+    fused_qnorm_rope_kv_insert as _cuda_fused_qnorm_rope_kv_insert,
+)
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+    has_fused_qnorm_rope_kv_insert as _cuda_has_fused_qnorm_rope_kv_insert,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
@@ -52,12 +58,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
-from tokenspeed_kernel_nvidia.attention.cuda.deepseek_v4 import (
-    fused_qnorm_rope_kv_insert as _cuda_fused_qnorm_rope_kv_insert,
-)
-from tokenspeed_kernel_nvidia.attention.cuda.deepseek_v4 import (
-    has_fused_qnorm_rope_kv_insert as _cuda_has_fused_qnorm_rope_kv_insert,
-)
+from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_FP8_MAX,
@@ -186,7 +187,7 @@ def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
 
 def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
     try:
-        from tokenspeed_kernel_nvidia.thirdparty.fast_hadamard_transform import (
+        from tokenspeed_kernel.ops.attention.fast_hadamard_transform import (
             hadamard_transform,
         )
     except Exception as exc:
@@ -194,6 +195,12 @@ def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
             "DeepSeek V4 CSA indexer requires fast_hadamard_transform. "
             "Build/install `tokenspeed-kernel/python` before serving V4."
         ) from exc
+
+    if hadamard_transform is error_fn:
+        raise RuntimeError(
+            "DeepSeek V4 CSA indexer requires fast_hadamard_transform. "
+            "Build/install `tokenspeed-kernel/python` before serving V4."
+        )
 
     shape = x.shape
     rotated = hadamard_transform(

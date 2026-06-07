@@ -24,11 +24,11 @@ import functools
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_nvidia.activation.flashinfer import (
+from tokenspeed_kernel.ops.activation.flashinfer import (
     silu_and_mul as flashinfer_silu_and_mul,
 )
-from tokenspeed_kernel_nvidia.moe.flashinfer import moe_wna16_marlin_gemm
+from tokenspeed_kernel.ops.moe.flashinfer import moe_wna16_marlin_gemm
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend

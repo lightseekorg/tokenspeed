@@ -34,36 +34,32 @@ from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.gemm import deep_gemm as _deep_gemm
+from tokenspeed_kernel.registry import error_fn
 
-try:
-    # Optional dependency; the module-level wrapper imports the external
-    # `deep_gemm` package unguarded, which is not installed in baseline V4
-    # builds. Callsites guard usage with `deep_gemm is not None`.
-    from tokenspeed_kernel_nvidia.thirdparty import deep_gemm
-except ImportError:
-    deep_gemm = None  # type: ignore[assignment]
+deep_gemm = None if _deep_gemm.get_num_sms is error_fn else _deep_gemm
 
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+    has_indexer_mxfp4_paged_gather,
+    has_persistent_topk,
+    indexer_mxfp4_paged_gather,
+    persistent_topk,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
 from tokenspeed_kernel.ops.moe.triton import (
     stage_deepseek_v4_mega_moe_inputs as _stage_deepseek_v4_mega_moe_inputs,
 )
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_nvidia.attention.cuda.deepseek_v4 import (
-    has_indexer_mxfp4_paged_gather,
-    has_persistent_topk,
-    indexer_mxfp4_paged_gather,
-    persistent_topk,
-)
-from tokenspeed_kernel_nvidia.routing.cuda import (
+from tokenspeed_kernel.ops.routing.cuda import (
     dsv3_router_gemm,
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
-from tokenspeed_kernel_nvidia.thirdparty.trtllm import (
+from tokenspeed_kernel.ops.routing.trtllm import (
     fast_topk_v2,
 )
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
@@ -88,7 +89,7 @@ class Bf16FlashinferTrtllmBackend(MoEBackend):
         )
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        from tokenspeed_kernel_nvidia.moe.flashinfer import (
+        from tokenspeed_kernel.ops.moe.flashinfer import (
             _maybe_get_cached_w3_w1_permute_indices,
             convert_to_block_layout,
             get_w2_permute_indices_with_cache,
@@ -241,7 +242,7 @@ class Bf16FlashinferTrtllmBackend(MoEBackend):
         router_logits = topk_output.router_logits
 
         try:
-            from tokenspeed_kernel_nvidia.moe.flashinfer import (
+            from tokenspeed_kernel.ops.moe.flashinfer import (
                 autotune as flashinfer_autotune,
             )
         except ImportError:
@@ -251,7 +252,7 @@ class Bf16FlashinferTrtllmBackend(MoEBackend):
         # Equivalent to tokenspeed's _flashinfer_autotune() which runs a dummy
         # forward inside autotune() context. Without this, calls with new
         # token counts trigger JIT compilation that desyncs TP ranks.
-        if not self._autotuned and flashinfer_autotune is not None:
+        if not self._autotuned and flashinfer_autotune not in (None, error_fn):
             with flashinfer_autotune():
                 # Autotune with do_finalize=True (matches the default path the
                 # kernel heuristic is tuned for). The deferred path reuses

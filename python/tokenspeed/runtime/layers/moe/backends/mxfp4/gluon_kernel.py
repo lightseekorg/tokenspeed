@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.moe.triton_kernels import (
     PrecisionConfig,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 from torch import nn
 from torch.nn.parameter import Parameter
 
@@ -87,11 +88,16 @@ def _pad_w2_to_block_n(layer: nn.Module, block_n: int) -> None:
 
 def _attach_gluon_bpreshuffle(layer: nn.Module) -> None:
     try:
-        from tokenspeed_kernel_amd.moe.gluon import (
+        from tokenspeed_kernel.ops.moe.gluon import (
             _extract_gluon_raw_w,
             shuffle_weight_for_gluon_dot_layout,
         )
     except ImportError:
+        return
+    if (
+        _extract_gluon_raw_w is error_fn
+        or shuffle_weight_for_gluon_dot_layout is error_fn
+    ):
         return
 
     targets = (

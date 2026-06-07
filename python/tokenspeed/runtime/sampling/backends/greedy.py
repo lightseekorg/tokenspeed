@@ -23,11 +23,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.registry import error_fn
-from tokenspeed_kernel_nvidia.sampling.cuda import (
+from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
-from tokenspeed_kernel_nvidia.sampling.cute_dsl import argmax as cute_argmax
+from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
+from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
