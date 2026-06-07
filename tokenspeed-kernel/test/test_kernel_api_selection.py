@@ -329,7 +329,7 @@ def _attention_merge_state() -> object:
     out_b = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     lse_a = torch.empty((4, 16), dtype=torch.float32)
     lse_b = torch.empty((4, 16), dtype=torch.float32)
-    return tokenspeed_kernel.mha_merge_state(out_a, lse_a, out_b, lse_b)
+    return tokenspeed_kernel.merge_state(out_a, lse_a, out_b, lse_b)
 
 
 def _moe_route_grouped_topk() -> object:

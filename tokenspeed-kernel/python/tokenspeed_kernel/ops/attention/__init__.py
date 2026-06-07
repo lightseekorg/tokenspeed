@@ -47,11 +47,18 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
-    "mha_merge_state",
+    "mla_prefill",
+    "mla_decode_with_kvcache",
+    "merge_state",
     "mha_decode_scheduler_metadata",
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+# ===-----------------------------------------------------------------------===#
+# MHA Kernels
+# ===-----------------------------------------------------------------------===#
 
 
 def mha_prefill(
@@ -368,7 +375,146 @@ def mha_decode_with_kvcache(
         return kernel(**kernel_kwargs)
 
 
-def mha_merge_state(
+# ===-----------------------------------------------------------------------===#
+# MLA Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def mla_prefill(
+    # attention inputs
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    softmax_scale: float,
+    # attention options
+    *,
+    seq_lens_kv: torch.Tensor | None = None,
+    batch_size: int | None = None,
+    is_causal: bool = True,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MLA prefill/cross-attention from explicit, non-cached Q/K/V tensors.
+
+    This API is for the non-absorbed MLA path. Callers materialize full
+    per-head K/V before calling this function, so the kernel contract is close
+    to MHA ragged attention. It is used for both prompt/new-token causal
+    prefill and prefix-cache replay chunks after the compressed MLA cache has
+    been read and expanded by the model.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, qk_head_dim], where
+            qk_head_dim = qk_nope_head_dim + qk_rope_head_dim.
+        k: Key tensor with shape [total_kv, num_kv_heads, qk_head_dim]. For
+            DeepSeek MLA prefill today, num_kv_heads is normally num_q_heads
+            after expanding the shared RoPE key part across heads.
+        v: Value tensor with shape [total_kv, num_kv_heads, v_head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+            This is independent from cu_seqlens_q so prefix-cache chunks can use
+            q_lens != kv_lens.
+        max_seqlen_q: Maximum query length in the batch.
+        max_seqlen_kv: Maximum KV length in the batch.
+        softmax_scale: Scale applied to QK logits before softmax.
+        seq_lens_kv: Optional per-request KV lengths with shape [batch]. Some
+            backends need this in addition to cu_seqlens_kv.
+        batch_size: Optional explicit batch size. Defaults to
+            cu_seqlens_q.shape[0] - 1 in implementations that can derive it.
+        is_causal: Whether to apply a causal mask between Q and KV. Prefix-cache
+            replay chunks should pass False because all prefix tokens precede all
+            extend tokens.
+        logit_cap: Optional soft cap applied to attention logits.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads]. Required when partial attention states
+            will be merged.
+        out: Optional output tensor with shape [total_q, num_q_heads, v_head_dim].
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Attention output with shape [total_q, num_q_heads, v_head_dim], or
+        (output, lse) when return_lse is True.
+    """
+    raise NotImplementedError("mla_prefill kernel API is scaffolded only")
+
+
+def mla_decode_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    # MLA dimensions
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    # attention options
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MLA absorbed decode over compressed paged MLA KV cache.
+
+    This API is for the absorbed MLA decode path. The model has already
+    transformed the non-RoPE query part into latent space using the key half of
+    kv_b_proj, so Q and the compressed cache share the same q/k dimension:
+    kv_lora_rank + qk_rope_head_dim. The kernel returns the attention-weighted
+    latent value; the model applies the value half of kv_b_proj afterward.
+
+    Args:
+        q: Absorbed query with shape
+            [batch, q_len, num_q_heads, kv_lora_rank + qk_rope_head_dim]. For
+            plain decode q_len is 1; speculative/draft paths may pass q_len > 1.
+        kv_cache: Paged compressed MLA cache with shape
+            [num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim]. The first
+            kv_lora_rank elements are latent KV; the final qk_rope_head_dim
+            elements are the RoPE key part.
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Visible KV lengths in the cache, shape [batch]. These
+            lengths include current decode tokens when they were prewritten.
+        max_seqlen_k: Maximum visible KV length.
+        qk_nope_head_dim: Original non-RoPE q/k head dim. Some backends need
+            this for kernel specialization even though q stores the absorbed
+            latent dimension.
+        kv_lora_rank: MLA latent rank R. The output head dim is R.
+        qk_rope_head_dim: RoPE q/k head dim.
+        softmax_scale: Scale applied to QK logits before softmax.
+        logit_cap: Optional soft cap applied to attention logits.
+        return_lse: Whether to also return log-sum-exp values.
+        out: Optional output tensor with shape [batch, q_len, num_q_heads,
+            kv_lora_rank].
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Latent attention output with shape [batch, q_len, num_q_heads,
+        kv_lora_rank], or (output, lse) when return_lse is True. The caller is
+        responsible for applying the MLA value projection from latent rank to
+        v_head_dim.
+    """
+    raise NotImplementedError("mla_decode_with_kvcache kernel API is scaffolded only")
+
+
+# ===-----------------------------------------------------------------------===#
+# Attention Utility Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def merge_state(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,
     out_b: torch.Tensor,
@@ -378,7 +524,7 @@ def mha_merge_state(
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge two MHA partial attention states.
+    """Merge two partial attention states.
 
     Args:
         out_a: First partial output with shape [total_q, num_heads, head_dim].
@@ -388,6 +534,9 @@ def mha_merge_state(
         lse_scale_log2: Multiplier that converts input LSE to log2 domain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
+
+    This is shared by MHA and MLA because the merge only depends on partial
+    attention outputs and LSE values, not on how the K/V states were produced.
     """
     traits = {
         "head_dim": out_a.shape[-1],

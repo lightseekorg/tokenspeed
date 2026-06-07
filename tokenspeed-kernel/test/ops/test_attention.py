@@ -23,9 +23,9 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import (
+    merge_state,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
-    mha_merge_state,
     mha_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -289,7 +289,7 @@ def test_mha_decode_with_kvcache(
     [None, "triton", "cuda"],
     ids=["auto", "triton", "cuda"],
 )
-def test_mha_merge_state(
+def test_merge_state(
     device: str,
     solution: str | None,
     dtype: torch.dtype,
@@ -305,7 +305,7 @@ def test_mha_merge_state(
     lse_a = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
     lse_b = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
 
-    out, lse = mha_merge_state(
+    out, lse = merge_state(
         out_a,
         lse_a,
         out_b,
