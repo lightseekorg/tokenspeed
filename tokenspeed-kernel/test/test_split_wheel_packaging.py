@@ -224,7 +224,10 @@ from tokenspeed_kernel.registry import error_fn
 
 class BlockVendorPackages(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname == "tokenspeed_kernel_nvidia" or fullname.startswith("tokenspeed_kernel_nvidia."):
+        vendor_packages = ("tokenspeed_kernel_nvidia", "tokenspeed_kernel_amd")
+        if fullname in vendor_packages or fullname.startswith(
+            tuple(package + "." for package in vendor_packages)
+        ):
             raise ModuleNotFoundError(fullname)
         return None
 
@@ -258,7 +261,14 @@ try:
 finally:
     Platform.reset()
 """
-    subprocess.run([sys.executable, "-c", code], env=env, check=True)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_wheel_artifact_boundaries(tmp_path) -> None:
