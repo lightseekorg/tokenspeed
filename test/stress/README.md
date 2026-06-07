@@ -49,7 +49,27 @@ test/stress/
     metrics.py        # /metrics scraper (spec-decode acceptance, etc.)
   audits/             # pluggable per-response output checkers (see below)
   workloads/          # pluggable traffic generators (see table below)
+  scripts/            # self-contained stress scenarios (server config + run)
 ```
+
+## Scenarios & on-demand CI
+
+A *scenario* is a self-contained script under `scripts/` that owns one
+configuration end to end — it boots a server (via `--launch-cmd`), drives a
+workload, and writes `events.jsonl` + `summary.txt` to `$OUT_DIR`. Tunables come
+from the environment (`OUT_DIR`, `DURATION_S`, `MAX_CONCURRENCY`), so a scenario
+runs the same by hand or in CI:
+
+```bash
+DURATION_S=120 bash test/stress/scripts/kimi-k2.5-nvfp4-reality-mix.sh
+```
+
+The `Stress Test` GitHub workflow (`.github/workflows/stress.yml`) is
+config-agnostic: it just checks out a ref and runs the chosen scenario script,
+then publishes the summary to the run page. It's **manual only** (Actions →
+*Run workflow*) — heavyweight, not part of per-commit CI — and can stress any
+branch/tag/commit (`ref`, default `main`). Add a scenario by dropping a new
+script in `scripts/` and selecting it with the `scenario` input.
 
 ## Quick start
 
