@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols, false_fn
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols, false_fn
 
 __all__ = [
     "fused_qnorm_rope_kv_insert",
@@ -14,7 +14,7 @@ __all__ = [
 globals().update(
     export_vendor_symbols(
         "nvidia",
-        "tokenspeed_kernel.ops.attention.cuda.deepseek_v4",
+        "tokenspeed_kernel_nvidia.attention.cuda.deepseek_v4",
         __all__,
         fallback_by_name={
             "has_fused_qnorm_rope_kv_insert": false_fn,

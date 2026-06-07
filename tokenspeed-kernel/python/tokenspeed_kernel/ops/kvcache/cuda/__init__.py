@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "transfer_kv_all_layer_lf_pf",
@@ -13,5 +13,5 @@ __all__ = [
 ]
 
 globals().update(
-    export_vendor_symbols("nvidia", "tokenspeed_kernel.ops.kvcache.cuda", __all__)
+    export_vendor_symbols("nvidia", "tokenspeed_kernel_nvidia.kvcache.cuda", __all__)
 )

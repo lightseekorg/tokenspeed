@@ -1,9 +1,9 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = ["merge_state"]
 
 globals().update(
     export_vendor_symbols(
-        "nvidia", "tokenspeed_kernel.ops.attention.merge_state", __all__
+        "nvidia", "tokenspeed_kernel_nvidia.thirdparty.cuda.merge_state", __all__
     )
 )

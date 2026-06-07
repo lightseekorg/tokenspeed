@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "moe_finalize_fuse_shared",
@@ -7,5 +7,5 @@ __all__ = [
 ]
 
 globals().update(
-    export_vendor_symbols("nvidia", "tokenspeed_kernel.ops.moe.cuda", __all__)
+    export_vendor_symbols("nvidia", "tokenspeed_kernel_nvidia.moe.cuda", __all__)
 )

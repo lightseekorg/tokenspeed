@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "fp4_quantize",
@@ -9,6 +9,6 @@ __all__ = [
 
 globals().update(
     export_vendor_symbols(
-        "nvidia", "tokenspeed_kernel.ops.quantization.flashinfer", __all__
+        "nvidia", "tokenspeed_kernel_nvidia.quantization.flashinfer", __all__
     )
 )

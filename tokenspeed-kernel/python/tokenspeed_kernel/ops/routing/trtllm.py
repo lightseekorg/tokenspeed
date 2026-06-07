@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "dsv3_fused_a_gemm",
@@ -12,6 +12,6 @@ __all__ = [
 
 globals().update(
     export_vendor_symbols(
-        "nvidia", "tokenspeed_kernel.ops.routing.trtllm", __all__
+        "nvidia", "tokenspeed_kernel_nvidia.thirdparty.trtllm", __all__
     )
 )

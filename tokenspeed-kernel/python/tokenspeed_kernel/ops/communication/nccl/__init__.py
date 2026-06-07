@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "NCCLLibrary",
@@ -11,5 +11,7 @@ __all__ = [
 ]
 
 globals().update(
-    export_vendor_symbols("nvidia", "tokenspeed_kernel.ops.communication.nccl", __all__)
+    export_vendor_symbols(
+        "nvidia", "tokenspeed_kernel_nvidia.communication.nccl", __all__
+    )
 )

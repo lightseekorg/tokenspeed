@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "_extract_gluon_raw_w",
@@ -10,5 +10,5 @@ __all__ = [
 ]
 
 globals().update(
-    export_vendor_symbols("amd", "tokenspeed_kernel.ops.moe.gluon", __all__)
+    export_vendor_symbols("amd", "tokenspeed_kernel_amd.moe.gluon", __all__)
 )

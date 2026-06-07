@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "min_p_sampling_from_probs",
@@ -11,5 +11,7 @@ __all__ = [
 ]
 
 globals().update(
-    export_vendor_symbols("nvidia", "tokenspeed_kernel.ops.sampling.flashinfer", __all__)
+    export_vendor_symbols(
+        "nvidia", "tokenspeed_kernel_nvidia.sampling.flashinfer", __all__
+    )
 )

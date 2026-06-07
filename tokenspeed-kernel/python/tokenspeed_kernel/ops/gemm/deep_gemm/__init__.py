@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "ceil_div",
@@ -24,6 +24,6 @@ __all__ = [
 
 globals().update(
     export_vendor_symbols(
-        "nvidia", "tokenspeed_kernel.ops.gemm.deep_gemm", __all__
+        "nvidia", "tokenspeed_kernel_nvidia.thirdparty.deep_gemm", __all__
     )
 )

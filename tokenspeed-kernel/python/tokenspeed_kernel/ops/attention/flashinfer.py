@@ -1,4 +1,7 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols, import_vendor_module
+from tokenspeed_kernel.registrations._vendor import (
+    export_vendor_symbols,
+    import_vendor_module,
+)
 from tokenspeed_kernel.registry import error_fn
 
 __all__ = [
@@ -17,12 +20,12 @@ __all__ = [
 globals().update(
     export_vendor_symbols(
         "nvidia",
-        "tokenspeed_kernel.ops.attention.flashinfer",
+        "tokenspeed_kernel_nvidia.attention.flashinfer",
         [name for name in __all__ if name != "gated_delta_rule"],
     )
 )
 gated_delta_rule = import_vendor_module(
     "nvidia",
-    "tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule",
+    "tokenspeed_kernel_nvidia.attention.flashinfer.gated_delta_rule",
     fallback=error_fn,
 )

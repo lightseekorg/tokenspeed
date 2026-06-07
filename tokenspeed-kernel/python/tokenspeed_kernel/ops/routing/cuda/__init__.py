@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "dsv3_router_gemm",
@@ -9,5 +9,5 @@ __all__ = [
 ]
 
 globals().update(
-    export_vendor_symbols("nvidia", "tokenspeed_kernel.ops.routing.cuda", __all__)
+    export_vendor_symbols("nvidia", "tokenspeed_kernel_nvidia.routing.cuda", __all__)
 )

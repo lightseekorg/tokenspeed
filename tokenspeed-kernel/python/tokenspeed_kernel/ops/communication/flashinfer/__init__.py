@@ -1,4 +1,4 @@
-from tokenspeed_kernel._vendor import export_vendor_symbols
+from tokenspeed_kernel.registrations._vendor import export_vendor_symbols
 
 __all__ = [
     "all_reduce",
@@ -15,6 +15,6 @@ __all__ = [
 
 globals().update(
     export_vendor_symbols(
-        "nvidia", "tokenspeed_kernel.ops.communication.flashinfer", __all__
+        "nvidia", "tokenspeed_kernel_nvidia.communication.flashinfer", __all__
     )
 )
