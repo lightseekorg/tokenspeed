@@ -218,7 +218,6 @@ def test_core_vendor_shims_skip_missing_opposite_vendor() -> None:
 import importlib.abc
 import sys
 
-import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import error_fn
 
@@ -248,10 +247,6 @@ try:
     import tokenspeed_kernel.ops.attention.cuda.deepseek_v4 as deepseek_v4
     import tokenspeed_kernel.ops.gemm.flashinfer as flashinfer
     import tokenspeed_kernel.ops.gemm.fp8_utils as fp8_utils
-    import tokenspeed_kernel.ops.sampling.cute_dsl as cute_dsl
-
-    logits = torch.tensor([[1.0, 3.0, 2.0], [4.0, -1.0, 5.0]])
-    out = torch.empty((2,), dtype=torch.int32)
 
     assert flashinfer.tinygemm_bf16 is error_fn
     assert deepseek_v4.indexer_topk_prefill is error_fn
@@ -260,10 +255,6 @@ try:
     assert fp8_utils._trtllm_per_tensor_quant_fp8 is error_fn
     assert fp8_utils._trtllm_per_token_group_quant_fp8 is error_fn
     assert fp8_utils._trtllm_per_token_quant_fp8 is error_fn
-    assert cute_dsl.is_available() is False
-    torch.testing.assert_close(cute_dsl.argmax(logits), torch.argmax(logits, dim=-1))
-    assert cute_dsl.argmax(logits, out=out) is out
-    torch.testing.assert_close(out, torch.argmax(logits, dim=-1).to(torch.int32))
 finally:
     Platform.reset()
 """

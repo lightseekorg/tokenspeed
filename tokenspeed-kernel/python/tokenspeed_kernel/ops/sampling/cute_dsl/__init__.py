@@ -27,6 +27,9 @@ __all__ = ["argmax", "argmax_pair", "is_available"]
 
 _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
 
+# TODO: Replace these torch fallbacks with a default Triton argmax implementation,
+# then delete the temporary torch fallback code.
+
 
 def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:
     if out.shape != (logits.shape[0],):
