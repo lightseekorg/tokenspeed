@@ -392,7 +392,6 @@ def mla_prefill(
     softmax_scale: float,
     # attention options
     seq_lens_kv: torch.Tensor | None = None,
-    batch_size: int | None = None,
     is_causal: bool = True,
     logit_cap: float = 0.0,
     return_lse: bool = False,
@@ -425,8 +424,6 @@ def mla_prefill(
         softmax_scale: Scale applied to QK logits before softmax.
         seq_lens_kv: Optional per-request KV lengths with shape [batch]. Some
             backends need this in addition to cu_seqlens_kv.
-        batch_size: Optional explicit batch size. Defaults to
-            cu_seqlens_q.shape[0] - 1 in implementations that can derive it.
         is_causal: Whether to apply a causal mask between Q and KV. Prefix-cache
             replay chunks should pass False because all prefix tokens precede all
             extend tokens.
@@ -442,7 +439,65 @@ def mla_prefill(
         Attention output with shape [total_q, num_q_heads, v_head_dim], or
         (output, lse) when return_lse is True.
     """
-    raise NotImplementedError("mla_prefill kernel API is scaffolded only")
+    batch_size = cu_seqlens_q.shape[0] - 1
+    traits = {
+        "qk_head_dim": q.shape[-1],
+        "v_head_dim": v.shape[-1],
+        "is_causal": is_causal,
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "mla_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "total_kv": k.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "qk_head_dim": q.shape[-1],
+        "v_head_dim": v.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_kv": max_seqlen_kv,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            softmax_scale=softmax_scale,
+            seq_lens_kv=seq_lens_kv,
+            is_causal=is_causal,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            out=out,
+        )
 
 
 def mla_decode_with_kvcache(
@@ -504,7 +559,66 @@ def mla_decode_with_kvcache(
         responsible for applying the MLA value projection from latent rank to
         v_head_dim.
     """
-    raise NotImplementedError("mla_decode_with_kvcache kernel API is scaffolded only")
+    traits = {
+        "page_size": kv_cache.shape[1],
+        "q_len": q.shape[1],
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": q.shape[0],
+        "q_len": q.shape[1],
+        "num_q_heads": q.shape[2],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            out=out,
+        )
 
 
 # ===-----------------------------------------------------------------------===#

@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -270,6 +273,23 @@ def mla_prefill_fwd(
     )
 
 
+@register_kernel(
+    "attention",
+    "mla_prefill",
+    name="triton_mla_prefill",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "is_causal": frozenset({False, True}),
+        "support_logit_cap": frozenset({False, True}),
+        "return_lse": frozenset({False, True}),
+    },
+    tags={"portability"},
+)
 def triton_mla_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -284,6 +304,7 @@ def triton_mla_prefill(
     logit_cap: float = 0.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         out_dtype = (

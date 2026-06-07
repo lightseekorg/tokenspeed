@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -244,6 +247,23 @@ def mla_decode_fwd(
     )
 
 
+@register_kernel(
+    "attention",
+    "mla_decode_with_kvcache",
+    name="triton_mla_decode_with_kvcache",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("q", "kv_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "q_len": frozenset({1}),
+        "support_logit_cap": frozenset({False, True}),
+        "return_lse": frozenset({False, True}),
+    },
+    tags={"portability"},
+)
 def triton_mla_decode_with_kvcache(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
