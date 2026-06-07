@@ -211,53 +211,54 @@ def test_runtime_imports_only_core_kernel_package() -> None:
     assert violations == []
 
 
-def test_core_vendor_shims_skip_missing_opposite_vendor(monkeypatch) -> None:
-    from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-    from tokenspeed_kernel.registry import error_fn
+def test_core_vendor_shims_skip_missing_opposite_vendor() -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PYTHON_ROOT)
+    code = """
+import importlib.abc
+import sys
 
-    real_import_module = importlib.import_module
+from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
+from tokenspeed_kernel.registry import error_fn
 
-    def fake_import_module(name: str, *args, **kwargs):
-        if name == "tokenspeed_kernel_nvidia" or name.startswith(
-            "tokenspeed_kernel_nvidia."
-        ):
-            raise ImportError(name)
-        return real_import_module(name, *args, **kwargs)
 
-    monkeypatch.setattr(importlib, "import_module", fake_import_module)
-    Platform.override(
-        PlatformInfo(
-            vendor="amd",
-            arch_version=ArchVersion(9, 5),
-            device_name="test-amd",
-            device_count=1,
-            total_memory=0,
-            memory_bandwidth=0,
-            sm_count=0,
-            max_threads_per_sm=0,
-            max_shared_memory_per_sm=0,
-        )
+class BlockVendorPackages(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "tokenspeed_kernel_nvidia" or fullname.startswith("tokenspeed_kernel_nvidia."):
+            raise ModuleNotFoundError(fullname)
+        return None
+
+
+sys.meta_path.insert(0, BlockVendorPackages())
+Platform.override(
+    PlatformInfo(
+        vendor="amd",
+        arch_version=ArchVersion(9, 5),
+        device_name="test-amd",
+        device_count=1,
+        total_memory=0,
+        memory_bandwidth=0,
+        sm_count=0,
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
     )
-    try:
-        import tokenspeed_kernel.ops.attention.cuda.deepseek_v4 as deepseek_v4
-        import tokenspeed_kernel.ops.gemm.flashinfer as flashinfer
+)
+try:
+    import tokenspeed_kernel.ops.attention.cuda.deepseek_v4 as deepseek_v4
+    import tokenspeed_kernel.ops.gemm.flashinfer as flashinfer
+    import tokenspeed_kernel.ops.gemm.fp8_utils as fp8_utils
 
-        deepseek_v4 = importlib.reload(deepseek_v4)
-        flashinfer = importlib.reload(flashinfer)
-
-        import tokenspeed_kernel.ops.gemm.fp8_utils as fp8_utils
-
-        fp8_utils = importlib.reload(fp8_utils)
-
-        assert flashinfer.tinygemm_bf16 is error_fn
-        assert deepseek_v4.indexer_topk_prefill is error_fn
-        assert deepseek_v4.has_indexer_topk_prefill() is False
-        assert fp8_utils._flashinfer_fp8_blockscale_quantize_runner_sm90 is error_fn
-        assert fp8_utils._trtllm_per_tensor_quant_fp8 is error_fn
-        assert fp8_utils._trtllm_per_token_group_quant_fp8 is error_fn
-        assert fp8_utils._trtllm_per_token_quant_fp8 is error_fn
-    finally:
-        Platform.reset()
+    assert flashinfer.tinygemm_bf16 is error_fn
+    assert deepseek_v4.indexer_topk_prefill is error_fn
+    assert deepseek_v4.has_indexer_topk_prefill() is False
+    assert fp8_utils._flashinfer_fp8_blockscale_quantize_runner_sm90 is error_fn
+    assert fp8_utils._trtllm_per_tensor_quant_fp8 is error_fn
+    assert fp8_utils._trtllm_per_token_group_quant_fp8 is error_fn
+    assert fp8_utils._trtllm_per_token_quant_fp8 is error_fn
+finally:
+    Platform.reset()
+"""
+    subprocess.run([sys.executable, "-c", code], env=env, check=True)
 
 
 def test_wheel_artifact_boundaries(tmp_path) -> None:
