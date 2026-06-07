@@ -138,6 +138,8 @@ def _matmul(
         assert (
             n_tokens is not None
         ), "n_tokens required when n_expts_act > 1 for top-k reduction"
+        if out.ndim == 3:
+            out = out.sum(dim=0)
         return out.view(n_tokens, n_expts_act, out.shape[-1]).sum(dim=1)
     return out
 

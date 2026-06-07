@@ -144,7 +144,7 @@ if platform.is_nvidia:
             else getattr(w, name, default)
         )
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
-        return trtllm_bf16_moe(
+        result = trtllm_bf16_moe(
             routing_logits=router_logits.to(torch.bfloat16),
             routing_bias=routing_value("correction_bias", None),
             hidden_states=x,
@@ -162,4 +162,7 @@ if platform.is_nvidia:
             routing_method_type=routing_value("routing_method_type", 1),
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
-        )[0]
+        )
+        if isinstance(result, (list, tuple)):
+            return result[0]
+        return result
