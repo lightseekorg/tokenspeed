@@ -218,10 +218,6 @@ def test_core_vendor_shims_skip_missing_opposite_vendor() -> None:
 import importlib.abc
 import sys
 
-from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.registry import error_fn
-
-
 class BlockVendorPackages(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         vendor_packages = ("tokenspeed_kernel_nvidia", "tokenspeed_kernel_amd")
@@ -233,6 +229,10 @@ class BlockVendorPackages(importlib.abc.MetaPathFinder):
 
 
 sys.meta_path.insert(0, BlockVendorPackages())
+
+from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
+from tokenspeed_kernel.registry import error_fn
+
 Platform.override(
     PlatformInfo(
         vendor="amd",
