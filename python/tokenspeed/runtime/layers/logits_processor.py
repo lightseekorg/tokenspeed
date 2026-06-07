@@ -133,8 +133,11 @@ def _get_fused_lm_head_gemm():
     global _FUSED_LM_HEAD_GEMM
     if _FUSED_LM_HEAD_GEMM is not None:
         return _FUSED_LM_HEAD_GEMM
+    if not current_platform().is_nvidia:
+        _FUSED_LM_HEAD_GEMM = (None, None)
+        return _FUSED_LM_HEAD_GEMM
     try:
-        from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
+        from tokenspeed_kernel_nvidia.thirdparty.cuda.lm_head_gemm import (
             lm_head_gemm,
             should_use_fused,
         )

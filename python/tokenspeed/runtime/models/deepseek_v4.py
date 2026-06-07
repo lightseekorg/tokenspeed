@@ -34,15 +34,6 @@ from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
-try:
-    # Optional dependency; the module-level wrapper imports the external
-    # `deep_gemm` package unguarded, which is not installed in baseline V4
-    # builds. Callsites guard usage with `deep_gemm is not None`.
-    from tokenspeed_kernel.thirdparty import deep_gemm
-except ImportError:
-    deep_gemm = None  # type: ignore[assignment]
-
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -61,9 +52,25 @@ from tokenspeed_kernel.ops.routing.cuda import (
     softplus_sqrt_topk_flash,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.trtllm import (
-    fast_topk_v2,
-)
+from tokenspeed_kernel.registry import error_fn
+
+_platform = current_platform()
+
+if _platform.is_nvidia:
+    try:
+        # Optional dependency; the module-level wrapper imports the external
+        # `deep_gemm` package unguarded, which is not installed in baseline V4
+        # builds. Callsites guard usage with `deep_gemm is not None`.
+        from tokenspeed_kernel_nvidia.thirdparty import deep_gemm
+    except Exception:
+        deep_gemm = None  # type: ignore[assignment]
+    try:
+        from tokenspeed_kernel_nvidia.thirdparty.trtllm import fast_topk_v2
+    except ImportError:
+        fast_topk_v2 = error_fn
+else:
+    deep_gemm = None  # type: ignore[assignment]
+    fast_topk_v2 = error_fn
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -141,9 +148,6 @@ from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
 from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-
-_platform = current_platform()
-
 
 logger = get_colorful_logger(__name__)
 
