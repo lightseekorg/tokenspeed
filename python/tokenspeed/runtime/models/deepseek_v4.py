@@ -2061,7 +2061,7 @@ class DeepseekV4MLP(nn.Module):
             and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
         )
         if _use_fused_swiglu:
-            from tokenspeed.runtime.models.deepseek_v4_fused_swiglu import (
+            from tokenspeed_kernel.ops.activation.triton import (
                 fused_swiglu_fp8_ue8m0,
             )
 
@@ -2543,9 +2543,10 @@ class DeepseekV4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
-        need_scores: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
+        fmt = getattr(self.experts, "topk_output_format", None)
+        need_scores = fmt is not None and not fmt.is_bypassed()
         return deepseek_v4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
@@ -2609,7 +2610,7 @@ class DeepseekV4MoE(nn.Module):
         else:
             with nvtx_range("moe_select_experts"):
                 topk_weights, topk_ids, _ = self._select_experts(
-                    hidden_states, input_ids, need_scores=False
+                    hidden_states, input_ids
                 )
 
         shared = None
