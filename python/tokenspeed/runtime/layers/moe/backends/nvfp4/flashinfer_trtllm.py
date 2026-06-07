@@ -39,7 +39,9 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
     _maybe_get_cached_w3_w1_permute_indices,
     get_w2_permute_indices_with_cache,
 )
-from tokenspeed_kernel.ops.quantization.flashinfer import nvfp4_block_scale_interleave
+from tokenspeed_kernel.ops.quantization.flashinfer import (
+    nvfp4_block_scale_interleave,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
