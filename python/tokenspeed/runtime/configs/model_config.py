@@ -31,6 +31,7 @@ import yaml
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.adapters.minimax_m2 import MiniMaxM2RuntimeView
+from tokenspeed.runtime.configs.adapters.qwen3_5 import Qwen35RuntimeView
 from tokenspeed.runtime.configs.engine_spec import EngineModelSpec, build_engine_spec
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -344,6 +345,18 @@ class ModelConfig:
         if spec.body.type == "minimax_m2":
             runtime_view = MiniMaxM2RuntimeView.from_engine_spec(spec)
             self.hf_config = runtime_view
+            self.hf_text_config = runtime_view
+        elif spec.body.type == "qwen3_5":
+            runtime_view = Qwen35RuntimeView.from_engine_spec(spec)
+            runtime_view.torch_dtype = getattr(
+                self._hf_source_config, "torch_dtype", None
+            )
+            source = self._hf_source_config
+            if getattr(source, "text_config", None) is not None:
+                source.text_config = runtime_view
+                self.hf_config = source
+            else:
+                self.hf_config = runtime_view
             self.hf_text_config = runtime_view
         else:
             raise ValueError(

@@ -69,9 +69,17 @@ class RMSNormSpec:
 
 
 @dataclass(frozen=True)
-class MinimaxM2ModelSpec:
-    """First architecture variant; add more typed bodies as adapters land."""
+class GatedDeltaNetSpec:
+    type: Literal["gated_delta_net"]
+    conv_kernel_dim: int
+    key_head_dim: int
+    value_head_dim: int
+    num_key_heads: int
+    num_value_heads: int
 
+
+@dataclass(frozen=True)
+class MinimaxM2ModelSpec:
     type: Literal["minimax_m2"]
     architecture_kind: ArchitectureKind
     num_layers: int
@@ -87,7 +95,32 @@ class MinimaxM2ModelSpec:
     mtp_transformer_layers: int = 1
 
 
-ModelBody = MinimaxM2ModelSpec
+@dataclass(frozen=True)
+class Qwen35ModelSpec:
+    type: Literal["qwen3_5"]
+    architecture_kind: ArchitectureKind
+    text_model_type: str
+    num_layers: int
+    hidden_size: int
+    vocab_size: int
+    hidden_act: str
+    tie_word_embeddings: bool
+    attention: GQAAttentionSpec
+    mlp: MoEMLPSpec
+    linear_attn: GatedDeltaNetSpec
+    norm: RMSNormSpec
+    position: RopePositionSpec
+    full_attention_interval: int
+    partial_rotary_factor: float
+    attn_output_gate: bool
+    decoder_sparse_step: int
+    mlp_only_layers: tuple[int, ...]
+    dense_intermediate_size: int
+    moe_intermediate_size: int
+    shared_expert_intermediate_size: int
+
+
+ModelBody = MinimaxM2ModelSpec | Qwen35ModelSpec
 
 
 @dataclass(frozen=True)
@@ -109,16 +142,22 @@ def build_engine_spec(hf_config: Any) -> EngineModelSpec | None:
         from tokenspeed.runtime.configs.adapters.minimax_m2 import from_hugging_face
 
         return from_hugging_face(hf_config)
+    if model_type in {"qwen3_5", "qwen3_5_moe"}:
+        from tokenspeed.runtime.configs.adapters.qwen3_5 import from_hugging_face
+
+        return from_hugging_face(hf_config)
     return None
 
 
 __all__ = [
     "ENGINE_SPEC_SCHEMA_VERSION",
     "EngineModelSpec",
+    "GatedDeltaNetSpec",
     "GQAAttentionSpec",
     "MinimaxM2ModelSpec",
     "MoEMLPSpec",
     "ModelBody",
+    "Qwen35ModelSpec",
     "RMSNormSpec",
     "RopePositionSpec",
     "build_engine_spec",
