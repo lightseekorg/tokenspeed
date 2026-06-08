@@ -4637,7 +4637,9 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         x_fp8 = hidden_states
     else:
         x_fp8 = quantize_fp8(hidden_states, scale=w13_act_scale, solution="triton")
-    x_u8 = x_fp8.view(torch.uint8) if x_fp8.dtype != torch.uint8 else x_fp8
+    # Pass FP8 tensors directly to Gluon.  ``view(torch.uint8)`` materializes a
+    # copy for float8 tensors on this stack and dominates small-M latency.
+    x_u8 = x_fp8
 
     inter = torch.empty(
         (n_tokens * top_k, I), dtype=x_fp8.dtype, device=hidden_states.device
@@ -4733,7 +4735,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         )
 
     s2_grid = (n_tokens * ((N + BLOCK_N - 1) // BLOCK_N),)
-    inter_u8 = inter.view(torch.uint8) if inter.dtype != torch.uint8 else inter
+    inter_u8 = inter
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
         inter_u8,
         w2_raw,
