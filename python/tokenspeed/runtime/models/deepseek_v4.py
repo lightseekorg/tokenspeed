@@ -34,10 +34,14 @@ from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.gemm import deep_gemm as _deep_gemm
-from tokenspeed_kernel.registry import error_fn
 
-deep_gemm = None if _deep_gemm.get_num_sms is error_fn else _deep_gemm
+try:
+    # Optional dependency; the module-level wrapper imports the external
+    # `deep_gemm` package unguarded, which is not installed in baseline V4
+    # builds. Callsites guard usage with `deep_gemm is not None`.
+    from tokenspeed_kernel.thirdparty import deep_gemm
+except ImportError:
+    deep_gemm = None  # type: ignore[assignment]
 
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
@@ -56,10 +60,10 @@ from tokenspeed_kernel.ops.routing.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
-from tokenspeed_kernel.ops.routing.trtllm import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.trtllm import (
     fast_topk_v2,
 )
-from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 

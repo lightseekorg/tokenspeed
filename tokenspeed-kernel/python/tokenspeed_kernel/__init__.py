@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
-from tokenspeed_kernel.registry import load_builtin_kernels
 
 bootstrap_profiling_from_env()
 
@@ -68,5 +67,3 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_mxfp4",
 ]
-
-load_builtin_kernels()
