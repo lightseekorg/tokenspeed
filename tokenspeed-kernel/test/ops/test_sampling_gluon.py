@@ -59,6 +59,7 @@ def test_argmax_matches_torch_for_dtypes(dtype):
     "M,N",
     [
         (1, MODEL_VOCABS["deepseek_v4"]),
+        (4, MODEL_VOCABS["deepseek_v4"]),
         (16, MODEL_VOCABS["qwen3_5"]),
         (64, MODEL_VOCABS["minimax_m2"]),
         (128, MODEL_VOCABS["qwen3_5"]),

@@ -145,6 +145,68 @@ def _argmax_split_atomic_kernel(
         gl.store(counters + row, 0)
 
 
+@gluon.jit
+def _argmax_tile_chunk(
+    logits,
+    row,
+    start,
+    stride_m: gl.constexpr,
+    N: gl.constexpr,
+    CHUNK_SIZE: gl.constexpr,
+    BLOCK: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+):
+    offs = gl.arange(0, BLOCK, layout=_argmax_layout(BLOCK, gl.num_warps(), LOAD_ELEMS))
+    cols = start + offs
+    mask = (offs < CHUNK_SIZE) & (cols < N)
+    vals = cdna4.buffer_load(
+        logits,
+        row * stride_m + cols,
+        mask=mask,
+        other=-float("inf"),
+    ).to(gl.float32)
+    indices = gl.where(mask, cols.to(gl.int32), 2147483647)
+    return gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
+
+
+@gluon.jit
+def _argmax_split_chunk_atomic_kernel(
+    logits,
+    partial_values,
+    partial_indices,
+    counters,
+    out,
+    stride_m: gl.constexpr,
+    out_stride: gl.constexpr,
+    N: gl.constexpr,
+    CHUNK_SIZE: gl.constexpr,
+    BLOCK: gl.constexpr,
+    NUM_SPLITS: gl.constexpr,
+    REDUCE_BLOCK: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    split = gl.program_id(1)
+    tile_val, tile_idx = _argmax_tile_chunk(
+        logits, row, split * CHUNK_SIZE, stride_m, N, CHUNK_SIZE, BLOCK, LOAD_ELEMS
+    )
+    partial_offset = row * NUM_SPLITS + split
+    gl.store(partial_values + partial_offset, tile_val)
+    gl.store(partial_indices + partial_offset, tile_idx)
+
+    old = gl.atomic_add(counters + row, 1, sem="acq_rel", scope="gpu")
+    if old == NUM_SPLITS - 1:
+        offs = gl.arange(
+            0, REDUCE_BLOCK, layout=_argmax_layout(REDUCE_BLOCK, gl.num_warps(), 1)
+        )
+        base = row * NUM_SPLITS + offs
+        vals = gl.load(partial_values + base, volatile=True)
+        indices = gl.load(partial_indices + base)
+        _, best_idx = gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
+        gl.store(out + row * out_stride, best_idx.to(out.dtype.element_ty))
+        gl.store(counters + row, 0)
+
+
 def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:
     if out.shape != (logits.shape[0],):
         raise ValueError(
@@ -279,7 +341,31 @@ def gluon_argmax_gfx950(
 
     block, num_warps, use_split = _select_config(M, N)
     load_elems = _load_elements_per_thread(logits.dtype)
-    if use_split:
+    # Extra row splits help M=1/4 occupancy; too many lose to atomic overhead.
+    if (M == 1 or M == 4) and N >= 65536:
+        num_splits = 32 if M == 1 else 16
+        chunk_size = triton.cdiv(N, num_splits)
+        fixed_block = triton.next_power_of_2(chunk_size)
+        partial_values, partial_indices, counters = _get_atomic_scratch(
+            M, num_splits, logits.device
+        )
+        _argmax_split_chunk_atomic_kernel[(M, num_splits)](
+            logits,
+            partial_values,
+            partial_indices,
+            counters,
+            out,
+            stride_m=logits.stride(0),
+            out_stride=out.stride(0),
+            N=N,
+            CHUNK_SIZE=chunk_size,
+            BLOCK=fixed_block,
+            NUM_SPLITS=num_splits,
+            REDUCE_BLOCK=num_splits,
+            LOAD_ELEMS=load_elems,
+            num_warps=num_warps,
+        )
+    elif use_split:
         num_splits = triton.cdiv(N, block)
         split_block = triton.next_power_of_2(num_splits)
         partial_values, partial_indices, counters = _get_atomic_scratch(
