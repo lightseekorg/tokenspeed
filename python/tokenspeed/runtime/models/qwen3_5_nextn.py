@@ -135,7 +135,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         **kwargs,
@@ -170,7 +169,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             input_embeds=hidden_states,
         )
 
-        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

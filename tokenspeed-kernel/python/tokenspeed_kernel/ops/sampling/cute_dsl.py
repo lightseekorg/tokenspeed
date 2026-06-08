@@ -97,14 +97,44 @@ def _ts_supported_arch() -> bool:
     return 90 <= sm < 120
 
 
+def _has_cluster_launch_support() -> bool:
+    """Check if the GPU supports TMA cluster launches required by the kernel.
+
+    The CUTLASS DSL ArgmaxKernel uses cluster dimensions > 1 via TMA, which
+    requires hardware cluster launch support. NVIDIA H20 GPUs report sm_90
+    (Hopper architecture) but lack the cluster launch capability, causing
+    CUDA_ERROR_INVALID_CLUSTER_SIZE (error 912) at kernel launch time.
+
+    This function uses a device-name heuristic to detect H20 SKUs and route
+    them through the torch.argmax fallback instead.
+    """
+    try:
+        p = current_platform()
+    except Exception:
+        return False
+    if not p.is_nvidia:
+        return False
+
+    # Only Hopper (sm_90) SKUs are affected -- Blackwell always supports
+    # cluster launches.
+    if p.arch_version.major > 9:
+        return True
+
+    # Device-name heuristic: H20 is the only sm_90 SKU known to lack cluster
+    # launch support. Other Hopper SKUs (H100, H200, H800) all support it.
+    import re
+
+    return not re.search(r"\bH20\b", p.device_name, re.IGNORECASE)
+
+
 _ARCH_SUPPORTED = _ts_supported_arch()
 
 
-# Only import the third-party CuTe DSL module on supported NVIDIA hardware.
-# On AMD / CPU-only / unsupported SM, leave ``_CUTE_AVAILABLE = False`` so every
-# entry point in this module routes through ``torch.argmax``.
+# Only import the third-party CuTe DSL module on supported NVIDIA hardware
+# with cluster launch capability. H20 GPUs (sm_90 without TMA cluster support)
+# hit CUDA_ERROR_INVALID_CLUSTER_SIZE; route them through torch.argmax instead.
 _CUTE_AVAILABLE = False
-if _ARCH_SUPPORTED:
+if _ARCH_SUPPORTED and _has_cluster_launch_support():
     try:
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
