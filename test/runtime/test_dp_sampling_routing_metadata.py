@@ -177,6 +177,51 @@ def test_cuda_graph_wrapper_uses_shared_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
+def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=0,
+        num_extends=0,
+        input_num_tokens=0,
+        forward_mode=ForwardMode.DECODE,
+        global_num_tokens=[0, 17],
+        all_decode_or_idle=True,
+    )
+
+    assert _graph_route(
+        0,
+        ctx,
+        dp_size=2,
+        max_bs=32,
+        capture_bs=[16, 32],
+        max_tokens_per_req=1,
+    ) == (True, 32)
+
+
+def test_cuda_graph_route_respects_disable_padding_with_global_batch():
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=0,
+        num_extends=0,
+        input_num_tokens=0,
+        forward_mode=ForwardMode.DECODE,
+        global_num_tokens=[0, 17],
+        all_decode_or_idle=True,
+    )
+
+    assert _graph_route(
+        0,
+        ctx,
+        dp_size=2,
+        disable_padding=True,
+        max_bs=32,
+        capture_bs=[16, 32],
+        max_tokens_per_req=1,
+    ) == (False, 0)
+
+
 def test_layout_planner_pads_graph_layout_bucket_to_tp_size():
     planner = LogitsLayoutPlanner(
         dp_sampling_enabled=True,
@@ -193,9 +238,7 @@ def test_layout_planner_pads_graph_layout_bucket_to_tp_size():
         forward_mode=ForwardMode.DECODE,
     )
 
-    use_graph, bucket_bs = _graph_route(
-        79, ctx, max_bs=80, capture_bs=[72, 79, 80]
-    )
+    use_graph, bucket_bs = _graph_route(79, ctx, max_bs=80, capture_bs=[72, 79, 80])
     plan = planner.build_plan(
         forward_mode=ctx.forward_mode,
         real_bs=79,
