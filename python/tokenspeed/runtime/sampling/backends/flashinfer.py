@@ -151,16 +151,6 @@ class FlashInferSamplingBackend(SamplingBackend):
             (config.max_bs,), dtype=torch.float32, device=config.device
         )
 
-        self._cpu_coins_buf = torch.empty(
-            config.max_bs,
-            config.max_draft_tokens_per_req,
-            dtype=torch.float32,
-            pin_memory=True,
-        )
-        self._cpu_final_coins_buf = torch.empty(
-            config.max_bs, dtype=torch.float32, pin_memory=True
-        )
-
         # Stub generator used during CUDA-graph capture/warm-up (no requests yet).
         self._capture_gen = torch.Generator(device=config.device)
         self._capture_gen.manual_seed(config.random_seed)
@@ -209,8 +199,8 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._final_coins_buf[:bs].uniform_(lo, 1.0, generator=self._capture_gen)
             return
 
-        cpu_coins = self._cpu_coins_buf[:bs, :n]
-        cpu_final = self._cpu_final_coins_buf[:bs]
+        cpu_coins = torch.empty((bs, n), dtype=torch.float32, pin_memory=True)
+        cpu_final = torch.empty((bs,), dtype=torch.float32, pin_memory=True)
 
         for i, pool_idx in enumerate(request_pool_indices):
             # No _reset_slot has run for this slot yet — fall back to
