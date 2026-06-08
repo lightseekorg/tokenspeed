@@ -1055,7 +1055,7 @@ def allreduce_residual_rmsnorm(
 
         token_num, hidden_dim = input_tensor.shape
 
-        from . import iris as _iris_mod
+        from tokenspeed_kernel_amd.communication import iris as _iris_mod
 
         if (
             input_tensor.is_cuda

@@ -24,12 +24,12 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.flash_attn import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_nvidia.attention.flash_attn import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
-from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
 torch.manual_seed(42)

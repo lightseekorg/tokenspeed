@@ -23,6 +23,7 @@ from __future__ import annotations
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 from torch import nn
 from torch.nn.parameter import Parameter
 
@@ -479,7 +480,7 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         # Equivalent to tokenspeed's _flashinfer_autotune() which runs a dummy
         # forward inside autotune() context. Without this, calls with new
         # token counts trigger JIT compilation that desyncs TP ranks.
-        if not self._autotuned and flashinfer_autotune is not None:
+        if not self._autotuned and flashinfer_autotune not in (None, error_fn):
             with flashinfer_autotune():
                 self._call_kernel(router_logits, x_quant, x_scale, layer, top_k, output)
             self._autotuned = True

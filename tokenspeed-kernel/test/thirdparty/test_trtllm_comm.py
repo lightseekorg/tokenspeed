@@ -104,7 +104,7 @@ EXPECTED_ENUMS = {
 
 
 def test_pattern_enums():
-    import tokenspeed_kernel.thirdparty.cuda.trtllm as tk_comm
+    import tokenspeed_kernel_nvidia.thirdparty.cuda.trtllm as tk_comm
 
     for cls_name, members in EXPECTED_ENUMS.items():
         tk_cls = getattr(tk_comm, cls_name)
@@ -123,7 +123,7 @@ def test_pattern_enums():
 def _worker_allreduce(rank, world_size, port, results):
     device = setup_distributed(rank, world_size, port)
     try:
-        import tokenspeed_kernel.thirdparty.cuda.trtllm as tk_comm
+        import tokenspeed_kernel_nvidia.thirdparty.cuda.trtllm as tk_comm
 
         hidden_dim = 4096
         max_token_num = 128
@@ -221,7 +221,7 @@ def _worker_allreduce(rank, world_size, port, results):
 def _worker_reducescatter(rank, world_size, port, results):
     device = setup_distributed(rank, world_size, port)
     try:
-        import tokenspeed_kernel.thirdparty.cuda.trtllm as tk_comm
+        import tokenspeed_kernel_nvidia.thirdparty.cuda.trtllm as tk_comm
 
         hidden_dim = 4096
         max_token_num = 128

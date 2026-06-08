@@ -24,12 +24,10 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.ops.gemm import deep_gemm as _deep_gemm
 from tokenspeed_kernel.registry import error_fn
 
-try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
-except Exception:
-    deep_gemm = None  # type: ignore[assignment]
+deep_gemm = None if _deep_gemm.get_num_sms is error_fn else _deep_gemm
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,

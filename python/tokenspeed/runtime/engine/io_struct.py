@@ -28,7 +28,7 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from tokenspeed.runtime.engine.request_types import BaseFinishReason
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
@@ -614,6 +614,46 @@ class FlushCacheReqInput:
 @dataclass
 class FlushCacheReqOutput:
     success: bool
+
+
+# How a pause should treat in-flight requests.
+# - "abort": kill in-flight requests immediately, then stop admitting new ones.
+# - "wait":  stop admitting new ones, keep stepping until running requests drain.
+# - "keep":  freeze everything in place; resume picks up where it left off.
+PauseMode = Literal["abort", "wait", "keep"]
+
+
+@dataclass
+class PauseSchedulerReqInput:
+    # See PauseMode for how each mode treats in-flight requests.
+    mode: PauseMode = "abort"
+
+
+@dataclass
+class PauseSchedulerReqOutput:
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class ResumeSchedulerReqInput:
+    pass
+
+
+@dataclass
+class ResumeSchedulerReqOutput:
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class IsSchedulerPausedReqInput:
+    pass
+
+
+@dataclass
+class IsSchedulerPausedReqOutput:
+    is_paused: bool
 
 
 @dataclass

@@ -22,19 +22,20 @@ from __future__ import annotations
 
 import math
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
-import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
+
+
+def mha_decode_scheduler_metadata(*args, **kwargs):
+    from tokenspeed_kernel.ops.attention.flash_attn import (
+        mha_decode_scheduler_metadata as _mha_decode_scheduler_metadata,
+    )
+
+    return _mha_decode_scheduler_metadata(*args, **kwargs)
 
 
 def _attention_format_signature(**roles: torch.Tensor):

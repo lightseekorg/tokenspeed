@@ -41,6 +41,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
+from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_forward,
@@ -98,6 +99,11 @@ logger = get_colorful_logger(__name__)
 
 def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
     return scheduler.calc_rolling_hash(tokens, apply_match=True)
+
+
+# Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
+# not busy-spin a CPU core waiting for /resume.
+_PAUSED_IDLE_SLEEP_S = 0.001
 
 
 class _NullSender:
@@ -361,6 +367,10 @@ class EventLoop:
 
         self._init_interprocess_comm()
 
+        # Pause/resume control state. Shared with the request handler, which
+        # drives the control-request side; the event loop reads the gate.
+        self._pause = PauseController(self.send_to_tokenizer)
+
         self.metrics = EngineMetrics(
             labels={
                 "model_name": server_args.served_model_name,
@@ -383,6 +393,7 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
+            pause_controller=self._pause,
         )
 
         self.output_processor = OutputProcesser(
@@ -817,8 +828,40 @@ class EventLoop:
     # Shared step helpers
     # ------------------------------------------------------------------
 
+    def _reap_or_keep_buffered_spec(self, spec) -> bool:
+        """Resolve a buffered spec on resume; return True if it should be admitted.
+
+        A buffered spec was already registered in ``rid_to_state`` before it was
+        withheld, so if it was aborted while paused it never reached the
+        scheduler and the forward path can never reap it. Handle that here:
+
+        - state missing  -> already published and reaped; drop silently.
+        - state finished -> aborted in place. Stream a terminating finish for
+          pause-initiated aborts (the passive client is still waiting) and drop
+          the registered state so the rid does not leak; client-initiated aborts
+          already tore down their own state, so just reap.
+        - otherwise      -> still live; admit it.
+        """
+        state = self.output_processor.rid_to_state.get(spec.request_id)
+        if state is None:
+            return False
+        if state.finished:
+            if state.abort_notify_client:
+                self.output_processor.publish_finished_at_admission(
+                    spec.request_id, state
+                )
+            else:
+                self.output_processor.rid_to_state.pop(spec.request_id, None)
+            return False
+        return True
+
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
+        # Snapshot the pause state before dispatch: process_requests may flip it
+        # mid-batch. If it was not blocked before but is after, a pause control
+        # message was processed in this very batch — which is what makes the
+        # FIFO edge below detectable (see TODO(pause-fifo)).
+        pause_blocked_before = self._pause.admit_blocked
         new_req_specs, new_req_states, bootstrap_infos, abort_rids = (
             self.request_handler.process_requests(recv_reqs)
         )
@@ -836,6 +879,41 @@ class EventLoop:
         for rid in abort_rids:
             self.output_processor.mark_abort(rid)
             grammar_manager.mark_abort(rid)
+
+        # A pause(mode="abort") cancels every in-flight request through the same
+        # marker path as a client abort; they finish on their next scheduled
+        # step, then the drain check resolves the pause reply.
+        if self._pause.consume_abort_all():
+            for rid in list(self.output_processor.rid_to_state.keys()):
+                # notify_client=True: pause aborts a passive client's request,
+                # so it must receive a terminating finish (unlike a client abort).
+                self.output_processor.mark_abort(rid, notify_client=True)
+                grammar_manager.mark_abort(rid)
+
+        # abort/wait also cancel requests still compiling in the grammar queue:
+        # they are not yet in rid_to_state or the scheduler, so the sweep above
+        # and the drain check both miss them. A finished state makes the next
+        # get_ready_grammar_requests pass publish them instead of admitting, so
+        # they never run under post-resume weights or strand the drain.
+        if self._pause.consume_cancel_grammar():
+            for _, state, _ in grammar_manager.grammar_queue:
+                state.set_finish_with_abort("Aborted by pause", notify_client=True)
+
+        # On resume, flush specs buffered while paused even when no new request
+        # arrives this iteration. This must run before the ``if not ready:
+        # return`` guard below, which would otherwise strand buffered specs
+        # until the next inbound request. Specs aborted while paused are reaped
+        # in place (terminating finish + state cleanup) rather than admitted, so
+        # they don't burn a scheduler slot or leak their rid — see
+        # ``_reap_or_keep_buffered_spec``.
+        if not self._pause.admit_blocked and self._pause.buffered_specs:
+            specs = [
+                spec
+                for spec in self._pause.take_buffered_specs()
+                if self._reap_or_keep_buffered_spec(spec)
+            ]
+            if specs:
+                self.scheduler.submit_requests(specs)
 
         # Partition new requests by grammar readiness. Compile-bound requests
         # are queued in GrammarManager and admitted in a later iteration when
@@ -898,6 +976,32 @@ class EventLoop:
                     spec.rolling_hashes = hashes
                     spec.storage_hit_pages = hit_pages
             admitted_specs.append(spec)
+
+        # Pause gate: while paused, withhold new requests from the scheduler
+        # (running requests keep stepping); buffered specs are flushed on resume
+        # above, ahead of any newly-admitted ones, preserving FIFO order.
+        #
+        # TODO(pause-fifo): recv_reqs() drains the socket non-blocking, so a
+        # generate request that arrived *before* a pause control message can be
+        # coalesced into the same batch and reach here after the pause flipped
+        # admit_blocked. Such a pre-pause request is buffered as post-pause work
+        # instead of running (wait) / being aborted (abort). Correct handling
+        # needs the batch processed as an ordered stream that respects the
+        # control request's FIFO position. Tracked as a follow-up; until then we
+        # warn when the coalescing condition is observed so it is not silent.
+        if self._pause.admit_blocked:
+            if admitted_specs and not pause_blocked_before:
+                logger.warning(
+                    "Pause engaged in the same recv batch as %d generate "
+                    "request(s) (rids=%s); their FIFO order relative to the "
+                    "pause is not preserved, so a pre-pause request may be "
+                    "buffered as post-pause work and run only after resume. "
+                    "See TODO(pause-fifo).",
+                    len(admitted_specs),
+                    [spec.request_id for spec in admitted_specs],
+                )
+            self._pause.buffer_specs(admitted_specs)
+            return
 
         if admitted_specs:
             self.scheduler.submit_requests(admitted_specs)
@@ -1061,6 +1165,33 @@ class EventLoop:
         )
 
     # ------------------------------------------------------------------
+    # Pause / resume helpers
+    # ------------------------------------------------------------------
+
+    def _paused_idle_step(self, prev_forward_op=None, prev_results=None) -> None:
+        """Run one iteration under ``PAUSED_ALL`` (keep mode): no new forward
+        work, but keep DP ranks in lockstep, service the drain check, and yield
+        the CPU so the freeze does not busy-spin a core."""
+        if prev_results is not None:
+            request_changes = self._commit_forward_results(
+                prev_forward_op, prev_results
+            )
+            advance_forward(self.scheduler, request_changes)
+            self._publish_scheduler_kv_events()
+
+        if self.has_dp:
+            dp_metadata = self._dp_sync_and_check(None)
+            if dp_metadata.need_idle_forward:
+                self.model_executor.execute_idle_forward(
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
+                    dp_metadata.all_decode_or_idle,
+                )
+
+        self._pause.maybe_finish_drain(self.scheduler)
+        time.sleep(_PAUSED_IDLE_SLEEP_S)
+
+    # ------------------------------------------------------------------
     # Event loops
     # ------------------------------------------------------------------
 
@@ -1069,6 +1200,9 @@ class EventLoop:
         while True:
             self._process_new_requests()
             self._commit_cache_results()
+            if self._pause.forward_blocked:
+                self._paused_idle_step()
+                continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
@@ -1121,6 +1255,9 @@ class EventLoop:
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
                 self._publish_scheduler_kv_events()
+
+            # Resolve a deferred abort/wait pause reply once in-flight work drains.
+            self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
@@ -1183,6 +1320,13 @@ class EventLoop:
             )
             self._process_new_requests()
             self._commit_cache_results()
+            if self._pause.forward_blocked:
+                # Freeze: commit any in-flight (overlapped) step — a forward
+                # already on the GPU can't be un-launched — then idle.
+                self._paused_idle_step(prev_forward_op, prev_results)
+                prev_results = None
+                prev_forward_op = None
+                continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 
@@ -1281,6 +1425,9 @@ class EventLoop:
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
                 self._publish_scheduler_kv_events()
+
+            # Resolve a deferred abort/wait pause reply once in-flight work drains.
+            self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 

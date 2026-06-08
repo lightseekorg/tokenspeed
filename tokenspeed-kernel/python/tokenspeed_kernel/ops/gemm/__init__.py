@@ -22,12 +22,6 @@ from __future__ import annotations
 
 import logging
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
-import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
-import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
-import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
