@@ -95,7 +95,6 @@ class LogitsMetadata:
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
-    extend_seq_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: list[int] | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
@@ -123,16 +122,11 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
     @classmethod
-    def from_forward_context(
-        cls,
-        ctx: ForwardContext,
-        input_lengths: torch.Tensor | None = None,
-    ):
+    def from_forward_context(cls, ctx: ForwardContext):
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
-            extend_seq_lens=input_lengths,
         )
 
 
