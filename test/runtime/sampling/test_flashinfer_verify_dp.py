@@ -31,8 +31,10 @@ import torch.multiprocessing as mp
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
-from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    resolve_dp_sampling_vocab_size_update,
+    slice_dp_vocab_mask,
+)
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
@@ -117,6 +119,11 @@ def _build_backend(
     group,
     enable_output_logprobs: bool = False,
 ):
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.flashinfer import (
+        FlashInferSamplingBackend,
+    )
+
     cfg = SamplingBackendConfig(
         enable_nan_detection=False,
         enable_output_logprobs=enable_output_logprobs,
@@ -134,40 +141,27 @@ def _build_backend(
 
 
 def test_configure_dp_sampling_vocab_size_rebuilds_comm_before_use():
-    class _FakeComm:
-        is_initialized = False
-
-    backend = object.__new__(FlashInferSamplingBackend)
-    backend._dp_comm = _FakeComm()
-    backend._dp_comm_vocab_size = 32002
-    backend._dp_tp_size = 2
-    backend.config = object()
-
-    made_vocab_sizes = []
-
-    def _make_dp_comm(vocab_size, config):
-        made_vocab_sizes.append(vocab_size)
-        return _FakeComm()
-
-    backend._make_dp_comm = _make_dp_comm
-
-    backend.configure_dp_sampling_vocab_size(32064)
-
-    assert made_vocab_sizes == [32064]
-    assert backend._dp_comm_vocab_size == 32064
+    assert (
+        resolve_dp_sampling_vocab_size_update(
+            has_comm=True,
+            current_vocab_size=32002,
+            requested_vocab_size=32064,
+            tp_size=2,
+            comm_initialized=False,
+        )
+        == 32064
+    )
 
 
 def test_configure_dp_sampling_vocab_size_rejects_unsharded_size():
-    class _FakeComm:
-        is_initialized = False
-
-    backend = object.__new__(FlashInferSamplingBackend)
-    backend._dp_comm = _FakeComm()
-    backend._dp_comm_vocab_size = 32002
-    backend._dp_tp_size = 2
-
     with pytest.raises(RuntimeError, match="must be divisible"):
-        backend.configure_dp_sampling_vocab_size(32001)
+        resolve_dp_sampling_vocab_size_update(
+            has_comm=True,
+            current_vocab_size=32002,
+            requested_vocab_size=32001,
+            tp_size=2,
+            comm_initialized=False,
+        )
 
 
 def _test_verify_dp_matches_today(
@@ -286,7 +280,7 @@ def test_dp_vocab_mask_slices_by_request_shard():
         full_bs * n, mask_words
     )
 
-    rank0 = FlashInferSamplingBackend._slice_dp_vocab_mask(
+    rank0 = slice_dp_vocab_mask(
         vocab_mask,
         full_bs=full_bs,
         pad_bs=pad_bs,
@@ -295,7 +289,7 @@ def test_dp_vocab_mask_slices_by_request_shard():
     )
     torch.testing.assert_close(rank0, vocab_mask[: 3 * n], rtol=0, atol=0)
 
-    rank1 = FlashInferSamplingBackend._slice_dp_vocab_mask(
+    rank1 = slice_dp_vocab_mask(
         vocab_mask,
         full_bs=full_bs,
         pad_bs=pad_bs,

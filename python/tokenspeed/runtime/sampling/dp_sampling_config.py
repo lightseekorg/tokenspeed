@@ -23,7 +23,9 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlanner
+import torch
+
+from tokenspeed.runtime.sampling.logits_layout import resolve_dp_sampling_min_bs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,6 +53,7 @@ class DpSamplingSupport:
 class DpSamplingRuntimeConfig:
     vocab_size: int | None = None
     max_bucket_bs: int | None = None
+    min_bs: int | None = None
 
 
 def resolve_dp_sampling_support(
@@ -83,20 +86,6 @@ def resolve_dp_sampling_support(
     return support
 
 
-def create_logits_layout_planner(
-    *,
-    support: DpSamplingSupport,
-    configured_min_bs: int | None,
-    num_tokens_per_req: int,
-) -> LogitsLayoutPlanner:
-    return LogitsLayoutPlanner.from_settings(
-        dp_sampling_enabled=support.enabled,
-        configured_min_bs=configured_min_bs,
-        tp_size=support.tp_size,
-        num_tokens_per_req=num_tokens_per_req,
-    )
-
-
 def configure_dp_sampling_runtime(
     *,
     support: DpSamplingSupport,
@@ -107,6 +96,7 @@ def configure_dp_sampling_runtime(
     max_num_seqs: int,
     data_parallel_size: int,
     num_tokens_per_req: int,
+    configured_min_bs: int | None,
     device: Any,
 ) -> DpSamplingRuntimeConfig:
     if not support.enabled:
@@ -142,8 +132,13 @@ def configure_dp_sampling_runtime(
     max_bucket_bs = (
         (max_bs + logits_processor.tp_size - 1) // logits_processor.tp_size
     ) * logits_processor.tp_size
+    min_bs = resolve_dp_sampling_min_bs(
+        tp_size=logits_processor.tp_size,
+        configured_min_bs=configured_min_bs,
+    )
     logits_processor.configure_dp_sampling(
         dp_num_tokens_per_req=num_tokens_per_req,
+        dp_sampling_min_bs=min_bs,
         max_bucket_bs=max_bucket_bs,
         vocab_size=dp_vocab_size,
         device=device,
@@ -151,6 +146,7 @@ def configure_dp_sampling_runtime(
     return DpSamplingRuntimeConfig(
         vocab_size=dp_vocab_size,
         max_bucket_bs=max_bucket_bs,
+        min_bs=min_bs,
     )
 
 
@@ -164,6 +160,48 @@ def dp_sampling_comm_vocab_size(
     if not skip_all_gather:
         vocab_size *= int(tp_size)
     return ((vocab_size + int(tp_size) - 1) // int(tp_size)) * int(tp_size)
+
+
+def resolve_dp_sampling_vocab_size_update(
+    *,
+    has_comm: bool,
+    current_vocab_size: int,
+    requested_vocab_size: int,
+    tp_size: int,
+    comm_initialized: bool,
+) -> int | None:
+    if not has_comm:
+        return None
+    if requested_vocab_size == current_vocab_size:
+        return None
+    if requested_vocab_size % int(tp_size) != 0:
+        raise RuntimeError(
+            f"DP sampling vocab_size={requested_vocab_size} must be divisible by "
+            f"tp_size={tp_size}"
+        )
+    if comm_initialized:
+        raise RuntimeError("Cannot resize DP sampling comm after use")
+    return requested_vocab_size
+
+
+def slice_dp_vocab_mask(
+    vocab_mask: torch.Tensor | None,
+    *,
+    full_bs: int,
+    pad_bs: int,
+    num_tokens_per_req: int,
+    shard: slice,
+) -> torch.Tensor | None:
+    if vocab_mask is None:
+        return None
+    n = num_tokens_per_req
+    if pad_bs > full_bs:
+        vocab_mask = torch.nn.functional.pad(
+            vocab_mask,
+            (0, 0, 0, (pad_bs - full_bs) * n),
+            value=-1,
+        )
+    return vocab_mask.view(pad_bs, n, -1)[shard].reshape(-1, vocab_mask.shape[-1])
 
 
 def validate_dp_sampling_lm_head_vocab(

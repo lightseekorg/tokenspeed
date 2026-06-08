@@ -51,7 +51,6 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     configure_dp_sampling_runtime,
-    create_logits_layout_planner,
     resolve_dp_sampling_support,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -64,7 +63,6 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
-    from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -312,12 +310,7 @@ class ModelExecutor:
         )
 
         self.dp_sampling_enabled = dp_support.enabled
-        self.logits_layout_planner = create_logits_layout_planner(
-            support=dp_support,
-            configured_min_bs=self.config.dp_sampling_min_bs,
-            num_tokens_per_req=spec_num_tokens,
-        )
-        configure_dp_sampling_runtime(
+        dp_runtime_config = configure_dp_sampling_runtime(
             support=dp_support,
             model=self.model_runner.model,
             sampling_backend=self.sampling_backend,
@@ -326,6 +319,7 @@ class ModelExecutor:
             max_num_seqs=config.max_num_seqs,
             data_parallel_size=config.data_parallel_size,
             num_tokens_per_req=spec_num_tokens,
+            configured_min_bs=self.config.dp_sampling_min_bs,
             device=self.device,
         )
         logger.info(
@@ -335,7 +329,7 @@ class ModelExecutor:
             dp_support.requested,
             dp_support.infra_supports,
             dp_support.enabled,
-            self.logits_layout_planner.dp_sampling_min_bs,
+            dp_runtime_config.min_bs,
             dp_support.drafter_available,
             dp_support.backend_supports_verify,
             dp_support.tp_size,
@@ -357,7 +351,6 @@ class ModelExecutor:
             capturable_grammar=self.capturable_grammar,
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
-            logits_layout_plan_builder=self._build_capture_logits_layout_plan,
             runtime_states=self.runtime_states,
         )
 
@@ -625,7 +618,6 @@ class ModelExecutor:
         self,
         bs: int,
         sampling_params_list: list[SamplingParams],
-        logits_layout_plan: LogitsLayoutPlan | None = None,
     ) -> SamplingBatchInfo:
         return SamplingBatchInfo.from_runtime_buffers(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
@@ -633,14 +625,6 @@ class ModelExecutor:
             is_all_greedy=all(p.top_k <= 1 for p in sampling_params_list),
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
-            logits_layout_plan=logits_layout_plan,
-        )
-
-    def _build_capture_logits_layout_plan(self, bs: int) -> LogitsLayoutPlan:
-        return self.logits_layout_planner.build_plan(
-            forward_mode=ForwardMode.DECODE,
-            real_bs=bs,
-            effective_bs=bs,
         )
 
     def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
@@ -953,20 +937,12 @@ class ModelExecutor:
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
         )
-        _use_graph, bucket_bs = self.forward_step.graph_route(0, ctx)
-        ctx.logits_layout_plan = self.logits_layout_planner.build_plan(
-            forward_mode=ctx.forward_mode,
-            real_bs=0,
-            effective_bs=bucket_bs,
-        )
-
         sampling_info = SamplingBatchInfo.from_runtime_buffers(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             is_all_greedy=True,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
-            logits_layout_plan=ctx.logits_layout_plan,
         )
         if self.forward_step.can_run(bs=0, ctx=ctx):
             padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
@@ -1366,25 +1342,10 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
-                _use_graph, bucket_bs = self.forward_step.graph_route(bs, ctx)
-                ctx.logits_layout_plan = self.logits_layout_planner.build_plan(
-                    forward_mode=forward_mode,
-                    real_bs=bs,
-                    effective_bs=bucket_bs,
-                )
-                if forward_mode.is_decode() and self.config.global_rank == 0:
-                    logger.debug(
-                        "Logits layout: bs=%s mode=%s bucket_bs=%s",
-                        bs,
-                        ctx.logits_layout_plan.mode,
-                        ctx.logits_layout_plan.bucket_bs,
-                    )
-
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(
                         bs,
                         sampling_params_list,
-                        logits_layout_plan=ctx.logits_layout_plan,
                     )
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,

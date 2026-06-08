@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -175,11 +176,10 @@ def _build_processor(
     )
 
 
-def _build_metadata(*, dp_sampling: bool):
+def _build_metadata():
     return LogitsMetadata(
         forward_mode=ForwardMode.DECODE,
         capture_hidden_mode=CaptureHiddenMode.NULL,
-        dp_sampling=dp_sampling,
     )
 
 
@@ -213,6 +213,7 @@ def _test_dp_chain_matches_legacy(
     )
     processor.configure_dp_sampling(
         dp_num_tokens_per_req=n,
+        dp_sampling_min_bs=1,
         max_bucket_bs=pad_bs,
         vocab_size=vocab,
         device=device,
@@ -233,7 +234,7 @@ def _test_dp_chain_matches_legacy(
     candidates = _make_candidates(bs, n, vocab, device=device, seed=2024)
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
 
-    legacy_meta = _build_metadata(dp_sampling=False)
+    legacy_meta = _build_metadata()
     legacy_logits = processor._get_logits(hidden_states.clone(), lm_head, legacy_meta)
     assert legacy_logits.shape == (
         bs * n,
@@ -255,8 +256,17 @@ def _test_dp_chain_matches_legacy(
     legacy_predict = legacy_predict.clone()
     legacy_accept_length = legacy_accept_length.clone()
 
-    dp_meta = _build_metadata(dp_sampling=True)
-    dp_logits = processor._get_logits(hidden_states.clone(), lm_head, dp_meta)
+    dp_meta = _build_metadata()
+    dp_plan = LogitsLayoutPlan.dp_all_to_all(
+        real_bs=bs,
+        effective_bs=bs,
+        bucket_bs=pad_bs,
+        tp_size=tp_size,
+        num_tokens_per_req=n,
+    )
+    dp_logits = processor._get_logits(
+        hidden_states.clone(), lm_head, dp_meta, plan=dp_plan
+    )
     reqs_per_rank = pad_bs // tp_size
     assert dp_logits.shape == (
         reqs_per_rank * n,
@@ -268,9 +278,11 @@ def _test_dp_chain_matches_legacy(
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
-        dp_sampling=True,
     )
-    dp_out = LogitsProcessorOutput(next_token_logits=dp_logits)
+    dp_out = LogitsProcessorOutput(
+        next_token_logits=dp_logits,
+        logits_layout_plan=dp_plan,
+    )
     _seed_coins(backend, bs=bs, n=n, seed=2024)
     dp_predict, dp_accept_length = backend.verify(dp_out, dp_info, candidates)
 

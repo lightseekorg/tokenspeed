@@ -3,10 +3,10 @@ import torch
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
-from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
 
-def test_logits_metadata_derives_dp_sampling_from_forward_context_layout_plan():
+def test_logits_metadata_derives_basic_fields_from_forward_context():
+    gather_ids = torch.tensor([0], dtype=torch.int64)
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -14,12 +14,7 @@ def test_logits_metadata_derives_dp_sampling_from_forward_context_layout_plan():
         num_extends=0,
         input_num_tokens=1,
         forward_mode=ForwardMode.DECODE,
-        logits_layout_plan=LogitsLayoutPlan.dp_all_to_all(
-            real_bs=1,
-            bucket_bs=4,
-            tp_size=4,
-            num_tokens_per_req=1,
-        ),
+        gather_ids=gather_ids,
     )
 
     metadata = LogitsMetadata.from_forward_context(
@@ -27,4 +22,6 @@ def test_logits_metadata_derives_dp_sampling_from_forward_context_layout_plan():
         torch.tensor([1], dtype=torch.int32),
     )
 
-    assert metadata.dp_sampling is True
+    assert metadata.forward_mode == ForwardMode.DECODE
+    assert metadata.gather_ids is gather_ids
+    assert metadata.extend_seq_lens.tolist() == [1]

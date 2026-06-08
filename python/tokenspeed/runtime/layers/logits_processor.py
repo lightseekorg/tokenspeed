@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
+    LogitsLayoutPlanner,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -58,6 +59,7 @@ class LogitsProcessorOutput:
     # Used by speculative decoding.
     # The last hidden layers
     hidden_states: torch.Tensor | None = None
+    logits_layout_plan: LogitsLayoutPlan | None = None
 
     ## Part 2: Populated by the active SamplingBackend during sample()/verify().
     # The logprobs of the next tokens.                              shape: [#seq]
@@ -116,25 +118,17 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_cpu: torch.Tensor | None = None
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
-    dp_sampling: bool = False
-    logits_layout_plan: LogitsLayoutPlan | None = None
-
     @classmethod
     def from_forward_context(
         cls,
         ctx: ForwardContext,
         input_lengths: torch.Tensor | None = None,
     ):
-        logits_layout_plan = ctx.logits_layout_plan
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
             extend_seq_lens=input_lengths,
-            dp_sampling=(
-                logits_layout_plan is not None and logits_layout_plan.is_dp_all_to_all
-            ),
-            logits_layout_plan=logits_layout_plan,
         )
 
 
@@ -206,6 +200,7 @@ class LogitsProcessor(nn.Module):
         self.dp_num_tokens_per_req = dp_num_tokens_per_req
         self.logit_scale = logit_scale
         self._logits_layout_executor: LogitsLayoutExecutor | None = None
+        self._logits_layout_planner: LogitsLayoutPlanner | None = None
 
         if tp_rank is None:
             assert tp_size is None
@@ -237,12 +232,19 @@ class LogitsProcessor(nn.Module):
         self,
         *,
         dp_num_tokens_per_req: int,
+        dp_sampling_min_bs: int,
         max_bucket_bs: int,
         vocab_size: int,
         device: torch.device | str,
     ) -> None:
         self.dp_sampling_enabled = True
         self.dp_num_tokens_per_req = dp_num_tokens_per_req
+        self._logits_layout_planner = LogitsLayoutPlanner(
+            dp_sampling_enabled=True,
+            dp_sampling_min_bs=dp_sampling_min_bs,
+            tp_size=self.tp_size,
+            num_tokens_per_req=dp_num_tokens_per_req,
+        )
         assert (
             self.tp_size > 1 and self.tp_group is not None
         ), "dp_sampling requires tp_size > 1 and a real tp_group"
@@ -255,6 +257,29 @@ class LogitsProcessor(nn.Module):
             vocab_size=vocab_size,
             device=device,
         )
+
+    def _resolve_logits_layout_plan(
+        self,
+        hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> LogitsLayoutPlan | None:
+        if self._logits_layout_planner is None:
+            return None
+        if not (
+            logits_metadata.forward_mode.is_decode()
+            or logits_metadata.forward_mode.is_target_verify()
+        ):
+            return None
+        n = self.dp_num_tokens_per_req
+        rows = hidden_states.shape[0]
+        assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
+        effective_bs = rows // n
+        plan = self._logits_layout_planner.build_plan(
+            forward_mode=logits_metadata.forward_mode,
+            real_bs=effective_bs,
+            effective_bs=effective_bs,
+        )
+        return plan if plan.is_dp_all_to_all else None
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia:
@@ -352,7 +377,12 @@ class LogitsProcessor(nn.Module):
             )
 
         # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+        logits_layout_plan = self._resolve_logits_layout_plan(
+            pruned_states, logits_metadata
+        )
+        logits = self._get_logits(
+            pruned_states, lm_head, logits_metadata, plan=logits_layout_plan
+        )
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
@@ -397,6 +427,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                logits_layout_plan=logits_layout_plan,
             )
         else:
             input_logprobs = logits[input_logprob_indices]
@@ -460,6 +491,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: torch.Tensor | None = None,
+        plan: LogitsLayoutPlan | None = None,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -467,25 +499,10 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        plan = logits_metadata.logits_layout_plan
-        if plan is None and logits_metadata.dp_sampling:
-            rows = hidden_states.shape[0]
-            n = self.dp_num_tokens_per_req
-            assert (
-                rows % n == 0
-            ), f"hidden_states have {rows} rows, not divisible by N={n}"
-            real_bs = rows // n
-            bucket_bs = ((real_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
-            plan = LogitsLayoutPlan.dp_all_to_all(
-                real_bs=real_bs,
-                bucket_bs=bucket_bs,
-                tp_size=self.tp_size,
-                num_tokens_per_req=n,
-            )
         dp_sampling = plan is not None and plan.is_dp_all_to_all
         assert (not dp_sampling) or self.dp_sampling_enabled, (
-            "logits_metadata.dp_sampling=True but LogitsProcessor was not "
-            "built with dp_sampling_enabled=True"
+            "DP logits layout plan was provided but LogitsProcessor was not "
+            "configured with dp_sampling"
         )
 
         if dp_sampling and self.skip_all_gather:

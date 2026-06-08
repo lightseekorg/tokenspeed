@@ -35,6 +35,7 @@ from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 class LogitsLayoutPlan:
     mode: Literal["normal", "dp_all_to_all"]
     real_bs: int
+    effective_bs: int
     bucket_bs: int
     tp_size: int
     num_tokens_per_req: int
@@ -48,6 +49,7 @@ class LogitsLayoutPlan:
         cls,
         *,
         real_bs: int,
+        effective_bs: int,
         bucket_bs: int,
         tp_size: int,
         num_tokens_per_req: int,
@@ -55,6 +57,7 @@ class LogitsLayoutPlan:
         return cls(
             mode="normal",
             real_bs=real_bs,
+            effective_bs=effective_bs,
             bucket_bs=bucket_bs,
             tp_size=tp_size,
             num_tokens_per_req=num_tokens_per_req,
@@ -65,6 +68,7 @@ class LogitsLayoutPlan:
         cls,
         *,
         real_bs: int,
+        effective_bs: int,
         bucket_bs: int,
         tp_size: int,
         num_tokens_per_req: int,
@@ -72,6 +76,7 @@ class LogitsLayoutPlan:
         return cls(
             mode="dp_all_to_all",
             real_bs=real_bs,
+            effective_bs=effective_bs,
             bucket_bs=bucket_bs,
             tp_size=tp_size,
             num_tokens_per_req=num_tokens_per_req,
@@ -104,7 +109,7 @@ def should_use_dp_sampling_for_bucket(
     return (
         dp_sampling_enabled
         and forward_mode is not None
-        and forward_mode.is_decode()
+        and (forward_mode.is_decode() or forward_mode.is_target_verify())
         and effective_bs >= min_bs
     )
 
@@ -153,6 +158,7 @@ class LogitsLayoutPlanner:
             ) * self.tp_size
             return LogitsLayoutPlan.dp_all_to_all(
                 real_bs=real_bs,
+                effective_bs=effective_bs,
                 bucket_bs=bucket_bs,
                 tp_size=self.tp_size,
                 num_tokens_per_req=self.num_tokens_per_req,
@@ -160,6 +166,7 @@ class LogitsLayoutPlanner:
 
         return LogitsLayoutPlan.normal(
             real_bs=real_bs,
+            effective_bs=effective_bs,
             bucket_bs=effective_bs,
             tp_size=self.tp_size,
             num_tokens_per_req=self.num_tokens_per_req,
@@ -204,11 +211,11 @@ class LogitsLayoutExecutor:
         rows = hidden_states.shape[0]
         assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
         bs = rows // n
-        assert bs == plan.real_bs, (
-            f"hidden_states imply real_bs={bs}, but logits layout plan has "
-            f"real_bs={plan.real_bs}"
+        assert bs == plan.effective_bs, (
+            f"hidden_states imply effective_bs={bs}, but logits layout plan has "
+            f"effective_bs={plan.effective_bs}"
         )
-        pad_rows = (plan.bucket_bs - plan.real_bs) * n
+        pad_rows = (plan.bucket_bs - plan.effective_bs) * n
         if pad_rows > 0:
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_rows))
         reqs_per_rank = plan.bucket_bs // self._tp_size
@@ -224,11 +231,11 @@ class LogitsLayoutExecutor:
         rows = local_logits.shape[0]
         assert rows % n == 0, f"local logits have {rows} rows, not divisible by N={n}"
         bs = rows // n
-        assert bs == plan.real_bs, (
-            f"local logits imply real_bs={bs}, but logits layout plan has "
-            f"real_bs={plan.real_bs}"
+        assert bs == plan.effective_bs, (
+            f"local logits imply effective_bs={bs}, but logits layout plan has "
+            f"effective_bs={plan.effective_bs}"
         )
-        pad_rows = (plan.bucket_bs - plan.real_bs) * n
+        pad_rows = (plan.bucket_bs - plan.effective_bs) * n
         if pad_rows > 0:
             local_logits = torch.nn.functional.pad(local_logits, (0, 0, 0, pad_rows))
         return self._comm.swap_batch_vocab(local_logits, pad_bs=plan.bucket_bs)
@@ -243,8 +250,11 @@ class LogitsLayoutExecutor:
             f"N={self._num_tokens_per_req}"
         )
         assert (
-            plan.bucket_bs >= plan.real_bs
-        ), f"bucket_bs={plan.bucket_bs} must be >= real_bs={plan.real_bs}"
+            plan.effective_bs >= plan.real_bs
+        ), f"effective_bs={plan.effective_bs} must be >= real_bs={plan.real_bs}"
+        assert (
+            plan.bucket_bs >= plan.effective_bs
+        ), f"bucket_bs={plan.bucket_bs} must be >= effective_bs={plan.effective_bs}"
         assert (
             plan.bucket_bs % self._tp_size == 0
         ), f"bucket_bs={plan.bucket_bs} must be divisible by tp_size={self._tp_size}"

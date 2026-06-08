@@ -8,6 +8,7 @@ import torch
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.graph_routing import select_cuda_graph_route
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     resolve_dp_sampling_support,
@@ -19,7 +20,32 @@ from tokenspeed.runtime.sampling.logits_layout import (
     resolve_dp_sampling_min_bs,
     should_use_dp_sampling_for_bucket,
 )
-from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+
+
+def _graph_route(
+    bs: int,
+    ctx: ForwardContext,
+    *,
+    disable: bool = False,
+    dp_size: int = 1,
+    disable_padding: bool = False,
+    max_bs: int,
+    capture_bs: list[int],
+    max_tokens_per_req: int = 1,
+) -> tuple[bool, int]:
+    return select_cuda_graph_route(
+        bs=bs,
+        forward_mode=ctx.forward_mode,
+        disable=disable,
+        dp_size=dp_size,
+        all_decode_or_idle=ctx.all_decode_or_idle,
+        global_num_tokens=ctx.global_num_tokens,
+        max_tokens_per_req=max_tokens_per_req,
+        disable_padding=disable_padding,
+        capture_bs=capture_bs,
+        max_bs=max_bs,
+        available_graph_bs=set(capture_bs),
+    )
 
 
 def test_dp_sampling_bucket_threshold():
@@ -32,6 +58,12 @@ def test_dp_sampling_bucket_threshold():
     assert should_use_dp_sampling_for_bucket(
         dp_sampling_enabled=True,
         forward_mode=ForwardMode.DECODE,
+        effective_bs=16,
+        min_bs=16,
+    )
+    assert should_use_dp_sampling_for_bucket(
+        dp_sampling_enabled=True,
+        forward_mode=ForwardMode.TARGET_VERIFY,
         effective_bs=16,
         min_bs=16,
     )
@@ -93,12 +125,6 @@ def test_layout_planner_dp_bucket_rounds_to_tp_size():
 
 
 def test_layout_planner_uses_graph_bucket_threshold():
-    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    runner.disable = False
-    runner.dp_size = 1
-    runner.disable_padding = False
-    runner.max_bs = 32
-    runner.capture_bs = [24, 32]
     planner = LogitsLayoutPlanner(
         dp_sampling_enabled=True,
         dp_sampling_min_bs=32,
@@ -114,7 +140,7 @@ def test_layout_planner_uses_graph_bucket_threshold():
         forward_mode=ForwardMode.DECODE,
     )
 
-    use_graph, bucket_bs = runner.graph_route(30, ctx)
+    use_graph, bucket_bs = _graph_route(30, ctx, max_bs=32, capture_bs=[24, 32])
     plan = planner.build_plan(
         forward_mode=ctx.forward_mode,
         real_bs=30,
@@ -124,16 +150,34 @@ def test_layout_planner_uses_graph_bucket_threshold():
     assert use_graph
     assert plan.is_dp_all_to_all
     assert plan.real_bs == 30
+    assert plan.effective_bs == 32
     assert plan.bucket_bs == 32
 
 
+def test_cuda_graph_wrapper_uses_shared_route_for_padding():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.disable = False
+    wrapper.dp_size = 1
+    wrapper.disable_padding = False
+    wrapper.max_bs = 32
+    wrapper.capture_bs = [24, 32]
+    wrapper.graphs = {24, 32}
+    wrapper.max_tokens_per_req = 1
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=30,
+        num_extends=0,
+        input_num_tokens=30,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    assert wrapper.graph_route(30, ctx) == (True, 32)
+    assert wrapper.can_run(30, ctx)
+    assert wrapper.padded_bs(30, ctx) == 32
+
+
 def test_layout_planner_pads_graph_layout_bucket_to_tp_size():
-    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    runner.disable = False
-    runner.dp_size = 1
-    runner.disable_padding = False
-    runner.max_bs = 80
-    runner.capture_bs = [72, 79, 80]
     planner = LogitsLayoutPlanner(
         dp_sampling_enabled=True,
         dp_sampling_min_bs=32,
@@ -149,7 +193,9 @@ def test_layout_planner_pads_graph_layout_bucket_to_tp_size():
         forward_mode=ForwardMode.DECODE,
     )
 
-    use_graph, bucket_bs = runner.graph_route(79, ctx)
+    use_graph, bucket_bs = _graph_route(
+        79, ctx, max_bs=80, capture_bs=[72, 79, 80]
+    )
     plan = planner.build_plan(
         forward_mode=ctx.forward_mode,
         real_bs=79,
@@ -158,16 +204,12 @@ def test_layout_planner_pads_graph_layout_bucket_to_tp_size():
 
     assert use_graph
     assert plan.is_dp_all_to_all
+    assert plan.real_bs == 79
+    assert plan.effective_bs == 79
     assert plan.bucket_bs == 80
 
 
 def test_layout_planner_pads_capture_bucket_above_threshold_to_tp_size():
-    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    runner.disable = False
-    runner.dp_size = 1
-    runner.disable_padding = False
-    runner.max_bs = 32
-    runner.capture_bs = [24, 32]
     planner = LogitsLayoutPlanner(
         dp_sampling_enabled=True,
         dp_sampling_min_bs=16,
@@ -183,7 +225,7 @@ def test_layout_planner_pads_capture_bucket_above_threshold_to_tp_size():
         forward_mode=ForwardMode.DECODE,
     )
 
-    use_graph, bucket_bs = runner.graph_route(24, ctx)
+    use_graph, bucket_bs = _graph_route(24, ctx, max_bs=32, capture_bs=[24, 32])
     plan = planner.build_plan(
         forward_mode=ctx.forward_mode,
         real_bs=24,
@@ -192,16 +234,12 @@ def test_layout_planner_pads_capture_bucket_above_threshold_to_tp_size():
 
     assert use_graph
     assert plan.is_dp_all_to_all
+    assert plan.real_bs == 24
+    assert plan.effective_bs == 24
     assert plan.bucket_bs == 32
 
 
 def test_layout_planner_keeps_graph_bucket_below_threshold_non_dp():
-    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    runner.disable = False
-    runner.dp_size = 1
-    runner.disable_padding = False
-    runner.max_bs = 32
-    runner.capture_bs = [24, 32]
     planner = LogitsLayoutPlanner(
         dp_sampling_enabled=True,
         dp_sampling_min_bs=32,
@@ -217,7 +255,7 @@ def test_layout_planner_keeps_graph_bucket_below_threshold_non_dp():
         forward_mode=ForwardMode.DECODE,
     )
 
-    use_graph, bucket_bs = runner.graph_route(23, ctx)
+    use_graph, bucket_bs = _graph_route(23, ctx, max_bs=32, capture_bs=[24, 32])
     plan = planner.build_plan(
         forward_mode=ctx.forward_mode,
         real_bs=23,
@@ -227,17 +265,11 @@ def test_layout_planner_keeps_graph_bucket_below_threshold_non_dp():
     assert use_graph
     assert not plan.is_dp_all_to_all
     assert plan.real_bs == 23
+    assert plan.effective_bs == 24
     assert plan.bucket_bs == 24
 
 
 def test_layout_planner_uses_global_decode_bucket_for_idle_rank():
-    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    runner.disable = False
-    runner.dp_size = 2
-    runner.disable_padding = False
-    runner.max_bs = 32
-    runner.capture_bs = [16, 32]
-    runner.max_tokens_per_req = 1
     planner = LogitsLayoutPlanner(
         dp_sampling_enabled=True,
         dp_sampling_min_bs=16,
@@ -256,7 +288,14 @@ def test_layout_planner_uses_global_decode_bucket_for_idle_rank():
         all_decode_or_idle=True,
     )
 
-    use_graph, bucket_bs = runner.graph_route(0, ctx)
+    use_graph, bucket_bs = _graph_route(
+        0,
+        ctx,
+        dp_size=2,
+        max_bs=32,
+        capture_bs=[16, 32],
+        max_tokens_per_req=1,
+    )
     plan = planner.build_plan(
         forward_mode=ctx.forward_mode,
         real_bs=0,
@@ -266,12 +305,11 @@ def test_layout_planner_uses_global_decode_bucket_for_idle_rank():
     assert use_graph
     assert plan.is_dp_all_to_all
     assert plan.real_bs == 0
+    assert plan.effective_bs == 16
     assert plan.bucket_bs == 16
 
 
 def test_layout_planner_eager_route_returns_tp_divisible_bucket():
-    runner = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    runner.disable = True
     planner = LogitsLayoutPlanner(
         dp_sampling_enabled=True,
         dp_sampling_min_bs=16,
@@ -287,7 +325,9 @@ def test_layout_planner_eager_route_returns_tp_divisible_bucket():
         forward_mode=ForwardMode.DECODE,
     )
 
-    use_graph, bucket_bs = runner.graph_route(17, ctx)
+    use_graph, bucket_bs = _graph_route(
+        17, ctx, disable=True, max_bs=32, capture_bs=[24, 32]
+    )
     plan = planner.build_plan(
         forward_mode=ctx.forward_mode,
         real_bs=17,
@@ -296,25 +336,9 @@ def test_layout_planner_eager_route_returns_tp_divisible_bucket():
 
     assert not use_graph
     assert plan.is_dp_all_to_all
+    assert plan.real_bs == 17
+    assert plan.effective_bs == 17
     assert plan.bucket_bs == 20
-
-
-def test_sampling_info_derives_dp_sampling_from_layout_plan():
-    sampling_info = SamplingBatchInfo.from_runtime_buffers(
-        req_pool_indices=torch.arange(2),
-        valid_cache_lengths=None,
-        is_all_greedy=False,
-        vocab_size=7,
-        device="cpu",
-        logits_layout_plan=LogitsLayoutPlan.dp_all_to_all(
-            real_bs=2,
-            bucket_bs=4,
-            tp_size=2,
-            num_tokens_per_req=1,
-        ),
-    )
-
-    assert sampling_info.dp_sampling is True
 
 
 def test_configure_dp_sampling_sets_state():
@@ -327,12 +351,45 @@ def test_configure_dp_sampling_sets_state():
 
     processor.configure_dp_sampling(
         dp_num_tokens_per_req=6,
+        dp_sampling_min_bs=8,
         max_bucket_bs=8,
         vocab_size=8,
         device="cpu",
     )
     assert processor.dp_sampling_enabled
     assert processor.dp_num_tokens_per_req == 6
+
+
+@pytest.mark.parametrize(
+    "forward_mode",
+    [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY],
+)
+def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
+    forward_mode,
+):
+    processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        tp_rank=0,
+        tp_size=4,
+        tp_group=(0, 1, 2, 3),
+    )
+    processor.configure_dp_sampling(
+        dp_num_tokens_per_req=6,
+        dp_sampling_min_bs=5,
+        max_bucket_bs=8,
+        vocab_size=8,
+        device="cpu",
+    )
+
+    plan = processor._resolve_logits_layout_plan(
+        torch.empty(5 * 6, 3),
+        LogitsMetadata(forward_mode=forward_mode),
+    )
+
+    assert plan is not None
+    assert plan.real_bs == 5
+    assert plan.effective_bs == 5
+    assert plan.bucket_bs == 8
 
 
 def test_dp_sampling_skip_all_gather_rejects_sharded_lm_head_vocab():
@@ -371,22 +428,55 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
     )
     hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
     lm_head = SimpleNamespace(weight=torch.ones(7, 3))
+    plan = LogitsLayoutPlan.dp_all_to_all(
+        real_bs=5,
+        effective_bs=5,
+        bucket_bs=8,
+        tp_size=4,
+        num_tokens_per_req=6,
+    )
 
     logits = processor._get_logits(
         hidden_states,
         lm_head,
-        LogitsMetadata(
-            forward_mode=ForwardMode.DECODE,
-            dp_sampling=True,
-            logits_layout_plan=LogitsLayoutPlan.dp_all_to_all(
-                real_bs=5,
-                bucket_bs=8,
-                tp_size=4,
-                num_tokens_per_req=6,
-            ),
-        ),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        plan=plan,
     )
 
     assert logits.shape == (12, 7)
     expected_rows = hidden_states[12:24].sum(dim=1)
+    assert torch.equal(logits[:, 0], expected_rows)
+
+
+def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
+    processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        skip_all_gather=True,
+        tp_rank=2,
+        tp_size=4,
+        tp_group=(0, 1, 2, 3),
+        dp_sampling_enabled=True,
+        dp_num_tokens_per_req=6,
+    )
+    hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
+    lm_head = SimpleNamespace(weight=torch.ones(7, 3))
+    plan = LogitsLayoutPlan.dp_all_to_all(
+        real_bs=4,
+        effective_bs=5,
+        bucket_bs=8,
+        tp_size=4,
+        num_tokens_per_req=6,
+    )
+
+    logits = processor._get_logits(
+        hidden_states,
+        lm_head,
+        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        plan=plan,
+    )
+
+    assert logits.shape == (12, 7)
+    expected_rows = torch.cat(
+        [hidden_states[24:30].sum(dim=1), torch.zeros(6, dtype=torch.float32)]
+    )
     assert torch.equal(logits[:, 0], expected_rows)

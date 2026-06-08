@@ -57,6 +57,10 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SamplingBackendConfig,
 )
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    resolve_dp_sampling_vocab_size_update,
+    slice_dp_vocab_mask,
+)
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
@@ -142,19 +146,19 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     def configure_dp_sampling_vocab_size(self, vocab_size: int) -> None:
         """Use the target LM-head padded vocab size for DP logits exchange."""
-        if self._dp_comm is None:
+        new_vocab_size = resolve_dp_sampling_vocab_size_update(
+            has_comm=self._dp_comm is not None,
+            current_vocab_size=self._dp_comm_vocab_size,
+            requested_vocab_size=vocab_size,
+            tp_size=self._dp_tp_size,
+            comm_initialized=bool(
+                self._dp_comm is not None and self._dp_comm.is_initialized
+            ),
+        )
+        if new_vocab_size is None:
             return
-        if vocab_size == self._dp_comm_vocab_size:
-            return
-        if vocab_size % self._dp_tp_size != 0:
-            raise RuntimeError(
-                f"DP sampling vocab_size={vocab_size} must be divisible by "
-                f"tp_size={self._dp_tp_size}"
-            )
-        if self._dp_comm.is_initialized:
-            raise RuntimeError("Cannot resize DP sampling comm after use")
-        self._dp_comm_vocab_size = vocab_size
-        self._dp_comm = self._make_dp_comm(vocab_size, self.config)
+        self._dp_comm_vocab_size = new_vocab_size
+        self._dp_comm = self._make_dp_comm(new_vocab_size, self.config)
 
     @staticmethod
     def _slice_dp_vocab_mask(
@@ -165,16 +169,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         num_tokens_per_req: int,
         shard: slice,
     ) -> torch.Tensor | None:
-        if vocab_mask is None:
-            return None
-        n = num_tokens_per_req
-        if pad_bs > full_bs:
-            vocab_mask = torch.nn.functional.pad(
-                vocab_mask,
-                (0, 0, 0, (pad_bs - full_bs) * n),
-                value=-1,
-            )
-        return vocab_mask.view(pad_bs, n, -1)[shard].reshape(-1, vocab_mask.shape[-1])
+        return slice_dp_vocab_mask(
+            vocab_mask,
+            full_bs=full_bs,
+            pad_bs=pad_bs,
+            num_tokens_per_req=num_tokens_per_req,
+            shard=shard,
+        )
 
     def _init_pool_scalars(self, config: SamplingBackendConfig) -> None:
         # Capture warm-up reads row 0 with req_pool_indices zeroed, so row 0
@@ -399,35 +400,57 @@ class FlashInferSamplingBackend(SamplingBackend):
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
         vocab_mask = sampling_info.vocab_mask
+        logits_layout_plan = getattr(logits_output, "logits_layout_plan", None)
+        dp_sampling = (
+            logits_layout_plan is not None and logits_layout_plan.is_dp_all_to_all
+        ) or sampling_info.dp_sampling
 
-        if sampling_info.dp_sampling:
+        if dp_sampling:
             assert (
                 self._dp_tp_size > 1 and self._dp_pg is not None
             ), "dp_sampling requires tp_size > 1 and a resolved tp_group"
             tp_size = self._dp_tp_size
             rank = self._dp_rank
-            full_bs = bs
-            pad_bs = ((bs + tp_size - 1) // tp_size) * tp_size
+            effective_bs = (
+                logits_layout_plan.effective_bs
+                if logits_layout_plan is not None
+                else bs
+            )
+            assert effective_bs == bs, (
+                f"DP sampling effective_bs={effective_bs} must match "
+                f"candidate batch size {bs}"
+            )
+            pad_bs = (
+                logits_layout_plan.bucket_bs
+                if logits_layout_plan is not None
+                else ((effective_bs + tp_size - 1) // tp_size) * tp_size
+            )
+            assert pad_bs >= effective_bs, (
+                f"pad_bs={pad_bs} must be >= effective_bs={effective_bs}"
+            )
             assert (
                 pad_bs <= self._dp_max_pad_bs
             ), f"pad_bs={pad_bs} exceeds dp_max_pad_bs={self._dp_max_pad_bs}"
+            assert pad_bs % tp_size == 0, (
+                f"pad_bs={pad_bs} must be divisible by tp_size={tp_size}"
+            )
             bs = pad_bs // tp_size
 
             # Shard by request so each request's draft chain stays on one rank.
             shard = slice(rank * bs, (rank + 1) * bs)
-            if pad_bs > full_bs:
+            if pad_bs > effective_bs:
                 candidates = torch.nn.functional.pad(
-                    candidates, (0, 0, 0, pad_bs - full_bs)
+                    candidates, (0, 0, 0, pad_bs - effective_bs)
                 )[shard]
                 pool_indices = torch.nn.functional.pad(
-                    sampling_info.req_pool_indices, (0, pad_bs - full_bs)
+                    sampling_info.req_pool_indices, (0, pad_bs - effective_bs)
                 )[shard]
             else:
                 candidates = candidates[shard]
                 pool_indices = sampling_info.req_pool_indices[shard]
             vocab_mask = self._slice_dp_vocab_mask(
                 vocab_mask,
-                full_bs=full_bs,
+                full_bs=effective_bs,
                 pad_bs=pad_bs,
                 num_tokens_per_req=num_tokens_per_req,
                 shard=shard,
@@ -456,6 +479,12 @@ class FlashInferSamplingBackend(SamplingBackend):
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
         )
+        if dp_sampling:
+            expected_rows = bs * num_tokens_per_req
+            assert logits.shape[0] == expected_rows, (
+                f"DP sampling logits rows {logits.shape[0]} != expected "
+                f"{expected_rows}"
+            )
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
@@ -523,13 +552,13 @@ class FlashInferSamplingBackend(SamplingBackend):
                 draft_probs=None,
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=not sampling_info.dp_sampling,
+                deterministic=not dp_sampling,
                 enable_pdl=pdl_enabled(),
             )
 
         accept_length += 1
         logprobs_local = None
-        if self.config.enable_output_logprobs and sampling_info.dp_sampling:
+        if self.config.enable_output_logprobs and dp_sampling:
             # DP verify logits are still sharded by request at this point.
             # Compute scalar logprobs for local predictions before gathering
             # predictions to full-batch shape; the non-DP writer requires
@@ -538,7 +567,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 bs, num_tokens_per_req
             )
 
-        if sampling_info.dp_sampling:
+        if dp_sampling:
             n = num_tokens_per_req
             assert self._dp_comm is not None
             self._dp_comm.prepare_verify_outputs(logits_output.next_token_logits.dtype)
@@ -552,16 +581,16 @@ class FlashInferSamplingBackend(SamplingBackend):
                 accept_length_local=accept_length,
                 pad_bs=pad_bs,
             )
-            predict = predict_full.view(-1)[: full_bs * n]
-            accept_index = accept_index_full[:full_bs]
-            accept_length = accept_length_full[:full_bs]
+            predict = predict_full.view(-1)[: effective_bs * n]
+            accept_index = accept_index_full[:effective_bs]
+            accept_length = accept_length_full[:effective_bs]
             if logprobs_local is not None:
                 logprobs_full = self._dp_comm.gather_verify_logprobs(
                     logprobs_local,
                     pad_bs=pad_bs,
                 )
                 logits_output.next_token_logprobs = logprobs_full.view(-1)[
-                    : full_bs * n
+                    : effective_bs * n
                 ]
         # TP-rank sync: rank 0 wins on the full verify-output triple.
         # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
@@ -574,7 +603,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         elif not _FUSED_TOPK_TOPP_AVAILABLE:
             self.maybe_broadcast(predict, accept_index, accept_length)
 
-        if self.config.enable_output_logprobs and not sampling_info.dp_sampling:
+        if self.config.enable_output_logprobs and not dp_sampling:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
                 logits, predict
             )
