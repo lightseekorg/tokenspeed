@@ -8,7 +8,6 @@ import torch
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.graph_routing import select_cuda_graph_route
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -39,19 +38,16 @@ def _graph_route(
     capture_bs: list[int],
     max_tokens_per_req: int = 1,
 ) -> tuple[bool, int]:
-    return select_cuda_graph_route(
-        bs=bs,
-        forward_mode=ctx.forward_mode,
-        disable=disable,
-        dp_size=dp_size,
-        all_decode_or_idle=ctx.all_decode_or_idle,
-        global_num_tokens=ctx.global_num_tokens,
-        max_tokens_per_req=max_tokens_per_req,
-        disable_padding=disable_padding,
-        capture_bs=capture_bs,
-        max_bs=max_bs,
-        available_graph_bs=set(capture_bs),
-    )
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.disable = disable
+    wrapper.dp_size = dp_size
+    wrapper.disable_padding = disable_padding
+    wrapper.max_bs = max_bs
+    wrapper.capture_bs = capture_bs
+    wrapper.graphs = set(capture_bs)
+    wrapper.max_tokens_per_req = max_tokens_per_req
+    use_graph = wrapper.can_run(bs, ctx)
+    return use_graph, wrapper.padded_bs(bs, ctx) if use_graph else bs
 
 
 def _dp_runtime_config(
@@ -198,7 +194,7 @@ def test_layout_planner_uses_graph_bucket_threshold():
     assert plan.bucket_bs == 32
 
 
-def test_cuda_graph_wrapper_uses_shared_route_for_padding():
+def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
     wrapper.disable = False
     wrapper.dp_size = 1
@@ -216,7 +212,6 @@ def test_cuda_graph_wrapper_uses_shared_route_for_padding():
         forward_mode=ForwardMode.DECODE,
     )
 
-    assert wrapper.graph_route(30, ctx) == (True, 32)
     assert wrapper.can_run(30, ctx)
     assert wrapper.padded_bs(30, ctx) == 32
 

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import bisect
 import gc
 import queue
 from collections.abc import Callable
@@ -34,10 +35,6 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
-)
-from tokenspeed.runtime.execution.graph_routing import (
-    global_graph_bs,
-    select_cuda_graph_route,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import (
@@ -364,7 +361,7 @@ class CudaGraphWrapper:
         # is_all_greedy=True at capture would freeze the graph into
         # argmax and bypass per-request seeding at replay.
         ibd = self.input_buffers
-        sampling_info = SamplingBatchInfo.from_runtime_buffers(
+        sampling_info = SamplingBatchInfo(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
             valid_cache_lengths=(
                 self.runtime_states.valid_cache_lengths
@@ -762,29 +759,28 @@ class CudaGraphWrapper:
                 )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
-        return global_graph_bs(
-            dp_size=self.dp_size,
-            global_num_tokens=ctx.global_num_tokens,
-            max_tokens_per_req=self.max_tokens_per_req,
-        )
-
-    def graph_route(self, bs: int, ctx: ForwardContext) -> tuple[bool, int]:
-        return select_cuda_graph_route(
-            bs=bs,
-            forward_mode=ctx.forward_mode,
-            disable=self.disable,
-            dp_size=self.dp_size,
-            all_decode_or_idle=ctx.all_decode_or_idle,
-            global_num_tokens=ctx.global_num_tokens,
-            max_tokens_per_req=self.max_tokens_per_req,
-            disable_padding=self.disable_padding,
-            capture_bs=self.capture_bs,
-            max_bs=self.max_bs,
-            available_graph_bs=self.graphs,
-        )
+        if self.dp_size <= 1 or ctx.global_num_tokens is None:
+            return None
+        max_num_tokens = max(ctx.global_num_tokens)
+        return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
 
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
-        return self.graph_route(bs, ctx)[0]
+        if self.disable:
+            return False
+        if not (ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()):
+            return False
+        if self.dp_size > 1:
+            if not ctx.all_decode_or_idle:
+                return False
+            global_bs = self._global_graph_bs(ctx)
+            if global_bs is None or global_bs == 0:
+                return False
+            if self.disable_padding:
+                return global_bs in self.graphs
+            return global_bs <= self.max_bs
+        if self.disable_padding:
+            return bs in self.graphs
+        return bs <= self.max_bs
 
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
         return self._can_use_graph(bs, ctx)
@@ -793,7 +789,10 @@ class CudaGraphWrapper:
         return self._padded_bs(bs, ctx)
 
     def _padded_bs(self, bs: int, ctx: ForwardContext) -> int:
-        return self.graph_route(bs, ctx)[1]
+        graph_bs = self._global_graph_bs(ctx)
+        target_bs = graph_bs if graph_bs is not None else bs
+        index = bisect.bisect_left(self.capture_bs, target_bs)
+        return self.capture_bs[index]
 
     def __call__(
         self,
@@ -823,7 +822,8 @@ class CudaGraphWrapper:
         eager forward_func otherwise.  The caller does not need to know which
         path was taken.
         """
-        use_graph, padded_bs = self.graph_route(bs, ctx)
+        use_graph = self._can_use_graph(bs, ctx)
+        padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
