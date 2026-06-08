@@ -4612,9 +4612,10 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     N = int(w2_raw.shape[2])
 
-    fuse_topk_stage1 = os.environ.get(
-        "TOKENSPEED_MOE_GLUON_FUSE_TOPK_STAGE1", "0"
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    fuse_topk_stage1 = (
+        os.environ.get("TOKENSPEED_MOE_GLUON_FUSE_TOPK_STAGE1", "1").strip().lower()
+        not in _GLUON_DISABLE_VALUES
+    )
     if fuse_topk_stage1:
         router_logits_c = router_logits.contiguous()
         topk_ids = torch.empty(
