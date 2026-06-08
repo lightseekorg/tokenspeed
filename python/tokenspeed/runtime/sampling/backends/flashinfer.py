@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.distributed as dist
@@ -95,7 +95,7 @@ class FlashInferSamplingBackend(SamplingBackend):
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
-        self._init_dp_geometry(config)
+        self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
         # Pre-create the side stream used by fused_topk_topp_renorm. Must
@@ -103,44 +103,39 @@ class FlashInferSamplingBackend(SamplingBackend):
         # inside capture, and verify() runs from the captured graph.
         fused_topk_topp_prepare(config.device)
 
-    def _init_dp_geometry(self, config: SamplingBackendConfig) -> None:
-        tp_group = config.tp_group
-        tp_size = len(tp_group) if tp_group is not None else 1
-
-        self._dp_tp_size = tp_size
-        self._dp_tp_group = tp_group
+    def _init_dp_sampling(self, config: SamplingBackendConfig) -> None:
+        self._dp_tp_group = config.tp_group
+        self._dp_tp_size = (
+            len(self._dp_tp_group) if self._dp_tp_group is not None else 1
+        )
         self._dp_pg = None
         self._dp_rank = 0
         self._dp_comm: DpSamplingComm | None = None
         self._dp_comm_vocab_size = 0
 
-        if tp_size > 1 and config.dp_sampling:
-            self._dp_max_pad_bs = ((config.max_bs + tp_size - 1) // tp_size) * tp_size
-            self._dp_max_reqs_per_rank = self._dp_max_pad_bs // tp_size
-
-            self._dp_pg = pg_manager.get_process_group("nccl", tp_group)
-
-            self._dp_rank = dist.get_rank(group=self._dp_pg)
-
-            self._dp_comm_vocab_size = (
-                (max(config.vocab_size, tp_size) + tp_size - 1) // tp_size
-            ) * tp_size
-            self._dp_comm = self._make_dp_comm(self._dp_comm_vocab_size, config)
-        else:
+        if self._dp_tp_size <= 1 or not config.dp_sampling:
             self._dp_max_pad_bs = config.max_bs
             self._dp_max_reqs_per_rank = config.max_bs
+            return
 
-    def _make_dp_comm(
-        self, vocab_size: int, config: SamplingBackendConfig
-    ) -> DpSamplingComm:
         assert self._dp_tp_group is not None
-        return DpSamplingComm(
+        self._dp_max_pad_bs = (
+            (config.max_bs + self._dp_tp_size - 1) // self._dp_tp_size
+        ) * self._dp_tp_size
+        self._dp_max_reqs_per_rank = self._dp_max_pad_bs // self._dp_tp_size
+        self._dp_pg = pg_manager.get_process_group("nccl", self._dp_tp_group)
+        self._dp_rank = dist.get_rank(group=self._dp_pg)
+        self._dp_comm_vocab_size = (
+            (max(config.vocab_size, self._dp_tp_size) + self._dp_tp_size - 1)
+            // self._dp_tp_size
+        ) * self._dp_tp_size
+        self._dp_comm = DpSamplingComm(
             tp_size=self._dp_tp_size,
             rank=self._dp_rank,
             group=self._dp_tp_group,
             max_pad_bs=self._dp_max_pad_bs,
             num_tokens_per_req=config.max_draft_tokens_per_req,
-            vocab_size=vocab_size,
+            vocab_size=self._dp_comm_vocab_size,
             logits_dtype=None,
             device=config.device,
         )
@@ -151,6 +146,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         assert runtime.vocab_size is not None
         assert runtime.max_bucket_bs is not None
         assert runtime.topology is not None
+        assert runtime.device is not None
         if runtime.topology.tp_size != self._dp_tp_size:
             raise RuntimeError(
                 f"DP sampling runtime tp_size={runtime.topology.tp_size} "
@@ -163,14 +159,10 @@ class FlashInferSamplingBackend(SamplingBackend):
                 f"DP sampling max_bucket_bs={runtime.max_bucket_bs} exceeds "
                 f"backend max_pad_bs={self._dp_max_pad_bs}"
             )
-        self._configure_dp_sampling_comm_vocab(runtime.vocab_size)
-
-    def _configure_dp_sampling_comm_vocab(self, vocab_size: int) -> None:
-        """Use the target LM-head padded vocab size for DP logits exchange."""
         new_vocab_size = resolve_dp_sampling_vocab_size_update(
             has_comm=self._dp_comm is not None,
             current_vocab_size=self._dp_comm_vocab_size,
-            requested_vocab_size=vocab_size,
+            requested_vocab_size=runtime.vocab_size,
             tp_size=self._dp_tp_size,
             comm_initialized=bool(
                 self._dp_comm is not None and self._dp_comm.is_initialized
@@ -178,8 +170,18 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
         if new_vocab_size is None:
             return
+        assert self._dp_tp_group is not None
         self._dp_comm_vocab_size = new_vocab_size
-        self._dp_comm = self._make_dp_comm(new_vocab_size, self.config)
+        self._dp_comm = DpSamplingComm(
+            tp_size=self._dp_tp_size,
+            rank=self._dp_rank,
+            group=self._dp_tp_group,
+            max_pad_bs=self._dp_max_pad_bs,
+            num_tokens_per_req=runtime.num_tokens_per_req,
+            vocab_size=new_vocab_size,
+            logits_dtype=None,
+            device=runtime.device,
+        )
 
     @staticmethod
     def _slice_dp_vocab_mask(
@@ -319,12 +321,11 @@ class FlashInferSamplingBackend(SamplingBackend):
         request_pool_indices=None is the capture/warm-up path — uses
         _capture_gen for all rows. Otherwise reads per-slot generators
         populated via _reset_slot."""
-        n = min(num_tokens_per_req, self.config.max_draft_tokens_per_req)
-        lo = coin_eps(self._coins_buf.dtype)
-
         if bs <= 0:
             return
 
+        n = min(num_tokens_per_req, self.config.max_draft_tokens_per_req)
+        lo = coin_eps(self._coins_buf.dtype)
         if request_pool_indices is None:
             self._coins_buf[:bs, :n].uniform_(lo, 1.0, generator=self._capture_gen)
             self._final_coins_buf[:bs].uniform_(lo, 1.0, generator=self._capture_gen)
@@ -334,11 +335,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         cpu_final = self._cpu_final_coins_buf[:bs]
 
         for i, pool_idx in enumerate(request_pool_indices):
-            # No _reset_slot has run for this slot yet — fall back to
-            # the stub generator. Should not happen in well-formed runs
-            # because prepare_step's flip detection runs _reset_slot
-            # before this hook.
-            gen = self._cpu_generator_per_slot[pool_idx] or self._capture_gen
+            gen = cast(torch.Generator, self._cpu_generator_per_slot[pool_idx])
             cpu_coins[i, :n].uniform_(lo, 1.0, generator=gen)
             cpu_final[i].uniform_(lo, 1.0, generator=gen)
 
