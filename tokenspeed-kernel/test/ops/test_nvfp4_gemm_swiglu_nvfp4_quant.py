@@ -154,12 +154,12 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
     i: int,
 ) -> None:
     import tokenspeed_kernel
-    from tokenspeed_kernel.ops.gemm.cute_dsl import (
+    from tokenspeed_kernel.registry import load_builtin_kernels
+    from tokenspeed_kernel_nvidia.gemm.cute_dsl import (
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
-    from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-    from tokenspeed_kernel.registry import load_builtin_kernels
-    from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_nvfp4_quant
+    from tokenspeed_kernel_nvidia.quantization.flashinfer import fp4_quantize
+    from tokenspeed_kernel_nvidia.thirdparty.cuda import silu_and_mul_fuse_nvfp4_quant
 
     from tokenspeed.runtime.layers.dense.nvfp4 import (
         interleave_linear_and_gate,

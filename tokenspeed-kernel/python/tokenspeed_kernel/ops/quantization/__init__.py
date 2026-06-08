@@ -368,9 +368,3 @@ def quantize_mxfp4(
             scale_layout=scale_layout,
             enable_pdl=enable_pdl,
         )
-
-
-# Backend registration (side-effect imports).
-import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
-import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
-import tokenspeed_kernel.ops.quantization.trtllm  # noqa: E402,F401

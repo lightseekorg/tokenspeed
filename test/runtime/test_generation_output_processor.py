@@ -98,3 +98,23 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert len(reserve_events) == 1
     assert reserve_events[0].request_id == "decode"
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
+
+
+def test_mark_abort_notify_client_flag():
+    """Pause-initiated aborts must flag the request to stream a terminating
+    finish to the (passive) client; client-initiated aborts must not."""
+    sender = _Sender()
+    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+
+    pause_state = _state([1, 2, 3])
+    processor.rid_to_state["pause"] = pause_state
+    processor.mark_abort("pause", notify_client=True)
+    assert pause_state.to_abort
+    assert pause_state.abort_notify_client
+    assert pause_state.finished  # finished_reason materialized
+
+    client_state = _state([1, 2, 3])
+    processor.rid_to_state["client"] = client_state
+    processor.mark_abort("client")  # default: client tore down its own state
+    assert client_state.to_abort
+    assert not client_state.abort_notify_client

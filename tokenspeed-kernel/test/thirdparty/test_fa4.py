@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.flash_attn import (
     flash_attn_varlen_func,
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.registrations import nvidia as nvidia_registrations
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 
@@ -372,6 +373,7 @@ def test_mha_ragged_extend_with_paged_kvcache(
 
 def _reload_fa4_registry_entries() -> None:
     KernelRegistry.reset()
+    nvidia_registrations.load()
     importlib.reload(flash_attn_module)
 
 

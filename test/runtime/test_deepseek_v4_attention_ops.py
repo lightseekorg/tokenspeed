@@ -179,7 +179,9 @@ def _mxfp4_bytes_and_scales(
 
 
 def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
-    from tokenspeed_kernel.thirdparty.fast_hadamard_transform import hadamard_transform
+    from tokenspeed_kernel.ops.attention.fast_hadamard_transform import (
+        hadamard_transform,
+    )
 
     shape = row.shape
     return hadamard_transform(

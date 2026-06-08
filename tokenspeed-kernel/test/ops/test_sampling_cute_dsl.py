@@ -37,7 +37,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-cute_dsl = pytest.importorskip("tokenspeed_kernel.ops.sampling.cute_dsl")
+cute_dsl = pytest.importorskip("tokenspeed_kernel_nvidia.sampling.cute_dsl")
 cute_argmax = cute_dsl.argmax
 cute_argmax_pair = cute_dsl.argmax_pair
 

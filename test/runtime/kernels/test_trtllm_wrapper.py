@@ -6,8 +6,8 @@ import torch
 
 class TRTLLMWrapperTest(unittest.TestCase):
     def test_fast_topk_v2_decode_accepts_2d_lens(self):
+        from tokenspeed_kernel.ops.routing import trtllm
         from tokenspeed_kernel.registry import error_fn
-        from tokenspeed_kernel.thirdparty import trtllm
 
         if trtllm.fast_topk_v2 is None or trtllm.fast_topk_v2 is error_fn:
             self.skipTest("TRTLLM fast_topk_v2 is unavailable on this platform")
@@ -50,8 +50,8 @@ class TRTLLMWrapperTest(unittest.TestCase):
         )
 
     def test_fast_topk_v2_prefill_uses_int32_row_offsets(self):
+        from tokenspeed_kernel.ops.routing import trtllm
         from tokenspeed_kernel.registry import error_fn
-        from tokenspeed_kernel.thirdparty import trtllm
 
         if trtllm.fast_topk_v2 is None or trtllm.fast_topk_v2 is error_fn:
             self.skipTest("TRTLLM fast_topk_v2 is unavailable on this platform")

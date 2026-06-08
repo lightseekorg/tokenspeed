@@ -26,7 +26,6 @@ On systems without an NVIDIA CUDA build target, the build is skipped and the
 package installs as a pure-Python stub.
 """
 
-import ctypes
 import importlib
 import os
 import shutil
@@ -45,10 +44,20 @@ from setuptools.command.editable_wheel import editable_wheel
 
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
-THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
+THIRDPARTY_DIR = ROOT / "tokenspeed_kernel_nvidia" / "thirdparty"
 BASE_VERSION = "0.1.0"
-BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
-VALID_BACKENDS = {"cuda", "rocm"}
+PACKAGE_ENV = "TOKENSPEED_KERNEL_PACKAGE"
+VALID_PACKAGE_MODES = {"core", "nvidia", "amd"}
+DIST_NAMES = {
+    "core": "tokenspeed-kernel",
+    "nvidia": "tokenspeed-kernel-nvidia",
+    "amd": "tokenspeed-kernel-amd",
+}
+PACKAGE_BACKENDS = {
+    "core": None,
+    "nvidia": "cuda",
+    "amd": "rocm",
+}
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -129,73 +138,42 @@ def _package_version() -> str:
     return f"{BASE_VERSION}.dev{_version_date()}+git{_git_sha()}"
 
 
-def _is_cuda_platform() -> bool:
-    def toolkit_available() -> bool:
-        if shutil.which(NVCC) is not None:
-            return True
-        cuda_home = Path(CUDA_HOME)
-        return (cuda_home / "bin" / "nvcc").exists()
-
-    for lib_name in ("libcuda.so.1", "libcuda.so"):
-        try:
-            libcuda = ctypes.CDLL(lib_name)
-            break
-        except OSError:
-            pass
-    else:
-        return toolkit_available()
-
-    try:
-        if libcuda.cuInit(0) != 0:
-            return toolkit_available()
-        count = ctypes.c_int()
-        if libcuda.cuDeviceGetCount(ctypes.byref(count)) != 0:
-            return toolkit_available()
-        if count.value > 0:
-            return True
-    except AttributeError:
-        pass
-
-    return toolkit_available()
+def _package_mode() -> str:
+    mode = os.environ.get(PACKAGE_ENV, "core").strip().lower()
+    if mode not in VALID_PACKAGE_MODES:
+        valid = ", ".join(sorted(VALID_PACKAGE_MODES))
+        raise RuntimeError(f"{PACKAGE_ENV} must be one of: {valid}")
+    return mode
 
 
-def _is_rocm_platform() -> bool:
-    rocm_env_names = (
-        "ROCM_HOME",
-        "ROCM_PATH",
-        "ROCM_VERSION",
-        "HIP_PATH",
-        "HIP_PLATFORM",
-    )
-    if any(os.environ.get(name) for name in rocm_env_names):
-        return True
-    if shutil.which("hipcc") is not None:
-        return True
-    if Path("/dev/kfd").exists():
-        return True
-    return Path("/opt/rocm").exists()
+def _distribution_name() -> str:
+    return DIST_NAMES[_package_mode()]
 
 
-def _selected_backend() -> str:
-    override = os.environ.get(BACKEND_ENV, "").strip().lower()
-    if override:
-        if override not in VALID_BACKENDS:
-            valid = ", ".join(sorted(VALID_BACKENDS))
-            raise RuntimeError(f"{BACKEND_ENV} must be one of: {valid}")
-        return override
-
-    if _is_cuda_platform():
-        return "cuda"
-    if _is_rocm_platform():
-        return "rocm"
-
-    raise RuntimeError(
-        "Unable to detect CUDA or ROCm for tokenspeed_kernel dependencies. "
-        f"Set {BACKEND_ENV}=cuda or {BACKEND_ENV}=rocm."
-    )
+def _vendor_distribution_requirement(mode: str, version: str) -> str:
+    return f"{DIST_NAMES[mode]}=={version}"
 
 
-def _read_requirements(path: Path, seen=None) -> list[str]:
+def _selected_packages() -> list[str]:
+    prefix = {
+        "core": "tokenspeed_kernel",
+        "nvidia": "tokenspeed_kernel_nvidia",
+        "amd": "tokenspeed_kernel_amd",
+    }[_package_mode()]
+    return [
+        package
+        for package in find_packages()
+        if package == prefix or package.startswith(prefix + ".")
+    ]
+
+
+def _package_backend() -> str | None:
+    return PACKAGE_BACKENDS[_package_mode()]
+
+
+def _read_requirements(
+    path: Path, seen=None, *, include_nested: bool = True
+) -> list[str]:
     seen = seen or set()
     path = path.resolve()
     if path in seen:
@@ -205,23 +183,18 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
     requirements = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or line.startswith("--"):
             continue
         if line.startswith("-r ") or line.startswith("--requirement "):
-            include = line.split(maxsplit=1)[1]
-            requirements.extend(_read_requirements(path.parent / include, seen))
+            if include_nested:
+                include = line.split(maxsplit=1)[1]
+                requirements.extend(_read_requirements(path.parent / include, seen))
             continue
         requirements.append(line)
     return requirements
 
 
-def _selected_install_requires() -> list[str]:
-    backend = _selected_backend()
-    requirements = []
-    requirements.extend(
-        _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
-    )
-
+def _dedupe_requirements(requirements: list[str]) -> list[str]:
     deduped = []
     seen = set()
     for requirement in requirements:
@@ -229,6 +202,40 @@ def _selected_install_requires() -> list[str]:
             deduped.append(requirement)
             seen.add(requirement)
     return deduped
+
+
+def _vendor_requirements(backend: str) -> list[str]:
+    requirements = []
+    requirements.extend(
+        _read_requirements(REQUIREMENTS_DIR / f"{backend}.txt", include_nested=False)
+    )
+    requirements.extend(
+        _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
+    )
+    return requirements
+
+
+def _selected_install_requires() -> list[str]:
+    backend = _package_backend()
+    if backend is None:
+        requirements = _read_requirements(REQUIREMENTS_DIR / "common.txt")
+    else:
+        requirements = _vendor_requirements(backend)
+    return _dedupe_requirements(requirements)
+
+
+def _selected_extras_require() -> dict[str, list[str]]:
+    if _package_mode() != "core":
+        return {}
+
+    version = _package_version()
+    nvidia = [_vendor_distribution_requirement("nvidia", version)]
+    amd = [_vendor_distribution_requirement("amd", version)]
+    return {
+        "nvidia": nvidia,
+        "amd": amd,
+        "all": nvidia + amd,
+    }
 
 
 def _pip_verbose_args(verbose) -> list[str]:
@@ -255,8 +262,7 @@ def _refresh_python_install_paths() -> None:
     importlib.invalidate_caches()
 
 
-def _install_backend_build_requirements(verbose=False) -> None:
-    backend = _selected_backend()
+def _install_backend_build_requirements(backend: str, verbose=False) -> None:
     print(f"Installing {backend} build requirements before native build")
     subprocess.check_call(
         [
@@ -277,9 +283,8 @@ def _install_backend_build_requirements(verbose=False) -> None:
     _refresh_python_install_paths()
 
 
-def _ensure_cuda_compiler() -> None:
-    if shutil.which(NVCC) is None:
-        raise RuntimeError(f"CUDA backend selected but nvcc was not found: {NVCC}")
+def _cuda_compiler_available() -> bool:
+    return shutil.which(NVCC) is not None or Path(NVCC).exists()
 
 
 # Kernel groups: each entry produces one .so file.
@@ -735,17 +740,19 @@ class CudaKernelBuilder:
 
 
 class BuildKernels(build_ext):
-    """Compile CUDA kernels into .so files for the CUDA backend."""
+    """Compile CUDA kernels into .so files for the NVIDIA package."""
 
     def run(self):
-        if _selected_backend() != "cuda":
+        if _package_mode() != "nvidia":
             print(
-                f"CUDA backend not selected; skipping CUDA kernel build. "
+                f"NVIDIA package not selected; skipping CUDA kernel build. "
                 f"{self.distribution.get_name()}"
             )
             return
+        if not _cuda_compiler_available():
+            print(f"nvcc not found ({NVCC}); skipping CUDA kernel build")
+            return
 
-        _ensure_cuda_compiler()
         verbose = bool(getattr(self, "verbose", False))
         CudaKernelBuilder(KERNEL_GROUPS, verbose=verbose).run()
 
@@ -761,12 +768,14 @@ class BuildNative(Command):
         pass
 
     def run(self):
-        backend = _selected_backend()
-        _install_backend_build_requirements(getattr(self, "verbose", False))
-        if backend != "cuda":
-            print("CUDA backend not selected; skipping CUDA kernel build")
+        if _package_mode() != "nvidia":
+            print("NVIDIA package not selected; skipping native CUDA build")
+            return
+        if not _cuda_compiler_available():
+            print(f"nvcc not found ({NVCC}); skipping native CUDA build")
             return
 
+        _install_backend_build_requirements("cuda", getattr(self, "verbose", False))
         self.run_command("build_ext")
 
 
@@ -795,13 +804,15 @@ class BuildPyWithBuild(build_py):
 
 
 setup(
-    name="tokenspeed_kernel",
+    name=_distribution_name(),
     version=_package_version(),
     install_requires=_selected_install_requires(),
-    packages=find_packages(),
+    extras_require=_selected_extras_require(),
+    packages=_selected_packages(),
     package_data={
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        "tokenspeed_kernel_nvidia.thirdparty.cuda": ["objs/**/*.so"],
     },
+    license_files=["LICENSE", "THIRDPARTYNOTICES"],
     cmdclass={
         "build_native": BuildNative,
         "build_ext": BuildKernels,

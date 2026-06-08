@@ -1,10 +1,3 @@
 [build-system]
 requires = ["setuptools>=69.5.1", "wheel", "apache-tvm-ffi>=0.1.5"]
 build-backend = "setuptools.build_meta"
-
-[project]
-name = "tokenspeed_kernel"
-dynamic = ["version", "dependencies"]
-
-[tool.setuptools]
-license-files = ["LICENSE", "THIRDPARTYNOTICES"]

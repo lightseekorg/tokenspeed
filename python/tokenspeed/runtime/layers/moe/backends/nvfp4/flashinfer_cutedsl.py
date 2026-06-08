@@ -23,6 +23,7 @@ from __future__ import annotations
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
@@ -230,7 +231,7 @@ class Nvfp4FlashinferCuteDslBackend(MoEBackend):
         wrapper_capacity = max(int(max_num_tokens_per_gpu or 0), x.shape[0])
         capacity = max(1, int(wrapper_capacity))
 
-        if not self._autotuned:
+        if not self._autotuned and flashinfer_autotune is not error_fn:
             # Avoid profiling through the persistent CUDA-graph wrapper. Its
             # preallocated buffers are sized for the current graph capacity,
             # while autotune may profile larger internal token buckets.
