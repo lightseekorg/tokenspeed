@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
 
 import torch
 
@@ -44,31 +43,54 @@ class DpSamplingSupport:
             "preconditions are not met: "
             f"drafter={self.drafter_available}, "
             f"backend_supports_dp_verify={self.backend_supports_verify}, "
-            f"processor.tp_size={self.tp_size}, "
-            f"processor.tp_group_set={self.tp_group_set}"
+            f"tp_size={self.tp_size}, "
+            f"tp_group_set={self.tp_group_set}"
         )
 
 
 @dataclasses.dataclass(frozen=True)
+class DpSamplingTopology:
+    tp_rank: int
+    tp_size: int
+    tp_group: tuple[int, ...] | None
+    skip_all_gather: bool
+    tie_word_embeddings: bool = False
+
+    @property
+    def tp_group_set(self) -> bool:
+        return self.tp_group is not None
+
+
+@dataclasses.dataclass(frozen=True)
 class DpSamplingRuntimeConfig:
+    enabled: bool = False
     vocab_size: int | None = None
     max_bucket_bs: int | None = None
     min_bs: int | None = None
+    num_tokens_per_req: int = 1
+    topology: DpSamplingTopology | None = None
+    device: torch.device | str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class DpSamplingRuntimeLimits:
+    runtime_vocab_size: int
+    max_num_seqs: int
+    data_parallel_size: int
+    num_tokens_per_req: int
+    configured_min_bs: int | None
+    device: torch.device | str
 
 
 def resolve_dp_sampling_support(
     *,
     requested: bool,
-    drafter: Any,
-    sampling_backend: Any,
-    logits_processor: Any,
+    drafter_available: bool,
+    backend_supports_verify: bool,
+    topology: DpSamplingTopology,
 ) -> DpSamplingSupport:
-    backend_supports_verify = bool(
-        getattr(sampling_backend, "_SUPPORTS_DP_VERIFY", False)
-    )
-    drafter_available = drafter is not None
-    tp_size = int(logits_processor.tp_size)
-    tp_group_set = logits_processor.tp_group is not None
+    tp_size = int(topology.tp_size)
+    tp_group_set = topology.tp_group_set
     infra_supports = (
         drafter_available and backend_supports_verify and tp_size > 1 and tp_group_set
     )
@@ -86,67 +108,47 @@ def resolve_dp_sampling_support(
     return support
 
 
-def configure_dp_sampling_runtime(
+def resolve_dp_sampling_runtime(
     *,
     support: DpSamplingSupport,
-    model: Any,
-    sampling_backend: Any,
-    logits_processor: Any,
-    runtime_vocab_size: int,
-    max_num_seqs: int,
-    data_parallel_size: int,
-    num_tokens_per_req: int,
-    configured_min_bs: int | None,
-    device: Any,
+    lm_head_rows: int,
+    topology: DpSamplingTopology,
+    limits: DpSamplingRuntimeLimits,
 ) -> DpSamplingRuntimeConfig:
     if not support.enabled:
-        return DpSamplingRuntimeConfig()
-
-    lm_head = model.lm_head
-    weight = lm_head.weight
-    if weight.ndim < 1:
-        raise RuntimeError(
-            f"dp_sampling LM head weight must be at least 1D, got {weight.ndim}D"
+        return DpSamplingRuntimeConfig(
+            num_tokens_per_req=limits.num_tokens_per_req,
+            topology=topology,
+            device=limits.device,
         )
-    lm_head_rows = int(weight.shape[0])
     validate_dp_sampling_lm_head_vocab(
         lm_head_rows=lm_head_rows,
-        vocab_size=runtime_vocab_size,
-        tp_size=logits_processor.tp_size,
-        skip_all_gather=logits_processor.skip_all_gather,
-        tie_word_embeddings=bool(
-            getattr(logits_processor.config, "tie_word_embeddings", False)
-        ),
+        vocab_size=limits.runtime_vocab_size,
+        tp_size=topology.tp_size,
+        skip_all_gather=topology.skip_all_gather,
+        tie_word_embeddings=topology.tie_word_embeddings,
     )
     dp_vocab_size = dp_sampling_comm_vocab_size(
         lm_head_rows=lm_head_rows,
-        tp_size=logits_processor.tp_size,
-        skip_all_gather=logits_processor.skip_all_gather,
+        tp_size=topology.tp_size,
+        skip_all_gather=topology.skip_all_gather,
     )
-    configure_dp_vocab = getattr(
-        sampling_backend, "configure_dp_sampling_vocab_size", None
-    )
-    if configure_dp_vocab is not None:
-        configure_dp_vocab(dp_vocab_size)
-    max_bs = max_num_seqs // max(data_parallel_size, 1)
+    max_bs = limits.max_num_seqs // max(limits.data_parallel_size, 1)
     max_bucket_bs = (
-        (max_bs + logits_processor.tp_size - 1) // logits_processor.tp_size
-    ) * logits_processor.tp_size
+        (max_bs + topology.tp_size - 1) // topology.tp_size
+    ) * topology.tp_size
     min_bs = resolve_dp_sampling_min_bs(
-        tp_size=logits_processor.tp_size,
-        configured_min_bs=configured_min_bs,
-    )
-    logits_processor.configure_dp_sampling(
-        dp_num_tokens_per_req=num_tokens_per_req,
-        dp_sampling_min_bs=min_bs,
-        max_bucket_bs=max_bucket_bs,
-        vocab_size=dp_vocab_size,
-        device=device,
+        tp_size=topology.tp_size,
+        configured_min_bs=limits.configured_min_bs,
     )
     return DpSamplingRuntimeConfig(
+        enabled=True,
         vocab_size=dp_vocab_size,
         max_bucket_bs=max_bucket_bs,
         min_bs=min_bs,
+        num_tokens_per_req=limits.num_tokens_per_req,
+        topology=topology,
+        device=limits.device,
     )
 
 

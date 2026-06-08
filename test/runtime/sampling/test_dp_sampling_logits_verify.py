@@ -43,9 +43,13 @@ from tokenspeed.runtime.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    DpSamplingRuntimeConfig,
+    DpSamplingTopology,
+)
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
@@ -212,11 +216,20 @@ def _test_dp_chain_matches_legacy(
         config=config, tp_rank=rank, tp_size=tp_size, tp_group=group, n=n
     )
     processor.configure_dp_sampling(
-        dp_num_tokens_per_req=n,
-        dp_sampling_min_bs=1,
-        max_bucket_bs=pad_bs,
-        vocab_size=vocab,
-        device=device,
+        DpSamplingRuntimeConfig(
+            enabled=True,
+            vocab_size=vocab,
+            max_bucket_bs=pad_bs,
+            min_bs=1,
+            num_tokens_per_req=n,
+            topology=DpSamplingTopology(
+                tp_rank=rank,
+                tp_size=tp_size,
+                tp_group=group,
+                skip_all_gather=False,
+            ),
+            device=device,
+        )
     )
 
     backend = _build_backend(

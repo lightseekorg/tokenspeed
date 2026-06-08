@@ -140,7 +140,7 @@ def _build_backend(
     return FlashInferSamplingBackend(cfg)
 
 
-def test_configure_dp_sampling_vocab_size_rebuilds_comm_before_use():
+def test_dp_sampling_runtime_vocab_size_rebuilds_comm_before_use():
     assert (
         resolve_dp_sampling_vocab_size_update(
             has_comm=True,
@@ -153,7 +153,7 @@ def test_configure_dp_sampling_vocab_size_rebuilds_comm_before_use():
     )
 
 
-def test_configure_dp_sampling_vocab_size_rejects_unsharded_size():
+def test_dp_sampling_runtime_vocab_size_rejects_unsharded_size():
     with pytest.raises(RuntimeError, match="must be divisible"):
         resolve_dp_sampling_vocab_size_update(
             has_comm=True,

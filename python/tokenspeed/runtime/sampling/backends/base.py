@@ -32,6 +32,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
@@ -147,6 +148,13 @@ class SamplingBackend(ABC):
 
             self._tp_pg = pg_manager.get_process_group("nccl", config.tp_group)
             self._tp_src_global_rank = config.tp_group[0]
+
+    def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
+        """Configure optional DP sampling state.
+
+        Stateless or unsupported backends ignore this; DP-capable backends
+        override it to initialize backend-local communication buffers.
+        """
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
         """Broadcast each tensor from tp_group[0] so all attention-TP ranks

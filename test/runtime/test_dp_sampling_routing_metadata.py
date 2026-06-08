@@ -11,7 +11,12 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.graph_routing import select_cuda_graph_route
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.sampling.dp_sampling_config import (
+    DpSamplingRuntimeConfig,
+    DpSamplingRuntimeLimits,
+    DpSamplingSupport,
+    DpSamplingTopology,
     resolve_dp_sampling_support,
+    resolve_dp_sampling_runtime,
     validate_dp_sampling_lm_head_vocab,
 )
 from tokenspeed.runtime.sampling.logits_layout import (
@@ -45,6 +50,34 @@ def _graph_route(
         capture_bs=capture_bs,
         max_bs=max_bs,
         available_graph_bs=set(capture_bs),
+    )
+
+
+def _dp_runtime_config(
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 4,
+    tp_group: tuple[int, ...] = (0, 1, 2, 3),
+    num_tokens_per_req: int = 6,
+    min_bs: int = 8,
+    max_bucket_bs: int = 8,
+    vocab_size: int = 8,
+    device: torch.device | str = "cpu",
+    skip_all_gather: bool = False,
+) -> DpSamplingRuntimeConfig:
+    return DpSamplingRuntimeConfig(
+        enabled=True,
+        vocab_size=vocab_size,
+        max_bucket_bs=max_bucket_bs,
+        min_bs=min_bs,
+        num_tokens_per_req=num_tokens_per_req,
+        topology=DpSamplingTopology(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
+            skip_all_gather=skip_all_gather,
+        ),
+        device=device,
     )
 
 
@@ -392,15 +425,46 @@ def test_configure_dp_sampling_sets_state():
         tp_group=(0, 1, 2, 3),
     )
 
-    processor.configure_dp_sampling(
-        dp_num_tokens_per_req=6,
-        dp_sampling_min_bs=8,
-        max_bucket_bs=8,
-        vocab_size=8,
-        device="cpu",
-    )
+    processor.configure_dp_sampling(_dp_runtime_config())
     assert processor.dp_sampling_enabled
     assert processor.dp_num_tokens_per_req == 6
+
+
+def test_resolve_dp_sampling_runtime_uses_grouped_metadata():
+    support = DpSamplingSupport(
+        requested=True,
+        enabled=True,
+        infra_supports=True,
+        drafter_available=True,
+        backend_supports_verify=True,
+        tp_size=4,
+        tp_group_set=True,
+    )
+
+    runtime_config = resolve_dp_sampling_runtime(
+        support=support,
+        lm_head_rows=7,
+        topology=DpSamplingTopology(
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            skip_all_gather=False,
+        ),
+        limits=DpSamplingRuntimeLimits(
+            runtime_vocab_size=7,
+            max_num_seqs=17,
+            data_parallel_size=1,
+            num_tokens_per_req=6,
+            configured_min_bs=None,
+            device="cpu",
+        ),
+    )
+
+    assert runtime_config.enabled
+    assert runtime_config.vocab_size == 28
+    assert runtime_config.max_bucket_bs == 20
+    assert runtime_config.min_bs == 8
+    assert runtime_config.num_tokens_per_req == 6
 
 
 @pytest.mark.parametrize(
@@ -416,13 +480,7 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
         tp_size=4,
         tp_group=(0, 1, 2, 3),
     )
-    processor.configure_dp_sampling(
-        dp_num_tokens_per_req=6,
-        dp_sampling_min_bs=5,
-        max_bucket_bs=8,
-        vocab_size=8,
-        device="cpu",
-    )
+    processor.configure_dp_sampling(_dp_runtime_config(min_bs=5))
 
     plan = processor._resolve_logits_layout_plan(
         torch.empty(5 * 6, 3),
@@ -447,15 +505,17 @@ def test_dp_sampling_skip_all_gather_rejects_sharded_lm_head_vocab():
 
 
 def test_resolve_dp_sampling_support_rejects_missing_preconditions():
-    backend = SimpleNamespace(_SUPPORTS_DP_VERIFY=False)
-    processor = SimpleNamespace(tp_size=4, tp_group=(0, 1, 2, 3))
-
     with pytest.raises(RuntimeError, match="backend_supports_dp_verify=False"):
         resolve_dp_sampling_support(
             requested=True,
-            drafter=object(),
-            sampling_backend=backend,
-            logits_processor=processor,
+            drafter_available=True,
+            backend_supports_verify=False,
+            topology=DpSamplingTopology(
+                tp_rank=0,
+                tp_size=4,
+                tp_group=(0, 1, 2, 3),
+                skip_all_gather=False,
+            ),
         )
 
 

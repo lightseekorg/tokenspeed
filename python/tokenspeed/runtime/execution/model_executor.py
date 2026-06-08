@@ -50,8 +50,9 @@ from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
-    configure_dp_sampling_runtime,
+    DpSamplingRuntimeLimits,
     resolve_dp_sampling_support,
+    resolve_dp_sampling_runtime,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
@@ -302,26 +303,42 @@ class ModelExecutor:
             )
 
         processor = self.model_runner.model.logits_processor
+        dp_topology = processor.dp_sampling_topology()
         dp_support = resolve_dp_sampling_support(
             requested=self.config.dp_sampling,
-            drafter=self.drafter,
-            sampling_backend=self.sampling_backend,
-            logits_processor=processor,
+            drafter_available=self.drafter is not None,
+            backend_supports_verify=bool(
+                getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
+            ),
+            topology=dp_topology,
         )
 
         self.dp_sampling_enabled = dp_support.enabled
-        dp_runtime_config = configure_dp_sampling_runtime(
+        lm_head_rows = 0
+        if dp_support.enabled:
+            lm_head_weight = self.model_runner.model.lm_head.weight
+            if lm_head_weight.ndim < 1:
+                raise RuntimeError(
+                    "dp_sampling LM head weight must be at least 1D, got "
+                    f"{lm_head_weight.ndim}D"
+                )
+            lm_head_rows = int(lm_head_weight.shape[0])
+        dp_runtime_config = resolve_dp_sampling_runtime(
             support=dp_support,
-            model=self.model_runner.model,
-            sampling_backend=self.sampling_backend,
-            logits_processor=processor,
-            runtime_vocab_size=self.config.vocab_size,
-            max_num_seqs=config.max_num_seqs,
-            data_parallel_size=config.data_parallel_size,
-            num_tokens_per_req=spec_num_tokens,
-            configured_min_bs=self.config.dp_sampling_min_bs,
-            device=self.device,
+            lm_head_rows=lm_head_rows,
+            topology=dp_topology,
+            limits=DpSamplingRuntimeLimits(
+                runtime_vocab_size=self.config.vocab_size,
+                max_num_seqs=config.max_num_seqs,
+                data_parallel_size=config.data_parallel_size,
+                num_tokens_per_req=spec_num_tokens,
+                configured_min_bs=self.config.dp_sampling_min_bs,
+                device=self.device,
+            ),
         )
+        if dp_runtime_config.enabled:
+            self.sampling_backend.configure_dp_sampling(dp_runtime_config)
+            processor.configure_dp_sampling(dp_runtime_config)
         logger.info(
             "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
             "min_bs=%s (drafter=%s, backend_supports_dp=%s, "

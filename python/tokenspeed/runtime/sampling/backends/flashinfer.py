@@ -58,6 +58,7 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.dp_sampling_config import (
+    DpSamplingRuntimeConfig,
     resolve_dp_sampling_vocab_size_update,
     slice_dp_vocab_mask,
 )
@@ -144,7 +145,27 @@ class FlashInferSamplingBackend(SamplingBackend):
             device=config.device,
         )
 
-    def configure_dp_sampling_vocab_size(self, vocab_size: int) -> None:
+    def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
+        if not runtime.enabled:
+            return
+        assert runtime.vocab_size is not None
+        assert runtime.max_bucket_bs is not None
+        assert runtime.topology is not None
+        if runtime.topology.tp_size != self._dp_tp_size:
+            raise RuntimeError(
+                f"DP sampling runtime tp_size={runtime.topology.tp_size} "
+                f"does not match backend tp_size={self._dp_tp_size}"
+            )
+        if runtime.topology.tp_group != self._dp_tp_group:
+            raise RuntimeError("DP sampling runtime tp_group does not match backend")
+        if runtime.max_bucket_bs > self._dp_max_pad_bs:
+            raise RuntimeError(
+                f"DP sampling max_bucket_bs={runtime.max_bucket_bs} exceeds "
+                f"backend max_pad_bs={self._dp_max_pad_bs}"
+            )
+        self._configure_dp_sampling_comm_vocab(runtime.vocab_size)
+
+    def _configure_dp_sampling_comm_vocab(self, vocab_size: int) -> None:
         """Use the target LM-head padded vocab size for DP logits exchange."""
         new_vocab_size = resolve_dp_sampling_vocab_size_update(
             has_comm=self._dp_comm is not None,

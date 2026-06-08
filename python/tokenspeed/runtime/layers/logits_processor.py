@@ -41,6 +41,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    DpSamplingRuntimeConfig,
+    DpSamplingTopology,
+)
 from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
@@ -228,34 +232,48 @@ class LogitsProcessor(nn.Module):
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
 
-    def configure_dp_sampling(
-        self,
-        *,
-        dp_num_tokens_per_req: int,
-        dp_sampling_min_bs: int,
-        max_bucket_bs: int,
-        vocab_size: int,
-        device: torch.device | str,
-    ) -> None:
+    def dp_sampling_topology(self) -> DpSamplingTopology:
+        return DpSamplingTopology(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            tp_group=self.tp_group,
+            skip_all_gather=self.skip_all_gather,
+            tie_word_embeddings=bool(
+                getattr(self.config, "tie_word_embeddings", False)
+            ),
+        )
+
+    def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
+        assert runtime.enabled, "cannot configure disabled dp_sampling runtime"
+        assert runtime.topology is not None
+        assert runtime.min_bs is not None
+        assert runtime.max_bucket_bs is not None
+        assert runtime.vocab_size is not None
+        assert runtime.device is not None
+        topology = runtime.topology
+        assert topology.tp_rank == self.tp_rank
+        assert topology.tp_size == self.tp_size
+        assert topology.tp_group == self.tp_group
+        assert topology.skip_all_gather == self.skip_all_gather
         self.dp_sampling_enabled = True
-        self.dp_num_tokens_per_req = dp_num_tokens_per_req
+        self.dp_num_tokens_per_req = runtime.num_tokens_per_req
         self._logits_layout_planner = LogitsLayoutPlanner(
             dp_sampling_enabled=True,
-            dp_sampling_min_bs=dp_sampling_min_bs,
-            tp_size=self.tp_size,
-            num_tokens_per_req=dp_num_tokens_per_req,
+            dp_sampling_min_bs=runtime.min_bs,
+            tp_size=topology.tp_size,
+            num_tokens_per_req=runtime.num_tokens_per_req,
         )
         assert (
             self.tp_size > 1 and self.tp_group is not None
         ), "dp_sampling requires tp_size > 1 and a real tp_group"
         self._logits_layout_executor = LogitsLayoutExecutor(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            tp_group=self.tp_group,
-            max_bucket_bs=max_bucket_bs,
-            num_tokens_per_req=dp_num_tokens_per_req,
-            vocab_size=vocab_size,
-            device=device,
+            tp_rank=topology.tp_rank,
+            tp_size=topology.tp_size,
+            tp_group=topology.tp_group,
+            max_bucket_bs=runtime.max_bucket_bs,
+            num_tokens_per_req=runtime.num_tokens_per_req,
+            vocab_size=runtime.vocab_size,
+            device=runtime.device,
         )
 
     def _resolve_logits_layout_plan(
