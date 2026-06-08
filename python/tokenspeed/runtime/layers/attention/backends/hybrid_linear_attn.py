@@ -29,6 +29,9 @@ import torch
 from tokenspeed_kernel.ops.attention.flashinfer import (
     gated_delta_rule as gdn_flashinfer,
 )
+from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+    fused_qkv_split_gdn_prefill,
+)
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -1042,20 +1045,18 @@ class MambaAttnBackend(AttentionBackend):
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
+        num_heads = key_split_dim // head_k_dim
+        num_value_heads = value_split_dim // head_v_dim
 
-        query, key, value = torch.split(
+        query, key, value = fused_qkv_split_gdn_prefill(
             mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
+            num_q_heads=num_heads,
+            num_k_heads=num_heads,
+            num_v_heads=num_value_heads,
+            head_q=head_k_dim,
+            head_k=head_k_dim,
+            head_v=head_v_dim,
         )
-
-        actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        num_value_heads = value.shape[1] // head_v_dim
-
-        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         if is_target_verify:
             draft_token_num = kwargs.get(
@@ -1122,8 +1123,6 @@ class MambaAttnBackend(AttentionBackend):
                             f"sm100_available={gdn_flashinfer.is_available()}."
                         )
                     self._gdn_fastpath_checked = True
-                # sm100 fast-path. q/k l2norm here since the kernel ignores its
-                # own flag; the wrapper handles the gate/beta/state conventions.
                 core_attn_out, last_recurrent_state = gdn_flashinfer.gdn_chunk_prefill(
                     l2norm_fwd(query),
                     l2norm_fwd(key),
