@@ -23,10 +23,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as gdn
-from tokenspeed_kernel.registry import error_fn
 
 pytestmark = pytest.mark.skipif(
-    gdn is error_fn or not gdn.is_available(), reason="sm100 GDN kernel unavailable"
+    not gdn.is_available(), reason="sm100 GDN kernel unavailable"
 )
 
 

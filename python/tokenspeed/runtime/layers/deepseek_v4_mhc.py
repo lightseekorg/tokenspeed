@@ -8,12 +8,13 @@ import math
 from functools import cache
 
 import torch
-from tokenspeed_kernel.ops.gemm import deep_gemm as _deep_gemm
-from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.utils import ceil_div
 
-deep_gemm = None if _deep_gemm.get_num_sms is error_fn else _deep_gemm
+try:
+    from tokenspeed_kernel.thirdparty import deep_gemm
+except Exception:
+    deep_gemm = None  # type: ignore[assignment]
 
 try:
     import tilelang
