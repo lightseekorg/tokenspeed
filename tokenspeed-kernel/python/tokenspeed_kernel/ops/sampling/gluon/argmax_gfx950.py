@@ -60,7 +60,7 @@ def _argmax_layout(
 
 
 @gluon.jit
-def _argmax_tile(
+def _argmax_fixed_block_size_tile(
     logits,
     row,
     start,
@@ -97,7 +97,7 @@ def _argmax_one_stage_kernel(
     best_idx = gl.full((), 2147483647, gl.int32)
 
     for start in range(0, N, BLOCK):
-        tile_val, tile_idx = _argmax_tile(
+        tile_val, tile_idx = _argmax_fixed_block_size_tile(
             logits, row, start, stride_m, N, BLOCK, LOAD_ELEMS
         )
         best_val, best_idx = _argmax_combine(best_val, best_idx, tile_val, tile_idx)
@@ -122,7 +122,7 @@ def _argmax_split_atomic_fixed_block_size_kernel(
 ):
     row = gl.program_id(0)
     split = gl.program_id(1)
-    tile_val, tile_idx = _argmax_tile(
+    tile_val, tile_idx = _argmax_fixed_block_size_tile(
         logits, row, split * BLOCK, stride_m, N, BLOCK, LOAD_ELEMS
     )
     partial_offset = row * NUM_SPLITS + split
@@ -146,7 +146,7 @@ def _argmax_split_atomic_fixed_block_size_kernel(
 
 
 @gluon.jit
-def _argmax_tile_chunk(
+def _argmax_fixed_split_count_tile(
     logits,
     row,
     start,
@@ -187,7 +187,7 @@ def _argmax_split_atomic_fixed_split_count_kernel(
 ):
     row = gl.program_id(0)
     split = gl.program_id(1)
-    tile_val, tile_idx = _argmax_tile_chunk(
+    tile_val, tile_idx = _argmax_fixed_split_count_tile(
         logits, row, split * CHUNK_SIZE, stride_m, N, CHUNK_SIZE, BLOCK, LOAD_ELEMS
     )
     partial_offset = row * NUM_SPLITS + split
@@ -294,18 +294,24 @@ def _load_elements_per_thread(dtype: torch.dtype) -> int:
     return 128 // torch.finfo(dtype).bits
 
 
-def _select_config(M: int, N: int) -> tuple[int, int, bool]:
+def _select_config(M: int, N: int) -> tuple[int, int, bool, int | None]:
     """Return Gluon launch config for ``M x N`` logits.
 
-    Returns ``(block, num_warps, use_split_atomic)``: the tile width,
-    wave grouping, and whether to use the split-tile atomic reduction path.
+    Returns ``(block_size, num_warps, use_split_atomic, fixed_split_count)``:
+    the physical tile width, wave grouping, whether to use a split-atomic
+    path, and an optional fixed split count. When ``fixed_split_count`` is
+    set, ``block`` is the power-of-two tile width for each derived chunk.
     """
+    if M <= 4 and N >= 65536:
+        num_splits = 32 if M == 1 else 16
+        block = triton.next_power_of_2(triton.cdiv(N, num_splits))
+        return block, 4, True, num_splits
     if M <= 32:
-        return 16384, 4, True
+        return 16384, 4, True, None
     if M <= 64:
         block = 32768 if N >= 180000 else 16384
-        return block, 4, True
-    return 8192, 4, False
+        return block, 4, True, None
+    return 8192, 4, False, None
 
 
 @register_kernel(
@@ -339,13 +345,11 @@ def gluon_argmax_gfx950(
     if M == 0:
         return out
 
-    block, num_warps, use_split = _select_config(M, N)
+    block, num_warps, use_split, fixed_split_count = _select_config(M, N)
     load_elems = _load_elements_per_thread(logits.dtype)
-    # Extra row splits help M=1/4 occupancy; too many lose to atomic overhead.
-    if (M == 1 or M == 4) and N >= 65536:
-        num_splits = 32 if M == 1 else 16
+    if fixed_split_count is not None:
+        num_splits = fixed_split_count
         chunk_size = triton.cdiv(N, num_splits)
-        fixed_block = triton.next_power_of_2(chunk_size)
         partial_values, partial_indices, counters = _get_atomic_scratch(
             M, num_splits, logits.device
         )
@@ -359,7 +363,7 @@ def gluon_argmax_gfx950(
             out_stride=out.stride(0),
             N=N,
             CHUNK_SIZE=chunk_size,
-            BLOCK=fixed_block,
+            BLOCK=block,
             NUM_SPLITS=num_splits,
             REDUCE_BLOCK=num_splits,
             LOAD_ELEMS=load_elems,

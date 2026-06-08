@@ -31,7 +31,7 @@ Applicable to various problems:
 * Prefer to launch enough workgroups to fill the GPU.
 * Ensure proper software pipelining to break dependencies in the same loop
   iteration.
-* Prefer coaleased async global memory load/store.
+* Prefer coaleased and vectorized async global memory load/store.
 * If indexing range allows, prefer buffer load/store intrinsics in Gluon to
   avoid out-of-bound branches and overheads.
 * Avoid shared memory bank conflict if possible. Use padding instead of
