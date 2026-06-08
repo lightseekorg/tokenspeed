@@ -65,6 +65,7 @@ def make_config(
     decode_input_tokens: int = 1,
     disable_prefix_cache: bool = False,
     has_sliding_window: bool = False,
+    sliding_window_size: int = 0,
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
@@ -95,6 +96,7 @@ def make_config(
     cfg.decode_input_tokens = decode_input_tokens
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.has_sliding_window = has_sliding_window
+    cfg.sliding_window_size = sliding_window_size
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mamba = enable_mamba

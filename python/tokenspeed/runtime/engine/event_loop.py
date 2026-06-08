@@ -179,10 +179,19 @@ class EventLoop:
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
-        # Sliding-window-attention models must not publish their prefix mid-flight (they
-        # publish only at FinishEvent); the SWA prefix-reuse path corrupts outputs
-        # otherwise. Mirror ModelRunner's SWA detection (hf_config.sliding_window).
-        has_sliding_window = getattr(hf_config, "sliding_window", None) is not None
+        # Mirror ModelRunner's SWA detection (hf_config.sliding_window). Plain
+        # SWA mid-flight publish is capped to this window; hybrid paged-cache
+        # models use their windowed adjunct snapshots. gpt-oss stores an
+        # inclusive HF window and converts it to TokenSpeed's exclusive
+        # attention window inside the model.
+        sliding_window = getattr(hf_config, "sliding_window", None)
+        if (
+            getattr(hf_config, "model_type", None) == "gpt_oss"
+            and sliding_window is not None
+        ):
+            sliding_window = max(0, int(sliding_window) - 1)
+        has_sliding_window = sliding_window is not None
+        sliding_window_size = int(sliding_window) if sliding_window is not None else 0
 
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
@@ -332,6 +341,7 @@ class EventLoop:
             ),
             disable_prefix_cache=not server_args.enable_prefix_caching,
             has_sliding_window=has_sliding_window,
+            sliding_window_size=sliding_window_size,
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,

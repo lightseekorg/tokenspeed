@@ -191,11 +191,12 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return {};
     }
 
-    // Sliding-window-attention models pass a null kv_prefix_cache so InsertPrefixCache
-    // skips the mid-flight publish; their prefix is published only at FinishEvent.
+    // Plain SWA models publish only up to the attention window; hybrid
+    // paged-cache SWA models publish when their adjunct carries window state.
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
-                                     config_.has_sliding_window ? nullptr : &kv_prefix_cache_};
+                                     &kv_prefix_cache_, enableMidflightPrefixPublish(),
+                                     maxMidflightPrefixPublishTokens()};
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
@@ -220,10 +221,39 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         return {};
     }
 
-    // SWA models: skip mid-flight publish (see schedulePrefill) -- publish only at FinishEvent.
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
-                                    config_.has_sliding_window ? nullptr : &kv_prefix_cache_};
+                                    &kv_prefix_cache_, enableMidflightPrefixPublish(),
+                                    maxMidflightPrefixPublishTokens()};
+}
+
+bool Scheduler::enableMidflightPrefixPublish() const {
+    if (!config_.has_sliding_window) {
+        return true;
+    }
+    if (!hybrid_prefix_cache_ && config_.sliding_window_size > 0) {
+        return true;
+    }
+    if (!hybrid_prefix_cache_ || !hybrid_prefix_cache_->HasPagedCacheAdjunct()) {
+        return false;
+    }
+    for (const auto& group : config_.paged_cache_groups) {
+        if (group.family == PagedCacheGroupFamily::State &&
+            group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::int32_t Scheduler::maxMidflightPrefixPublishTokens() const {
+    if (!config_.has_sliding_window) {
+        return 0;
+    }
+    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasPagedCacheAdjunct()) {
+        return 0;
+    }
+    return std::max(0, config_.sliding_window_size);
 }
 
 std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(

@@ -103,6 +103,8 @@ private:
                                                              std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request,
                                                            std::map<std::string, std::int32_t>& simulated_free);
+    bool enableMidflightPrefixPublish() const;
+    std::int32_t maxMidflightPrefixPublishTokens() const;
     std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
         Request* request, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);

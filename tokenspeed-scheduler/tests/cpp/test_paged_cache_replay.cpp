@@ -124,6 +124,60 @@ protected:
     }
 };
 
+class PagedCacheDecodePublishPlainSwaTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.page_size = 1;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.decode_input_tokens = 4;
+        cfg.enable_l3_storage = false;
+        cfg.has_sliding_window = true;
+        cfg.sliding_window_size = 4;
+        return cfg;
+    }
+
+    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
+        }
+        return nullptr;
+    }
+};
+
+class PagedCacheDecodePublishHybridHistorySwaTest : public PagedCacheDecodePublishTest {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PagedCacheDecodePublishTest::MakeConfig();
+        cfg.has_sliding_window = true;
+        cfg.sliding_window_size = 4;
+        return cfg;
+    }
+};
+
+class PagedCacheDecodePublishHybridSwaTest : public PagedCacheDecodePublishTest {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PagedCacheDecodePublishTest::MakeConfig();
+        cfg.has_sliding_window = true;
+        cfg.sliding_window_size = 4;
+
+        PagedCacheGroupConfig state{};
+        state.group_id = "swa_state";
+        state.rows_per_page = 1;
+        state.entry_stride_tokens = 1;
+        state.total_pages = 64;
+        state.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        state.sliding_window_tokens = 4;
+        state.family = PagedCacheGroupFamily::State;
+        cfg.paged_cache_groups.push_back(state);
+        return cfg;
+    }
+};
+
 class PagedCacheTerminalContinuationTest : public ::testing::Test {
 protected:
     static constexpr std::int32_t kPageSize = 64;
@@ -444,6 +498,96 @@ TEST_F(PagedCacheDecodePublishTest, ContinuingDecodePublishesAcceptedPagesOnly) 
     ASSERT_TRUE(prefix_by_request.contains("probe_tail"));
     EXPECT_EQ(prefix_by_request.at("hit4"), 4);
     EXPECT_EQ(prefix_by_request.at("probe_tail"), 4);
+}
+
+TEST_F(PagedCacheDecodePublishPlainSwaTest, MidflightPublishIsCappedToSlidingWindow) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4, 5, 6, 7, 8}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    Submit(RequestSpec{.request_id = "hit4", .tokens = {1, 2, 3, 4, 5, 6, 7, 8}});
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_GE(fwd->extend_prefix_lens.size(), 1u);
+
+    std::unordered_map<std::string, std::int32_t> prefix_by_request;
+    for (std::size_t row = 0; row < fwd->extend_prefix_lens.size(); ++row) {
+        ASSERT_LT(row, fwd->request_ids.size());
+        prefix_by_request.emplace(fwd->request_ids[row], fwd->extend_prefix_lens[row]);
+    }
+
+    ASSERT_TRUE(prefix_by_request.contains("hit4"));
+    EXPECT_EQ(prefix_by_request.at("hit4"), 4);
+}
+
+TEST_F(PagedCacheDecodePublishPlainSwaTest, DecodeResultPublishesWindowCappedPrefix) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    SendForwardDone("r1", {3, 4, 5, 6});
+
+    Submit(RequestSpec{.request_id = "hit4", .tokens = {1, 2, 3, 4, 5, 6}});
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_GE(fwd->extend_prefix_lens.size(), 1u);
+
+    std::unordered_map<std::string, std::int32_t> prefix_by_request;
+    for (std::size_t row = 0; row < fwd->extend_prefix_lens.size(); ++row) {
+        ASSERT_LT(row, fwd->request_ids.size());
+        prefix_by_request.emplace(fwd->request_ids[row], fwd->extend_prefix_lens[row]);
+    }
+
+    ASSERT_TRUE(prefix_by_request.contains("hit4"));
+    EXPECT_EQ(prefix_by_request.at("hit4"), 4);
+}
+
+TEST_F(PagedCacheDecodePublishHybridHistorySwaTest, MidflightPublishRequiresWindowState) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4, 5, 6, 7, 8}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    Submit(RequestSpec{.request_id = "hit4", .tokens = {1, 2, 3, 4, 5, 6, 7, 8}});
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_GE(fwd->extend_prefix_lens.size(), 1u);
+
+    std::unordered_map<std::string, std::int32_t> prefix_by_request;
+    for (std::size_t row = 0; row < fwd->extend_prefix_lens.size(); ++row) {
+        ASSERT_LT(row, fwd->request_ids.size());
+        prefix_by_request.emplace(fwd->request_ids[row], fwd->extend_prefix_lens[row]);
+    }
+
+    ASSERT_TRUE(prefix_by_request.contains("hit4"));
+    EXPECT_EQ(prefix_by_request.at("hit4"), 0);
+}
+
+TEST_F(PagedCacheDecodePublishHybridSwaTest, ContinuingDecodePublishesWindowedHybridPrefixes) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    SendForwardDone("r1", {3});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    SendForwardDone("r1", {4, 5});
+
+    Submit(RequestSpec{.request_id = "hit4", .tokens = {1, 2, 3, 4, 5}});
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_GE(fwd->extend_prefix_lens.size(), 1u);
+
+    std::unordered_map<std::string, std::int32_t> prefix_by_request;
+    for (std::size_t row = 0; row < fwd->extend_prefix_lens.size(); ++row) {
+        ASSERT_LT(row, fwd->request_ids.size());
+        prefix_by_request.emplace(fwd->request_ids[row], fwd->extend_prefix_lens[row]);
+    }
+
+    ASSERT_TRUE(prefix_by_request.contains("hit4"));
+    EXPECT_EQ(prefix_by_request.at("hit4"), 4);
 }
 
 TEST_F(PagedCacheTerminalMixedSchedulerTest, MixedPrefillDecodePagedTablesCoverScheduledTokens) {
