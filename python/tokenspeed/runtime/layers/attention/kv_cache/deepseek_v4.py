@@ -964,7 +964,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         return tuple(
             str(spec.group_id)
             for spec in self.paged_cache_group_specs
-            if spec.family == "history"
+            if spec.family in {"history", "state"}
         )
 
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:

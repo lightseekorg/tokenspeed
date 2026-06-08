@@ -174,6 +174,7 @@ protected:
         state.sliding_window_tokens = 4;
         state.family = PagedCacheGroupFamily::State;
         cfg.paged_cache_groups.push_back(state);
+        cfg.prefix_cache_adjunct->required_groups.push_back("swa_state");
         return cfg;
     }
 };

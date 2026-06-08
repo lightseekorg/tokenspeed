@@ -53,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
+    scheduler_sliding_window_args,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -179,19 +180,9 @@ class EventLoop:
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
-        # Mirror ModelRunner's SWA detection (hf_config.sliding_window). Plain
-        # SWA mid-flight publish is capped to this window; hybrid paged-cache
-        # models use their windowed adjunct snapshots. gpt-oss stores an
-        # inclusive HF window and converts it to TokenSpeed's exclusive
-        # attention window inside the model.
-        sliding_window = getattr(hf_config, "sliding_window", None)
-        if (
-            getattr(hf_config, "model_type", None) == "gpt_oss"
-            and sliding_window is not None
-        ):
-            sliding_window = max(0, int(sliding_window) - 1)
-        has_sliding_window = sliding_window is not None
-        sliding_window_size = int(sliding_window) if sliding_window is not None else 0
+        has_sliding_window, sliding_window_size = scheduler_sliding_window_args(
+            hf_config
+        )
 
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,

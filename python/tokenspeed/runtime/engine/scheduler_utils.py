@@ -44,6 +44,19 @@ _CACHE_EVENT_TYPES = {
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
+def scheduler_sliding_window_args(hf_config: Any) -> tuple[bool, int]:
+    sliding_window = getattr(hf_config, "sliding_window", None)
+    if sliding_window is None:
+        return False, 0
+    if getattr(hf_config, "model_type", None) == "gpt_oss":
+        # gpt-oss mixes full-attention and sliding-attention layers in a plain
+        # MHA KV pool. The scheduler must publish full prefix nodes so the full
+        # layers can replay all cached KV; sliding layers apply their window in
+        # the attention kernel.
+        return False, 0
+    return True, int(sliding_window)
+
+
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid

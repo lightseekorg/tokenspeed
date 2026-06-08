@@ -101,9 +101,9 @@ struct SchedulerConfig {
     Role role{Role::kFused};
 
     bool disable_prefix_cache{false};
-    // Plain sliding-window-attention models publish their prefix only at FinishEvent.
-    // Hybrid paged-cache SWA models may publish mid-flight when their adjunct can
-    // restore the windowed state needed for prefix reuse.
+    // Plain sliding-window-attention models cap mid-flight prefix publish to the
+    // full-history-equivalent prefix region. Mixed-layer models that need full
+    // history should leave this false and rely on per-layer attention windows.
     bool has_sliding_window{false};
     // Token length of the SWA window. Plain SWA mid-flight publish is capped to
     // this many tokens so reuse stays in the full-history-equivalent region.

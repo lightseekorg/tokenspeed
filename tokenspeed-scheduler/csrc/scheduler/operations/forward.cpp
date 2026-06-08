@@ -238,10 +238,18 @@ bool Scheduler::enableMidflightPrefixPublish() const {
     if (!hybrid_prefix_cache_ || !hybrid_prefix_cache_->HasPagedCacheAdjunct()) {
         return false;
     }
+    if (!config_.prefix_cache_adjunct.has_value()) {
+        return false;
+    }
     for (const auto& group : config_.paged_cache_groups) {
-        if (group.family == PagedCacheGroupFamily::State &&
-            group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
-            return true;
+        if (group.family != PagedCacheGroupFamily::State ||
+            group.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
+            continue;
+        }
+        for (const auto& required_group : config_.prefix_cache_adjunct->required_groups) {
+            if (required_group == group.group_id) {
+                return true;
+            }
         }
     }
     return false;
