@@ -106,7 +106,7 @@ def _argmax_one_stage_kernel(
 
 
 @gluon.jit
-def _argmax_split_atomic_kernel(
+def _argmax_split_atomic_fixed_block_size_kernel(
     logits,
     partial_values,
     partial_indices,
@@ -170,7 +170,7 @@ def _argmax_tile_chunk(
 
 
 @gluon.jit
-def _argmax_split_chunk_atomic_kernel(
+def _argmax_split_atomic_fixed_split_count_kernel(
     logits,
     partial_values,
     partial_indices,
@@ -349,7 +349,7 @@ def gluon_argmax_gfx950(
         partial_values, partial_indices, counters = _get_atomic_scratch(
             M, num_splits, logits.device
         )
-        _argmax_split_chunk_atomic_kernel[(M, num_splits)](
+        _argmax_split_atomic_fixed_split_count_kernel[(M, num_splits)](
             logits,
             partial_values,
             partial_indices,
@@ -371,7 +371,7 @@ def gluon_argmax_gfx950(
         partial_values, partial_indices, counters = _get_atomic_scratch(
             M, num_splits, logits.device
         )
-        _argmax_split_atomic_kernel[(M, num_splits)](
+        _argmax_split_atomic_fixed_block_size_kernel[(M, num_splits)](
             logits,
             partial_values,
             partial_indices,
