@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 from tokenspeed_kernel import (
@@ -54,9 +52,11 @@ def test_mha_prefill(
 ) -> None:
     seqlens_list = [17, 9, 12]
     max_seqlen = max(seqlens_list)
+    cu_seqlens_cpu = [0]
+    for seqlen in seqlens_list:
+        cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + seqlen)
     seqlens = torch.tensor(seqlens_list, device=device, dtype=torch.int32)
-    cu_seqlens = torch.cumsum(seqlens, dim=0, dtype=torch.int32)
-    cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0))
+    cu_seqlens = torch.tensor(cu_seqlens_cpu, device=device, dtype=torch.int32)
     total_tokens = int(seqlens.sum().item())
 
     q = torch.randn(total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
@@ -67,10 +67,9 @@ def test_mha_prefill(
         q=q,
         k=k,
         v=v,
-        cu_seqlens_q=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        softmax_scale=1.0 / math.sqrt(head_dim),
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        max_seqlen=max_seqlen,
     )
 
     assert out.shape == q.shape
@@ -172,7 +171,6 @@ def test_mha_extend_with_kvcache(
         cache_seqlens=cache_seqlens,
         max_seqlen_q=max_query_seqlen,
         max_seqlen_k=max_cache_seqlen_used,
-        softmax_scale=1.0 / math.sqrt(head_dim),
     )
 
     assert out.shape == q.shape
@@ -186,7 +184,6 @@ def test_mha_extend_with_kvcache(
         cache_seqlens=prefix_seqlens,
         max_seqlen_q=max_query_seqlen,
         max_seqlen_k=int(prefix_seqlens.max().item()),
-        softmax_scale=1.0 / math.sqrt(head_dim),
         return_lse=True,
         solution="triton",
     )
@@ -278,7 +275,6 @@ def test_mha_decode_with_kvcache(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max_cache_seqlen,
-        softmax_scale=1.0 / math.sqrt(head_dim),
     )
 
     assert out.shape == q.shape

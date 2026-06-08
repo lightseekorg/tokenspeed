@@ -41,6 +41,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
+from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_forward,
@@ -52,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
+    should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
@@ -97,6 +99,11 @@ logger = get_colorful_logger(__name__)
 
 def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
     return scheduler.calc_rolling_hash(tokens, apply_match=True)
+
+
+# Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
+# not busy-spin a CPU core waiting for /resume.
+_PAUSED_IDLE_SLEEP_S = 0.001
 
 
 class _NullSender:
@@ -260,13 +267,10 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
-        is_deepseek_v4_pool = (
-            type(token_to_kv_pool).__name__ == "DeepseekV4TokenToKVPool"
-        )
-        if is_deepseek_v4_pool:
+        if not token_to_kv_pool.supports_hierarchical_kv_cache:
             if server_args.enable_kvstore:
                 raise NotImplementedError(
-                    "DeepSeek V4 baseline does not support hierarchical cache "
+                    "This KV cache pool does not support hierarchical cache "
                     "(kvstore); pass --disable-kvstore."
                 )
             self.memory_executor = None
@@ -300,8 +304,8 @@ class EventLoop:
             )
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
-
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
@@ -336,7 +340,8 @@ class EventLoop:
             "Scheduler config: page_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "mamba_pool_total_chunks=%s enable_mamba=%s",
+            "mamba_pool_total_chunks=%s enable_mamba=%s "
+            "disable_prefix_cache=%s paged_cache_groups=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -347,8 +352,11 @@ class EventLoop:
             self.dp_size,
             mamba_pool_total_chunks,
             has_mamba,
+            scheduler_cfg.disable_prefix_cache,
+            [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
                 server_args.kv_events_config,
@@ -358,6 +366,10 @@ class EventLoop:
             self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
+
+        # Pause/resume control state. Shared with the request handler, which
+        # drives the control-request side; the event loop reads the gate.
+        self._pause = PauseController(self.send_to_tokenizer)
 
         self.metrics = EngineMetrics(
             labels={
@@ -381,6 +393,7 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
+            pause_controller=self._pause,
         )
 
         self.output_processor = OutputProcesser(
@@ -598,6 +611,7 @@ class EventLoop:
                     self.model_executor.device,
                 )
                 self.pd_kv_transfer.execute(forward_op)
+                self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
             else:
                 # Path 3b: decode batch — normal forward
@@ -635,6 +649,7 @@ class EventLoop:
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
+                        capture_next_input_ids=True,
                         **stats,
                     ),
                     self.pd_kv_transfer.store_prefill_token,
@@ -813,8 +828,40 @@ class EventLoop:
     # Shared step helpers
     # ------------------------------------------------------------------
 
+    def _reap_or_keep_buffered_spec(self, spec) -> bool:
+        """Resolve a buffered spec on resume; return True if it should be admitted.
+
+        A buffered spec was already registered in ``rid_to_state`` before it was
+        withheld, so if it was aborted while paused it never reached the
+        scheduler and the forward path can never reap it. Handle that here:
+
+        - state missing  -> already published and reaped; drop silently.
+        - state finished -> aborted in place. Stream a terminating finish for
+          pause-initiated aborts (the passive client is still waiting) and drop
+          the registered state so the rid does not leak; client-initiated aborts
+          already tore down their own state, so just reap.
+        - otherwise      -> still live; admit it.
+        """
+        state = self.output_processor.rid_to_state.get(spec.request_id)
+        if state is None:
+            return False
+        if state.finished:
+            if state.abort_notify_client:
+                self.output_processor.publish_finished_at_admission(
+                    spec.request_id, state
+                )
+            else:
+                self.output_processor.rid_to_state.pop(spec.request_id, None)
+            return False
+        return True
+
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
+        # Snapshot the pause state before dispatch: process_requests may flip it
+        # mid-batch. If it was not blocked before but is after, a pause control
+        # message was processed in this very batch — which is what makes the
+        # FIFO edge below detectable (see TODO(pause-fifo)).
+        pause_blocked_before = self._pause.admit_blocked
         new_req_specs, new_req_states, bootstrap_infos, abort_rids = (
             self.request_handler.process_requests(recv_reqs)
         )
@@ -832,6 +879,41 @@ class EventLoop:
         for rid in abort_rids:
             self.output_processor.mark_abort(rid)
             grammar_manager.mark_abort(rid)
+
+        # A pause(mode="abort") cancels every in-flight request through the same
+        # marker path as a client abort; they finish on their next scheduled
+        # step, then the drain check resolves the pause reply.
+        if self._pause.consume_abort_all():
+            for rid in list(self.output_processor.rid_to_state.keys()):
+                # notify_client=True: pause aborts a passive client's request,
+                # so it must receive a terminating finish (unlike a client abort).
+                self.output_processor.mark_abort(rid, notify_client=True)
+                grammar_manager.mark_abort(rid)
+
+        # abort/wait also cancel requests still compiling in the grammar queue:
+        # they are not yet in rid_to_state or the scheduler, so the sweep above
+        # and the drain check both miss them. A finished state makes the next
+        # get_ready_grammar_requests pass publish them instead of admitting, so
+        # they never run under post-resume weights or strand the drain.
+        if self._pause.consume_cancel_grammar():
+            for _, state, _ in grammar_manager.grammar_queue:
+                state.set_finish_with_abort("Aborted by pause", notify_client=True)
+
+        # On resume, flush specs buffered while paused even when no new request
+        # arrives this iteration. This must run before the ``if not ready:
+        # return`` guard below, which would otherwise strand buffered specs
+        # until the next inbound request. Specs aborted while paused are reaped
+        # in place (terminating finish + state cleanup) rather than admitted, so
+        # they don't burn a scheduler slot or leak their rid — see
+        # ``_reap_or_keep_buffered_spec``.
+        if not self._pause.admit_blocked and self._pause.buffered_specs:
+            specs = [
+                spec
+                for spec in self._pause.take_buffered_specs()
+                if self._reap_or_keep_buffered_spec(spec)
+            ]
+            if specs:
+                self.scheduler.submit_requests(specs)
 
         # Partition new requests by grammar readiness. Compile-bound requests
         # are queued in GrammarManager and admitted in a later iteration when
@@ -895,6 +977,32 @@ class EventLoop:
                     spec.storage_hit_pages = hit_pages
             admitted_specs.append(spec)
 
+        # Pause gate: while paused, withhold new requests from the scheduler
+        # (running requests keep stepping); buffered specs are flushed on resume
+        # above, ahead of any newly-admitted ones, preserving FIFO order.
+        #
+        # TODO(pause-fifo): recv_reqs() drains the socket non-blocking, so a
+        # generate request that arrived *before* a pause control message can be
+        # coalesced into the same batch and reach here after the pause flipped
+        # admit_blocked. Such a pre-pause request is buffered as post-pause work
+        # instead of running (wait) / being aborted (abort). Correct handling
+        # needs the batch processed as an ordered stream that respects the
+        # control request's FIFO position. Tracked as a follow-up; until then we
+        # warn when the coalescing condition is observed so it is not silent.
+        if self._pause.admit_blocked:
+            if admitted_specs and not pause_blocked_before:
+                logger.warning(
+                    "Pause engaged in the same recv batch as %d generate "
+                    "request(s) (rids=%s); their FIFO order relative to the "
+                    "pause is not preserved, so a pre-pause request may be "
+                    "buffered as post-pause work and run only after resume. "
+                    "See TODO(pause-fifo).",
+                    len(admitted_specs),
+                    [spec.request_id for spec in admitted_specs],
+                )
+            self._pause.buffer_specs(admitted_specs)
+            return
+
         if admitted_specs:
             self.scheduler.submit_requests(admitted_specs)
 
@@ -909,6 +1017,10 @@ class EventLoop:
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),
             len(forward_op.request_ids),
+            has_drafter=self.server_args.speculative_algorithm is not None,
+            use_target_verify=(
+                self.model_executor.config.use_target_verify_forward_mode
+            ),
         )
         self.request_handler._profile_batch_predicate(forward_mode)
 
@@ -948,6 +1060,15 @@ class EventLoop:
                 bootstrap_token = event.bootstrap_token
 
                 self.output_processor.on_remote_prefill_done(req_id, bootstrap_token)
+                if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+                    candidate_info = self.pd_kv_transfer.pop_remote_spec_candidate_ids(
+                        req_id
+                    )
+                    if candidate_info is not None:
+                        req_pool_idx, candidate_ids = candidate_info
+                        self.model_executor.write_remote_spec_candidate_ids(
+                            req_pool_idx, candidate_ids
+                        )
 
         return processed
 
@@ -985,6 +1106,10 @@ class EventLoop:
             forward_mode = ForwardMode.from_num_extends(
                 forward_op.num_extends(),
                 batch_size,
+                has_drafter=self.server_args.speculative_algorithm is not None,
+                use_target_verify=(
+                    self.model_executor.config.use_target_verify_forward_mode
+                ),
             )
 
         self._dp_local_info[0, 0] = num_tokens
@@ -1001,7 +1126,13 @@ class EventLoop:
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
-            ForwardMode(mode).is_decode_or_idle() for mode in global_forward_mode
+            mode
+            in (
+                int(ForwardMode.DECODE),
+                int(ForwardMode.IDLE),
+                int(ForwardMode.TARGET_VERIFY),
+            )
+            for mode in global_forward_mode
         )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
@@ -1034,6 +1165,33 @@ class EventLoop:
         )
 
     # ------------------------------------------------------------------
+    # Pause / resume helpers
+    # ------------------------------------------------------------------
+
+    def _paused_idle_step(self, prev_forward_op=None, prev_results=None) -> None:
+        """Run one iteration under ``PAUSED_ALL`` (keep mode): no new forward
+        work, but keep DP ranks in lockstep, service the drain check, and yield
+        the CPU so the freeze does not busy-spin a core."""
+        if prev_results is not None:
+            request_changes = self._commit_forward_results(
+                prev_forward_op, prev_results
+            )
+            advance_forward(self.scheduler, request_changes)
+            self._publish_scheduler_kv_events()
+
+        if self.has_dp:
+            dp_metadata = self._dp_sync_and_check(None)
+            if dp_metadata.need_idle_forward:
+                self.model_executor.execute_idle_forward(
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
+                    dp_metadata.all_decode_or_idle,
+                )
+
+        self._pause.maybe_finish_drain(self.scheduler)
+        time.sleep(_PAUSED_IDLE_SLEEP_S)
+
+    # ------------------------------------------------------------------
     # Event loops
     # ------------------------------------------------------------------
 
@@ -1042,6 +1200,9 @@ class EventLoop:
         while True:
             self._process_new_requests()
             self._commit_cache_results()
+            if self._pause.forward_blocked:
+                self._paused_idle_step()
+                continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
@@ -1094,6 +1255,9 @@ class EventLoop:
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
                 self._publish_scheduler_kv_events()
+
+            # Resolve a deferred abort/wait pause reply once in-flight work drains.
+            self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
@@ -1156,6 +1320,13 @@ class EventLoop:
             )
             self._process_new_requests()
             self._commit_cache_results()
+            if self._pause.forward_blocked:
+                # Freeze: commit any in-flight (overlapped) step — a forward
+                # already on the GPU can't be un-launched — then idle.
+                self._paused_idle_step(prev_forward_op, prev_results)
+                prev_results = None
+                prev_forward_op = None
+                continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 
@@ -1255,6 +1426,9 @@ class EventLoop:
                 advance_forward(self.scheduler, request_changes)
                 self._publish_scheduler_kv_events()
 
+            # Resolve a deferred abort/wait pause reply once in-flight work drains.
+            self._pause.maybe_finish_drain(self.scheduler)
+
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
             prev_results = curr_results
@@ -1300,11 +1474,13 @@ def run_event_loop(
             }
         )
 
-        # Prefill nodes have no steady-state decode stream to overlap over;
-        # overlap scheduling adds complexity with negligible benefit, so always
-        # fall back to the non-overlapping loop for prefill instances.
-        is_prefill_instance = server_args.disaggregation_mode == "prefill"
-        if not server_args.disable_overlap_schedule and not is_prefill_instance:
+        use_overlap = should_use_overlap_schedule(
+            disable_overlap_schedule=server_args.disable_overlap_schedule,
+            disaggregation_mode=server_args.disaggregation_mode,
+            speculative_algorithm=server_args.speculative_algorithm,
+            paged_cache_groups=getattr(event_loop, "_paged_cache_groups", ()),
+        )
+        if use_overlap:
             event_loop.event_loop_overlap()
         else:
             event_loop.event_loop()

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
@@ -112,6 +113,18 @@ class ModelRunner:
             gpu_id=self.gpu_id,
             memory_saver_adapter=self.memory_saver_adapter,
         )
+        self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
+            self.model, "spec_step_idx"
+        )
+
+    @staticmethod
+    def _forward_accepts_kwarg(model, name: str) -> bool:
+        try:
+            parameters = inspect.signature(model.forward).parameters
+        except (TypeError, ValueError):
+            return False
+
+        return name in parameters
 
     def forward(
         self,
@@ -119,12 +132,12 @@ class ModelRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         req_pool_indices: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
+        spec_step_idx: int | None = None,
     ) -> LogitsProcessorOutput:
         kwargs = {}
         if req_pool_indices is not None:
@@ -139,12 +152,15 @@ class ModelRunner:
             kwargs["captured_hidden_states"] = captured_hidden_states
         if multimodal_context is not None:
             kwargs["multimodal_context"] = multimodal_context
+        if spec_step_idx is not None and getattr(
+            self, "_model_forward_accepts_spec_step_idx", False
+        ):
+            kwargs["spec_step_idx"] = spec_step_idx
 
         return self.model.forward(
             ctx,
             input_ids,
             positions,
             out_cache_loc,
-            input_lengths,
             **kwargs,
         )

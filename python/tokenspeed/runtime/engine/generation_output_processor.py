@@ -119,6 +119,10 @@ class RequestState:
         # abort related
         self.to_abort = False
         self.to_abort_message = None
+        # Client-initiated aborts skip streaming a finish (the TM already tore
+        # down its state). Pause-initiated aborts set this so the passive client
+        # still receives a terminating finish.
+        self.abort_notify_client = False
 
         # cached tokenizer ids
         self._eos_token_id_cached = None
@@ -129,12 +133,16 @@ class RequestState:
         self.grammar_key: tuple[str, str] | None = None
         self.grammar_queued_ts: float = 0.0
 
-    def set_finish_with_abort(self, message: str) -> None:
+    def set_finish_with_abort(self, message: str, notify_client: bool = False) -> None:
         """Mark this request as aborted with ``message``; finished_reason is
         materialized immediately so callers don't need a check_finished() pass.
+
+        ``notify_client`` streams a terminating finish to the client (used for
+        pause-initiated aborts, where the client did not tear down its state).
         """
         self.to_abort = True
         self.to_abort_message = message
+        self.abort_notify_client = notify_client
         self.finished_reason = FINISH_ABORT(message=message)
 
     @classmethod
@@ -338,7 +346,7 @@ class OutputProcesser:
                 break
             self.pending_aborts.pop(oldest_rid)
 
-    def mark_abort(self, rid: str):
+    def mark_abort(self, rid: str, notify_client: bool = False):
         """Mark a request for abort. Safe to call before or after register().
 
         Routes through ``RequestState.set_finish_with_abort`` so
@@ -349,10 +357,15 @@ class OutputProcesser:
         running the request until natural ``max_tokens``/EOS — the
         cancelled request burns up to ``max_tokens`` forward steps and
         latches a ``--max-num-seqs`` slot in the meantime.
+
+        ``notify_client`` streams a terminating finish to the client (for
+        pause-initiated aborts; client-initiated aborts leave it False since
+        the tokenizer manager has already cleaned up its own state).
         """
         state = self.rid_to_state.get(rid)
         if state is not None:
-            state.set_finish_with_abort("AbortReq from client")
+            msg = "Aborted by pause" if notify_client else "AbortReq from client"
+            state.set_finish_with_abort(msg, notify_client=notify_client)
             return
 
         self.sweep_pending_aborts()
@@ -551,7 +564,20 @@ class OutputProcesser:
             # Notify caller of first output token (used by prefill node to hand off
             # bootstrap token to the KV transfer layer before streaming output).
             if on_first_token is not None and model_output_ids:
-                on_first_token(forward_op.request_pool_indices[i], model_output_ids[0])
+                spec_candidate_ids = None
+                if model_execution_results.next_input_ids is not None and i < len(
+                    model_execution_results.next_input_ids
+                ):
+                    spec_candidate_ids = [
+                        int(x)
+                        for x in model_execution_results.next_input_ids[i].tolist()
+                    ]
+                on_first_token(
+                    rid,
+                    forward_op.request_pool_indices[i],
+                    model_output_ids[0],
+                    spec_candidate_ids,
+                )
 
             if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
@@ -604,9 +630,14 @@ class OutputProcesser:
 
             # For aborted requests, skip output to detokenizer (the tokenizer
             # manager already cleaned up), just notify the scheduler to finish.
+            # Exception: pause-initiated aborts (abort_notify_client) leave a
+            # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
                 request_changes.append(make_extend_result_event(rid, new_ids))
                 request_changes.append(make_finish_event(rid))
+                if request_state.abort_notify_client:
+                    stream_out_rids.append(rid)
+                    stream_out_states.append(request_state)
                 self.rid_to_state.pop(rid)
                 continue
 
@@ -665,9 +696,10 @@ class OutputProcesser:
         so we must NOT emit an additional make_finish_event here.
 
         We send a finished BatchTokenIDOut to the detokenizer so the Prefill TM
-        can resolve its HTTP coroutine and let mini_lb unblock.  Without this,
-        mini_lb waits forever for the prefill side's HTTP response while the
-        decode side has already finished — client hangs indefinitely.
+        can resolve its HTTP coroutine and let the HTTP load balancer unblock.
+        Without this, the load balancer waits forever for the prefill side's HTTP
+        response while the decode side has already finished — client hangs
+        indefinitely.
         """
         if req_id not in self.rid_to_state:
             return []

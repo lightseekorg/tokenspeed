@@ -34,41 +34,31 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
-    "allgather_vocab",
     "allreduce_residual_rmsnorm",
     "minimax_allreduce_rms_qk",
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
     "trtllm_create_ipc_workspace_for_minimax",
-    "simple_all_gather",
-    "create_ipc_workspace_for_allgather",
 ]
 
 platform = current_platform()
 
 AllReduceFusionPattern = ErrorClass
 allgather_dual_rmsnorm = error_fn
-allgather_vocab = error_fn
 allreduce_residual_rmsnorm = error_fn
 minimax_allreduce_rms_qk = error_fn
 reducescatter_residual_rmsnorm = error_fn
 trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_minimax = error_fn
-simple_all_gather = error_fn
-create_ipc_workspace_for_allgather = error_fn
 
 if current_platform().is_nvidia:
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         AllGatherFusionPattern,
         AllReduceFusionPattern,
         ReduceScatterFusionPattern,
-        all_gather,
-        create_ipc_workspace_for_allgather,
-        destroy_ipc_workspace_for_allgather,
         minimax_allreduce_rms_qk,
-        simple_all_gather,
         trtllm_allgather_fusion,
         trtllm_allreduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
@@ -86,49 +76,12 @@ if current_platform().is_nvidia:
             self.world_size = None
             self.rank = None
             self.max_token_num = None
-            self.max_token_num_for_vocab_gather = None
             self.hidden_dim = None
             self.use_fp32_lamport = None
             self.initialized = False
-            self.vocab_gather_space_initialized = False
-            self.local_vocab_size = None
             self.group_ranks = (
                 None  # tuple of global ranks this workspace was created for
             )
-
-        def init_workspace_for_vocab_gather(
-            self,
-            world_size: int,
-            rank: int,
-            local_vocab_size: int,
-            group,
-            max_token_num_for_vocab_gather: int = 16,
-        ):
-            if (
-                self.vocab_gather_space_initialized
-                and self.world_size == world_size
-                and self.max_token_num_for_vocab_gather
-                == max_token_num_for_vocab_gather
-                and self.local_vocab_size == local_vocab_size
-            ):
-                return
-            self.cleanup_vocab_gather_buf()
-
-            (
-                self.ipc_handles_for_gather_vocab,
-                self.workspace_tensor_for_gather_vocab,
-            ) = all_gather.create_ipc_workspace_for_allgather(
-                rank,
-                world_size,
-                max_token_num_for_vocab_gather,
-                local_vocab_size * world_size,
-                False,
-                group=group,
-            )
-            self.vocab_gather_space_initialized = True
-            self.world_size = world_size
-            self.max_token_num_for_vocab_gather = max_token_num_for_vocab_gather
-            self.local_vocab_size = local_vocab_size
 
         def initialize(
             self,
@@ -197,23 +150,6 @@ if current_platform().is_nvidia:
                     self.use_fp32_lamport = None
                     self.group_ranks = None
 
-        def cleanup_vocab_gather_buf(self):
-            if (
-                self.vocab_gather_space_initialized
-                and self.ipc_handles_for_gather_vocab is not None
-            ):
-                try:
-                    destroy_ipc_workspace_for_allgather(
-                        self.ipc_handles_for_gather_vocab, group=self.group
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup TRT-LLM fusion workspace: {e}")
-                finally:
-                    self.vocab_gather_space_initialized = False
-                    self.world_size = None
-                    self.max_token_num_for_vocab_gather = None
-                    self.local_vocab_size = None
-
     _workspace_manager = TrtllmFusionWorkspaceManager()
 
     #
@@ -278,48 +214,6 @@ if current_platform().is_nvidia:
 
         return _workspace_manager.initialized
 
-    def ensure_vocab_allgather_initialized(
-        rank: int,
-        group: dist.ProcessGroup,
-        max_token_num_for_vocab_gather: int = 16,
-        local_vocab_size: int = 4096,
-    ):
-        world_size = group.size()
-        if world_size <= 1:
-            return False
-
-        target_max_token_num = max_token_num_for_vocab_gather
-        target_vocab_size = local_vocab_size
-        if (
-            _workspace_manager.initialized
-            and _workspace_manager.world_size == world_size
-        ):
-            if _workspace_manager.max_token_num_for_vocab_gather is not None:
-                target_max_token_num = max(
-                    _workspace_manager.max_token_num_for_vocab_gather,
-                    max_token_num_for_vocab_gather,
-                )
-            if _workspace_manager.local_vocab_size is not None:
-                target_vocab_size = max(
-                    _workspace_manager.local_vocab_size, local_vocab_size
-                )
-
-        if (
-            (not _workspace_manager.vocab_gather_space_initialized)
-            or (_workspace_manager.world_size != world_size)
-            or (_workspace_manager.max_token_num != target_max_token_num)
-            or (_workspace_manager.local_vocab_size != target_vocab_size)
-        ):
-            _workspace_manager.init_workspace_for_vocab_gather(
-                world_size=world_size,
-                rank=rank,
-                group=group,
-                max_token_num_for_vocab_gather=target_max_token_num,
-                local_vocab_size=target_vocab_size,
-            )
-
-        return _workspace_manager.vocab_gather_space_initialized
-
     def get_num_tokens_per_rank(world_size: int, total_tokens_in_group: int) -> list:
         token_list_in_group = []
         for rank in range(0, world_size):
@@ -328,56 +222,6 @@ if current_platform().is_nvidia:
             )
             token_list_in_group.append(num_tokens_per_rank)
         return token_list_in_group
-
-    def allgather_vocab(
-        input_tensor: torch.Tensor,
-        rank: int,
-        group: dist.ProcessGroup,
-        max_tokens_num: int,
-        local_vocab_size: int,
-        max_sm_to_use: int | None = None,
-        launch_with_pdl: bool | None = True,
-        trigger_completion_at_end: bool | None = False,
-        fallback_all_gather=None,
-    ):
-        assert input_tensor.dtype == torch.bfloat16, "Only support bf16 for now"
-
-        world_size = group.size()
-        assert world_size > 1, "Single GPU, no need for allreduce fusion"
-        assert input_tensor.shape[0] <= max_tokens_num
-
-        if not ensure_vocab_allgather_initialized(
-            rank=rank,
-            group=group,
-            max_token_num_for_vocab_gather=max_tokens_num,
-            local_vocab_size=local_vocab_size,
-        ):
-            if current_platform().is_amd and fallback_all_gather is not None:
-                return fallback_all_gather(input_tensor, group)
-
-            raise RuntimeError("TRT-LLM fusion workspace not available")
-
-        token_num, _ = input_tensor.shape
-        vocab_size = local_vocab_size * world_size
-        allgather_out = torch.empty(
-            (token_num, vocab_size),
-            dtype=input_tensor.dtype,
-            device=input_tensor.device,
-        )
-        all_gather.simple_all_gather(
-            allgather_in=input_tensor,
-            world_size=world_size,
-            world_rank=rank,
-            token_num=token_num,
-            hidden_size=local_vocab_size,
-            workspace_ptrs=_workspace_manager.workspace_tensor_for_gather_vocab,
-            launch_with_pdl=launch_with_pdl,
-            trigger_completion_at_end=trigger_completion_at_end,
-            max_num_tokens=max_tokens_num,
-            allgather_out=allgather_out,
-            max_sm_to_use=max_sm_to_use,
-        )
-        return allgather_out
 
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,

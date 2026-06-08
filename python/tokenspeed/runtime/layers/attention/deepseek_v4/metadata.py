@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     DeepseekV4CacheMetadata,
 )
@@ -137,6 +138,7 @@ class DeepseekV4ForwardMetadata:
     indexer: DeepseekV4IndexerMetadata = field(
         default_factory=DeepseekV4IndexerMetadata
     )
+    forward_mode: ForwardMode | None = None
     # Padding mask for CUDA graph replay rows; this is not mixed-batch state.
     is_valid_token: torch.Tensor | None = None
     # CPU lens are retained for sparse prefill/indexer planning without

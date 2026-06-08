@@ -112,6 +112,7 @@ def _matmul(
     y=None,
     n_tokens=None,
     n_expts_act=None,
+    **_ignored,
 ):
     with _maybe_lds_guard(x, w, precision_config):
         out = matmul(
@@ -145,14 +146,6 @@ _matmul_common = dict(
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
 )
-
-register_kernel(
-    "moe",
-    "experts",
-    name="triton_kernels_matmul_ogs",
-    features={"ragged_metadata"},
-    **_matmul_common,
-)(_matmul)
 
 register_kernel(
     "moe",
@@ -196,6 +189,7 @@ def triton_kernels_routing(
     n_tokens, _ = logits.shape
 
     assert sm_first is False, "sm_first=True not supported for triton_kernels_routing"
+
     sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
     mask_metadata = sparse.mask_metadata
 

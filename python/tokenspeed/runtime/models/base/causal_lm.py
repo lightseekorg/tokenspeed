@@ -44,6 +44,10 @@ class BaseCausalLM(nn.Module):
 
     model_cls: type[BaseTransformerModel]
 
+    # TODO: temporary; remove in the follow-up refactoring that extends
+    # pre-attn q-slice to Qwen NextN and DeepSeek V3 NextN.
+    pre_attention_trim: bool = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -141,7 +145,6 @@ class BaseCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -154,7 +157,7 @@ class BaseCausalLM(nn.Module):
             out_cache_loc,
             **model_kwargs,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
 
         return self.logits_processor(
             input_ids,

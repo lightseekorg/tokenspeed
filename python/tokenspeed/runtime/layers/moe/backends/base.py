@@ -112,6 +112,7 @@ class MoEBackend(ABC):
             is_bias=is_bias,
             use_presharded_weights=use_presharded_weights,
             do_transpose=do_transpose,
+            tp_size=self.spec.tp_size,
         )
 
     def _make_group_scale_loader(self, *, do_transpose: bool = False) -> Callable:

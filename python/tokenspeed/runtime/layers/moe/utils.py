@@ -72,6 +72,7 @@ class MoeBackend(Enum):
     AUTO = "auto"
     TRITON = "triton"
     TRITON_KERNEL = "triton_kernel"
+    GLUON_KERNEL = "gluon_kernel"
     MARLIN = "marlin"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
@@ -88,6 +89,9 @@ class MoeBackend(Enum):
 
     def is_triton_kernel(self):
         return self == MoeBackend.TRITON_KERNEL
+
+    def is_gluon_kernel(self):
+        return self == MoeBackend.GLUON_KERNEL
 
     def is_marlin(self):
         return self == MoeBackend.MARLIN

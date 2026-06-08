@@ -28,10 +28,11 @@ def _fp8_quantize_kernel(
     out_ptr,
     scale,
     M,
+    N,
     x_row_stride,
     out_row_stride,
-    N: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    EVEN_N: tl.constexpr,
     FP8_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HAS_SCALE: tl.constexpr,
@@ -42,16 +43,19 @@ def _fp8_quantize_kernel(
     m_idx = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = m_idx < M
     n_idx = tl.arange(0, BLOCK_N)
-    n_mask = n_idx < N
 
     # PDL: wait for the producer kernel (e.g., kv_b_proj GEMM) to drain before
     # we read its output. No-op when disabled.
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
+    if EVEN_N:
+        load_mask = m_mask[:, None]
+    else:
+        load_mask = m_mask[:, None] & (n_idx[None, :] < N)
+
     x_off = m_idx[:, None] * x_row_stride + n_idx[None, :]
-    mask = m_mask[:, None] & n_mask[None, :]
-    x = tl.load(x_ptr + x_off, mask=mask, other=0.0)
+    x = tl.load(x_ptr + x_off, mask=load_mask)
 
     x = x.to(tl.float32)
     if HAS_SCALE:
@@ -61,7 +65,7 @@ def _fp8_quantize_kernel(
     x_fp8 = x.to(FP8_DTYPE)
 
     out_off = m_idx[:, None] * out_row_stride + n_idx[None, :]
-    tl.store(out_ptr + out_off, x_fp8, mask=mask)
+    tl.store(out_ptr + out_off, x_fp8, mask=load_mask)
 
     # PDL: signal that dependents (e.g., FMHA) can begin their preamble.
     if ENABLE_PDL:
@@ -115,7 +119,8 @@ def fp8_quantize(
            are passed as plain kernel args; scalar tensors are loaded on device.
         out: optional pre-allocated FP8 output. Same shape as ``x``. If not
            provided, allocated as contiguous.
-        fp8_dtype: ``torch.float8_e4m3fn`` (default) or ``torch.float8_e5m2``.
+        fp8_dtype: ``torch.float8_e4m3fn`` (default), ``torch.float8_e5m2`` or
+           ``torch.float8_e4m3fnuz`` (the bias-8 e4m3 used on AMD CDNA3).
         enable_pdl: opt into Programmatic Dependent Launch (Hopper+). Caller
            must also pass ``launch_pdl=True`` upstream / downstream as needed.
 
@@ -126,7 +131,11 @@ def fp8_quantize(
         torch.bfloat16,
         torch.float16,
     ), f"fp8_quantize input must be bf16/fp16, got {x.dtype}"
-    assert fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    assert fp8_dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+    ), f"fp8_quantize unsupported fp8 dtype: {fp8_dtype}"
     has_scale = scale is not None
     has_scale_tensor = isinstance(scale, torch.Tensor)
     if has_scale_tensor:
@@ -142,8 +151,12 @@ def fp8_quantize(
     out_M, _, out_row_stride = _flatten_to_2d(out)
     assert out_M == M
 
-    fp8_dtype_const = tl.float8e4nv if fp8_dtype is torch.float8_e4m3fn else tl.float8e5
-    block_n = triton.next_power_of_2(N)
+    if fp8_dtype is torch.float8_e4m3fn:
+        fp8_dtype_const = tl.float8e4nv
+    elif fp8_dtype is torch.float8_e5m2:
+        fp8_dtype_const = tl.float8e5
+    else:
+        fp8_dtype_const = tl.float8e4b8
 
     # Block-size heuristic — picked from per-shape best configs in an
     # nsys-driven sweep on B200 (kv_a [s,512] and v [s,h,128] for K2.5).
@@ -161,6 +174,9 @@ def fp8_quantize(
 
     grid = (triton.cdiv(M, block_m),)
 
+    block_n = max(1, triton.next_power_of_2(N))
+    even_n = block_n == N
+
     # ``launch_pdl`` is a NVIDIA-only Triton runtime kwarg (Hopper+ Programmatic
     # Dependent Launch). The HIP backend rejects unknown kwargs, so only forward
     # it when PDL is actually requested.
@@ -171,10 +187,11 @@ def fp8_quantize(
         out,
         1.0 if scale is None else scale,
         M,
+        N,
         x_row_stride,
         out_row_stride,
-        N=N,
         BLOCK_N=block_n,
+        EVEN_N=even_n,
         FP8_DTYPE=fp8_dtype_const,
         BLOCK_M=block_m,
         HAS_SCALE=has_scale,

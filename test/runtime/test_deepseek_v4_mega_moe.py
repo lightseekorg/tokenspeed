@@ -28,6 +28,7 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
             intermediate_size=128,
             mapping=None,
             prefix="layers.0.ffn.experts",
+            swiglu_limit=None,
         )
 
         w1 = torch.full((128, 64), 1, dtype=torch.uint8)
@@ -50,6 +51,22 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
         torch.testing.assert_close(experts.w13_weight_scale[1, :128], s1)
         torch.testing.assert_close(experts.w13_weight_scale[1, 128:], s3)
         torch.testing.assert_close(experts.w2_weight_scale[1], s2)
+
+    def test_init_stores_swiglu_limit(self):
+        # swiglu_limit is a DeepGEMM compile-time template arg; the experts
+        # module must carry the served value so warmup_jit_variants()
+        # pre-compiles the matching mega-MoE tiles (see deepseek_v4.py).
+        experts = DeepseekV4MegaMoEExperts(
+            num_experts=4,
+            num_local_experts=2,
+            top_k=2,
+            hidden_size=128,
+            intermediate_size=128,
+            mapping=None,
+            prefix="layers.0.ffn.experts",
+            swiglu_limit=10.0,
+        )
+        self.assertEqual(experts.swiglu_limit, 10.0)
 
 
 if __name__ == "__main__":
