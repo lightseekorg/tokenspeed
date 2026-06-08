@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.moe.gluon import (
     _direct_topk_small_m,
     _gluon_mxfp4_fp8_warp_decode_moe,
 )
-from tokenspeed_kernel.ops.moe.triton_kernels import FlexCtx, InFlexData, PrecisionConfig
+from tokenspeed_kernel.ops.moe.triton_kernels import (
+    FlexCtx,
+    InFlexData,
+    PrecisionConfig,
+)
 from tokenspeed_kernel.platform import current_platform
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.skipif(not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only")
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
+)
 @pytest.mark.parametrize("M", [1, 4, 8, 16])
 @pytest.mark.parametrize("E", [16, 128])
 @pytest.mark.parametrize("topk", [1, 4])
@@ -33,7 +38,9 @@ def test_direct_topk_small_m_matches_selected_softmax(M: int, E: int, topk: int)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.skipif(not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only")
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
+)
 def test_direct_topk_small_m_rejects_large_m():
     logits = torch.randn((17, 16), device="cuda", dtype=torch.float32)
     with pytest.raises(ValueError, match="requires M <="):
@@ -41,10 +48,13 @@ def test_direct_topk_small_m_rejects_large_m():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.skipif(not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only")
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
+)
 def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference():
     pytest.importorskip("aiter")
     from aiter.utility.fp4_utils import mxfp4_to_f32
+
     from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import swizzle_mxfp4
 
     torch.manual_seed(123)
@@ -62,13 +72,17 @@ def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference():
     scale2 = torch.ones((1,), device=device, dtype=torch.float32)
     fp8_dtype = torch.float8_e4m3fn
     pc1 = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=InFlexData(dtype=fp8_dtype, scale=scale1), rhs_data=flex13),
+        flex_ctx=FlexCtx(
+            lhs_data=InFlexData(dtype=fp8_dtype, scale=scale1), rhs_data=flex13
+        ),
         b_mx_scale=st13,
         b_microblock_size=32,
         out_dtype=torch.bfloat16,
     )
     pc2 = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=InFlexData(dtype=fp8_dtype, scale=scale2), rhs_data=flex2),
+        flex_ctx=FlexCtx(
+            lhs_data=InFlexData(dtype=fp8_dtype, scale=scale2), rhs_data=flex2
+        ),
         b_mx_scale=st2,
         b_microblock_size=32,
         out_dtype=torch.bfloat16,
@@ -103,4 +117,6 @@ def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference():
             inter = (gate / (1.0 + torch.exp(-1.702 * gate))) * (linear + 1.0)
             inter_fp8 = inter.to(fp8_dtype).to(torch.float32)
             ref[m] += topk_weights[m, slot] * (inter_fp8 @ w2_f[expert].T).squeeze(0)
-    torch.testing.assert_close(out.float(), ref.to(torch.bfloat16).float(), rtol=5e-2, atol=2.0)
+    torch.testing.assert_close(
+        out.float(), ref.to(torch.bfloat16).float(), rtol=5e-2, atol=2.0
+    )
