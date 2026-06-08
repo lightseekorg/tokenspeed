@@ -345,7 +345,13 @@ class MHAAttnBackend(AttentionBackend):
 
         metadata = self.forward_prefill_metadata
         if metadata.max_extend_prefix_len > 0:
-            if self.mha_extend_mode == "ragged":
+            sinks = kwargs.get("sinks")
+            # gpt-oss uses attention sinks. The ragged split path computes the
+            # cached-prefix and new-token attention states separately before
+            # merging; keep sink-attention requests on the unified KV-cache path
+            # so prefix-cache hits preserve the same numerical path as ordinary
+            # extend.
+            if self.mha_extend_mode == "ragged" and sinks is None:
                 return self._forward_extend_split(
                     q,
                     k,
@@ -355,7 +361,7 @@ class MHAAttnBackend(AttentionBackend):
                     token_to_kv_pool,
                     metadata,
                     save_kv_cache,
-                    kwargs.get("sinks"),
+                    sinks,
                 )
             else:
                 return self._forward_extend(
@@ -367,7 +373,7 @@ class MHAAttnBackend(AttentionBackend):
                     token_to_kv_pool,
                     metadata,
                     save_kv_cache,
-                    kwargs.get("sinks"),
+                    sinks,
                 )
         return self._forward_prefill(
             q,
