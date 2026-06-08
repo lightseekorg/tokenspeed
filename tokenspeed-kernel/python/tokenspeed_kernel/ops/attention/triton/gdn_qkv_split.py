@@ -572,6 +572,11 @@ def causal_conv1d_qkv_split_gdn_prefill(
     Q_DIM = num_q_heads * head_q
     K_DIM = num_k_heads * head_k
     V_DIM = num_v_heads * head_v
+    if Q_DIM % _CONV1D_BLOCK_N or K_DIM % _CONV1D_BLOCK_N or V_DIM % _CONV1D_BLOCK_N:
+        raise ValueError(
+            f"Q/K/V dims ({Q_DIM}/{K_DIM}/{V_DIM}) must each be divisible by "
+            f"BLOCK_N={_CONV1D_BLOCK_N}; use the two-kernel path for other shapes."
+        )
     dim, cu_seqlen = x.shape
     _, width = weight.shape
     state_len = width - 1
