@@ -193,9 +193,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
     // Plain SWA models publish only up to the attention window; hybrid
     // paged-cache SWA models publish when their adjunct carries window state.
-    return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
+    return fsm::SchedulePrefillEvent{tokens_this_round,
+                                     reserve_num_tokens_in_next_schedule_event,
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
-                                     &kv_prefix_cache_, enableMidflightPrefixPublish(),
+                                     &kv_prefix_cache_,
+                                     enableMidflightPrefixPublish(),
                                      maxMidflightPrefixPublishTokens()};
 }
 
@@ -222,9 +224,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     }
 
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
-                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
-                                    &kv_prefix_cache_, enableMidflightPrefixPublish(),
-                                    maxMidflightPrefixPublishTokens()};
+                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr, &kv_prefix_cache_,
+                                    enableMidflightPrefixPublish(), maxMidflightPrefixPublishTokens()};
 }
 
 bool Scheduler::enableMidflightPrefixPublish() const {
