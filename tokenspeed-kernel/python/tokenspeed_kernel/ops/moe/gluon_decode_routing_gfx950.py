@@ -39,7 +39,13 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 with redirect_triton_to_tokenspeed_triton():
     from triton_kernels.tensor import RaggedTensorMetadata
@@ -114,9 +120,10 @@ def _fused_topk(
     """Fused in-kernel top-k matching ``topk_forward(apply_softmax=True)``.
 
     Selects, per token row, the top ``TOPK`` experts by logit value (ties to
-    the smaller expert id, descending value order) and the softmax gate over
-    the selected logits -- reproducing the OAI ``_topk_forward`` semantics
-    without a separate launch or a ``y_vals``/``y_indx`` global round-trip.
+    the smaller expert id, descending value order) and     the softmax gate over
+    the selected logits -- reproducing the triton kernels ``_topk_forward``
+    semantics without a separate launch or a ``y_vals``/``y_indx`` global
+    round-trip.
     Returns flat ``(idx[GP] int32, vals[GP] X_DTYPE)`` in token-major gate
     order (``g = token*TOPK + slot``), ready for the counting sort.
     """
@@ -174,7 +181,7 @@ def _fused_topk(
 # Small-M (M <= 16): single-workgroup, stable-order, single-block collapse.
 # ===========================================================================
 @gluon.jit
-def _fused_route_smallM(
+def _fused_route_small_m(
     Logits,  # [M, E]       X_DTYPE (raw routing logits)
     SliceSizes,  # [E]          int32
     SliceOffs,  # [E+1]         int32
@@ -302,7 +309,7 @@ def _next_pow2(x: int) -> int:
     return 1 << (max(1, x) - 1).bit_length()
 
 
-def _route_smallM(logits, topk, dtype):
+def _route_small_m(logits, topk, dtype):
     """M <= 16: 1-kernel stable-order fused route (top-k fused in-kernel)."""
     M, E = logits.shape
     G = M * topk
@@ -325,7 +332,7 @@ def _route_smallM(logits, topk, dtype):
     # tile + top-k) to benefit from 4 warps.
     nw = 1 if M <= 2 else 4
 
-    _fused_route_smallM[(1,)](
+    _fused_route_small_m[(1,)](
         logits,
         slice_sizes,
         slice_offs,
@@ -414,4 +421,51 @@ def gluon_fused_route(
             f"(single-block-collapse regime); got M={M}. Route larger M "
             "through the generic triton_kernels_routing pipeline."
         )
-    return _route_smallM(logits, topk, dtype)
+    return _route_small_m(logits, topk, dtype)
+
+
+@register_kernel(
+    "moe",
+    "route",
+    name="gluon_decode_routing_gfx950",
+    solution="gluon",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=format_signatures(
+        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+    traits={"output_type": frozenset({"ragged_metadata"})},
+    # Narrowly gated on gfx950 + small-M decode shapes -> SPECIALIZED. Selection
+    # prefers this over the portable triton route on gfx950; the runtime guard
+    # below degrades to the generic route for shapes it does not cover.
+    priority=Priority.SPECIALIZED,
+)
+def gluon_decode_routing_gfx950(
+    logits: torch.Tensor,
+    n_expts_act: int,
+    sm_first: bool = False,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """gfx950 small-M decode route, registered alongside the generic Triton route.
+
+    The single-block-collapse fused kernel only covers the decode regime
+    (``M <= SMALLM_MAX_M`` and the bounds ``gluon_route_supported`` checks); the
+    bound is dynamic, so it cannot be a static selection trait. Shapes outside
+    it fall back to the registered ``triton_kernels_routing`` generic pipeline,
+    keeping that kernel free of any gluon coupling.
+    """
+    if dtype is None:
+        dtype = logits.dtype
+    n_tokens = logits.shape[0]
+    if (
+        not sm_first
+        and n_tokens <= SMALLM_MAX_M
+        and gluon_route_supported(logits, n_expts_act, dtype)
+    ):
+        return gluon_fused_route(logits, n_expts_act, dtype=dtype)
+
+    generic = KernelRegistry.get().get_impl("triton_kernels_routing")
+    return generic(logits, n_expts_act, sm_first, dtype)

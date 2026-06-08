@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import tokenspeed_kernel  # noqa: F401  (registers moe kernels)
-import tokenspeed_kernel.ops.moe.triton_kernels as triton_kernels_mod
+import tokenspeed_kernel.ops.moe.gluon_decode_routing_gfx950 as gluon_mod
 import torch
 from tokenspeed_kernel.ops.moe import moe_route
 from tokenspeed_kernel.ops.moe.gluon_decode_routing_gfx950 import (
@@ -30,18 +30,22 @@ def _route(logits):
         sm_first=False,
         dtype=logits.dtype,
         traits={"output_type": "ragged_metadata"},
-        expected_kernel_name="triton_kernels_routing",
+        expected_kernel_name="gluon_decode_routing_gfx950",
     )
 
 
 def _route_generic(logits):
-    """Reference: force the generic pipeline by disabling the small-M bound."""
-    saved = triton_kernels_mod.SMALLM_MAX_M
-    triton_kernels_mod.SMALLM_MAX_M = -1
+    """Reference: force the generic pipeline by disabling the small-M bound.
+
+    The gfx950 route kernel is still selected; setting its bound below 1 makes
+    it fall back to the registered triton_kernels_routing generic pipeline.
+    """
+    saved = gluon_mod.SMALLM_MAX_M
+    gluon_mod.SMALLM_MAX_M = -1
     try:
         return _route(logits)
     finally:
-        triton_kernels_mod.SMALLM_MAX_M = saved
+        gluon_mod.SMALLM_MAX_M = saved
 
 
 def _assert_metadata_exact(rg, rg_ref):
