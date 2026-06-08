@@ -30,6 +30,8 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.adapters.minimax_m2 import MiniMaxM2RuntimeView
+from tokenspeed.runtime.configs.engine_spec import EngineModelSpec, build_engine_spec
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
@@ -128,6 +130,7 @@ class ModelConfig:
         self.revision = revision
         self.quantization = quantization
         self.mapping = server_args.mapping
+        self.engine_spec: EngineModelSpec | None = None
 
         # Parse args
         self.model_override_args = json.loads(model_override_args)
@@ -135,7 +138,7 @@ class ModelConfig:
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
 
-        self.hf_config = get_config(
+        self._hf_source_config = get_config(
             model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
@@ -143,6 +146,18 @@ class ModelConfig:
             is_draft_worker=is_draft_worker,
             **kwargs,
         )
+        self.hf_config = self._hf_source_config
+
+        engine_spec = None
+        if envs.TOKENSPEED_USE_ENGINE_SPEC.get():
+            engine_spec = build_engine_spec(self._hf_source_config)
+            if engine_spec is None:
+                logger.info(
+                    "TOKENSPEED_USE_ENGINE_SPEC=1 but no adapter for "
+                    "model_type=%s; using legacy HF config object",
+                    getattr(self._hf_source_config, "model_type", None),
+                )
+
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -151,6 +166,16 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+
+        if engine_spec is not None:
+            self._init_from_engine_spec(
+                engine_spec,
+                context_length=context_length,
+                dtype=dtype,
+                is_draft_worker=bool(is_draft_worker),
+                server_args=server_args,
+            )
+            return
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
@@ -305,11 +330,98 @@ class ModelConfig:
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
 
+    def _init_from_engine_spec(
+        self,
+        spec: EngineModelSpec,
+        *,
+        context_length: int | None,
+        dtype: str,
+        is_draft_worker: bool,
+        server_args: ServerArgs,
+    ) -> None:
+        """Initialize from a stable EngineModelSpec (adapter path)."""
+        self.engine_spec = spec
+        if spec.body.type == "minimax_m2":
+            runtime_view = MiniMaxM2RuntimeView.from_engine_spec(spec)
+            self.hf_config = runtime_view
+            self.hf_text_config = runtime_view
+        else:
+            raise ValueError(
+                f"EngineModelSpec path is not wired for body.type={spec.body.type!r}"
+            )
+
+        architectures = list(spec.architectures)
+        self.is_generation = is_generation_model(architectures)
+        self.is_multimodal = is_multimodal_model(architectures)
+        self.is_multimodal_gen = is_multimodal_gen_model(architectures)
+        self.is_image_gen = is_image_gen_model(architectures)
+        self.is_audio_model = is_audio_model(architectures)
+        self.is_multimodal_active = self.is_multimodal
+        self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
+
+        logger.info(
+            "ModelConfig using EngineModelSpec for model_type=%s architecture=%s",
+            spec.model_type,
+            spec.architecture,
+        )
+
+        self.dtype = _get_and_verify_dtype(self._hf_source_config, dtype)
+
+        body = spec.body
+        derived_context_len = int(body.position.context_len)
+        if context_length is not None:
+            if context_length > derived_context_len:
+                if envs.TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get():
+                    logger.warning(
+                        "User-specified context_length (%s) is greater than the derived "
+                        "context_length (%s). This may lead to incorrect model outputs or "
+                        "CUDA errors.",
+                        context_length,
+                        derived_context_len,
+                    )
+                    self.context_len = context_length
+                else:
+                    raise ValueError(
+                        f"User-specified context_length ({context_length}) is greater "
+                        f"than the derived context_length ({derived_context_len}). "
+                        f"To allow overriding this maximum, set the env var "
+                        f"TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                    )
+            else:
+                self.context_len = context_length
+        else:
+            self.context_len = derived_context_len
+
+        self.head_dim = int(body.attention.head_dim)
+        self.attention_arch = AttentionArch.MHA
+
+        self.num_attention_heads = int(body.attention.num_query_heads)
+        self.num_key_value_heads = int(body.attention.num_kv_heads)
+        self.hidden_size = int(body.hidden_size)
+        self.num_hidden_layers = int(body.num_layers)
+        self.num_attention_layers = int(body.num_layers)
+        if is_draft_worker:
+            mtp_layers = getattr(self._hf_source_config, "mtp_num_hidden_layers", None)
+            if mtp_layers is not None:
+                self.num_attention_layers = mtp_layers
+        self.vocab_size = int(body.vocab_size)
+
+        self._verify_quantization()
+
+        self.hf_eos_token_id = self.get_hf_eos_token_id()
+        self.image_token_id = getattr(self._hf_source_config, "image_token_id", None)
+
+        if server_args is not None and server_args.load_format == "extensible":
+            override_model_config(self, server_args.ext_yaml)
+
     def _parse_quant_hf_config(self):
-        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if self.engine_spec is not None and self.engine_spec.quantization is not None:
+            return self.engine_spec.quantization
+        source_config = getattr(self, "_hf_source_config", self.hf_config)
+        quant_cfg = getattr(source_config, "quantization_config", None)
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
-            quant_cfg = getattr(self.hf_config, "compression_config", None)
+            quant_cfg = getattr(source_config, "compression_config", None)
         if quant_cfg is None:
             # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
             # Resolve the local snapshot directory (model_path may be a HF hub ID)
@@ -405,7 +517,8 @@ class ModelConfig:
                 )
 
     def get_hf_eos_token_id(self) -> set[int] | None:
-        eos_ids = getattr(self.hf_config, "eos_token_id", None)
+        source_config = getattr(self, "_hf_source_config", self.hf_config)
+        eos_ids = getattr(source_config, "eos_token_id", None)
         if eos_ids:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
@@ -457,13 +570,23 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
 }
 
 
+def _parse_config_torch_dtype(value) -> torch.dtype | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        return _STR_DTYPE_TO_TORCH_DTYPE.get(value.lower().removeprefix("torch."))
+    return None
+
+
 def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: str | torch.dtype,
 ) -> torch.dtype:
     #  getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "torch_dtype", None)
+    config_dtype = _parse_config_torch_dtype(getattr(config, "torch_dtype", None))
     if config_dtype is None:
         config_dtype = torch.bfloat16
 
