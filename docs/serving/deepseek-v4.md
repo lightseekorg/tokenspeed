@@ -62,7 +62,8 @@ speculative flags. For `num_steps > 1`, keep the main V4 launch flags and add:
 
 ```bash
 --speculative-algorithm MTP \
---speculative-num-steps 3
+--speculative-num-steps 3 \
+--enable-metrics
 ```
 
 When `--speculative-draft-model-path` is omitted for MTP, TokenSpeed uses the
@@ -90,10 +91,18 @@ the draft-extend/prefill metadata and refresh `decode_swa_indices`/`decode_swa_l
 after each accepted-prefix advance; otherwise later draft steps can read stale or
 out-of-range SWA rows.
 
-Do not enable scheduler prefix caching for V4 MTP yet. The current scheduler
-prefix cache reuses ordinary KV pages only; it does not restore SWA, compressed
-KV, compressor state, or CSA indexer group pages for prefix-hit requests, so a
-prefix hit could skip tokens whose group cache state is not actually populated.
+Scheduler prefix caching is supported for the phase-1 V4 MTP path and is enabled
+by default. No extra flag is needed for normal serving; use
+`--no-enable-prefix-caching` only for ablation or debugging. During MTP decode,
+TokenSpeed reuses previously accepted prefix state while keeping unaccepted draft
+tokens out of the reusable prefix cache.
+
+Keep this path on the non-overlap scheduler. The runtime disables overlap
+scheduling when speculative decoding and paged-cache groups are both active, and
+that is the supported phase-1 boundary. State-family reuse remains conservative:
+if SWA, compressed KV, compressor state, or CSA indexer state cannot be restored
+from a complete accepted snapshot, the request should fall back to recomputing
+that state rather than treating the speculative tail as reusable prefix state.
 
 SWA cache insert slot mappings are validated against the current SWA group cache
 capacity before invoking fused cache writers. Multi-step MTP can carry padded or
@@ -101,11 +110,15 @@ draft-tail slot entries that are valid as ignored tokens but not valid physical
 SWA cache locations; these entries must stay negative or be masked before the
 writer touches paged cache memory.
 
-Do not enable mixed prefill/decode batches for V4 MTP yet. MTP advances each
-request by the sampled accepted length, not by a fixed verify width; the next
-target-verify step must therefore wait for the scheduler to observe the previous
-accepted length before it builds group block tables and base logical-page
-offsets.
+MTP advances each request by the sampled accepted length, not by a fixed verify
+width. The next target-verify step must be scheduled only after the scheduler has
+observed the previous accepted length, so group block tables and base
+logical-page offsets are built from accepted scheduler truth rather than from the
+speculative reserve width.
+
+With `--enable-metrics`, check the run summary under `--outputs-dir` for
+`Decoded Tok/Iter` and speculative accept-rate fields when comparing prefix-cache
+default runs against `--no-enable-prefix-caching` ablations.
 
 ## Hardware / dependency requirements
 

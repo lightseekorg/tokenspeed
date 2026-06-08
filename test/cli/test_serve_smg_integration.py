@@ -84,6 +84,11 @@ def test_orchestrator_runs_against_fake_engine():
             "30",
             "--drain-timeout",
             "5",
+            # The fake engine serves a placeholder model id (/fake) with no real
+            # tokenizer and no GetTokenizer RPC. Newer smg gates gateway
+            # readiness on tokenizer registration, so skip autoload here — this
+            # test exercises orchestration/teardown, not tokenizer loading.
+            "--disable-tokenizer-autoload",
         ],
         env=env,
         stdout=subprocess.PIPE,

@@ -64,6 +64,16 @@ logger = get_colorful_logger(__name__)
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
 
 
+def _draft_idle_global_num_tokens_for_step(
+    step_idx: int,
+    global_num_tokens: list[int],
+    global_bs: list[int] | None,
+) -> list[int]:
+    if step_idx == 0 or global_bs is None:
+        return global_num_tokens
+    return global_bs
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -309,6 +319,11 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
         )
 
+        # CUDA graph warmup runs the drafter with dummy data whose
+        # uninitialized KV cache produces NaN → argmax sentinel -1.
+        # Clear the residue so pool slots reused by real requests start clean.
+        self.runtime_states.future_input_map.zero_()
+
         # Encoder CUDA graph: install the model-built wrapper by overriding
         # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
         # ``CudaGraphWrapper``.
@@ -385,7 +400,6 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-            self.input_buffers.input_lengths_buf[:bs],
             req_pool_indices=req_pool_indices,
             seq_lens=self.input_buffers.seq_lens_buf[:bs],
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
@@ -492,6 +506,18 @@ class ModelExecutor:
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
         )
+
+        # Single choke point for every (sample/verify) x (greedy/flashinfer)
+        # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
+        # make cute_argmax emit the -1 sentinel. Left unclamped, that -1 poisons
+        # both consumers below -- it flows into output_ids -> detokenizer (the
+        # HF Rust tokenizer raises OverflowError on a negative id and kills the
+        # engine) and, via the drafter, back into future_input_map as the next
+        # round's input_ids (negative embedding index -> garbage / CUDA illegal
+        # access). Clamp in place (this runs inside the CUDA graph) so grammar,
+        # drafter, and the return value all observe clean ids. Mirror of the
+        # draft-side draft_ids.clamp_(min=0) guard.
+        output_tokens.clamp_(min=0)
 
         # Fork sampler-output D2H onto the grammar side stream so the
         # next step's build hostfunc can advance the matcher.
@@ -840,6 +866,7 @@ class ModelExecutor:
                     gen_throughput,
                     num_queue_reqs,
                 )
+            self.token_to_kv_pool.maybe_log_paged_cache_group_pages()
             self.num_generated_tokens = 0
             self.num_decode_steps = 0
             self.last_decode_stats_tic = now
@@ -914,7 +941,6 @@ class ModelExecutor:
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -924,6 +950,11 @@ class ModelExecutor:
             for step_idx in range(self.drafter.spec_num_steps):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
+                draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
+                    step_idx,
+                    global_num_tokens,
+                    global_bs,
+                )
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
@@ -932,7 +963,7 @@ class ModelExecutor:
                     num_extends=0,
                     input_num_tokens=0,
                     forward_mode=ForwardMode.IDLE,
-                    global_num_tokens=global_num_tokens,
+                    global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
                     draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
@@ -942,7 +973,6 @@ class ModelExecutor:
                     input_ids=empty,
                     positions=empty,
                     out_cache_loc=empty,
-                    input_lengths=empty,
                     spec_step_idx=step_idx,
                 )
 

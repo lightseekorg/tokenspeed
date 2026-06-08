@@ -132,7 +132,6 @@ class ModelRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         req_pool_indices: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
@@ -163,6 +162,5 @@ class ModelRunner:
             input_ids,
             positions,
             out_cache_loc,
-            input_lengths,
             **kwargs,
         )

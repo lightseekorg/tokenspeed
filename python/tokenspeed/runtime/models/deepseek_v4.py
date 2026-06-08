@@ -292,12 +292,13 @@ def _deepseek_v4_fused_select_experts(
     if (
         not router_logits.is_cuda
         or router_logits.dim() != 2
-        or router_logits.shape[1] != 256
         or top_k <= 0
         or top_k > 32
         or router_logits.dtype not in (torch.float32, torch.float16, torch.bfloat16)
     ):
         return None
+
+    num_experts = router_logits.shape[1]
 
     topk_weights = torch.empty(
         router_logits.shape[0],
@@ -312,12 +313,17 @@ def _deepseek_v4_fused_select_experts(
         device=router_logits.device,
     )
 
+    if num_experts not in (256, 384) or top_k != 6 or not renormalize:
+        return None
+
+    logits_f32 = router_logits.float().contiguous()
+
     try:
         if hash_indices_table is not None:
             if input_ids is None:
                 raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
             hash_softplus_sqrt_topk_flash(
-                router_logits.contiguous(),
+                logits_f32,
                 input_ids.reshape(-1).to(device=router_logits.device).contiguous(),
                 hash_indices_table.to(
                     device=router_logits.device, dtype=torch.int32
@@ -329,7 +335,7 @@ def _deepseek_v4_fused_select_experts(
             )
         elif correction_bias is not None:
             softplus_sqrt_topk_flash(
-                router_logits.contiguous(),
+                logits_f32,
                 correction_bias.to(
                     device=router_logits.device, dtype=torch.float32
                 ).contiguous(),
@@ -409,6 +415,7 @@ def deepseek_v4_select_experts(
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
+    need_scores: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """DeepSeek V4 MoE routing.
 
@@ -416,6 +423,9 @@ def deepseek_v4_select_experts(
     only affects expert selection; the gathered expert weights come from the
     unbiased scores. Hash-routed layers use checkpoint-provided expert ids but
     still gather weights from the gate scores.
+
+    Set ``need_scores=False`` when the caller discards the third return value
+    (e.g. mega_moe) to skip the redundant sqrt(softplus(logits)) computation.
     """
 
     fused_topk = _deepseek_v4_fused_select_experts(
@@ -428,7 +438,10 @@ def deepseek_v4_select_experts(
     )
     if fused_topk is not None:
         topk_weights, topk_ids = fused_topk
-        scores = torch.sqrt(F.softplus(router_logits.float()))
+        if need_scores:
+            scores = torch.sqrt(F.softplus(router_logits.float()))
+        else:
+            scores = router_logits
         return topk_weights, topk_ids, scores
 
     scores = torch.sqrt(F.softplus(router_logits.float()))
@@ -1954,6 +1967,34 @@ def _deepseek_v4_sanitize_swa_slot_mapping(
     )
 
 
+def _deepseek_v4_swa_slot_mapping(
+    ctx: ForwardContext,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> torch.Tensor:
+    if positions.numel() == 0:
+        return out_cache_loc
+    metadata = _deepseek_v4_forward_metadata(ctx)
+    if metadata is None:
+        raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+    cache_metadata = metadata.cache
+    if cache_metadata.swa_block_table is None:
+        return out_cache_loc
+    token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
+    if token_to_req_indices.numel() != positions.numel() and (
+        token_to_req_indices.numel() <= 0
+        or positions.numel() % token_to_req_indices.numel() != 0
+    ):
+        return out_cache_loc
+    return _group_slot_mapping_from_raw(
+        positions,
+        token_to_req_indices,
+        cache_metadata.swa_block_table,
+        ctx.token_to_kv_pool.swa_block_size,
+        base_offsets=cache_metadata.swa_base_logical_page,
+    )
+
+
 def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
     override = global_server_args_dict.get("attention_use_fp4_indexer_cache", None)
     if override is not None:
@@ -2041,12 +2082,28 @@ class DeepseekV4MLP(nn.Module):
         if x.shape[0] == 0:
             return x.new_empty((0, self.down_proj.output_size))
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.float().chunk(2, dim=-1)
-        if self.swiglu_limit is not None and self.swiglu_limit > 0:
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-        x = (F.silu(gate) * up).to(x.dtype)
-        out, _ = self.down_proj(x)
+
+        _use_fused_swiglu = (
+            gate_up.ndim == 2
+            and gate_up.shape[-1] % 256 == 0
+            and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
+        )
+        if _use_fused_swiglu:
+            from tokenspeed_kernel.ops.activation.triton import (
+                fused_swiglu_fp8_ue8m0,
+            )
+
+            x_fp8, scale = fused_swiglu_fp8_ue8m0(
+                gate_up, swiglu_limit=self.swiglu_limit or 0.0
+            )
+            out, _ = self.down_proj(x_fp8, scale=scale)
+        else:
+            gate, up = gate_up.float().chunk(2, dim=-1)
+            if self.swiglu_limit is not None and self.swiglu_limit > 0:
+                gate = torch.clamp(gate, max=self.swiglu_limit)
+                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            x = (F.silu(gate) * up).to(x.dtype)
+            out, _ = self.down_proj(x)
         return out
 
 
@@ -2243,17 +2300,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             (1, DEEPSEEK_V4_MXFP4_BLOCK_SIZE),
             self.num_local_experts,
         )
-        self._transformed_l1_weights, self._transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(
-                (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-            )
+        l1, l2 = deep_gemm.transform_weights_for_mega_moe(
+            (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
+            (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
         )
+        # L2 data tensor may alias the input .contiguous() buffer — clone
+        # to break the reference so the original weight storage can be freed.
+        self._transformed_l1_weights = l1
+        self._transformed_l2_weights = (l2[0].clone(), l2[1])
 
-        self.w13_weight = None
-        self.w13_weight_scale = None
-        self.w2_weight = None
-        self.w2_weight_scale = None
+        del self.w13_weight
+        del self.w13_weight_scale
+        del self.w2_weight
+        del self.w2_weight_scale
 
     def get_symm_buffer(self):
         if deep_gemm is None:
@@ -2514,6 +2573,8 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
+        fmt = getattr(self.experts, "topk_output_format", None)
+        need_scores = fmt is not None and not fmt.is_bypassed()
         return deepseek_v4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
@@ -2521,6 +2582,7 @@ class DeepseekV4MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
+            need_scores=need_scores,
         )
 
     def _make_topk_output(
@@ -2784,17 +2846,18 @@ class DeepseekV4Compressor(nn.Module):
             if state_hit is not None:
                 state_slot_mapping, state_block_table = state_hit
             else:
-                if state_block_table is not None:
-                    state_slot_mapping = _group_slot_mapping_from_raw(
-                        positions,
-                        metadata.token_to_req_indices[: positions.numel()],
-                        state_block_table,
-                        state_block_size,
-                        base_offsets=state_base_logical_page,
+                if state_block_table is None:
+                    raise RuntimeError(
+                        "DeepSeek V4 missing paged-cache block table for compressor "
+                        f"state ratio={self.compress_ratio}"
                     )
-                else:
-                    state_block_table = cache_metadata.block_table
-                    state_slot_mapping = out_cache_loc
+                state_slot_mapping = _group_slot_mapping_from_raw(
+                    positions,
+                    metadata.token_to_req_indices[: positions.numel()],
+                    state_block_table,
+                    state_block_size,
+                    base_offsets=state_base_logical_page,
+                )
                 state_slot_mapping = _mask_invalid_graph_tokens(
                     state_slot_mapping,
                     valid_token,
@@ -3210,22 +3273,19 @@ class DeepseekV4Indexer(nn.Module):
             indexer_state_base_logical_page = (
                 cache_metadata.indexer_state_base_logical_page
             )
-            if indexer_state_block_table is not None:
-                indexer_state_block_size = pool.get_indexer_state_block_size(
-                    layer_index
+            if indexer_state_block_table is None:
+                raise RuntimeError(
+                    "DeepSeek V4 missing paged-cache block table for indexer "
+                    "compressor state"
                 )
-                indexer_state_slot_mapping = _group_slot_mapping_from_raw(
-                    positions,
-                    metadata.token_to_req_indices[: positions.numel()],
-                    indexer_state_block_table,
-                    indexer_state_block_size,
-                    base_offsets=indexer_state_base_logical_page,
-                )
-            else:
-                indexer_state_block_table = cache_metadata.block_table
-                indexer_state_block_size = pool.state_block_size
-                indexer_state_slot_mapping = out_cache_loc
-                indexer_state_base_logical_page = None
+            indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
+            indexer_state_slot_mapping = _group_slot_mapping_from_raw(
+                positions,
+                metadata.token_to_req_indices[: positions.numel()],
+                indexer_state_block_table,
+                indexer_state_block_size,
+                base_offsets=indexer_state_base_logical_page,
+            )
             indexer_state_slot_mapping = _mask_invalid_graph_tokens(
                 indexer_state_slot_mapping,
                 valid_token,
@@ -3599,14 +3659,12 @@ class DeepseekV4Attention(nn.Module):
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
 
-        # When swa_slot_mapping is provided (main model path), use it directly.
-        # When None (MTP draft path), fall back to out_cache_loc.
-        # TODO: MTP draft metadata has token_to_req_indices shaped per-request
-        # (not per-token), so _group_slot_mapping_from_raw cannot compute the
-        # correct paged SWA mapping here. out_cache_loc is not ideal when paged
-        # SWA groups are active; fix once MTP metadata packs per-token indices.
         if swa_slot_mapping is None:
-            swa_slot_mapping = out_cache_loc
+            swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+                ctx,
+                positions,
+                out_cache_loc,
+            )
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -3993,26 +4051,11 @@ class DeepseekV4Model(nn.Module):
         # The SWA write-slot mapping is identical across all layers, so compute
         # it once per step here instead of recomputing it in every attention
         # layer (DeepSeek-V3 likewise derives its slot mapping once per step).
-        # On an empty batch (e.g. the DP idle fallback) the attention layers
-        # early-return without touching metadata, so skip the metadata read here
-        # too to preserve that behavior on a fresh backend.
-        if hidden_states.shape[0] == 0:
-            swa_slot_mapping = out_cache_loc
-        else:
-            metadata = ctx.attn_backend.forward_metadata
-            if metadata is None:
-                raise RuntimeError("DeepSeek V4 attention requires forward metadata")
-            cache_metadata = metadata.cache
-            if cache_metadata.swa_block_table is not None:
-                swa_slot_mapping = _group_slot_mapping_from_raw(
-                    positions,
-                    metadata.token_to_req_indices[: positions.numel()],
-                    cache_metadata.swa_block_table,
-                    ctx.token_to_kv_pool.swa_block_size,
-                    base_offsets=cache_metadata.swa_base_logical_page,
-                )
-            else:
-                swa_slot_mapping = out_cache_loc
+        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+            ctx,
+            positions,
+            out_cache_loc,
+        )
         # Per-(step, ratio) compressor slot mappings are identical across layers of the
         # same ratio; memoize within the step (filled lazily by the first compressor of
         # each ratio, reused by the rest).
@@ -4119,7 +4162,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+        del params_dict, moe_loader
         self.post_load_weights()
+        self.warmup_mega_moe()
 
     def post_load_weights(self):
         mega_moe_experts: list[DeepseekV4MegaMoEExperts] = []
@@ -4131,18 +4176,25 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 mega_moe_experts.append(module)
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
-        # Pre-compile the DeepGEMM mega-MoE tiles now so DeepGEMM never JITs on
-        # the serving hot path: a cold mid-serving compile stalls one EP rank
-        # past the NVLink barrier's 30 s timeout and aborts the job. Tiles are
-        # cached by GEMM shape + token count (not by layer), so warming one
-        # experts module covers every layer. Opt out with
-        # TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1.
-        if (
-            mega_moe_experts
-            and os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") != "1"
-        ):
-            logger.info("Pre-compiling DeepGEMM mega-MoE kernel variants...")
-            mega_moe_experts[0].warmup_jit_variants()
+
+    def warmup_mega_moe(self) -> None:
+        """Pre-compile DeepGEMM mega-MoE tiles.
+
+        Called after post_load_weights (not inside it) so that
+        finalize_weights temporaries have been freed by GC and there is
+        enough GPU memory for the symmetric buffer allocation.
+        """
+        if os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") == "1":
+            return
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        for module in self.modules():
+            if isinstance(module, DeepseekV4MegaMoEExperts):
+                logger.info("Pre-compiling DeepGEMM mega-MoE kernel variants...")
+                module.warmup_jit_variants()
+                return
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -117,6 +117,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_paged_cache_eviction.cpp
         tests/cpp/test_paged_cache_family_split.cpp
         tests/cpp/test_paged_cache_prefix_hit_commit.cpp
+        tests/cpp/test_paged_cache_replay.cpp
         tests/cpp/test_retract_abort_pages.cpp
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_mamba_slot.cpp

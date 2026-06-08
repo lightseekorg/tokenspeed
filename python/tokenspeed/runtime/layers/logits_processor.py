@@ -85,7 +85,6 @@ class LogitsMetadata:
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
-    extend_seq_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: list[int] | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
@@ -113,16 +112,11 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
     @classmethod
-    def from_forward_context(
-        cls,
-        ctx: ForwardContext,
-        input_lengths: torch.Tensor,
-    ):
+    def from_forward_context(cls, ctx: ForwardContext):
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
-            extend_seq_lens=input_lengths,
         )
 
 
@@ -252,13 +246,10 @@ class LogitsProcessor(nn.Module):
                     pruned_states = hidden_states[gather_ids]
                     if aux_hidden_states is not None:
                         aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
-            elif logits_metadata.forward_mode.is_extend_or_mixed():
-                # Fallback for prefill callers that do not precompute gather_ids.
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-                pruned_states = hidden_states[last_index]
-                if aux_hidden_states is not None:
-                    aux_pruned_states = [h[last_index] for h in aux_hidden_states]
             else:
+                assert (
+                    not logits_metadata.forward_mode.is_extend_or_mixed()
+                ), "EXTEND/MIXED forward must set gather_ids on ForwardContext"
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
