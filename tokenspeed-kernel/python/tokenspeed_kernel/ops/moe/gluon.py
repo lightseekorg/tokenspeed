@@ -4550,6 +4550,166 @@ def _gluon_mxfp_ragged_matmul(
     return
 
 
+def _direct_raw_weight_for_warp_decode(w):
+    """Return raw (E, K_packed, N) storage for direct warp-decode kernels."""
+    if isinstance(w, torch.Tensor):
+        return w
+    if isinstance(w, Tensor):
+        return w.storage.data
+    return w
+
+
+def _gluon_mxfp4_fp8_warp_decode_moe(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    w13_weight,
+    w2_weight,
+    *,
+    w13_bias=None,
+    w2_bias=None,
+    w13_precision_config=None,
+    w2_precision_config=None,
+    w13_act_scale: torch.Tensor,
+    w2_act_scale: torch.Tensor,
+    top_k: int,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+) -> torch.Tensor | None:
+    """Small-M direct warp-decode MoE for GPT-OSS FP8 x MXFP4 path."""
+    if hidden_states.ndim != 2 or router_logits.ndim != 2:
+        return None
+    n_tokens = int(router_logits.shape[0])
+    if n_tokens > SMALLM_MAX_M:
+        return None
+    if not gluon_route_supported(router_logits, top_k, router_logits.dtype):
+        return None
+    if w13_precision_config is None or w2_precision_config is None:
+        return None
+
+    w13_raw = _direct_raw_weight_for_warp_decode(w13_weight)
+    w2_raw = _direct_raw_weight_for_warp_decode(w2_weight)
+    w13_scale = _extract_gluon_raw_s(getattr(w13_precision_config, "b_mx_scale", None))
+    w2_scale = _extract_gluon_raw_s(getattr(w2_precision_config, "b_mx_scale", None))
+    if not all(
+        isinstance(t, torch.Tensor) for t in (w13_raw, w2_raw, w13_scale, w2_scale)
+    ):
+        return None
+    if w13_raw.ndim != 3 or w2_raw.ndim != 3:
+        return None
+    if w13_raw.dtype != torch.uint8 or w2_raw.dtype != torch.uint8:
+        return None
+    if w13_scale.dtype != torch.uint8 or w2_scale.dtype != torch.uint8:
+        return None
+
+    D = int(hidden_states.shape[1])
+    if int(w13_raw.shape[1]) * 2 != D:
+        return None
+    two_i = int(w13_raw.shape[2])
+    if two_i % 2 != 0:
+        return None
+    I = two_i // 2
+    if int(w2_raw.shape[1]) * 2 != I:
+        return None
+    N = int(w2_raw.shape[2])
+
+    # Direct kernels consume dense top-k rather than ragged metadata.
+    topk_ids, topk_weights = _direct_topk_small_m(
+        router_logits, top_k, router_logits.dtype
+    )
+
+    # Current GPT-OSS path uses FP8 E4M3 activations with per-tensor scale.
+    from tokenspeed_kernel import quantize_fp8
+
+    if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        x_fp8 = hidden_states
+    else:
+        x_fp8 = quantize_fp8(hidden_states, scale=w13_act_scale, solution="triton")
+    x_u8 = x_fp8.view(torch.uint8) if x_fp8.dtype != torch.uint8 else x_fp8
+
+    inter = torch.empty(
+        (n_tokens * top_k, I), dtype=x_fp8.dtype, device=hidden_states.device
+    )
+    out_dtype = getattr(w2_precision_config, "out_dtype", None) or torch.bfloat16
+    out = torch.empty((n_tokens, N), dtype=out_dtype, device=hidden_states.device)
+
+    dummy_bias = _make_dummy(hidden_states.device, torch.float32, 1)
+    b13 = w13_bias if w13_bias is not None else dummy_bias
+    b2 = w2_bias if w2_bias is not None else dummy_bias
+
+    BLOCK_K = 128
+    BLOCK_N = 16
+    M_DUP = 16
+    s1_grid = (n_tokens * top_k * ((I + BLOCK_N - 1) // BLOCK_N),)
+    _warp_decode_stage1_fp8_mxfp4_kernel[s1_grid](
+        x_u8,
+        w13_raw,
+        w13_scale,
+        topk_ids,
+        inter,
+        n_tokens,
+        D,
+        I,
+        top_k,
+        x_u8.stride(0),
+        x_u8.stride(1),
+        w13_raw.stride(0),
+        w13_raw.stride(-2),
+        w13_raw.stride(-1),
+        w13_scale.stride(0),
+        w13_scale.stride(-2),
+        w13_scale.stride(-1),
+        inter.stride(0),
+        inter.stride(1),
+        w13_act_scale,
+        w2_act_scale,
+        b13,
+        D_PACKED=D // 2,
+        TOPK=top_k,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=BLOCK_N,
+        M_DUP=M_DUP,
+        HAS_BIAS=w13_bias is not None,
+        SWIGLU_ALPHA=float(swiglu_alpha),
+        SWIGLU_LIMIT=float(swiglu_limit),
+        num_warps=1,
+    )
+
+    s2_grid = (n_tokens * ((N + BLOCK_N - 1) // BLOCK_N),)
+    inter_u8 = inter.view(torch.uint8) if inter.dtype != torch.uint8 else inter
+    _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
+        inter_u8,
+        w2_raw,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        out,
+        n_tokens,
+        N,
+        I,
+        top_k,
+        inter_u8.stride(0),
+        inter_u8.stride(1),
+        w2_raw.stride(0),
+        w2_raw.stride(-2),
+        w2_raw.stride(-1),
+        w2_scale.stride(0),
+        w2_scale.stride(-2),
+        w2_scale.stride(-1),
+        out.stride(0),
+        out.stride(1),
+        w2_act_scale,
+        b2,
+        I_PACKED=I // 2,
+        TOPK=top_k,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=BLOCK_N,
+        M_DUP=M_DUP,
+        HAS_BIAS=w2_bias is not None,
+        num_warps=1,
+    )
+    return out
+
+
 _GLUON_FUSED_SIGNATURES = frozenset(
     {
         format_signature(
@@ -4638,13 +4798,63 @@ def _gluon_mxfp_fused_moe(
 
     n_tokens = router_logits.shape[0]
 
+    if os.environ.get("TOKENSPEED_MOE_GLUON_WARP_DECODE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        try:
+            warp_out = _gluon_mxfp4_fp8_warp_decode_moe(
+                hidden_states,
+                router_logits,
+                w13_weight,
+                w2_weight,
+                w13_bias=w13_bias,
+                w2_bias=w2_bias,
+                w13_precision_config=w13_precision_config,
+                w2_precision_config=w2_precision_config,
+                w13_act_scale=w13_act_scale,
+                w2_act_scale=w2_act_scale,
+                top_k=top_k,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_limit=swiglu_limit,
+            )
+            if warp_out is not None:
+                return warp_out
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            import traceback
+
+            logger = logging.getLogger("tokenspeed_kernel.ops.moe.gluon")
+            logger.warning(
+                "warp-decode small-M path falling back: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            logger.warning(
+                "  full chain:\n%s",
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            )
+
+    # Decode-small GPT-OSS routing is launch-overhead dominated.  Prefer the
+    # single-kernel Gluon route for the M<=16 single-block-collapse regime;
+    # fall back to the generic Triton route for larger/unsupported shapes.
+    route_expected_kernel = (
+        "gluon_decode_routing_gfx950"
+        if (
+            n_tokens <= SMALLM_MAX_M
+            and gluon_route_supported(router_logits, top_k, router_logits.dtype)
+        )
+        else "triton_kernels_routing"
+    )
     ragged_metadata, gather_indx, scatter_indx, gate_scal = moe_route(
         router_logits,
         top_k,
         sm_first=False,
         dtype=router_logits.dtype,
         traits={"output_type": "ragged_metadata"},
-        expected_kernel_name="triton_kernels_routing",
+        expected_kernel_name=route_expected_kernel,
     )
 
     act = FusedActivation(
@@ -4978,6 +5188,429 @@ def _fused_route_small_m(
 # ===========================================================================
 def _route_next_pow2(x: int) -> int:
     return 1 << (max(1, x) - 1).bit_length()
+
+
+@gluon.jit
+def _direct_topk_small_m_kernel(
+    Logits,
+    TopkIds,
+    TopkWeights,
+    stride_lm,
+    stride_im,
+    stride_wm,
+    M: gl.constexpr,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    MP: gl.constexpr,
+    GP: gl.constexpr,
+    EP: gl.constexpr,
+    TKP: gl.constexpr,
+    X_DTYPE: gl.constexpr,
+    NW_C: gl.constexpr,
+):
+    """Small-M direct top-k output for warp-decode kernels.
+
+    This reuses the same in-kernel top-k/softmax implementation as the fused
+    routing path, but stores dense token-major ``topk_ids`` and ``topk_weights``
+    instead of ragged metadata.
+    """
+    LG: gl.constexpr = gl.BlockedLayout([1], [64], [NW_C], [0])
+    LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NW_C, 1], [1, 0])
+    g = gl.arange(0, GP, layout=LG)
+    gmask = g < (M * TOPK)
+    tok = (g // TOPK).to(gl.int32)
+    slot = (g % TOPK).to(gl.int32)
+    idx, vals = _fused_topk(
+        Logits,
+        stride_lm,
+        gmask,
+        tok,
+        slot,
+        M,
+        E,
+        TOPK,
+        MP,
+        EP,
+        GP,
+        TKP,
+        X_DTYPE,
+        LG,
+        LT,
+    )
+    gl.store(TopkIds + tok * stride_im + slot, idx, mask=gmask)
+    gl.store(TopkWeights + tok * stride_wm + slot, vals, mask=gmask)
+
+
+def _direct_topk_small_m(
+    logits: torch.Tensor, topk: int, dtype: torch.dtype | None = None
+):
+    """Return dense ``(topk_ids, topk_weights)`` for small-M warp decode."""
+    if dtype is None:
+        dtype = logits.dtype
+    M, E = logits.shape
+    if M > SMALLM_MAX_M:
+        raise ValueError(f"_direct_topk_small_m requires M <= {SMALLM_MAX_M}; got {M}")
+    if not gluon_route_supported(logits, topk, dtype):
+        raise ValueError("_direct_topk_small_m received unsupported logits/topk/dtype")
+    logits = logits.contiguous()
+    ids = torch.empty((M, topk), dtype=torch.int32, device=logits.device)
+    weights = torch.empty((M, topk), dtype=dtype, device=logits.device)
+    G = M * topk
+    nw = 1 if M <= 2 else 4
+    _direct_topk_small_m_kernel[(1,)](
+        logits,
+        ids,
+        weights,
+        logits.stride(0),
+        ids.stride(0),
+        weights.stride(0),
+        M=M,
+        E=E,
+        TOPK=topk,
+        MP=_route_next_pow2(M),
+        GP=_route_next_pow2(G),
+        EP=_route_next_pow2(E),
+        TKP=_route_next_pow2(topk),
+        X_DTYPE=_ROUTE_GL_DTYPE[dtype],
+        NW_C=nw,
+        num_warps=nw,
+    )
+    return ids, weights
+
+
+@gluon.jit
+def _warp_decode_stage1_fp8_mxfp4_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    Y,
+    M,
+    D,
+    I,
+    TOPK_RUNTIME,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    D_PACKED: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    M_DUP: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+):
+    """Direct top-k stage1: FP8 hidden x MXFP4 W13 -> FP8 intermediate."""
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(I, BLOCK_N)
+    pid_ts = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    token = pid_ts // TOPK_RUNTIME
+    slot = pid_ts % TOPK_RUNTIME
+
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 1]
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+    a_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_a_layout, [M_DUP, BLOCK_K_SCALE]
+    )
+    b_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_b_layout, [BLOCK_N, BLOCK_K_SCALE]
+    )
+
+    am = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, dot_a_layout))[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    n_gate = pid_n * BLOCK_N + bn
+    n_up = I + n_gate
+
+    asm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, a_scale_layout))[:, None]
+    ask = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, a_scale_layout))[None, :]
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, b_scale_layout))[None, :]
+    n_gate_s = pid_n * BLOCK_N + bsn
+    n_up_s = I + n_gate_s
+
+    acc_g = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+    acc_u = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+    if token < M:
+        expert = gl.load(
+            TopkIds + token * TOPK_RUNTIME + slot, mask=token < M, other=-1
+        )
+        if expert >= 0:
+            w_base = W + expert.to(gl.int64) * stride_we
+            ws_base = WScale + expert.to(gl.int64) * stride_wse
+            for kt in range(gl.cdiv(D, BLOCK_K)):
+                k_elem = kt * BLOCK_K + ak
+                k_pack = kt * BLOCK_K_PACKED + bk
+                a = gl.load(
+                    X
+                    + token.to(gl.int64) * stride_xm
+                    + k_elem.to(gl.int64) * stride_xk
+                    + am.to(gl.int64) * 0,
+                    mask=k_elem < D,
+                    other=0.0,
+                )
+                a_scale = gl.full(
+                    (M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout
+                )
+                b_g = gl.load(
+                    w_base
+                    + k_pack.to(gl.int64) * stride_wk
+                    + n_gate.to(gl.int64) * stride_wn,
+                    mask=(k_pack < D_PACKED) & (n_gate < I),
+                    other=0,
+                )
+                b_u = gl.load(
+                    w_base
+                    + k_pack.to(gl.int64) * stride_wk
+                    + n_up.to(gl.int64) * stride_wn,
+                    mask=(k_pack < D_PACKED) & (n_gate < I),
+                    other=0,
+                )
+                sg = kt * BLOCK_K_SCALE + bsk
+                # CDNA4 scale swizzle: storage shape (..., K_SCALE_PAD*32, N_PAD/32).
+                row_g = n_gate_s.to(gl.uint32)
+                lin_g = (
+                    (sg // 8) * 128
+                    + (sg % 4) * 32
+                    + (row_g % 16) * 4
+                    + ((sg % 8) // 4) * 2
+                    + ((row_g % 32) // 16)
+                )
+                off_g = (row_g // 32).to(gl.int64) * stride_wsn + lin_g.to(
+                    gl.int64
+                ) * stride_wsk
+                row_u = n_up_s.to(gl.uint32)
+                lin_u = (
+                    (sg // 8) * 128
+                    + (sg % 4) * 32
+                    + (row_u % 16) * 4
+                    + ((sg % 8) // 4) * 2
+                    + ((row_u % 32) // 16)
+                )
+                off_u = (row_u // 32).to(gl.int64) * stride_wsn + lin_u.to(
+                    gl.int64
+                ) * stride_wsk
+                s_g = gl.load(
+                    ws_base + off_g, mask=(sg < (D // 32)) & (n_gate_s < I), other=0
+                )
+                s_u = gl.load(
+                    ws_base + off_u, mask=(sg < (D // 32)) & (n_gate_s < I), other=0
+                )
+                acc_g = gl.amd.cdna4.mfma_scaled(
+                    a=a,
+                    a_scale=a_scale,
+                    a_format="e4m3",
+                    b=b_g,
+                    b_scale=s_g,
+                    b_format="e2m1",
+                    acc=acc_g,
+                )
+                acc_u = gl.amd.cdna4.mfma_scaled(
+                    a=a,
+                    a_scale=a_scale,
+                    a_format="e4m3",
+                    b=b_u,
+                    b_scale=s_u,
+                    b_format="e2m1",
+                    acc=acc_u,
+                )
+    x_scale = gl.load(x_global_scale_ptr).to(gl.float32)
+    acc_g = acc_g * x_scale
+    acc_u = acc_u * x_scale
+    if HAS_BIAS:
+        bg = gl.load(
+            w13_bias + expert.to(gl.int64) * (2 * I) + n_gate,
+            mask=(token < M) & (n_gate < I),
+            other=0.0,
+        ).to(gl.float32)
+        bu = gl.load(
+            w13_bias + expert.to(gl.int64) * (2 * I) + n_up,
+            mask=(token < M) & (n_gate < I),
+            other=0.0,
+        ).to(gl.float32)
+        acc_g += bg
+        acc_u += bu
+    if SWIGLU_LIMIT > 0.0:
+        acc_g = gl.minimum(acc_g, SWIGLU_LIMIT)
+        acc_u = gl.clamp(acc_u, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+    out_scale = gl.load(out_quant_scale_ptr).to(gl.float32)
+    out = ((acc_g / (1.0 + gl.exp(-SWIGLU_ALPHA * acc_g))) * (acc_u + 1.0)) / out_scale
+    sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
+    sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
+    col = pid_n * BLOCK_N + sn
+    gl.store(
+        Y
+        + pid_ts.to(gl.int64) * stride_ym
+        + col.to(gl.int64) * stride_yn
+        + sm.to(gl.int64) * 0,
+        out.to(Y.dtype.element_ty),
+        mask=(token < M) & (sm == 0) & (col < I),
+    )
+
+
+@gluon.jit
+def _warp_decode_stage2_fp8_mxfp4_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    TopkWeights,
+    Out,
+    M,
+    N,
+    I,
+    TOPK_RUNTIME,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_om,
+    stride_on,
+    x_global_scale_ptr,
+    w2_bias,
+    I_PACKED: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    M_DUP: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+):
+    """Direct top-k stage2: FP8 intermediate x MXFP4 W2 -> BF16 output."""
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    pid = gl.program_id(axis=0)
+    pid_token = pid // gl.cdiv(N, BLOCK_N)
+    pid_n = pid % gl.cdiv(N, BLOCK_N)
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 1]
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+    a_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_a_layout, [M_DUP, BLOCK_K_SCALE]
+    )
+    b_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_b_layout, [BLOCK_N, BLOCK_K_SCALE]
+    )
+    am = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, dot_a_layout))[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, b_scale_layout))[None, :]
+    n_cols = pid_n * BLOCK_N + bn
+    n_cols_s = pid_n * BLOCK_N + bsn
+    acc_total = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+    if pid_token < M:
+        for slot in gl.static_range(0, TOPK):
+            expert = gl.load(
+                TopkIds + pid_token * TOPK_RUNTIME + slot, mask=pid_token < M, other=-1
+            )
+            gate = gl.load(
+                TopkWeights + pid_token * TOPK_RUNTIME + slot,
+                mask=pid_token < M,
+                other=0.0,
+            ).to(gl.float32)
+            if expert >= 0:
+                row = pid_token * TOPK_RUNTIME + slot
+                w_base = W + expert.to(gl.int64) * stride_we
+                ws_base = WScale + expert.to(gl.int64) * stride_wse
+                acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+                for kt in range(gl.cdiv(I, BLOCK_K)):
+                    k_elem = kt * BLOCK_K + ak
+                    k_pack = kt * BLOCK_K_PACKED + bk
+                    a = gl.load(
+                        X
+                        + row.to(gl.int64) * stride_xm
+                        + k_elem.to(gl.int64) * stride_xk
+                        + am.to(gl.int64) * 0,
+                        mask=k_elem < I,
+                        other=0.0,
+                    )
+                    a_scale = gl.full(
+                        (M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout
+                    )
+                    b = gl.load(
+                        w_base
+                        + k_pack.to(gl.int64) * stride_wk
+                        + n_cols.to(gl.int64) * stride_wn,
+                        mask=(k_pack < I_PACKED) & (n_cols < N),
+                        other=0,
+                    )
+                    sk = kt * BLOCK_K_SCALE + bsk
+                    row_s = n_cols_s.to(gl.uint32)
+                    lin_s = (
+                        (sk // 8) * 128
+                        + (sk % 4) * 32
+                        + (row_s % 16) * 4
+                        + ((sk % 8) // 4) * 2
+                        + ((row_s % 32) // 16)
+                    )
+                    off_s = (row_s // 32).to(gl.int64) * stride_wsn + lin_s.to(
+                        gl.int64
+                    ) * stride_wsk
+                    s = gl.load(
+                        ws_base + off_s, mask=(sk < (I // 32)) & (n_cols_s < N), other=0
+                    )
+                    acc = gl.amd.cdna4.mfma_scaled(
+                        a=a,
+                        a_scale=a_scale,
+                        a_format="e4m3",
+                        b=b,
+                        b_scale=s,
+                        b_format="e2m1",
+                        acc=acc,
+                    )
+                acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
+                if HAS_BIAS:
+                    bias = gl.load(
+                        w2_bias + expert.to(gl.int64) * N + n_cols,
+                        mask=n_cols < N,
+                        other=0.0,
+                    ).to(gl.float32)
+                    acc += bias
+                acc_total += gate * acc
+    sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
+    sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
+    col = pid_n * BLOCK_N + sn
+    gl.store(
+        Out
+        + pid_token.to(gl.int64) * stride_om
+        + col.to(gl.int64) * stride_on
+        + sm.to(gl.int64) * 0,
+        acc_total.to(Out.dtype.element_ty),
+        mask=(pid_token < M) & (sm == 0) & (col < N),
+    )
 
 
 def _route_small_m(logits, topk, dtype):
