@@ -762,7 +762,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                     req.mooncake_session_id
                                 ].dst_state_data_ptrs,
                                 req.dst_mamba_indices,
-                                req.transfer_fragments,
+                                transfer_fragments=req.transfer_fragments,
                             )
                         logger.debug(
                             "[TRANSFER_WORKER] send_kvcache returned %s for room %s",
