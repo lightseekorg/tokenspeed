@@ -416,8 +416,9 @@ def main(argv: list[str] | None = None) -> int:
         "--accept-len-min",
         type=float,
         default=1.1,
-        help="Flag spec-decode acceptance when accept_len drops below this "
-        "(default: 1.1)",
+        help="Raise a FATAL finding when spec-decode accept_len drops below "
+        "this for consecutive windows (~1.0 = accepting zero draft tokens). "
+        "Only active when spec decode is enabled. (default: 1.1)",
     )
     p_run.add_argument(
         "--fail-on-audit",

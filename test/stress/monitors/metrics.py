@@ -4,14 +4,15 @@ Some quality signals aren't attributable to a single response — spec-decode
 acceptance, for instance, is only exposed as global counters
 (``tokenspeed:spec_decode_num_accepted_tokens`` / ``...num_drafts``), scraped
 from the server's ``/metrics`` endpoint. This monitor samples them on a fixed
-cadence, derives the windowed acceptance length, and raises an ``audit_finding``
-when it drops below a floor — the spec-decode equivalent of the per-response
-auditors.
+cadence, derives the windowed acceptance length, and raises a FATAL
+``audit_finding`` when it drops below a floor — the spec-decode equivalent of
+the per-response auditors. The counters only emit a series once spec decode has
+actually run, so this check is inert unless spec decode is enabled.
 
 accept_len = Δaccepted_draft_tokens / Δdrafts + 1   (the +1 is the always-
 sampled bonus token). A value near 1.0 means almost no draft tokens are being
-accepted, i.e. speculation is buying nothing — usually a regression or a
-misconfigured drafter.
+accepted, i.e. speculation is buying nothing — usually a correctness bug (e.g.
+corrupted speculative coins), a regression, or a misconfigured drafter.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import Dict, Optional, Tuple
 
 import aiohttp
 
-from ..audits import SEVERITY_WARN
+from ..audits import SEVERITY_FATAL
 from ..events import AUDIT_FINDING, METRICS_PROBE, JsonlSink
 
 # Counter base names we care about. prometheus_client appends `_total` to
@@ -82,6 +83,7 @@ class MetricsMonitor:
         self._task: Optional[asyncio.Task] = None
         self._prev: Optional[Tuple[float, float]] = None  # (accepted, drafts)
         self._below_streak = 0
+        self._fired = False
 
     async def _scrape(self, session: aiohttp.ClientSession) -> Optional[str]:
         url = f"{self.base_url}/metrics"
@@ -129,20 +131,31 @@ class MetricsMonitor:
 
         self.sink.emit(METRICS_PROBE, **fields)
 
+        # accept_len is non-None only once a draft window has closed, which can
+        # only happen when spec decode is actually running (the counters emit no
+        # series otherwise and we already returned above). So the floor check
+        # below inherently fires only when spec decode is enabled.
         if accept_len is None:
             return
+
         if accept_len < self.accept_len_min:
             self._below_streak += 1
-            if self._below_streak >= self.consecutive_below:
+            # A sustained drop toward ~1.0 means spec decode is accepting (close
+            # to) zero draft tokens — a correctness signature (e.g. corrupted
+            # speculative coins), not a tuning dip. Fire FATAL once so it lands
+            # in the loud top-of-summary banner rather than the quiet audit block.
+            if self._below_streak >= self.consecutive_below and not self._fired:
+                self._fired = True
                 self.sink.emit(
                     AUDIT_FINDING,
                     rid="",
                     workload="__server__",
                     check="spec_acceptance",
-                    severity=SEVERITY_WARN,
+                    severity=SEVERITY_FATAL,
                     detail=(
                         f"accept_len={accept_len:.3f} below {self.accept_len_min} "
-                        f"for {self._below_streak} consecutive windows"
+                        f"for {self._below_streak} consecutive windows — spec "
+                        "decode accepting ~zero draft tokens"
                     ),
                     value=round(accept_len, 4),
                 )
