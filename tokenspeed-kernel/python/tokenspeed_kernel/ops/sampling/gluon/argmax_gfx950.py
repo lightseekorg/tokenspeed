@@ -53,15 +53,23 @@ def _argmax_combine(value1, index1, value2, index2):
 
 
 @gluon.constexpr_function
-def _argmax_layout(BLOCK: gl.constexpr, NUM_WARPS: gl.constexpr):
-    return gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+def _argmax_layout(
+    BLOCK: gl.constexpr, NUM_WARPS: gl.constexpr, LOAD_ELEMS: gl.constexpr
+):
+    return gl.BlockedLayout([LOAD_ELEMS], [64], [NUM_WARPS], [0])
 
 
 @gluon.jit
 def _argmax_tile(
-    logits, row, start, stride_m: gl.constexpr, N: gl.constexpr, BLOCK: gl.constexpr
+    logits,
+    row,
+    start,
+    stride_m: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
 ):
-    offs = gl.arange(0, BLOCK, layout=_argmax_layout(BLOCK, gl.num_warps()))
+    offs = gl.arange(0, BLOCK, layout=_argmax_layout(BLOCK, gl.num_warps(), LOAD_ELEMS))
     cols = start + offs
     mask = cols < N
     vals = cdna4.buffer_load(
@@ -82,13 +90,16 @@ def _argmax_one_stage_kernel(
     out_stride: gl.constexpr,
     N: gl.constexpr,
     BLOCK: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
 ):
     row = gl.program_id(0)
     best_val = gl.full((), -float("inf"), gl.float32)
     best_idx = gl.full((), 2147483647, gl.int32)
 
     for start in range(0, N, BLOCK):
-        tile_val, tile_idx = _argmax_tile(logits, row, start, stride_m, N, BLOCK)
+        tile_val, tile_idx = _argmax_tile(
+            logits, row, start, stride_m, N, BLOCK, LOAD_ELEMS
+        )
         best_val, best_idx = _argmax_combine(best_val, best_idx, tile_val, tile_idx)
 
     gl.store(out + row * out_stride, best_idx.to(out.dtype.element_ty))
@@ -107,10 +118,13 @@ def _argmax_split_atomic_kernel(
     NUM_SPLITS: gl.constexpr,
     BLOCK: gl.constexpr,
     REDUCE_BLOCK: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
 ):
     row = gl.program_id(0)
     split = gl.program_id(1)
-    tile_val, tile_idx = _argmax_tile(logits, row, split * BLOCK, stride_m, N, BLOCK)
+    tile_val, tile_idx = _argmax_tile(
+        logits, row, split * BLOCK, stride_m, N, BLOCK, LOAD_ELEMS
+    )
     partial_offset = row * NUM_SPLITS + split
     gl.store(partial_values + partial_offset, tile_val)
     gl.store(partial_indices + partial_offset, tile_idx)
@@ -118,7 +132,7 @@ def _argmax_split_atomic_kernel(
     old = gl.atomic_add(counters + row, 1, sem="acq_rel", scope="gpu")
     if old == NUM_SPLITS - 1:
         offs = gl.arange(
-            0, REDUCE_BLOCK, layout=_argmax_layout(REDUCE_BLOCK, gl.num_warps())
+            0, REDUCE_BLOCK, layout=_argmax_layout(REDUCE_BLOCK, gl.num_warps(), 1)
         )
         mask = offs < NUM_SPLITS
         base = row * NUM_SPLITS + offs
@@ -214,6 +228,10 @@ def _get_atomic_scratch(
     return scratch
 
 
+def _load_elements_per_thread(dtype: torch.dtype) -> int:
+    return 128 // torch.finfo(dtype).bits
+
+
 def _select_config(M: int, N: int) -> tuple[int, int, bool]:
     """Return Gluon launch config for ``M x N`` logits.
 
@@ -260,6 +278,7 @@ def gluon_argmax_gfx950(
         return out
 
     block, num_warps, use_split = _select_config(M, N)
+    load_elems = _load_elements_per_thread(logits.dtype)
     if use_split:
         num_splits = triton.cdiv(N, block)
         split_block = triton.next_power_of_2(num_splits)
@@ -278,6 +297,7 @@ def gluon_argmax_gfx950(
             NUM_SPLITS=num_splits,
             BLOCK=block,
             REDUCE_BLOCK=split_block,
+            LOAD_ELEMS=load_elems,
             num_warps=num_warps,
         )
     else:
@@ -288,6 +308,7 @@ def gluon_argmax_gfx950(
             out_stride=out.stride(0),
             N=N,
             BLOCK=block,
+            LOAD_ELEMS=load_elems,
             num_warps=num_warps,
         )
     return out
