@@ -44,44 +44,6 @@ class LogitsLayoutPlan:
     def is_dp_all_to_all(self) -> bool:
         return self.mode == "dp_all_to_all"
 
-    @classmethod
-    def normal(
-        cls,
-        *,
-        real_bs: int,
-        effective_bs: int,
-        bucket_bs: int,
-        tp_size: int,
-        num_tokens_per_req: int,
-    ) -> "LogitsLayoutPlan":
-        return cls(
-            mode="normal",
-            real_bs=real_bs,
-            effective_bs=effective_bs,
-            bucket_bs=bucket_bs,
-            tp_size=tp_size,
-            num_tokens_per_req=num_tokens_per_req,
-        )
-
-    @classmethod
-    def dp_all_to_all(
-        cls,
-        *,
-        real_bs: int,
-        effective_bs: int,
-        bucket_bs: int,
-        tp_size: int,
-        num_tokens_per_req: int,
-    ) -> "LogitsLayoutPlan":
-        return cls(
-            mode="dp_all_to_all",
-            real_bs=real_bs,
-            effective_bs=effective_bs,
-            bucket_bs=bucket_bs,
-            tp_size=tp_size,
-            num_tokens_per_req=num_tokens_per_req,
-        )
-
 
 def resolve_dp_sampling_min_bs(
     tp_size: int,
@@ -156,7 +118,8 @@ class LogitsLayoutPlanner:
             bucket_bs = (
                 (effective_bs + self.tp_size - 1) // self.tp_size
             ) * self.tp_size
-            return LogitsLayoutPlan.dp_all_to_all(
+            return LogitsLayoutPlan(
+                mode="dp_all_to_all",
                 real_bs=real_bs,
                 effective_bs=effective_bs,
                 bucket_bs=bucket_bs,
@@ -164,7 +127,8 @@ class LogitsLayoutPlanner:
                 num_tokens_per_req=self.num_tokens_per_req,
             )
 
-        return LogitsLayoutPlan.normal(
+        return LogitsLayoutPlan(
+            mode="normal",
             real_bs=real_bs,
             effective_bs=effective_bs,
             bucket_bs=effective_bs,

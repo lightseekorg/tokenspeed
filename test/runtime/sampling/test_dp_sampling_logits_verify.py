@@ -270,7 +270,8 @@ def _test_dp_chain_matches_legacy(
     legacy_accept_length = legacy_accept_length.clone()
 
     dp_meta = _build_metadata()
-    dp_plan = LogitsLayoutPlan.dp_all_to_all(
+    dp_plan = LogitsLayoutPlan(
+        mode="dp_all_to_all",
         real_bs=bs,
         effective_bs=bs,
         bucket_bs=pad_bs,

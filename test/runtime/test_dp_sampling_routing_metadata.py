@@ -10,6 +10,7 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.graph_routing import select_cuda_graph_route
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     DpSamplingRuntimeLimits,
@@ -79,6 +80,16 @@ def _dp_runtime_config(
         ),
         device=device,
     )
+
+
+def test_extensible_lm_exposes_base_sampling_setup_handles():
+    base = SimpleNamespace(logits_processor=object(), lm_head=object())
+    ext = ExtensibleLM.__new__(ExtensibleLM)
+    torch.nn.Module.__init__(ext)
+    ext.base_lm = base
+
+    assert ext.logits_processor is base.logits_processor
+    assert ext.lm_head is base.lm_head
 
 
 def test_dp_sampling_bucket_threshold():
@@ -531,7 +542,8 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
     )
     hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
     lm_head = SimpleNamespace(weight=torch.ones(7, 3))
-    plan = LogitsLayoutPlan.dp_all_to_all(
+    plan = LogitsLayoutPlan(
+        mode="dp_all_to_all",
         real_bs=5,
         effective_bs=5,
         bucket_bs=8,
@@ -563,7 +575,8 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
     )
     hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
     lm_head = SimpleNamespace(weight=torch.ones(7, 3))
-    plan = LogitsLayoutPlan.dp_all_to_all(
+    plan = LogitsLayoutPlan(
+        mode="dp_all_to_all",
         real_bs=4,
         effective_bs=5,
         bucket_bs=8,

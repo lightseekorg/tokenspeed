@@ -112,17 +112,9 @@ class BaseCausalLM(nn.Module):
 
     def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
 
-        if self.mapping.attn.has_dp:
-            return LogitsProcessor(
-                config,
-                skip_all_gather=True,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
-
         return LogitsProcessor(
             config,
+            skip_all_gather=self.mapping.attn.has_dp,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,

@@ -118,7 +118,8 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._dp_max_reqs_per_rank = config.max_bs
             return
 
-        assert self._dp_tp_group is not None
+        if self._dp_tp_group is None:
+            raise RuntimeError("dp_sampling requires a tp_group")
         self._dp_max_pad_bs = (
             (config.max_bs + self._dp_tp_size - 1) // self._dp_tp_size
         ) * self._dp_tp_size
@@ -143,16 +144,20 @@ class FlashInferSamplingBackend(SamplingBackend):
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         if not runtime.enabled:
             return
-        assert runtime.vocab_size is not None
-        assert runtime.max_bucket_bs is not None
-        assert runtime.topology is not None
-        assert runtime.device is not None
-        if runtime.topology.tp_size != self._dp_tp_size:
+        if (
+            runtime.vocab_size is None
+            or runtime.max_bucket_bs is None
+            or runtime.topology is None
+            or runtime.device is None
+        ):
+            raise RuntimeError("enabled DP sampling runtime is incomplete")
+        topology = runtime.topology
+        if topology.tp_size != self._dp_tp_size:
             raise RuntimeError(
-                f"DP sampling runtime tp_size={runtime.topology.tp_size} "
+                f"DP sampling runtime tp_size={topology.tp_size} "
                 f"does not match backend tp_size={self._dp_tp_size}"
             )
-        if runtime.topology.tp_group != self._dp_tp_group:
+        if topology.tp_group != self._dp_tp_group:
             raise RuntimeError("DP sampling runtime tp_group does not match backend")
         if runtime.max_bucket_bs > self._dp_max_pad_bs:
             raise RuntimeError(
@@ -170,7 +175,8 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
         if new_vocab_size is None:
             return
-        assert self._dp_tp_group is not None
+        if self._dp_tp_group is None:
+            raise RuntimeError("dp_sampling requires a tp_group")
         self._dp_comm_vocab_size = new_vocab_size
         self._dp_comm = DpSamplingComm(
             tp_size=self._dp_tp_size,
@@ -424,9 +430,12 @@ class FlashInferSamplingBackend(SamplingBackend):
         ) or sampling_info.dp_sampling
 
         if dp_sampling:
-            assert (
-                self._dp_tp_size > 1 and self._dp_pg is not None
-            ), "dp_sampling requires tp_size > 1 and a resolved tp_group"
+            if self._dp_tp_size <= 1 or self._dp_pg is None or self._dp_comm is None:
+                raise RuntimeError(
+                    "dp_sampling requires tp_size > 1, a resolved tp_group, "
+                    "and a configured DP comm"
+                )
+            dp_comm = self._dp_comm
             tp_size = self._dp_tp_size
             rank = self._dp_rank
             effective_bs = (
@@ -434,24 +443,25 @@ class FlashInferSamplingBackend(SamplingBackend):
                 if logits_layout_plan is not None
                 else bs
             )
-            assert effective_bs == bs, (
-                f"DP sampling effective_bs={effective_bs} must match "
-                f"candidate batch size {bs}"
-            )
             pad_bs = (
                 logits_layout_plan.bucket_bs
                 if logits_layout_plan is not None
                 else ((effective_bs + tp_size - 1) // tp_size) * tp_size
             )
-            assert pad_bs >= effective_bs, (
-                f"pad_bs={pad_bs} must be >= effective_bs={effective_bs}"
-            )
-            assert (
-                pad_bs <= self._dp_max_pad_bs
-            ), f"pad_bs={pad_bs} exceeds dp_max_pad_bs={self._dp_max_pad_bs}"
-            assert pad_bs % tp_size == 0, (
-                f"pad_bs={pad_bs} must be divisible by tp_size={tp_size}"
-            )
+            if effective_bs != bs:
+                raise RuntimeError(
+                    f"DP sampling effective_bs={effective_bs} must match "
+                    f"candidate batch size {bs}"
+                )
+            if (
+                pad_bs < effective_bs
+                or pad_bs > self._dp_max_pad_bs
+                or pad_bs % tp_size != 0
+            ):
+                raise RuntimeError(
+                    f"invalid DP sampling pad_bs={pad_bs} for effective_bs={effective_bs}, "
+                    f"max_pad_bs={self._dp_max_pad_bs}, tp_size={tp_size}"
+                )
             bs = pad_bs // tp_size
 
             # Shard by request so each request's draft chain stays on one rank.
@@ -499,10 +509,11 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
         if dp_sampling:
             expected_rows = bs * num_tokens_per_req
-            assert logits.shape[0] == expected_rows, (
-                f"DP sampling logits rows {logits.shape[0]} != expected "
-                f"{expected_rows}"
-            )
+            if logits.shape[0] != expected_rows:
+                raise RuntimeError(
+                    f"DP sampling logits rows {logits.shape[0]} != expected "
+                    f"{expected_rows}"
+                )
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
@@ -587,13 +598,12 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if dp_sampling:
             n = num_tokens_per_req
-            assert self._dp_comm is not None
-            self._dp_comm.prepare_verify_outputs(logits_output.next_token_logits.dtype)
+            dp_comm.prepare_verify_outputs(logits_output.next_token_logits.dtype)
             (
                 predict_full,
                 accept_index_full,
                 accept_length_full,
-            ) = self._dp_comm.gather_verify_outputs(
+            ) = dp_comm.gather_verify_outputs(
                 predict_local=predict.view(bs, n),
                 accept_index_local=accept_index,
                 accept_length_local=accept_length,
@@ -603,7 +613,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             accept_index = accept_index_full[:effective_bs]
             accept_length = accept_length_full[:effective_bs]
             if logprobs_local is not None:
-                logprobs_full = self._dp_comm.gather_verify_logprobs(
+                logprobs_full = dp_comm.gather_verify_logprobs(
                     logprobs_local,
                     pad_bs=pad_bs,
                 )
