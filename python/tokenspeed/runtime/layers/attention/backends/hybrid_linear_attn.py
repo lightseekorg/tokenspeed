@@ -36,7 +36,6 @@ from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from tokenspeed.runtime.layers.attention.linear.chunk import chunk_gated_delta_rule
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -1090,40 +1089,43 @@ class MambaAttnBackend(AttentionBackend):
                 self.forward_metadata.track_ssm_final_src is not None
                 and self.forward_metadata.track_ssm_final_src.numel() > 0
             )
+            if not self._gdn_fastpath_checked:
+                if not (
+                    gdn_flashinfer.is_supported(
+                        head_k_dim, query.dtype, num_heads, num_value_heads
+                    )
+                    and head_v_dim == head_k_dim
+                ):
+                    raise RuntimeError(
+                        "GDN prefill requires the flashinfer Blackwell fast-path "
+                        "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
+                        "head_v == head_k + num_v >= num_q). Got "
+                        f"dtype={query.dtype}, head_k={head_k_dim}, "
+                        f"head_v={head_v_dim}, num_q={num_heads}, "
+                        f"num_v={num_value_heads}, "
+                        f"sm100_available={gdn_flashinfer.is_available()}."
+                    )
+                self._gdn_fastpath_checked = True
+            # sm100 fast-path for both code paths. q/k l2norm here since the
+            # kernel ignores its own flag; the wrapper handles the
+            # gate/beta/state conventions and, when output_h=True, returns a
+            # drop-in replacement for FLA's intermediate-h tensor so the
+            # downstream track_ssm_h_src indexing is identical.
             if need_h_track:
-                core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    output_final_state=True,
-                    cu_seqlens=query_start_loc,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                    output_h=True,
+                core_attn_out, last_recurrent_state, h = (
+                    gdn_flashinfer.gdn_chunk_prefill(
+                        l2norm_fwd(query),
+                        l2norm_fwd(key),
+                        value,
+                        g,
+                        beta,
+                        scale=head_k_dim**-0.5,
+                        initial_state=recurrent_state,
+                        cu_seqlens=query_start_loc,
+                        output_h=True,
+                    )
                 )
             else:
-                if not self._gdn_fastpath_checked:
-                    if not (
-                        gdn_flashinfer.is_supported(
-                            head_k_dim, query.dtype, num_heads, num_value_heads
-                        )
-                        and head_v_dim == head_k_dim
-                    ):
-                        raise RuntimeError(
-                            "GDN prefill requires the flashinfer Blackwell fast-path "
-                            "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
-                            "head_v == head_k + num_v >= num_q). Got "
-                            f"dtype={query.dtype}, head_k={head_k_dim}, "
-                            f"head_v={head_v_dim}, num_q={num_heads}, "
-                            f"num_v={num_value_heads}, "
-                            f"sm100_available={gdn_flashinfer.is_available()}."
-                        )
-                    self._gdn_fastpath_checked = True
-                # sm100 fast-path. q/k l2norm here since the kernel ignores its
-                # own flag; the wrapper handles the gate/beta/state conventions.
                 core_attn_out, last_recurrent_state = gdn_flashinfer.gdn_chunk_prefill(
                     l2norm_fwd(query),
                     l2norm_fwd(key),
