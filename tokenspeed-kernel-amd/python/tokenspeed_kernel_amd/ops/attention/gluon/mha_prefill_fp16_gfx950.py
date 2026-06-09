@@ -26,17 +26,14 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon
-from tokenspeed_kernel.ops.attention.gluon.utils import (
+from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2,
     _INV_LN2_VALUE,
     InputStrides,
     max,
     maximum,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
@@ -1025,28 +1022,6 @@ def get_config(
     )
 
 
-@register_kernel(
-    "attention",
-    "mha_prefill",
-    name="gluon_mha_prefill_fp16_gfx950",
-    solution="gluon",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=format_signatures(
-        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.SPECIALIZED,
-    traits={
-        "head_dim": frozenset({64}),
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False}),
-        "return_lse": frozenset({False, True}),
-    },
-)
 def gluon_mha_prefill_fp16_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,

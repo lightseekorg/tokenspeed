@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenspeed-kernel-amd"
+version = "0.1.0"
+description = "TokenSpeed AMD-specific high-performance kernels."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "torch",
+    "tokenspeed-triton>=3.7.10.post20260531",
+]
+
+[project.urls]
+Homepage = "https://github.com/lightseekorg/tokenspeed/tokenspeed-kernel-amd"
+Repository = "https://github.com/lightseekorg/tokenspeed/tokenspeed-kernel-amd"
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRDPARTYNOTICES"]
+
+[tool.setuptools.packages.find]
+where = ["python"]

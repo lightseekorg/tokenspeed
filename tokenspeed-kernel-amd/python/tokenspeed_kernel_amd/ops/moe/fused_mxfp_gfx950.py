@@ -21,28 +21,14 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
-from tokenspeed_kernel._triton import (
+from tokenspeed_kernel_amd._triton import (
     aggregate,
     gl,
     gluon,
     redirect_triton_to_tokenspeed_triton,
-)
-from tokenspeed_kernel.platform import (
-    ArchVersion,
-    CapabilityRequirement,
-    current_platform,
-)
-from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
-from tokenspeed_kernel.signature import (
-    ScaleFormat,
-    dense_tensor_format,
-    format_signature,
-    format_signatures,
-    tensor_format,
 )
 
 with redirect_triton_to_tokenspeed_triton():
@@ -64,11 +50,6 @@ __all__ = [
     "gluon_route_supported",
     "gluon_decode_routing_gfx950",
 ]
-
-_GLUON_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
-_GLUON_DISABLED_ENV = (
-    os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
-)
 
 
 def _as_int32(t):
@@ -4330,79 +4311,6 @@ def _global_scale_passthrough(scale):
     return float(scale)
 
 
-def _kernel_priority() -> int:
-    if _GLUON_DISABLED_ENV:
-        return Priority.PORTABLE + 1  # 5
-    return Priority.SPECIALIZED + 2  # 14
-
-
-_MXFP4_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.uint8,
-    granularity="block",
-    block_shape=(32,),
-)
-_FP8_PER_TENSOR_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="tensor",
-)
-
-_FUSED_WEIGHT_MXFP4 = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT)
-
-
-def _experts_fp8_mxfp4_signatures() -> frozenset:
-    return frozenset(
-        {
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fn,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fnuz,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-        }
-    )
-
-
-_common = dict(
-    solution="gluon",
-    signatures=_experts_fp8_mxfp4_signatures(),
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    priority=_kernel_priority(),
-    tags={"throughput", "latency"},
-)
-
-
-@register_kernel(
-    "moe",
-    "experts",
-    name="gluon_dispatch_gemm",
-    features={"ragged_metadata", "dispatch_gemm"},
-    **_common,
-)
-@register_kernel(
-    "moe",
-    "experts",
-    name="gluon_gemm_combine",
-    features={"ragged_metadata", "gemm_combine"},
-    **_common,
-)
 def _gluon_mxfp_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -4535,7 +4443,7 @@ def _gluon_mxfp_ragged_matmul(
         import logging
         import traceback
 
-        logger = logging.getLogger("tokenspeed_kernel.ops.moe.gluon")
+        logger = logging.getLogger("tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950")
         logger.warning(
             "_gluon_mxfp_ragged_matmul falling back to upstream: %s: %s",
             type(exc).__name__,
@@ -4550,52 +4458,6 @@ def _gluon_mxfp_ragged_matmul(
     return
 
 
-_GLUON_FUSED_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.float16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fnuz,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-    }
-)
-
-
-@register_kernel(
-    "moe",
-    "fused",
-    name="gluon_mxfp4_fp8_fused_moe",
-    features={"self_routing"},
-    solution="gluon",
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    signatures=_GLUON_FUSED_SIGNATURES,
-    traits={"activation_dtype": frozenset({"fp8"})},
-    priority=_kernel_priority(),
-    tags={"throughput", "latency"},
-)
 def _gluon_mxfp_fused_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -5051,10 +4913,7 @@ def gluon_route_supported(
     and an expert count whose ``next_pow2`` keeps the histogram bins / EP-wide
     tiles bounded.
     """
-    # The kernel's BlockedLayouts assume a 64-lane wavefront, so the path is
-    # gfx950 (CDNA4) only; every other arch falls back to the generic pipeline.
-    if not current_platform().is_cdna4:
-        return False
+    # Platform gating lives in the tokenspeed-kernel registration shim.
     if logits.ndim != 2:
         return False
     if dtype is None:
@@ -5097,40 +4956,16 @@ def gluon_fused_route(
     return _route_small_m(logits, topk, dtype)
 
 
-@register_kernel(
-    "moe",
-    "route",
-    name="gluon_decode_routing_gfx950",
-    solution="gluon",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=format_signatures(
-        "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    traits={"output_type": frozenset({"ragged_metadata"})},
-    # Narrowly gated on gfx950 + small-M decode shapes -> SPECIALIZED. Selection
-    # prefers this over the portable triton route on gfx950; the runtime guard
-    # below degrades to the generic route for shapes it does not cover.
-    # TOKENSPEED_MOE_GLUON=0 demotes it below the triton route, matching the
-    # other gluon moe kernels' disable switch.
-    priority=Priority.PORTABLE if _GLUON_DISABLED_ENV else Priority.SPECIALIZED,
-)
 def gluon_decode_routing_gfx950(
     logits: torch.Tensor,
     n_expts_act: int,
     sm_first: bool = False,
     dtype: torch.dtype | None = None,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """gfx950 small-M decode route, registered alongside the generic Triton route.
+    """gfx950 small-M decode route implementation.
 
-    The single-block-collapse fused kernel only covers the decode regime
-    (``M <= SMALLM_MAX_M`` and the bounds ``gluon_route_supported`` checks); the
-    bound is dynamic, so it cannot be a static selection trait. Shapes outside
-    it fall back to the registered ``triton_kernels_routing`` generic pipeline,
-    keeping that kernel free of any gluon coupling.
+    General-shape fallback is handled by the tokenspeed-kernel registration
+    shim. Direct calls into this implementation fail for unsupported shapes.
     """
     if dtype is None:
         dtype = logits.dtype
@@ -5142,5 +4977,7 @@ def gluon_decode_routing_gfx950(
     ):
         return gluon_fused_route(logits, n_expts_act, dtype=dtype)
 
-    generic = KernelRegistry.get().get_impl("triton_kernels_routing")
-    return generic(logits, n_expts_act, sm_first, dtype)
+    raise ValueError(
+        "gluon_decode_routing_gfx950 only supports small-M gfx950 decode "
+        "routing shapes; fallback routing is handled by tokenspeed-kernel"
+    )

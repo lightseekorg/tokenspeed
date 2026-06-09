@@ -23,10 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, triton
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
     "argmax",
@@ -330,20 +327,6 @@ def _select_config(M: int, N: int) -> tuple[int, int, bool, int | None]:
     return 8192, 4, False, None
 
 
-@register_kernel(
-    "sampling",
-    "argmax",
-    name="gluon_argmax_gfx950",
-    solution="gluon",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=format_signatures("logits", "dense", set(_SUPPORTED_DTYPES)),
-    priority=Priority.SPECIALIZED,
-    tags={"latency", "determinism"},
-)
 def gluon_argmax_gfx950(
     logits: torch.Tensor,
     *,

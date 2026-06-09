@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import pytest
 import tokenspeed_kernel  # noqa: F401  (registers moe kernels)
-import tokenspeed_kernel.ops.moe.gluon as gluon_mod
+import tokenspeed_kernel.ops.moe as moe_mod
 import torch
-from tokenspeed_kernel.ops.moe import moe_route
-from tokenspeed_kernel.ops.moe.gluon import (
+from tokenspeed_kernel.ops.moe import (
     SMALLM_MAX_M,
-    gluon_fused_route,
-    gluon_route_supported,
+    moe_route,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -21,6 +19,10 @@ E = 128
 TOPK = 4
 # The small-M fused route regime (M <= SMALLM_MAX_M, the single-block collapse).
 SMALL_M = [1, 2, 4, 8, 16]
+
+
+def _amd_gluon():
+    return pytest.importorskip("tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950")
 
 
 def _route(logits):
@@ -40,12 +42,12 @@ def _route_generic(logits):
     The gfx950 route kernel is still selected; setting its bound below 1 makes
     it fall back to the registered triton_kernels_routing generic pipeline.
     """
-    saved = gluon_mod.SMALLM_MAX_M
-    gluon_mod.SMALLM_MAX_M = -1
+    saved = moe_mod.SMALLM_MAX_M
+    moe_mod.SMALLM_MAX_M = -1
     try:
         return _route(logits)
     finally:
-        gluon_mod.SMALLM_MAX_M = saved
+        moe_mod.SMALLM_MAX_M = saved
 
 
 def _assert_metadata_exact(rg, rg_ref):
@@ -96,7 +98,7 @@ def test_large_m_uses_generic_pipeline():
 def test_gluon_fused_route_direct(M):
     """gluon_fused_route returns a well-formed routing result for small M."""
     logits = torch.randn(M, E, device="cuda", dtype=torch.bfloat16)
-    rg, ga, sc, gs = gluon_fused_route(logits, TOPK)
+    rg, ga, sc, gs = _amd_gluon().gluon_fused_route(logits, TOPK)
     assert int(rg.slice_sizes.sum()) == M * TOPK
     assert ga.numel() == M * TOPK == sc.numel() == gs.numel()
 
@@ -105,10 +107,10 @@ def test_gluon_fused_route_direct(M):
 def test_gluon_route_supported_guards():
     """Unsupported configs report False so callers fall back safely."""
     logits = torch.randn(16, E, dtype=torch.bfloat16)
-    assert gluon_route_supported(logits, TOPK)
+    assert _amd_gluon().gluon_route_supported(logits, TOPK)
     # unsupported dtype
-    assert not gluon_route_supported(logits.to(torch.float64), TOPK)
+    assert not _amd_gluon().gluon_route_supported(logits.to(torch.float64), TOPK)
     # non-2D
-    assert not gluon_route_supported(logits.reshape(1, 16, E), TOPK)
+    assert not _amd_gluon().gluon_route_supported(logits.reshape(1, 16, E), TOPK)
     # nonsensical topk
-    assert not gluon_route_supported(logits, E + 1)
+    assert not _amd_gluon().gluon_route_supported(logits, E + 1)
