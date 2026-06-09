@@ -85,13 +85,6 @@ class BaseTokenToKVPool:
     def set_token_slot_refs(self, token_slot_refs: torch.Tensor):
         self.token_slot_refs = token_slot_refs
 
-    def bind_paged_cache_scheduler(self, scheduler: object) -> None:
-        """Optional hook for model-specific paged-cache diagnostics."""
-        return None
-
-    def maybe_log_paged_cache_group_pages(self) -> None:
-        return None
-
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 

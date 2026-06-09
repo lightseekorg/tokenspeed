@@ -78,7 +78,9 @@ SplitResult RadixTree::splitChild(TreeNode* parent, const token_vec_t& child_key
 TreeNode* RadixTree::PruneEmptyByNode(TreeNode* node) {
     TreeNode* current = node;
     while (current != nullptr && !current->IsRoot()) {
-        if (current->NumChildren() != 0 || current->OnDevice() || current->OnHost()) {
+        if (current->NumChildren() != 0 || current->OnDevice() || current->OnHost() ||
+            current->HasPagedCacheSnapshot() || current->HasPagedCacheHostSnapshot() ||
+            current->HasPagedCachePendingHostSnapshot()) {
             break;
         }
 
@@ -117,7 +119,8 @@ TreeNode* RadixTree::SplitAt(TreeNode* descendant, std::int32_t depth_in_tokens)
         }
         if (depth_in_tokens > parent_depth && depth_in_tokens < this_depth) {
             // Refuse to split a snapshot-bearing node (would dangle borrowed ids).
-            if (current->HasPagedCacheSnapshot()) {
+            if (current->HasPagedCacheSnapshot() || current->HasPagedCacheHostSnapshot() ||
+                current->HasPagedCachePendingHostSnapshot()) {
                 return nullptr;
             }
             TreeNode* parent = current->Parent();
@@ -140,6 +143,7 @@ WalkResult RadixTree::WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode:
         .remaining_tokens = aligned_tokens,
         .match =
             {
+                .token_terminal = current,
                 .device = {.last_node = current},
                 .host = {.last_node = current},
             },
@@ -174,7 +178,8 @@ WalkResult RadixTree::WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode:
         }
         if (matched_num_pages != static_cast<std::int32_t>(child->Tokens().size() / page_size_)) {
             // Refuse to split a snapshot-bearing node; borrowed ids rely on it.
-            if (child->HasPagedCacheSnapshot()) {
+            if (child->HasPagedCacheSnapshot() || child->HasPagedCacheHostSnapshot() ||
+                child->HasPagedCachePendingHostSnapshot()) {
                 break;
             }
             SplitResult split = splitChild(current, walk_key_cache, matched_num_pages);
@@ -188,6 +193,7 @@ WalkResult RadixTree::WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode:
 
         current = child;
         result.terminal = child;
+        result.match.token_terminal = child;
         result.remaining_tokens = result.remaining_tokens.subspan(matched_num_pages * page_size_);
     }
 

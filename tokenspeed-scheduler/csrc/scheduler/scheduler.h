@@ -65,6 +65,7 @@ public:
     std::size_t DecodingSize() const;
     std::size_t RetractedSize() const;
     std::size_t AvailableKvPages() const;
+    std::size_t AvailableHostKvPages() const;
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
     std::int32_t GetRequestTokenSize(const std::string& id) const;
@@ -72,6 +73,9 @@ public:
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
     std::int64_t PagedCacheGroupFailedAllocCount(const std::string& group_id) const;
+    std::int32_t PagedCacheHostGroupTotalPages(const std::string& group_id) const;
+    std::int32_t PagedCacheHostGroupAvailablePages(const std::string& group_id) const;
+    std::int64_t PagedCacheHostGroupFailedAllocCount(const std::string& group_id) const;
     std::vector<std::int32_t> GetRequestPagedCachePageIds(const std::string& request_id,
                                                           const std::string& group_id) const;
     // Compact-view base logical-page offset; 0 for full-history / unseen.

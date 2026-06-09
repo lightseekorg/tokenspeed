@@ -52,6 +52,9 @@ using DeviceNodeRef = NodeRef<ResourceType::Device>;
 using HostNodeRef = NodeRef<ResourceType::Host>;
 
 struct MatchResult {
+    // Deepest token-radix node reached before tier-specific resource capping.
+    TreeNode* token_terminal{nullptr};
+
     struct Device {
         TreeNode* last_node;
         std::int32_t page_size{0};
@@ -85,6 +88,9 @@ struct MatchResult {
         std::map<std::string, std::vector<std::int32_t>> per_group_page_ids;
         std::map<std::string, std::int32_t> per_group_base_logical_page;
     } paged_cache;
+    // Host-tier paged-cache hit. These page ids are host page ids and must be
+    // materialized into device pages before a forward op is built.
+    PagedCache paged_cache_host;
 };
 
 struct InsertResult {
@@ -108,6 +114,7 @@ struct CacheOpSpec {
     std::string request_id;
     TreeNode* last_node{nullptr};
     std::vector<TreeNode*> nodes;
+    std::vector<TreeNode*> paged_cache_nodes;
 
     CacheOpSpec();
     ~CacheOpSpec();

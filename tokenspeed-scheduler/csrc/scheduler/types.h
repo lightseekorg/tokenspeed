@@ -21,6 +21,7 @@
 #pragma once
 
 #include <optional>
+#include <map>
 #include <unordered_map>
 #include <variant>
 #include <cstdint>
@@ -84,6 +85,7 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+    std::map<std::string, std::int32_t> paged_cache_host_group_pages{};
 
     // Unset means paged-cache groups are transport-only.
     std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};

@@ -5,7 +5,12 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from tokenspeed.runtime.cache.transfer.types import CacheKind, Location, TransferUnit
+from tokenspeed.runtime.cache.transfer.types import (
+    PAGED_CACHE_KIND,
+    CacheKind,
+    Location,
+    TransferUnit,
+)
 
 
 class FakeEvent:
@@ -107,6 +112,29 @@ class FakePool:
         self.writebacks.clear()
         self.loadbacks.clear()
         self.counter.reset()
+
+
+class FakePagedPool:
+    kind = PAGED_CACHE_KIND
+
+    def __init__(self, num_layers: int):
+        self._num_layers = num_layers
+        self.device = torch.device("cpu")
+        self.counter = FakeCounter(num_layers)
+        self.writebacks = []
+        self.loadbacks = []
+
+    def num_layers(self):
+        return self._num_layers
+
+    def get_layer_done_counter(self):
+        return self.counter
+
+    def writeback_paged(self, transfers):
+        self.writebacks.append(list(transfers))
+
+    def loadback_paged(self, transfers, layer_idx: int):
+        self.loadbacks.append((layer_idx, list(transfers)))
 
 
 def _patch_host_executor_device(monkeypatch):
@@ -227,6 +255,46 @@ def test_host_executor_loadback_uses_independent_layer_counters(monkeypatch):
     assert kv_pool.counter.consumer == [0]
 
 
+def test_host_executor_paged_cache_loadback_marks_layers_and_producer(monkeypatch):
+    HostExecutor = _patch_host_executor_device(monkeypatch)
+    paged_pool = FakePagedPool(num_layers=3)
+    executor = HostExecutor(pools=[], paged_pool=paged_pool, io_backend="kernel")
+    transfer = object()
+
+    executor.enqueue_paged_cache_loadback(33, [transfer])
+    executor.flush()
+
+    assert paged_pool.loadbacks == [
+        (0, [transfer]),
+        (1, [transfer]),
+        (2, [transfer]),
+    ]
+    assert all(event.recorded for event in paged_pool.counter.events[0].load_events)
+    assert executor.get_producer_index(PAGED_CACHE_KIND, 33) == 0
+    executor.set_consumer(PAGED_CACHE_KIND, [0])
+    assert paged_pool.counter.consumer == [0]
+    assert executor.drain() == []
+
+
+def test_cache_event_payloads_commit_only_common_ops_and_and_success():
+    from tokenspeed.runtime.engine.scheduler_utils import (
+        pop_common_cache_event_payloads,
+    )
+
+    rank0 = [
+        {"kind": "WriteBackDoneEvent", "op_id": 3, "success": True},
+        {"kind": "WriteBackDoneEvent", "op_id": 5, "success": True},
+    ]
+    rank1 = [
+        {"kind": "WriteBackDoneEvent", "op_id": 3, "success": False},
+    ]
+
+    ready = pop_common_cache_event_payloads([rank0, rank1])
+
+    assert ready == [{"kind": "WriteBackDoneEvent", "op_id": 3, "success": False}]
+    assert pop_common_cache_event_payloads([rank0, []]) == []
+
+
 def test_memory_executor_submit_dispatches_flat_op_by_cache_kind(monkeypatch):
     import tokenspeed.runtime.cache.executor.memory_executor as memory_executor
 
@@ -296,6 +364,69 @@ def test_memory_executor_submit_dispatches_flat_op_by_cache_kind(monkeypatch):
         (CacheKind.KV, 9, [10], [20]),
         (CacheKind.MAMBA, 9, [30], [40]),
     ]
+
+
+def test_memory_executor_submit_dispatches_paged_cache_transfers(monkeypatch):
+    import tokenspeed.runtime.cache.executor.memory_executor as memory_executor
+
+    class FakeCache:
+        class WriteBackOp:
+            pass
+
+        class LoadBackOp:
+            pass
+
+        class PrefetchOp:
+            pass
+
+        class BackUpOp:
+            pass
+
+    class FakeHostExec:
+        def __init__(self):
+            self.pools = {}
+            self.completed_writebacks = []
+            self.paged_writebacks = []
+            self.paged_loadbacks = []
+
+        def enqueue_paged_cache_writeback(self, op_id, transfers, is_retract=False):
+            self.paged_writebacks.append((op_id, transfers, is_retract))
+
+        def enqueue_paged_cache_loadback(self, op_id, transfers):
+            self.paged_loadbacks.append((op_id, transfers))
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(memory_executor, "Cache", FakeCache)
+    executor = object.__new__(memory_executor.MemoryExecutor)
+    executor.host_exec = FakeHostExec()
+    executor.storage_exec = None
+
+    transfer = object()
+    wb = FakeCache.WriteBackOp()
+    wb.op_ids = [7]
+    wb.src_pages = [[]]
+    wb.dst_pages = [[]]
+    wb.src_pages_by_kind = {"kv": [[]], "mamba": [[]]}
+    wb.dst_pages_by_kind = {"kv": [[]], "mamba": [[]]}
+    wb.paged_cache_transfers = [[transfer]]
+    wb.is_retract = [True]
+    executor.submit(wb)
+
+    assert executor.host_exec.paged_writebacks == [(7, [transfer], True)]
+    assert executor.host_exec.completed_writebacks == []
+
+    lb = FakeCache.LoadBackOp()
+    lb.op_ids = [9]
+    lb.src_pages = [[]]
+    lb.dst_pages = [[]]
+    lb.src_pages_by_kind = {"kv": [[]], "mamba": [[]]}
+    lb.dst_pages_by_kind = {"kv": [[]], "mamba": [[]]}
+    lb.paged_cache_transfers = [[transfer]]
+    executor.submit(lb)
+
+    assert executor.host_exec.paged_loadbacks == [(9, [transfer])]
 
 
 def test_memory_executor_submit_plan_keeps_generic_submit_signature(monkeypatch):

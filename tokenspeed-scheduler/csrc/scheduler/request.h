@@ -271,6 +271,36 @@ public:
             state_);
     }
 
+    template <typename S>
+        requires(std::same_as<S, fsm::Draining> || std::same_as<S, fsm::Retracting>)
+    const std::vector<PagedCacheTransferPair>& GetPagedCacheWriteBackTransfers() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> const std::vector<PagedCacheTransferPair>&
+                requires(std::same_as<T, S>)
+            { return s.GetPagedCacheWriteBackTransfers(); },
+            [this](const auto&) -> const std::vector<PagedCacheTransferPair>& {
+                throw std::logic_error("Request::GetPagedCacheWriteBackTransfers: expected state=" +
+                                       std::string(detail::TypeName<S>()) + "; got state=" + StateName());
+            },
+            },
+            state_);
+    }
+
+    template <typename S>
+        requires(std::same_as<S, fsm::Draining> || std::same_as<S, fsm::Retracting>)
+    const std::vector<TreeNode*>& GetPagedCacheWriteBackNodes() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> const std::vector<TreeNode*>&
+                requires(std::same_as<T, S>)
+            { return s.PagedCacheWriteBackNodes(); },
+            [this](const auto&) -> const std::vector<TreeNode*>& {
+                throw std::logic_error("Request::GetPagedCacheWriteBackNodes: expected state=" +
+                                       std::string(detail::TypeName<S>()) + "; got state=" + StateName());
+            },
+            },
+            state_);
+    }
+
 private:
     std::string id_;
     TokenContainer token_container_;

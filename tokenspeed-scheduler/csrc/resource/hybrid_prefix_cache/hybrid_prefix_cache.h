@@ -65,21 +65,23 @@ public:
     std::vector<TransferPair> PrepareMambaDeviceLoadBack(const std::vector<TreeNode*>& nodes);
     void OnKVHostEvict(TreeNode* node);
     void OnKVDeviceDemote(TreeNode* node);
-    void OnMambaHostWriteBackDone(TreeNode* last_node);
-    void OnMambaHostWriteBackDone(const std::vector<TreeNode*>& nodes);
+    void OnMambaHostWriteBackDone(TreeNode* last_node, bool success = true);
+    void OnMambaHostWriteBackDone(const std::vector<TreeNode*>& nodes, bool success = true);
     void DemoteIdleMambaDeviceCopiesPresentOnHost();
 
     // Takes ownership. Duplicate group_id throws std::invalid_argument.
     void RegisterPagedCacheGroup(std::unique_ptr<PagedCacheGroupAllocator> allocator);
+    void RegisterPagedCacheHostGroup(std::unique_ptr<PagedCacheGroupAllocator> allocator);
 
-    // History alignment is the LCM of RawTokensPerPage() over the History-family
-    // groups; state groups only need the trailing window. Sliding groups must
-    // have a window entry; full-history groups must not.
+    // History alignment is the LCM of RawTokensPerPage() over the required
+    // History-family groups. Continuation state groups only need their trailing
+    // window and are intentionally outside prefix-reuse admission.
     void EnablePagedCacheAdjunct(std::vector<std::string> required_groups,
                                  std::unordered_map<std::string, std::int32_t> sliding_window_per_group);
 
     bool HasMambaAdjunct() const { return mamba_allocator_ != nullptr; }
     bool HasPagedCacheAdjunct() const { return paged_cache_history_alignment_tokens_ > 0; }
+    bool HasPagedCacheHostAdjunct() const { return !paged_cache_host_allocators_.empty(); }
     std::int32_t PagedCacheHistoryAlignmentTokens() const { return paged_cache_history_alignment_tokens_; }
     const std::vector<std::string>& PagedCacheRequiredGroups() const { return paged_cache_required_groups_; }
 
@@ -88,6 +90,9 @@ public:
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
     std::int64_t PagedCacheGroupFailedAllocCount(const std::string& group_id) const;
+    std::int32_t PagedCacheHostGroupTotalPages(const std::string& group_id) const;
+    std::int32_t PagedCacheHostGroupAvailablePages(const std::string& group_id) const;
+    std::int64_t PagedCacheHostGroupFailedAllocCount(const std::string& group_id) const;
 
     // Per-request introspection: unknown group_id throws; unknown request_id returns empty.
     std::vector<std::int32_t> GetRequestPagedCachePageIds(const std::string& request_id,
@@ -111,6 +116,16 @@ public:
 
     // Reclaim request-local paged-cache tail slots beyond the accepted token length.
     void RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens);
+
+    // Allocate request-local device pages for a host paged-cache hit and import
+    // them as owned prefix pages. Returns the HOST->DEVICE transfer specs.
+    std::vector<PagedCacheTransferPair> PreparePagedCacheDeviceLoadBack(const std::string& request_id,
+                                                                        const MatchResult::PagedCache& host_hit);
+
+    // Allocate pending host snapshots from device snapshots. Host metadata is
+    // invisible to Match() until OnPagedCacheHostWriteBackDone(..., true).
+    std::vector<PagedCacheTransferPair> PreparePagedCacheHostWriteBack(const std::vector<TreeNode*>& nodes);
+    void OnPagedCacheHostWriteBackDone(const std::vector<TreeNode*>& nodes, bool success = true);
 
     // Fill op.paged_cache_pages / op.paged_cache_page_base_offsets from the tables.
     void PopulateOp(ForwardOperationBase& op_base) const;
@@ -136,9 +151,11 @@ public:
     // null (defensive no-op). Accepts partial snapshots; the per-policy
     // "snapshot must be full" invariant is enforced upstream by CommitChunk.
     bool AttachPagedCacheSnapshotToNode(TreeNode* node, std::unique_ptr<PagedCacheSnapshot> snapshot);
+    bool AttachPagedCacheHostSnapshotToNode(TreeNode* node, std::unique_ptr<PagedCacheSnapshot> snapshot);
 
     // Drops `node` from the membership set, then detaches and returns the snapshot.
     std::unique_ptr<PagedCacheSnapshot> DetachPagedCacheSnapshotFromNode(TreeNode* node);
+    std::unique_ptr<PagedCacheSnapshot> DetachPagedCacheHostSnapshotFromNode(TreeNode* node);
 
     // Callback from KV prefix-cache eviction.
     void OnKVEvict(TreeNode* node);
@@ -189,11 +206,12 @@ private:
                                             std::int32_t target);
 
     void augmentMatch(MatchResult& match) const;
-    void augmentMatchPagedCache(MatchResult& match) const;
+    void augmentMatchPagedCache(MatchResult& match, MatchIntent intent) const;
 
     // Detach oldest evictable snapshot to free pool pages. State-only path is
     // used only on kStateStarved; history/both go to full cascade.
     bool tryPrunePagedCacheSnapshot(AdmissionFailureKind kind);
+    bool tryPrunePagedCacheHostSnapshot();
 
     bool admitPagedCacheChunk(const std::string& request_id, std::int32_t first_raw_position_of_op,
                               std::int32_t target_raw_tokens_exclusive,
@@ -225,6 +243,7 @@ private:
 
     // `paged_cache_history_alignment_tokens_ == 0` means adjunct disabled; tables still work.
     std::map<std::string, std::unique_ptr<PagedCacheGroupAllocator>> paged_cache_allocators_;
+    std::map<std::string, std::unique_ptr<PagedCacheGroupAllocator>> paged_cache_host_allocators_;
     std::unordered_map<std::string, std::map<std::string, PagedCacheGroupTable>> request_paged_cache_tables_;
     std::int32_t paged_cache_history_alignment_tokens_{0};
     std::vector<std::string> paged_cache_required_groups_;
@@ -240,6 +259,7 @@ private:
 
     // TODO(snapshot-lru-perf): O(N log N) per prune; swap in LRU index if profiling shows it matters.
     std::unordered_set<TreeNode*> paged_cache_snapshot_nodes_;
+    std::unordered_set<TreeNode*> paged_cache_host_snapshot_nodes_;
 };
 
 }  // namespace tokenspeed

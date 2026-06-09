@@ -230,6 +230,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             "num_host_pages", [](const tokenspeed::SchedulerConfig& c) { return c.host_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.host_allocator.total_pages = v; })
         .def_rw("paged_cache_groups", &tokenspeed::SchedulerConfig::paged_cache_groups)
+        .def_rw("paged_cache_host_group_pages", &tokenspeed::SchedulerConfig::paged_cache_host_group_pages)
         .def_rw("prefix_cache_adjunct", &tokenspeed::SchedulerConfig::prefix_cache_adjunct)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
@@ -353,6 +354,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("KV", tokenspeed::CacheKind::kKV)
         .value("MAMBA", tokenspeed::CacheKind::kMamba);
 
+    nb::class_<tokenspeed::PagedCacheTransferPair>(cache, "PagedCacheTransferPair")
+        .def_ro("group_id", &tokenspeed::PagedCacheTransferPair::group_id)
+        .def_ro("src_pages", &tokenspeed::PagedCacheTransferPair::src_pages)
+        .def_ro("dst_pages", &tokenspeed::PagedCacheTransferPair::dst_pages);
+
     auto prefetch_op = nb::class_<tokenspeed::PrefetchOperation>(cache, "PrefetchOp");
     BindCacheCommonFields<tokenspeed::PrefetchOperation>(prefetch_op);
     prefetch_op.def(nb::init<>())
@@ -368,7 +374,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("src_pages", &tokenspeed::FlatLoadBackOperation::src_pages)
         .def_ro("dst_pages", &tokenspeed::FlatLoadBackOperation::dst_pages)
         .def_ro("src_pages_by_kind", &tokenspeed::FlatLoadBackOperation::src_pages_by_kind)
-        .def_ro("dst_pages_by_kind", &tokenspeed::FlatLoadBackOperation::dst_pages_by_kind);
+        .def_ro("dst_pages_by_kind", &tokenspeed::FlatLoadBackOperation::dst_pages_by_kind)
+        .def_ro("paged_cache_transfers", &tokenspeed::FlatLoadBackOperation::paged_cache_transfers);
 
     nb::class_<tokenspeed::FlatWriteBackOperation>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::FlatWriteBackOperation::op_ids)
@@ -376,6 +383,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dst_pages", &tokenspeed::FlatWriteBackOperation::dst_pages)
         .def_ro("src_pages_by_kind", &tokenspeed::FlatWriteBackOperation::src_pages_by_kind)
         .def_ro("dst_pages_by_kind", &tokenspeed::FlatWriteBackOperation::dst_pages_by_kind)
+        .def_ro("paged_cache_transfers", &tokenspeed::FlatWriteBackOperation::paged_cache_transfers)
         .def_ro("is_retract", &tokenspeed::FlatWriteBackOperation::is_retract);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
@@ -434,6 +442,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
              nb::arg("group_id"))
         .def("paged_cache_group_failed_alloc_count", &tokenspeed::Scheduler::PagedCacheGroupFailedAllocCount,
+             nb::arg("group_id"))
+        .def("paged_cache_host_group_total_pages", &tokenspeed::Scheduler::PagedCacheHostGroupTotalPages,
+             nb::arg("group_id"))
+        .def("paged_cache_host_group_available_pages", &tokenspeed::Scheduler::PagedCacheHostGroupAvailablePages,
+             nb::arg("group_id"))
+        .def("paged_cache_host_group_failed_alloc_count", &tokenspeed::Scheduler::PagedCacheHostGroupFailedAllocCount,
              nb::arg("group_id"))
         .def("get_request_paged_cache_page_ids", &tokenspeed::Scheduler::GetRequestPagedCachePageIds,
              nb::arg("request_id"), nb::arg("group_id"))

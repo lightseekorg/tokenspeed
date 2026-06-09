@@ -40,6 +40,9 @@ except (ImportError, AttributeError):
 
 from tokenspeed_scheduler import Cache
 
+from tokenspeed.runtime.cache.deepseek_v4_cache_host import (
+    DeepseekV4TokenToKVPoolHost,
+)
 from tokenspeed.runtime.cache.executor.host_executor import HostExecutor
 from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
 from tokenspeed.runtime.cache.kv_cache_host import (
@@ -47,9 +50,13 @@ from tokenspeed.runtime.cache.kv_cache_host import (
     MLATokenToKVPoolHost,
 )
 from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
+from tokenspeed.runtime.cache.transfer.deepseek_v4_pool import DeepseekV4CachePool
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
 from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
 from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+    DeepseekV4TokenToKVPool,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -103,7 +110,26 @@ class MemoryExecutor:
         ):
             actual_pool = device_pool.inner
 
-        if isinstance(actual_pool, _mha_types):
+        self.paged_cache_pool = None
+        actual_draft_pool = None
+        if isinstance(actual_pool, DeepseekV4TokenToKVPool):
+            if config.storage_backend is not None:
+                raise NotImplementedError(
+                    "DeepSeek V4 KVStore currently supports L2 host memory only; "
+                    "L3 storage backends are out of scope."
+                )
+            self.host_pool = DeepseekV4TokenToKVPoolHost(
+                actual_pool,
+                config.host_ratio,
+                config.host_size_gb,
+                config.host_layout,
+            )
+            self.paged_cache_pool = DeepseekV4CachePool(
+                device_pool=actual_pool,
+                host_pool=self.host_pool,
+                io_backend=config.io_backend,
+            )
+        elif isinstance(actual_pool, _mha_types):
             self.host_pool = MHATokenToKVPoolHost(
                 actual_pool,
                 config.host_ratio,
@@ -121,14 +147,14 @@ class MemoryExecutor:
             )
         else:
             raise ValueError(
-                f"host_pool only supports MHA and MLA, got {type(actual_pool)} "
-                f"from module {type(actual_pool).__module__}"
+                "host_pool only supports MHA, MLA, and DeepSeek V4, "
+                f"got {type(actual_pool)} from module {type(actual_pool).__module__}"
             )
 
         # Draft model L2 cache: draft shares the same page mapping as the base
         # model, so its host pool must hold exactly the same number of tokens.
         # Pass host_size_tokens directly to bypass ratio/GB recalculation.
-        if draft_device_pool is not None:
+        if draft_device_pool is not None and self.paged_cache_pool is None:
             actual_draft_pool = draft_device_pool
             if hasattr(draft_device_pool, "inner") and not isinstance(
                 draft_device_pool, (*_mha_types, *_mla_types)
@@ -176,7 +202,8 @@ class MemoryExecutor:
         pools = None
         self.mamba_host_pool = None
         if (
-            config.enable_mamba_l2
+            self.paged_cache_pool is None
+            and config.enable_mamba_l2
             and mamba_pool is not None
             and config.mamba_l2_host_slots > 0
         ):
@@ -213,7 +240,13 @@ class MemoryExecutor:
                 config.host_layout,
             )
 
-        if pools is not None:
+        if self.paged_cache_pool is not None:
+            self.host_exec = HostExecutor(
+                pools=pools or [],
+                paged_pool=self.paged_cache_pool,
+                io_backend=config.io_backend,
+            )
+        elif pools is not None:
             self.host_exec = HostExecutor(pools=pools, io_backend=config.io_backend)
         else:
             self.host_exec = HostExecutor(
@@ -277,9 +310,14 @@ class MemoryExecutor:
                 len(op.dst_pages),
             )
             groups = self._page_groups_by_kind(op)
+            paged_transfers_by_op = getattr(op, "paged_cache_transfers", [])
+            is_retract_flags = getattr(op, "is_retract", [])
             for i in range(len(op.op_ids)):
                 op_id = op.op_ids[i]
-                is_retract = bool(getattr(op, "is_retract", [False])[i])
+                is_retract = (
+                    bool(is_retract_flags[i]) if i < len(is_retract_flags) else False
+                )
+                submitted = False
                 for kind, (src_groups, dst_groups) in groups.items():
                     if kind not in self.host_exec.pools:
                         continue
@@ -305,7 +343,18 @@ class MemoryExecutor:
                         is_retract=is_retract,
                         kind=kind,
                     )
-                if all(
+                    submitted = True
+                paged_transfers = (
+                    paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
+                )
+                if paged_transfers:
+                    self.host_exec.enqueue_paged_cache_writeback(
+                        op_id,
+                        paged_transfers,
+                        is_retract=is_retract,
+                    )
+                    submitted = True
+                if not submitted and all(
                     i >= len(src_groups) or not src_groups[i]
                     for kind, (src_groups, _) in groups.items()
                     if kind in self.host_exec.pools
@@ -319,6 +368,7 @@ class MemoryExecutor:
                 len(op.dst_pages),
             )
             groups = self._page_groups_by_kind(op)
+            paged_transfers_by_op = getattr(op, "paged_cache_transfers", [])
             for i in range(len(op.op_ids)):
                 op_id = op.op_ids[i]
                 for kind, (src_groups, dst_groups) in groups.items():
@@ -347,6 +397,14 @@ class MemoryExecutor:
                         )
                     self.host_exec.enqueue_loadback(
                         op_id, src_pages, dst_pages, kind=kind, **loadback_kwargs
+                    )
+                paged_transfers = (
+                    paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
+                )
+                if paged_transfers:
+                    self.host_exec.enqueue_paged_cache_loadback(
+                        op_id,
+                        paged_transfers,
                     )
 
         elif isinstance(op, Cache.PrefetchOp):

@@ -99,7 +99,8 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
     // Mamba stays in suffix.
     // Invariant: snapshot-bearing nodes are never split (RadixTree refuses).
     // A split here would dangle borrowed ids in active requests.
-    _assert(paged_cache_snapshot_ == nullptr,
+    _assert(paged_cache_snapshot_ == nullptr && paged_cache_host_snapshot_ == nullptr &&
+                paged_cache_pending_host_snapshot_ == nullptr,
             "TreeNode::SplitSelfInto called on a node with an attached paged-cache snapshot; "
             "splitting would invalidate borrowed page id references in active requests");
 }
@@ -110,6 +111,29 @@ void TreeNode::AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snap
 
 std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCacheSnapshot() {
     return std::move(paged_cache_snapshot_);
+}
+
+void TreeNode::AttachPagedCacheHostSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot) {
+    paged_cache_host_snapshot_ = std::move(snapshot);
+}
+
+std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCacheHostSnapshot() {
+    return std::move(paged_cache_host_snapshot_);
+}
+
+void TreeNode::AttachPagedCachePendingHostSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot) {
+    paged_cache_pending_host_snapshot_ = std::move(snapshot);
+}
+
+std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCachePendingHostSnapshot() {
+    return std::move(paged_cache_pending_host_snapshot_);
+}
+
+void TreeNode::PromotePagedCachePendingHostSnapshot() {
+    if (paged_cache_pending_host_snapshot_ == nullptr) {
+        return;
+    }
+    paged_cache_host_snapshot_ = std::move(paged_cache_pending_host_snapshot_);
 }
 
 void TreeNode::SetPersisted(bool persisted) {

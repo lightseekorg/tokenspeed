@@ -35,7 +35,7 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
     MemoryExecutorConfig,
 )
-from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.cache.transfer.types import PAGED_CACHE_KIND, CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -51,7 +51,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_sync_debug_enabled,
     make_config,
     pool_to_paged_cache_groups,
-    pool_to_prefix_cache_adjunct_spec,
+    pool_to_prefix_cache_adjunct_spec_if_enabled,
     pop_common_cache_event_payloads,
     should_use_overlap_schedule,
 )
@@ -95,6 +95,14 @@ from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
+
+
+def _paged_cache_host_group_pages_for_scheduler(
+    enable_kvstore: bool, host_pool
+) -> dict:
+    if not enable_kvstore:
+        return {}
+    return dict(getattr(host_pool, "paged_cache_group_page_counts", {}))
 
 
 def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
@@ -267,6 +275,7 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
+        paged_cache_host_group_pages = {}
         if not token_to_kv_pool.supports_hierarchical_kv_cache:
             if server_args.enable_kvstore:
                 raise NotImplementedError(
@@ -284,7 +293,10 @@ class EventLoop:
                 draft_device_pool=draft_token_to_kv_pool,
                 mamba_pool=mamba_pool,
             )
-            num_host_pages = self.memory_executor.host_pool.page_num
+            num_host_pages = int(getattr(self.memory_executor.host_pool, "page_num", 0))
+            paged_cache_host_group_pages = _paged_cache_host_group_pages_for_scheduler(
+                server_args.enable_kvstore, self.memory_executor.host_pool
+            )
 
         # For DP attention, max_batch_size must be per-rank to avoid
         # req_pool_allocator overflow.  The C++ scheduler allocates
@@ -303,13 +315,14 @@ class EventLoop:
                 f"(ratio={server_args.mamba_full_memory_ratio})."
             )
 
-        # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
+        # Adjunct enabled only when pool opts in and host-side kvstore is active.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         self._paged_cache_groups = paged_cache_groups
-        prefix_cache_adjunct = None
-        required_groups = token_to_kv_pool.prefix_cache_required_group_ids
-        if required_groups is not None and server_args.enable_prefix_caching:
-            prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
+        prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec_if_enabled(
+            token_to_kv_pool.prefix_cache_required_group_ids,
+            enable_prefix_caching=server_args.enable_prefix_caching,
+            enable_kvstore=server_args.enable_kvstore,
+        )
         scheduler_cfg = make_config(
             num_device_pages=self.max_total_num_tokens // server_args.block_size,
             max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -333,6 +346,7 @@ class EventLoop:
             enable_mamba_l2=server_args.enable_mamba_l2,
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
+            paged_cache_host_group_pages=paged_cache_host_group_pages,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
@@ -341,7 +355,8 @@ class EventLoop:
             "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "mamba_pool_total_chunks=%s enable_mamba=%s "
-            "disable_prefix_cache=%s paged_cache_groups=%s",
+            "disable_prefix_cache=%s paged_cache_groups=%s "
+            "paged_cache_host_group_pages=%s",
             scheduler_cfg.page_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -354,9 +369,9 @@ class EventLoop:
             has_mamba,
             scheduler_cfg.disable_prefix_cache,
             [group.group_id for group in paged_cache_groups],
+            paged_cache_host_group_pages,
         )
         self.scheduler = Scheduler(scheduler_cfg)
-        token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
                 server_args.kv_events_config,
@@ -745,9 +760,12 @@ class EventLoop:
         consumer_indices_by_kind: dict[CacheKind, list[int]] = {
             kind: [] for kind in available_pools
         }
+        consumer_indices_by_paged_cache: list[int] = []
+        has_paged_pool = getattr(host_exec, "paged_pool", None) is not None
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
-                for op_id in cache_op.op_ids:
+                paged_transfers_by_op = getattr(cache_op, "paged_cache_transfers", [])
+                for i, op_id in enumerate(cache_op.op_ids):
                     for kind in consumer_indices_by_kind:
                         producer_idx = self.memory_executor.get_producer_index(
                             kind, op_id
@@ -757,9 +775,33 @@ class EventLoop:
                             and producer_idx not in consumer_indices_by_kind[kind]
                         ):
                             consumer_indices_by_kind[kind].append(producer_idx)
+                    paged_transfers = (
+                        paged_transfers_by_op[i]
+                        if i < len(paged_transfers_by_op)
+                        else []
+                    )
+                    if has_paged_pool and paged_transfers:
+                        producer_idx = self.memory_executor.get_producer_index(
+                            PAGED_CACHE_KIND,
+                            op_id,
+                        )
+                        if (
+                            producer_idx is not None
+                            and producer_idx not in consumer_indices_by_paged_cache
+                        ):
+                            consumer_indices_by_paged_cache.append(producer_idx)
         for kind, consumer_indices in consumer_indices_by_kind.items():
             self.memory_executor.set_consumer(
                 kind, consumer_indices if consumer_indices else -1
+            )
+        if has_paged_pool:
+            self.memory_executor.set_consumer(
+                PAGED_CACHE_KIND,
+                (
+                    consumer_indices_by_paged_cache
+                    if consumer_indices_by_paged_cache
+                    else -1
+                ),
             )
 
     def _flush_mamba_retract_states(self, forward_op) -> None:

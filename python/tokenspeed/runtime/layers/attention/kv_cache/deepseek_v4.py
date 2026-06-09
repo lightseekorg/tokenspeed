@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Iterable, Optional, Sequence
@@ -755,7 +754,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     group rather than owning a separate group of its own.
     """
 
-    supports_hierarchical_kv_cache = False
+    supports_hierarchical_kv_cache = True
 
     def __init__(
         self,
@@ -801,12 +800,6 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         self._paged_cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.paged_cache_group_specs
         }
-        self._paged_cache_scheduler: object | None = None
-        self._paged_cache_state_group_ids = tuple(
-            str(spec.group_id)
-            for spec in self.paged_cache_group_specs
-            if spec.family == "state"
-        )
         self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
             self.paged_cache_group_specs,
             max_live_requests=max_batch_size,
@@ -967,36 +960,22 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             if spec.family == "history"
         )
 
-    def bind_paged_cache_scheduler(self, scheduler: object) -> None:
-        self._paged_cache_scheduler = scheduler
-
-    def maybe_log_paged_cache_group_pages(self) -> None:
-        scheduler = self._paged_cache_scheduler
-        if self.rank != 0 or scheduler is None or not self._paged_cache_state_group_ids:
-            return
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-
-        parts = []
-        for group_id in self._paged_cache_state_group_ids:
-            total = scheduler.paged_cache_group_total_pages(group_id)
-            available = scheduler.paged_cache_group_available_pages(group_id)
-            failed = scheduler.paged_cache_group_failed_alloc_count(group_id)
-            parts.append(
-                f"{group_id}: used={total - available}/{total}, "
-                f"available={available}, failed_alloc={failed}"
-            )
-        logger.debug("DeepSeek V4 paged-cache state group pages. %s", "; ".join(parts))
-
     def _require(
         self, buffers: list[torch.Tensor | None], layer_id: int, name: str
     ) -> torch.Tensor:
+        self._wait_for_layer_loadback(layer_id)
         buf = buffers[layer_id]
         if buf is None:
             raise ValueError(f"DeepSeek V4 layer {layer_id} has no {name} cache")
         return buf
 
+    def _wait_for_layer_loadback(self, layer_id: int) -> None:
+        counter = self.layer_transfer_counter
+        if counter is not None:
+            counter.wait_until(layer_id)
+
     def get_swa_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer_loadback(layer_id)
         return self.swa_kv_buffer[layer_id]
 
     def get_compressed_kv_buffer_2d(self, layer_id: int) -> torch.Tensor:
@@ -1237,13 +1216,13 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     def get_cpu_copy(self, token_indices: list[int]) -> list[torch.Tensor]:
         del token_indices
         raise NotImplementedError(
-            "DeepSeek V4 KV cache offload is not implemented; the compressed-MQA "
-            "and indexer buffers are page-shaped and require page-aware indexing."
+            "DeepSeek V4 does not support legacy token-indexed KV cache offload; "
+            "use the group-paged L2 KVStore path instead."
         )
 
     def load_cpu_copy(self, kv_cache_cpu, token_indices: list[int]) -> None:
         del kv_cache_cpu, token_indices
         raise NotImplementedError(
-            "DeepSeek V4 KV cache reload is not implemented; the compressed-MQA "
-            "and indexer buffers are page-shaped and require page-aware indexing."
+            "DeepSeek V4 does not support legacy token-indexed KV cache reload; "
+            "use the group-paged L2 KVStore path instead."
         )

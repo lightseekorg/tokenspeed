@@ -30,6 +30,8 @@
 
 namespace tokenspeed {
 
+class HybridPrefixCache;
+
 // Positive-only ceiling division; returns 0 for non-positive numerators.
 // Lives here because paged-cache admission/table math is its only caller.
 inline std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
@@ -88,6 +90,7 @@ public:
 
 private:
     friend class PagedCacheGroupTable;
+    friend class HybridPrefixCache;
 
     // Empty OwnedPages on insufficient capacity (bumps failed_alloc_count_).
     OwnedPages AcquireOwned(std::int32_t num_pages);
@@ -150,6 +153,11 @@ public:
     // Throws std::logic_error if called after Acquire/Import/Commit.
     void ImportPrefixBorrowed(std::vector<std::int32_t> ids, std::int32_t base_logical_page,
                               std::int32_t raw_tokens_covered);
+
+    // Adopt owned device pages that were freshly materialized from host L2.
+    // Legal only on a fresh-empty table. The table owns these pages and can
+    // later commit them into device snapshots or release them with the request.
+    void ImportPrefixOwned(OwnedPages pages, std::int32_t base_logical_page, std::int32_t raw_tokens_covered);
 
     // Sliding-only: drop front pages strictly below `window_lower_bound`.
     // On an empty table, advances base_logical_page_ so first allocation starts

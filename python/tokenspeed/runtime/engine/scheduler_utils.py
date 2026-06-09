@@ -70,6 +70,7 @@ def make_config(
     enable_mamba_l2: bool = False,
     mamba_l2_host_slots: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+    paged_cache_host_group_pages: Mapping[str, int] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
 ) -> SchedulerConfig:
@@ -103,6 +104,11 @@ def make_config(
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
+    if paged_cache_host_group_pages:
+        cfg.paged_cache_host_group_pages = {
+            str(group_id): int(page_count)
+            for group_id, page_count in paged_cache_host_group_pages.items()
+        }
     # Opt-in; unset means paged-cache groups are transport-only.
     if prefix_cache_adjunct is not None:
         cfg.prefix_cache_adjunct = prefix_cache_adjunct
@@ -161,6 +167,23 @@ def pool_to_prefix_cache_adjunct_spec(
     spec = PrefixCacheAdjunctSpec()
     spec.required_groups = [str(gid) for gid in required_group_ids]
     return spec
+
+
+def pool_to_prefix_cache_adjunct_spec_if_enabled(
+    required_group_ids: Sequence[str] | None,
+    *,
+    enable_prefix_caching: bool,
+    enable_kvstore: bool,
+) -> "PrefixCacheAdjunctSpec | None":
+    """Build a prefix adjunct only when host-side KV store is enabled.
+
+    Paged-cache groups are still needed without kvstore because they provide
+    model block tables. The prefix adjunct is the extra prefix-reuse layer; keep
+    it disabled with ``--disable-kvstore`` so that path matches origin/main.
+    """
+    if required_group_ids is None or not enable_prefix_caching or not enable_kvstore:
+        return None
+    return pool_to_prefix_cache_adjunct_spec(required_group_ids)
 
 
 def should_use_overlap_schedule(

@@ -191,6 +191,7 @@ MatchResult KVPrefixCache::RootMatch() const {
     TreeNode* root = tree_.Root();
     const std::int32_t page_size = tree_.PageSize();
     return MatchResult{
+        .token_terminal = root,
         .device = {.last_node = root, .page_size = page_size},
         .host = {.last_node = root, .page_size = page_size},
     };
@@ -381,6 +382,42 @@ std::vector<TreeNode*> KVPrefixCache::ReleaseDeviceResourcesPresentOnHost(TreeNo
         }
         released.push_back(node);
         device_.UpdateLeaves(node->Parent());
+    }
+    return released;
+}
+
+std::vector<TreeNode*> KVPrefixCache::ReleaseHostResources(const std::vector<TreeNode*>& nodes,
+                                                           std::function<void(TreeNode*)> on_release) {
+    std::vector<TreeNode*> candidates;
+    candidates.reserve(nodes.size());
+    std::unordered_set<TreeNode*> seen;
+    for (TreeNode* node : nodes) {
+        if (node == nullptr || node->IsRoot() || !node->OnHost()) {
+            continue;
+        }
+        if (seen.insert(node).second) {
+            candidates.push_back(node);
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const TreeNode* lhs, const TreeNode* rhs) { return lhs->DepthInTokens() > rhs->DepthInTokens(); });
+
+    std::vector<TreeNode*> released;
+    for (TreeNode* node : candidates) {
+        if (node == nullptr || !node->OnHost() || node->Host().RefCount() != 0) {
+            continue;
+        }
+        if (on_release) {
+            on_release(node);
+        }
+        host_.RemoveLeaf(node);
+        auto detached = node->DetachResource<ResourceType::Host>();
+        if (detached == nullptr) {
+            continue;
+        }
+        released.push_back(node);
+        host_.UpdateLeaves(node->Parent());
     }
     return released;
 }

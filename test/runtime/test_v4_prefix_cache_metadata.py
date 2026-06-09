@@ -158,5 +158,38 @@ class TestV4PrefixCacheMetadata(unittest.TestCase):
         self.assertEqual(fh_base, 0)
 
 
+class TestV4PrefixCacheAdjunctGate(unittest.TestCase):
+
+    def test_disable_kvstore_keeps_paged_groups_transport_only(self) -> None:
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            pool_to_prefix_cache_adjunct_spec_if_enabled,
+        )
+
+        required = ("fh", "swa")
+
+        self.assertIsNone(
+            pool_to_prefix_cache_adjunct_spec_if_enabled(
+                required,
+                enable_prefix_caching=True,
+                enable_kvstore=False,
+            )
+        )
+        self.assertIsNone(
+            pool_to_prefix_cache_adjunct_spec_if_enabled(
+                required,
+                enable_prefix_caching=False,
+                enable_kvstore=True,
+            )
+        )
+
+        adjunct = pool_to_prefix_cache_adjunct_spec_if_enabled(
+            required,
+            enable_prefix_caching=True,
+            enable_kvstore=True,
+        )
+        self.assertIsNotNone(adjunct)
+        self.assertEqual(adjunct.required_groups, ["fh", "swa"])
+
+
 if __name__ == "__main__":
     unittest.main()

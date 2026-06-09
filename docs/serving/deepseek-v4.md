@@ -18,8 +18,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
     --max-total-tokens 16384 \
     --chunked-prefill-size 8192 \
     --enable-mixed-batch \
-    --gpu-memory-utilization 0.9 \
-    --disable-kvstore
+    --gpu-memory-utilization 0.9
 ```
 
 ## Required flags
@@ -54,6 +53,35 @@ also be bumped to 256.)
   workspace (`0` lets the kernel pick).
 - `--deepseek-v4-indexer-prefill-max-logits-mb N`: caps the FP4 indexer
   prefill logits buffer in MB (default 512).
+
+## KVStore L2 host cache
+
+DeepSeek V4 supports KVStore L2 host offload through the existing KVStore
+switches. KVStore is enabled by default for non-decode instances unless
+`--disable-kvstore` is passed; do not add or use a separate `--enable-kvstore`
+flag.
+
+The V4 L2 path stores complete group-paged cache snapshots on host memory:
+SWA KV, compressed full-history KV, compressor state, CSA indexer KV, and CSA
+indexer compressor state. Host hits are loaded back into destination device
+group pages before forward execution, so model code still consumes device
+cache only. Loadback is synchronized per layer through the V4 cache pool's
+layer transfer counter; the scheduler does not wait for a global loadback
+barrier.
+
+Sizing is per V4 paged-cache group because the group page byte sizes differ:
+
+- `--kvstore-ratio R`: allocates `ceil(device_group_pages * R)` host pages per
+  V4 group.
+- `--kvstore-size N`: uses an aggregate host-memory budget in GB and distributes
+  it across V4 groups in proportion to resident device bytes.
+
+The scheduler also creates lightweight shadow host token pages for V4 tree-node
+pinning and eviction. They are metadata only; ordinary KV host buffers are not
+allocated or copied for DeepSeek V4.
+
+L3 storage backends are not part of the DeepSeek V4 path in this implementation.
+Do not combine V4 L2 with `--kvstore-storage-backend`.
 
 ## MTP speculative decoding
 
@@ -103,6 +131,11 @@ that is the supported phase-1 boundary. State-family reuse remains conservative:
 if SWA, compressed KV, compressor state, or CSA indexer state cannot be restored
 from a complete accepted snapshot, the request should fall back to recomputing
 that state rather than treating the speculative tail as reusable prefix state.
+
+V4 prefix caching can reuse both full-history group pages and exact terminal
+state snapshots. For MTP, only accepted target tokens may be published to shared
+device or host snapshots; rejected verify-tail and draft-only state must remain
+request-local.
 
 SWA cache insert slot mappings are validated against the current SWA group cache
 capacity before invoking fused cache writers. Multi-step MTP can carry padded or
