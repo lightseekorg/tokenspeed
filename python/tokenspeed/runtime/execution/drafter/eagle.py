@@ -218,7 +218,11 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        draft_first_step_reduce = forward_mode.is_decode()
+        # Llama Eagle3 narrows for prefill catch-up too; Qwen/DeepSeek do not.
+        draft_first_step_reduce = forward_mode.is_decode() or (
+            isinstance(self.draft_model_runner.model, LlamaForCausalLMEagle3)
+            and forward_mode.is_target_verify()
+        )
 
         draft_first_mode = (
             ForwardMode.DRAFT_EXTEND

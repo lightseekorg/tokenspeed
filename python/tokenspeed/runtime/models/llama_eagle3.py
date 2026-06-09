@@ -84,10 +84,10 @@ class LlamaAttention(BaseLlamaAttention):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
-        # Active draft first step (= target verify was pure decode + drafter set
-        # up gather_ids). Other forwards (multi-step decode without gather_ids,
-        # or first step after a target verify with extends) delegate to base.
-        if ctx.gather_ids is None or not ctx.forward_mode.is_decode():
+        # Active draft first step (drafter set up gather_ids + accept_lengths).
+        # Covers both decode catch-up and prefill catch-up; multi-step decode
+        # delegates to base.
+        if ctx.accept_lengths is None:
             return super()._attn(positions, q, k, v, ctx, out_cache_loc)
 
         # Active dispatch B: correction + q-slice + DECODE (fused) or post-slice (non-fused).
@@ -113,22 +113,17 @@ class LlamaAttention(BaseLlamaAttention):
         )
 
     def _apply_correction(self, ctx: ForwardContext) -> None:
-        """Trim cache_seqlens by ``spec_num_tokens - accept_lengths``.
-
-        Idempotent across draft layers via ``ctx.accept_lengths = None``.
-        No-op when drafter did not populate ``accept_lengths`` (e.g. backends
-        without KV pre-write).
-        """
-        if ctx.accept_lengths is None:
-            return
+        """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
         seq_lens_buf = ctx.draft_seq_lens_buf
-        if seq_lens_buf is None:
+        if seq_lens_buf is None or ctx.accept_lengths is None:
             return
-        correction = (ctx.attn_backend.spec_num_tokens - ctx.accept_lengths).to(
-            seq_lens_buf.dtype
-        )
-        seq_lens_buf[: ctx.bs].sub_(correction)
-        ctx.accept_lengths = None
+        num_extends = ctx.num_extends
+        if num_extends >= ctx.bs:
+            return
+        correction = (
+            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
+        ).to(seq_lens_buf.dtype)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction)
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +256,8 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         residual: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Wrapper: align residual with attn output narrowed to [bs, H]."""
-        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
-            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
+        """Align residual with attn output narrowed to [bs, H]."""
+        if ctx.accept_lengths is not None and not ctx.forward_mode.is_idle():
             return residual.index_select(0, ctx.gather_ids)
         return residual
 
