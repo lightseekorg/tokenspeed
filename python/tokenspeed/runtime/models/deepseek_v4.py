@@ -292,12 +292,13 @@ def _deepseek_v4_fused_select_experts(
     if (
         not router_logits.is_cuda
         or router_logits.dim() != 2
-        or router_logits.shape[1] != 256
         or top_k <= 0
         or top_k > 32
         or router_logits.dtype not in (torch.float32, torch.float16, torch.bfloat16)
     ):
         return None
+
+    num_experts = router_logits.shape[1]
 
     topk_weights = torch.empty(
         router_logits.shape[0],
@@ -312,12 +313,17 @@ def _deepseek_v4_fused_select_experts(
         device=router_logits.device,
     )
 
+    if num_experts not in (256, 384) or top_k != 6 or not renormalize:
+        return None
+
+    logits_f32 = router_logits.float().contiguous()
+
     try:
         if hash_indices_table is not None:
             if input_ids is None:
                 raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
             hash_softplus_sqrt_topk_flash(
-                router_logits.contiguous(),
+                logits_f32,
                 input_ids.reshape(-1).to(device=router_logits.device).contiguous(),
                 hash_indices_table.to(
                     device=router_logits.device, dtype=torch.int32
@@ -329,7 +335,7 @@ def _deepseek_v4_fused_select_experts(
             )
         elif correction_bias is not None:
             softplus_sqrt_topk_flash(
-                router_logits.contiguous(),
+                logits_f32,
                 correction_bias.to(
                     device=router_logits.device, dtype=torch.float32
                 ).contiguous(),
@@ -409,6 +415,7 @@ def deepseek_v4_select_experts(
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
+    need_scores: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """DeepSeek V4 MoE routing.
 
@@ -416,6 +423,9 @@ def deepseek_v4_select_experts(
     only affects expert selection; the gathered expert weights come from the
     unbiased scores. Hash-routed layers use checkpoint-provided expert ids but
     still gather weights from the gate scores.
+
+    Set ``need_scores=False`` when the caller discards the third return value
+    (e.g. mega_moe) to skip the redundant sqrt(softplus(logits)) computation.
     """
 
     fused_topk = _deepseek_v4_fused_select_experts(
@@ -428,7 +438,10 @@ def deepseek_v4_select_experts(
     )
     if fused_topk is not None:
         topk_weights, topk_ids = fused_topk
-        scores = torch.sqrt(F.softplus(router_logits.float()))
+        if need_scores:
+            scores = torch.sqrt(F.softplus(router_logits.float()))
+        else:
+            scores = router_logits
         return topk_weights, topk_ids, scores
 
     scores = torch.sqrt(F.softplus(router_logits.float()))
@@ -1954,6 +1967,34 @@ def _deepseek_v4_sanitize_swa_slot_mapping(
     )
 
 
+def _deepseek_v4_swa_slot_mapping(
+    ctx: ForwardContext,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> torch.Tensor:
+    if positions.numel() == 0:
+        return out_cache_loc
+    metadata = _deepseek_v4_forward_metadata(ctx)
+    if metadata is None:
+        raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+    cache_metadata = metadata.cache
+    if cache_metadata.swa_block_table is None:
+        return out_cache_loc
+    token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
+    if token_to_req_indices.numel() != positions.numel() and (
+        token_to_req_indices.numel() <= 0
+        or positions.numel() % token_to_req_indices.numel() != 0
+    ):
+        return out_cache_loc
+    return _group_slot_mapping_from_raw(
+        positions,
+        token_to_req_indices,
+        cache_metadata.swa_block_table,
+        ctx.token_to_kv_pool.swa_block_size,
+        base_offsets=cache_metadata.swa_base_logical_page,
+    )
+
+
 def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
     override = global_server_args_dict.get("attention_use_fp4_indexer_cache", None)
     if override is not None:
@@ -2041,12 +2082,28 @@ class DeepseekV4MLP(nn.Module):
         if x.shape[0] == 0:
             return x.new_empty((0, self.down_proj.output_size))
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.float().chunk(2, dim=-1)
-        if self.swiglu_limit is not None and self.swiglu_limit > 0:
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-        x = (F.silu(gate) * up).to(x.dtype)
-        out, _ = self.down_proj(x)
+
+        _use_fused_swiglu = (
+            gate_up.ndim == 2
+            and gate_up.shape[-1] % 256 == 0
+            and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
+        )
+        if _use_fused_swiglu:
+            from tokenspeed_kernel.ops.activation.triton import (
+                fused_swiglu_fp8_ue8m0,
+            )
+
+            x_fp8, scale = fused_swiglu_fp8_ue8m0(
+                gate_up, swiglu_limit=self.swiglu_limit or 0.0
+            )
+            out, _ = self.down_proj(x_fp8, scale=scale)
+        else:
+            gate, up = gate_up.float().chunk(2, dim=-1)
+            if self.swiglu_limit is not None and self.swiglu_limit > 0:
+                gate = torch.clamp(gate, max=self.swiglu_limit)
+                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            x = (F.silu(gate) * up).to(x.dtype)
+            out, _ = self.down_proj(x)
         return out
 
 
@@ -2513,6 +2570,8 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
+        fmt = getattr(self.experts, "topk_output_format", None)
+        need_scores = fmt is not None and not fmt.is_bypassed()
         return deepseek_v4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
@@ -2520,6 +2579,7 @@ class DeepseekV4MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
+            need_scores=need_scores,
         )
 
     def _make_topk_output(
@@ -3596,14 +3656,12 @@ class DeepseekV4Attention(nn.Module):
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
 
-        # When swa_slot_mapping is provided (main model path), use it directly.
-        # When None (MTP draft path), fall back to out_cache_loc.
-        # TODO: MTP draft metadata has token_to_req_indices shaped per-request
-        # (not per-token), so _group_slot_mapping_from_raw cannot compute the
-        # correct paged SWA mapping here. out_cache_loc is not ideal when paged
-        # SWA groups are active; fix once MTP metadata packs per-token indices.
         if swa_slot_mapping is None:
-            swa_slot_mapping = out_cache_loc
+            swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+                ctx,
+                positions,
+                out_cache_loc,
+            )
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -3990,26 +4048,11 @@ class DeepseekV4Model(nn.Module):
         # The SWA write-slot mapping is identical across all layers, so compute
         # it once per step here instead of recomputing it in every attention
         # layer (DeepSeek-V3 likewise derives its slot mapping once per step).
-        # On an empty batch (e.g. the DP idle fallback) the attention layers
-        # early-return without touching metadata, so skip the metadata read here
-        # too to preserve that behavior on a fresh backend.
-        if hidden_states.shape[0] == 0:
-            swa_slot_mapping = out_cache_loc
-        else:
-            metadata = ctx.attn_backend.forward_metadata
-            if metadata is None:
-                raise RuntimeError("DeepSeek V4 attention requires forward metadata")
-            cache_metadata = metadata.cache
-            if cache_metadata.swa_block_table is not None:
-                swa_slot_mapping = _group_slot_mapping_from_raw(
-                    positions,
-                    metadata.token_to_req_indices[: positions.numel()],
-                    cache_metadata.swa_block_table,
-                    ctx.token_to_kv_pool.swa_block_size,
-                    base_offsets=cache_metadata.swa_base_logical_page,
-                )
-            else:
-                swa_slot_mapping = out_cache_loc
+        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+            ctx,
+            positions,
+            out_cache_loc,
+        )
         # Per-(step, ratio) compressor slot mappings are identical across layers of the
         # same ratio; memoize within the step (filled lazily by the first compressor of
         # each ratio, reused by the rest).

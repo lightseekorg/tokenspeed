@@ -512,7 +512,11 @@ def create_attn_components(
         temporal_size = 1
         for dim in temporal_state_shape:
             temporal_size *= dim
-        speculative_num_draft_tokens = server_args.speculative_num_draft_tokens or 0
+        speculative_num_draft_tokens = (
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_algorithm is not None
+            else 0
+        )
         per_layer_mamba_chunk_memory = (
             conv_size * conv_dtype.itemsize + temporal_size * ssm_dtype.itemsize
         ) * (1 + speculative_num_draft_tokens)

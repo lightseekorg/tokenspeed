@@ -126,7 +126,8 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 }
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (auto req = find_request(event.request_id)) {
-        req->Apply(fsm::ExtendResultEvent{event.tokens});
+        req->Apply(fsm::ExtendResultEvent{event.request_id, event.tokens,
+                                          hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
     }
 }
 

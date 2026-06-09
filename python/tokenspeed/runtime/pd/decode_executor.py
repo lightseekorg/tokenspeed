@@ -174,9 +174,15 @@ class DisaggDecodeExecutor:
                 bootstrap_token, spec_candidate_ids = (
                     self.kv_manager.pop_prefill_metadata(bootstrap_room)
                 )
+                receiver = self.receivers[req_id]
                 if (
                     spec_candidate_ids is not None
                     and req_id in self._request_pool_indices
+                    and getattr(
+                        receiver,
+                        "supports_remote_spec_candidates",
+                        True,
+                    )
                 ):
                     self._remote_spec_candidate_ids[req_id] = (
                         self._request_pool_indices[req_id],

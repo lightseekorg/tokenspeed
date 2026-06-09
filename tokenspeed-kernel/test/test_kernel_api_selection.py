@@ -42,7 +42,26 @@ import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
+import tokenspeed_kernel.ops.moe as _moe_pkg
+import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
+import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
+import tokenspeed_kernel.ops.moe.triton as _moe_triton
+import tokenspeed_kernel.ops.sampling as _sampling_pkg
+import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
+import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
+import tokenspeed_kernel.ops.sampling.gluon.argmax_gfx950 as _sampling_gluon_argmax
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
+)
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
+from tokenspeed_kernel.ops.moe.gluon import mxfp4_gfx950 as _moe_gluon_mxfp4_gfx950
+from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
@@ -64,6 +83,25 @@ _RELOAD_MODULES = [
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
+    # MoE registration modules.
+    _moe_cutedsl_deepep_nvfp4,
+    _moe_cutlass_fp8,
+    _moe_cutlass_nvfp4,
+    _moe_cutlass_unquant,
+    _moe_trtllm_mxfp4,
+    _moe_trtllm_nvfp4,
+    _moe_trtllm_unquant,
+    _moe_flashinfer,
+    _moe_gluon_mxfp4_gfx950,
+    _moe_gluon,
+    _moe_triton_mxfp4,
+    _moe_triton,
+    _moe_pkg,
+    # Sampling registration modules.
+    _sampling_cute_dsl,
+    _sampling_gluon_argmax,
+    _sampling_gluon,
+    _sampling_pkg,
     # Top-level public API re-exports.
     tokenspeed_kernel,
 ]
@@ -101,6 +139,14 @@ def _is_blackwell_non_sm100(platform: PlatformInfo) -> bool:
 
 def _is_blackwell_plus(platform: PlatformInfo) -> bool:
     return platform.is_blackwell_plus
+
+
+def _is_nvidia(platform: PlatformInfo) -> bool:
+    return platform.is_nvidia
+
+
+def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
+    return platform.is_nvidia and _sampling_cute_dsl.is_available()
 
 
 def _is_cdna4(platform: PlatformInfo) -> bool:
@@ -311,6 +357,49 @@ def _attention_merge_state() -> object:
     return tokenspeed_kernel.mha_merge_state(out_a, lse_a, out_b, lse_b)
 
 
+def _sampling_argmax() -> object:
+    logits = torch.empty((4, 4096), dtype=torch.float32, device="cuda")
+    return tokenspeed_kernel.argmax(logits)
+
+
+def _moe_apply_unquant_trtllm() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        requires_deferred_finalize=True,
+        ep_size=2,
+        internal_activation_dtype="input",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        do_finalize=False,
+    )
+
+
+def _moe_apply_mxfp4_gluon_gfx950() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        internal_activation_dtype="fp8",
+        with_bias=True,
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+    )
+
+
 def _case(
     matches: Callable[[PlatformInfo], bool],
     arch: str,
@@ -486,6 +575,40 @@ _CASES = [
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
     ),
+    # Sampling API x architecture golden cases.
+    _case(
+        _is_nvidia_with_cute_dsl,
+        "nvidia-cutedsl",
+        "sampling",
+        "argmax",
+        "cute_dsl_argmax",
+        _sampling_argmax,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "sampling",
+        "argmax",
+        "gluon_argmax_gfx950",
+        _sampling_argmax,
+    ),
+    # MoE API x architecture golden cases.
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "moe",
+        "apply",
+        "flashinfer_trtllm_unquant_moe_apply",
+        _moe_apply_unquant_trtllm,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "gluon_gfx950_mxfp4_moe_apply",
+        _moe_apply_mxfp4_gluon_gfx950,
+    ),
 ]
 
 
@@ -515,6 +638,18 @@ def selected_kernel_spy(monkeypatch):
                 lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
                 return torch.empty_like(q), lse
             return torch.empty_like(q)
+
+        if case.family == "sampling":
+            (logits,) = args[:1]
+            out = kwargs.get("out")
+            if out is not None:
+                return out
+            return torch.empty(
+                (logits.shape[0],), dtype=torch.int64, device=logits.device
+            )
+
+        if case.family == "moe":
+            return torch.empty_like(kwargs["x"])
 
         return None
 

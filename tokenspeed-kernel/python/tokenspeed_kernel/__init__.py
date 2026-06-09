@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_mxfp8,
     quantize_nvfp4,
 )
+from tokenspeed_kernel.ops.sampling import argmax
 
 __all__ = [
     # gemm
@@ -58,4 +59,6 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
+    # sampling
+    "argmax",
 ]

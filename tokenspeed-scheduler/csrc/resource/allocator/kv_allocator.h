@@ -47,6 +47,7 @@ public:
     OwnedPages TakeFirst(std::int32_t n) { return pages_.TakeFirst(n); }
 
     std::vector<std::int32_t> Pages() const { return pages_.Ids(); };
+    std::int32_t PageCount() const { return pages_.Size(); }
     std::int32_t TailPageAvailableTokens() const { return tail_page_available_tokens_; };
     void ReleaseOwnershipByID(const std::vector<std::int32_t>& pages) { pages_.ReleaseOwnershipByID(pages); }
 
