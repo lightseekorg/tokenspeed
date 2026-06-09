@@ -4,47 +4,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.gluon import (
-    _direct_topk_small_m,
-    _gluon_mxfp4_fp8_warp_decode_moe,
-)
+from tokenspeed_kernel.ops.moe.gluon import _gluon_mxfp4_fp8_warp_decode_moe
 from tokenspeed_kernel.ops.moe.triton_kernels import (
     FlexCtx,
     InFlexData,
     PrecisionConfig,
 )
 from tokenspeed_kernel.platform import current_platform
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.skipif(
-    not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
-)
-@pytest.mark.parametrize("M", [1, 4, 8, 16])
-@pytest.mark.parametrize("E", [16, 128])
-@pytest.mark.parametrize("topk", [1, 4])
-def test_direct_topk_small_m_matches_selected_softmax(M: int, E: int, topk: int):
-    torch.manual_seed(M * 1000 + E * 10 + topk)
-    logits = torch.randn((M, E), device="cuda", dtype=torch.float32)
-
-    ids, weights = _direct_topk_small_m(logits, topk)
-    torch.cuda.synchronize()
-
-    ref_vals, ref_ids = torch.topk(logits, topk, dim=-1)
-    ref_weights = torch.softmax(ref_vals, dim=-1)
-
-    assert torch.equal(ids, ref_ids.to(torch.int32))
-    torch.testing.assert_close(weights, ref_weights, rtol=1e-6, atol=1e-6)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.skipif(
-    not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
-)
-def test_direct_topk_small_m_rejects_large_m():
-    logits = torch.randn((17, 16), device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="requires M <="):
-        _direct_topk_small_m(logits, 4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")

@@ -4605,22 +4605,14 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     N = int(w2_raw.shape[2])
 
-    # Fused top-k stage1 is the default warp-decode path; the non-fused path is
-    # kept as a fallback below and removed in a follow-up.
-    fuse_topk_stage1 = True
-    if fuse_topk_stage1:
-        router_logits_c = router_logits.contiguous()
-        topk_ids = torch.empty(
-            (n_tokens, top_k), dtype=torch.int32, device=router_logits.device
-        )
-        topk_weights = torch.empty(
-            (n_tokens, top_k), dtype=router_logits.dtype, device=router_logits.device
-        )
-    else:
-        # Direct kernels consume dense top-k rather than ragged metadata.
-        topk_ids, topk_weights = _direct_topk_small_m(
-            router_logits, top_k, router_logits.dtype
-        )
+    # Stage1 computes the dense top-k inside the kernel; allocate its outputs.
+    router_logits_c = router_logits.contiguous()
+    topk_ids = torch.empty(
+        (n_tokens, top_k), dtype=torch.int32, device=router_logits.device
+    )
+    topk_weights = torch.empty(
+        (n_tokens, top_k), dtype=router_logits.dtype, device=router_logits.device
+    )
 
     fp8_dtype = (
         getattr(
@@ -4670,85 +4662,49 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     S1_M_DUP = 8 if n_tokens <= 4 else 16
     S2_BLOCK_N = 8 if n_tokens <= 1 else 16
     S2_M_DUP = 4
-    if fuse_topk_stage1:
-        s1_grid = (n_tokens * ((I + S1_BLOCK_N - 1) // S1_BLOCK_N),)
-        _warp_decode_topk_stage1_fp8_mxfp4_kernel[s1_grid](
-            x_fp8,
-            router_logits_c,
-            w13_raw,
-            w13_scale,
-            topk_ids,
-            topk_weights,
-            inter,
-            n_tokens,
-            n_experts,
-            D,
-            I,
-            x_fp8.stride(0),
-            x_fp8.stride(1),
-            router_logits_c.stride(0),
-            topk_ids.stride(0),
-            topk_weights.stride(0),
-            w13_raw.stride(0),
-            w13_raw.stride(-2),
-            w13_raw.stride(-1),
-            w13_scale.stride(0),
-            w13_scale.stride(-2),
-            w13_scale.stride(-1),
-            inter.stride(0),
-            inter.stride(1),
-            w13_act_scale,
-            w2_act_scale,
-            b13,
-            D_PACKED=D // 2,
-            TOPK=top_k,
-            EP=_route_next_pow2(n_experts),
-            TKP=_route_next_pow2(top_k),
-            X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
-            BLOCK_K=BLOCK_K,
-            BLOCK_N=S1_BLOCK_N,
-            M_DUP=S1_M_DUP,
-            QUANTIZE_X=quantize_x,
-            HAS_BIAS=w13_bias is not None,
-            SWIGLU_ALPHA=float(swiglu_alpha),
-            SWIGLU_LIMIT=float(swiglu_limit),
-            num_warps=1,
-        )
-    else:
-        s1_grid = (n_tokens * top_k * ((I + S1_BLOCK_N - 1) // S1_BLOCK_N),)
-        _warp_decode_stage1_fp8_mxfp4_kernel[s1_grid](
-            x_fp8,
-            w13_raw,
-            w13_scale,
-            topk_ids,
-            inter,
-            n_tokens,
-            D,
-            I,
-            x_fp8.stride(0),
-            x_fp8.stride(1),
-            w13_raw.stride(0),
-            w13_raw.stride(-2),
-            w13_raw.stride(-1),
-            w13_scale.stride(0),
-            w13_scale.stride(-2),
-            w13_scale.stride(-1),
-            inter.stride(0),
-            inter.stride(1),
-            w13_act_scale,
-            w2_act_scale,
-            b13,
-            D_PACKED=D // 2,
-            TOPK=top_k,
-            BLOCK_K=BLOCK_K,
-            BLOCK_N=S1_BLOCK_N,
-            M_DUP=S1_M_DUP,
-            QUANTIZE_X=quantize_x,
-            HAS_BIAS=w13_bias is not None,
-            SWIGLU_ALPHA=float(swiglu_alpha),
-            SWIGLU_LIMIT=float(swiglu_limit),
-            num_warps=1,
-        )
+    s1_grid = (n_tokens * ((I + S1_BLOCK_N - 1) // S1_BLOCK_N),)
+    _warp_decode_topk_stage1_fp8_mxfp4_kernel[s1_grid](
+        x_fp8,
+        router_logits_c,
+        w13_raw,
+        w13_scale,
+        topk_ids,
+        topk_weights,
+        inter,
+        n_tokens,
+        n_experts,
+        D,
+        I,
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        router_logits_c.stride(0),
+        topk_ids.stride(0),
+        topk_weights.stride(0),
+        w13_raw.stride(0),
+        w13_raw.stride(-2),
+        w13_raw.stride(-1),
+        w13_scale.stride(0),
+        w13_scale.stride(-2),
+        w13_scale.stride(-1),
+        inter.stride(0),
+        inter.stride(1),
+        w13_act_scale,
+        w2_act_scale,
+        b13,
+        D_PACKED=D // 2,
+        TOPK=top_k,
+        EP=_route_next_pow2(n_experts),
+        TKP=_route_next_pow2(top_k),
+        X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=S1_BLOCK_N,
+        M_DUP=S1_M_DUP,
+        QUANTIZE_X=quantize_x,
+        HAS_BIAS=w13_bias is not None,
+        SWIGLU_ALPHA=float(swiglu_alpha),
+        SWIGLU_LIMIT=float(swiglu_limit),
+        num_warps=1,
+    )
 
     s2_grid = (n_tokens * ((N + S2_BLOCK_N - 1) // S2_BLOCK_N),)
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
@@ -5263,94 +5219,6 @@ def _route_next_pow2(x: int) -> int:
 
 
 @gluon.jit
-def _direct_topk_small_m_kernel(
-    Logits,
-    TopkIds,
-    TopkWeights,
-    stride_lm,
-    stride_im,
-    stride_wm,
-    M: gl.constexpr,
-    E: gl.constexpr,
-    TOPK: gl.constexpr,
-    MP: gl.constexpr,
-    GP: gl.constexpr,
-    EP: gl.constexpr,
-    TKP: gl.constexpr,
-    X_DTYPE: gl.constexpr,
-    NW_C: gl.constexpr,
-):
-    """Small-M direct top-k output for warp-decode kernels.
-
-    This reuses the same in-kernel top-k/softmax implementation as the fused
-    routing path, but stores dense token-major ``topk_ids`` and ``topk_weights``
-    instead of ragged metadata.
-    """
-    LG: gl.constexpr = gl.BlockedLayout([1], [64], [NW_C], [0])
-    LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NW_C, 1], [1, 0])
-    g = gl.arange(0, GP, layout=LG)
-    gmask = g < (M * TOPK)
-    tok = (g // TOPK).to(gl.int32)
-    slot = (g % TOPK).to(gl.int32)
-    idx, vals = _fused_topk(
-        Logits,
-        stride_lm,
-        gmask,
-        tok,
-        slot,
-        M,
-        E,
-        TOPK,
-        MP,
-        EP,
-        GP,
-        TKP,
-        X_DTYPE,
-        LG,
-        LT,
-    )
-    gl.store(TopkIds + tok * stride_im + slot, idx, mask=gmask)
-    gl.store(TopkWeights + tok * stride_wm + slot, vals, mask=gmask)
-
-
-def _direct_topk_small_m(
-    logits: torch.Tensor, topk: int, dtype: torch.dtype | None = None
-):
-    """Return dense ``(topk_ids, topk_weights)`` for small-M warp decode."""
-    if dtype is None:
-        dtype = logits.dtype
-    M, E = logits.shape
-    if M > SMALLM_MAX_M:
-        raise ValueError(f"_direct_topk_small_m requires M <= {SMALLM_MAX_M}; got {M}")
-    if not gluon_route_supported(logits, topk, dtype):
-        raise ValueError("_direct_topk_small_m received unsupported logits/topk/dtype")
-    logits = logits.contiguous()
-    ids = torch.empty((M, topk), dtype=torch.int32, device=logits.device)
-    weights = torch.empty((M, topk), dtype=dtype, device=logits.device)
-    G = M * topk
-    nw = 1 if M <= 2 else 4
-    _direct_topk_small_m_kernel[(1,)](
-        logits,
-        ids,
-        weights,
-        logits.stride(0),
-        ids.stride(0),
-        weights.stride(0),
-        M=M,
-        E=E,
-        TOPK=topk,
-        MP=_route_next_pow2(M),
-        GP=_route_next_pow2(G),
-        EP=_route_next_pow2(E),
-        TKP=_route_next_pow2(topk),
-        X_DTYPE=_ROUTE_GL_DTYPE[dtype],
-        NW_C=nw,
-        num_warps=nw,
-    )
-    return ids, weights
-
-
-@gluon.jit
 def _add_expert_bias(acc, bias_base, col, bound, mfma_layout: gl.constexpr):
     """Broadcast-add a per-expert column bias into an MFMA accumulator.
 
@@ -5680,84 +5548,6 @@ def _warp_decode_topk_stage1_fp8_mxfp4_kernel(
             SWIGLU_ALPHA,
             SWIGLU_LIMIT,
         )
-
-
-@gluon.jit
-def _warp_decode_stage1_fp8_mxfp4_kernel(
-    X,
-    W,
-    WScale,
-    TopkIds,
-    Y,
-    M,
-    D,
-    I,
-    stride_xm,
-    stride_xk,
-    stride_we,
-    stride_wk,
-    stride_wn,
-    stride_wse,
-    stride_wsk,
-    stride_wsn,
-    stride_ym,
-    stride_yn,
-    x_global_scale_ptr,
-    out_quant_scale_ptr,
-    w13_bias,
-    D_PACKED: gl.constexpr,
-    TOPK: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    M_DUP: gl.constexpr,
-    QUANTIZE_X: gl.constexpr,
-    HAS_BIAS: gl.constexpr,
-    SWIGLU_ALPHA: gl.constexpr,
-    SWIGLU_LIMIT: gl.constexpr,
-):
-    """Direct top-k stage1: FP8 hidden x MXFP4 W13 -> FP8 intermediate."""
-    pid = gl.program_id(axis=0)
-    num_pid_n = gl.cdiv(I, BLOCK_N)
-    pid_ts = pid // num_pid_n
-    pid_n = pid % num_pid_n
-    token = pid_ts // TOPK
-    slot = pid_ts % TOPK
-    expert = gl.load(TopkIds + token * TOPK + slot, mask=token < M, other=-1)
-    _warp_decode_stage1_compute(
-        token,
-        slot,
-        expert,
-        pid_n,
-        X,
-        W,
-        WScale,
-        Y,
-        M,
-        D,
-        I,
-        stride_xm,
-        stride_xk,
-        stride_we,
-        stride_wk,
-        stride_wn,
-        stride_wse,
-        stride_wsk,
-        stride_wsn,
-        stride_ym,
-        stride_yn,
-        x_global_scale_ptr,
-        out_quant_scale_ptr,
-        w13_bias,
-        D_PACKED,
-        TOPK,
-        BLOCK_K,
-        BLOCK_N,
-        M_DUP,
-        QUANTIZE_X,
-        HAS_BIAS,
-        SWIGLU_ALPHA,
-        SWIGLU_LIMIT,
-    )
 
 
 @gluon.jit
