@@ -27,7 +27,6 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
-from python.tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_uniform,
 )
@@ -37,6 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
