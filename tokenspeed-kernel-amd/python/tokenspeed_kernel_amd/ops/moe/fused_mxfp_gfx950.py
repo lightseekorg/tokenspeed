@@ -3880,6 +3880,11 @@ def _round_up_int(x: int, m: int) -> int:
     return ((x + m - 1) // m) * m
 
 
+def _clamp_block_m(block_m: int, M: int) -> int:
+    target = max(_MFMA_M, min(block_m, _round_up_int(M, _MFMA_M)))
+    return 1 << (target.bit_length() - 1)
+
+
 def _ragged_slice_size(a_ragged_metadata, M: int) -> int | None:
     """Per-expert M hint for autotune (mirrors upstream
     ``opt_flags_amd``'s formula). Returns ``None`` on no metadata."""
@@ -3952,7 +3957,7 @@ def _autotune_block(
             bm, bn, bk, nw = 64, 256, 256, 4
     # Clamp tile to actual shape (avoid over-tile + NaN-padded
     # reduction on tiny test shapes).
-    bm = max(_MFMA_M, min(bm, _round_up_int(M, _MFMA_M)))
+    bm = _clamp_block_m(bm, M)
     bn = max(_MFMA_M, min(bn, _round_up_int(N, _MFMA_M)))
     bk = max(_MFMA_SCALED_K, min(bk, _round_up_int(K, _MFMA_SCALED_K)))
     # Swizzle unswizzle reshape requires BLOCK_K_S >= 8 (= BLOCK_K
