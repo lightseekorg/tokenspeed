@@ -153,59 +153,21 @@ def _reference(case: dict) -> torch.Tensor:
     return ref
 
 
-def _p50_latency_ms(case: dict, *, warmup: int = 20, iters: int = 100) -> float:
-    for _ in range(warmup):
-        _run_kernel(case)
-    torch.cuda.synchronize()
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    for i in range(iters):
-        starts[i].record()
-        _run_kernel(case)
-        ends[i].record()
-    torch.cuda.synchronize()
-    samples = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
-    return samples[len(samples) // 2]
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 @pytest.mark.skipif(
     not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
 )
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference(use_bias: bool):
-    case = _build_case(M=2, E=4, D=128, I=128, topk=2, use_bias=use_bias)
-    out = _run_kernel(case)
-    assert out is not None
-    torch.cuda.synchronize()
-    ref = _reference(case)
-    torch.testing.assert_close(
-        out.float(), ref.to(torch.bfloat16).float(), rtol=5e-2, atol=2.0
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.skipif(
-    not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
-)
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 16])
-def test_fp8_mxfp4_warp_decode_moe_decode_perf(M: int):
-    """Decode-shape (gpt-oss-120B MoE) perf with a correctness gate.
-
-    Validates against the torch reference, then reports p50 kernel latency
-    measured with CUDA events. Run with ``-s`` to see the latency line.
-    """
-    case = _build_case(M=M, E=128, D=2880, I=2880, topk=4, use_bias=True)
+def test_fp8_mxfp4_warp_decode_moe(M: int, use_bias: bool):
+    # I = 256 > BLOCK_K (128) so stage2 split-K partitions the reduction across
+    # real K slices. M sweeps the supported decode range (up to SMALLM_MAX_M=16)
+    # and its tiling transitions (stage2 at M>1, stage1 at M>4).
+    case = _build_case(M=M, E=4, D=256, I=256, topk=2, use_bias=use_bias)
     out = _run_kernel(case)
     assert out is not None
     torch.cuda.synchronize()
     ref = _reference(case)
     torch.testing.assert_close(
         out.float(), ref.to(torch.bfloat16).float(), rtol=5e-2, atol=2.0
-    )
-    p50_ms = _p50_latency_ms(case)
-    assert p50_ms > 0.0
-    print(
-        f"\n[warp-decode MoE] M={M} E=128 D=2880 I=2880 topk=4: "
-        f"p50={p50_ms * 1e3:.1f} us"
     )
