@@ -249,6 +249,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_contiguous_buf_unit_lens(self):
+        key_units = [
+            self._get_key_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
+        ]
+        value_units = [
+            self._get_value_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
+        ]
+        return key_units + value_units
+
     def get_layerwise_buf_info_offsets(self, start_idx=0):
         return [
             [start_idx + i * self.layer_num + layer_id for i in range(2)]
@@ -437,6 +446,12 @@ class SWAKVPool(BaseTokenToKVPool):
         kv_item_lens = full_kv_item_lens + swa_kv_item_lens
 
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_contiguous_buf_unit_lens(self):
+        return (
+            self.full_kv_pool.get_contiguous_buf_unit_lens()
+            + self.swa_kv_pool.get_contiguous_buf_unit_lens()
+        )
 
     def get_key_buffer(self, layer_id: int):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]

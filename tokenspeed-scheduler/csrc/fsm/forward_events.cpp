@@ -165,11 +165,10 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     if (mamba_allocator_ != nullptr) {
         local_mamba_allocator = std::make_unique<LocalMambaAllocator>(mamba_allocator_);
         if (!local_mamba_allocator->AllocateWorking()) {
-            local_mamba_allocator.reset();
-        } else {
-            if (!local_mamba_allocator->AllocateCheckpoint()) {
-                throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba checkpoint slot");
-            }
+            throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba working slot");
+        }
+        if (!local_mamba_allocator->AllocateCheckpoint()) {
+            throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba checkpoint slot");
         }
     }
 

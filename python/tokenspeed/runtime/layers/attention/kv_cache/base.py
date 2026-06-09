@@ -127,6 +127,9 @@ class BaseTokenToKVPool:
     def get_contiguous_buf_infos(self):
         raise NotImplementedError()
 
+    def get_contiguous_buf_unit_lens(self):
+        return [1] * len(self.get_contiguous_buf_infos()[2])
+
     # Layerwise buffer offsets used by prefill/decode disaggregation.
     def get_layerwise_buf_info_offsets(self, start_idx=0):
         raise NotImplementedError()
