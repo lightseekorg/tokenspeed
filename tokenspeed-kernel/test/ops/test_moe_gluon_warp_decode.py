@@ -51,7 +51,8 @@ def test_direct_topk_small_m_rejects_large_m():
 @pytest.mark.skipif(
     not current_platform().is_cdna4, reason="Gluon warp-decode helpers are gfx950-only"
 )
-def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference():
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference(use_bias: bool):
     pytest.importorskip("aiter")
     from aiter.utility.fp4_utils import mxfp4_to_f32
 
@@ -66,6 +67,9 @@ def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference():
     w2 = torch.randint(0, 256, (E, D, I // 2), device=device, dtype=torch.uint8)
     s13 = torch.full((E, 2 * I, D // 32), 127, device=device, dtype=torch.uint8)
     s2 = torch.full((E, D, I // 32), 127, device=device, dtype=torch.uint8)
+    # N (w2 output dim) equals D for this square config.
+    w13_bias = torch.randn((E, 2 * I), device=device, dtype=torch.float32) if use_bias else None
+    w2_bias = torch.randn((E, D), device=device, dtype=torch.float32) if use_bias else None
     wt13, flex13, st13 = swizzle_mxfp4(w13, s13, 8)
     wt2, flex2, st2 = swizzle_mxfp4(w2, s2, 8)
     scale1 = torch.ones((1,), device=device, dtype=torch.float32)
@@ -93,6 +97,8 @@ def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference():
         router,
         wt13,
         wt2,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
         w13_precision_config=pc1,
         w2_precision_config=pc2,
         w13_act_scale=scale1,
@@ -112,11 +118,17 @@ def test_fp8_mxfp4_warp_decode_moe_matches_torch_reference():
         for slot in range(topk):
             expert = int(topk_ids[m, slot])
             gate_up = hidden_fp8[m : m + 1] @ w13_f[expert].T
+            if use_bias:
+                # Bias is added before the swiglu clamp, matching the kernel.
+                gate_up = gate_up + w13_bias[expert][None, :]
             gate = torch.minimum(gate_up[:, :I], torch.tensor(7.0, device=device))
             linear = torch.clamp(gate_up[:, I:], -7.0, 7.0)
             inter = (gate / (1.0 + torch.exp(-1.702 * gate))) * (linear + 1.0)
             inter_fp8 = inter.to(fp8_dtype).to(torch.float32)
-            ref[m] += topk_weights[m, slot] * (inter_fp8 @ w2_f[expert].T).squeeze(0)
+            second = inter_fp8 @ w2_f[expert].T
+            if use_bias:
+                second = second + w2_bias[expert][None, :]
+            ref[m] += topk_weights[m, slot] * second.squeeze(0)
     torch.testing.assert_close(
         out.float(), ref.to(torch.bfloat16).float(), rtol=5e-2, atol=2.0
     )
