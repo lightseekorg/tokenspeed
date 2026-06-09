@@ -4605,10 +4605,9 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     N = int(w2_raw.shape[2])
 
-    fuse_topk_stage1 = (
-        os.environ.get("TOKENSPEED_MOE_GLUON_FUSE_TOPK_STAGE1", "1").strip().lower()
-        not in _GLUON_DISABLE_VALUES
-    )
+    # Fused top-k stage1 is the default warp-decode path; the non-fused path is
+    # kept as a fallback below and removed in a follow-up.
+    fuse_topk_stage1 = True
     if fuse_topk_stage1:
         router_logits_c = router_logits.contiguous()
         topk_ids = torch.empty(
@@ -4873,17 +4872,11 @@ def _gluon_mxfp_fused_moe(
 
     n_tokens = router_logits.shape[0]
 
-    # Warp-decode small-M MoE is the default on gfx950: it is the fastest path
-    # for the M<=16 decode regime and self-guards (returns None) for any shape
-    # it does not cover. Mirrors the other gluon moe kernels' opt-out switch:
-    # TOKENSPEED_MOE_GLUON_WARP_DECODE=0 (or the master TOKENSPEED_MOE_GLUON=0)
-    # disables it and falls back to the generic gluon/triton route.
-    warp_decode_enabled = (
-        not _GLUON_DISABLED_ENV
-        and current_platform().is_cdna4
-        and os.environ.get("TOKENSPEED_MOE_GLUON_WARP_DECODE", "1").strip().lower()
-        not in _GLUON_DISABLE_VALUES
-    )
+    # Warp-decode small-M MoE is the fastest path for the M<=16 decode regime
+    # and is the default on gfx950. It self-guards (returns None) for any shape
+    # it does not cover, and the master TOKENSPEED_MOE_GLUON=0 switch disables
+    # the whole gluon family (this path included), falling back to triton.
+    warp_decode_enabled = not _GLUON_DISABLED_ENV and current_platform().is_cdna4
     if warp_decode_enabled:
         try:
             warp_out = _gluon_mxfp4_fp8_warp_decode_moe(
