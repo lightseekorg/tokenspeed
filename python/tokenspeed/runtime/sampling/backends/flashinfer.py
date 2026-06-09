@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -305,7 +305,12 @@ class FlashInferSamplingBackend(SamplingBackend):
         cpu_final = self._cpu_final_coins_buf[:bs]
 
         for i, pool_idx in enumerate(request_pool_indices):
-            gen = cast(torch.Generator, self._cpu_generator_per_slot[pool_idx])
+            gen = self._cpu_generator_per_slot[pool_idx]
+            if gen is None:
+                raise RuntimeError(
+                    f"sampling slot {pool_idx} was not initialized before "
+                    "coin-buffer refill"
+                )
             cpu_coins[i, :n].uniform_(lo, 1.0, generator=gen)
             cpu_final[i].uniform_(lo, 1.0, generator=gen)
 

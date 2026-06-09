@@ -227,23 +227,19 @@ class LogitsProcessor(nn.Module):
         )
 
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
-        assert runtime.enabled, "cannot configure disabled dp_sampling runtime"
-        assert runtime.topology is not None
-        assert runtime.min_bs is not None
-        assert runtime.max_bucket_bs is not None
-        assert runtime.vocab_size is not None
-        assert runtime.device is not None
+        if (
+            not runtime.enabled
+            or runtime.topology is None
+            or runtime.min_bs is None
+            or runtime.max_bucket_bs is None
+            or runtime.vocab_size is None
+            or runtime.device is None
+        ):
+            raise RuntimeError("enabled DP sampling runtime is incomplete")
         topology = runtime.topology
-        assert topology.tp_rank == self.tp_rank
-        assert topology.tp_size == self.tp_size
-        assert topology.tp_group == self.tp_group
-        assert topology.skip_all_gather == self.skip_all_gather
         self.dp_sampling_enabled = True
         self.dp_num_tokens_per_req = runtime.num_tokens_per_req
         self.dp_sampling_min_bs = runtime.min_bs
-        assert (
-            self.tp_size > 1 and self.tp_group is not None
-        ), "dp_sampling requires tp_size > 1 and a real tp_group"
         self._logits_layout_executor = LogitsLayoutExecutor(
             tp_rank=topology.tp_rank,
             tp_size=topology.tp_size,
