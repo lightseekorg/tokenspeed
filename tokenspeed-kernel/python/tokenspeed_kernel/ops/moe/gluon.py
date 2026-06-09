@@ -5554,6 +5554,8 @@ def _warp_decode_topk_stage1_fp8_mxfp4_kernel(
                 mask=(token < M) & (bias_n < I),
                 other=0.0,
             ).to(gl.float32)
+            bg = gl.convert_layout(bg, gl.SliceLayout(0, mfma_layout))
+            bu = gl.convert_layout(bu, gl.SliceLayout(0, mfma_layout))
             acc_g = acc_g + bg[None, :]
             acc_u = acc_u + bu[None, :]
         if SWIGLU_LIMIT > 0.0:
@@ -5752,6 +5754,8 @@ def _warp_decode_stage1_fp8_mxfp4_kernel(
             mask=(token < M) & (bias_n < I),
             other=0.0,
         ).to(gl.float32)
+        bg = gl.convert_layout(bg, gl.SliceLayout(0, mfma_layout))
+        bu = gl.convert_layout(bu, gl.SliceLayout(0, mfma_layout))
         acc_g = acc_g + bg[None, :]
         acc_u = acc_u + bu[None, :]
     if SWIGLU_LIMIT > 0.0:
@@ -5903,6 +5907,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                         mask=bias_n < N,
                         other=0.0,
                     ).to(gl.float32)
+                    bias = gl.convert_layout(bias, gl.SliceLayout(0, mfma_layout))
                     acc = acc + bias[None, :]
                 acc_total += gate * acc
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
