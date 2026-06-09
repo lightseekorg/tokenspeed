@@ -49,7 +49,7 @@ __all__ = [
     "mha_decode_with_kvcache",
     "mla_prefill",
     "mla_decode_with_kvcache",
-    "merge_state",
+    "attn_merge_state",
     "mha_decode_scheduler_metadata",
 ]
 
@@ -626,7 +626,7 @@ def mla_decode_with_kvcache(
 # ===-----------------------------------------------------------------------===#
 
 
-def merge_state(
+def attn_merge_state(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,
     out_b: torch.Tensor,

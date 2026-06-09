@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
-    merge_state,
+    attn_merge_state,
     mha_decode_scheduler_metadata,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
@@ -462,7 +462,7 @@ class MHAAttnBackend(AttentionBackend):
         )
         prefix_out, prefix_lse = prefix_result
 
-        output, _ = merge_state(
+        output, _ = attn_merge_state(
             chunk_out.contiguous(),
             chunk_lse.contiguous(),
             prefix_out.contiguous(),

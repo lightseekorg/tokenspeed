@@ -21,18 +21,13 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
 _MLA_PREFILL_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
-
-
-@triton.jit
-def tanh(x):
-    return 2 * tl.sigmoid(2 * x) - 1
 
 
 @triton.jit
@@ -143,7 +138,7 @@ def _mla_prefill_kernel(
         qk *= sm_scale
 
         if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            qk = logit_cap * libdevice.tanh(qk / logit_cap)
 
         qk = tl.where(final_mask, qk, float("-inf"))
 
