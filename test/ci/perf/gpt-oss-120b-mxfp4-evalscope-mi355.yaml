@@ -6,7 +6,7 @@ triggers:
   - manual
 runner:
   labels:
-    - linux-mi355-1gpu-lightseek
+    - amd-mi350-bench
 env:
   CI: "true"
 install:
