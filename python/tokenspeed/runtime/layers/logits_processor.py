@@ -115,6 +115,7 @@ class LogitsMetadata:
     gathered_buffer: torch.Tensor | None = None
     # Buffer to gather logits from all ranks.
     forward_batch_gathered_buffer: torch.Tensor | None = None
+
     @classmethod
     def from_forward_context(cls, ctx: ForwardContext):
         return cls(

@@ -15,8 +15,8 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
     DpSamplingSupport,
     DpSamplingTopology,
-    resolve_dp_sampling_support,
     resolve_dp_sampling_runtime,
+    resolve_dp_sampling_support,
     validate_dp_sampling_lm_head_vocab,
 )
 from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan

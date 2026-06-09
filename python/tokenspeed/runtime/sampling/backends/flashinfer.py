@@ -593,8 +593,9 @@ class FlashInferSamplingBackend(SamplingBackend):
         # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
         # knob and produces non-bit-identical results across ranks (sub-ulp
         # FP accumulation order).
-        # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
+        # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL,
+        # fused top-k + top-p is bit-identical across ranks and does not need
+        # a broadcast.
         elif pdl_enabled():
             self.maybe_broadcast(predict, accept_index, accept_length)
         elif not _FUSED_TOPK_TOPP_AVAILABLE:

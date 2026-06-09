@@ -150,6 +150,7 @@ def resolve_dp_sampling_runtime(
         device=limits.device,
     )
 
+
 def slice_dp_vocab_mask(
     vocab_mask: torch.Tensor | None,
     *,

@@ -50,8 +50,8 @@ from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
     DpSamplingTopology,
-    resolve_dp_sampling_support,
     resolve_dp_sampling_runtime,
+    resolve_dp_sampling_support,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
