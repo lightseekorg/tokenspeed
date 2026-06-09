@@ -110,23 +110,18 @@ def gdn_chunk_prefill(
     Default returns ``(out, final_state)`` matching the FLA layout:
     out [B, T, Hv, D] in q.dtype, final_state [N, H, K, V].
 
-    When ``output_h=True`` returns ``(out, final_state, h)`` where ``h`` is a
-    drop-in replacement for FLA's ``output_h=True`` tensor:
-    shape ``[1, total_chunks, H, K, V]`` in q.dtype, with per-sequence layout
-    ``[h_init_i, h_after_chunk_0_i, ...]`` of ``ceil(L_i / CHUNK_SIZE)``
-    entries (= ``L_i // CHUNK_SIZE`` when ``L_i`` is chunk-aligned, otherwise
-    one more). Index convention matches FLA's: ``h[offset_i + lens // CHUNK]``
-    is the state right *before* chunk ``lens // CHUNK`` for seq ``i`` (so
-    chunk-0's slot holds that seq's initial state, and ``h[-1]`` of a
-    non-aligned seq is the state right before its trailing partial chunk).
+    When ``output_h=True`` returns
+    ``(out, final_state, fi_checkpoints, checkpoint_cu_starts)`` where:
+    - ``fi_checkpoints``: raw flashinfer checkpoint buffer in FLA state layout
+      ``[total_fi_ckpts, H, K, V]`` (float32). Checkpoint ``k`` within a
+      sequence is the state *after* processing chunk ``k`` (= FLA ``h[k+1]``).
+      Per-sequence count is ``L_i // CHUNK_SIZE``.
+    - ``checkpoint_cu_starts``: int64 tensor of length ``N+1`` giving the
+      cumulative start offset of each sequence's checkpoints in
+      ``fi_checkpoints``.
 
-    flashinfer natively emits only post-chunk states (``L_i // CHUNK`` of
-    them, *including* the post-last one which equals ``final_state[i]`` on
-    chunk-aligned seqs). To match FLA we (a) splice ``initial_state[i]`` into
-    the front of each seq's slice and (b) drop flashinfer's last checkpoint
-    on chunk-aligned seqs (FLA does not include the final-state slot in h).
-    This keeps the caller's index math (``track_ssm_h_src``) identical to the
-    FLA path.
+    The caller indexes directly with flashinfer-native offsets rather than
+    rebuilding the FLA h tensor.
     """
     batched = q.dim() == 4
     q3 = q.squeeze(0) if batched else q
@@ -152,17 +147,12 @@ def gdn_chunk_prefill(
         H_state = fi_initial_state.shape[1]
         D_state = fi_initial_state.shape[-1]
         state_checkpoints = torch.empty(
-            total_ckpts_fi,
-            H_state,
-            D_state,
-            D_state,
-            device=fi_initial_state.device,
-            dtype=torch.float32,
+            total_ckpts_fi, H_state, D_state, D_state,
+            device=fi_initial_state.device, dtype=torch.float32,
         )
         checkpoint_cu_starts = torch.zeros(
             per_seq_ckpts_fi.numel() + 1,
-            device=fi_initial_state.device,
-            dtype=torch.int64,
+            device=fi_initial_state.device, dtype=torch.int64,
         )
         checkpoint_cu_starts[1:] = torch.cumsum(per_seq_ckpts_fi, dim=0)
 
@@ -192,41 +182,8 @@ def gdn_chunk_prefill(
     if not output_h:
         return out, final_state_fla
 
-    # Build the FLA-equivalent h: per seq -> [init, ckpt_0, ..., ckpt_{n_fla-2}].
-    fi_ckpts_fla = state_checkpoints.transpose(-1, -2)  # [total_fi, H, K, V]
-    per_seq_lens_cpu = per_seq_lens.cpu()
-    per_seq_ckpts_fi_cpu = per_seq_lens_cpu // CHUNK_SIZE
-    per_seq_fla_counts_cpu = (per_seq_lens_cpu + CHUNK_SIZE - 1) // CHUNK_SIZE
-    n_seq = per_seq_fla_counts_cpu.numel()
-    total_fla = int(per_seq_fla_counts_cpu.sum().item())
-    H_state = fi_initial_state.shape[1]
-    D_state = fi_initial_state.shape[-1]
-    h_fla = torch.empty(
-        total_fla,
-        H_state,
-        D_state,
-        D_state,
-        device=fi_initial_state.device,
-        dtype=torch.float32,
-    )
-    init_fla = initial_state.float()
-    fla_off = 0
-    fi_off = 0
-    for i in range(n_seq):
-        n_fla = int(per_seq_fla_counts_cpu[i].item())
-        n_fi = int(per_seq_ckpts_fi_cpu[i].item())
-        if n_fla == 0:
-            continue
-        # Slot 0: initial state.
-        h_fla[fla_off] = init_fla[i]
-        # Remaining (n_fla - 1) slots: the first (n_fla - 1) flashinfer
-        # checkpoints (drops final-state-equivalent ckpt on aligned seqs).
-        n_take = n_fla - 1
-        if n_take > 0:
-            h_fla[fla_off + 1 : fla_off + 1 + n_take] = fi_ckpts_fla[
-                fi_off : fi_off + n_take
-            ]
-        fla_off += n_fla
-        fi_off += n_fi
-
-    return out, final_state_fla, h_fla.to(q.dtype).unsqueeze(0)
+    # Return raw flashinfer checkpoints in FLA state layout [total_fi, H, K, V].
+    # The caller indexes directly using flashinfer-native offsets, avoiding the
+    # expensive per-seq loop that used to splice initial_state into slot 0.
+    fi_ckpts_fla = state_checkpoints.transpose(-1, -2)
+    return out, final_state_fla, fi_ckpts_fla, checkpoint_cu_starts
