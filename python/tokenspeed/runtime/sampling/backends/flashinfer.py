@@ -23,13 +23,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
     fused_topk_topp_prepare,
     fused_topk_topp_renorm,
     verify_chain_greedy,
 )
-from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
     top_k_renorm_prob,
@@ -234,7 +234,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            batch_next_token_ids = cute_argmax(logits)
+            batch_next_token_ids = sampling_argmax(logits)
 
         else:
 
@@ -312,7 +312,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
+            target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
 
             verify_chain_greedy(
                 predicts=predict,

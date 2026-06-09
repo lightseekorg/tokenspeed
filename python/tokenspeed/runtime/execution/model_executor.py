@@ -509,7 +509,7 @@ class ModelExecutor:
 
         # Single choke point for every (sample/verify) x (greedy/flashinfer)
         # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
-        # make cute_argmax emit the -1 sentinel. Left unclamped, that -1 poisons
+        # make sampling argmax emit the -1 sentinel. Left unclamped, that -1 poisons
         # both consumers below -- it flows into output_ids -> detokenizer (the
         # HF Rust tokenizer raises OverflowError on a negative id and kills the
         # engine) and, via the drafter, back into future_input_map as the next

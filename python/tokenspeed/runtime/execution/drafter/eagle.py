@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
 from python.tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
@@ -344,7 +344,7 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = cute_argmax(logits_output.next_token_logits)
+                draft_ids = sampling_argmax(logits_output.next_token_logits)
                 draft_ids.clamp_(min=0)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
@@ -414,7 +414,7 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output = self._run_first_step(bs, draft_input)
 
-        draft_ids = cute_argmax(logits_output.next_token_logits)
+        draft_ids = sampling_argmax(logits_output.next_token_logits)
         draft_ids.clamp_(min=0)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
