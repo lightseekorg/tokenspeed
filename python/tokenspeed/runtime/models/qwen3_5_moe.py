@@ -263,6 +263,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             enable=(
                 self.shared_expert is not None
                 and hidden_states.shape[0] > 0
+                and get_is_capture_mode()
             )
         ) as fork:
             with fork.branch():
