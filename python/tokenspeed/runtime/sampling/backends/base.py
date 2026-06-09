@@ -69,8 +69,6 @@ class SamplingBackendConfig:
     tp_group: tuple[int, ...] | None = None
     enable_tp_sync: bool = True
 
-    dp_sampling: bool = False
-
     @classmethod
     def from_server_args(
         cls,
@@ -96,7 +94,6 @@ class SamplingBackendConfig:
             random_seed=random_seed,
             tp_group=tp_group,
             enable_tp_sync=not server_args.disable_sampling_tp_sync,
-            dp_sampling=server_args.dp_sampling,
         )
 
 

@@ -59,7 +59,6 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
-    resolve_dp_sampling_vocab_size_update,
     slice_dp_vocab_mask,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
@@ -113,33 +112,17 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._dp_comm: DpSamplingComm | None = None
         self._dp_comm_vocab_size = 0
 
-        if self._dp_tp_size <= 1 or not config.dp_sampling:
+        if self._dp_tp_size <= 1:
             self._dp_max_pad_bs = config.max_bs
             self._dp_max_reqs_per_rank = config.max_bs
             return
 
-        if self._dp_tp_group is None:
-            raise RuntimeError("dp_sampling requires a tp_group")
         self._dp_max_pad_bs = (
             (config.max_bs + self._dp_tp_size - 1) // self._dp_tp_size
         ) * self._dp_tp_size
         self._dp_max_reqs_per_rank = self._dp_max_pad_bs // self._dp_tp_size
         self._dp_pg = pg_manager.get_process_group("nccl", self._dp_tp_group)
         self._dp_rank = dist.get_rank(group=self._dp_pg)
-        self._dp_comm_vocab_size = (
-            (max(config.vocab_size, self._dp_tp_size) + self._dp_tp_size - 1)
-            // self._dp_tp_size
-        ) * self._dp_tp_size
-        self._dp_comm = DpSamplingComm(
-            tp_size=self._dp_tp_size,
-            rank=self._dp_rank,
-            group=self._dp_tp_group,
-            max_pad_bs=self._dp_max_pad_bs,
-            num_tokens_per_req=config.max_draft_tokens_per_req,
-            vocab_size=self._dp_comm_vocab_size,
-            logits_dtype=None,
-            device=config.device,
-        )
 
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         if not runtime.enabled:
@@ -164,46 +147,27 @@ class FlashInferSamplingBackend(SamplingBackend):
                 f"DP sampling max_bucket_bs={runtime.max_bucket_bs} exceeds "
                 f"backend max_pad_bs={self._dp_max_pad_bs}"
             )
-        new_vocab_size = resolve_dp_sampling_vocab_size_update(
-            has_comm=self._dp_comm is not None,
-            current_vocab_size=self._dp_comm_vocab_size,
-            requested_vocab_size=runtime.vocab_size,
-            tp_size=self._dp_tp_size,
-            comm_initialized=bool(
-                self._dp_comm is not None and self._dp_comm.is_initialized
-            ),
-        )
-        if new_vocab_size is None:
+        if runtime.vocab_size % self._dp_tp_size != 0:
+            raise RuntimeError(
+                f"DP sampling vocab_size={runtime.vocab_size} must be divisible by "
+                f"tp_size={self._dp_tp_size}"
+            )
+        if runtime.vocab_size == self._dp_comm_vocab_size:
             return
+        if self._dp_comm is not None and self._dp_comm.is_initialized:
+            raise RuntimeError("Cannot resize DP sampling comm after use")
         if self._dp_tp_group is None:
             raise RuntimeError("dp_sampling requires a tp_group")
-        self._dp_comm_vocab_size = new_vocab_size
+        self._dp_comm_vocab_size = runtime.vocab_size
         self._dp_comm = DpSamplingComm(
             tp_size=self._dp_tp_size,
             rank=self._dp_rank,
             group=self._dp_tp_group,
             max_pad_bs=self._dp_max_pad_bs,
             num_tokens_per_req=runtime.num_tokens_per_req,
-            vocab_size=new_vocab_size,
+            vocab_size=runtime.vocab_size,
             logits_dtype=None,
             device=runtime.device,
-        )
-
-    @staticmethod
-    def _slice_dp_vocab_mask(
-        vocab_mask: torch.Tensor | None,
-        *,
-        full_bs: int,
-        pad_bs: int,
-        num_tokens_per_req: int,
-        shard: slice,
-    ) -> torch.Tensor | None:
-        return slice_dp_vocab_mask(
-            vocab_mask,
-            full_bs=full_bs,
-            pad_bs=pad_bs,
-            num_tokens_per_req=num_tokens_per_req,
-            shard=shard,
         )
 
     def _init_pool_scalars(self, config: SamplingBackendConfig) -> None:
@@ -427,7 +391,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         logits_layout_plan = getattr(logits_output, "logits_layout_plan", None)
         dp_sampling = (
             logits_layout_plan is not None and logits_layout_plan.is_dp_all_to_all
-        ) or sampling_info.dp_sampling
+        )
 
         if dp_sampling:
             if self._dp_tp_size <= 1 or self._dp_pg is None or self._dp_comm is None:
@@ -476,7 +440,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             else:
                 candidates = candidates[shard]
                 pool_indices = sampling_info.req_pool_indices[shard]
-            vocab_mask = self._slice_dp_vocab_mask(
+            vocab_mask = slice_dp_vocab_mask(
                 vocab_mask,
                 full_bs=effective_bs,
                 pad_bs=pad_bs,

@@ -32,9 +32,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.sampling.dp_sampling_config import (
-    resolve_dp_sampling_vocab_size_update,
+    DpSamplingRuntimeConfig,
+    DpSamplingTopology,
     slice_dp_vocab_mask,
 )
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
@@ -135,33 +137,8 @@ def _build_backend(
         random_seed=123,
         tp_group=group,
         enable_tp_sync=False,
-        dp_sampling=True,
     )
     return FlashInferSamplingBackend(cfg)
-
-
-def test_dp_sampling_runtime_vocab_size_rebuilds_comm_before_use():
-    assert (
-        resolve_dp_sampling_vocab_size_update(
-            has_comm=True,
-            current_vocab_size=32002,
-            requested_vocab_size=32064,
-            tp_size=2,
-            comm_initialized=False,
-        )
-        == 32064
-    )
-
-
-def test_dp_sampling_runtime_vocab_size_rejects_unsharded_size():
-    with pytest.raises(RuntimeError, match="must be divisible"):
-        resolve_dp_sampling_vocab_size_update(
-            has_comm=True,
-            current_vocab_size=32002,
-            requested_vocab_size=32001,
-            tp_size=2,
-            comm_initialized=False,
-        )
 
 
 def _test_verify_dp_matches_today(
@@ -190,6 +167,22 @@ def _test_verify_dp_matches_today(
         group=group,
         enable_output_logprobs=enable_output_logprobs,
     )
+    backend.configure_dp_sampling(
+        DpSamplingRuntimeConfig(
+            enabled=True,
+            vocab_size=vocab,
+            max_bucket_bs=pad_bs,
+            min_bs=1,
+            num_tokens_per_req=n,
+            topology=DpSamplingTopology(
+                tp_rank=rank,
+                tp_size=tp_size,
+                tp_group=group,
+                skip_all_gather=False,
+            ),
+            device=device,
+        )
+    )
     _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=32, top_p=0.9)
 
     full_logits = _make_logits(bs, n, vocab, dtype=dtype, device=device, seed=2024)
@@ -201,14 +194,12 @@ def _test_verify_dp_matches_today(
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
-        dp_sampling=False,
     )
     sampling_info_dp = SamplingBatchInfo(
         is_all_greedy=is_all_greedy,
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
-        dp_sampling=True,
     )
 
     class _StubOutput:
@@ -235,6 +226,14 @@ def _test_verify_dp_matches_today(
     ].clone()
     dp_in = _StubOutput()
     dp_in.next_token_logits = local_logits
+    dp_in.logits_layout_plan = LogitsLayoutPlan(
+        mode="dp_all_to_all",
+        real_bs=bs,
+        effective_bs=bs,
+        bucket_bs=pad_bs,
+        tp_size=tp_size,
+        num_tokens_per_req=n,
+    )
     if forbid_global_logprob_writer:
         import tokenspeed.runtime.sampling.backends.flashinfer as flashinfer_backend
 

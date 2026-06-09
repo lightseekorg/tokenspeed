@@ -17,11 +17,7 @@ def test_logits_metadata_derives_basic_fields_from_forward_context():
         gather_ids=gather_ids,
     )
 
-    metadata = LogitsMetadata.from_forward_context(
-        ctx,
-        torch.tensor([1], dtype=torch.int32),
-    )
+    metadata = LogitsMetadata.from_forward_context(ctx)
 
     assert metadata.forward_mode == ForwardMode.DECODE
     assert metadata.gather_ids is gather_ids
-    assert metadata.extend_seq_lens.tolist() == [1]

@@ -24,8 +24,6 @@ import dataclasses
 
 import torch
 
-from tokenspeed.runtime.sampling.logits_layout import resolve_dp_sampling_min_bs
-
 
 @dataclasses.dataclass(frozen=True)
 class DpSamplingSupport:
@@ -36,16 +34,6 @@ class DpSamplingSupport:
     backend_supports_verify: bool
     tp_size: int
     tp_group_set: bool
-
-    def unsupported_message(self) -> str:
-        return (
-            "--dp-sampling was set but Batch-DP spec-verify "
-            "preconditions are not met: "
-            f"drafter={self.drafter_available}, "
-            f"backend_supports_dp_verify={self.backend_supports_verify}, "
-            f"tp_size={self.tp_size}, "
-            f"tp_group_set={self.tp_group_set}"
-        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,7 +92,14 @@ def resolve_dp_sampling_support(
         tp_group_set=tp_group_set,
     )
     if support.requested and not support.infra_supports:
-        raise RuntimeError(support.unsupported_message())
+        raise RuntimeError(
+            "--dp-sampling was set but Batch-DP spec-verify "
+            "preconditions are not met: "
+            f"drafter={support.drafter_available}, "
+            f"backend_supports_dp_verify={support.backend_supports_verify}, "
+            f"tp_size={support.tp_size}, "
+            f"tp_group_set={support.tp_group_set}"
+        )
     return support
 
 
@@ -128,19 +123,23 @@ def resolve_dp_sampling_runtime(
         skip_all_gather=topology.skip_all_gather,
         tie_word_embeddings=topology.tie_word_embeddings,
     )
-    dp_vocab_size = dp_sampling_comm_vocab_size(
-        lm_head_rows=lm_head_rows,
-        tp_size=topology.tp_size,
-        skip_all_gather=topology.skip_all_gather,
-    )
+    dp_vocab_size = int(lm_head_rows)
+    if not topology.skip_all_gather:
+        dp_vocab_size *= int(topology.tp_size)
+    dp_vocab_size = (
+        (dp_vocab_size + int(topology.tp_size) - 1) // int(topology.tp_size)
+    ) * int(topology.tp_size)
     max_bs = limits.max_num_seqs // max(limits.data_parallel_size, 1)
     max_bucket_bs = (
         (max_bs + topology.tp_size - 1) // topology.tp_size
     ) * topology.tp_size
-    min_bs = resolve_dp_sampling_min_bs(
-        tp_size=topology.tp_size,
-        configured_min_bs=limits.configured_min_bs,
+    min_bs = (
+        int(limits.configured_min_bs)
+        if limits.configured_min_bs is not None
+        else 2 * int(topology.tp_size)
     )
+    if min_bs < 1:
+        raise ValueError("dp_sampling_min_bs must be >= 1")
     return DpSamplingRuntimeConfig(
         enabled=True,
         vocab_size=dp_vocab_size,
@@ -150,41 +149,6 @@ def resolve_dp_sampling_runtime(
         topology=topology,
         device=limits.device,
     )
-
-
-def dp_sampling_comm_vocab_size(
-    *,
-    lm_head_rows: int,
-    tp_size: int,
-    skip_all_gather: bool,
-) -> int:
-    vocab_size = int(lm_head_rows)
-    if not skip_all_gather:
-        vocab_size *= int(tp_size)
-    return ((vocab_size + int(tp_size) - 1) // int(tp_size)) * int(tp_size)
-
-
-def resolve_dp_sampling_vocab_size_update(
-    *,
-    has_comm: bool,
-    current_vocab_size: int,
-    requested_vocab_size: int,
-    tp_size: int,
-    comm_initialized: bool,
-) -> int | None:
-    if not has_comm:
-        return None
-    if requested_vocab_size == current_vocab_size:
-        return None
-    if requested_vocab_size % int(tp_size) != 0:
-        raise RuntimeError(
-            f"DP sampling vocab_size={requested_vocab_size} must be divisible by "
-            f"tp_size={tp_size}"
-        )
-    if comm_initialized:
-        raise RuntimeError("Cannot resize DP sampling comm after use")
-    return requested_vocab_size
-
 
 def slice_dp_vocab_mask(
     vocab_mask: torch.Tensor | None,

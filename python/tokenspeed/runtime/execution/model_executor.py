@@ -34,9 +34,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 )
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-    CudaGraphWrapper,
-)
+from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -313,7 +311,6 @@ class ModelExecutor:
             topology=dp_topology,
         )
 
-        self.dp_sampling_enabled = dp_support.enabled
         lm_head_rows = 0
         if dp_support.enabled:
             lm_head_weight = self.model_runner.model.lm_head.weight
@@ -635,7 +632,7 @@ class ModelExecutor:
         bs: int,
         sampling_params_list: list[SamplingParams],
     ) -> SamplingBatchInfo:
-        return SamplingBatchInfo.from_runtime_buffers(
+        return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             is_all_greedy=all(p.top_k <= 1 for p in sampling_params_list),
@@ -953,7 +950,7 @@ class ModelExecutor:
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
         )
-        sampling_info = SamplingBatchInfo.from_runtime_buffers(
+        sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             is_all_greedy=True,
@@ -1357,10 +1354,7 @@ class ModelExecutor:
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
                 with nvtx_range("sampling_prep", color="yellow"):
-                    sampling_info = self._build_sampling_info(
-                        bs,
-                        sampling_params_list,
-                    )
+                    sampling_info = self._build_sampling_info(bs, sampling_params_list)
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,

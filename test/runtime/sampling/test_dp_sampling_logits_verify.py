@@ -156,7 +156,6 @@ def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
         random_seed=123,
         tp_group=group,
         enable_tp_sync=False,
-        dp_sampling=True,
     )
     return FlashInferSamplingBackend(cfg)
 
@@ -167,7 +166,6 @@ def _build_processor(
     tp_rank: int,
     tp_size: int,
     tp_group: tuple[int, ...],
-    n: int,
 ):
     return LogitsProcessor(
         config=config,
@@ -175,8 +173,6 @@ def _build_processor(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_group=tp_group,
-        dp_sampling_enabled=True,
-        dp_num_tokens_per_req=n,
     )
 
 
@@ -213,7 +209,7 @@ def _test_dp_chain_matches_legacy(
 
     config = _StubConfig(vocab_size=vocab)
     processor = _build_processor(
-        config=config, tp_rank=rank, tp_size=tp_size, tp_group=group, n=n
+        config=config, tp_rank=rank, tp_size=tp_size, tp_group=group
     )
     processor.configure_dp_sampling(
         DpSamplingRuntimeConfig(
@@ -239,6 +235,22 @@ def _test_dp_chain_matches_legacy(
         device=device,
         group=group,
     )
+    backend.configure_dp_sampling(
+        DpSamplingRuntimeConfig(
+            enabled=True,
+            vocab_size=vocab,
+            max_bucket_bs=pad_bs,
+            min_bs=1,
+            num_tokens_per_req=n,
+            topology=DpSamplingTopology(
+                tp_rank=rank,
+                tp_size=tp_size,
+                tp_group=group,
+                skip_all_gather=False,
+            ),
+            device=device,
+        )
+    )
     _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=32, top_p=0.9)
 
     hidden_states = _make_hidden_states(
@@ -259,7 +271,6 @@ def _test_dp_chain_matches_legacy(
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
-        dp_sampling=False,
     )
     legacy_out = LogitsProcessorOutput(next_token_logits=legacy_logits)
     _seed_coins(backend, bs=bs, n=n, seed=2024)

@@ -19,12 +19,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     resolve_dp_sampling_runtime,
     validate_dp_sampling_lm_head_vocab,
 )
-from tokenspeed.runtime.sampling.logits_layout import (
-    LogitsLayoutPlan,
-    LogitsLayoutPlanner,
-    resolve_dp_sampling_min_bs,
-    should_use_dp_sampling_for_bucket,
-)
+from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
 
 def _graph_route(
@@ -88,110 +83,44 @@ def test_extensible_lm_exposes_base_sampling_setup_handles():
     assert ext.lm_head is base.lm_head
 
 
-def test_dp_sampling_bucket_threshold():
-    assert not should_use_dp_sampling_for_bucket(
-        dp_sampling_enabled=True,
-        forward_mode=ForwardMode.DECODE,
-        effective_bs=15,
-        min_bs=16,
+def test_logits_processor_dp_layout_threshold_and_modes():
+    processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        tp_rank=0,
+        tp_size=4,
+        tp_group=(0, 1, 2, 3),
     )
-    assert should_use_dp_sampling_for_bucket(
-        dp_sampling_enabled=True,
-        forward_mode=ForwardMode.DECODE,
-        effective_bs=16,
-        min_bs=16,
-    )
-    assert should_use_dp_sampling_for_bucket(
-        dp_sampling_enabled=True,
-        forward_mode=ForwardMode.TARGET_VERIFY,
-        effective_bs=16,
-        min_bs=16,
+    processor.configure_dp_sampling(_dp_runtime_config(min_bs=16))
+
+    assert (
+        processor._resolve_logits_layout_plan(
+            torch.empty(15 * 6, 3),
+            LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        )
+        is None
     )
 
-
-def test_dp_sampling_default_threshold_covers_two_local_requests():
-    min_bs = resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=None)
-    assert min_bs == 8
-
-    assert not should_use_dp_sampling_for_bucket(
-        dp_sampling_enabled=True,
-        forward_mode=ForwardMode.DECODE,
-        effective_bs=7,
-        min_bs=min_bs,
+    decode_plan = processor._resolve_logits_layout_plan(
+        torch.empty(16 * 6, 3),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE),
     )
-    assert should_use_dp_sampling_for_bucket(
-        dp_sampling_enabled=True,
-        forward_mode=ForwardMode.DECODE,
-        effective_bs=8,
-        min_bs=min_bs,
+    assert decode_plan is not None
+    assert decode_plan.is_dp_all_to_all
+
+    verify_plan = processor._resolve_logits_layout_plan(
+        torch.empty(16 * 6, 3),
+        LogitsMetadata(forward_mode=ForwardMode.TARGET_VERIFY),
     )
-    assert not should_use_dp_sampling_for_bucket(
-        dp_sampling_enabled=True,
-        forward_mode=ForwardMode.EXTEND,
-        effective_bs=32,
-        min_bs=min_bs,
+    assert verify_plan is not None
+    assert verify_plan.is_dp_all_to_all
+
+    assert (
+        processor._resolve_logits_layout_plan(
+            torch.empty(32 * 6, 3),
+            LogitsMetadata(forward_mode=ForwardMode.EXTEND),
+        )
+        is None
     )
-    assert not should_use_dp_sampling_for_bucket(
-        dp_sampling_enabled=False,
-        forward_mode=ForwardMode.DECODE,
-        effective_bs=32,
-        min_bs=min_bs,
-    )
-
-
-def test_dp_sampling_min_bs_ignores_env_override(monkeypatch):
-    monkeypatch.setenv("TOKENSPEED_DP_SAMPLING_MIN_BS", "16")
-
-    assert resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=None) == 8
-    assert resolve_dp_sampling_min_bs(tp_size=4, configured_min_bs=12) == 12
-
-
-def test_layout_planner_dp_bucket_rounds_to_tp_size():
-    planner = LogitsLayoutPlanner(
-        dp_sampling_enabled=True,
-        dp_sampling_min_bs=1,
-        tp_size=8,
-        num_tokens_per_req=6,
-    )
-
-    plan = planner.build_plan(
-        forward_mode=ForwardMode.DECODE,
-        real_bs=33,
-        effective_bs=33,
-    )
-
-    assert plan.is_dp_all_to_all
-    assert plan.bucket_bs == 40
-
-
-def test_layout_planner_uses_graph_bucket_threshold():
-    planner = LogitsLayoutPlanner(
-        dp_sampling_enabled=True,
-        dp_sampling_min_bs=32,
-        tp_size=8,
-        num_tokens_per_req=6,
-    )
-    ctx = ForwardContext(
-        attn_backend=None,
-        token_to_kv_pool=None,
-        bs=30,
-        num_extends=0,
-        input_num_tokens=30,
-        forward_mode=ForwardMode.DECODE,
-    )
-
-    use_graph, bucket_bs = _graph_route(30, ctx, max_bs=32, capture_bs=[24, 32])
-    plan = planner.build_plan(
-        forward_mode=ctx.forward_mode,
-        real_bs=30,
-        effective_bs=bucket_bs,
-    )
-
-    assert use_graph
-    assert plan.is_dp_all_to_all
-    assert plan.real_bs == 30
-    assert plan.effective_bs == 32
-    assert plan.bucket_bs == 32
 
 
 def test_cuda_graph_wrapper_uses_existing_route_for_padding():
@@ -259,168 +188,6 @@ def test_cuda_graph_route_respects_disable_padding_with_global_batch():
         capture_bs=[16, 32],
         max_tokens_per_req=1,
     ) == (False, 0)
-
-
-def test_layout_planner_pads_graph_layout_bucket_to_tp_size():
-    planner = LogitsLayoutPlanner(
-        dp_sampling_enabled=True,
-        dp_sampling_min_bs=32,
-        tp_size=8,
-        num_tokens_per_req=6,
-    )
-    ctx = ForwardContext(
-        attn_backend=None,
-        token_to_kv_pool=None,
-        bs=79,
-        num_extends=0,
-        input_num_tokens=79,
-        forward_mode=ForwardMode.DECODE,
-    )
-
-    use_graph, bucket_bs = _graph_route(79, ctx, max_bs=80, capture_bs=[72, 79, 80])
-    plan = planner.build_plan(
-        forward_mode=ctx.forward_mode,
-        real_bs=79,
-        effective_bs=bucket_bs,
-    )
-
-    assert use_graph
-    assert plan.is_dp_all_to_all
-    assert plan.real_bs == 79
-    assert plan.effective_bs == 79
-    assert plan.bucket_bs == 80
-
-
-def test_layout_planner_pads_capture_bucket_above_threshold_to_tp_size():
-    planner = LogitsLayoutPlanner(
-        dp_sampling_enabled=True,
-        dp_sampling_min_bs=16,
-        tp_size=16,
-        num_tokens_per_req=6,
-    )
-    ctx = ForwardContext(
-        attn_backend=None,
-        token_to_kv_pool=None,
-        bs=24,
-        num_extends=0,
-        input_num_tokens=24,
-        forward_mode=ForwardMode.DECODE,
-    )
-
-    use_graph, bucket_bs = _graph_route(24, ctx, max_bs=32, capture_bs=[24, 32])
-    plan = planner.build_plan(
-        forward_mode=ctx.forward_mode,
-        real_bs=24,
-        effective_bs=bucket_bs,
-    )
-
-    assert use_graph
-    assert plan.is_dp_all_to_all
-    assert plan.real_bs == 24
-    assert plan.effective_bs == 24
-    assert plan.bucket_bs == 32
-
-
-def test_layout_planner_keeps_graph_bucket_below_threshold_non_dp():
-    planner = LogitsLayoutPlanner(
-        dp_sampling_enabled=True,
-        dp_sampling_min_bs=32,
-        tp_size=8,
-        num_tokens_per_req=6,
-    )
-    ctx = ForwardContext(
-        attn_backend=None,
-        token_to_kv_pool=None,
-        bs=23,
-        num_extends=0,
-        input_num_tokens=23,
-        forward_mode=ForwardMode.DECODE,
-    )
-
-    use_graph, bucket_bs = _graph_route(23, ctx, max_bs=32, capture_bs=[24, 32])
-    plan = planner.build_plan(
-        forward_mode=ctx.forward_mode,
-        real_bs=23,
-        effective_bs=bucket_bs,
-    )
-
-    assert use_graph
-    assert not plan.is_dp_all_to_all
-    assert plan.real_bs == 23
-    assert plan.effective_bs == 24
-    assert plan.bucket_bs == 24
-
-
-def test_layout_planner_uses_global_decode_bucket_for_idle_rank():
-    planner = LogitsLayoutPlanner(
-        dp_sampling_enabled=True,
-        dp_sampling_min_bs=16,
-        tp_size=8,
-        num_tokens_per_req=6,
-    )
-    ctx = ForwardContext(
-        attn_backend=None,
-        token_to_kv_pool=None,
-        bs=0,
-        num_extends=0,
-        input_num_tokens=0,
-        forward_mode=ForwardMode.DECODE,
-        global_num_tokens=[16, 0],
-        global_bs=[16, 0],
-        all_decode_or_idle=True,
-    )
-
-    use_graph, bucket_bs = _graph_route(
-        0,
-        ctx,
-        dp_size=2,
-        max_bs=32,
-        capture_bs=[16, 32],
-        max_tokens_per_req=1,
-    )
-    plan = planner.build_plan(
-        forward_mode=ctx.forward_mode,
-        real_bs=0,
-        effective_bs=bucket_bs,
-    )
-
-    assert use_graph
-    assert plan.is_dp_all_to_all
-    assert plan.real_bs == 0
-    assert plan.effective_bs == 16
-    assert plan.bucket_bs == 16
-
-
-def test_layout_planner_eager_route_returns_tp_divisible_bucket():
-    planner = LogitsLayoutPlanner(
-        dp_sampling_enabled=True,
-        dp_sampling_min_bs=16,
-        tp_size=4,
-        num_tokens_per_req=6,
-    )
-    ctx = ForwardContext(
-        attn_backend=None,
-        token_to_kv_pool=None,
-        bs=17,
-        num_extends=0,
-        input_num_tokens=17,
-        forward_mode=ForwardMode.DECODE,
-    )
-
-    use_graph, bucket_bs = _graph_route(
-        17, ctx, disable=True, max_bs=32, capture_bs=[24, 32]
-    )
-    plan = planner.build_plan(
-        forward_mode=ctx.forward_mode,
-        real_bs=17,
-        effective_bs=bucket_bs,
-    )
-
-    assert not use_graph
-    assert plan.is_dp_all_to_all
-    assert plan.real_bs == 17
-    assert plan.effective_bs == 17
-    assert plan.bucket_bs == 20
 
 
 def test_configure_dp_sampling_sets_state():
@@ -532,8 +299,9 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
         tp_rank=1,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
-        dp_sampling_enabled=True,
-        dp_num_tokens_per_req=6,
+    )
+    processor.configure_dp_sampling(
+        _dp_runtime_config(tp_rank=1, skip_all_gather=True, device="cpu")
     )
     hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
     lm_head = SimpleNamespace(weight=torch.ones(7, 3))
@@ -565,8 +333,9 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
         tp_rank=2,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
-        dp_sampling_enabled=True,
-        dp_num_tokens_per_req=6,
+    )
+    processor.configure_dp_sampling(
+        _dp_runtime_config(tp_rank=2, skip_all_gather=True, device="cpu")
     )
     hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
     lm_head = SimpleNamespace(weight=torch.ones(7, 3))

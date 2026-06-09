@@ -74,28 +74,8 @@ class SamplingBatchInfo:
     # index_select inside the captured graph.
     valid_cache_lengths: torch.Tensor | None = None
 
-    dp_sampling: bool = False
-
     # Device
     device: str = "cuda"
-
-    @classmethod
-    def from_runtime_buffers(
-        cls,
-        *,
-        req_pool_indices: torch.Tensor | None,
-        valid_cache_lengths: torch.Tensor | None,
-        is_all_greedy: bool,
-        vocab_size: int,
-        device: torch.device | str,
-    ) -> SamplingBatchInfo:
-        return cls(
-            req_pool_indices=req_pool_indices,
-            valid_cache_lengths=valid_cache_lengths,
-            is_all_greedy=is_all_greedy,
-            vocab_size=vocab_size,
-            device=device,
-        )
 
     def __getitem__(self, s: slice) -> SamplingBatchInfo:
         """Row-slice batch-indexed fields; pool/scalar fields pass through.

@@ -48,7 +48,6 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
-    LogitsLayoutPlanner,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -117,10 +116,6 @@ class LogitsMetadata:
     gathered_buffer: torch.Tensor | None = None
     # Buffer to gather logits from all ranks.
     forward_batch_gathered_buffer: torch.Tensor | None = None
-    # Number of tokens to sample per DP rank
-    global_num_tokens_for_logprob_cpu: torch.Tensor | None = None
-    global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
-
     @classmethod
     def from_forward_context(cls, ctx: ForwardContext):
         return cls(
@@ -188,17 +183,15 @@ class LogitsProcessor(nn.Module):
         tp_rank: int | None = None,
         tp_size: int | None = None,
         tp_group: tuple[int, ...] | None = None,
-        dp_sampling_enabled: bool = False,
-        dp_num_tokens_per_req: int = 1,
     ):
         super().__init__()
         self.config = config
         self.skip_all_gather = skip_all_gather
-        self.dp_sampling_enabled = dp_sampling_enabled
-        self.dp_num_tokens_per_req = dp_num_tokens_per_req
+        self.dp_sampling_enabled = False
+        self.dp_num_tokens_per_req = 1
+        self.dp_sampling_min_bs = 0
         self.logit_scale = logit_scale
         self._logits_layout_executor: LogitsLayoutExecutor | None = None
-        self._logits_layout_planner: LogitsLayoutPlanner | None = None
 
         if tp_rank is None:
             assert tp_size is None
@@ -208,10 +201,6 @@ class LogitsProcessor(nn.Module):
         assert tp_size == 1 or tp_group is not None
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
 
-        if dp_sampling_enabled:
-            assert (
-                tp_size > 1 and tp_group is not None
-            ), "dp_sampling requires tp_size > 1 and a real tp_group"
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
 
         self.final_logit_softcapping = getattr(
@@ -251,12 +240,7 @@ class LogitsProcessor(nn.Module):
         assert topology.skip_all_gather == self.skip_all_gather
         self.dp_sampling_enabled = True
         self.dp_num_tokens_per_req = runtime.num_tokens_per_req
-        self._logits_layout_planner = LogitsLayoutPlanner(
-            dp_sampling_enabled=True,
-            dp_sampling_min_bs=runtime.min_bs,
-            tp_size=topology.tp_size,
-            num_tokens_per_req=runtime.num_tokens_per_req,
-        )
+        self.dp_sampling_min_bs = runtime.min_bs
         assert (
             self.tp_size > 1 and self.tp_group is not None
         ), "dp_sampling requires tp_size > 1 and a real tp_group"
@@ -275,7 +259,7 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         logits_metadata: LogitsMetadata,
     ) -> LogitsLayoutPlan | None:
-        if self._logits_layout_planner is None:
+        if not self.dp_sampling_enabled:
             return None
         if not (
             logits_metadata.forward_mode.is_decode()
@@ -286,12 +270,17 @@ class LogitsProcessor(nn.Module):
         rows = hidden_states.shape[0]
         assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
         effective_bs = rows // n
-        plan = self._logits_layout_planner.build_plan(
-            forward_mode=logits_metadata.forward_mode,
+        if effective_bs < self.dp_sampling_min_bs:
+            return None
+        bucket_bs = ((effective_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
+        return LogitsLayoutPlan(
+            mode="dp_all_to_all",
             real_bs=effective_bs,
             effective_bs=effective_bs,
+            bucket_bs=bucket_bs,
+            tp_size=self.tp_size,
+            num_tokens_per_req=n,
         )
-        return plan if plan.is_dp_all_to_all else None
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia:
