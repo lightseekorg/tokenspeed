@@ -107,7 +107,7 @@ def _argmax_one_stage_kernel(
 
     for start in range(0, N, BLOCK):
         tile_val, tile_idx = _argmax_fixed_block_size_tile(
-            logits, row, start, stride_m, N, BLOCK, LOAD_ELEMS, False
+            logits, row, start, stride_m, N, BLOCK, LOAD_ELEMS, True
         )
         best_val, best_idx = _argmax_combine(best_val, best_idx, tile_val, tile_idx)
 

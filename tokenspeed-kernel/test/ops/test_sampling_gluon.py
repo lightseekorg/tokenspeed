@@ -90,8 +90,9 @@ def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
-def test_argmax_split_path_ignores_nan_but_preserves_valid_negative_infinity():
-    M, N = 4, MODEL_VOCABS["deepseek_v4"]
+@pytest.mark.parametrize("M", [4, 128])
+def test_argmax_ignores_nan_but_preserves_valid_negative_infinity(M):
+    N = MODEL_VOCABS["deepseek_v4"]
     x = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float32)
     x[0, 123] = 0.5
     x[0, 456] = 1.0
@@ -100,7 +101,8 @@ def test_argmax_split_path_ignores_nan_but_preserves_valid_negative_infinity():
     x[2, 5] = 3.0
 
     out = gluon.argmax(x)
-    expected = torch.tensor([456, 0, 5, -1], device="cuda", dtype=out.dtype)
+    expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
+    expected[:3] = torch.tensor([456, 0, 5], device="cuda", dtype=out.dtype)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
