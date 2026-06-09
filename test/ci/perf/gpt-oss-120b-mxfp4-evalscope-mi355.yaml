@@ -68,7 +68,7 @@ perf:
     rc=$?;
     if [ $rc -ne 0 ] && [ $PERF_STATUS -eq 0 ]; then PERF_STATUS=$rc; fi;
     done;
-    python3 "$REPO_ROOT/test/random_bencmkar/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 1;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 1;
     PARSE_STATUS=$?;
     if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
     exit "$PARSE_STATUS"
