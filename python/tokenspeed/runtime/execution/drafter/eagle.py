@@ -27,6 +27,7 @@ import torch
 from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from typing_extensions import override
 
+from python.tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_uniform,
 )
