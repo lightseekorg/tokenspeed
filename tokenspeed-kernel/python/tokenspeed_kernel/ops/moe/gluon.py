@@ -5541,18 +5541,21 @@ def _warp_decode_topk_stage1_fp8_mxfp4_kernel(
         acc_g = acc_g * x_scale
         acc_u = acc_u * x_scale
         if HAS_BIAS:
+            bias_n = pid_n * BLOCK_N + gl.arange(
+                0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+            )
             bg = gl.load(
-                w13_bias + expert.to(gl.int64) * (2 * I) + n_gate,
-                mask=(token < M) & (n_gate < I),
+                w13_bias + expert.to(gl.int64) * (2 * I) + bias_n,
+                mask=(token < M) & (bias_n < I),
                 other=0.0,
             ).to(gl.float32)
             bu = gl.load(
-                w13_bias + expert.to(gl.int64) * (2 * I) + n_up,
-                mask=(token < M) & (n_gate < I),
+                w13_bias + expert.to(gl.int64) * (2 * I) + I + bias_n,
+                mask=(token < M) & (bias_n < I),
                 other=0.0,
             ).to(gl.float32)
-            acc_g += bg
-            acc_u += bu
+            acc_g = acc_g + bg[None, :]
+            acc_u = acc_u + bu[None, :]
         if SWIGLU_LIMIT > 0.0:
             acc_g = gl.minimum(acc_g, SWIGLU_LIMIT)
             acc_u = gl.clamp(acc_u, -SWIGLU_LIMIT, SWIGLU_LIMIT)
@@ -5736,18 +5739,21 @@ def _warp_decode_stage1_fp8_mxfp4_kernel(
     acc_g = acc_g * x_scale
     acc_u = acc_u * x_scale
     if HAS_BIAS:
+        bias_n = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+        )
         bg = gl.load(
-            w13_bias + expert.to(gl.int64) * (2 * I) + n_gate,
-            mask=(token < M) & (n_gate < I),
+            w13_bias + expert.to(gl.int64) * (2 * I) + bias_n,
+            mask=(token < M) & (bias_n < I),
             other=0.0,
         ).to(gl.float32)
         bu = gl.load(
-            w13_bias + expert.to(gl.int64) * (2 * I) + n_up,
-            mask=(token < M) & (n_gate < I),
+            w13_bias + expert.to(gl.int64) * (2 * I) + I + bias_n,
+            mask=(token < M) & (bias_n < I),
             other=0.0,
         ).to(gl.float32)
-        acc_g += bg
-        acc_u += bu
+        acc_g = acc_g + bg[None, :]
+        acc_u = acc_u + bu[None, :]
     if SWIGLU_LIMIT > 0.0:
         acc_g = gl.minimum(acc_g, SWIGLU_LIMIT)
         acc_u = gl.clamp(acc_u, -SWIGLU_LIMIT, SWIGLU_LIMIT)
@@ -5889,12 +5895,15 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                     )
                 acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
                 if HAS_BIAS:
+                    bias_n = pid_n * BLOCK_N + gl.arange(
+                        0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     bias = gl.load(
-                        w2_bias + expert.to(gl.int64) * N + n_cols,
-                        mask=n_cols < N,
+                        w2_bias + expert.to(gl.int64) * N + bias_n,
+                        mask=bias_n < N,
                         other=0.0,
                     ).to(gl.float32)
-                    acc += bias
+                    acc = acc + bias[None, :]
                 acc_total += gate * acc
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
     sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
