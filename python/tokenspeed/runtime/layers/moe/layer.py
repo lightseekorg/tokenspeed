@@ -155,6 +155,7 @@ class MoELayer(torch.nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
+        prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         # Only pass ``do_finalize`` through when the caller actually wants
         # the deferred path. Other backends do not accept this kwarg;
@@ -166,6 +167,8 @@ class MoELayer(torch.nn.Module):
                 self.backend.supports_deferred_finalize
             ), f"{type(self.backend).__name__} does not support do_finalize=False"
             kwargs["do_finalize"] = False
+        if prequantized_input is not None:
+            kwargs["prequantized_input"] = prequantized_input
         return self.backend.forward(
             self,
             hidden_states,

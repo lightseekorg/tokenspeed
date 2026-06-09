@@ -512,6 +512,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             ctx
         )
 
+        prequantized_input = None
         if not ctx.forward_mode.is_idle():
             hidden_states, residual = self.comm_manager.input_reduce_norm(
                 hidden_states, residual
@@ -523,9 +524,21 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 ctx,
             )
 
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
+            if self.is_moe and self._can_fuse_post_attn_quant(hidden_states):
+                hp_norm, residual, fp4, sf = (
+                    self.comm_manager.post_attn_reduce_norm_quant(
+                        hidden_states,
+                        residual,
+                        ctx,
+                        sf_scale=self.mlp.experts.w13_input_scale_quant,
+                    )
+                )
+                hidden_states = hp_norm
+                prequantized_input = (fp4, sf)
+            else:
+                hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
+                    hidden_states, residual, ctx
+                )
 
         hidden_states = self.forward_mlp(
             hidden_states,
@@ -533,9 +546,35 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             ctx,
             num_global_tokens,
             max_num_tokens_per_gpu,
+            prequantized_input=prequantized_input,
         )
 
         return hidden_states, residual
+
+    def _can_fuse_post_attn_quant(self, hidden_states: torch.Tensor) -> bool:
+        """Check whether the fused RMSNorm+FP4-quant path is currently admissible.
+
+        Returns False (fall back to ``post_attn_reduce_norm``) unless:
+          * the MoE backend is the TRT-LLM FP4 backend (it understands
+            ``prequantized_input``);
+          * comm_manager.can_fuse_post_attn_quant agrees (SM/hidden_size/server
+            arg gating);
+          * input dtype is fp16/bf16 (kernel constraint);
+          * w13_input_scale_quant is materialised (post weight-loading).
+        """
+        if not isinstance(self.mlp, Qwen3_5MoeSparseMoeBlock):
+            return False
+        backend = getattr(self.mlp.experts, "backend", None)
+        if backend is None or type(backend).__name__ != "Nvfp4FlashinferTrtllmBackend":
+            return False
+        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if not hasattr(self.mlp.experts, "w13_input_scale_quant"):
+            return False
+        return self.comm_manager.can_fuse_post_attn_quant(
+            num_tokens=hidden_states.shape[0],
+            hidden_size=hidden_states.shape[-1],
+        )
 
     def forward_mlp(
         self,
@@ -544,10 +583,15 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         ctx: ForwardContext,
         num_global_tokens,
         max_num_tokens_per_gpu,
+        prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         if isinstance(self.mlp, Qwen3_5MoeSparseMoeBlock):
             hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
+                hidden_states,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                ctx,
+                prequantized_input=prequantized_input,
             )
         else:
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)

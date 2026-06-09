@@ -226,13 +226,22 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
+        prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if self.use_deepep:
+            # _forward_deepep does its own per-rank dispatch + fp4 quant inside
+            # the dispatcher, so the post-attn fused (FP4-quant) precomputation
+            # is irrelevant there. Drop the precomputed buffers if the upstream
+            # gating slipped through; downstream behavior is unchanged.
             return self._forward_deepep(
                 hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
             )
         return self._forward_tp(
-            hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
+            hidden_states,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            ctx,
+            prequantized_input=prequantized_input,
         )
 
     def _forward_tp(
@@ -241,6 +250,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
+        prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -278,6 +288,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 topk_output=topk_output,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                prequantized_input=prequantized_input,
             )
 
         if shared_output is not None:

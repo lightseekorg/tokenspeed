@@ -299,6 +299,78 @@ class CommManager:
             hidden_states, residual = self.post_attn_layernorm(hidden_states, residual)
         return hidden_states, residual
 
+    # ---- Fused allreduce + post-attn RMSNorm + NVFP4 quant (prefill MoE only) ----
+
+    def can_fuse_post_attn_quant(self, num_tokens: int, hidden_size: int) -> bool:
+        """Gating helper: True iff post_attn_reduce_norm_quant() is admissible.
+
+        Conditions (kept centralised so callers don't replicate them):
+          * The current layer is MoE and its TP comm pattern is allreduce.
+          * The 4-pattern allreduce+norm fusion does NOT apply (otherwise that
+            path is preferred and we shouldn't intercept it).
+          * hidden_size in [2048, 16384] and divisible by 16 (kernel constraint).
+          * GPU is SM90 (Hopper) or newer.
+          * The ``enable_fused_rmsnorm_fp4_quant`` server arg is enabled.
+        """
+        if not self.use_all_reduce(is_moe=True):
+            return False
+        if self.should_fuse(num_tokens):
+            return False
+        if hidden_size < 2048 or hidden_size > 16384 or hidden_size % 16 != 0:
+            return False
+
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if not global_server_args_dict.get("enable_fused_rmsnorm_fp4_quant", False):
+            return False
+
+        # SM check: cache once per process. We ask torch (already initialised by
+        # the time decoder.forward is called) rather than calling cudaGetDeviceProperties.
+        sm_major = getattr(self, "_sm_major_cache", None)
+        if sm_major is None:
+            try:
+                sm_major = torch.cuda.get_device_capability()[0]
+            except Exception:
+                sm_major = 0
+            self._sm_major_cache = sm_major
+        return sm_major >= 9
+
+    def post_attn_reduce_norm_quant(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+        sf_scale: torch.Tensor | None,
+    ):
+        """Allreduce -> (residual + RMSNorm + NVFP4 quant) in a single fused kernel.
+
+        Replaces the no-fuse branch of ``post_attn_reduce_norm`` for the
+        prefill MoE path. Caller must have verified ``can_fuse_post_attn_quant``.
+
+        Returns a 4-tuple ``(hp_norm, residual_out, fp4_packed_uint8, sf_uint8)``:
+          * ``hp_norm``: bf16/fp16 normed activations for the MoE gate /
+            shared-expert path (same layout as the original
+            ``post_attn_reduce_norm`` first return).
+          * ``residual_out``: pre-norm sum (input + residual) used as the next
+            layer's residual input.
+          * ``fp4_packed_uint8``: ``[M, hidden_size // 2]`` uint8 packed FP4
+            activations consumed by the MoE FP4 GEMM.
+          * ``sf_uint8``: 1-D uint8 buffer in TRT-LLM swizzled SF layout.
+        """
+        from tokenspeed_kernel.thirdparty.cuda import fused_add_rmsnorm_fp4_quant
+
+        # The 4-pattern fusion path is excluded by gating; only no-fuse remains.
+        hidden_states, residual = self.post_attn_comm(hidden_states, residual, ctx)
+        fp4, residual_out, sf_out, hp_norm = fused_add_rmsnorm_fp4_quant(
+            hidden_states,
+            residual,
+            self.post_attn_layernorm.weight,
+            sf_scale,
+            eps=self.post_attn_layernorm.variance_epsilon,
+            output_hp_norm=True,
+        )
+        return hp_norm, residual_out, fp4, sf_out
+
     def post_mlp_fused(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):

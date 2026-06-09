@@ -26,6 +26,9 @@ from tokenspeed_kernel.thirdparty.cuda.activation import (
 )
 from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
 from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import fp32_router_gemm
+from tokenspeed_kernel.thirdparty.cuda.fused_add_rmsnorm_fp4_quant import (
+    fused_add_rmsnorm_fp4_quant,
+)
 from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
     fused_topk_topp_renorm,
     fused_topk_topp_workspace_size,
@@ -52,6 +55,7 @@ __all__ = [
     "chain_speculative_sampling_target_only",
     "dsv3_router_gemm",
     "fp32_router_gemm",
+    "fused_add_rmsnorm_fp4_quant",
     "fused_topk_topp_prepare",
     "fused_topk_topp_renorm",
     "fused_topk_topp_workspace_size",
