@@ -14,8 +14,22 @@ from tokenspeed_kernel.platform import current_platform
 
 # Standard OCP MXFP4 (E2M1) value table; index is the 4-bit code.
 _E2M1_VALUES = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 ]
 
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -58,7 +72,9 @@ def _build_case(
     s13 = torch.full((E, 2 * I, D // 32), 127, device=device, dtype=torch.uint8)
     s2 = torch.full((E, D, I // 32), 127, device=device, dtype=torch.uint8)
     w13_bias = (
-        torch.randn((E, 2 * I), device=device, dtype=torch.float32) if use_bias else None
+        torch.randn((E, 2 * I), device=device, dtype=torch.float32)
+        if use_bias
+        else None
     )
     w2_bias = (
         torch.randn((E, D), device=device, dtype=torch.float32) if use_bias else None
@@ -85,11 +101,24 @@ def _build_case(
         out_dtype=torch.bfloat16,
     )
     return {
-        "M": M, "E": E, "D": D, "I": I, "topk": topk, "use_bias": use_bias,
-        "hidden": hidden, "router": router,
-        "w13": w13, "w2": w2, "w13_bias": w13_bias, "w2_bias": w2_bias,
-        "wt13": wt13, "wt2": wt2, "pc1": pc1, "pc2": pc2,
-        "scale1": scale1, "scale2": scale2,
+        "M": M,
+        "E": E,
+        "D": D,
+        "I": I,
+        "topk": topk,
+        "use_bias": use_bias,
+        "hidden": hidden,
+        "router": router,
+        "w13": w13,
+        "w2": w2,
+        "w13_bias": w13_bias,
+        "w2_bias": w2_bias,
+        "wt13": wt13,
+        "wt2": wt2,
+        "pc1": pc1,
+        "pc2": pc2,
+        "scale1": scale1,
+        "scale2": scale2,
     }
 
 
