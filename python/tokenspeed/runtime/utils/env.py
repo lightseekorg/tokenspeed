@@ -240,6 +240,7 @@ class Envs:
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
+    TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)

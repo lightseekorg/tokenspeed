@@ -71,6 +71,10 @@ _ENGINE_EXPLICIT = {"--tensor-parallel-size"}
 
 _MODEL_FLAG_TOKENS = ("--model", "--model-path")
 
+_ENGINE_MULTI_VALUE_FLAGS = {
+    "--cudagraph-capture-sizes",
+}
+
 
 def _has_model_flag(tokens: Iterable[str]) -> bool:
     for token in tokens:
@@ -97,13 +101,13 @@ class SplitResult:
     opts: OrchestratorOpts = field(default_factory=OrchestratorOpts)
 
 
-def _normalize(argv: Iterable[str]) -> list[tuple[str, str | None]]:
+def _normalize(argv: Iterable[str]) -> list[tuple[str, list[str] | str | None]]:
     """Convert raw argv into a list of (name, value) pairs.
 
     Handles both ``--flag value`` and ``--flag=value`` forms. Aliases are
     resolved to their canonical names.
     """
-    items: list[tuple[str, str | None]] = []
+    items: list[tuple[str, list[str] | str | None]] = []
     tokens = list(argv)
     i = 0
     while i < len(tokens):
@@ -112,18 +116,35 @@ def _normalize(argv: Iterable[str]) -> list[tuple[str, str | None]]:
             raise ValueError(f"unexpected positional arg: {raw!r}")
         if "=" in raw:
             name, _, value = raw.partition("=")
+            name = _ALIASES.get(name, name)
             i += 1
         else:
-            name = raw
+            name = _ALIASES.get(raw, raw)
             nxt = tokens[i + 1] if i + 1 < len(tokens) else None
             if nxt is None or nxt.startswith("--"):
                 value = None
                 i += 1
+            elif name in _ENGINE_MULTI_VALUE_FLAGS:
+                values = []
+                i += 1
+                while i < len(tokens) and not tokens[i].startswith("--"):
+                    values.append(tokens[i])
+                    i += 1
+                value = values
             else:
                 value = nxt
                 i += 2
-        items.append((_ALIASES.get(name, name), value))
+        items.append((name, value))
     return items
+
+
+def _append_arg(args: list[str], name: str, value: list[str] | str | None) -> None:
+    if value is None:
+        args.append(name)
+    elif isinstance(value, list):
+        args.extend([name, *value])
+    else:
+        args.extend([name, value])
 
 
 @functools.lru_cache(maxsize=1)
@@ -191,38 +212,32 @@ def split_argv(argv: list[str]) -> SplitResult:
         if name in _FANOUT_FLAGS:
             if value is None:
                 raise ValueError(f"{name} requires a value")
-            result.engine.extend([name, value])
-            result.gateway.extend([name, value])
+            _append_arg(result.engine, name, value)
+            _append_arg(result.gateway, name, value)
             continue
 
         if name in _GATEWAY_USER_FACING:
             if value is None:
                 raise ValueError(f"{name} requires a value")
-            result.gateway.extend([name, value])
+            _append_arg(result.gateway, name, value)
             continue
 
         if name in _GATEWAY_OVERRIDE:
             if value is None:
                 raise ValueError(f"{name} requires a value")
-            result.gateway.extend([name, value])
+            _append_arg(result.gateway, name, value)
             continue
 
         if name in _ENGINE_EXPLICIT:
             if value is None:
                 raise ValueError(f"{name} requires a value")
-            result.engine.extend([name, value])
+            _append_arg(result.engine, name, value)
             continue
 
         if name in engine_flags:
-            if value is not None:
-                result.engine.extend([name, value])
-            else:
-                result.engine.append(name)
+            _append_arg(result.engine, name, value)
             continue
 
-        if value is not None:
-            result.gateway.extend([name, value])
-        else:
-            result.gateway.append(name)
+        _append_arg(result.gateway, name, value)
 
     return result

@@ -177,6 +177,12 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--max-num-seqs", "256"])
         self.assertEqual(args.max_num_seqs, 256)
 
+    def test_dp_sampling_backend_arg_removed(self):
+        with self.assertRaises(SystemExit):
+            self._parse_args(
+                ["--model", "test/model", "--dp-sampling-backend", "onesided"]
+            )
+
     def test_max_prefill_tokens_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--max-prefill-tokens", "4096"]
@@ -503,6 +509,21 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_basic_defaults()
         with self.assertRaisesRegex(ValueError, "speculative_eagle_topk"):
             sa.resolve_speculative_decoding()
+
+    def test_dp_sampling_is_opt_in(self):
+        args = self._parse_args(["--model", "test/model"])
+        sa = self._from_cli_args_no_init(args)
+        self.assertFalse(sa.dp_sampling)
+        self.assertIsNone(sa.dp_sampling_min_bs)
+
+        args = self._parse_args(["--model", "test/model", "--dp-sampling"])
+        sa = self._from_cli_args_no_init(args)
+        self.assertTrue(sa.dp_sampling)
+
+    def test_dp_sampling_min_bs_arg(self):
+        args = self._parse_args(["--model", "test/model", "--dp-sampling-min-bs", "16"])
+        sa = self._from_cli_args_no_init(args)
+        self.assertEqual(sa.dp_sampling_min_bs, 16)
 
     # ---- Full server command example ----
 

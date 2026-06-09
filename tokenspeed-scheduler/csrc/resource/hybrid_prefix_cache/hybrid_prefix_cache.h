@@ -109,6 +109,9 @@ public:
     // Owned pages return to the pool via OwnedPages RAII; borrowed ids are dropped.
     void ReleaseRequest(const std::string& request_id);
 
+    // Reclaim request-local paged-cache tail slots beyond the accepted token length.
+    void RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens);
+
     // Fill op.paged_cache_pages / op.paged_cache_page_base_offsets from the tables.
     void PopulateOp(ForwardOperationBase& op_base) const;
 
@@ -139,6 +142,16 @@ public:
 
     // Callback from KV prefix-cache eviction.
     void OnKVEvict(TreeNode* node);
+
+    // Callback from RadixTree just before a node is destroyed by prune. Drops
+    // the dying node from every adjunct bookkeeping set that holds raw
+    // TreeNode* (mamba_leaves_, paged_cache_snapshot_nodes_) so no dangling
+    // pointer survives the free. Unlike OnKVEvict this must NOT detach the
+    // node's slots — the node (and its owned unique_ptr<MambaSlot> /
+    // PagedCacheSnapshot) is being destroyed, so the destructors free them; we
+    // only un-register the membership. Safe to call on a node that was never
+    // tracked (erase is a no-op).
+    void OnNodeDestroyed(TreeNode* node);
 
     std::int32_t AvailableSlots() const;
     KVPrefixCache& GetKVPrefixCache() { return kv_prefix_cache_; }

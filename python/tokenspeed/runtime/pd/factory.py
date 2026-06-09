@@ -30,6 +30,18 @@ from tokenspeed.runtime.pd.utils import (
 )
 
 
+def _get_contiguous_buf_unit_lens(pool, item_lens):
+    getter = getattr(pool, "get_contiguous_buf_unit_lens", None)
+    if getter is None:
+        return [1] * len(item_lens)
+    unit_lens = list(getter())
+    if len(unit_lens) != len(item_lens):
+        raise ValueError(
+            f"contiguous buffer unit count mismatch: units={len(unit_lens)}, items={len(item_lens)}"
+        )
+    return unit_lens
+
+
 def get_kv_args(
     engine_rank: int,
     gpu_id,
@@ -41,6 +53,7 @@ def get_kv_args(
     kv_data_ptrs, kv_data_lens, kv_item_lens = (
         token_to_kv_pool.get_contiguous_buf_infos()
     )
+    kv_unit_lens = _get_contiguous_buf_unit_lens(token_to_kv_pool, kv_item_lens)
     # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
     offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
     target_layer_num = token_to_kv_pool.layer_num
@@ -53,6 +66,9 @@ def get_kv_args(
         draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
             draft_token_to_kv_pool.get_contiguous_buf_infos()
         )
+        draft_kv_unit_lens = _get_contiguous_buf_unit_lens(
+            draft_token_to_kv_pool, draft_kv_item_lens
+        )
         draft_offsets = draft_token_to_kv_pool.get_layerwise_buf_info_offsets(
             len(kv_data_ptrs)
         )
@@ -60,6 +76,7 @@ def get_kv_args(
         kv_data_ptrs += draft_kv_data_ptrs
         kv_data_lens += draft_kv_data_lens
         kv_item_lens += draft_kv_item_lens
+        kv_unit_lens += draft_kv_unit_lens
         offsets += draft_offsets
         draft_base_layer_id = (
             max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
@@ -73,12 +90,14 @@ def get_kv_args(
     state_data_ptrs = []
     state_data_lens = []
     state_item_lens = []
+    state_unit_lens = []
     state_type = "none"
     state_layer_ids = []
     if mamba_pool is not None:
         state_data_ptrs, state_data_lens, state_item_lens = (
             mamba_pool.get_contiguous_buf_infos()
         )
+        state_unit_lens = _get_contiguous_buf_unit_lens(mamba_pool, state_item_lens)
         state_layer_ids = mamba_pool.get_contiguous_buf_layer_ids()
         state_type = "mamba"
 
@@ -90,9 +109,11 @@ def get_kv_args(
         target_layer_num=target_layer_num,
         draft_layer_num=draft_layer_num,
         kv_layer_ids=kv_layer_ids,
+        kv_unit_lens=kv_unit_lens,
         state_data_ptrs=state_data_ptrs,
         state_data_lens=state_data_lens,
         state_item_lens=state_item_lens,
+        state_unit_lens=state_unit_lens,
         state_type=state_type,
         state_layer_ids=state_layer_ids,
         mamba_offsets=[],

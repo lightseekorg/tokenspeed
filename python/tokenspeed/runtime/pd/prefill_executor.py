@@ -103,6 +103,19 @@ class DisaggPrefillExecutor:
             bootstrap_room=info.bootstrap_room,
         )
 
+    def _drop_request_state(self, req_id: str) -> None:
+        # Best-effort cleanup of all per-request state so failed/aborted
+        # requests do not leak into the bookkeeping dicts. request_id is
+        # stable (not a reusable slot index), so without explicit pop here
+        # these entries would live until the engine restarts.
+        sender = self.senders.pop(req_id, None)
+        if sender is not None:
+            self.kv_manager.discard_expired_metadata_room(sender.bootstrap_room)
+        self._local_states.pop(req_id, None)
+        self._request_token.pop(req_id, None)
+        self._request_spec_candidate_ids.pop(req_id, None)
+        self._layerwise_token_published.discard(req_id)
+
     @staticmethod
     def _mamba_indices(op, index: int):
         indices = getattr(op, "mamba_pool_indices", None)
@@ -158,7 +171,14 @@ class DisaggPrefillExecutor:
             return
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
         for i, request_id in enumerate(op.request_ids[: op.num_extends()]):
-            sender = self.senders[request_id]
+            sender = self.senders.get(request_id)
+            if sender is None:
+                logger.debug(
+                    "[prefill][prepare_prefill] skipping request_id=%s without sender",
+                    request_id,
+                )
+                self._drop_request_state(request_id)
+                continue
             kv_indices, index_slice, is_last = self._prefill_page_window(op, i, sender)
             if len(kv_indices) == 0 and not is_last:
                 continue
@@ -178,10 +198,17 @@ class DisaggPrefillExecutor:
         is_last = True
 
         for i, request_id in enumerate(op.request_ids):
+            sender = self.senders.get(request_id)
+            if sender is None:
+                logger.debug(
+                    "[prefill][_decode] skipping request_id=%s without sender",
+                    request_id,
+                )
+                self._drop_request_state(request_id)
+                continue
             aux_index = op.request_pool_indices[i]
             bootstrap_token = self._request_token.pop(request_id, -1)
             spec_candidate_ids = self._request_spec_candidate_ids.pop(request_id, None)
-            sender = self.senders[request_id]
             if sender.has_layerwise_transfer():
                 if request_id not in self._layerwise_token_published:
                     self.kv_manager.set_prefill_metadata(
@@ -260,16 +287,6 @@ class DisaggPrefillExecutor:
             else:
                 pass
         for req_id in to_remove:
-            # Best-effort cleanup of all per-request state so failed/aborted
-            # requests do not leak into the bookkeeping dicts. request_id is
-            # stable (not a reusable slot index), so without explicit pop here
-            # these entries would live until the engine restarts.
-            sender = self.senders.pop(req_id, None)
-            if sender is not None:
-                self.kv_manager.discard_expired_metadata_room(sender.bootstrap_room)
-            self._local_states.pop(req_id, None)
-            self._request_token.pop(req_id, None)
-            self._request_spec_candidate_ids.pop(req_id, None)
-            self._layerwise_token_published.discard(req_id)
+            self._drop_request_state(req_id)
 
         return events

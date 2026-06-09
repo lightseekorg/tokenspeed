@@ -190,6 +190,8 @@ class ServerArgs:
     attention_backend: str | None = None
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
+    dp_sampling: bool = False
+    dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
     mha_extend_mode: Literal["paged", "ragged"] = "paged"
@@ -1309,6 +1311,22 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+        )
+        parser.add_argument(
+            "--dp-sampling",
+            action="store_true",
+            default=ServerArgs.dp_sampling,
+            help=(
+                "Enable Batch-DP spec-verify sampling. Backend selection defaults "
+                "to auto; override with TOKENSPEED_DP_SAMPLING_BACKEND."
+            ),
+        )
+        parser.add_argument(
+            "--dp-sampling-min-bs",
+            type=int,
+            default=ServerArgs.dp_sampling_min_bs,
+            help="Minimum effective decode batch for Batch-DP spec-verify. "
+            "Defaults to 2 * TP size.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",

@@ -63,7 +63,7 @@ def _add_tokenspeed_servicer(server) -> None:
                 pad_token_id=0,
                 bos_token_id=1,
                 weight_version="fake-v0",
-                preferred_sampling_params="",
+                default_sampling_params_json="",
             )
 
         def HealthCheck(self, request, context):

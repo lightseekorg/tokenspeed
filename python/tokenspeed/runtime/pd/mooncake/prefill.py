@@ -42,6 +42,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (
     TransferInfo,
     TransferKVChunk,
 )
+from tokenspeed.runtime.pd.transfer_plan import BufferKind, TransferFragment
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
     FastQueue,
@@ -158,19 +159,28 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     ) -> tuple[int, Optional[list[int]]]:
         if room is None or fallback_token != -1:
             return fallback_token, fallback_candidate_ids
-        deadline = time.monotonic() + envs.TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT.get()
+        wait_log_interval = max(envs.TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT.get(), 0.01)
+        start_time = time.monotonic()
+        next_log_time = start_time + wait_log_interval
         with self.bootstrap_token_cond:
             while room not in self.prefill_metadata:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if self.request_status.get(room) == KVPoll.Failed:
                     self.expired_prefill_metadata_rooms.add(room)
                     logger.warning(
-                        "Timed out waiting for prefill metadata for bootstrap_room=%s; using fallback=%s",
+                        "Prefill metadata unavailable for failed bootstrap_room=%s; using fallback=%s",
                         room,
                         fallback_token,
                     )
                     return fallback_token, fallback_candidate_ids
-                self.bootstrap_token_cond.wait(timeout=min(0.01, remaining))
+                now = time.monotonic()
+                if now >= next_log_time:
+                    logger.debug(
+                        "Still waiting for prefill metadata for bootstrap_room=%s after %.2fs",
+                        room,
+                        now - start_time,
+                    )
+                    next_log_time = now + wait_log_interval
+                self.bootstrap_token_cond.wait(timeout=0.01)
             return self.prefill_metadata.pop(room)
 
     def _is_session_failed(self, mooncake_session_id: str) -> bool:
@@ -327,6 +337,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
         executor: concurrent.futures.ThreadPoolExecutor,
+        transfer_fragments: tuple[TransferFragment, ...] = (),
     ):
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -339,6 +350,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             dst_blocks=dst_kv_blocks,
             begin_layer_id=0,
             end_layer_id=self.layer_num,
+            transfer_fragments=transfer_fragments,
         )
         return self._transfer_data(mooncake_session_id, transfer_blocks)
 
@@ -349,13 +361,45 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_blocks,
         begin_layer_id: int,
         end_layer_id: int,
+        transfer_fragments: tuple[TransferFragment, ...] = (),
     ) -> List[Tuple[int, int, int]]:
         transfer_blocks = []
+        fragments_by_buffer: dict[int, list[TransferFragment]] = defaultdict(list)
+        for fragment in transfer_fragments:
+            if fragment.buffer_kind != BufferKind.MAMBA_STATE:
+                fragments_by_buffer[fragment.buffer_index].append(fragment)
+        has_fragment_plan = bool(transfer_fragments)
+
         for layer_id in range(begin_layer_id, end_layer_id):
             for ptr_offset in self.kv_args.offsets[layer_id]:
                 src_ptr = self.kv_args.kv_data_ptrs[ptr_offset]
                 dst_ptr = dst_ptrs[ptr_offset]
                 item_len = self.kv_args.kv_item_lens[ptr_offset]
+                buffer_fragments = fragments_by_buffer.get(ptr_offset, ())
+                if has_fragment_plan:
+                    for fragment in buffer_fragments:
+                        for prefill_index, decode_index in zip(src_blocks, dst_blocks):
+                            page_count = min(len(prefill_index), len(decode_index))
+                            if fragment.page_count is not None:
+                                page_count = min(page_count, fragment.page_count)
+                            for page_offset in range(page_count):
+                                src_addr = (
+                                    src_ptr
+                                    + int(prefill_index[page_offset])
+                                    * fragment.src_page_stride_bytes
+                                    + fragment.src_byte_offset
+                                )
+                                dst_addr = (
+                                    dst_ptr
+                                    + int(decode_index[page_offset])
+                                    * fragment.dst_page_stride_bytes
+                                    + fragment.dst_byte_offset
+                                )
+                                transfer_blocks.append(
+                                    (src_addr, dst_addr, fragment.bytes_per_page)
+                                )
+                    continue
+
                 for prefill_index, decode_index in zip(src_blocks, dst_blocks):
                     src_addr = src_ptr + int(prefill_index[0]) * item_len
                     dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -380,6 +424,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_mamba_indices: Optional[npt.NDArray[np.int64]],
         begin_layer_id: Optional[int] = None,
         end_layer_id: Optional[int] = None,
+        transfer_fragments: tuple[TransferFragment, ...] = (),
     ) -> int:
         if self.kv_args.state_type != "mamba":
             return 0
@@ -415,7 +460,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
                 return -1
 
-        state_items = list(zip(state_ptrs, dst_state_data_ptrs, state_item_lens))
+        state_items = list(
+            enumerate(zip(state_ptrs, dst_state_data_ptrs, state_item_lens))
+        )
         if begin_layer_id is not None or end_layer_id is not None:
             begin = 0 if begin_layer_id is None else begin_layer_id
             end = self.layer_num if end_layer_id is None else end_layer_id
@@ -444,7 +491,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 begin_layer_id,
                 end_layer_id,
                 len(state_items),
-                sum(item_len for _, _, item_len in state_items) * int(valid.sum()),
+                sum(item_len for _, (_, _, item_len) in state_items) * int(valid.sum()),
             )
         if not valid.any():
             return 0
@@ -453,7 +500,38 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_indices = dst_mamba_indices[valid]
         src_blocks, dst_blocks = group_concurrent_contiguous(src_indices, dst_indices)
         transfer_blocks = []
-        for src_ptr, dst_ptr, item_len in state_items:
+        state_fragments_by_buffer: dict[int, list[TransferFragment]] = defaultdict(list)
+        for fragment in transfer_fragments:
+            if fragment.buffer_kind == BufferKind.MAMBA_STATE:
+                state_fragments_by_buffer[fragment.buffer_index].append(fragment)
+        has_state_fragment_plan = bool(state_fragments_by_buffer)
+
+        for state_index, (src_ptr, dst_ptr, item_len) in state_items:
+            buffer_fragments = state_fragments_by_buffer.get(state_index, ())
+            if has_state_fragment_plan:
+                for fragment in buffer_fragments:
+                    for prefill_index, decode_index in zip(src_blocks, dst_blocks):
+                        page_count = min(len(prefill_index), len(decode_index))
+                        if fragment.page_count is not None:
+                            page_count = min(page_count, fragment.page_count)
+                        for page_offset in range(page_count):
+                            src_addr = (
+                                src_ptr
+                                + int(prefill_index[page_offset])
+                                * fragment.src_page_stride_bytes
+                                + fragment.src_byte_offset
+                            )
+                            dst_addr = (
+                                dst_ptr
+                                + int(decode_index[page_offset])
+                                * fragment.dst_page_stride_bytes
+                                + fragment.dst_byte_offset
+                            )
+                            transfer_blocks.append(
+                                (src_addr, dst_addr, fragment.bytes_per_page)
+                            )
+                continue
+
             for prefill_index, decode_index in zip(src_blocks, dst_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -483,6 +561,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_state_data_ptrs: Optional[list[int]] = None,
         prefill_mamba_indices: Optional[npt.NDArray[np.int64]] = None,
         dst_mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        transfer_fragments: tuple[TransferFragment, ...] = (),
     ) -> int:
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -517,6 +596,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             dst_blocks=dst_kv_blocks,
                             begin_layer_id=kv_layer_index,
                             end_layer_id=kv_layer_index + 1,
+                            transfer_fragments=transfer_fragments,
                         )
                     )
             if transfer_blocks:
@@ -541,6 +621,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 dst_mamba_indices,
                 begin_layer_id=begin_layer_id,
                 end_layer_id=end_layer_id,
+                transfer_fragments=transfer_fragments,
             )
             if ret != 0:
                 return ret
@@ -640,6 +721,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 dst_kv_ptrs,
                                 resolved.dst_indices,
                                 executor,
+                                req.transfer_fragments,
                             )
                         else:
                             ret = self.send_kvcache_layerwise(
@@ -654,6 +736,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 ].dst_state_data_ptrs,
                                 kv_chunk.prefill_mamba_indices,
                                 req.dst_mamba_indices,
+                                req.transfer_fragments,
                             )
                         if (
                             ret == 0
@@ -679,6 +762,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                     req.mooncake_session_id
                                 ].dst_state_data_ptrs,
                                 req.dst_mamba_indices,
+                                transfer_fragments=req.transfer_fragments,
                             )
                         logger.debug(
                             "[TRANSFER_WORKER] send_kvcache returned %s for room %s",
@@ -734,6 +818,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                         kv_chunk.spec_candidate_ids,
                                     )
                                 )
+                                if self.check_status(req.room) == KVPoll.Failed:
+                                    status = KVPoll.Failed
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
@@ -929,6 +1015,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
             "enable_mla_l1_5_cache": self.args.enable_mla_l1_5_cache,
+            "kv_item_lens": self.kv_args.kv_item_lens,
+            "kv_unit_lens": getattr(self.kv_args, "kv_unit_lens", []),
+            "state_item_lens": self.kv_args.state_item_lens,
+            "state_unit_lens": getattr(self.kv_args, "state_unit_lens", []),
         }
 
         try:

@@ -102,15 +102,13 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     prefix=add_prefix("lm_head", prefix),
                 )
 
-        if self.mapping.attn.has_dp:
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
-        else:
-            self.logits_processor = LogitsProcessor(
-                config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
 
     def get_hot_token_id(self):
         return None
@@ -135,7 +133,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         **kwargs,
@@ -170,7 +167,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             input_embeds=hidden_states,
         )
 
-        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

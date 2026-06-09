@@ -185,7 +185,7 @@ jobs:
               cd /workspace/tokenspeed-kernel/python
 
               "${PYBIN}/python" -m pip install --upgrade \
-                pip "setuptools<82" wheel build twine packaging "apache-tvm-ffi>=0.1.5"
+                pip "setuptools<82" wheel build twine packaging "apache-tvm-ffi>=0.1.5,<=0.1.11"
               "${PYBIN}/python" -m pip install --no-cache-dir "torch==2.11.0" --index-url "${TORCH_INDEX_URL}"
 
               rm -rf build *.egg-info
@@ -227,7 +227,7 @@ jobs:
       - name: Build source distribution
         run: |
           python -m pip install --upgrade \
-            build twine "setuptools<82" wheel packaging "apache-tvm-ffi>=0.1.5"
+            build twine "setuptools<82" wheel packaging "apache-tvm-ffi>=0.1.5,<=0.1.11"
           cd tokenspeed-kernel/python
           TOKENSPEED_KERNEL_BACKEND=cuda \
           TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \

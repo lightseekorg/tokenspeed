@@ -112,11 +112,9 @@ class BaseCausalLM(nn.Module):
 
     def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
 
-        if self.mapping.attn.has_dp:
-            return LogitsProcessor(config, skip_all_gather=True)
-
         return LogitsProcessor(
             config,
+            skip_all_gather=self.mapping.attn.has_dp,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
@@ -145,7 +143,6 @@ class BaseCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -158,7 +155,7 @@ class BaseCausalLM(nn.Module):
             out_cache_loc,
             **model_kwargs,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
 
         return self.logits_processor(
             input_ids,

@@ -23,10 +23,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
-from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -182,7 +182,7 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
         bs = logits.shape[0]
-        tokens = cute_argmax(logits, out=self._sample_token_buf[:bs])
+        tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
 
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
@@ -221,7 +221,7 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
 
         _verify_chain_greedy(
             predicts=predict,
