@@ -148,6 +148,15 @@ protected:
     }
 };
 
+class PagedCacheDecodePublishPlainSwaNoWindowTest : public PagedCacheDecodePublishPlainSwaTest {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PagedCacheDecodePublishPlainSwaTest::MakeConfig();
+        cfg.sliding_window_size = 0;
+        return cfg;
+    }
+};
+
 class PagedCacheDecodePublishHybridHistorySwaTest : public PagedCacheDecodePublishTest {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -543,6 +552,29 @@ TEST_F(PagedCacheDecodePublishPlainSwaTest, DecodeResultPublishesWindowCappedPre
 
     ASSERT_TRUE(prefix_by_request.contains("hit4"));
     EXPECT_EQ(prefix_by_request.at("hit4"), 4);
+}
+
+TEST_F(PagedCacheDecodePublishPlainSwaNoWindowTest, MidflightPublishIsDisabledWithoutSafeWindow) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    SendForwardDone("r1", {3, 4, 5, 6});
+
+    Submit(RequestSpec{.request_id = "hit4", .tokens = {1, 2, 3, 4, 5, 6}});
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_GE(fwd->extend_prefix_lens.size(), 1u);
+
+    std::unordered_map<std::string, std::int32_t> prefix_by_request;
+    for (std::size_t row = 0; row < fwd->extend_prefix_lens.size(); ++row) {
+        ASSERT_LT(row, fwd->request_ids.size());
+        prefix_by_request.emplace(fwd->request_ids[row], fwd->extend_prefix_lens[row]);
+    }
+
+    ASSERT_TRUE(prefix_by_request.contains("hit4"));
+    EXPECT_EQ(prefix_by_request.at("hit4"), 0);
 }
 
 TEST_F(PagedCacheDecodePublishHybridHistorySwaTest, MidflightPublishRequiresWindowState) {

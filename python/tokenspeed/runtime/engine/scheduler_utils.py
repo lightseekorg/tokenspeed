@@ -49,11 +49,12 @@ def scheduler_sliding_window_args(hf_config: Any) -> tuple[bool, int]:
     if sliding_window is None:
         return False, 0
     if getattr(hf_config, "model_type", None) == "gpt_oss":
-        # gpt-oss mixes full-attention and sliding-attention layers in a plain
-        # MHA KV pool. The scheduler must publish full prefix nodes so the full
-        # layers can replay all cached KV; sliding layers apply their window in
-        # the attention kernel.
-        return False, 0
+        # gpt-oss mixes full-attention and sliding-attention layers with
+        # attention sinks in a plain MHA KV pool. Prefix hits remain valid after
+        # a request finishes, but the current mid-flight publish paths are not
+        # numerically equivalent for this mix, so use the SWA guard with no safe
+        # plain publish window.
+        return True, 0
     return True, int(sliding_window)
 
 
