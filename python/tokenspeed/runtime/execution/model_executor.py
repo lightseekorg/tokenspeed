@@ -49,6 +49,7 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
+    DpSamplingTopology,
     resolve_dp_sampling_support,
     resolve_dp_sampling_runtime,
 )
@@ -301,7 +302,15 @@ class ModelExecutor:
             )
 
         processor = self.model_runner.model.logits_processor
-        dp_topology = processor.dp_sampling_topology()
+        dp_topology = DpSamplingTopology(
+            tp_rank=processor.tp_rank,
+            tp_size=processor.tp_size,
+            tp_group=processor.tp_group,
+            skip_all_gather=processor.skip_all_gather,
+            tie_word_embeddings=bool(
+                getattr(processor.config, "tie_word_embeddings", False)
+            ),
+        )
         dp_support = resolve_dp_sampling_support(
             requested=self.config.dp_sampling,
             drafter_available=self.drafter is not None,

@@ -43,7 +43,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 )
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
-    DpSamplingTopology,
 )
 from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
@@ -214,17 +213,6 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
-
-    def dp_sampling_topology(self) -> DpSamplingTopology:
-        return DpSamplingTopology(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            tp_group=self.tp_group,
-            skip_all_gather=self.skip_all_gather,
-            tie_word_embeddings=bool(
-                getattr(self.config, "tie_word_embeddings", False)
-            ),
-        )
 
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
