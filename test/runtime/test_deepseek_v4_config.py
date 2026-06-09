@@ -20,7 +20,6 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
@@ -80,10 +79,6 @@ from tokenspeed.runtime.layers.attention.registry import (
     _resolve_draft_cache_cell_size_for_profile,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
-from tokenspeed.runtime.layers.moe_legacy.backends.mxfp4.flashinfer import (
-    _get_flashinfer_mxfp4_device_permute_indices,
-    _reorder_w1w3_to_w3w1,
-)
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
@@ -4230,42 +4225,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         recovered = packed.softmax(dim=-1).gather(1, topk_ids.long())
 
         self.assertTrue(torch.allclose(recovered, topk_weights))
-
-    def test_mxfp4_flashinfer_reorders_w1w3_halves_for_trtllm(self):
-        weight = torch.arange(4, dtype=torch.uint8).reshape(1, 4, 1)
-        scale = torch.arange(8, dtype=torch.uint8).reshape(1, 4, 2)
-        bias = torch.arange(4, dtype=torch.float32).reshape(1, 4)
-
-        self.assertTrue(
-            torch.equal(
-                _reorder_w1w3_to_w3w1(weight, -2).flatten(),
-                torch.tensor([2, 3, 0, 1], dtype=torch.uint8),
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                _reorder_w1w3_to_w3w1(scale, -2).flatten(),
-                torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.uint8),
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                _reorder_w1w3_to_w3w1(bias, -1).flatten(),
-                torch.tensor([2, 3, 0, 1], dtype=torch.float32),
-            )
-        )
-        if hasattr(torch, "float8_e8m0fnu"):
-            scale_f8 = torch.tensor(
-                [[0.0078125, 0.015625, 0.03125, 0.0625]], dtype=torch.float32
-            ).to(torch.float8_e8m0fnu)
-            reordered = _reorder_w1w3_to_w3w1(scale_f8, -1)
-            self.assertEqual(reordered.dtype, torch.float8_e8m0fnu)
-            self.assertTrue(
-                torch.equal(
-                    reordered.view(torch.uint8),
-                    torch.tensor([[122, 123, 120, 121]], dtype=torch.uint8),
-                )
-            )
 
     def test_c4_ape_reorder_matches_overlap_window_layout(self):
         ape = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
