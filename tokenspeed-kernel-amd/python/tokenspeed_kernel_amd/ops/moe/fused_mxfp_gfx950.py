@@ -1847,14 +1847,16 @@ class MoESliceMNProgram:
             x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
 
             c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
-            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            # issue_x_top also refills the scale LDS slot. Read the
+            # current right-W scale before that slot is reused.
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
             w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
+            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
 
             c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
             mfma_idx += 1
             load_idx = self.issue_x_bot(load_idx, USE_MASK=-1)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
             w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
 
             c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
@@ -1869,14 +1871,14 @@ class MoESliceMNProgram:
             x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
 
             c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
-            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
             w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
+            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
 
             c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
             mfma_idx += 1
             load_idx = self.issue_x_bot(load_idx, USE_MASK=-1)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
             w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
 
             c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
@@ -1892,14 +1894,14 @@ class MoESliceMNProgram:
             x_bot, sx_bot = self.issue_local_load_x_sub(mfma_idx, 1)
 
             c_bl = self.mfma(x_bot, sx_bot, w_left, sw_left, c_bl)
-            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
             w_right, sw_right = self.issue_local_load_w_sub(mfma_idx, 1)
+            load_idx = self.issue_x_top(load_idx, USE_MASK=-1)
 
             c_tr = self.mfma(x_top, sx_top, w_right, sw_right, c_tr)
             mfma_idx += 1
             load_idx = self.issue_x_bot(load_idx, USE_MASK=-1)
-            gl.amd.cdna4.async_copy.wait_group(4 * NB - 2)
+            gl.amd.cdna4.async_copy.wait_group(4 * NB - 3)
             w_left, sw_left = self.issue_local_load_w_sub(mfma_idx, 0)
 
             c_br = self.mfma(x_bot, sx_bot, w_right, sw_right, c_br)
