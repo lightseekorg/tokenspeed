@@ -4630,19 +4630,36 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
             router_logits, top_k, router_logits.dtype
         )
 
-    # Current GPT-OSS path uses FP8 E4M3 activations with per-tensor scale.
-    from tokenspeed_kernel import quantize_fp8
-
+    fp8_dtype = (
+        getattr(
+            getattr(getattr(w13_precision_config, "flex_ctx", None), "lhs_data", None),
+            "dtype",
+            None,
+        )
+        or torch.float8_e4m3fn
+    )
+    fuse_input_quant = os.environ.get(
+        "TOKENSPEED_MOE_GLUON_FUSE_INPUT_QUANT", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         x_fp8 = hidden_states
+        quantize_x = False
+    elif fuse_input_quant:
+        # Experimental: quantize BF16/FP16 input tiles to FP8 in-register in
+        # stage1.  Currently slower than the standalone quantize_fp8 launch.
+        x_fp8 = hidden_states
+        quantize_x = True
     else:
+        from tokenspeed_kernel import quantize_fp8
+
         x_fp8 = quantize_fp8(hidden_states, scale=w13_act_scale, solution="triton")
+        quantize_x = False
     # Pass FP8 tensors directly to Gluon.  ``view(torch.uint8)`` materializes a
     # copy for float8 tensors on this stack and dominates small-M latency.
     x_u8 = x_fp8
 
     inter = torch.empty(
-        (n_tokens * top_k, I), dtype=x_fp8.dtype, device=hidden_states.device
+        (n_tokens * top_k, I), dtype=fp8_dtype, device=hidden_states.device
     )
     out_dtype = getattr(w2_precision_config, "out_dtype", None) or torch.bfloat16
     out = torch.empty((n_tokens, N), dtype=out_dtype, device=hidden_states.device)
@@ -4695,6 +4712,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
             BLOCK_K=BLOCK_K,
             BLOCK_N=S1_BLOCK_N,
             M_DUP=S1_M_DUP,
+            QUANTIZE_X=quantize_x,
             HAS_BIAS=w13_bias is not None,
             SWIGLU_ALPHA=float(swiglu_alpha),
             SWIGLU_LIMIT=float(swiglu_limit),
@@ -4730,6 +4748,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
             BLOCK_K=BLOCK_K,
             BLOCK_N=S1_BLOCK_N,
             M_DUP=S1_M_DUP,
+            QUANTIZE_X=quantize_x,
             HAS_BIAS=w13_bias is not None,
             SWIGLU_ALPHA=float(swiglu_alpha),
             SWIGLU_LIMIT=float(swiglu_limit),
@@ -5378,6 +5397,7 @@ def _warp_decode_topk_stage1_fp8_mxfp4_kernel(
     BLOCK_K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     M_DUP: gl.constexpr,
+    QUANTIZE_X: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -5476,6 +5496,9 @@ def _warp_decode_topk_stage1_fp8_mxfp4_kernel(
                     mask=k_elem < D,
                     other=0.0,
                 )
+                if QUANTIZE_X:
+                    x_scale_tile = gl.load(x_global_scale_ptr).to(gl.float32)
+                    a = (a.to(gl.float32) / x_scale_tile).to(gl.float8e4nv)
                 b_g = gl.load(
                     w_base
                     + k_pack.to(gl.int64) * stride_wk
@@ -5608,6 +5631,7 @@ def _warp_decode_stage1_fp8_mxfp4_kernel(
     BLOCK_K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     M_DUP: gl.constexpr,
+    QUANTIZE_X: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -5672,6 +5696,9 @@ def _warp_decode_stage1_fp8_mxfp4_kernel(
                     mask=k_elem < D,
                     other=0.0,
                 )
+                if QUANTIZE_X:
+                    x_scale_tile = gl.load(x_global_scale_ptr).to(gl.float32)
+                    a = (a.to(gl.float32) / x_scale_tile).to(gl.float8e4nv)
                 a_scale = gl.full(
                     (M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout
                 )
