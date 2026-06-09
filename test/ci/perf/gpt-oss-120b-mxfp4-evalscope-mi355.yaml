@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: perf-gpt-oss-120b-mxfp4-mi355
+name: perf-gpt-oss-120b-mxfp4-mi350
 type: perf
 triggers:
   - per-commit
