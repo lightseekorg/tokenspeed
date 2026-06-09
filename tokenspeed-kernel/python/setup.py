@@ -432,6 +432,7 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "fused_add_rmsnorm_fp4_quant" / "ws_layernorm_fp4_traits.cu",
             CUDA_CSRC_DIR / "fused_add_rmsnorm_fp4_quant" / "fused_add_rmsnorm_fp4_quant_binding.cu",
+            CUDA_CSRC_DIR / "fused_add_rmsnorm_fp4_quant" / "tllm_compat_impl.cu",
         ],
         [],
         # Generic-lambda heavy WS layernorm + warp-specialized launcher.
