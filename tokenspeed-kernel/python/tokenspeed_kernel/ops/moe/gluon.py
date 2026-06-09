@@ -70,6 +70,9 @@ _GLUON_DISABLED_ENV = (
     os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
 )
 
+# Stage2 split-K factor (applied across the whole small-M decode path).
+_WARP_DECODE_S2_SPLIT_K = 4
+
 
 def _as_int32(t):
     if t is None or t.dtype == torch.int32:
@@ -4688,14 +4691,30 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         num_warps=1,
     )
 
-    s2_grid = (n_tokens * ((N + S2_BLOCK_N - 1) // S2_BLOCK_N),)
+    n_tiles2 = (N + S2_BLOCK_N - 1) // S2_BLOCK_N
+    s2_split_k = _WARP_DECODE_S2_SPLIT_K
+    if s2_split_k > 1:
+        out_partial = torch.empty(
+            (s2_split_k, n_tokens, N), dtype=torch.float32, device=hidden_states.device
+        )
+        s2_dst = out_partial
+        s2_stride_om = out_partial.stride(1)
+        s2_stride_on = out_partial.stride(2)
+        s2_stride_ok = out_partial.stride(0)
+        s2_grid = (n_tokens * n_tiles2 * s2_split_k,)
+    else:
+        s2_dst = out
+        s2_stride_om = out.stride(0)
+        s2_stride_on = out.stride(1)
+        s2_stride_ok = 0
+        s2_grid = (n_tokens * n_tiles2,)
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
         inter,
         w2_raw,
         w2_scale,
         topk_ids,
         topk_weights,
-        out,
+        s2_dst,
         n_tokens,
         N,
         I,
@@ -4707,8 +4726,9 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         w2_scale.stride(0),
         w2_scale.stride(-2),
         w2_scale.stride(-1),
-        out.stride(0),
-        out.stride(1),
+        s2_stride_om,
+        s2_stride_on,
+        s2_stride_ok,
         w2_act_scale,
         b2,
         I_PACKED=I // 2,
@@ -4717,8 +4737,26 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         BLOCK_N=S2_BLOCK_N,
         M_DUP=S2_M_DUP,
         HAS_BIAS=w2_bias is not None,
+        SPLIT_K=s2_split_k,
         num_warps=1,
     )
+    if s2_split_k > 1:
+        R_BLOCK_N = 256
+        r_grid = (n_tokens * ((N + R_BLOCK_N - 1) // R_BLOCK_N),)
+        _warp_decode_stage2_reduce[r_grid](
+            out_partial,
+            out,
+            n_tokens,
+            N,
+            out_partial.stride(0),
+            out_partial.stride(1),
+            out_partial.stride(2),
+            out.stride(0),
+            out.stride(1),
+            SPLIT_K=s2_split_k,
+            BLOCK_N=R_BLOCK_N,
+            num_warps=1,
+        )
     return out
 
 
@@ -5547,6 +5585,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     stride_wsn,
     stride_om,
     stride_on,
+    stride_ok,
     x_global_scale_ptr,
     w2_bias,
     I_PACKED: gl.constexpr,
@@ -5555,13 +5594,32 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     BLOCK_N: gl.constexpr,
     M_DUP: gl.constexpr,
     HAS_BIAS: gl.constexpr,
+    SPLIT_K: gl.constexpr,
 ):
-    """Direct top-k stage2: FP8 intermediate x MXFP4 W2 -> BF16 output."""
+    """Direct top-k stage2: FP8 intermediate x MXFP4 W2 -> BF16 output.
+
+    With SPLIT_K > 1 the K (intermediate) reduction is partitioned across
+    SPLIT_K CTAs per output tile; each writes an fp32 partial into slice
+    ``pid_k`` of the destination, reduced by ``_warp_decode_stage2_reduce``.
+    Bias is added only by the first slice so it is not counted SPLIT_K times.
+    """
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
     pid = gl.program_id(axis=0)
-    pid_token = pid // gl.cdiv(N, BLOCK_N)
-    pid_n = pid % gl.cdiv(N, BLOCK_N)
+    num_n = gl.cdiv(N, BLOCK_N)
+    if SPLIT_K == 1:
+        pid_k = 0
+        pid_token = pid // num_n
+        pid_n = pid % num_n
+    else:
+        per_k = M * num_n
+        pid_k = pid // per_k
+        rem = pid % per_k
+        pid_token = rem // num_n
+        pid_n = rem % num_n
+    num_kt = gl.cdiv(I, BLOCK_K)
+    kt_per = gl.cdiv(num_kt, SPLIT_K)
+    kt_start = pid_k * kt_per
     _layouts: gl.constexpr = _warp_decode_mfma_layouts(M_DUP, BLOCK_N, BLOCK_K_SCALE)
     mfma_layout: gl.constexpr = _layouts[0]
     dot_a_layout: gl.constexpr = _layouts[1]
@@ -5592,7 +5650,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                 w_base = W + expert.to(gl.int64) * stride_we
                 ws_base = WScale + expert.to(gl.int64) * stride_wse
                 acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
-                for kt in range(gl.cdiv(I, BLOCK_K)):
+                for kt in range(kt_start, kt_start + kt_per):
                     k_elem = kt * BLOCK_K + ak
                     k_pack = kt * BLOCK_K_PACKED + bk
                     a = gl.load(
@@ -5633,20 +5691,68 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                         0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
                     )
                     w2_base = w2_bias + expert.to(gl.int64) * N
+                    if SPLIT_K == 1:
+                        bias_bound = bias_n < N
+                    else:
+                        bias_bound = (bias_n < N) & (pid_k == 0)
                     acc = _add_expert_bias(
-                        acc, w2_base, bias_n, bias_n < N, mfma_layout
+                        acc, w2_base, bias_n, bias_bound, mfma_layout
                     )
                 acc_total += gate * acc
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
     sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
     col = pid_n * BLOCK_N + sn
-    gl.store(
+    out_base = (
         Out
         + pid_token.to(gl.int64) * stride_om
         + col.to(gl.int64) * stride_on
-        + sm.to(gl.int64) * 0,
+        + sm.to(gl.int64) * 0
+    )
+    if SPLIT_K > 1:
+        out_base = out_base + pid_k.to(gl.int64) * stride_ok
+    gl.store(
+        out_base,
         acc_total.to(Out.dtype.element_ty),
         mask=(pid_token < M) & (sm == 0) & (col < N),
+    )
+
+
+@gluon.jit
+def _warp_decode_stage2_reduce(
+    Partial,
+    Out,
+    M,
+    N,
+    stride_pk,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    SPLIT_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """Sum the SPLIT_K stage2 partials into the bf16 output in one launch."""
+    pid = gl.program_id(axis=0)
+    num_n = gl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_n
+    pid_n = pid % num_n
+    LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
+    n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
+    bound = (pid_m < M) & (n < N)
+    acc = gl.zeros([BLOCK_N], gl.float32, layout=LAYOUT)
+    for k in gl.static_range(SPLIT_K):
+        acc += gl.load(
+            Partial
+            + k * stride_pk
+            + pid_m.to(gl.int64) * stride_pm
+            + n.to(gl.int64) * stride_pn,
+            mask=bound,
+            other=0.0,
+        )
+    gl.store(
+        Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
+        acc.to(Out.dtype.element_ty),
+        mask=bound,
     )
 
 
