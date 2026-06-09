@@ -211,7 +211,7 @@ def _test_dp_chain_matches_legacy(
     processor = _build_processor(
         config=config, tp_rank=rank, tp_size=tp_size, tp_group=group
     )
-    processor.configure_dp_sampling(
+    processor.configure_dp_logits_layout(
         DpSamplingRuntimeConfig(
             enabled=True,
             vocab_size=vocab,
@@ -282,8 +282,6 @@ def _test_dp_chain_matches_legacy(
 
     dp_meta = _build_metadata()
     dp_plan = LogitsLayoutPlan(
-        mode="dp_all_to_all",
-        real_bs=bs,
         effective_bs=bs,
         bucket_bs=pad_bs,
         tp_size=tp_size,

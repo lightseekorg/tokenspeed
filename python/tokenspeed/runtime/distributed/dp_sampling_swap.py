@@ -35,7 +35,6 @@ def swap_batch_vocab(
     pad_bs: int,
     num_tokens_per_req: int,
     vocab_size: int,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
 ) -> torch.Tensor:
@@ -65,7 +64,7 @@ def swap_batch_vocab(
     )
 
     recv = torch.empty_like(local_logits)
-    all_to_all_single(recv, local_logits, rank, group, backend=backend)
+    all_to_all_single(recv, local_logits, group, backend=backend)
 
     return (
         recv.view(tp_size, reqs_per_rank, n, v_local)

@@ -184,7 +184,7 @@ def _test_all_to_all_single(rank, world_size, device, group, ref_group):
             expected = torch.empty_like(inp)
             dist.all_to_all_single(expected, inp, group=ref_group)
             output = torch.empty_like(inp)
-            all_to_all_single(output, inp, rank, group)
+            all_to_all_single(output, inp, group)
             torch.testing.assert_close(output, expected)
 
     for dtype in DTYPES:
@@ -194,7 +194,7 @@ def _test_all_to_all_single(rank, world_size, device, group, ref_group):
         expected = torch.empty_like(inp)
         dist.all_to_all_single(expected, inp, group=ref_group)
         output = torch.empty_like(inp)
-        all_to_all_single(output, inp, rank, group)
+        all_to_all_single(output, inp, group)
         torch.testing.assert_close(output, expected)
 
 

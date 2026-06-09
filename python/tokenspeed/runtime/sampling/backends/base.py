@@ -27,13 +27,12 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-from tokenspeed.runtime.utils.server_args import ServerArgs
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 DEFAULT_RANDOM_SEED = 48

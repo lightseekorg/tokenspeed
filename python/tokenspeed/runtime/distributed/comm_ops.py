@@ -159,7 +159,6 @@ def reduce_scatter(
 def all_to_all_single(
     output: torch.Tensor,
     input: torch.Tensor,
-    rank: int,
     group: Group,
     backend: CommBackend | None = None,
 ) -> None:

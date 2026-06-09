@@ -133,7 +133,6 @@ def _test_swap_parity_with_free_function(
         pad_bs=pad_bs,
         num_tokens_per_req=n,
         vocab_size=vocab,
-        rank=rank,
         group=group,
     )
 

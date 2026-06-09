@@ -342,9 +342,13 @@ class ModelExecutor:
                 device=self.device,
             ),
         )
+        self.dp_sampling_runtime_config = dp_runtime_config
+        self._last_dp_sampling_route_log: (
+            tuple[str, int, bool, int, int, bool, int] | None
+        ) = None
         if dp_runtime_config.enabled:
             self.sampling_backend.configure_dp_sampling(dp_runtime_config)
-            processor.configure_dp_sampling(dp_runtime_config)
+            processor.configure_dp_logits_layout(dp_runtime_config)
         logger.info(
             "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
             "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
@@ -528,6 +532,47 @@ class ModelExecutor:
         return (
             torch.cat([prefill_tokens, decode_tokens]),
             torch.cat([prefill_accept, decode_accept]),
+        )
+
+    def _log_dp_sampling_route(self, bs: int, ctx: ForwardContext) -> None:
+        runtime = self.dp_sampling_runtime_config
+        if (
+            self.config.global_rank != 0
+            or not runtime.enabled
+            or runtime.min_bs is None
+            or runtime.topology is None
+            or ctx.forward_mode is None
+            or not (ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify())
+        ):
+            return
+
+        use_graph = self.forward_step.can_run(bs=bs, ctx=ctx)
+        effective_bs = self.forward_step.padded_bs(bs=bs, ctx=ctx) if use_graph else bs
+        tp_size = runtime.topology.tp_size
+        bucket_bs = ((effective_bs + tp_size - 1) // tp_size) * tp_size
+        dp_sampling = effective_bs >= runtime.min_bs
+        route_key = (
+            ctx.forward_mode.name,
+            bs,
+            use_graph,
+            effective_bs,
+            bucket_bs,
+            dp_sampling,
+            runtime.min_bs,
+        )
+        if route_key == self._last_dp_sampling_route_log:
+            return
+        self._last_dp_sampling_route_log = route_key
+        logger.debug(
+            "Batch-DP route: forward_mode=%s bs=%d effective_bs=%d "
+            "use_graph=%s bucket_bs=%d dp_sampling=%s min_bs=%d",
+            ctx.forward_mode.name.lower(),
+            bs,
+            effective_bs,
+            use_graph,
+            bucket_bs,
+            dp_sampling,
+            runtime.min_bs,
         )
 
     @maybe_inference_mode()
@@ -1424,6 +1469,7 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
+                    self._log_dp_sampling_route(bs, ctx)
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,

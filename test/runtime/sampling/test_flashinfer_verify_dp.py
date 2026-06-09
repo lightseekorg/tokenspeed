@@ -227,8 +227,6 @@ def _test_verify_dp_matches_today(
     dp_in = _StubOutput()
     dp_in.next_token_logits = local_logits
     dp_in.logits_layout_plan = LogitsLayoutPlan(
-        mode="dp_all_to_all",
-        real_bs=bs,
         effective_bs=bs,
         bucket_bs=pad_bs,
         tp_size=tp_size,

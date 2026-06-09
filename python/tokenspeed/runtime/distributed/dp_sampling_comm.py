@@ -279,7 +279,6 @@ class DpSamplingComm:
             pad_bs=pad_bs,
             num_tokens_per_req=self._num_tokens_per_req,
             vocab_size=self._vocab_size,
-            rank=self._rank,
             group=self._group,
             backend=self._fallback_backend,
         )

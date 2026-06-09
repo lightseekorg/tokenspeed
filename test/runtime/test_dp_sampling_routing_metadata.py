@@ -90,7 +90,7 @@ def test_logits_processor_dp_layout_threshold_and_modes():
         tp_size=4,
         tp_group=(0, 1, 2, 3),
     )
-    processor.configure_dp_sampling(_dp_runtime_config(min_bs=16))
+    processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=16))
 
     assert (
         processor._resolve_logits_layout_plan(
@@ -105,14 +105,12 @@ def test_logits_processor_dp_layout_threshold_and_modes():
         LogitsMetadata(forward_mode=ForwardMode.DECODE),
     )
     assert decode_plan is not None
-    assert decode_plan.is_dp_all_to_all
 
     verify_plan = processor._resolve_logits_layout_plan(
         torch.empty(16 * 6, 3),
         LogitsMetadata(forward_mode=ForwardMode.TARGET_VERIFY),
     )
     assert verify_plan is not None
-    assert verify_plan.is_dp_all_to_all
 
     assert (
         processor._resolve_logits_layout_plan(
@@ -198,7 +196,7 @@ def test_configure_dp_sampling_sets_state():
         tp_group=(0, 1, 2, 3),
     )
 
-    processor.configure_dp_sampling(_dp_runtime_config())
+    processor.configure_dp_logits_layout(_dp_runtime_config())
     assert processor.dp_sampling_enabled
     assert processor.dp_num_tokens_per_req == 6
 
@@ -253,7 +251,7 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
         tp_size=4,
         tp_group=(0, 1, 2, 3),
     )
-    processor.configure_dp_sampling(_dp_runtime_config(min_bs=5))
+    processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=5))
 
     plan = processor._resolve_logits_layout_plan(
         torch.empty(5 * 6, 3),
@@ -261,7 +259,6 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
     )
 
     assert plan is not None
-    assert plan.real_bs == 5
     assert plan.effective_bs == 5
     assert plan.bucket_bs == 8
 
@@ -300,14 +297,12 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
         tp_size=4,
         tp_group=(0, 1, 2, 3),
     )
-    processor.configure_dp_sampling(
+    processor.configure_dp_logits_layout(
         _dp_runtime_config(tp_rank=1, skip_all_gather=True, device="cpu")
     )
     hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
     lm_head = SimpleNamespace(weight=torch.ones(7, 3))
     plan = LogitsLayoutPlan(
-        mode="dp_all_to_all",
-        real_bs=5,
         effective_bs=5,
         bucket_bs=8,
         tp_size=4,
@@ -334,14 +329,12 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
         tp_size=4,
         tp_group=(0, 1, 2, 3),
     )
-    processor.configure_dp_sampling(
+    processor.configure_dp_logits_layout(
         _dp_runtime_config(tp_rank=2, skip_all_gather=True, device="cpu")
     )
     hidden_states = torch.arange(5 * 6 * 3, dtype=torch.float32).view(5 * 6, 3)
     lm_head = SimpleNamespace(weight=torch.ones(7, 3))
     plan = LogitsLayoutPlan(
-        mode="dp_all_to_all",
-        real_bs=4,
         effective_bs=5,
         bucket_bs=8,
         tp_size=4,

@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal
 
 import torch
 
@@ -33,16 +32,10 @@ from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 
 @dataclasses.dataclass(frozen=True)
 class LogitsLayoutPlan:
-    mode: Literal["normal", "dp_all_to_all"]
-    real_bs: int
     effective_bs: int
     bucket_bs: int
     tp_size: int
     num_tokens_per_req: int
-
-    @property
-    def is_dp_all_to_all(self) -> bool:
-        return self.mode == "dp_all_to_all"
 
 
 class LogitsLayoutExecutor:
@@ -61,7 +54,6 @@ class LogitsLayoutExecutor:
     ) -> None:
         self._tp_rank = tp_rank
         self._tp_size = tp_size
-        self._tp_group = tp_group
         self._num_tokens_per_req = num_tokens_per_req
         self._comm = DpSamplingComm(
             tp_size=tp_size,
@@ -114,8 +106,7 @@ class LogitsLayoutExecutor:
 
     def _tokens_per_req(self, plan: LogitsLayoutPlan) -> int:
         if (
-            not plan.is_dp_all_to_all
-            or plan.tp_size != self._tp_size
+            plan.tp_size != self._tp_size
             or plan.num_tokens_per_req != self._num_tokens_per_req
             or plan.bucket_bs < plan.effective_bs
             or plan.bucket_bs % self._tp_size != 0

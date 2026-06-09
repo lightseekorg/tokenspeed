@@ -80,7 +80,6 @@ def _test_swap_matches_reference(
         pad_bs=pad_bs,
         num_tokens_per_req=n,
         vocab_size=vocab,
-        rank=rank,
         group=group,
     )
 
@@ -113,7 +112,6 @@ def _test_swap_chain_safety(
         pad_bs=pad_bs,
         num_tokens_per_req=n,
         vocab_size=vocab,
-        rank=rank,
         group=group,
     )
 

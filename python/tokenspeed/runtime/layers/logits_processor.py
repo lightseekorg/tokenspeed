@@ -215,7 +215,7 @@ class LogitsProcessor(nn.Module):
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
 
-    def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
+    def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
             not runtime.enabled
             or runtime.topology is None
@@ -255,12 +255,10 @@ class LogitsProcessor(nn.Module):
         rows = hidden_states.shape[0]
         assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
         effective_bs = rows // n
+        bucket_bs = ((effective_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
         if effective_bs < self.dp_sampling_min_bs:
             return None
-        bucket_bs = ((effective_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
         return LogitsLayoutPlan(
-            mode="dp_all_to_all",
-            real_bs=effective_bs,
             effective_bs=effective_bs,
             bucket_bs=bucket_bs,
             tp_size=self.tp_size,
@@ -485,33 +483,20 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        dp_sampling = plan is not None and plan.is_dp_all_to_all
+        dp_sampling = plan is not None
         assert (not dp_sampling) or self.dp_sampling_enabled, (
             "DP logits layout plan was provided but LogitsProcessor was not "
             "configured with dp_sampling"
         )
 
         if dp_sampling and self.skip_all_gather:
-            if self._logits_layout_executor is not None:
-                hidden_states = self._logits_layout_executor.slice_hidden_states(
-                    hidden_states, plan
+            if self._logits_layout_executor is None:
+                raise RuntimeError(
+                    "dp_sampling logits layout executor is not configured"
                 )
-            else:
-                n = self.dp_num_tokens_per_req
-                rows = hidden_states.shape[0]
-                assert (
-                    rows % n == 0
-                ), f"hidden_states have {rows} rows, not divisible by N={n}"
-                bs = rows // n
-                pad_bs = ((bs + self.tp_size - 1) // self.tp_size) * self.tp_size
-                reqs_per_rank = pad_bs // self.tp_size
-                pad_rows = (pad_bs - bs) * n
-                if pad_rows > 0:
-                    hidden_states = torch.nn.functional.pad(
-                        hidden_states, (0, 0, 0, pad_rows)
-                    )
-                start = self.tp_rank * reqs_per_rank * n
-                hidden_states = hidden_states[start : start + reqs_per_rank * n]
+            hidden_states = self._logits_layout_executor.slice_hidden_states(
+                hidden_states, plan
+            )
 
         if hasattr(lm_head, "weight"):
             if self._use_fused_lm_head:
