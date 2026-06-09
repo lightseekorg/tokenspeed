@@ -295,7 +295,6 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 bias=False,
                 prefix=add_prefix("lm_head", prefix),
             )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -306,12 +305,13 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 tp_group=self.mapping.attn.tp_group,
                 prefix=add_prefix("lm_head", prefix),
             )
-            self.logits_processor = LogitsProcessor(
-                config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
 
     def get_hot_token_id(self):
         return None

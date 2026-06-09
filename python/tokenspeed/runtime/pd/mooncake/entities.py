@@ -25,6 +25,10 @@ from typing import List, Optional
 import numpy as np
 import numpy.typing as npt
 
+from tokenspeed.runtime.pd.transfer_plan import (
+    TransferFragment,
+    decode_transfer_fragments,
+)
 from tokenspeed.runtime.pd.utils import PageTransferMetadata
 
 
@@ -85,9 +89,11 @@ class TransferInfo:
     dst_page_indices_mapping: Optional[npt.NDArray[np.int64]]
     dst_mamba_indices: Optional[npt.NDArray[np.int64]]
     is_dummy: bool
+    transfer_fragments: tuple[TransferFragment, ...] = ()
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        transfer_fragments = ()
         if msg[4] == b"" and msg[5] == b"":
             dst_kv_indices = np.array([], dtype=np.int64)
             dst_aux_index = None
@@ -122,6 +128,9 @@ class TransferInfo:
                 if len(msg) > 11 and msg[11] != b""
                 else None
             )
+            transfer_fragments = (
+                decode_transfer_fragments(msg[12], msg[13]) if len(msg) > 13 else ()
+            )
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -138,6 +147,7 @@ class TransferInfo:
             dst_page_indices_mapping=dst_page_indices_mapping,
             dst_mamba_indices=dst_mamba_indices,
             is_dummy=is_dummy,
+            transfer_fragments=transfer_fragments,
         )
 
 

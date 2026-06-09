@@ -394,6 +394,14 @@ class SimpleMambaPool:
                 item_lens.append(layer_cache[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
+    def get_contiguous_buf_unit_lens(self):
+        unit_lens = []
+        for cache in self.mamba_cache:
+            for layer_id in range(cache.shape[0]):
+                layer_cache = cache[layer_id]
+                unit_lens.append(layer_cache[0, 0].nbytes)
+        return unit_lens
+
     def get_contiguous_buf_layer_ids(self):
         """Return global layer ids aligned with get_contiguous_buf_infos()."""
         return self.mamba_layer_ids * len(self.mamba_cache)

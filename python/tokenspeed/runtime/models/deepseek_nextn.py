@@ -191,7 +191,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 bias=False,
             )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -201,12 +200,13 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 tp_size=self.mapping.attn.tp_size,
                 tp_group=self.mapping.attn.tp_group,
             )
-            self.logits_processor = LogitsProcessor(
-                config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
 
     @torch.no_grad()
     def forward(

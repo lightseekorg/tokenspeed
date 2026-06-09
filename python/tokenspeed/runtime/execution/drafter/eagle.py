@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -155,8 +155,8 @@ class Eagle(BaseDrafter):
         draft_input: EagleDraftInput,
         bs: int,
         input_num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (input_ids, unpadded_input_lengths, gather_ids) for the first draft step.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (input_ids, gather_ids) for the first draft step.
 
         The first-step input shape matches the base model's: ragged
         ``[prefill_part || decode_part]`` under MIXED, full prefill chunks
@@ -198,12 +198,11 @@ class Eagle(BaseDrafter):
                 )
         else:
             input_ids = draft_input.base_model_output
-            unpadded_input_lengths = draft_input.accept_lengths
             gather_ids = (
                 self.padded_gather_ids_offsets_buf[:bs] + draft_input.accept_lengths
             )
 
-        return input_ids, unpadded_input_lengths, gather_ids
+        return input_ids, gather_ids
 
     @nvtx_range("draft_first_step", color="purple")
     def _run_first_step(
@@ -215,7 +214,7 @@ class Eagle(BaseDrafter):
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
 
-        input_ids, _, gather_ids = self._get_first_step_input(
+        input_ids, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
@@ -352,7 +351,7 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = cute_argmax(logits_output.next_token_logits)
+                draft_ids = sampling_argmax(logits_output.next_token_logits)
                 draft_ids.clamp_(min=0)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
@@ -422,7 +421,7 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output = self._run_first_step(bs, draft_input)
 
-        draft_ids = cute_argmax(logits_output.next_token_logits)
+        draft_ids = sampling_argmax(logits_output.next_token_logits)
         draft_ids.clamp_(min=0)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
