@@ -93,8 +93,9 @@ class LlamaAttention(BaseLlamaAttention):
         # Active dispatch B: correction + q-slice + DECODE (fused) or post-slice (non-fused).
         self._apply_correction(ctx)
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            q_rope = self._fused_rope_kv_write(positions, q, k, v, ctx, out_cache_loc)
-            q_rope = q_rope.index_select(0, ctx.gather_ids)
+            q_rope = self._fused_rope_kv_write(
+                positions, q, k, v, ctx, out_cache_loc
+            ).index_select(0, ctx.gather_ids)
             return ctx.attn_backend.forward(
                 q_rope,
                 None,
