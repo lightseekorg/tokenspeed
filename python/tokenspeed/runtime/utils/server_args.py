@@ -285,6 +285,8 @@ class ServerArgs:
     comm_fusion_max_num_tokens: int = 2048
     enable_allreduce_fusion: bool = False
 
+    enable_fused_rmsnorm_fp4_quant: bool = True
+
     enable_expert_parallel: bool = False
 
     @property
@@ -1748,6 +1750,16 @@ class ServerArgs:
             "--enable-allreduce-fusion",
             action="store_true",
             help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations.",
+        )
+        parser.add_argument(
+            "--enable-fused-rmsnorm-fp4-quant",
+            dest="enable_fused_rmsnorm_fp4_quant",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_fused_rmsnorm_fp4_quant,
+            help=(
+                "fuse post-attn allreduce + residual + RMSNorm "
+                "+ NVFP4 block-scale quant into a single ws_layernorm kernel"
+            ),
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",

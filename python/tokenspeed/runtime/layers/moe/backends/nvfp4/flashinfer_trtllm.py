@@ -284,19 +284,22 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
+        prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         del num_global_tokens, max_num_tokens_per_gpu
 
         x = hidden_states
         num_tokens = x.shape[0]
 
-        # Quantize input to FP4 using the fused-kernel scale layout.
-        hs_fp4, hs_scale = fp4_quantize(
-            x,
-            layer.w13_input_scale_quant,
-            is_sf_swizzled_layout=False,
-            enable_pdl=pdl_enabled(),
-        )
+        if prequantized_input is not None:
+            hs_fp4, hs_scale = prequantized_input
+        else:
+            hs_fp4, hs_scale = fp4_quantize(
+                x,
+                layer.w13_input_scale_quant,
+                is_sf_swizzled_layout=False,
+                enable_pdl=pdl_enabled(),
+            )
 
         routing_logits = topk_output.router_logits.to(self._routing_logits_dtype)
         routing_bias = self._correction_bias
