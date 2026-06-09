@@ -38,7 +38,7 @@ perf:
     rm -rf "$OUTPUTS_DIR" &&
     set +e &&
     PERF_STATUS=0 &&
-    for input_len in 1024 2048 4096 8192; do
+    for input_len in 1024 4096 8192; do
     label=$((input_len / 1024))k;
     echo "==================================================";
     echo ">>> input=${label} output=1k bs=1,2,4,8,16";
@@ -55,7 +55,7 @@ perf:
     --min-tokens 1024
     --max-tokens 1024
     --parallel 1 2 4 8 16
-    --number 80 80 80 80 80
+    --number 5 10 20 40 80
     --warmup-num 16
     --rate -1
     --seed 1
