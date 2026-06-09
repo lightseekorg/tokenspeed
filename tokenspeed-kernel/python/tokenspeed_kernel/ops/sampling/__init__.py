@@ -75,6 +75,13 @@ def argmax(
         solution: Optional kernel solution to force through normal selection.
         override: Optional exact kernel-name or solution override.
 
+    NaN handling:
+        Kernel-backed sampling paths treat NaNs as invalid candidates.
+        Rows with at least one non-NaN value return the index of the
+        maximum non-NaN value, with ties broken toward the lowest index.
+        Rows with no valid non-NaN values return the ``-1`` sentinel.
+        Unsupported inputs fall back to ``torch.argmax`` semantics.
+
     Returns:
         A tensor containing argmax indices for each row of ``logits``.
     """

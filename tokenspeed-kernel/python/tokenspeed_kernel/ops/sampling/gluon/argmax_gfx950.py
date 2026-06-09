@@ -39,6 +39,7 @@ cdna4 = gl.amd.cdna4
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
 _MIN_GLUON_VOCAB_SIZE = 4096
+_INT32_MAX = gl.constexpr(2**31 - 1)
 _scratch_cache: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
@@ -54,7 +55,7 @@ def _argmax_combine(value1, index1, value2, index2):
 
 @gluon.jit
 def _normalize_argmax_sentinel(value, index):
-    return gl.where((index == 2147483647) | (value != value), -1, index)
+    return gl.where((index == _INT32_MAX) | (value != value), -1, index)
 
 
 @gluon.constexpr_function
@@ -87,7 +88,7 @@ def _argmax_fixed_block_size_tile(
     if SANITIZE_NAN:
         mask = mask & (vals == vals)
         vals = gl.where(mask, vals, -float("inf"))
-    indices = gl.where(mask, cols.to(gl.int32), 2147483647)
+    indices = gl.where(mask, cols.to(gl.int32), _INT32_MAX)
     return gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
 
 
@@ -103,7 +104,7 @@ def _argmax_one_stage_kernel(
 ):
     row = gl.program_id(0)
     best_val = gl.full((), -float("inf"), gl.float32)
-    best_idx = gl.full((), 2147483647, gl.int32)
+    best_idx = gl.full((), _INT32_MAX, gl.int32)
 
     for start in range(0, N, BLOCK):
         tile_val, tile_idx = _argmax_fixed_block_size_tile(
@@ -149,7 +150,7 @@ def _argmax_split_atomic_fixed_block_size_kernel(
         vals = gl.load(
             partial_values + base, mask=mask, other=-float("inf"), volatile=True
         )
-        indices = gl.load(partial_indices + base, mask=mask, other=2147483647)
+        indices = gl.load(partial_indices + base, mask=mask, other=_INT32_MAX)
         best_val, best_idx = gl.reduce(
             (vals, indices), axis=0, combine_fn=_argmax_combine
         )
@@ -180,7 +181,7 @@ def _argmax_fixed_split_count_tile(
     ).to(gl.float32)
     mask = mask & (vals == vals)
     vals = gl.where(mask, vals, -float("inf"))
-    indices = gl.where(mask, cols.to(gl.int32), 2147483647)
+    indices = gl.where(mask, cols.to(gl.int32), _INT32_MAX)
     return gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
 
 
@@ -292,10 +293,7 @@ def _supports_gluon(logits: torch.Tensor) -> bool:
 def _get_atomic_scratch(
     M: int, num_splits: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    key = (device_index, M, num_splits)
+    key = (device.index, M, num_splits)
     scratch = _scratch_cache.get(key)
     if scratch is None:
         partial_values = torch.empty(
