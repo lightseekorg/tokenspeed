@@ -52,6 +52,11 @@ def _argmax_combine(value1, index1, value2, index2):
     return value, index
 
 
+@gluon.jit
+def _normalize_argmax_sentinel(value, index):
+    return gl.where((index == 2147483647) | (value != value), -1, index)
+
+
 @gluon.constexpr_function
 def _argmax_layout(
     BLOCK: gl.constexpr, NUM_WARPS: gl.constexpr, LOAD_ELEMS: gl.constexpr
@@ -68,6 +73,7 @@ def _argmax_fixed_block_size_tile(
     N: gl.constexpr,
     BLOCK: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
+    SANITIZE_NAN: gl.constexpr,
 ):
     offs = gl.arange(0, BLOCK, layout=_argmax_layout(BLOCK, gl.num_warps(), LOAD_ELEMS))
     cols = start + offs
@@ -78,6 +84,9 @@ def _argmax_fixed_block_size_tile(
         mask=mask,
         other=-float("inf"),
     ).to(gl.float32)
+    if SANITIZE_NAN:
+        mask = mask & (vals == vals)
+        vals = gl.where(mask, vals, -float("inf"))
     indices = gl.where(mask, cols.to(gl.int32), 2147483647)
     return gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
 
@@ -98,10 +107,11 @@ def _argmax_one_stage_kernel(
 
     for start in range(0, N, BLOCK):
         tile_val, tile_idx = _argmax_fixed_block_size_tile(
-            logits, row, start, stride_m, N, BLOCK, LOAD_ELEMS
+            logits, row, start, stride_m, N, BLOCK, LOAD_ELEMS, False
         )
         best_val, best_idx = _argmax_combine(best_val, best_idx, tile_val, tile_idx)
 
+    best_idx = _normalize_argmax_sentinel(best_val, best_idx)
     gl.store(out + row * out_stride, best_idx.to(out.dtype.element_ty))
 
 
@@ -123,7 +133,7 @@ def _argmax_split_atomic_fixed_block_size_kernel(
     row = gl.program_id(0)
     split = gl.program_id(1)
     tile_val, tile_idx = _argmax_fixed_block_size_tile(
-        logits, row, split * BLOCK, stride_m, N, BLOCK, LOAD_ELEMS
+        logits, row, split * BLOCK, stride_m, N, BLOCK, LOAD_ELEMS, True
     )
     partial_offset = row * NUM_SPLITS + split
     gl.store(partial_values + partial_offset, tile_val)
@@ -140,7 +150,10 @@ def _argmax_split_atomic_fixed_block_size_kernel(
             partial_values + base, mask=mask, other=-float("inf"), volatile=True
         )
         indices = gl.load(partial_indices + base, mask=mask, other=2147483647)
-        _, best_idx = gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
+        best_val, best_idx = gl.reduce(
+            (vals, indices), axis=0, combine_fn=_argmax_combine
+        )
+        best_idx = _normalize_argmax_sentinel(best_val, best_idx)
         gl.store(out + row * out_stride, best_idx.to(out.dtype.element_ty))
         gl.store(counters + row, 0)
 
@@ -165,6 +178,8 @@ def _argmax_fixed_split_count_tile(
         mask=mask,
         other=-float("inf"),
     ).to(gl.float32)
+    mask = mask & (vals == vals)
+    vals = gl.where(mask, vals, -float("inf"))
     indices = gl.where(mask, cols.to(gl.int32), 2147483647)
     return gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
 
@@ -202,7 +217,10 @@ def _argmax_split_atomic_fixed_split_count_kernel(
         base = row * NUM_SPLITS + offs
         vals = gl.load(partial_values + base, volatile=True)
         indices = gl.load(partial_indices + base)
-        _, best_idx = gl.reduce((vals, indices), axis=0, combine_fn=_argmax_combine)
+        best_val, best_idx = gl.reduce(
+            (vals, indices), axis=0, combine_fn=_argmax_combine
+        )
+        best_idx = _normalize_argmax_sentinel(best_val, best_idx)
         gl.store(out + row * out_stride, best_idx.to(out.dtype.element_ty))
         gl.store(counters + row, 0)
 

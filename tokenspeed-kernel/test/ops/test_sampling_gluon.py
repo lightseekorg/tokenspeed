@@ -74,6 +74,36 @@ def test_argmax_matches_torch_for_model_shapes(M, N):
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "M,N,dtype",
+    [
+        (1, MODEL_VOCABS["deepseek_v4"], torch.float32),
+        (4, MODEL_VOCABS["deepseek_v4"], torch.float32),
+        (8, MODEL_VOCABS["deepseek_v4"], torch.float16),
+        (128, MODEL_VOCABS["deepseek_v4"], torch.bfloat16),
+    ],
+)
+def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
+    x = torch.full((M, N), float("nan"), device="cuda", dtype=dtype)
+    out = gluon.argmax(x)
+    expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_argmax_split_path_ignores_nan_but_preserves_valid_negative_infinity():
+    M, N = 4, MODEL_VOCABS["deepseek_v4"]
+    x = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float32)
+    x[0, 123] = 0.5
+    x[0, 456] = 1.0
+    x[1].fill_(-float("inf"))
+    x[2, 7] = 3.0
+    x[2, 5] = 3.0
+
+    out = gluon.argmax(x)
+    expected = torch.tensor([456, 0, 5, -1], device="cuda", dtype=out.dtype)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
 def test_argmax_returns_first_index_on_ties():
     M, N = 4, 4096
     x = torch.full((M, N), -100.0, device="cuda", dtype=torch.float32)
