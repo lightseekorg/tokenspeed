@@ -32,7 +32,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -42,12 +41,9 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import (
@@ -55,9 +51,8 @@ from tokenspeed.runtime.models.base import (
     BaseDecoderLayer,
     BaseTransformerModel,
 )
-from tokenspeed.runtime.models.utils import create_fused_set_kv_buffer_arg
+from tokenspeed.runtime.models.llama import LlamaAttention as BaseLlamaAttention
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -67,160 +62,72 @@ logger = get_colorful_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class LlamaAttention(nn.Module):
+class LlamaAttention(BaseLlamaAttention):
+    """Eagle3 draft head attention.
 
-    def __init__(
-        self,
-        config: LlamaConfig,
-        mapping: Mapping,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        layer_id: int = 0,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        qkv_input_size: int | None = None,
-    ) -> None:
+    Inherits ``__init__`` (with ``qkv_input_size=2*hidden_size`` to accommodate
+    the [embed || hidden] concat) and ``forward`` (= empty-shape handling +
+    qkv projection + o_proj scaffolding) from base.
 
-        super().__init__()
-        self.hidden_size = hidden_size
+    Overrides ``_attn`` to add the draft-first-step dispatch B: trim
+    cache_seqlens, slice q to one live row per request, and route the attention
+    call as ``DECODE`` (fused KV pre-write path) or post-slice attn_output
+    (non-fused fallback). Inactive draft steps delegate to base.
+    """
 
-        self.attn_tp_size = mapping.attn.tp_size
-        self.attn_tp_rank = mapping.attn.tp_rank
-        attn_tp_group = mapping.attn.tp_group
-
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
-        else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.total_num_heads
-        )
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-
-        rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-
-        self.qkv_proj = QKVParallelLinear(
-            qkv_input_size or hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=attn_tp_group,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=attn_tp_group,
-            prefix=add_prefix("o_proj", prefix),
-        )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-        self.attn = PagedAttention(
-            self.num_heads,
-            self.head_dim,
-            self.head_dim**-0.5,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-        )
-
-    def forward(
+    def _attn(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
+        # Active draft first step (= target verify was pure decode + drafter set
+        # up gather_ids). Other forwards (multi-step decode without gather_ids,
+        # or first step after a target verify with extends) delegate to base.
+        if ctx.gather_ids is None or not ctx.forward_mode.is_decode():
+            return super()._attn(positions, q, k, v, ctx, out_cache_loc)
 
-        if hidden_states.shape[0] == 0:
-            # Under DP attention the caller concatenates [embeds, hidden_states]
-            # to width 2*H before attention.  Peers with N>0 return an H-wide
-            # tensor from o_proj; idle ranks must match that invariant so the
-            # subsequent dense-TP RSAG agrees on the last dim.
-            return hidden_states.new_zeros(
-                (0, self.hidden_size), dtype=hidden_states.dtype
-            )
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        fused_kv_arg = None
+        # Active dispatch B: correction + q-slice + DECODE (fused) or post-slice (non-fused).
+        self._apply_correction(ctx)
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            n = q.shape[0]
-            v_3d = v.view(n, self.num_kv_heads, self.head_dim)
-            fused_kv_arg = create_fused_set_kv_buffer_arg(
-                value=v_3d,
-                layer=self.attn,
-                out_cache_loc=out_cache_loc,
-                token_to_kv_pool=ctx.token_to_kv_pool,
+            q_rope = self._fused_rope_kv_write(positions, q, k, v, ctx, out_cache_loc)
+            q_rope = q_rope.index_select(0, ctx.gather_ids)
+            return ctx.attn_backend.forward(
+                q_rope,
+                None,
+                None,
+                self.attn,
+                out_cache_loc,
+                ctx.token_to_kv_pool,
+                ForwardMode.DECODE,
+                ctx.bs,
+                save_kv_cache=False,
             )
+        q, k = self.rotary_emb(positions, q, k)
+        return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
+            0, ctx.gather_ids
+        )
 
-        if fused_kv_arg is not None:
-            n = q.shape[0]
-            q_rope = torch.empty((n, self.q_size), dtype=q.dtype, device=q.device)
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                fused_set_kv_buffer_arg=fused_kv_arg,
-                output_q_rope=q_rope,
-                enable_pdl=pdl_enabled(),
-            )
-            if ctx.draft_first_step_reduce:
-                # KV already written via fused_set_kv_buffer_arg above; slice Q
-                # to one query per request and route attn as decode.
-                q_rope = q_rope.index_select(0, ctx.gather_ids)
-                attn_output = ctx.attn_backend.forward(
-                    q_rope,
-                    None,
-                    None,
-                    self.attn,
-                    out_cache_loc,
-                    ctx.token_to_kv_pool,
-                    ForwardMode.DECODE,
-                    ctx.bs,
-                    save_kv_cache=False,
-                )
-            else:
-                attn_output = self.attn(
-                    q_rope,
-                    None,
-                    None,
-                    save_kv_cache=False,
-                    ctx=ctx,
-                    out_cache_loc=out_cache_loc,
-                )
-        else:
-            q, k = self.rotary_emb(positions, q, k)
-            attn_output = self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
-            if ctx.draft_first_step_reduce:
-                # KV written by self.attn above; slice attn_output so o_proj
-                # and the rest of the layer only run on the live rows.
-                attn_output = attn_output.index_select(0, ctx.gather_ids)
+    def _apply_correction(self, ctx: ForwardContext) -> None:
+        """Trim cache_seqlens by ``spec_num_tokens - accept_lengths``.
 
-        output, _ = self.o_proj(attn_output)
-        return output
+        Idempotent across draft layers via ``ctx.accept_lengths = None``.
+        No-op when drafter did not populate ``accept_lengths`` (e.g. backends
+        without KV pre-write).
+        """
+        if ctx.accept_lengths is None:
+            return
+        seq_lens_buf = ctx.draft_seq_lens_buf
+        if seq_lens_buf is None:
+            return
+        correction = (ctx.attn_backend.spec_num_tokens - ctx.accept_lengths).to(
+            seq_lens_buf.dtype
+        )
+        seq_lens_buf[: ctx.bs].sub_(correction)
+        ctx.accept_lengths = None
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +255,17 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             prefix=f"{prefix}.mlp",
         )
 
+    def _maybe_narrow_residual(
+        self,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Wrapper: align residual with attn output narrowed to [bs, H]."""
+        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
+            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
+            return residual.index_select(0, ctx.gather_ids)
+        return residual
+
     def forward_low_latency(
         self,
         positions: torch.Tensor,
@@ -383,9 +301,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
-            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
-            residual = residual.index_select(0, ctx.gather_ids)
+        residual = self._maybe_narrow_residual(residual, ctx)
 
         # Fused post-attn allreduce + norm (uses attn tp group)
         block_scale = None
@@ -451,9 +367,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
-        if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
-            # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
-            residual = residual.index_select(0, ctx.gather_ids)
+        residual = self._maybe_narrow_residual(residual, ctx)
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
         )
@@ -582,11 +496,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
 class LlamaForCausalLMEagle3(BaseCausalLM):
 
     model_cls = Eagle3LlamaModel
-
-    # Eagle3 catch-up pre-slices q to active row before attn; trim must pair.
-    # TODO: remove together with the base flag once Qwen NextN / DeepSeek V3
-    # NextN also pre-slice.
-    pre_attention_trim: bool = True
 
     def __init__(
         self,

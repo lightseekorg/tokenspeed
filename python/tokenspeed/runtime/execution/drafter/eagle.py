@@ -36,7 +36,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -221,20 +220,6 @@ class Eagle(BaseDrafter):
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
         draft_first_step_reduce = forward_mode.is_decode()
 
-        # TODO: remove the isinstance/flag gate together with pre_attention_trim
-        # once Qwen NextN and DeepSeek V3 NextN also pre-slice q.
-        draft_model = self.draft_model_runner.model
-        if (
-            draft_first_step_reduce
-            and self.attn_backend.support_kv_cache_prewrite
-            and isinstance(draft_model, BaseCausalLM)
-            and draft_model.pre_attention_trim
-        ):
-            correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
-                self.draft_seq_lens_buf.dtype
-            )
-            self.draft_seq_lens_buf[:bs].sub_(correction)
-
         draft_first_mode = (
             ForwardMode.DRAFT_EXTEND
             if forward_mode.is_target_verify()
@@ -255,6 +240,8 @@ class Eagle(BaseDrafter):
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
             draft_first_step_reduce=draft_first_step_reduce,
+            draft_seq_lens_buf=self.draft_seq_lens_buf,
+            accept_lengths=draft_input.accept_lengths,
         )
 
         return self.draft_model_runner.forward(
