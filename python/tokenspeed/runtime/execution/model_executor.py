@@ -64,6 +64,16 @@ logger = get_colorful_logger(__name__)
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
 
 
+def _draft_idle_global_num_tokens_for_step(
+    step_idx: int,
+    global_num_tokens: list[int],
+    global_bs: list[int] | None,
+) -> list[int]:
+    if step_idx == 0 or global_bs is None:
+        return global_num_tokens
+    return global_bs
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -390,7 +400,6 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-            self.input_buffers.input_lengths_buf[:bs],
             req_pool_indices=req_pool_indices,
             seq_lens=self.input_buffers.seq_lens_buf[:bs],
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
@@ -932,7 +941,6 @@ class ModelExecutor:
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -942,6 +950,11 @@ class ModelExecutor:
             for step_idx in range(self.drafter.spec_num_steps):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
+                draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
+                    step_idx,
+                    global_num_tokens,
+                    global_bs,
+                )
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
@@ -950,7 +963,7 @@ class ModelExecutor:
                     num_extends=0,
                     input_num_tokens=0,
                     forward_mode=ForwardMode.IDLE,
-                    global_num_tokens=global_num_tokens,
+                    global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
                     draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
@@ -960,7 +973,6 @@ class ModelExecutor:
                     input_ids=empty,
                     positions=empty,
                     out_cache_loc=empty,
-                    input_lengths=empty,
                     spec_step_idx=step_idx,
                 )
 

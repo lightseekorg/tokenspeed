@@ -126,13 +126,6 @@ class Eagle(BaseDrafter):
             device=self.device,
         )
 
-        # Per-request input length is always 1 in multi-step decode (one token per request).
-        self.draft_input_lengths_buf = torch.ones(
-            (self.input_buffers.max_bs,),
-            dtype=torch.int32,
-            device=self.device,
-        )
-
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
         self.padded_gather_ids_offsets_buf = (
@@ -222,7 +215,7 @@ class Eagle(BaseDrafter):
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
 
-        input_ids, unpadded_input_lengths, gather_ids = self._get_first_step_input(
+        input_ids, _, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
@@ -269,7 +262,6 @@ class Eagle(BaseDrafter):
             input_ids=input_ids,
             positions=buffers.positions_buf[: draft_input.input_num_tokens],
             out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
-            input_lengths=unpadded_input_lengths,  # Used in logits processor
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
@@ -312,7 +304,6 @@ class Eagle(BaseDrafter):
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)
 
-        input_lengths = self.draft_input_lengths_buf[:bs]
         positions = cache_start.clone()
 
         for i in range(1, self.spec_num_steps):
@@ -356,7 +347,6 @@ class Eagle(BaseDrafter):
                     input_ids=self._map_hot(draft_ids),
                     positions=positions,
                     out_cache_loc=out_cache_loc,
-                    input_lengths=input_lengths,
                     captured_hidden_states=logits_output.hidden_states,
                     spec_step_idx=i,
                 )

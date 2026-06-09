@@ -109,6 +109,9 @@ public:
     // Owned pages return to the pool via OwnedPages RAII; borrowed ids are dropped.
     void ReleaseRequest(const std::string& request_id);
 
+    // Reclaim request-local paged-cache tail slots beyond the accepted token length.
+    void RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens);
+
     // Fill op.paged_cache_pages / op.paged_cache_page_base_offsets from the tables.
     void PopulateOp(ForwardOperationBase& op_base) const;
 

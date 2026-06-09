@@ -189,6 +189,7 @@ def triton_kernels_routing(
     n_tokens, _ = logits.shape
 
     assert sm_first is False, "sm_first=True not supported for triton_kernels_routing"
+
     sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
     mask_metadata = sparse.mask_metadata
 
