@@ -40,7 +40,6 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-
-    python3 -c "import urllib.request,json;urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/v1/completions',json.dumps({'model':'deepseek-ai/DeepSeek-V4-Flash','prompt':' '.join(['hello']*300),'max_tokens':2}).encode(),{'Content-Type':'application/json'}),timeout=120).read()" &&
     /tmp/evalscope-perf/bin/evalscope eval
     --model deepseek-ai/DeepSeek-V4-Flash
     --api-url http://127.0.0.1:8000/v1
