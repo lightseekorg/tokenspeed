@@ -2,7 +2,6 @@
 """Collect random perf sweeps into one CI summary table."""
 
 import argparse
-import csv
 import json
 import sys
 from pathlib import Path
@@ -86,11 +85,18 @@ def collect(sweep_dir: Path, num_gpus: int):
 
 def print_table(rows):
     # The CI pipeline recognizes this marker and adds the following block to
-    # the GitHub step summary. Keep the CSV header aligned with perf refs.
+    # the GitHub step summary.
     print("\nOverall perf table:")
-    writer = csv.DictWriter(sys.stdout, fieldnames=COLUMNS)
-    writer.writeheader()
-    writer.writerows(rows)
+    widths = {
+        column: max(len(column), *(len(str(row[column])) for row in rows))
+        for column in COLUMNS
+    }
+    header = "  ".join(column.rjust(widths[column]) for column in COLUMNS)
+    sep = "  ".join("-" * widths[column] for column in COLUMNS)
+    print(header)
+    print(sep)
+    for row in rows:
+        print("  ".join(str(row[column]).rjust(widths[column]) for column in COLUMNS))
 
 
 def main():
