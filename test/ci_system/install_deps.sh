@@ -9,7 +9,7 @@ set -e
 # to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AMD_RUNNER_LABEL_PATTERNS=(linux-mi350* linux-mi355*)
+AMD_RUNNER_LABEL_PATTERNS=(*mi35[0-9]* linux-mi350* linux-mi355*)
 
 for pat in "${AMD_RUNNER_LABEL_PATTERNS[@]}"; do
     if [[ "${CI_RUNNER_LABEL:-}" == ${pat} ]]; then
