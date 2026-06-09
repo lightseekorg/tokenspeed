@@ -11,6 +11,8 @@ Usage:
 import os
 import signal
 import subprocess
+import sys
+import threading
 import time
 
 import pytest
@@ -27,6 +29,7 @@ LB_PORT = int(os.environ.get("LB_PORT", "12345"))
 MODEL = os.environ.get("MODEL", "nvidia/Qwen3.5-397B-A17B-NVFP4")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL)
 STARTUP_TIMEOUT = int(os.environ.get("PD_STARTUP_TIMEOUT", "2400"))
+LOG_DIR = os.environ.get("PD_CI_LOG_DIR", ".ci-artifacts/pd-qwen35-397b-1p1d")
 
 QUALITY_CHECKS = [
     {
@@ -105,6 +108,20 @@ def _kill_proc_tree(proc: subprocess.Popen):
         proc.wait(timeout=10)
 
 
+def _tail_file(path: str, stop_event: threading.Event, prefix: str = "[decode] "):
+    while not os.path.exists(path):
+        if stop_event.wait(1):
+            return
+    with open(path) as f:
+        while not stop_event.is_set():
+            line = f.readline()
+            if line:
+                sys.stdout.write(f"{prefix}{line}")
+                sys.stdout.flush()
+            else:
+                stop_event.wait(0.5)
+
+
 @pytest.fixture(scope="session")
 def pd_server():
     env = os.environ.copy()
@@ -114,6 +131,13 @@ def pd_server():
         env=env,
         preexec_fn=os.setsid,
     )
+    stop_event = threading.Event()
+    tail_thread = threading.Thread(
+        target=_tail_file,
+        args=(os.path.join(LOG_DIR, "decode.log"), stop_event),
+        daemon=True,
+    )
+    tail_thread.start()
     try:
         if not _wait_for_server(proc, LB_PORT, STARTUP_TIMEOUT):
             rc = proc.poll()
@@ -125,6 +149,8 @@ def pd_server():
         yield proc
     finally:
         _kill_proc_tree(proc)
+        stop_event.set()
+        tail_thread.join(timeout=5)
 
 
 def test_quality(pd_server):
@@ -133,6 +159,9 @@ def test_quality(pd_server):
     for i, check in enumerate(QUALITY_CHECKS):
         data = _chat(LB_PORT, check["messages"], max_tokens=check["max_tokens"])
         content = data["choices"][0]["message"]["content"]
+        prompt = check["messages"][0]["content"]
+        print(f"\n[Q{i}] {prompt}")
+        print(f"[A{i}] {content}")
         if check["expected"] not in content:
             failures.append(
                 f"  check[{i}]: expected {check['expected']!r} in {content!r}"
