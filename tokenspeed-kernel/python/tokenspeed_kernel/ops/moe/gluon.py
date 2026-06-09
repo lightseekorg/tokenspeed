@@ -4873,8 +4873,15 @@ def _gluon_mxfp_fused_moe(
 
     n_tokens = router_logits.shape[0]
 
+    # Warp-decode small-M MoE is the default on gfx950: it is the fastest path
+    # for the M<=16 decode regime and self-guards (returns None) for any shape
+    # it does not cover. Mirrors the other gluon moe kernels' opt-out switch:
+    # TOKENSPEED_MOE_GLUON_WARP_DECODE=0 (or the master TOKENSPEED_MOE_GLUON=0)
+    # disables it and falls back to the generic gluon/triton route.
     warp_decode_enabled = (
-        os.environ.get("TOKENSPEED_MOE_GLUON_WARP_DECODE", "0").strip().lower()
+        not _GLUON_DISABLED_ENV
+        and current_platform().is_cdna4
+        and os.environ.get("TOKENSPEED_MOE_GLUON_WARP_DECODE", "1").strip().lower()
         not in _GLUON_DISABLE_VALUES
     )
     if warp_decode_enabled:
@@ -4897,9 +4904,9 @@ def _gluon_mxfp_fused_moe(
             if warp_out is not None:
                 return warp_out
         except Exception as exc:  # noqa: BLE001
-            # Warp-decode is bring-up only: on a compile/launch failure for this
-            # shape, log once and fall back to the generic route. exc_info defers
-            # traceback formatting so it is skipped when WARNING is filtered out.
+            # On a compile/launch failure for this shape, log once and fall back
+            # to the generic gluon/triton route. exc_info defers traceback
+            # formatting so it is skipped when WARNING is filtered out.
             import logging
 
             logging.getLogger("tokenspeed_kernel.ops.moe.gluon").warning(
