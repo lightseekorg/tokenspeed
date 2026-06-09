@@ -64,6 +64,7 @@ dependencies = [
     "requests",
     "setproctitle",
     "tiktoken",
+    "tokenspeed-mooncake>=0.3.11.post20260527",
     "tokenspeed-smg==1.4.1.post20260607",
     "tokenspeed-smg-grpc-proto==0.4.8.post20260607",
     "tokenspeed-smg-grpc-servicer==0.5.3.post20260607",
