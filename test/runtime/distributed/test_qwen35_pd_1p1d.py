@@ -9,7 +9,6 @@ Usage:
 """
 
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -92,22 +91,6 @@ def _chat(port: int, messages, max_tokens=64, temperature=0):
     return resp.json()
 
 
-def _kill_proc_tree(proc: subprocess.Popen):
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, OSError):
-        pass
-    try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
-        proc.wait(timeout=10)
-
-
 def _tail_file(path: str, stop_event: threading.Event, prefix: str = "[decode] "):
     while not os.path.exists(path):
         if stop_event.wait(1):
@@ -129,7 +112,6 @@ def pd_server():
     proc = subprocess.Popen(
         ["bash", os.path.abspath(SERVE_SCRIPT)],
         env=env,
-        preexec_fn=os.setsid,
     )
     stop_event = threading.Event()
     tail_thread = threading.Thread(
@@ -148,7 +130,9 @@ def pd_server():
         time.sleep(5)
         yield proc
     finally:
-        _kill_proc_tree(proc)
+        from tokenspeed.runtime.utils.process import kill_process_tree
+
+        kill_process_tree(proc.pid)
         stop_event.set()
         tail_thread.join(timeout=5)
 
