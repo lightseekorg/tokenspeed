@@ -107,7 +107,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_outofplace_correctness(self):
         """Out-of-place RoPE matches torch reference."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -133,7 +133,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_inplace(self):
         """In-place RoPE works."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -144,7 +144,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_outofplace(self):
         """Out-of-place RoPE works."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -168,7 +168,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_outofplace_matches_inplace(self):
         """Out-of-place output matches in-place output."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -197,7 +197,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_correctness(self):
         """Matches torch reference."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -215,7 +215,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_float16(self):
         """Works with float16 (not just bfloat16)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -269,7 +269,7 @@ class TestDsv3RouterGemm:
 
     def test_basic(self):
         """Produces correct shape/dtype."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs()
         out = tk_gemm(hidden, weights, out_dtype=torch.float32)
@@ -278,7 +278,7 @@ class TestDsv3RouterGemm:
 
     def test_correctness(self):
         """Matches torch reference."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs()
         ref = self._torch_ref(hidden, weights)
@@ -287,7 +287,7 @@ class TestDsv3RouterGemm:
 
     def test_large_batch(self):
         """Supports num_tokens > 16 (cuBLAS fallback)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=64)
         ref = self._torch_ref(hidden, weights)
@@ -297,7 +297,7 @@ class TestDsv3RouterGemm:
 
     def test_fp32_weights(self):
         """Works with fp32 router weights."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs()
         weights_fp32 = weights.float()
@@ -308,7 +308,7 @@ class TestDsv3RouterGemm:
     @pytest.mark.parametrize("num_tokens", [1, 8, 16])
     def test_correctness_varied_tokens(self, num_tokens):
         """Matches torch ref at various token counts."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=num_tokens)
         ref = self._torch_ref(hidden, weights)
@@ -320,7 +320,7 @@ class TestDsv3RouterGemm:
 
     def test_large_batch_correctness(self):
         """Matches torch ref at num_tokens=64."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=64)
         ref = self._torch_ref(hidden, weights)
@@ -364,7 +364,7 @@ class TestFp32RouterGemm:
 
     def test_basic(self):
         """Produces correct shape/dtype."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import fp32_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs()
         out = tk_gemm(hidden, weights)
@@ -373,7 +373,7 @@ class TestFp32RouterGemm:
 
     def test_correctness_bf16_input(self):
         """bf16 input x fp32 weight matches torch reference."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import fp32_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(input_dtype=torch.bfloat16)
         ref = self._torch_ref(hidden, weights)
@@ -382,7 +382,7 @@ class TestFp32RouterGemm:
 
     def test_correctness_fp32_input(self):
         """fp32 input x fp32 weight matches torch reference."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import fp32_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(input_dtype=torch.float32)
         ref = self._torch_ref(hidden, weights)
@@ -392,7 +392,7 @@ class TestFp32RouterGemm:
     @pytest.mark.parametrize("num_tokens", [1, 8, 16, 32])
     def test_correctness_varied_tokens(self, num_tokens):
         """Matches torch ref at various token counts (custom kernel path)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import fp32_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=num_tokens)
         ref = self._torch_ref(hidden, weights)
@@ -404,7 +404,7 @@ class TestFp32RouterGemm:
 
     def test_large_batch(self):
         """M=64 falls back to cuBLAS and still correct."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import fp32_router_gemm as tk_gemm
+        from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=64)
         ref = self._torch_ref(hidden, weights)
@@ -504,9 +504,7 @@ class TestGptqMarlinRepack:
 
     def test_basic_4bit(self):
         """4-bit repack produces correct shape."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            gptq_marlin_repack as tk_repack,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import gptq_marlin_repack as tk_repack
 
         b_q, perm = self._make_inputs(num_bits=4)
         out = tk_repack(b_q, perm, 256, 64, 4)
@@ -515,9 +513,7 @@ class TestGptqMarlinRepack:
 
     def test_basic_8bit(self):
         """8-bit repack produces correct shape."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            gptq_marlin_repack as tk_repack,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import gptq_marlin_repack as tk_repack
 
         b_q, perm = self._make_inputs(num_bits=8)
         out = tk_repack(b_q, perm, 256, 64, 8)
@@ -526,9 +522,7 @@ class TestGptqMarlinRepack:
 
     def test_with_perm(self):
         """Repack with act_order permutation."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            gptq_marlin_repack as tk_repack,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import gptq_marlin_repack as tk_repack
 
         b_q, perm = self._make_inputs(num_bits=4, has_perm=True)
         out = tk_repack(b_q, perm, 256, 64, 4)
@@ -538,9 +532,7 @@ class TestGptqMarlinRepack:
     @pytest.mark.parametrize("has_perm", [False, True])
     def test_deterministic(self, num_bits, has_perm):
         """Deterministic (bitwise identical on repeated calls)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            gptq_marlin_repack as tk_repack,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import gptq_marlin_repack as tk_repack
 
         b_q, perm = self._make_inputs(num_bits=num_bits, has_perm=has_perm)
         out1 = tk_repack(b_q, perm, 256, 64, num_bits)
@@ -592,7 +584,7 @@ class TestRoutingFlash:
 
     def test_basic(self):
         """Produces correct shape."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import routing_flash as tk_route
+        from tokenspeed_kernel.thirdparty.cuda import routing_flash as tk_route
 
         inp, bias, idx, wts = self._make_inputs()
         tk_route(inp, bias, idx, wts, self.NUM_REAL_EXPERTS, self.SCALE, False)
@@ -601,7 +593,7 @@ class TestRoutingFlash:
 
     def test_correctness(self):
         """Matches torch reference."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import routing_flash as tk_route
+        from tokenspeed_kernel.thirdparty.cuda import routing_flash as tk_route
 
         inp, bias, idx, wts = self._make_inputs()
         inp_clone = inp.clone()
@@ -645,7 +637,7 @@ class TestVerifyChainGreedy:
 
     def test_basic(self):
         """All-matching candidates are accepted."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import verify_chain_greedy
+        from tokenspeed_kernel.thirdparty.cuda import verify_chain_greedy
 
         bs, ndt = 4, 4
         candidates, target_predict, predicts, accept_index, accept_length = (
@@ -667,7 +659,7 @@ class TestVerifyChainGreedy:
     @pytest.mark.parametrize("bs", [1, 8, 32, 64, 127])
     def test_batch_sizes(self, bs):
         """Correct across various batch sizes."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import verify_chain_greedy
+        from tokenspeed_kernel.thirdparty.cuda import verify_chain_greedy
 
         ndt = 4
         candidates, target_predict, predicts, accept_index, accept_length = (
@@ -687,7 +679,7 @@ class TestVerifyChainGreedy:
 
     def test_no_match(self):
         """Verify behavior when no candidates match target predictions."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import verify_chain_greedy
+        from tokenspeed_kernel.thirdparty.cuda import verify_chain_greedy
 
         bs, ndt = 2, 4
         candidates = torch.tensor(
@@ -717,7 +709,7 @@ class TestVerifyChainGreedy:
 
     def test_partial_match(self):
         """Verify behavior when only first candidate matches."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import verify_chain_greedy
+        from tokenspeed_kernel.thirdparty.cuda import verify_chain_greedy
 
         bs, ndt = 2, 4
         candidates = torch.tensor(
@@ -802,7 +794,7 @@ class TestChainSpeculativeSamplingTargetOnly:
 
     def test_deterministic(self):
         """Deterministic chain speculative sampling."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -839,7 +831,7 @@ class TestChainSpeculativeSamplingTargetOnly:
     @pytest.mark.parametrize("bs", [1, 8, 32, 64, 127])
     def test_batch_sizes(self, bs):
         """Deterministic sampling across batch sizes."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -875,7 +867,7 @@ class TestChainSpeculativeSamplingTargetOnly:
 
     def test_accept_index_values(self):
         """Verify accept_index values match expected pattern."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -913,7 +905,7 @@ class TestChainSpeculativeSamplingTargetOnly:
 
     def test_all_accepted(self):
         """Test when all draft tokens match target (high threshold)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -961,7 +953,7 @@ class TestChainSpeculativeSamplingTargetOnly:
 
     def test_none_draft_probs_deterministic(self):
         """draft_probs=None matches the deterministic baseline outputs."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -999,7 +991,7 @@ class TestChainSpeculativeSamplingTargetOnly:
     def test_none_draft_probs_matches_zeros_buffer(self, bs):
         """draft_probs=None produces bit-identical (predicts, accept_index,
         accept_token_num) to passing torch.zeros_like(target_probs)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -1061,7 +1053,7 @@ class TestChainSpeculativeSamplingTargetOnly:
 
     def test_none_draft_probs_all_accepted(self):
         """All-accepted path also works with draft_probs=None."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -1101,7 +1093,7 @@ class TestChainSpeculativeSamplingTargetOnly:
     def test_draft_probs_writeback_preserved(self):
         """When draft_probs IS provided, the kernel must still write back the
         rejected position once at kernel exit (legacy observable behavior)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
+        from tokenspeed_kernel.thirdparty.cuda import (
             chain_speculative_sampling_target_only,
         )
 
@@ -1160,7 +1152,7 @@ class TestRMSNormFusedParallel:
 
     def test_basic_bf16(self):
         """Basic fused parallel RMSNorm with bfloat16."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import rmsnorm_fused_parallel
+        from tokenspeed_kernel.thirdparty.cuda import rmsnorm_fused_parallel
 
         bs, dim1, dim2 = 4, 128, 64
         eps = 1e-6
@@ -1180,7 +1172,7 @@ class TestRMSNormFusedParallel:
 
     def test_basic_fp16(self):
         """Basic fused parallel RMSNorm with float16."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import rmsnorm_fused_parallel
+        from tokenspeed_kernel.thirdparty.cuda import rmsnorm_fused_parallel
 
         bs, dim1, dim2 = 4, 256, 128
         eps = 1e-5
@@ -1200,7 +1192,7 @@ class TestRMSNormFusedParallel:
 
     def test_inplace(self):
         """In-place output (output == input)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import rmsnorm_fused_parallel
+        from tokenspeed_kernel.thirdparty.cuda import rmsnorm_fused_parallel
 
         bs, dim1, dim2 = 4, 128, 64
         eps = 1e-6
@@ -1221,7 +1213,7 @@ class TestRMSNormFusedParallel:
     @pytest.mark.parametrize("bs", [1, 16, 64])
     def test_batch_sizes(self, bs):
         """Various batch sizes."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import rmsnorm_fused_parallel
+        from tokenspeed_kernel.thirdparty.cuda import rmsnorm_fused_parallel
 
         dim1, dim2 = 1536, 512
         eps = 1e-5
@@ -1241,7 +1233,7 @@ class TestRMSNormFusedParallel:
 
     def test_deepseek_dims(self):
         """DeepSeek model dimensions (q_a=1536, kv_a=512)."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import rmsnorm_fused_parallel
+        from tokenspeed_kernel.thirdparty.cuda import rmsnorm_fused_parallel
 
         bs = 32
         q_a_dim, kv_a_dim = 1536, 512
@@ -1301,9 +1293,7 @@ class TestSiluAndMulFuseBlockQuant:
 
     def test_basic(self):
         """Basic silu_and_mul_fuse_block_quant."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            silu_and_mul_fuse_block_quant,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_block_quant
 
         num_tokens, hidden_size = 16, 256
         x = torch.randn(
@@ -1327,9 +1317,7 @@ class TestSiluAndMulFuseBlockQuant:
     @pytest.mark.parametrize("num_tokens", [4, 16, 64])
     def test_batch_sizes(self, num_tokens):
         """Various batch sizes."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            silu_and_mul_fuse_block_quant,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_block_quant
 
         hidden_size = 256
         x = torch.randn(
@@ -1349,9 +1337,7 @@ class TestSiluAndMulFuseBlockQuant:
 
     def test_ep_variant(self):
         """EP variant with num_tokens_per_expert."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            silu_and_mul_fuse_block_quant,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_block_quant
 
         num_experts, max_tokens, hidden_size = 4, 8, 256
         x = torch.randn(
@@ -1389,9 +1375,7 @@ class TestSiluAndMulFuseBlockQuant:
 
     def test_correctness(self):
         """FP8 output approximately matches SiLU+Mul reference."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            silu_and_mul_fuse_block_quant,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_block_quant
 
         num_tokens, hidden_size = 16, 256
         x = torch.randn(
@@ -1427,9 +1411,7 @@ class TestSiluAndMulFuseBlockQuant:
 
     def test_fp16(self):
         """Float16 input."""
-        from tokenspeed_kernel_nvidia.thirdparty.cuda import (
-            silu_and_mul_fuse_block_quant,
-        )
+        from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_block_quant
 
         num_tokens, hidden_size = 8, 256
         x = torch.randn(

@@ -23,13 +23,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
     fused_topk_topp_prepare,
     fused_topk_topp_renorm,
     verify_chain_greedy,
 )
-from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
     top_k_renorm_prob,
@@ -46,11 +46,16 @@ from tokenspeed_kernel.torch_compile import get_compiler_backend
 # branch-free in the captured graph.
 _FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
 
+from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
     SamplingBackend,
     SamplingBackendConfig,
+)
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    DpSamplingRuntimeConfig,
+    slice_dp_vocab_mask,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
@@ -80,16 +85,100 @@ class FlashInferSamplingBackend(SamplingBackend):
     """
 
     _HAS_POOL_STATE = True
+    _SUPPORTS_DP_VERIFY = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
+        self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
         # Pre-create the side stream used by fused_topk_topp_renorm. Must
         # happen before any CUDA graph capture — cudaStreamCreate is illegal
         # inside capture, and verify() runs from the captured graph.
         fused_topk_topp_prepare(config.device)
+
+    def _init_dp_sampling(self, config: SamplingBackendConfig) -> None:
+        self._dp_tp_group = config.tp_group
+        self._dp_tp_size = (
+            len(self._dp_tp_group) if self._dp_tp_group is not None else 1
+        )
+        self._dp_rank = 0
+        self._dp_comm: DpSamplingComm | None = None
+        self._dp_comm_vocab_size = 0
+
+        if self._dp_tp_size <= 1:
+            self._dp_max_pad_bs = config.max_bs
+            self._dp_max_reqs_per_rank = config.max_bs
+            return
+
+        self._dp_max_pad_bs = (
+            (config.max_bs + self._dp_tp_size - 1) // self._dp_tp_size
+        ) * self._dp_tp_size
+        self._dp_max_reqs_per_rank = self._dp_max_pad_bs // self._dp_tp_size
+
+    def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
+        if not runtime.enabled:
+            return
+        if (
+            runtime.vocab_size is None
+            or runtime.max_bucket_bs is None
+            or runtime.topology is None
+            or runtime.device is None
+        ):
+            raise RuntimeError("enabled DP sampling runtime is incomplete")
+        topology = runtime.topology
+        if topology.tp_size != self._dp_tp_size:
+            raise RuntimeError(
+                f"DP sampling runtime tp_size={topology.tp_size} "
+                f"does not match backend tp_size={self._dp_tp_size}"
+            )
+        if topology.tp_group != self._dp_tp_group:
+            raise RuntimeError("DP sampling runtime tp_group does not match backend")
+        if self._dp_tp_group is None:
+            raise RuntimeError("dp_sampling requires a tp_group")
+        self._dp_rank = topology.tp_rank
+        if runtime.max_bucket_bs > self._dp_max_pad_bs:
+            raise RuntimeError(
+                f"DP sampling max_bucket_bs={runtime.max_bucket_bs} exceeds "
+                f"backend max_pad_bs={self._dp_max_pad_bs}"
+            )
+        if runtime.vocab_size % self._dp_tp_size != 0:
+            raise RuntimeError(
+                f"DP sampling vocab_size={runtime.vocab_size} must be divisible by "
+                f"tp_size={self._dp_tp_size}"
+            )
+        self._init_dp_verify_buffers(runtime.device)
+        if runtime.vocab_size == self._dp_comm_vocab_size:
+            return
+        if self._dp_comm is not None and self._dp_comm.is_initialized:
+            raise RuntimeError("Cannot resize DP sampling comm after use")
+        self._dp_comm_vocab_size = runtime.vocab_size
+        self._dp_comm = DpSamplingComm(
+            tp_size=self._dp_tp_size,
+            rank=self._dp_rank,
+            group=self._dp_tp_group,
+            max_pad_bs=self._dp_max_pad_bs,
+            num_tokens_per_req=runtime.num_tokens_per_req,
+            vocab_size=runtime.vocab_size,
+            logits_dtype=None,
+            device=runtime.device,
+        )
+
+    def _init_dp_verify_buffers(self, device: torch.device | str) -> None:
+        if self._predict_local_buf is not None:
+            return
+
+        max_n = self.config.max_draft_tokens_per_req
+        self._predict_local_buf = torch.zeros(
+            (self._dp_max_reqs_per_rank * max_n,), dtype=torch.int32, device=device
+        )
+        self._accept_index_local_buf = torch.zeros(
+            (self._dp_max_reqs_per_rank * max_n,), dtype=torch.int32, device=device
+        )
+        self._accept_length_local_buf = torch.zeros(
+            (self._dp_max_reqs_per_rank,), dtype=torch.int32, device=device
+        )
 
     def _init_pool_scalars(self, config: SamplingBackendConfig) -> None:
         # Capture warm-up reads row 0 with req_pool_indices zeroed, so row 0
@@ -119,8 +208,6 @@ class FlashInferSamplingBackend(SamplingBackend):
         # Generator from sp.seed. Sampling stays deterministic given the same
         # seed, and flashinfer's Philox path (seed + seq_len offset) already
         # gives per-step uniqueness independent of the torch.Generator.
-        self._generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
-        self._generator_per_slot[0] = self._capture_gen
         self._cpu_generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
         self._cpu_generator_per_slot[0] = self._capture_gen
 
@@ -130,35 +217,23 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._top_p_pool[pool_idx].fill_(float(sp.top_p))
         self._seed_pool[pool_idx].fill_(int(sp.seed))
 
-        gen = torch.Generator(device=self.config.device)
-        gen.manual_seed(int(sp.seed))
-        self._generator_per_slot[pool_idx] = gen
-
         cpu_gen = torch.Generator(device="cpu")
         cpu_gen.manual_seed(int(sp.seed))
         self._cpu_generator_per_slot[pool_idx] = cpu_gen
 
     def _init_shared_buffers(self, config: SamplingBackendConfig) -> None:
 
+        max_pad_bs = self._dp_max_pad_bs
+        max_n = config.max_draft_tokens_per_req
         # Persistent coin buffers. Filled per-request in prepare() outside the
         # CUDA graph so verify() only reads from them.
         self._coins_buf = torch.zeros(
-            (config.max_bs, config.max_draft_tokens_per_req),
+            (max_pad_bs, max_n),
             dtype=torch.float32,
             device=config.device,
         )
         self._final_coins_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.float32, device=config.device
-        )
-
-        self._cpu_coins_buf = torch.empty(
-            config.max_bs,
-            config.max_draft_tokens_per_req,
-            dtype=torch.float32,
-            pin_memory=True,
-        )
-        self._cpu_final_coins_buf = torch.empty(
-            config.max_bs, dtype=torch.float32, pin_memory=True
+            (max_pad_bs,), dtype=torch.float32, device=config.device
         )
 
         # Stub generator used during CUDA-graph capture/warm-up (no requests yet).
@@ -167,14 +242,14 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         # Pre-allocated persistent buffers — no per-step alloc in the hot path.
         self._ones_buf = torch.ones(
-            (config.max_bs,), dtype=torch.int32, device=config.device
+            (max_pad_bs,), dtype=torch.int32, device=config.device
         )
         # predict + accept_length share one packed backing store.
         # Layout: [0, max_bs * max_n) is predict, [max_bs * max_n, total)
         # is accept_length.
-        self._predict_max = config.max_bs * config.max_draft_tokens_per_req
+        self._predict_max = max_pad_bs * max_n
         self._output_pack_buf = torch.zeros(
-            (self._predict_max + config.max_bs,),
+            (self._predict_max + max_pad_bs,),
             dtype=torch.int32,
             device=config.device,
         )
@@ -182,10 +257,14 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._accept_length_buf = self._output_pack_buf[self._predict_max :]
         # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n.
         self._accept_index_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
+            (max_pad_bs * max_n,),
             dtype=torch.int32,
             device=config.device,
         )
+
+        self._predict_local_buf: torch.Tensor | None = None
+        self._accept_index_local_buf: torch.Tensor | None = None
+        self._accept_length_local_buf: torch.Tensor | None = None
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _prepare_step_hook(
@@ -198,26 +277,26 @@ class FlashInferSamplingBackend(SamplingBackend):
         request_pool_indices=None is the capture/warm-up path — uses
         _capture_gen for all rows. Otherwise reads per-slot generators
         populated via _reset_slot."""
-        n = min(num_tokens_per_req, self.config.max_draft_tokens_per_req)
-        lo = coin_eps(self._coins_buf.dtype)
-
         if bs <= 0:
             return
 
+        n = min(num_tokens_per_req, self.config.max_draft_tokens_per_req)
+        lo = coin_eps(self._coins_buf.dtype)
         if request_pool_indices is None:
             self._coins_buf[:bs, :n].uniform_(lo, 1.0, generator=self._capture_gen)
             self._final_coins_buf[:bs].uniform_(lo, 1.0, generator=self._capture_gen)
             return
 
-        cpu_coins = self._cpu_coins_buf[:bs, :n]
-        cpu_final = self._cpu_final_coins_buf[:bs]
+        cpu_coins = torch.empty((bs, n), dtype=torch.float32, pin_memory=True)
+        cpu_final = torch.empty((bs,), dtype=torch.float32, pin_memory=True)
 
         for i, pool_idx in enumerate(request_pool_indices):
-            # No _reset_slot has run for this slot yet — fall back to
-            # the stub generator. Should not happen in well-formed runs
-            # because prepare_step's flip detection runs _reset_slot
-            # before this hook.
-            gen = self._cpu_generator_per_slot[pool_idx] or self._capture_gen
+            gen = self._cpu_generator_per_slot[pool_idx]
+            if gen is None:
+                raise RuntimeError(
+                    f"sampling slot {pool_idx} was not initialized before "
+                    "coin-buffer refill"
+                )
             cpu_coins[i, :n].uniform_(lo, 1.0, generator=gen)
             cpu_final[i].uniform_(lo, 1.0, generator=gen)
 
@@ -244,7 +323,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            batch_next_token_ids = cute_argmax(logits)
+            batch_next_token_ids = sampling_argmax(logits)
 
         else:
 
@@ -299,30 +378,105 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
+        vocab_mask = sampling_info.vocab_mask
+        logits_layout_plan = getattr(logits_output, "logits_layout_plan", None)
+        dp_sampling = logits_layout_plan is not None
 
-        predict = self._predict_buf[: bs * num_tokens_per_req]
-        accept_index = (
-            self._accept_index_buf[: bs * num_tokens_per_req]
-            .view(bs, num_tokens_per_req)
-            .fill_(-1)
-        )
-        accept_length = self._accept_length_buf[:bs]
+        if dp_sampling:
+            if self._dp_comm is None:
+                raise RuntimeError(
+                    "dp_sampling requires tp_size > 1, a resolved tp_group, "
+                    "and a configured DP comm"
+                )
+            dp_comm = self._dp_comm
+            tp_size = self._dp_tp_size
+            rank = self._dp_rank
+            effective_bs = logits_layout_plan.effective_bs
+            pad_bs = logits_layout_plan.bucket_bs
+            if effective_bs != bs:
+                raise RuntimeError(
+                    f"DP sampling effective_bs={effective_bs} must match "
+                    f"candidate batch size {bs}"
+                )
+            if (
+                pad_bs < effective_bs
+                or pad_bs > self._dp_max_pad_bs
+                or pad_bs % tp_size != 0
+            ):
+                raise RuntimeError(
+                    f"invalid DP sampling pad_bs={pad_bs} for effective_bs={effective_bs}, "
+                    f"max_pad_bs={self._dp_max_pad_bs}, tp_size={tp_size}"
+                )
+            bs = pad_bs // tp_size
+
+            # Shard by request so each request's draft chain stays on one rank.
+            shard = slice(rank * bs, (rank + 1) * bs)
+            if pad_bs > effective_bs:
+                candidates = torch.nn.functional.pad(
+                    candidates, (0, 0, 0, pad_bs - effective_bs)
+                )[shard]
+                pool_indices = torch.nn.functional.pad(
+                    sampling_info.req_pool_indices, (0, pad_bs - effective_bs)
+                )[shard]
+            else:
+                candidates = candidates[shard]
+                pool_indices = sampling_info.req_pool_indices[shard]
+            vocab_mask = slice_dp_vocab_mask(
+                vocab_mask,
+                full_bs=effective_bs,
+                pad_bs=pad_bs,
+                num_tokens_per_req=num_tokens_per_req,
+                shard=shard,
+            )
+            coins = self._coins_buf[shard]
+            final_coins = self._final_coins_buf[shard]
+            if (
+                self._predict_local_buf is None
+                or self._accept_index_local_buf is None
+                or self._accept_length_local_buf is None
+            ):
+                raise RuntimeError("DP sampling verify buffers are not initialized")
+            predict = self._predict_local_buf[: bs * num_tokens_per_req]
+            accept_index = (
+                self._accept_index_local_buf[: bs * num_tokens_per_req]
+                .view(bs, num_tokens_per_req)
+                .fill_(-1)
+            )
+            accept_length = self._accept_length_local_buf[:bs]
+        else:
+            pool_indices = sampling_info.req_pool_indices
+            coins = self._coins_buf
+            final_coins = self._final_coins_buf
+            predict = self._predict_buf[: bs * num_tokens_per_req]
+            accept_index = (
+                self._accept_index_buf[: bs * num_tokens_per_req]
+                .view(bs, num_tokens_per_req)
+                .fill_(-1)
+            )
+            accept_length = self._accept_length_buf[:bs]
 
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
         )
+        if dp_sampling:
+            expected_rows = bs * num_tokens_per_req
+            if logits.shape[0] != expected_rows:
+                raise RuntimeError(
+                    f"DP sampling logits rows {logits.shape[0]} != expected "
+                    f"{expected_rows}"
+                )
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
-        if sampling_info.vocab_mask is not None:
+        if vocab_mask is not None:
             sampling_info.apply_vocab_mask(
                 logits=logits,
-                vocab_mask=sampling_info.vocab_mask,
+                vocab_mask=vocab_mask,
             )
 
         if sampling_info.is_all_greedy:
 
-            target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
+            target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
 
             verify_chain_greedy(
                 predicts=predict,
@@ -341,7 +495,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             # tuple; flat [bs*N] per-row knobs match the flat [bs*N, vocab] logits.
             n = num_tokens_per_req
             temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
-                sampling_info.req_pool_indices,
+                pool_indices,
                 temperature=self._temperature_pool,
                 top_k=self._top_k_pool,
                 top_p=self._top_p_pool,
@@ -372,28 +526,64 @@ class FlashInferSamplingBackend(SamplingBackend):
                 accept_index=accept_index,
                 accept_token_num=accept_length,
                 candidates=candidates,
-                uniform_samples=self._coins_buf[:bs, :n],
-                uniform_samples_for_final_sampling=self._final_coins_buf[:bs],
+                uniform_samples=coins[:bs, :n],
+                uniform_samples_for_final_sampling=final_coins[:bs],
                 target_probs=target_probs,
                 draft_probs=None,
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=True,
+                deterministic=not dp_sampling,
                 enable_pdl=pdl_enabled(),
             )
 
         accept_length += 1
+        logprobs_local = None
+        if self.config.enable_output_logprobs and dp_sampling:
+            # DP verify logits are still sharded by request at this point.
+            # Compute scalar logprobs for local predictions before gathering
+            # predictions to full-batch shape; the non-DP writer requires
+            # matching logits/token row counts.
+            logprobs_local = gather_token_logprobs_torch(logits, predict).view(
+                bs, num_tokens_per_req
+            )
 
+        if dp_sampling:
+            n = num_tokens_per_req
+            dp_comm.prepare_verify_outputs(logits_output.next_token_logits.dtype)
+            (
+                predict_full,
+                accept_index_full,
+                accept_length_full,
+            ) = dp_comm.gather_verify_outputs(
+                predict_local=predict.view(bs, n),
+                accept_index_local=accept_index,
+                accept_length_local=accept_length,
+                pad_bs=pad_bs,
+            )
+            predict = predict_full.view(-1)[: effective_bs * n]
+            accept_index = accept_index_full[:effective_bs]
+            accept_length = accept_length_full[:effective_bs]
+            if logprobs_local is not None:
+                logprobs_full = dp_comm.gather_verify_logprobs(
+                    logprobs_local,
+                    pad_bs=pad_bs,
+                )
+                logits_output.next_token_logprobs = logprobs_full.view(-1)[
+                    : effective_bs * n
+                ]
         # TP-rank sync: rank 0 wins on the full verify-output triple.
         # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
         # knob and produces non-bit-identical results across ranks (sub-ulp
         # FP accumulation order).
-        # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
-        if not _FUSED_TOPK_TOPP_AVAILABLE:
+        # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL,
+        # fused top-k + top-p is bit-identical across ranks and does not need
+        # a broadcast.
+        elif pdl_enabled():
+            self.maybe_broadcast(predict, accept_index, accept_length)
+        elif not _FUSED_TOPK_TOPP_AVAILABLE:
             self.maybe_broadcast(predict, accept_index, accept_length)
 
-        if self.config.enable_output_logprobs:
+        if self.config.enable_output_logprobs and not dp_sampling:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
                 logits, predict
             )

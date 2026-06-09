@@ -419,6 +419,36 @@ void HybridPrefixCache::OnKVEvict(TreeNode* node) {
     }
 }
 
+void HybridPrefixCache::OnNodeDestroyed(TreeNode* node) {
+    if (node == nullptr) return;
+    // The node is about to be freed by RadixTree::PruneEmptyByNode. Drop it from
+    // every adjunct set that stores a raw TreeNode* so none is left dangling.
+    // Mirror the per-resource eviction callbacks (OnKVEvict / OnKVHostEvict):
+    // detach the node's slots first, then refresh the parent's mamba-leaf
+    // membership. Detaching here (rather than relying on ~TreeNode) is required
+    // so UpdateLeaf(parent) re-derives the parent's status with this node
+    // already mamba-less -- otherwise the still-attached child would mask the
+    // parent and it would never be promoted to a mamba leaf.
+    if (mamba_allocator_ != nullptr && node->HasMamba()) {
+        mamba_eviction_manager_.UntrackNode(node);
+        node->DetachMamba();
+        if (node->Parent() != nullptr) {
+            mamba_eviction_manager_.UpdateLeaf(node->Parent());
+        }
+    }
+    if (node->HasPagedCacheSnapshot()) {
+        DetachPagedCacheSnapshotFromNode(node);
+    }
+    // Host-side Mamba L2 bookkeeping (no-op when the L2 pool is disabled, since
+    // these sets are only populated when mamba_host_allocator_ is present).
+    pending_mamba_host_writebacks_.erase(node);
+    if (node->HasMambaOnHost()) {
+        node->DetachMambaHost();
+        mamba_host_nodes_.erase(node);
+        mamba_host_writeback_done_nodes_.erase(node);
+    }
+}
+
 void HybridPrefixCache::OnKVHostEvict(TreeNode* node) {
     if (node == nullptr || mamba_host_allocator_ == nullptr) return;
     pending_mamba_host_writebacks_.erase(node);
@@ -999,6 +1029,19 @@ void HybridPrefixCache::ReleaseRequest(const std::string& request_id) {
     DemoteIdleMambaDeviceCopiesPresentOnHost();
 }
 
+void HybridPrefixCache::RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens) {
+    if (accepted_raw_tokens < 0) {
+        throw std::invalid_argument("HybridPrefixCache::RewindRequest: accepted_raw_tokens must be >= 0");
+    }
+    auto it = request_paged_cache_tables_.find(request_id);
+    if (it == request_paged_cache_tables_.end()) {
+        return;
+    }
+    for (auto& [_, table] : it->second) {
+        table.RewindTail(accepted_raw_tokens);
+    }
+}
+
 void HybridPrefixCache::PopulateOp(ForwardOperationBase& op_base) const {
     if (paged_cache_allocators_.empty()) return;
     auto req_it = request_paged_cache_tables_.find(op_base.request_id);
@@ -1356,21 +1399,6 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
         TreeNode* attach_node = kv_prefix_cache_.GetRadixTree().SplitAt(terminal, target);
         if (attach_node == nullptr) break;
 
-        if (attach_node->HasPagedCacheSnapshot()) {
-            PagedCacheSnapshot* existing = attach_node->GetPagedCacheSnapshotMut();
-            const bool adopted = existing != nullptr && adoptExistingPagedCacheSnapshot(*existing, tables, target);
-            if (!adopted) {
-                spdlog::warn(
-                    "[HybridPrefixCache] CommitChunk: existing snapshot adoption failed for request {} at target "
-                    "depth {}; leaving existing snapshot intact",
-                    request_id, target);
-                break;
-            }
-            RefreshPagedCacheSnapshotCompleteness(*existing);
-            last_committed = target;
-            continue;
-        }
-
         bool preflight_ok = true;
         for (const auto& gid : required_groups) {
             auto t_it = tables.find(gid);
@@ -1400,6 +1428,21 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
                 preflight_ok = false;
                 break;
             }
+            auto group_alloc_it = paged_cache_allocators_.find(gid);
+            if (group_alloc_it == paged_cache_allocators_.end() || group_alloc_it->second == nullptr) {
+                preflight_ok = false;
+                break;
+            }
+            const auto& cfg = group_alloc_it->second->Config();
+            if (cfg.family == PagedCacheGroupFamily::History) {
+                const std::int32_t committed_page = table.CommittedPrefixLenTokens() / raw_per_page;
+                const std::int32_t owned_base_page = table.BaseLogicalPage() + table.BorrowedPagesCount();
+                const std::int32_t pages_to_commit = (target - table.CommittedPrefixLenTokens()) / raw_per_page;
+                if (owned_base_page != committed_page || pages_to_commit > table.OwnedPagesCount()) {
+                    preflight_ok = false;
+                    break;
+                }
+            }
         }
         if (!preflight_ok) {
             spdlog::warn(
@@ -1407,6 +1450,21 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
                 "depth {}; leaving prior commits intact",
                 request_id, target);
             break;
+        }
+
+        if (attach_node->HasPagedCacheSnapshot()) {
+            PagedCacheSnapshot* existing = attach_node->GetPagedCacheSnapshotMut();
+            const bool adopted = existing != nullptr && adoptExistingPagedCacheSnapshot(*existing, tables, target);
+            if (!adopted) {
+                spdlog::warn(
+                    "[HybridPrefixCache] CommitChunk: existing snapshot adoption failed for request {} at target "
+                    "depth {}; leaving existing snapshot intact",
+                    request_id, target);
+                break;
+            }
+            RefreshPagedCacheSnapshotCompleteness(*existing);
+            last_committed = target;
+            continue;
         }
 
         auto snapshot = std::make_unique<PagedCacheSnapshot>();

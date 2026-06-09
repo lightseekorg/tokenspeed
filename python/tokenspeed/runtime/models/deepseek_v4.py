@@ -34,10 +34,14 @@ from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.gemm import deep_gemm as _deep_gemm
-from tokenspeed_kernel.registry import error_fn
 
-deep_gemm = None if _deep_gemm.get_num_sms is error_fn else _deep_gemm
+try:
+    # Optional dependency; the module-level wrapper imports the external
+    # `deep_gemm` package unguarded, which is not installed in baseline V4
+    # builds. Callsites guard usage with `deep_gemm is not None`.
+    from tokenspeed_kernel.thirdparty import deep_gemm
+except ImportError:
+    deep_gemm = None  # type: ignore[assignment]
 
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
@@ -56,10 +60,10 @@ from tokenspeed_kernel.ops.routing.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
-from tokenspeed_kernel.ops.routing.trtllm import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.trtllm import (
     fast_topk_v2,
 )
-from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1963,6 +1967,34 @@ def _deepseek_v4_sanitize_swa_slot_mapping(
     )
 
 
+def _deepseek_v4_swa_slot_mapping(
+    ctx: ForwardContext,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> torch.Tensor:
+    if positions.numel() == 0:
+        return out_cache_loc
+    metadata = _deepseek_v4_forward_metadata(ctx)
+    if metadata is None:
+        raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+    cache_metadata = metadata.cache
+    if cache_metadata.swa_block_table is None:
+        return out_cache_loc
+    token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
+    if token_to_req_indices.numel() != positions.numel() and (
+        token_to_req_indices.numel() <= 0
+        or positions.numel() % token_to_req_indices.numel() != 0
+    ):
+        return out_cache_loc
+    return _group_slot_mapping_from_raw(
+        positions,
+        token_to_req_indices,
+        cache_metadata.swa_block_table,
+        ctx.token_to_kv_pool.swa_block_size,
+        base_offsets=cache_metadata.swa_base_logical_page,
+    )
+
+
 def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
     override = global_server_args_dict.get("attention_use_fp4_indexer_cache", None)
     if override is not None:
@@ -3627,14 +3659,12 @@ class DeepseekV4Attention(nn.Module):
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
 
-        # When swa_slot_mapping is provided (main model path), use it directly.
-        # When None (MTP draft path), fall back to out_cache_loc.
-        # TODO: MTP draft metadata has token_to_req_indices shaped per-request
-        # (not per-token), so _group_slot_mapping_from_raw cannot compute the
-        # correct paged SWA mapping here. out_cache_loc is not ideal when paged
-        # SWA groups are active; fix once MTP metadata packs per-token indices.
         if swa_slot_mapping is None:
-            swa_slot_mapping = out_cache_loc
+            swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+                ctx,
+                positions,
+                out_cache_loc,
+            )
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -4021,26 +4051,11 @@ class DeepseekV4Model(nn.Module):
         # The SWA write-slot mapping is identical across all layers, so compute
         # it once per step here instead of recomputing it in every attention
         # layer (DeepSeek-V3 likewise derives its slot mapping once per step).
-        # On an empty batch (e.g. the DP idle fallback) the attention layers
-        # early-return without touching metadata, so skip the metadata read here
-        # too to preserve that behavior on a fresh backend.
-        if hidden_states.shape[0] == 0:
-            swa_slot_mapping = out_cache_loc
-        else:
-            metadata = ctx.attn_backend.forward_metadata
-            if metadata is None:
-                raise RuntimeError("DeepSeek V4 attention requires forward metadata")
-            cache_metadata = metadata.cache
-            if cache_metadata.swa_block_table is not None:
-                swa_slot_mapping = _group_slot_mapping_from_raw(
-                    positions,
-                    metadata.token_to_req_indices[: positions.numel()],
-                    cache_metadata.swa_block_table,
-                    ctx.token_to_kv_pool.swa_block_size,
-                    base_offsets=cache_metadata.swa_base_logical_page,
-                )
-            else:
-                swa_slot_mapping = out_cache_loc
+        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+            ctx,
+            positions,
+            out_cache_loc,
+        )
         # Per-(step, ratio) compressor slot mappings are identical across layers of the
         # same ratio; memoize within the step (filled lazily by the first compressor of
         # each ratio, reused by the rest).

@@ -106,12 +106,17 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
-                       std::int32_t page_size) {
+                       std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override) {
     if (hybrid_cache == nullptr) return;
 
-    std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
+    std::vector<std::int32_t> computed_prefix_pages;
+    const std::vector<std::int32_t>* prefix_pages = prefix_pages_override;
+    if (prefix_pages == nullptr) {
+        computed_prefix_pages = DevicePagesFromRoot(device_node_ref->Node());
+        prefix_pages = &computed_prefix_pages;
+    }
     std::int32_t new_page_count =
-        static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
+        static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages->size());
     if (new_page_count <= 0) {
         if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
             local_mamba_allocator->DetachCheckpoint();
@@ -120,7 +125,7 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
     }
 
     OwnedPages pages_to_insert = local_kv_allocator->TakeFirst(new_page_count);
-    auto insert_result = hybrid_cache->GetKVPrefixCache().Insert<ResourceType::Device>(full_paged_tokens, prefix_pages,
+    auto insert_result = hybrid_cache->GetKVPrefixCache().Insert<ResourceType::Device>(full_paged_tokens, *prefix_pages,
                                                                                        std::move(pages_to_insert));
 
     if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {

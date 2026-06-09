@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
-from tokenspeed_kernel.registry import load_builtin_kernels
 
 bootstrap_profiling_from_env()
 
@@ -45,6 +44,7 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_mxfp8,
     quantize_nvfp4,
 )
+from tokenspeed_kernel.ops.sampling import argmax
 
 __all__ = [
     # gemm
@@ -67,6 +67,6 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
+    # sampling
+    "argmax",
 ]
-
-load_builtin_kernels()

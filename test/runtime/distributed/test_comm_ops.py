@@ -15,6 +15,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
+
 
 def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -172,6 +174,28 @@ def _test_all_gather_into_tensor(rank, world_size, device, group, ref_group):
     dist.all_gather_into_tensor(expected, inp, group=ref_group)
     all_gather_into_tensor(output, inp, group)
     torch.testing.assert_close(output, expected)
+
+
+def _test_all_to_all_single(rank, world_size, device, group, ref_group):
+    for sz in TEST_SIZES:
+        for dtype in DTYPES:
+            total = sz * world_size
+            inp = torch.randint(1, 16, (total,), dtype=dtype, device=device)
+            expected = torch.empty_like(inp)
+            dist.all_to_all_single(expected, inp, group=ref_group)
+            output = torch.empty_like(inp)
+            all_to_all_single(output, inp, group)
+            torch.testing.assert_close(output, expected)
+
+    for dtype in DTYPES:
+        rows_per_rank = 4
+        total_rows = rows_per_rank * world_size
+        inp = torch.randint(1, 16, (total_rows, 128), dtype=dtype, device=device)
+        expected = torch.empty_like(inp)
+        dist.all_to_all_single(expected, inp, group=ref_group)
+        output = torch.empty_like(inp)
+        all_to_all_single(output, inp, group)
+        torch.testing.assert_close(output, expected)
 
 
 def _test_reduce_scatter(rank, world_size, device, group, ref_group):
@@ -345,6 +369,10 @@ class TestCommOps:
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_all_gather_into_tensor(self, world_size):
         _run(world_size, _test_all_gather_into_tensor)
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_all_to_all_single(self, world_size):
+        _run(world_size, _test_all_to_all_single)
 
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_reduce_scatter(self, world_size):

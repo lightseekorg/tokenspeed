@@ -47,8 +47,8 @@ _AUTO_IMPL_PREFERENCE = {
     ),
     "mxfp4": (
         "flashinfer_mxfp4",
-        "triton_kernel",
         "gluon_kernel",
+        "triton_kernel",
     ),
     "fp8": (
         "flashinfer_cutlass",

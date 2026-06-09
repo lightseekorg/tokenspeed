@@ -442,11 +442,20 @@ def describe_kernel(name: str) -> str:
 
 
 def load_builtin_kernels() -> None:
-    from tokenspeed_kernel.registrations import amd, nvidia, portable
+    import sys
 
-    portable.load()
-    nvidia.load()
-    amd.load()
+    if not KernelRegistry.get().list_kernels():
+        # Registry was reset; clear cached ops modules so decorators re-run.
+        for key in list(sys.modules.keys()):
+            if key.startswith("tokenspeed_kernel.ops.") or key.startswith(
+                "tokenspeed_kernel.numerics.reference."
+            ):
+                del sys.modules[key]
+    import tokenspeed_kernel.ops.embedding  # noqa: F401
+    import tokenspeed_kernel.ops.gemm  # noqa: F401
+    import tokenspeed_kernel.ops.moe  # noqa: F401
+    import tokenspeed_kernel.ops.quantization  # noqa: F401
+    import tokenspeed_kernel.ops.sampling  # noqa: F401
 
 
 def error_fn(*args, **kwargs):

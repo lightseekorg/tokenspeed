@@ -170,4 +170,53 @@ TEST(TreeNodeSeqId, IsMonotonicAcrossConstruction) {
     EXPECT_LT(b.SeqId(), c.SeqId());
 }
 
+// ---------------------------------------------------------------------------
+// Regression: dangling TreeNode* in mamba_leaves_ must never be dereferenced
+// by Evict(). Reproduces the production segfault from dashllm1.log:
+//
+//     MambaSlot::release() / ~MambaSlot()
+//     MambaEvictionManager::Evict(...)         <- leaf->DetachMamba() on a
+//     MambaEvictionManager::EnsureCapacity(...)    freed TreeNode
+//     Scheduler::scheduleDecode(...)
+//
+// A TreeNode owning a Mamba slot is destroyed (here via RemoveChild directly)
+// while it is still a member of mamba_leaves_. The next Evict() walks
+// mamba_leaves_, calls leaf->DetachMamba() on the freed node, and ~MambaSlot
+// runs on freed memory.
+//
+// DISABLED: this exercises the *universal* invariant -- a TreeNode must never be
+// destroyed while still tracked -- via a raw RemoveChild that bypasses
+// RadixTree::PruneEmptyByNode. The shipped stopgap untracks only inside
+// PruneEmptyByNode (the sole runtime destruction path), so it does NOT cover a
+// direct RemoveChild. The follow-up RAII fix (TreeNode auto-unregisters from
+// adjunct bookkeeping on destruction) is what makes this path safe; enable this
+// test (drop the DISABLED_ prefix) once that lands. The production crash itself
+// is covered today by MambaCacheTest.PruneOfMambaNodeUntracksSoLaterEvictIsSafe.
+//
+// Build with -fsanitize=address to observe the heap-use-after-free.
+// ---------------------------------------------------------------------------
+TEST_F(MambaEvictionTest, DISABLED_EvictDoesNotDereferenceDestroyedTrackedNode) {
+    // Two tracked mamba leaves so the pool is partially consumed and Evict has
+    // a reason to walk mamba_leaves_ to free a slot.
+    auto t_live = token_vec_t{1, 2};
+    auto* live = MakeNodeWithMamba(&root_, t_live);
+    auto t_dead = token_vec_t{3, 4};
+    auto* dead = MakeNodeWithMamba(&root_, t_dead);
+    ASSERT_TRUE(live->HasMamba());
+    ASSERT_TRUE(dead->HasMamba());
+
+    // Destroy `dead` by dropping the owning unique_ptr held by the parent
+    // WITHOUT untracking it from the eviction manager. This is the lifecycle
+    // bug: a node-free path that bypasses the mamba untrack leaves a dangling
+    // pointer in mamba_leaves_.
+    root_.RemoveChild(t_dead);  // frees `dead`; `dead` is now dangling
+
+    // Evict() walks mamba_leaves_ and would call dead->DetachMamba() on freed
+    // memory. With the RAII fix, `dead` is untracked on destruction, so Evict
+    // only sees `live` and frees its slot cleanly.
+    std::int32_t freed = eviction_->Evict(1);
+    EXPECT_EQ(freed, 1);
+    EXPECT_FALSE(live->HasMamba());
+}
+
 }  // namespace tokenspeed::test
