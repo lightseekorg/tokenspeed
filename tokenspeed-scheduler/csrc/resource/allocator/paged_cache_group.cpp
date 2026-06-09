@@ -430,6 +430,41 @@ std::vector<std::int32_t> PagedCacheGroupTable::ReleaseSkipped(std::int32_t wind
     return released;
 }
 
+std::vector<std::int32_t> PagedCacheGroupTable::RewindTail(std::int32_t target_raw_tokens_exclusive) {
+    if (allocator_ == nullptr) {
+        return {};
+    }
+    if (target_raw_tokens_exclusive < 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::RewindTail: target must be >= 0");
+    }
+    const std::int32_t target = std::max(target_raw_tokens_exclusive, committed_prefix_len_tokens_);
+    if (target >= raw_token_cursor_) {
+        return {};
+    }
+
+    const auto& cfg = allocator_->Config();
+    if (cfg.RawTokensPerPage() <= 0) {
+        throw std::logic_error("PagedCacheGroupTable::RewindTail: invalid group config");
+    }
+
+    const std::int32_t entries_needed = CeilDivPositive(target, cfg.entry_stride_tokens);
+    const std::int32_t pages_needed = (entries_needed + cfg.rows_per_page - 1) / cfg.rows_per_page;
+    const std::int32_t owned_base = base_logical_page_ + static_cast<std::int32_t>(borrowed_page_ids_.size());
+    const std::int32_t keep_owned = std::clamp(pages_needed - owned_base, 0, owned_pages_.Size());
+    const std::int32_t drop_owned = owned_pages_.Size() - keep_owned;
+
+    std::vector<std::int32_t> released;
+    if (drop_owned > 0) {
+        OwnedPages dropped = owned_pages_.TakeLast(drop_owned);
+        const auto& dropped_ids = dropped.Ids();
+        released.insert(released.end(), dropped_ids.begin(), dropped_ids.end());
+        RefreshPageIdsView();
+        // dropped dtor returns pages to pool.
+    }
+    raw_token_cursor_ = target;
+    return released;
+}
+
 std::vector<std::int32_t> PagedCacheGroupTable::ReleaseAll() {
     std::vector<std::int32_t> released;
     released.reserve(borrowed_page_ids_.size() + static_cast<std::size_t>(owned_pages_.Size()));

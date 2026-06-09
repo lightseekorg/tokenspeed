@@ -696,9 +696,10 @@ class OutputProcesser:
         so we must NOT emit an additional make_finish_event here.
 
         We send a finished BatchTokenIDOut to the detokenizer so the Prefill TM
-        can resolve its HTTP coroutine and let mini_lb unblock.  Without this,
-        mini_lb waits forever for the prefill side's HTTP response while the
-        decode side has already finished — client hangs indefinitely.
+        can resolve its HTTP coroutine and let the HTTP load balancer unblock.
+        Without this, the load balancer waits forever for the prefill side's HTTP
+        response while the decode side has already finished — client hangs
+        indefinitely.
         """
         if req_id not in self.rid_to_state:
             return []

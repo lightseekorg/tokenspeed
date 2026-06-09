@@ -1,0 +1,49 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-deepseek-v4-flash-gsm8k
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model deepseek-ai/DeepSeek-V4-Flash
+    --tensor-parallel-size 4
+    --enable-expert-parallel
+    --kv-cache-dtype fp8_e4m3
+    --moe-backend mega_moe
+    --attention-use-fp4-indexer-cache
+    --max-model-len 4096
+    --max-total-tokens 16384
+    --chunked-prefill-size 8192
+    --gpu-memory-utilization 0.9
+    --disable-kvstore
+    --trust-remote-code
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    python3 -c "import urllib.request,json;urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/v1/completions',json.dumps({'model':'deepseek-ai/DeepSeek-V4-Flash','prompt':' '.join(['hello']*300),'max_tokens':2}).encode(),{'Content-Type':'application/json'}),timeout=120).read()" &&
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model deepseek-ai/DeepSeek-V4-Flash
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --eval-batch-size 16
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":256}'
+report:
+  github_step_summary: true
+score_threshold: 0.90
