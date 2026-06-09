@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect GPT-OSS random perf sweeps into one CI summary table."""
+"""Collect random perf sweeps into one CI summary table."""
 
 import argparse
 import csv
