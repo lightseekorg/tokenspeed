@@ -49,7 +49,6 @@ perf:
     --api openai
     --dataset random
     --tokenizer-path "$MODEL"
-    --tokenize-prompt
     --min-prompt-length "$input_len"
     --max-prompt-length "$input_len"
     --prefix-length 0
