@@ -4652,10 +4652,12 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     b2 = w2_bias if w2_bias is not None else dummy_bias
 
     BLOCK_K = 128
-    BLOCK_N = 16
-    M_DUP = 16
+    S1_BLOCK_N = 8 if n_tokens <= 4 else 16
+    S1_M_DUP = 8 if n_tokens <= 4 else 16
+    S2_BLOCK_N = 8 if n_tokens <= 1 else 16
+    S2_M_DUP = 4
     if fuse_topk_stage1:
-        s1_grid = (n_tokens * ((I + BLOCK_N - 1) // BLOCK_N),)
+        s1_grid = (n_tokens * ((I + S1_BLOCK_N - 1) // S1_BLOCK_N),)
         _warp_decode_topk_stage1_fp8_mxfp4_kernel[s1_grid](
             x_u8,
             router_logits_c,
@@ -4691,15 +4693,15 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
             TKP=_route_next_pow2(top_k),
             X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
             BLOCK_K=BLOCK_K,
-            BLOCK_N=BLOCK_N,
-            M_DUP=M_DUP,
+            BLOCK_N=S1_BLOCK_N,
+            M_DUP=S1_M_DUP,
             HAS_BIAS=w13_bias is not None,
             SWIGLU_ALPHA=float(swiglu_alpha),
             SWIGLU_LIMIT=float(swiglu_limit),
             num_warps=1,
         )
     else:
-        s1_grid = (n_tokens * top_k * ((I + BLOCK_N - 1) // BLOCK_N),)
+        s1_grid = (n_tokens * top_k * ((I + S1_BLOCK_N - 1) // S1_BLOCK_N),)
         _warp_decode_stage1_fp8_mxfp4_kernel[s1_grid](
             x_u8,
             w13_raw,
@@ -4726,15 +4728,15 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
             D_PACKED=D // 2,
             TOPK=top_k,
             BLOCK_K=BLOCK_K,
-            BLOCK_N=BLOCK_N,
-            M_DUP=M_DUP,
+            BLOCK_N=S1_BLOCK_N,
+            M_DUP=S1_M_DUP,
             HAS_BIAS=w13_bias is not None,
             SWIGLU_ALPHA=float(swiglu_alpha),
             SWIGLU_LIMIT=float(swiglu_limit),
             num_warps=1,
         )
 
-    s2_grid = (n_tokens * ((N + BLOCK_N - 1) // BLOCK_N),)
+    s2_grid = (n_tokens * ((N + S2_BLOCK_N - 1) // S2_BLOCK_N),)
     inter_u8 = inter
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
         inter_u8,
@@ -4762,8 +4764,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         I_PACKED=I // 2,
         TOPK=top_k,
         BLOCK_K=BLOCK_K,
-        BLOCK_N=BLOCK_N,
-        M_DUP=M_DUP,
+        BLOCK_N=S2_BLOCK_N,
+        M_DUP=S2_M_DUP,
         HAS_BIAS=w2_bias is not None,
         num_warps=1,
     )
