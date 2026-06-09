@@ -79,7 +79,7 @@ class LogitsLayoutExecutor:
         hidden_states: torch.Tensor,
         plan: LogitsLayoutPlan,
     ) -> torch.Tensor:
-        n = self._validate_plan(plan)
+        n = self._tokens_per_req(plan)
         rows = hidden_states.shape[0]
         assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
         bs = rows // n
@@ -99,7 +99,7 @@ class LogitsLayoutExecutor:
         local_logits: torch.Tensor,
         plan: LogitsLayoutPlan,
     ) -> torch.Tensor:
-        n = self._validate_plan(plan)
+        n = self._tokens_per_req(plan)
         rows = local_logits.shape[0]
         assert rows % n == 0, f"local logits have {rows} rows, not divisible by N={n}"
         bs = rows // n
@@ -112,22 +112,13 @@ class LogitsLayoutExecutor:
             local_logits = torch.nn.functional.pad(local_logits, (0, 0, 0, pad_rows))
         return self._comm.swap_batch_vocab(local_logits, pad_bs=plan.bucket_bs)
 
-    def _validate_plan(self, plan: LogitsLayoutPlan) -> int:
-        assert plan.is_dp_all_to_all
-        assert (
-            plan.tp_size == self._tp_size
-        ), f"plan tp_size={plan.tp_size} != executor tp_size={self._tp_size}"
-        assert plan.num_tokens_per_req == self._num_tokens_per_req, (
-            f"plan N={plan.num_tokens_per_req} != executor "
-            f"N={self._num_tokens_per_req}"
-        )
-        assert (
-            plan.effective_bs >= plan.real_bs
-        ), f"effective_bs={plan.effective_bs} must be >= real_bs={plan.real_bs}"
-        assert (
-            plan.bucket_bs >= plan.effective_bs
-        ), f"bucket_bs={plan.bucket_bs} must be >= effective_bs={plan.effective_bs}"
-        assert (
-            plan.bucket_bs % self._tp_size == 0
-        ), f"bucket_bs={plan.bucket_bs} must be divisible by tp_size={self._tp_size}"
+    def _tokens_per_req(self, plan: LogitsLayoutPlan) -> int:
+        if (
+            not plan.is_dp_all_to_all
+            or plan.tp_size != self._tp_size
+            or plan.num_tokens_per_req != self._num_tokens_per_req
+            or plan.bucket_bs < plan.effective_bs
+            or plan.bucket_bs % self._tp_size != 0
+        ):
+            raise RuntimeError("invalid DP logits layout plan")
         return plan.num_tokens_per_req
