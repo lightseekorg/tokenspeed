@@ -151,6 +151,29 @@ logger = get_colorful_logger(__name__)
 SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS = 500.0
 
 
+def _deepseek_v4_timing_enabled(ctx: ForwardContext | None = None) -> bool:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return False
+    if ctx is None:
+        return True
+    return ctx.forward_mode is not None and ctx.forward_mode.is_extend_or_mixed()
+
+
+def _deepseek_v4_phase_start(enabled: bool) -> float | None:
+    return time.perf_counter() if enabled else None
+
+
+def _deepseek_v4_phase_done(
+    phase_wall_ms: dict[str, float],
+    name: str,
+    tic: float | None,
+) -> None:
+    if tic is None:
+        return
+    elapsed_ms = (time.perf_counter() - tic) * 1000
+    phase_wall_ms[name] = round(phase_wall_ms.get(name, 0.0) + elapsed_ms, 3)
+
+
 def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
     return (
         metadata is not None
@@ -1393,6 +1416,9 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
 
+    timing_enabled = _deepseek_v4_timing_enabled()
+    total_tic = _deepseek_v4_phase_start(timing_enabled)
+    phase_wall_ms: dict[str, float] = {}
     num_tokens = q_values.shape[0]
     if num_tokens == 0:
         return (
@@ -1414,7 +1440,9 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
             gathered_k,
         )
 
+    reused_gather = gathered_k is not None
     if gathered_k is None:
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_topk_prefill_gather_paged_mxfp4"):
             gathered_k = _deepseek_v4_gather_paged_indexer_mxfp4_cache(
                 cache_2d,
@@ -1423,8 +1451,10 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
                 cache_block_size,
                 out=gather_workspace,
             )
+        _deepseek_v4_phase_done(phase_wall_ms, "gather_paged_mxfp4", tic)
     k_values, k_scales = gathered_k
 
+    tic = _deepseek_v4_phase_start(timing_enabled)
     with nvtx_range("indexer_topk_prefill_deepgemm_logits"):
         logits = deep_gemm.fp8_fp4_mqa_logits(
             q=(q_values.contiguous().view(torch.int8), q_scales.contiguous()),
@@ -1436,17 +1466,39 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
             max_seqlen_k=max_len,
             logits_dtype=torch.float32,
         )
+    _deepseek_v4_phase_done(phase_wall_ms, "deepgemm_logits", tic)
 
+    tic = _deepseek_v4_phase_start(timing_enabled)
     with nvtx_range("indexer_topk_prefill_select"):
-        return (
-            _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                row_lens,
-                topk_tokens,
-                use_prefill_topk_op=use_prefill_topk_op,
-            ),
-            gathered_k,
+        topk = _deepseek_v4_indexer_topk_from_logits(
+            logits,
+            row_lens,
+            topk_tokens,
+            use_prefill_topk_op=use_prefill_topk_op,
         )
+    _deepseek_v4_phase_done(phase_wall_ms, "topk_select", tic)
+
+    if timing_enabled and total_tic is not None:
+        total_ms = (time.perf_counter() - total_tic) * 1000
+        if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+            logger.debug(
+                "[DeepSeekV4][slow_indexer_prefill_chunk] total_ms=%.3f "
+                "phase_wall_ms=%s num_tokens=%s max_len=%s topk_tokens=%s "
+                "gather_rows=%s reused_gather=%s workspace_rows=%s",
+                total_ms,
+                phase_wall_ms,
+                num_tokens,
+                max_len,
+                topk_tokens,
+                int(k_values.shape[0]),
+                reused_gather,
+                (
+                    int(gather_workspace[0].shape[0])
+                    if gather_workspace is not None
+                    else 0
+                ),
+            )
+    return topk, gathered_k
 
 
 def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
@@ -3136,6 +3188,7 @@ class DeepseekV4Indexer(nn.Module):
         indexer_cache: torch.Tensor,
         indexer_block_size: int,
         cos_sin_cache: torch.Tensor,
+        layer_index: int,
     ) -> torch.Tensor:
         if not self.use_fp4_cache:
             raise RuntimeError(
@@ -3158,11 +3211,19 @@ class DeepseekV4Indexer(nn.Module):
             total_tokens,
         )
 
+        timing_enabled = _deepseek_v4_timing_enabled(ctx)
+        total_tic = _deepseek_v4_phase_start(timing_enabled)
+        phase_wall_ms: dict[str, float] = {}
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_wq_b"):
             index_q, _ = self.wq_b(qr)
             index_q = index_q.view(-1, self.n_head, self.head_dim)
+        _deepseek_v4_phase_done(phase_wall_ms, "wq_b", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_weights_proj"):
             weights, _ = self.weights_proj(hidden_states)
+        _deepseek_v4_phase_done(phase_wall_ms, "weights_proj", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_prepare_mxfp4"):
             packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
                 index_q=index_q,
@@ -3172,6 +3233,7 @@ class DeepseekV4Indexer(nn.Module):
                 softmax_scale=self.softmax_scale,
                 head_scale=self.n_head**-0.5,
             )
+        _deepseek_v4_phase_done(phase_wall_ms, "prepare_mxfp4", tic)
 
         packed_indexer_available = _deepseek_v4_deepgemm_fp4_indexer_available(
             packed_index_q[0]
@@ -3196,6 +3258,7 @@ class DeepseekV4Indexer(nn.Module):
             self.compress_ratio,
             indexer_block_size,
         )
+        tic = _deepseek_v4_phase_start(timing_enabled)
         prefill_metadata = _deepseek_v4_indexer_prefill_metadata(
             metadata=metadata,
             block_table=indexer_block_table,
@@ -3203,6 +3266,7 @@ class DeepseekV4Indexer(nn.Module):
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
         )
+        _deepseek_v4_phase_done(phase_wall_ms, "prefill_metadata", tic)
 
         decode_schedule_metadata = None
         decode_plan = None
@@ -3215,6 +3279,7 @@ class DeepseekV4Indexer(nn.Module):
                 if getattr(metadata, "is_valid_token", None) is not None
                 else None
             )
+            tic = _deepseek_v4_phase_start(timing_enabled)
             decode_plan = _deepseek_v4_indexer_decode_plan(
                 positions=decode_positions,
                 token_to_req_indices=metadata.token_to_req_indices[
@@ -3233,6 +3298,7 @@ class DeepseekV4Indexer(nn.Module):
                 metadata=metadata,
                 context_lens=decode_plan.context_lens,
             )
+            _deepseek_v4_phase_done(phase_wall_ms, "decode_metadata", tic)
         indexer_metadata = DeepseekV4SparseIndexerMetadata(
             batch_metadata=DeepseekV4IndexerBatchMetadata(
                 positions=positions,
@@ -3246,11 +3312,14 @@ class DeepseekV4Indexer(nn.Module):
             decode_plan=decode_plan,
             decode_schedule_metadata=decode_schedule_metadata,
         )
+        tic = _deepseek_v4_phase_start(timing_enabled)
         prefill_gather_values, prefill_gather_scales = self._prefill_gather_workspace(
             prefill_metadata.max_gather_rows(),
             positions.device,
         )
+        _deepseek_v4_phase_done(phase_wall_ms, "prefill_gather_workspace", tic)
 
+        tic = _deepseek_v4_phase_start(timing_enabled)
         topk_out = (
             self.topk_buffer.get(total_tokens, positions.device)
             if self.topk_buffer is not None
@@ -3260,7 +3329,7 @@ class DeepseekV4Indexer(nn.Module):
                 dtype=torch.int32,
             )
         )[:total_tokens]
-        return _deepseek_v4_sparse_attn_indexer(
+        topk = _deepseek_v4_sparse_attn_indexer(
             indexer_metadata=indexer_metadata,
             indexer_cache=indexer_cache,
             indexer_block_table=indexer_block_table,
@@ -3275,6 +3344,26 @@ class DeepseekV4Indexer(nn.Module):
             persistent_topk_workspace=self._persistent_topk_workspace,
             topk_tokens=self.topk_tokens,
         )
+        _deepseek_v4_phase_done(phase_wall_ms, "sparse_attn_indexer_op", tic)
+        if timing_enabled and total_tic is not None:
+            total_ms = (time.perf_counter() - total_tic) * 1000
+            if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+                logger.debug(
+                    "[DeepSeekV4][slow_indexer_custom] layer=%s total_ms=%.3f "
+                    "phase_wall_ms=%s total_tokens=%s num_prefill_tokens=%s "
+                    "num_decode_tokens=%s prefill_chunks=%s max_gather_rows=%s "
+                    "topk_tokens=%s",
+                    layer_index,
+                    total_ms,
+                    phase_wall_ms,
+                    total_tokens,
+                    num_prefill_tokens,
+                    num_decode_tokens,
+                    len(prefill_metadata.chunks),
+                    prefill_metadata.max_gather_rows(),
+                    self.topk_tokens,
+                )
+        return topk
 
     def forward(
         self,
@@ -3299,6 +3388,9 @@ class DeepseekV4Indexer(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
+        timing_enabled = _deepseek_v4_timing_enabled(ctx)
+        total_tic = _deepseek_v4_phase_start(timing_enabled)
+        phase_wall_ms: dict[str, float] = {}
         idx_hit = (
             compressor_slot_cache.get("indexer_state")
             if compressor_slot_cache is not None
@@ -3322,6 +3414,7 @@ class DeepseekV4Indexer(nn.Module):
                     "compressor state"
                 )
             indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
+            tic = _deepseek_v4_phase_start(timing_enabled)
             indexer_state_slot_mapping = _group_slot_mapping_from_raw(
                 positions,
                 metadata.token_to_req_indices[: positions.numel()],
@@ -3333,6 +3426,11 @@ class DeepseekV4Indexer(nn.Module):
                 indexer_state_slot_mapping,
                 valid_token,
             )
+            _deepseek_v4_phase_done(
+                phase_wall_ms,
+                "indexer_state_slot_mapping",
+                tic,
+            )
             if compressor_slot_cache is not None:
                 compressor_slot_cache["indexer_state"] = (
                     indexer_state_slot_mapping,
@@ -3340,6 +3438,7 @@ class DeepseekV4Indexer(nn.Module):
                     indexer_state_block_size,
                     indexer_state_base_logical_page,
                 )
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_compressor_total"):
             self.compressor(
                 hidden_states=hidden_states,
@@ -3356,6 +3455,8 @@ class DeepseekV4Indexer(nn.Module):
                 write_compressed_cache=False,
                 kv_score=indexer_compressor_kv_score,
             )
+        _deepseek_v4_phase_done(phase_wall_ms, "indexer_compressor_total", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
             indexer_block_table = cache_metadata.compressed_block_table(
@@ -3374,6 +3475,8 @@ class DeepseekV4Indexer(nn.Module):
                 ),
                 is_valid_token=valid_token,
             )
+        _deepseek_v4_phase_done(phase_wall_ms, "indexer_compressed_slot_mapping", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_cache_insert"):
             deepseek_v4_csa_indexer_cache_insert(
                 state_cache=indexer_state,
@@ -3392,7 +3495,9 @@ class DeepseekV4Indexer(nn.Module):
                 use_fp4_cache=self.use_fp4_cache,
                 compress_ratio=self.compress_ratio,
             )
-        return self._forward_sparse_indexer_custom_op(
+        _deepseek_v4_phase_done(phase_wall_ms, "indexer_cache_insert", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
+        topk = self._forward_sparse_indexer_custom_op(
             hidden_states=hidden_states,
             qr=qr,
             positions=positions,
@@ -3401,7 +3506,25 @@ class DeepseekV4Indexer(nn.Module):
             indexer_cache=pool.get_indexer_kv_buffer_2d(layer_index),
             indexer_block_size=indexer_block_size,
             cos_sin_cache=cos_sin_cache,
+            layer_index=layer_index,
         )
+        _deepseek_v4_phase_done(phase_wall_ms, "indexer_sparse_custom_op", tic)
+        if timing_enabled and total_tic is not None:
+            total_ms = (time.perf_counter() - total_tic) * 1000
+            if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+                logger.debug(
+                    "[DeepSeekV4][slow_indexer_forward] layer=%s total_ms=%.3f "
+                    "phase_wall_ms=%s input_tokens=%s num_extends=%s "
+                    "compress_ratio=%s use_fp4_cache=%s",
+                    layer_index,
+                    total_ms,
+                    phase_wall_ms,
+                    positions.numel(),
+                    ctx.num_extends,
+                    self.compress_ratio,
+                    self.use_fp4_cache,
+                )
+        return topk
 
 
 class DeepseekV4Attention(nn.Module):
@@ -3678,6 +3801,10 @@ class DeepseekV4Attention(nn.Module):
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
 
+        timing_enabled = _deepseek_v4_timing_enabled(ctx)
+        total_tic = _deepseek_v4_phase_start(timing_enabled)
+        phase_wall_ms: dict[str, float] = {}
+
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
         # After this phase, each compressor's forward() receives its
@@ -3685,6 +3812,7 @@ class DeepseekV4Attention(nn.Module):
         # shared-weight dependency that prevents safe multi-stream overlap.
         compressor_kv_score: torch.Tensor | None = None
         indexer_compressor_kv_score: torch.Tensor | None = None
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with self.stream_fork.scope(
             enable=self.stream_fork.aux_stream is not None
         ) as fork:
@@ -3701,13 +3829,20 @@ class DeepseekV4Attention(nn.Module):
                         indexer_compressor_kv_score = (
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
+        _deepseek_v4_phase_done(
+            phase_wall_ms,
+            "project_q_kv_and_compressor_gemm",
+            tic,
+        )
 
         if swa_slot_mapping is None:
+            tic = _deepseek_v4_phase_start(timing_enabled)
             swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
                 ctx,
                 positions,
                 out_cache_loc,
             )
+            _deepseek_v4_phase_done(phase_wall_ms, "swa_slot_mapping", tic)
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -3748,6 +3883,7 @@ class DeepseekV4Attention(nn.Module):
         topk_indices = None
         if self.indexer is not None:
             assert self.compressor is not None
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with nvtx_range(f"{profile_prefix}_indexer_prepare_decode_metadata"):
                 self.indexer.prepare_decode_metadata(
                     positions=positions,
@@ -3757,10 +3893,17 @@ class DeepseekV4Attention(nn.Module):
                         self.cache_layer_index
                     ),
                 )
+            _deepseek_v4_phase_done(
+                phase_wall_ms,
+                "indexer_prepare_decode_metadata",
+                tic,
+            )
 
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with self.stream_fork.scope(
                 enable=self.stream_fork.aux_stream is not None
             ) as fork:
+                inner_tic = _deepseek_v4_phase_start(timing_enabled)
                 with nvtx_range(f"{profile_prefix}_indexer"):
                     topk_indices = self.indexer(
                         hidden_states=hidden_states,
@@ -3773,22 +3916,37 @@ class DeepseekV4Attention(nn.Module):
                         compressor_slot_cache=compressor_slot_cache,
                         indexer_compressor_kv_score=indexer_compressor_kv_score,
                     )
+                _deepseek_v4_phase_done(phase_wall_ms, "indexer", inner_tic)
+                inner_tic = _deepseek_v4_phase_start(timing_enabled)
                 with fork.branch():
                     insert_swa_cache()
+                _deepseek_v4_phase_done(phase_wall_ms, "insert_swa_cache", inner_tic)
+                inner_tic = _deepseek_v4_phase_start(timing_enabled)
                 run_compressor()
+                _deepseek_v4_phase_done(phase_wall_ms, "compressor", inner_tic)
+            _deepseek_v4_phase_done(phase_wall_ms, "indexer_stream_scope", tic)
         elif self.compressor is not None:
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with self.stream_fork.scope(
                 enable=self.stream_fork.aux_stream is not None
             ) as fork:
+                inner_tic = _deepseek_v4_phase_start(timing_enabled)
                 run_compressor()
+                _deepseek_v4_phase_done(phase_wall_ms, "compressor", inner_tic)
+                inner_tic = _deepseek_v4_phase_start(timing_enabled)
                 with fork.branch():
                     insert_swa_cache()
+                _deepseek_v4_phase_done(phase_wall_ms, "insert_swa_cache", inner_tic)
+            _deepseek_v4_phase_done(phase_wall_ms, "compressor_stream_scope", tic)
         else:
+            tic = _deepseek_v4_phase_start(timing_enabled)
             insert_swa_cache()
+            _deepseek_v4_phase_done(phase_wall_ms, "insert_swa_cache", tic)
         forward_mode = ctx.forward_mode
         if forward_mode is None:
             raise RuntimeError("DeepSeek V4 attention requires forward mode")
         if forward_mode.is_mixed():
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with nvtx_range(f"{profile_prefix}_mixed_backend"):
                 attn_output = ctx.attn_backend.forward_deepseek_v4_mixed(
                     q=q,
@@ -3805,7 +3963,9 @@ class DeepseekV4Attention(nn.Module):
                     attn_sink=self.attn_sink,
                     topk_indices=topk_indices,
                 )
+            _deepseek_v4_phase_done(phase_wall_ms, "mixed_backend", tic)
         elif forward_mode.is_decode() or forward_mode.is_speculative():
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with nvtx_range(f"{profile_prefix}_decode_backend"):
                 attn_output = ctx.attn_backend.forward_deepseek_v4_decode(
                     q=q,
@@ -3822,7 +3982,9 @@ class DeepseekV4Attention(nn.Module):
                     attn_sink=self.attn_sink,
                     topk_indices=topk_indices,
                 )
+            _deepseek_v4_phase_done(phase_wall_ms, "decode_backend", tic)
         elif forward_mode.is_extend_or_mixed():
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with nvtx_range(f"{profile_prefix}_prefill_backend"):
                 attn_output = ctx.attn_backend.forward_deepseek_v4_prefill(
                     q=q,
@@ -3839,14 +4001,37 @@ class DeepseekV4Attention(nn.Module):
                     attn_sink=self.attn_sink,
                     topk_indices=topk_indices,
                 )
+            _deepseek_v4_phase_done(phase_wall_ms, "prefill_backend", tic)
         else:
             raise RuntimeError(f"Unsupported DeepSeek V4 forward mode: {forward_mode}")
+        tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range(f"{profile_prefix}_output_proj"):
-            return self._project_attention_output(
+            out = self._project_attention_output(
                 attn_output,
                 positions,
                 cos_sin_cache,
             )
+        _deepseek_v4_phase_done(phase_wall_ms, "output_proj", tic)
+        if timing_enabled and total_tic is not None:
+            total_ms = (time.perf_counter() - total_tic) * 1000
+            if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+                logger.debug(
+                    "[DeepSeekV4][slow_attn] layer=%s cache_layer=%s kind=%s "
+                    "total_ms=%.3f phase_wall_ms=%s input_tokens=%s "
+                    "num_prefill_tokens=%s num_decode_tokens=%s num_extends=%s "
+                    "forward_mode=%s",
+                    self.layer_index,
+                    self.cache_layer_index,
+                    self.attention_kind,
+                    total_ms,
+                    phase_wall_ms,
+                    positions.numel(),
+                    getattr(metadata, "num_prefill_tokens", None),
+                    metadata.decode_token_count(),
+                    ctx.num_extends,
+                    forward_mode,
+                )
+        return out
 
 
 class DeepseekV4DecoderLayer(nn.Module):
