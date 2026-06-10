@@ -46,7 +46,7 @@ if platform.is_nvidia:
         "moe",
         "process_weights",
         name="flashinfer_cutedsl_deepep_nvfp4_moe_process_weights",
-        solution="flashinfer_cutedsl_deepep",
+        solution="flashinfer_cutedsl",
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
@@ -125,7 +125,7 @@ if platform.is_nvidia:
         "moe",
         "apply",
         name="flashinfer_cutedsl_deepep_nvfp4_moe_apply",
-        solution="flashinfer_cutedsl_deepep",
+        solution="flashinfer_cutedsl",
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

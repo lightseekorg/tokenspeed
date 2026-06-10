@@ -28,7 +28,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_all2all_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+)
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
@@ -163,6 +167,9 @@ class MoELayer(torch.nn.Module):
                 mapping.moe.tp_ep_group,
             )
 
+        # Moe Backend plan
+        moe_backend = get_moe_backend().value
+        moe_backend = None if moe_backend == "auto" else moe_backend
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -174,6 +181,7 @@ class MoELayer(torch.nn.Module):
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
             deepep_group=deepep_group,
+            solution=moe_backend,
         )
 
         create_layer_weights(
