@@ -44,7 +44,6 @@ import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
-import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
@@ -60,7 +59,6 @@ from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
-from tokenspeed_kernel.ops.moe.gluon import mxfp4_gfx950 as _moe_gluon_mxfp4_gfx950
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
@@ -92,8 +90,6 @@ _RELOAD_MODULES = [
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
     _moe_flashinfer,
-    _moe_gluon_mxfp4_gfx950,
-    _moe_gluon,
     _moe_triton_mxfp4,
     _moe_triton,
     _moe_pkg,
