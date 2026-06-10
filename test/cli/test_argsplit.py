@@ -105,6 +105,12 @@ def test_engine_only_flag_routes_to_engine():
     assert r.gateway == []
 
 
+def test_dp_sampling_routes_to_engine():
+    r = _split(["--dp-sampling"])
+    assert r.engine == ["--dp-sampling"]
+    assert r.gateway == []
+
+
 def test_unknown_flag_falls_through_to_gateway():
     """smg's clap is the final authority on these."""
     r = _split(["--policy", "cache_aware"])

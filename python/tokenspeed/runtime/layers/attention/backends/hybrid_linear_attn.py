@@ -29,6 +29,9 @@ import torch
 from tokenspeed_kernel.ops.attention.flashinfer import (
     gated_delta_rule as gdn_flashinfer,
 )
+from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+    fused_qkv_split_gdn_prefill,
+)
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -393,6 +396,14 @@ class SimpleMambaPool:
                 data_lens.append(layer_cache.nbytes)
                 item_lens.append(layer_cache[0].nbytes)
         return data_ptrs, data_lens, item_lens
+
+    def get_contiguous_buf_unit_lens(self):
+        unit_lens = []
+        for cache in self.mamba_cache:
+            for layer_id in range(cache.shape[0]):
+                layer_cache = cache[layer_id]
+                unit_lens.append(layer_cache[0, 0].nbytes)
+        return unit_lens
 
     def get_contiguous_buf_layer_ids(self):
         """Return global layer ids aligned with get_contiguous_buf_infos()."""
@@ -1041,20 +1052,18 @@ class MambaAttnBackend(AttentionBackend):
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
+        num_heads = key_split_dim // head_k_dim
+        num_value_heads = value_split_dim // head_v_dim
 
-        query, key, value = torch.split(
+        query, key, value = fused_qkv_split_gdn_prefill(
             mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
+            num_q_heads=num_heads,
+            num_k_heads=num_heads,
+            num_v_heads=num_value_heads,
+            head_q=head_k_dim,
+            head_k=head_k_dim,
+            head_v=head_v_dim,
         )
-
-        actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        num_value_heads = value.shape[1] // head_v_dim
-
-        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         if is_target_verify:
             draft_token_num = kwargs.get(

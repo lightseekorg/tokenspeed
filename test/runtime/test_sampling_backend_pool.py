@@ -108,6 +108,11 @@ class TestFlashInferFlipDetection(unittest.TestCase):
     def setUp(self):
         self.backend = FlashInferSamplingBackend(_make_config())
 
+    def test_dp_verify_buffers_are_lazy(self):
+        self.assertIsNone(self.backend._predict_local_buf)
+        self.assertIsNone(self.backend._accept_index_local_buf)
+        self.assertIsNone(self.backend._accept_length_local_buf)
+
     def test_first_admission_flips_and_scatters(self):
         sp_a = _sp("a", temperature=0.7, top_k=50, top_p=0.9, seed=42)
         sp_b = _sp("b", temperature=1.2, top_k=20, top_p=0.8, seed=123)
@@ -159,7 +164,7 @@ class TestFlashInferFlipDetection(unittest.TestCase):
             request_pool_indices=[2],
             sampling_params_list=[sp_a],
         )
-        gen_a = self.backend._generator_per_slot[2]
+        gen_a = self.backend._cpu_generator_per_slot[2]
         sp_b = _sp("b", temperature=0.3, seed=99)
         self.backend.prepare_step(
             request_ids=["b"],
@@ -169,7 +174,7 @@ class TestFlashInferFlipDetection(unittest.TestCase):
         self.assertEqual(self.backend._last_rid_per_slot[2], "b")
         self.assertAlmostEqual(self.backend._temperature_pool[2].item(), 0.3, places=3)
         self.assertEqual(self.backend._seed_pool[2].item(), 99)
-        self.assertIsNot(self.backend._generator_per_slot[2], gen_a)
+        self.assertIsNot(self.backend._cpu_generator_per_slot[2], gen_a)
 
 
 class TestFlashInferFullFlipExtended(unittest.TestCase):

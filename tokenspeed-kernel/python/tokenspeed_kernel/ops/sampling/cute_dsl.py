@@ -21,8 +21,8 @@
 """CuTe DSL based sampling kernels.
 
 Wraps the upstream CuTe DSL ``ArgmaxKernel`` (derived from the Quack library and
-ported through TensorRT-LLM) so the runtime can call it without touching the
-third-party module directly.
+ported through TensorRT-LLM) so the sampling public API can register it
+without touching the third-party module directly.
 
 Exports two entry points:
 
@@ -40,22 +40,25 @@ Exports two entry points:
 Platform support:
 
 The CuTe DSL kernel ships only for NVIDIA Hopper/Blackwell (sm_90..<sm_120).
-On every other target — AMD ROCm, CPU-only, unsupported SM, missing
-``nvidia-cutlass-dsl`` — the public ``argmax`` / ``argmax_pair`` names are
-bound at import time to pure-torch fallback implementations, so callers don't
-need to test for kernel availability. The cute-DSL imports are gated behind
-``_ARCH_SUPPORTED`` and never executed on non-NVIDIA hosts.
+The common ``tokenspeed_kernel.ops.sampling.argmax`` API selects this
+registered solution on NVIDIA.
 """
 
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
     "argmax",
     "argmax_pair",
+    "cute_dsl_argmax",
     "is_available",
 ]
 
@@ -151,7 +154,7 @@ if _ARCH_SUPPORTED and _has_cluster_launch_support():
 
 
 def is_available() -> bool:
-    """Whether the CuTe DSL argmax kernel can run on the current platform."""
+    """Whether the CuTe DSL argmax kernel can run on this platform."""
     return _CUTE_AVAILABLE
 
 
@@ -283,6 +286,28 @@ def _argmax_pair_torch_fallback(
     return out
 
 
+def _register_cute_argmax(fn):
+    if not _CUTE_AVAILABLE:
+        return fn
+    return register_kernel(
+        "sampling",
+        "argmax",
+        name="cute_dsl_argmax",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(11, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+        ),
+        priority=Priority.SPECIALIZED,
+        tags={"latency", "determinism"},
+    )(fn)
+
+
+@_register_cute_argmax
 def _argmax_cute(
     logits: torch.Tensor,
     *,
@@ -353,10 +378,10 @@ def _argmax_pair_cute(
     return out
 
 
-# Public API binding. On NVIDIA + cute-DSL-installed hosts the fast path is
-# selected; everywhere else the public names refer to pure-torch
-# implementations so callers don't need to test for availability. Mirrors the
-# pattern used in ``tokenspeed_kernel.ops.sampling.cuda``.
+cute_dsl_argmax = _argmax_cute
+
+# Direct CuTe DSL module API. The common runtime-facing API lives in
+# tokenspeed_kernel.ops.sampling and selects among registered solutions.
 if _CUTE_AVAILABLE:
     argmax = _argmax_cute
     argmax_pair = _argmax_pair_cute
