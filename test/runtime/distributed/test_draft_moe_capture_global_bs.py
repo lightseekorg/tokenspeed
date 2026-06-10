@@ -124,6 +124,58 @@ def test_capture_matches_replay_all_ranks(rank: int):
     assert scattered == [bs] * 4
 
 
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_moe_tp_ep_counts_use_post_attention_scattered_rows(rank: int):
+    """When attention TP and MoE TP differ, MoE all-gather sees the rows left
+    after attention reduce-scatter, not the original per-rank token counts."""
+    mapping = Mapping(
+        rank=rank,
+        world_size=4,
+        attn_tp_size=2,
+        attn_dp_size=2,
+        dense_tp_size=4,
+        moe_tp_size=4,
+    )
+    cm = CommManager(mapping=mapping, layer_id=0, is_moe=True, prev_is_moe=True)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=4,
+        num_extends=0,
+        input_num_tokens=4,
+        forward_mode=ForwardMode.DECODE,
+        draft_first_step_reduce=False,
+        global_num_tokens=[4, 4, 4, 4],
+    )
+
+    assert cm.moe_tp_ep_group_scattered_num_tokens(ctx) == [2, 2, 2, 2]
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_moe_tp_ep_counts_account_for_attention_cp_ranks(rank: int):
+    mapping = Mapping(
+        rank=rank,
+        world_size=4,
+        attn_tp_size=1,
+        attn_cp_size=4,
+        dense_tp_size=4,
+        moe_tp_size=4,
+    )
+    cm = CommManager(mapping=mapping, layer_id=0, is_moe=True, prev_is_moe=True)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=4,
+        num_extends=0,
+        input_num_tokens=4,
+        forward_mode=ForwardMode.DECODE,
+        draft_first_step_reduce=False,
+        global_num_tokens=[4, 4, 4, 4],
+    )
+
+    assert cm.moe_tp_ep_group_scattered_num_tokens(ctx) == [4, 4, 4, 4]
+
+
 def test_capture_one_sets_global_bs(monkeypatch):
     """Guards the fix at its source: CudaGraphWrapper._capture_one must set
     ctx.global_bs (not leave it None) for DP, matching how global_num_tokens is
