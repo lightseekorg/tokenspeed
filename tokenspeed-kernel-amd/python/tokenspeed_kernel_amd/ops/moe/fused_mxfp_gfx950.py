@@ -1797,7 +1797,6 @@ class MoESliceMNProgram:
     @gluon.jit
     def pipeline(self, loop_k):
         cfg = self.cfg
-        EVEN_K: gl.constexpr = cfg.EVEN_K
         NB: gl.constexpr = cfg.NUM_BUFFERS
         gl.static_assert(
             (cfg.NUM_SUBTILES[0] == 2)
@@ -2220,7 +2219,6 @@ class MoESliceNProgram:
     @gluon.jit
     def pipeline(self, loop_k):
         cfg = self.cfg
-        EVEN_K: gl.constexpr = cfg.EVEN_K
         NB: gl.constexpr = cfg.NUM_BUFFERS
         gl.static_assert(
             (cfg.NUM_SUBTILES[0] == 1)
@@ -3572,10 +3570,9 @@ def _launch_kernel(
     )
 
     if w.ndim == 3:
-        E, K_w_phys, N_w_phys = w.shape
+        _, K_w_phys, N_w_phys = w.shape
     else:
         K_w_phys, N_w_phys = w.shape
-        E = 1
     K_w = K_w_phys * div_w
     if w_preshuffle and getattr(w, "is_shuffled_for_gluon_dot", False):
         # Host pre-shuffle zero-pads K_pk to a multiple of 128 and W
@@ -3936,9 +3933,8 @@ def _autotune_block(
             # the BN=256 / SLICE_N constraint at the BN=256 tile.
             bm, bn, bk, nw = (64, 256, 128, 8) if do_swiglu else (64, 256, 128, 4)
         elif do_swiglu:
-            # dispatch+swiglu writes BLOCK_N//2 so the W_VIA_VGPR
-            # LinearLayout static_assert (expects BN=128 or
-            # USE_SLICE_N) is satisfied via OUT_BLOCK_N halving.
+            # The preshuffled W_VIA_VGPR path clamps BN to 128 in the
+            # launcher to match the host preshuffle layout.
             bm, bn, bk, nw = 128, 256, 128, 4
         else:
             # combine path: keep BN=256 throughput but force BM<=64
@@ -4146,6 +4142,8 @@ def gluon_mxfp_dispatch_swiglu(
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
+    if w_preshuffle and block_n > 128:
+        block_n = 128
     num_warps = num_warps or nw
     num_buffers = (
         num_buffers
@@ -4269,6 +4267,8 @@ def gluon_mxfp_combine(
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
+    if w_preshuffle and block_n > 128:
+        block_n = 128
     num_warps = num_warps or nw
     num_buffers = (
         num_buffers
