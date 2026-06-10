@@ -122,7 +122,11 @@ struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> ||
 
         // Get the output scale.
         // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-        float outputScale = reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal));
+        // Guard against the all-zero block: vecMax == 0 -> SFValue == 0 -> reciprocal would produce
+        // +Inf and corrupt the FP4 output for the entire block. Match TRT-LLM's cvt_warp_fp16_to_fp4.
+        float outputScale = vecMax != 0.0f
+                                ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                                : 0.0f;
 
         // Convert the input to float.
         float2 fp2Vals[ELTS_PER_THREAD / 2];
@@ -235,7 +239,9 @@ struct FP4Converter<float, UE8M0_SF>
             SFValue = static_cast<float>(tmp);
         }
 
-        float outputScale = reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal));
+        float outputScale = vecMax != 0.0f
+                                ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                                : 0.0f;
 
         // Convert the input to float.
         float2 fp2Vals[ELTS_PER_THREAD / 2];

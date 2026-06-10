@@ -131,9 +131,9 @@ def _unswizzle_sf_ref(
         row_in_g1 = (row % 128) // 32
         row_group = row // 128
         offset = col_in_g0
-               + col_group * 512                # columnGroupStride (4 * 128)
-               + row_in_g0  * 128               # rowGroup0Stride   (4 * 32)
-               + row_in_g1  * 4                 # rowGroup1Stride   (4)
+               + col_group * 512                # columnGroupStride
+               + row_in_g0  * 16                # rowGroup0Stride
+               + row_in_g1  * 4                 # rowGroup1Stride
                + row_group  * (128 * padded_col)
 
     where ``padded_col = round_up(n // scaling_vector_size, 4)``.
@@ -155,11 +155,11 @@ def _unswizzle_sf_ref(
     row_group = row // 128
 
     offset = (
-        col_in_g0
+        row_group * (128 * padded_col)
         + col_group * 512
-        + row_in_g0 * 128
+        + row_in_g0 * 16
         + row_in_g1 * 4
-        + row_group * (128 * padded_col)
+        + col_in_g0
     )  # [m, total_col]
 
     flat = sf_swizzled_u8.reshape(-1)
@@ -425,3 +425,63 @@ def test_fused_add_rmsnorm_fp4_quant_invalid_n_rejected() -> None:
         fused_add_rmsnorm_fp4_quant(
             hidden_states, residual, weight, sf_scale, eps=1e-6, output_hp_norm=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("m", "n"),
+    [
+        pytest.param(1, 4096, id="m1_n4096"),
+        pytest.param(16, 5120, id="m16_n5120"),
+        pytest.param(64, 8192, id="m64_n8192"),
+    ],
+)
+def test_fused_add_rmsnorm_fp4_quant_sf_layout_valid(m: int, n: int) -> None:
+    """SF output must be unswizzlable to (m, n//16) without OOB or NaN."""
+    from tokenspeed_kernel.thirdparty.cuda import fused_add_rmsnorm_fp4_quant
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    eps = 1e-6
+
+    hidden_states = torch.randn(m, n, device=device, dtype=dtype) * 0.5
+    residual = torch.randn(m, n, device=device, dtype=dtype) * 0.5
+    weight = torch.randn(n, device=device, dtype=dtype) * 0.1 + 1.0
+    sf_scale = torch.tensor([10.0], device=device, dtype=torch.float32)
+
+    fp4, residual_out, sf_out, hp_norm = fused_add_rmsnorm_fp4_quant(
+        hidden_states, residual, weight, sf_scale, eps=eps, output_hp_norm=True,
+    )
+
+    # Basic shape checks
+    assert fp4.shape == (m, n // 2)
+    assert residual_out.shape == (m, n)
+    assert hp_norm.shape == (m, n)
+    assert sf_out.dtype == torch.uint8
+
+    # SF buffer must be large enough for unswizzle
+    sf_cols = n // 16
+    padded_col = (sf_cols + 3) // 4 * 4
+    m_padded = (m + 31) // 32 * 32
+    sf_rows_padded = (m_padded + 127) // 128 * 128
+    expected_sf_numel = sf_rows_padded * padded_col
+    assert sf_out.numel() == expected_sf_numel
+
+    # Unswizzle and verify no OOB: use _unswizzle_sf_ref from this file
+    sf_unswizzled = _unswizzle_sf_ref(sf_out, m, n, scaling_vector_size=16)
+    assert sf_unswizzled.shape == (m, sf_cols)
+
+    # Interpret as e4m3 and check no NaN/Inf in the float conversion
+    sf_fp32 = sf_unswizzled.contiguous().view(torch.float8_e4m3fn).float()
+    assert not torch.isnan(sf_fp32).any(), "SF contains NaN after e4m3 decode"
+    assert not torch.isinf(sf_fp32).any(), "SF contains Inf after e4m3 decode"
+
+    # Dequantize FP4 and verify finite output
+    deq = _dequant_nvfp4(
+        fp4.view(torch.uint8).reshape(m, n // 2),
+        sf_out.view(torch.uint8).reshape(-1),
+        sf_scale,
+        m, n,
+    )
+    assert not torch.isnan(deq).any(), "Dequantized FP4 contains NaN"
+    assert not torch.isinf(deq).any(), "Dequantized FP4 contains Inf"

@@ -355,21 +355,71 @@ class CommManager:
             layer's residual input.
           * ``fp4_packed_uint8``: ``[M, hidden_size // 2]`` uint8 packed FP4
             activations consumed by the MoE FP4 GEMM.
-          * ``sf_uint8``: 1-D uint8 buffer in TRT-LLM swizzled SF layout.
+          * ``sf_uint8``: ``[M, hidden_size // 16]`` uint8 tensor of NVFP4
+            block scale factors (unswizzled from the kernel's TRT-LLM 128x4
+            layout) ready for ``trtllm_fp4_block_scale_moe``.
         """
         from tokenspeed_kernel.thirdparty.cuda import fused_add_rmsnorm_fp4_quant
 
         # The 4-pattern fusion path is excluded by gating; only no-fuse remains.
         hidden_states, residual = self.post_attn_comm(hidden_states, residual, ctx)
+        m, n = hidden_states.shape
+        # GemmaRMSNorm's effective weight is (stored weight + 1.0); the fused
+        # kernel implements vanilla RMSNorm (out = x * rsqrt(var) * weight).
+        norm_weight = getattr(
+            self.post_attn_layernorm, "gemma_weight", self.post_attn_layernorm.weight
+        )
         fp4, residual_out, sf_out, hp_norm = fused_add_rmsnorm_fp4_quant(
             hidden_states,
             residual,
-            self.post_attn_layernorm.weight,
+            norm_weight,
             sf_scale,
             eps=self.post_attn_layernorm.variance_epsilon,
             output_hp_norm=True,
         )
-        return hp_norm, residual_out, fp4, sf_out
+        sf_unswizzled = self._unswizzle_sf_128x4(sf_out, m, n)
+        return hp_norm, residual_out, fp4, sf_unswizzled
+
+    def _unswizzle_sf_128x4(
+        self, sf_swizzled: torch.Tensor, m: int, n: int, scaling_vector_size: int = 16
+    ) -> torch.Tensor:
+        """Inverse of TRT-LLM 128x4 SF swizzle -> (m, n // scaling_vector_size).
+
+        The fused kernel writes scale factors in TRT-LLM's swizzled padded
+        layout (1-D uint8 of size pad_up(m,128)*pad_up(n//16,4)) for kernel
+        efficiency. Downstream consumers (e.g. trtllm_fp4_block_scale_moe)
+        expect a 2-D scale tensor whose first dimension matches the live token
+        count. We gather the unswizzled bytes here.
+
+        Index cache is keyed on ``(m, n, device)`` so repeated calls in the
+        same forward pass don't rebuild it.
+        """
+        cache_key = (m, n, sf_swizzled.device)
+        cache = getattr(self, "_sf_unswizzle_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._sf_unswizzle_index_cache = cache
+        index = cache.get(cache_key)
+        if index is None:
+            total_col = n // scaling_vector_size
+            padded_col = (total_col + 3) // 4 * 4
+            row = torch.arange(m, device=sf_swizzled.device).view(-1, 1)
+            col = torch.arange(total_col, device=sf_swizzled.device).view(1, -1)
+            col_in_g0 = col % 4
+            col_group = col // 4
+            row_in_g0 = row % 32
+            row_in_g1 = (row % 128) // 32
+            row_group = row // 128
+            index = (
+                row_group * (128 * padded_col)
+                + col_group * 512
+                + row_in_g0 * 16
+                + row_in_g1 * 4
+                + col_in_g0
+            ).reshape(-1)
+            cache[cache_key] = index
+        flat = sf_swizzled.reshape(-1)
+        return flat[index].reshape(m, n // scaling_vector_size)
 
     def post_mlp_fused(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
