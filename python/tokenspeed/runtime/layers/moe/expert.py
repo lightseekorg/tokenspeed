@@ -56,7 +56,7 @@ class MoELayer(torch.nn.Module):
         swiglu_beta: float | None = None,
         w13_input_layout: str = "concatenated",
         with_bias=False,
-        routing_config: dict = None,
+        routing_config: dict = {},
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -120,7 +120,7 @@ class MoELayer(torch.nn.Module):
         )
 
         # Routing config
-        self.routing_config = routing_config or {}
+        self.routing_config = routing_config
         self._correction_bias = routing_config.get("correction_bias", None)
         self._routing_method_type = routing_config.get(
             "routing_method_type", RoutingMethodType.DeepSeekV3
