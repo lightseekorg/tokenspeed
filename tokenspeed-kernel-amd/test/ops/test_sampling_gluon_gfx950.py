@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel_amd.ops.sampling.gluon import argmax_gfx950
 
 MODEL_VOCABS = {
     "deepseek_v4": 129280,
@@ -38,8 +37,14 @@ def _is_gfx950() -> bool:
     return "gfx950" in arch
 
 
-pytestmark = pytest.mark.skipif(
-    not _is_gfx950(), reason="AMD GFX950 is required for Gluon argmax tests"
+if not _is_gfx950():
+    pytest.skip(
+        "AMD GFX950 is required for Gluon argmax tests", allow_module_level=True
+    )
+
+
+from tokenspeed_kernel_amd.ops.sampling.gluon import (  # noqa: E402
+    argmax_gfx950,
 )
 
 
