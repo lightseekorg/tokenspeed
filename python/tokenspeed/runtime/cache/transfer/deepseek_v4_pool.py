@@ -30,6 +30,9 @@ class PagedCacheTensorRef:
     page_bytes: int
 
 
+PagePair = tuple[int, int]
+
+
 def _parse_v4_compressed_kv_group_id(group_id: str) -> int | None:
     prefix = "v4.c"
     suffix = "a.compressed_kv"
@@ -41,17 +44,41 @@ def _parse_v4_compressed_kv_group_id(group_id: str) -> int | None:
         return None
 
 
-def _ordered_page_pairs(src_pages: Iterable[int], dst_pages: Iterable[int]):
+def _page_pair_span_key(pair: PagePair) -> tuple[int, int, int]:
+    src_page, dst_page = pair
+    return (dst_page - src_page, src_page, dst_page)
+
+
+def _ordered_page_pairs(
+    src_pages: Iterable[int],
+    dst_pages: Iterable[int],
+) -> list[PagePair]:
     seen = set()
-    pairs = []
+    pairs: list[PagePair] = []
     for src_page, dst_page in zip(src_pages, dst_pages):
         pair = (int(src_page), int(dst_page))
         if pair in seen:
             continue
         seen.add(pair)
         pairs.append(pair)
-    pairs.sort()
+    # transfer_kv_direct coalesces adjacent pairs only when both page ids
+    # advance by one, which means all pairs in a coalescible span share dst-src.
+    pairs.sort(key=_page_pair_span_key)
     return pairs
+
+
+def _count_page_spans(pairs: Iterable[PagePair]) -> int:
+    spans = 0
+    prev_pair: PagePair | None = None
+    for src_page, dst_page in pairs:
+        if (
+            prev_pair is None
+            or src_page != prev_pair[0] + 1
+            or dst_page != prev_pair[1] + 1
+        ):
+            spans += 1
+        prev_pair = (src_page, dst_page)
+    return spans
 
 
 class DeepseekV4CachePool:

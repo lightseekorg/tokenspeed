@@ -51,7 +51,11 @@ from tokenspeed.runtime.cache.kv_cache_host import (
     MLATokenToKVPoolHost,
 )
 from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
-from tokenspeed.runtime.cache.transfer.deepseek_v4_pool import DeepseekV4CachePool
+from tokenspeed.runtime.cache.transfer.deepseek_v4_pool import (
+    DeepseekV4CachePool,
+    _count_page_spans,
+    _ordered_page_pairs,
+)
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
 from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
 from tokenspeed.runtime.cache.transfer.types import CacheKind
@@ -288,21 +292,26 @@ class MemoryExecutor:
         return groups
 
     @staticmethod
-    def _paged_transfer_summary(transfers: list) -> tuple[int, int, list[str]]:
+    def _paged_transfer_summary(
+        transfers: list,
+    ) -> tuple[int, int, int, list[str], list[str]]:
         group_pages: dict[str, int] = {}
+        group_spans: dict[str, int] = {}
         for transfer in transfers:
             group_id = str(getattr(transfer, "group_id", "unknown"))
             src_pages = getattr(transfer, "src_pages", [])
             dst_pages = getattr(transfer, "dst_pages", [])
-            page_pairs = {
-                (int(src_page), int(dst_page))
-                for src_page, dst_page in zip(src_pages, dst_pages)
-            }
+            page_pairs = _ordered_page_pairs(src_pages, dst_pages)
             group_pages[group_id] = group_pages.get(group_id, 0) + len(page_pairs)
+            group_spans[group_id] = group_spans.get(group_id, 0) + _count_page_spans(
+                page_pairs
+            )
         return (
             len(group_pages),
             sum(group_pages.values()),
+            sum(group_spans.values()),
             [f"{group_id}:{pages}" for group_id, pages in sorted(group_pages.items())],
+            [f"{group_id}:{spans}" for group_id, spans in sorted(group_spans.items())],
         )
 
     def set_mamba_layerwise_cow(
@@ -368,17 +377,24 @@ class MemoryExecutor:
                 )
                 if paged_transfers:
                     if logger.isEnabledFor(logging.DEBUG):
-                        group_count, page_count, group_pages = (
-                            self._paged_transfer_summary(paged_transfers)
-                        )
+                        (
+                            group_count,
+                            page_count,
+                            span_count,
+                            group_pages,
+                            group_spans,
+                        ) = self._paged_transfer_summary(paged_transfers)
                         logger.debug(
                             "[cache_op][paged_l2] writeback schedule "
-                            "op_id=%s groups=%s pages=%s group_pages=%s "
+                            "op_id=%s groups=%s pages=%s spans=%s "
+                            "group_pages=%s group_spans=%s "
                             "is_retract=%s",
                             op_id,
                             group_count,
                             page_count,
+                            span_count,
                             group_pages,
+                            group_spans,
                             is_retract,
                         )
                     self.host_exec.enqueue_paged_cache_writeback(
@@ -436,16 +452,23 @@ class MemoryExecutor:
                 )
                 if paged_transfers:
                     if logger.isEnabledFor(logging.DEBUG):
-                        group_count, page_count, group_pages = (
-                            self._paged_transfer_summary(paged_transfers)
-                        )
+                        (
+                            group_count,
+                            page_count,
+                            span_count,
+                            group_pages,
+                            group_spans,
+                        ) = self._paged_transfer_summary(paged_transfers)
                         logger.debug(
                             "[cache_op][paged_l2] loadback schedule "
-                            "op_id=%s groups=%s pages=%s group_pages=%s",
+                            "op_id=%s groups=%s pages=%s spans=%s "
+                            "group_pages=%s group_spans=%s",
                             op_id,
                             group_count,
                             page_count,
+                            span_count,
                             group_pages,
+                            group_spans,
                         )
                     self.host_exec.enqueue_paged_cache_loadback(
                         op_id,
