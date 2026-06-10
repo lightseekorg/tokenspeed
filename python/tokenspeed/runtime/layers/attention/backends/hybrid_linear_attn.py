@@ -626,7 +626,10 @@ class MambaAttnBackend(AttentionBackend):
         mamba_track_indices: torch.Tensor,
         extend_seq_lens: torch.Tensor,
     ):
-        """Compute src/dst indices for extracting intermediate SSM states."""
+        """Compute src/dst indices for extracting intermediate SSM states.
+
+        Matching conv windows are gathered separately from packed pre-conv inputs.
+        """
         # flashinfer ckpts[k] = state after processing chunk k = FLA h[k+1]
         num_fi_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
         offset = torch.zeros_like(num_fi_ckpts)
