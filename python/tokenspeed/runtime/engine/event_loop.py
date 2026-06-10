@@ -183,7 +183,7 @@ class EventLoop:
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
-            max_req_pool_size=server_args.max_num_seqs,
+            max_req_pool_size=server_args.max_num_seqs + 1,
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
