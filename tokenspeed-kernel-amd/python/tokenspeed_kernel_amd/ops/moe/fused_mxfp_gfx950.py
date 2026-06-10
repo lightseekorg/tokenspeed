@@ -5062,8 +5062,7 @@ def gluon_decode_routing_gfx950(
     sm_first: bool = False,
     dtype: torch.dtype | None = None,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """gfx950 small-M decode route implementation.
-    """
+    """gfx950 small-M decode route implementation."""
     if dtype is None:
         dtype = logits.dtype
     n_tokens = logits.shape[0]
