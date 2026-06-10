@@ -68,7 +68,6 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert should_run_nvidia_gpu_cleanup("b300-4gpu")
     assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
-    assert not should_run_nvidia_gpu_cleanup("linux-mi355-2gpu-lightseek")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
 
@@ -237,12 +236,9 @@ def test_resolve_score_threshold_passes_through_range_list():
 
 
 def test_resolve_score_threshold_picks_per_runner_value():
-    threshold = {"b200-2gpu": 0.7, "linux-mi355-2gpu-lightseek": 0.69}
+    threshold = {"b200-2gpu": 0.7, "amd-mi35x-2gpu-test": 0.69}
     assert resolve_score_threshold_for_runner(threshold, "b200-2gpu") == 0.7
-    assert (
-        resolve_score_threshold_for_runner(threshold, "linux-mi355-2gpu-lightseek")
-        == 0.69
-    )
+    assert resolve_score_threshold_for_runner(threshold, "amd-mi35x-2gpu-test") == 0.69
 
 
 def test_resolve_score_threshold_returns_none_for_unknown_runner():
@@ -258,11 +254,11 @@ def test_check_eval_score_threshold_uses_per_runner_mapping_pass():
     task = {
         "score_threshold": {
             "b200-2gpu": 0.7,
-            "linux-mi355-2gpu-lightseek": 0.69,
+            "amd-mi35x-2gpu-test": 0.69,
         }
     }
     check = check_eval_score_threshold(
-        task, _eval_command_results(0.695), ["eval"], "linux-mi355-2gpu-lightseek"
+        task, _eval_command_results(0.695), ["eval"], "amd-mi35x-2gpu-test"
     )
     assert check is not None
     assert check["passed"] is True
@@ -273,7 +269,7 @@ def test_check_eval_score_threshold_uses_per_runner_mapping_fail():
     task = {
         "score_threshold": {
             "b200-2gpu": 0.7,
-            "linux-mi355-2gpu-lightseek": 0.69,
+            "amd-mi35x-2gpu-test": 0.69,
         }
     }
     check = check_eval_score_threshold(
