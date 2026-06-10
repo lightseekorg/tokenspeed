@@ -51,6 +51,9 @@ from tokenspeed.runtime.layers.attention.linear.index import (
     set_total_chunks_hint_uniform,
 )
 from tokenspeed.runtime.layers.attention.linear.l2norm import l2norm_fwd
+from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
+    fused_mamba_state_copy,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -1150,12 +1153,16 @@ class MambaAttnBackend(AttentionBackend):
                 ].to(ssm_states.dtype, copy=False)
 
             if need_final_track:
-                conv_states[self.forward_metadata.track_ssm_final_dst] = conv_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
-                ssm_states[self.forward_metadata.track_ssm_final_dst] = ssm_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
+                fused_mamba_state_copy(
+                    conv_states,
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
+                fused_mamba_state_copy(
+                    ssm_states,
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
 
         return core_attn_out
 
