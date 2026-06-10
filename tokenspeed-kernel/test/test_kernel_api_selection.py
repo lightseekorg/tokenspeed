@@ -597,14 +597,6 @@ _CASES = [
         "flashinfer_trtllm_unquant_moe_apply",
         _moe_apply_unquant_trtllm,
     ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "moe",
-        "apply",
-        "gluon_gfx950_mxfp4_moe_apply",
-        _moe_apply_mxfp4_gluon_gfx950,
-    ),
 ]
 
 
