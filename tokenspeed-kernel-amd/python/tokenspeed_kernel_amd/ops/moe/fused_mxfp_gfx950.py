@@ -5013,7 +5013,6 @@ def gluon_route_supported(
     and an expert count whose ``next_pow2`` keeps the histogram bins / EP-wide
     tiles bounded.
     """
-    # Platform gating lives in the tokenspeed-kernel registration shim.
     if logits.ndim != 2:
         return False
     if dtype is None:
