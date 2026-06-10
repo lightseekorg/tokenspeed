@@ -230,6 +230,10 @@ class ModelExecutor:
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
+            # req_to_page / valid_cache_lengths / future_input_map are all
+            # sized max_req_pool_size+1; the last row is the padding sentinel
+            # (page 0, valid_cache_length pinned at 0).
+            pad_req_slot=config.max_req_pool_size,
             device=self.device,
             has_mamba=(mamba_pool is not None),
         )

@@ -54,6 +54,7 @@ class InputBuffers:
         max_num_tokens: int,
         page_size: int,
         dummy_kv_slot: int,
+        pad_req_slot: int,
         device: str = "cuda",
         has_mamba: bool = False,
     ):
@@ -61,14 +62,26 @@ class InputBuffers:
         self.page_size = page_size
         self.max_num_tokens = max_num_tokens
         self.dummy_kv_slot = dummy_kv_slot
+        # Reserved sentinel req-pool slot for padded rows. Per-slot state is
+        # sized req_pool_size+1 everywhere (req_to_page, valid_cache_lengths,
+        # future_input_map, ...) precisely so this row exists: it maps to
+        # page 0 and its valid_cache_length stays 0, so anything a captured
+        # graph computes for padded rows (notably the drafter's in-graph
+        # compute_out_cache_loc_uniform) lands on the dummy page instead of a
+        # live request's KV. Padding with slot 0 routed the draft multi-step
+        # KV writes of padded rows into the slot-0 request's real draft
+        # pages — slot 0 is a live allocatable slot whose req_to_page row
+        # keeps its last tenant's pages after the request finishes.
+        self.pad_req_slot = pad_req_slot
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
         self.has_mamba = has_mamba
 
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
-            # expects for padded rows (input_ids=1, positions=0, req_pool=0,
-            # seq_lens=1, out_cache_loc=dummy_kv_slot). Each iteration overwrites
+            # expects for padded rows (input_ids=1, positions=0,
+            # req_pool=pad_req_slot, seq_lens=1, out_cache_loc=dummy_kv_slot).
+            # Each iteration overwrites
             # the active prefix [:total_tokens]; fill_input_buffers refreshes the
             # padding tail [total_tokens:] back to these defaults every step,
             # because a larger prior iter can leave stale values past the
@@ -83,7 +96,9 @@ class InputBuffers:
             self.mrope_positions_buf = torch.zeros(
                 (3, max_num_tokens), dtype=torch.int64
             )
-            self.req_pool_indices_buf = torch.zeros((max_bs,), dtype=torch.int64)
+            self.req_pool_indices_buf = torch.full(
+                (max_bs,), pad_req_slot, dtype=torch.int64
+            )
             self.seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
             # Initialise to dummy_kv_slot so that padding positions (never
             # written by compute_out_cache_loc) always point to the reserved
@@ -375,16 +390,17 @@ class InputBuffers:
         # forces attention to scan oversize ranges, and -- for a stale
         # out-of-range token id -- trips the embedding gather's device-side
         # assert that tears the server down. The __init__ safe defaults
-        # (input_ids=1, req_pool=0, positions=0) are not enough on their own
-        # once a larger iter has overwritten the tail, so scrub it back here
-        # (cheap tail-only fills; the active prefix was written above).
+        # (input_ids=1, req_pool=pad_req_slot, positions=0) are not enough on
+        # their own once a larger iter has overwritten the tail, so scrub it
+        # back here (cheap tail-only fills; the active prefix was written
+        # above).
         if total_tokens < self.max_num_tokens:
             self.input_ids_buf[total_tokens:].fill_(1)
             self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
             self.positions_buf[total_tokens:].fill_(0)
             self.mrope_positions_buf[:, total_tokens:].zero_()
         if batch_size < self.max_bs:
-            self.req_pool_indices_buf[batch_size:].fill_(0)
+            self.req_pool_indices_buf[batch_size:].fill_(self.pad_req_slot)
             self.seq_lens_buf[batch_size:].fill_(1)
 
         if (
@@ -433,7 +449,13 @@ class InputBuffers:
             self.positions_buf[:total_tokens].fill_(0)
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:
-            self.req_pool_indices_buf[:batch_size].fill_(0)
+            # Point at the padding sentinel slot, NOT slot 0: slot 0 is a live
+            # allocatable request slot whose req_to_page row keeps its last
+            # tenant's pages after the request finishes. Deriving dummy KV
+            # write locations from a stale live row lands idle-rank dummy
+            # writes on a REAL page the allocator later hands out. The
+            # sentinel row (req_to_page[pad_req_slot]) is all-zeros -> page 0.
+            self.req_pool_indices_buf[:batch_size].fill_(self.pad_req_slot)
             # seq_lens must be >= spec_num_tokens so the drafter's prewrite
             # correction never goes negative.
             num_tokens_per_req = total_tokens // batch_size if batch_size > 0 else 1
