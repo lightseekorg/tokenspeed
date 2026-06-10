@@ -1,19 +1,13 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel  # noqa: F401  (registers moe kernels)
 import torch
-from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950
-
-
-def _is_gfx950() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return "gfx950" in arch
-
+from tokenspeed_kernel.ops.moe import moe_route
+from tokenspeed_kernel.platform import current_platform
 
 requires_gfx950 = pytest.mark.skipif(
-    not _is_gfx950(),
+    not (torch.cuda.is_available() and current_platform().is_cdna4),
     reason="gluon decode routing kernel is gfx950 (CDNA4) only",
 )
 
@@ -23,16 +17,26 @@ TOPK = 4
 SMALL_M = [1, 2, 4, 8, 16]
 
 
+def _amd_gluon():
+    from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950
+
+    return fused_mxfp_gfx950
+
+
 def _route(logits):
-    return fused_mxfp_gfx950.gluon_decode_routing_gfx950(
+    return moe_route(
         logits,
         TOPK,
         sm_first=False,
         dtype=logits.dtype,
+        traits={"output_type": "ragged_metadata"},
+        expected_kernel_name="gluon_decode_routing_gfx950",
     )
 
 
-# Reference torch routing implementation.
+# Keep the reference in torch. Forcing the generic triton_kernels_routing
+# pipeline here exercises fallback code owned by tokenspeed-kernel and has
+# crashed on gfx950 ROCm CI before this test reaches the Gluon output check.
 def _reference_route(logits):
     M, E = logits.shape
     device = logits.device
@@ -137,12 +141,12 @@ def test_small_m_routing_matches_reference(M):
 
 @requires_gfx950
 def test_direct_large_m_rejects_fallback_shape():
-    M = fused_mxfp_gfx950.SMALLM_MAX_M + 16
+    M = _amd_gluon().SMALLM_MAX_M + 16
     gen = torch.Generator(device="cuda").manual_seed(7)
     logits = torch.randn(M, E, device="cuda", dtype=torch.bfloat16, generator=gen)
 
     with pytest.raises(ValueError, match="fallback routing is handled"):
-        fused_mxfp_gfx950.gluon_decode_routing_gfx950(
+        _amd_gluon().gluon_decode_routing_gfx950(
             logits,
             TOPK,
             sm_first=False,
@@ -155,7 +159,7 @@ def test_direct_large_m_rejects_fallback_shape():
 def test_gluon_fused_route_direct(M):
     """gluon_fused_route returns a well-formed routing result for small M."""
     logits = torch.randn(M, E, device="cuda", dtype=torch.bfloat16)
-    rg, gather, scatter, gate_scal = fused_mxfp_gfx950.gluon_fused_route(logits, TOPK)
+    rg, gather, scatter, gate_scal = _amd_gluon().gluon_fused_route(logits, TOPK)
     _assert_routing_matches_reference(rg, gather, scatter, gate_scal, logits)
     assert int(rg.slice_sizes.sum()) == M * TOPK
     assert gather.numel() == M * TOPK == scatter.numel() == gate_scal.numel()
@@ -165,10 +169,10 @@ def test_gluon_fused_route_direct(M):
 def test_gluon_route_supported_guards():
     """Unsupported configs report False so callers fall back safely."""
     logits = torch.randn(16, E, dtype=torch.bfloat16)
-    assert fused_mxfp_gfx950.gluon_route_supported(logits, TOPK)
+    assert _amd_gluon().gluon_route_supported(logits, TOPK)
     # unsupported dtype
-    assert not fused_mxfp_gfx950.gluon_route_supported(logits.to(torch.float64), TOPK)
+    assert not _amd_gluon().gluon_route_supported(logits.to(torch.float64), TOPK)
     # non-2D
-    assert not fused_mxfp_gfx950.gluon_route_supported(logits.reshape(1, 16, E), TOPK)
+    assert not _amd_gluon().gluon_route_supported(logits.reshape(1, 16, E), TOPK)
     # nonsensical topk
-    assert not fused_mxfp_gfx950.gluon_route_supported(logits, E + 1)
+    assert not _amd_gluon().gluon_route_supported(logits, E + 1)
