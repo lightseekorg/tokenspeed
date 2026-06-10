@@ -90,7 +90,8 @@ inline tensorrt_llm::kernels::WarpSpecializedCounters* get_or_create_counters(
 //
 // Caller-allocated outputs (sized to m_padded = (M+31)//32*32 by the caller):
 //   normed_fp4_out: [m_padded, N/8] int32 (FP4 packed, 8 FP4 values per int32)
-//   sf_out        : [sfSizePadded] uint8 (swizzled SF layout)
+//   sf_out        : [m_padded, N/16] uint8 (linear row-major SF; pass directly
+//                   to trtllm_fp4_block_scale_moe after slicing to [M, N/16])
 //   residual_out  : [m_padded, N] same dtype as input (= input + residual,
 //                  pre-norm, used as next layer's residual)
 //   hp_norm_out   : Optional [m_padded, N] same dtype as input; only written
@@ -123,9 +124,9 @@ void fused_add_rmsnorm_fp4_quant(TensorView input, TensorView residual, TensorVi
   TVM_FFI_ICHECK_EQ(residual_out.size(1), n);
   TVM_FFI_ICHECK_EQ(residual_out.dtype(), input.dtype());
 
-  int64_t const sf_padded = tensorrt_llm::computeSwizzledLayoutSFSize(m_padded, n / 16);
-  TVM_FFI_ICHECK_GE(sf_out.numel(), sf_padded)
-      << "sf_out is too small for swizzled FP4 SF layout";
+  int64_t const sf_linear = m_padded * (n / 16);
+  TVM_FFI_ICHECK_GE(sf_out.numel(), sf_linear)
+      << "sf_out is too small for linear FP4 SF layout";
 
   if (output_hp_norm) {
     TVM_FFI_ICHECK(hp_norm_out.has_value())

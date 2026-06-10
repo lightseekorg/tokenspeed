@@ -151,9 +151,11 @@ struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> ||
 
         if (write_output)
         {
+            // LINEAR layout: SF tensor is row-major [m_padded, n / SF_VEC_SIZE] and
+            // can be consumed by trtllm_fp4_block_scale_moe directly (no unswizzle).
             auto SFOffset
                 = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, rowIdx, colIdx,
-                    std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::SWIZZLED_128x4);
+                    std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::LINEAR);
             *SFOffset = fp8SFVal;
 
             int64_t outOffset = rowIdx * (numCols / ELTS_PER_THREAD) + colIdx;
@@ -258,9 +260,10 @@ struct FP4Converter<float, UE8M0_SF>
 
         if (write_output)
         {
+            // LINEAR layout: SF tensor is row-major [m_padded, n / SF_VEC_SIZE].
             auto SFOffset
                 = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, rowIdx, colIdx,
-                    std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::SWIZZLED_128x4);
+                    std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::LINEAR);
             *SFOffset = fp8SFVal;
 
             int64_t outOffset = rowIdx * (numCols / ELTS_PER_THREAD) + colIdx;

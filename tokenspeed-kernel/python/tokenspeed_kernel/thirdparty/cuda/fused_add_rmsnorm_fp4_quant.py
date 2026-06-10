@@ -55,16 +55,6 @@ def _load_module():
     return tvm_ffi.load_module(str(so_path))
 
 
-def _padded_sf_size(m_padded: int, n: int) -> int:
-    """Mirror ``tensorrt_llm::computeSwizzledLayoutSFSize(m_padded, n//16)``.
-
-    The TRT-LLM helper is ``pad_up(m_padded, 128) * pad_up(n // 16, 4)``.
-    """
-    sf_rows = (m_padded + 127) // 128 * 128
-    sf_cols = (n // _FP4_BLOCK_SIZE + 3) // 4 * 4
-    return int(sf_rows * sf_cols)
-
-
 def fused_add_rmsnorm_fp4_quant(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -96,9 +86,9 @@ def fused_add_rmsnorm_fp4_quant(
         * ``residual_out``: ``[M, N]`` same dtype as ``hidden_states``; this is
           ``hidden_states + residual`` (pre-norm), suitable as the residual
           input for the next decoder layer.
-        * ``sf_uint8``: 1-D ``uint8`` buffer in TRT-LLM's swizzled SF layout,
-          sized to ``computeSwizzledLayoutSFSize(M, N//16)`` (returned as a
-          flat view; the consumer reinterprets as ``e4m3``).
+        * ``sf_uint8``: ``[M, N // 16]`` ``uint8`` block-scale factors in
+          row-major LINEAR layout (consumer reinterprets as ``e4m3``); ready
+          for ``trtllm_fp4_block_scale_moe`` without any unswizzle step.
         * ``hp_norm``: ``[M, N]`` same dtype as ``hidden_states`` if
           ``output_hp_norm`` else ``None``.
     """
@@ -140,8 +130,9 @@ def fused_add_rmsnorm_fp4_quant(
     )
     residual_out_padded = torch.empty((m_padded, n), dtype=dtype, device=device)
 
-    sf_padded = _padded_sf_size(m_padded, n)
-    sf_out = torch.empty((sf_padded,), dtype=torch.uint8, device=device)
+    sf_out_padded = torch.empty(
+        (m_padded, n // _FP4_BLOCK_SIZE), dtype=torch.uint8, device=device
+    )
 
     hp_norm_padded: Optional[torch.Tensor] = None
     if output_hp_norm:
@@ -162,7 +153,7 @@ def fused_add_rmsnorm_fp4_quant(
         float(eps),
         bool(output_hp_norm),
         normed_fp4_padded_i32,
-        sf_out,
+        sf_out_padded,
         residual_out_padded,
         hp_norm_padded,
     )
@@ -174,6 +165,7 @@ def fused_add_rmsnorm_fp4_quant(
     )
     fp4_packed_uint8 = normed_fp4_i32.view(torch.uint8).view(m, n // 2)
     residual_out = residual_out_padded if m_padded == m else residual_out_padded[:m]
+    sf_out = sf_out_padded if m_padded == m else sf_out_padded[:m]
     hp_norm = None
     if output_hp_norm:
         hp_norm = hp_norm_padded if m_padded == m else hp_norm_padded[:m]

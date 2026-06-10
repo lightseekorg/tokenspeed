@@ -72,9 +72,9 @@ def _has_sm100() -> bool:
     )
 
 
-# The fused kernel produces SF in TRT-LLM swizzled layout. We compare against
-# flashinfer ``fp4_quantize`` with ``is_sf_swizzled_layout=True`` for bit-exact
-# parity. NVFP4 quant requires Blackwell (SM100) on the reference side.
+# The fused kernel writes SF in row-major LINEAR layout. We compare against
+# flashinfer ``fp4_quantize(is_sf_swizzled_layout=False)`` for bit-exact parity.
+# NVFP4 quant requires Blackwell (SM100) on the reference side.
 pytestmark = pytest.mark.skipif(
     not _has_sm100(),
     reason="fused_add_rmsnorm_fp4_quant requires Blackwell SM100",
@@ -107,79 +107,21 @@ def _rmsnorm_ref_fp32(
     return normed_fp32.to(out_dtype), pre_norm_fp32.to(out_dtype)
 
 
-def _unswizzle_sf_ref(
-    sf_swizzled_u8: torch.Tensor,
-    m: int,
-    n: int,
-    scaling_vector_size: int = 16,
-) -> torch.Tensor:
-    """Pure-PyTorch inverse of TRT-LLM's 128x4 SF swizzle (no custom op).
-
-    The fused kernel stores the block scale-factors in TRT-LLM's SWIZZLED
-    layout. ``flashinfer.fused_moe.utils.unswizzle_sf`` could reverse it, but it
-    dispatches to ``torch.ops.trtllm.block_scale_interleave_reverse`` which is
-    only registered when TRT-LLM is installed. To keep the test self-contained
-    we re-implement the index map from TRT-LLM's ``computeSFIndex`` (see
-    ``cpp/tensorrt_llm/thop/fp8Op.h``) and gather every logical ``(row, col)``
-    SF byte out of the swizzled 1-D buffer.
-
-    For an unswizzled position ``(row, col)`` the swizzled 1-D offset is::
-
-        col_in_g0 = col % 4
-        col_group = col // 4
-        row_in_g0 = row % 32
-        row_in_g1 = (row % 128) // 32
-        row_group = row // 128
-        offset = col_in_g0
-               + col_group * 512                # columnGroupStride
-               + row_in_g0  * 16                # rowGroup0Stride
-               + row_in_g1  * 4                 # rowGroup1Stride
-               + row_group  * (128 * padded_col)
-
-    where ``padded_col = round_up(n // scaling_vector_size, 4)``.
-
-    Returns:
-        ``[m, n // scaling_vector_size]`` ``uint8`` unswizzled SF.
-    """
-    device = sf_swizzled_u8.device
-    total_col = n // scaling_vector_size
-    padded_col = (total_col + 3) // 4 * 4
-
-    row = torch.arange(m, device=device).view(-1, 1)
-    col = torch.arange(total_col, device=device).view(1, -1)
-
-    col_in_g0 = col % 4
-    col_group = col // 4
-    row_in_g0 = row % 32
-    row_in_g1 = (row % 128) // 32
-    row_group = row // 128
-
-    offset = (
-        row_group * (128 * padded_col)
-        + col_group * 512
-        + row_in_g0 * 16
-        + row_in_g1 * 4
-        + col_in_g0
-    )  # [m, total_col]
-
-    flat = sf_swizzled_u8.reshape(-1)
-    return flat[offset.reshape(-1)].reshape(m, total_col)
-
-
 def _dequant_nvfp4(
     fp4_u8: torch.Tensor,
-    sf_swizzled_u8: torch.Tensor,
+    sf_linear_u8: torch.Tensor,
     sf_scale: torch.Tensor,
     m: int,
     n: int,
 ) -> torch.Tensor:
-    """Dequantize an NVFP4 (packed FP4 + swizzled e4m3 SF) buffer back to fp32.
+    """Dequantize an NVFP4 (packed FP4 + linear e4m3 SF) buffer back to fp32.
 
     Args:
         fp4_u8: ``[M, N // 2]`` ``uint8`` packed FP4 (low nibble first).
-        sf_swizzled_u8: 1-D ``uint8`` SF buffer in TRT-LLM swizzled 128x4 layout.
+        sf_linear_u8: ``[M, N // 16]`` ``uint8`` SF buffer in row-major LINEAR
+            layout (the layout the fused kernel now writes directly).
         sf_scale: ``[1]`` ``float32`` global scale (= 1 / input_scale).
-        m, n: original logical shape (pre-padding).
+        m, n: original logical shape.
 
     Returns:
         ``[M, N]`` ``float32`` reconstruction
@@ -199,23 +141,12 @@ def _dequant_nvfp4(
     e2m1[:, 0::2] = vals_lo
     e2m1[:, 1::2] = vals_hi
 
-    # ---- Unswizzle SF -> [M, N // 16] e4m3 codes -> fp32 SFValue -----------
-    # ``_unswizzle_sf_ref`` is a pure-PyTorch reverse of the 128x4 swizzle so
-    # the test stays self-contained (no ``torch.ops.trtllm`` custom op needed).
-    sf_unswizzled = _unswizzle_sf_ref(sf_swizzled_u8, m, n, scaling_vector_size=16)
-    sf_fp32 = sf_unswizzled.contiguous().view(torch.float8_e4m3fn).float()
+    # ---- LINEAR SF -> [M, N // 16] e4m3 codes -> fp32 SFValue --------------
+    sf_fp32 = sf_linear_u8.contiguous().view(torch.float8_e4m3fn).float()
 
     # ---- Combine: each [M, k*16:(k+1)*16] block scales by sf_fp32[M, k] ----
     sf_per_elem = sf_fp32.repeat_interleave(16, dim=1)  # [M, N]
     return e2m1 * sf_per_elem / sf_scale.float().item()
-
-
-def _padded_sf_size(m: int, n: int) -> int:
-    """Mirror ``computeSwizzledLayoutSFSize(m_padded, n // 16)`` exactly."""
-    m_padded = (m + 31) // 32 * 32
-    sf_rows = (m_padded + 127) // 128 * 128
-    sf_cols = (n // 16 + 3) // 4 * 4
-    return sf_rows * sf_cols
 
 
 @pytest.mark.parametrize(
@@ -285,7 +216,7 @@ def test_fused_add_rmsnorm_fp4_quant_matches_reference(
         normed_ref,
         sf_scale,
         sf_vec_size=16,
-        is_sf_swizzled_layout=True,
+        is_sf_swizzled_layout=False,
     )
 
     # ── Fused path.
@@ -306,8 +237,9 @@ def test_fused_add_rmsnorm_fp4_quant_matches_reference(
     assert hp_norm is not None
     assert hp_norm.shape == (m, n)
     assert hp_norm.dtype == dtype
-    expected_sf_numel = _padded_sf_size(m, n)
-    assert sf_out.numel() == expected_sf_numel
+    assert sf_out.shape == (m, n // 16), (
+        f"sf_out shape {tuple(sf_out.shape)} != ({m}, {n // 16})"
+    )
     assert sf_out.dtype == torch.uint8
 
     # Per-dtype tolerance ≈ 1 ULP of the storage type. bf16 has 7 mantissa bits
@@ -340,8 +272,8 @@ def test_fused_add_rmsnorm_fp4_quant_matches_reference(
     # or uint8; normalize to uint8 [M, N // 2] before decoding.
     fp4_ref_u8 = fp4_ref.view(torch.uint8).reshape(m, n // 2)
     fp4_u8 = fp4.view(torch.uint8).reshape(m, n // 2)
-    sf_ref_u8 = sf_ref.view(torch.uint8).reshape(-1)
-    sf_out_u8 = sf_out.view(torch.uint8).reshape(-1)
+    sf_ref_u8 = sf_ref.view(torch.uint8).reshape(m, n // 16)
+    sf_out_u8 = sf_out.view(torch.uint8).reshape(m, n // 16)
 
     deq_fused = _dequant_nvfp4(fp4_u8, sf_out_u8, sf_scale, m, n)
     deq_ref = _dequant_nvfp4(fp4_ref_u8, sf_ref_u8, sf_scale, m, n)
@@ -436,7 +368,7 @@ def test_fused_add_rmsnorm_fp4_quant_invalid_n_rejected() -> None:
     ],
 )
 def test_fused_add_rmsnorm_fp4_quant_sf_layout_valid(m: int, n: int) -> None:
-    """SF output must be unswizzlable to (m, n//16) without OOB or NaN."""
+    """SF output must be [M, N//16] uint8 (LINEAR row-major) without NaN/Inf."""
     from tokenspeed_kernel.thirdparty.cuda import fused_add_rmsnorm_fp4_quant
 
     torch.manual_seed(42)
@@ -458,28 +390,17 @@ def test_fused_add_rmsnorm_fp4_quant_sf_layout_valid(m: int, n: int) -> None:
     assert residual_out.shape == (m, n)
     assert hp_norm.shape == (m, n)
     assert sf_out.dtype == torch.uint8
-
-    # SF buffer must be large enough for unswizzle
-    sf_cols = n // 16
-    padded_col = (sf_cols + 3) // 4 * 4
-    m_padded = (m + 31) // 32 * 32
-    sf_rows_padded = (m_padded + 127) // 128 * 128
-    expected_sf_numel = sf_rows_padded * padded_col
-    assert sf_out.numel() == expected_sf_numel
-
-    # Unswizzle and verify no OOB: use _unswizzle_sf_ref from this file
-    sf_unswizzled = _unswizzle_sf_ref(sf_out, m, n, scaling_vector_size=16)
-    assert sf_unswizzled.shape == (m, sf_cols)
+    assert sf_out.shape == (m, n // 16)
 
     # Interpret as e4m3 and check no NaN/Inf in the float conversion
-    sf_fp32 = sf_unswizzled.contiguous().view(torch.float8_e4m3fn).float()
+    sf_fp32 = sf_out.contiguous().view(torch.float8_e4m3fn).float()
     assert not torch.isnan(sf_fp32).any(), "SF contains NaN after e4m3 decode"
     assert not torch.isinf(sf_fp32).any(), "SF contains Inf after e4m3 decode"
 
     # Dequantize FP4 and verify finite output
     deq = _dequant_nvfp4(
         fp4.view(torch.uint8).reshape(m, n // 2),
-        sf_out.view(torch.uint8).reshape(-1),
+        sf_out.view(torch.uint8).reshape(m, n // 16),
         sf_scale,
         m, n,
     )
