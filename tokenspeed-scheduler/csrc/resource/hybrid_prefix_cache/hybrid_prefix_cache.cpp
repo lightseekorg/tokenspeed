@@ -37,6 +37,7 @@
 #include <iterator>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace tokenspeed {
@@ -1722,37 +1723,63 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
         if (attach_node == nullptr) break;
 
         bool preflight_ok = true;
+        const char* preflight_fail_reason = "unknown";
+        std::string preflight_fail_group;
+        std::int32_t fail_raw_per_page = -1;
+        std::int32_t fail_committed = -1;
+        std::int32_t fail_raw_cursor = -1;
+        std::int32_t fail_base = -1;
+        std::int32_t fail_borrowed = -1;
+        std::int32_t fail_owned = -1;
+        std::int32_t fail_committed_page = -1;
+        std::int32_t fail_owned_base_page = -1;
+        std::int32_t fail_pages_to_commit = -1;
+
+        auto mark_preflight_failure = [&](const char* reason, const std::string& gid,
+                                          const PagedCacheGroupTable* table = nullptr, std::int32_t raw_per_page = -1) {
+            preflight_ok = false;
+            preflight_fail_reason = reason;
+            preflight_fail_group = gid;
+            fail_raw_per_page = raw_per_page;
+            if (table == nullptr) return;
+            fail_committed = table->CommittedPrefixLenTokens();
+            fail_raw_cursor = table->RawTokenCursor();
+            fail_base = table->BaseLogicalPage();
+            fail_borrowed = table->BorrowedPagesCount();
+            fail_owned = table->OwnedPagesCount();
+        };
+
         for (const auto& gid : required_groups) {
             auto t_it = tables.find(gid);
             if (t_it == tables.end()) {
-                preflight_ok = false;
+                mark_preflight_failure("missing_table", gid);
                 break;
             }
             const auto& table = t_it->second;
             const std::int32_t raw_per_page = table.RawTokensPerPage();
             if (raw_per_page <= 0) {
-                preflight_ok = false;
+                mark_preflight_failure("invalid_raw_per_page", gid, &table, raw_per_page);
                 break;
             }
             if (table.CommittedPrefixLenTokens() % raw_per_page != 0) {
-                preflight_ok = false;
+                mark_preflight_failure("committed_unaligned", gid, &table, raw_per_page);
                 break;
             }
             if (target % raw_per_page != 0) {
-                preflight_ok = false;
+                mark_preflight_failure("target_unaligned", gid, &table, raw_per_page);
                 break;
             }
             if (target <= table.CommittedPrefixLenTokens()) {
-                preflight_ok = false;
+                mark_preflight_failure("target_not_advanced", gid, &table, raw_per_page);
                 break;
             }
             if (target > table.RawTokenCursor()) {
-                preflight_ok = false;
+                mark_preflight_failure("target_exceeds_raw_cursor", gid, &table, raw_per_page);
                 break;
             }
             auto group_alloc_it = paged_cache_allocators_.find(gid);
             if (group_alloc_it == paged_cache_allocators_.end() || group_alloc_it->second == nullptr) {
-                preflight_ok = false;
+                mark_preflight_failure("missing_allocator", gid, &table, raw_per_page);
                 break;
             }
             const auto& cfg = group_alloc_it->second->Config();
@@ -1760,17 +1787,30 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
                 const std::int32_t committed_page = table.CommittedPrefixLenTokens() / raw_per_page;
                 const std::int32_t owned_base_page = table.BaseLogicalPage() + table.BorrowedPagesCount();
                 const std::int32_t pages_to_commit = (target - table.CommittedPrefixLenTokens()) / raw_per_page;
-                if (owned_base_page != committed_page || pages_to_commit > table.OwnedPagesCount()) {
-                    preflight_ok = false;
+                if (owned_base_page != committed_page) {
+                    mark_preflight_failure("history_owned_base_mismatch", gid, &table, raw_per_page);
+                    fail_committed_page = committed_page;
+                    fail_owned_base_page = owned_base_page;
+                    fail_pages_to_commit = pages_to_commit;
+                    break;
+                }
+                if (pages_to_commit > table.OwnedPagesCount()) {
+                    mark_preflight_failure("history_owned_pages_short", gid, &table, raw_per_page);
+                    fail_committed_page = committed_page;
+                    fail_owned_base_page = owned_base_page;
+                    fail_pages_to_commit = pages_to_commit;
                     break;
                 }
             }
         }
         if (!preflight_ok) {
             spdlog::warn(
-                "[HybridPrefixCache] CommitChunk: preflight failed for request {} at target "
-                "depth {}; leaving prior commits intact",
-                request_id, target);
+                "[HybridPrefixCache] CommitChunk: preflight failed request={} target={} chunk_depth={} lcm={} "
+                "reason={} group={} committed={} raw_cursor={} raw_per_page={} base={} borrowed={} owned={} "
+                "committed_page={} owned_base_page={} pages_to_commit={}; leaving prior commits intact",
+                request_id, target, chunk_depth, lcm, preflight_fail_reason, preflight_fail_group, fail_committed,
+                fail_raw_cursor, fail_raw_per_page, fail_base, fail_borrowed, fail_owned, fail_committed_page,
+                fail_owned_base_page, fail_pages_to_commit);
             break;
         }
 

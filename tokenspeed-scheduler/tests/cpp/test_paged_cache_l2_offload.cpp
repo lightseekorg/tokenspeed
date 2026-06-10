@@ -89,7 +89,7 @@ protected:
         };
         cfg.paged_cache_host_group_pages = {{"fh", 16}, {"swa", 16}};
         PrefixCacheAdjunctSpec adjunct;
-        adjunct.required_groups = {"fh", "swa"};
+        adjunct.required_groups = {"fh"};
         cfg.prefix_cache_adjunct = adjunct;
         return cfg;
     }
@@ -170,6 +170,70 @@ protected:
         }
         return static_cast<std::int32_t>(pages.size());
     }
+};
+
+class PagedCacheHistoryOnlyL2OffloadTest : public ::testing::Test {
+protected:
+    static constexpr std::int32_t kPageSize = 2;
+    static constexpr std::int32_t kLcm = 4;
+
+    void SetUp() override {
+        device_alloc_ = std::make_unique<PageAllocator>(kPageSize, /*total_pages=*/64);
+        kv_cache_ = std::make_unique<KVPrefixCache>(device_alloc_.get(), /*host=*/nullptr);
+
+        auto history_cfg = MakeHistoryGroup(/*total_pages=*/32);
+        auto history_owner = std::make_unique<PagedCacheGroupAllocator>(history_cfg);
+        history_alloc_ = history_owner.get();
+        hybrid_ = std::make_unique<HybridPrefixCache>(*kv_cache_, /*mamba=*/nullptr, /*mamba_chunk_size=*/0);
+        hybrid_->RegisterPagedCacheGroup(std::move(history_owner));
+
+        auto host_history_cfg = MakeHistoryGroup(/*total_pages=*/32);
+        auto host_history = std::make_unique<PagedCacheGroupAllocator>(host_history_cfg);
+        hybrid_->RegisterPagedCacheHostGroup(std::move(host_history));
+        hybrid_->EnablePagedCacheAdjunct({"fh"}, {});
+        kv_cache_->GetDeviceManager().SetEvictionCallback([this](TreeNode* node) { hybrid_->OnKVEvict(node); });
+    }
+
+    TreeNode* InsertDeviceTokens(std::int32_t num_pages, token_t token_start = 1) {
+        auto tokens = MakeAlignedTokens(num_pages, kPageSize, token_start);
+        OwnedPages pages = device_alloc_->Allocate(num_pages);
+        auto inserted =
+            kv_cache_->Insert<ResourceType::Device>(tokens, /*prefix_pages=*/{}, std::move(pages), /*page_hashes=*/{});
+        return inserted.last_node;
+    }
+
+    std::unique_ptr<PagedCacheSnapshot> MakeHistorySnapshot(std::int32_t prefix_len_tokens) {
+        PagedCacheGroupTable table{history_alloc_};
+        table.Acquire(prefix_len_tokens);
+        auto committed = table.CommitHistoryToSnapshot(prefix_len_tokens);
+
+        PagedCacheGroupSnapshot group{};
+        group.pages = std::move(committed.pages);
+        group.base_logical_page = committed.segment_base_logical_page;
+        group.raw_token_cursor = prefix_len_tokens;
+        group.sliding = false;
+
+        auto snapshot = std::make_unique<PagedCacheSnapshot>();
+        snapshot->prefix_len_tokens = prefix_len_tokens;
+        snapshot->groups.emplace("fh", std::move(group));
+        return snapshot;
+    }
+
+    static PagedCacheGroupConfig MakeHistoryGroup(std::int32_t total_pages) {
+        PagedCacheGroupConfig cfg{};
+        cfg.group_id = "fh";
+        cfg.rows_per_page = 4;
+        cfg.entry_stride_tokens = 1;
+        cfg.total_pages = total_pages;
+        cfg.retention = PagedCacheGroupConfig::Retention::FullHistory;
+        cfg.family = PagedCacheGroupFamily::History;
+        return cfg;
+    }
+
+    std::unique_ptr<PageAllocator> device_alloc_;
+    std::unique_ptr<KVPrefixCache> kv_cache_;
+    PagedCacheGroupAllocator* history_alloc_{nullptr};
+    std::unique_ptr<HybridPrefixCache> hybrid_;
 };
 
 TEST_F(PagedCacheL2OffloadTest, PendingHostSnapshotInvisibleUntilWriteBackAck) {
@@ -260,6 +324,40 @@ TEST_F(PagedCacheL2OffloadTest, HostHitMaterializesDeviceDestinationPagesForForw
     }
 
     hybrid_->ReleaseRequest("r-load");
+}
+
+TEST_F(PagedCacheHistoryOnlyL2OffloadTest, HostLoadedHistoryPrefixCanPublishContinuationSnapshot) {
+    TreeNode* prefix = InsertDeviceTokens(/*num_pages=*/2);
+    ASSERT_NE(prefix, nullptr);
+    ASSERT_TRUE(hybrid_->AttachPagedCacheSnapshotToNode(prefix, MakeHistorySnapshot(kLcm)));
+    prefix->AttachResource<ResourceType::Host>(std::make_unique<NodeResource<ResourceType::Host>>(OwnedPages{}));
+
+    auto writeback = hybrid_->PreparePagedCacheHostWriteBack({prefix});
+    ASSERT_EQ(writeback.size(), 1u);
+    hybrid_->OnPagedCacheHostWriteBackDone({prefix}, /*success=*/true);
+    auto detached_device = hybrid_->DetachPagedCacheSnapshotFromNode(prefix);
+    ASSERT_NE(detached_device, nullptr);
+
+    auto host_match = hybrid_->Match(MakeAlignedTokens(/*num_pages=*/2, kPageSize, /*start=*/1));
+    ASSERT_EQ(host_match.paged_cache.last_node, nullptr);
+    ASSERT_NE(host_match.paged_cache_host.last_node, nullptr);
+    EXPECT_EQ(host_match.paged_cache_host.prefix_len_tokens, kLcm);
+
+    auto loadback = hybrid_->PreparePagedCacheDeviceLoadBack("r-load", host_match.paged_cache_host);
+    ASSERT_EQ(loadback.size(), 1u);
+
+    TreeNode* extended = InsertDeviceTokens(/*num_pages=*/4);
+    ASSERT_NE(extended, nullptr);
+    hybrid_->AcquireForRequest("r-load", /*first_raw_position_of_op=*/kLcm,
+                               /*target_raw_tokens_exclusive=*/2 * kLcm);
+    hybrid_->CommitChunk("r-load", extended);
+
+    ASSERT_TRUE(extended->HasPagedCacheSnapshot());
+    auto device_match = hybrid_->Match(MakeAlignedTokens(/*num_pages=*/4, kPageSize, /*start=*/1));
+    ASSERT_NE(device_match.paged_cache.last_node, nullptr);
+    EXPECT_EQ(device_match.paged_cache.prefix_len_tokens, 2 * kLcm);
+    ASSERT_EQ(device_match.paged_cache.per_group_page_ids.count("fh"), 1u);
+    EXPECT_EQ(device_match.paged_cache.per_group_page_ids.at("fh").size(), 2u);
 }
 
 TEST_F(PagedCacheL2OffloadTest, HostStateRecoveryRequiresExactTerminalStateCompleteness) {

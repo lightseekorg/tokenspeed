@@ -416,7 +416,9 @@ void PagedCacheGroupTable::ImportPrefixOwned(OwnedPages pages, std::int32_t base
     owned_pages_ = std::move(pages);
     base_logical_page_ = base_logical_page;
     raw_token_cursor_ = raw_tokens_covered;
-    committed_prefix_len_tokens_ = raw_tokens_covered;
+    committed_prefix_len_tokens_ = allocator_->Config().family == PagedCacheGroupFamily::History
+                                       ? base_logical_page_ * raw_per_page
+                                       : raw_tokens_covered;
     RefreshPageIdsView();
 }
 

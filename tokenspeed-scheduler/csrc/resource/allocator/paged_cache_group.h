@@ -155,8 +155,10 @@ public:
                               std::int32_t raw_tokens_covered);
 
     // Adopt owned device pages that were freshly materialized from host L2.
-    // Legal only on a fresh-empty table. The table owns these pages and can
-    // later commit them into device snapshots or release them with the request.
+    // Legal only on a fresh-empty table. History-family pages remain
+    // uncommitted so CommitChunk can publish them into device snapshots before
+    // extending the chain; State-family pages represent terminal state already
+    // covered by the host hit.
     void ImportPrefixOwned(OwnedPages pages, std::int32_t base_logical_page, std::int32_t raw_tokens_covered);
 
     // Sliding-only: drop front pages strictly below `window_lower_bound`.
