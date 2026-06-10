@@ -9,7 +9,7 @@ runner:
     - h100-2gpu
     - b200-2gpu
     - gb200-2gpu
-    - linux-mi355-2gpu-lightseek
+    - amd-mi35x-2gpu-test
 env:
   CI: "true"
 install:
