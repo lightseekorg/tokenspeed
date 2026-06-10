@@ -471,7 +471,7 @@ class LogitsProcessor(nn.Module):
                     .view(logits.size(0), -1)
                 )
 
-        logits = logits[:, : self.config.vocab_size].contiguous()
+        logits = logits[:, : self.config.vocab_size].float().contiguous()
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)

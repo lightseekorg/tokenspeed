@@ -91,6 +91,8 @@ def register_backend(
 
 
 _HYBRID_GDN_ARCHITECTURES = {
+    "NemotronHForCausalLM",
+    "NemotronHPuzzleForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3_5MoeForConditionalGenerationNextN",
     "Qwen3_5ForConditionalGeneration",
@@ -271,6 +273,10 @@ def _create_hybrid_linear_attn(
         return full_attn_backend, pool, None
 
     linear_attn_backend = MambaAttnBackend(config)
+    linear_attn_backend.configure_mamba_metadata(
+        mamba_cache_chunk_size=model_config.mamba_cache_chunk_size,
+        uses_mamba2_tracking=hasattr(text_config, "mamba_chunk_size"),
+    )
 
     # Mamba radix cache uses C++ chunk indices. Without radix cache, the
     # backend uses 1-based req_pool_indices directly, so keep slot 0 as padding.

@@ -30,7 +30,11 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 platform = current_platform()
 
@@ -89,7 +93,15 @@ _ragged_prefill_workspaces: dict[torch.device, torch.Tensor] = {}
 _ragged_prefill_wrappers: dict[torch.device, BatchPrefillWithRaggedKVCacheWrapper] = {}
 _paged_prefill_workspaces: dict[torch.device, torch.Tensor] = {}
 _paged_prefill_wrappers: dict[torch.device, BatchPrefillWithPagedKVCacheWrapper] = {}
+_decode_workspaces: dict[tuple[torch.device, bool], torch.Tensor] = {}
+_decode_wrappers: dict[
+    tuple[torch.device, bool], BatchDecodeWithPagedKVCacheWrapper
+] = {}
 _paged_prefill_metadata_buffers: dict[
+    tuple[torch.device, int, int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+_decode_metadata_buffers: dict[
     tuple[torch.device, int, int],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
@@ -160,9 +172,44 @@ def _get_paged_prefill_wrapper(
             dtype=torch.uint8,
             device=device,
         )
-        wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
         _paged_prefill_workspaces[device] = workspace
         _paged_prefill_wrappers[device] = wrapper
+    return wrapper
+
+
+def _should_use_decode_tensor_cores(
+    kv_cache_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return True
+    if kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
+        return num_q_heads // num_kv_heads >= 4
+    return False
+
+
+def _get_decode_wrapper(
+    device: torch.device,
+    use_tensor_cores: bool,
+) -> BatchDecodeWithPagedKVCacheWrapper:
+    key = (device, use_tensor_cores)
+    wrapper = _decode_wrappers.get(key)
+    if wrapper is None:
+        workspace = torch.empty(
+            256 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            workspace,
+            "NHD",
+            backend="fa2",
+            use_tensor_cores=use_tensor_cores,
+        )
+        _decode_workspaces[key] = workspace
+        _decode_wrappers[key] = wrapper
     return wrapper
 
 
@@ -238,7 +285,23 @@ if platform.is_nvidia and platform.is_hopper_plus:
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
-            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16},
+        )
+        | frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                ),
+            }
         ),
         priority=Priority.SPECIALIZED,
         traits={
@@ -247,7 +310,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({True}),
+            "return_lse": frozenset({False, True}),
         },
         tags={"throughput"},
     )
@@ -265,6 +328,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = True,
+        bmm1_scale: float | None = None,
+        bmm2_scale: float | None = None,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         wrapper = _get_paged_prefill_wrapper(q.device)
         page_size = k_cache.shape[1]
@@ -315,11 +381,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
             page_size,
             head_dim_vo=v_cache.shape[-1],
             causal=is_causal,
-            sm_scale=1.0 / math.sqrt(q.shape[-1]),
+            sm_scale=(
+                bmm1_scale if bmm1_scale is not None else 1.0 / math.sqrt(q.shape[-1])
+            ),
             window_left=window_left,
             q_data_type=q.dtype,
             kv_data_type=k_cache.dtype,
-            o_data_type=q.dtype,
+            o_data_type=out_dtype if out_dtype is not None else q.dtype,
             seq_lens=cache_seqlens,
             max_token_per_sequence=max_seqlen_q,
         )
@@ -329,10 +397,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
             return_lse=return_lse,
             window_left=window_left,
             sinks=sinks,
+            v_scale=bmm2_scale if bmm2_scale is not None else 1.0,
         )
 
-        out, lse = result
-        return out, lse / _FLASHINFER_LOG2_E
+        if return_lse:
+            out, lse = result
+            return out, lse / _FLASHINFER_LOG2_E
+        return result
 
     @register_kernel(
         "attention",
@@ -344,9 +415,25 @@ if platform.is_nvidia and platform.is_hopper_plus:
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
-            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+        )
+        | frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                ),
+            }
         ),
-        priority=Priority.SPECIALIZED,
+        priority=Priority.PERFORMANT,
         traits={
             "is_causal": frozenset({False, True}),
             "head_dim": frozenset({64, 128, 256}),
@@ -371,6 +458,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
+        bmm1_scale: float | None = None,
+        bmm2_scale: float | None = None,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         global _workspace_buffer
         if _workspace_buffer is None:
@@ -397,15 +487,141 @@ if platform.is_nvidia and platform.is_hopper_plus:
             seq_lens=cache_seqlens,
             max_q_len=max_seqlen_q,
             max_kv_len=max_seqlen_k,
-            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
-            bmm2_scale=1.0,
+            bmm1_scale=(
+                bmm1_scale if bmm1_scale is not None else 1.0 / math.sqrt(q.shape[-1])
+            ),
+            bmm2_scale=bmm2_scale if bmm2_scale is not None else 1.0,
             batch_size=cache_seqlens.shape[0],
             cum_seq_lens_q=cu_seqlens_q,
             cum_seq_lens_kv=cum_seq_lens_kv,
             window_left=window_left,
             sinks=sinks,
-            out_dtype=q.dtype,
+            out_dtype=out_dtype if out_dtype is not None else q.dtype,
             causal=is_causal,
+        )
+
+    @register_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        name="flashinfer_mha_decode_with_kvcache",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+        )
+        | frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                ),
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({64, 128, 256}),
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+        tags={"latency"},
+    )
+    def flashinfer_mha_decode_with_kvcache(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_k: int,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        bmm1_scale: float | None = None,
+        bmm2_scale: float | None = None,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        page_size = k_cache.shape[1]
+        batch_size = cache_seqlens.shape[0]
+        max_pages_per_seq = page_table.shape[1]
+        wrapper = _get_decode_wrapper(
+            q.device,
+            _should_use_decode_tensor_cores(
+                k_cache.dtype,
+                q.shape[1],
+                k_cache.shape[2],
+            ),
+        )
+        buffers_key = (page_table.device, batch_size, max_pages_per_seq)
+        buffers = _decode_metadata_buffers.get(buffers_key)
+        if buffers is None:
+            buffers = (
+                torch.empty(
+                    batch_size + 1,
+                    dtype=torch.int32,
+                    device=page_table.device,
+                ),
+                torch.empty(
+                    max(1, batch_size * max_pages_per_seq),
+                    dtype=torch.int32,
+                    device=page_table.device,
+                ),
+                torch.empty(
+                    batch_size,
+                    dtype=torch.int32,
+                    device=page_table.device,
+                ),
+            )
+            _decode_metadata_buffers[buffers_key] = buffers
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = buffers
+        _build_paged_prefill_metadata_kernel[(batch_size,)](
+            page_table,
+            cache_seqlens,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            page_table.stride(0),
+            page_size,
+            batch_size,
+            max_pages_per_seq,
+            BLOCK_P=min(1024, 1 << (max_pages_per_seq - 1).bit_length()),
+        )
+        wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            q.shape[1],
+            k_cache.shape[2],
+            q.shape[-1],
+            page_size,
+            window_left=window_left,
+            q_data_type=q.dtype,
+            kv_data_type=k_cache.dtype,
+            o_data_type=out_dtype if out_dtype is not None else q.dtype,
+            sm_scale=(
+                bmm1_scale if bmm1_scale is not None else 1.0 / math.sqrt(q.shape[-1])
+            ),
+            block_tables=page_table,
+            seq_lens=cache_seqlens,
+        )
+        return wrapper.run(
+            q,
+            (k_cache, v_cache),
+            v_scale=bmm2_scale if bmm2_scale is not None else 1.0,
+            window_left=window_left,
+            sinks=sinks,
         )
 
     @register_kernel(
@@ -418,9 +634,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
-            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         ),
-        priority=Priority.SPECIALIZED,
+        priority=Priority.PERFORMANT,
         traits={
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
@@ -440,6 +658,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
+        bmm1_scale: float | None = None,
+        bmm2_scale: float | None = None,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         global _workspace_buffer
         if _workspace_buffer is None:
@@ -462,11 +683,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
             block_tables=page_table,
             seq_lens=cache_seqlens,
             max_seq_len=max_seqlen_k,
-            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
-            bmm2_scale=1.0,
+            bmm1_scale=(
+                bmm1_scale if bmm1_scale is not None else 1.0 / math.sqrt(q.shape[-1])
+            ),
+            bmm2_scale=bmm2_scale if bmm2_scale is not None else 1.0,
             window_left=window_left,
             sinks=sinks,
-            out_dtype=q.dtype,
+            out_dtype=out_dtype if out_dtype is not None else q.dtype,
         )
 
 

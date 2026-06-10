@@ -55,6 +55,23 @@ def test_logits_processor_extend_without_gather_ids_uses_request_last_tokens(
     torch.testing.assert_close(out.next_token_logits, hidden_states[[1, 4]])
 
 
+def test_logits_processor_returns_float_logits_for_bfloat16_lm_head():
+    processor = LogitsProcessor(config=SimpleNamespace(model_type="test", vocab_size=3))
+    hidden_states = torch.eye(3, dtype=torch.bfloat16)
+    lm_head = SimpleNamespace(weight=torch.eye(3, dtype=torch.bfloat16))
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+
+    out = processor(
+        input_ids=None,
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        logits_metadata=metadata,
+    )
+
+    assert out.next_token_logits.dtype == torch.float32
+    torch.testing.assert_close(out.next_token_logits, torch.eye(3, dtype=torch.float32))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_softcap_handles_large_logits_without_nan():
     cap = 30.0

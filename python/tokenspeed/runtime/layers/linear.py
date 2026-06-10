@@ -35,6 +35,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
 from tokenspeed.runtime.layers.dense import (
     Fp8LinearMethod,
+    ModelOptFp8LinearMethod,
     Nvfp4LinearMethod,
     UnquantizedLinearMethod,
     W8A8Fp8LinearMethod,
@@ -71,6 +72,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "AWQLinearMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
+    "ModelOptFp8LinearMethod",
     "BlockInt8LinearMethod",
     "MarlinLinearMethod",
     "QQQLinearMethod",
@@ -127,6 +129,24 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
     return param[shard_id], loaded_weight
 
 
+def load_fused_scalar_or_vector_scale(param_data, loaded_weight):
+    """Load a fused per-tensor scale tensor.
+
+    Some checkpoints store one scalar for a fused module even though the
+    runtime parameter keeps one slot per logical shard. In that case the
+    scalar applies to every logical shard.
+    """
+    if len(loaded_weight.shape) == 0:
+        loaded_weight = loaded_weight.reshape(1)
+
+    if loaded_weight.numel() == 1:
+        param_data.fill_(loaded_weight.item())
+        return
+
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
+
+
 class LinearBase(torch.nn.Module):
     """Base linear layer.
 
@@ -178,6 +198,12 @@ class LinearBase(torch.nn.Module):
         elif isinstance(quant_config, Nvfp4Config):
             # For NVFP4, excluded layers use unquantized (bf16)
             if quant_config.is_layer_excluded(prefix):
+                self.quant_method = UnquantizedLinearMethod()
+            elif quant_config.is_layer_fp8(prefix):
+                self.quant_method = ModelOptFp8LinearMethod(quant_config.fp8_config)
+            elif quant_config.is_mixed_precision and not quant_config.is_layer_nvfp4(
+                prefix
+            ):
                 self.quant_method = UnquantizedLinearMethod()
             else:
                 self.quant_method = Nvfp4LinearMethod(quant_config)
@@ -549,12 +575,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # Loaded weight is already fused on disk (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
-                    param_data, loaded_weight = adjust_scalar_to_fused_array(
-                        param_data, loaded_weight, 0
-                    )
-
-                assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                    load_fused_scalar_or_vector_scale(param_data, loaded_weight)
+                else:
+                    assert param_data.shape == loaded_weight.shape
+                    param_data.copy_(loaded_weight)
                 return
             current_shard_offset = 0
             shard_offsets: list[tuple[int, int, int]] = []
@@ -684,7 +708,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                load_fused_scalar_or_vector_scale(param.data, loaded_weight)
                 return
             elif type(param) in (RowParallelWeightParameter, BaseWeightParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
@@ -875,7 +899,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
-                param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
+                load_fused_scalar_or_vector_scale(param.data, loaded_weight)
                 return
             elif type(param) in (RowParallelWeightParameter, BaseWeightParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight)
@@ -922,12 +946,10 @@ class QKVParallelLinear(ColumnParallelLinear):
             # Loaded weight is already fused on disk (qkv/mlp).
             if output_dim is None:
                 if needs_scalar_to_array:
-                    param_data, loaded_weight = adjust_scalar_to_fused_array(
-                        param_data, loaded_weight, 0
-                    )
-
-                assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                    load_fused_scalar_or_vector_scale(param_data, loaded_weight)
+                else:
+                    assert param_data.shape == loaded_weight.shape
+                    param_data.copy_(loaded_weight)
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)

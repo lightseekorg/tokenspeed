@@ -134,7 +134,7 @@ def get_shard_dim(param, shard_id, do_transpose):
     if do_transpose:
         is_transposed = True
 
-    SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+    SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0, "w13": 0}
     shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
     if is_transposed:
         shard_dim = int(not shard_dim)
@@ -185,6 +185,8 @@ def load_per_tensor_weight_scale(
         # we need to re-quantize w1/w3 weights after weight loading.
         idx = 0 if shard_id == "w1" else 1
         param.data[local_expert_id][idx] = loaded_weight
+    elif shard_id == "w13":
+        param.data[local_expert_id] = loaded_weight
     # If we are in the row parallel case (down_proj)
     elif shard_id == "w2":
         param.data[local_expert_id] = loaded_weight

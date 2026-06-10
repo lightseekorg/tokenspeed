@@ -172,7 +172,7 @@ def split_argv(argv: list[str]) -> SplitResult:
 
     items = _normalize(argv)
     result = SplitResult()
-    engine_flags = _engine_recognized_flags()
+    engine_flags: set[str] | None = None
 
     for name, value in items:
         if name in _ORCH_FLAGS:
@@ -213,6 +213,8 @@ def split_argv(argv: list[str]) -> SplitResult:
             result.engine.extend([name, value])
             continue
 
+        if engine_flags is None:
+            engine_flags = _engine_recognized_flags()
         if name in engine_flags:
             if value is not None:
                 result.engine.extend([name, value])

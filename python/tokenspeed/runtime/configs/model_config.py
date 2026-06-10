@@ -128,6 +128,34 @@ def _derive_num_attention_layers(
     return num_attention_layers
 
 
+def resolve_mamba_cache_chunk_size(
+    server_args: ServerArgs,
+    hf_text_config: PretrainedConfig | None,
+) -> int:
+    """Resolve the scheduler/runtime Mamba cache chunk size.
+
+    This mirrors SGLang's rule: use the model's Mamba2 chunk size when it is
+    present, but keep it at least as large as the KV page size so checkpoint
+    insertion remains page-compatible.
+    """
+
+    chunk_size = getattr(hf_text_config, "mamba_chunk_size", None)
+    if chunk_size is None:
+        chunk_size = server_args.mamba_cache_chunk_size
+    chunk_size = int(chunk_size)
+    page_size = int(server_args.block_size)
+    if chunk_size <= 0:
+        raise ValueError(f"mamba_chunk_size must be positive, got {chunk_size}")
+    if page_size <= 0:
+        raise ValueError(f"block_size must be positive, got {page_size}")
+    if max(chunk_size, page_size) % min(chunk_size, page_size) != 0:
+        raise ValueError(
+            "For SSM models, either mamba_chunk_size or block_size must divide "
+            f"the other, got mamba_chunk_size={chunk_size}, block_size={page_size}"
+        )
+    return max(chunk_size, page_size)
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -169,6 +197,9 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.mamba_cache_chunk_size = resolve_mamba_cache_chunk_size(
+            server_args, self.hf_text_config
+        )
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
@@ -332,36 +363,82 @@ class ModelConfig:
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
-        if quant_cfg is None:
-            # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
-            # Resolve the local snapshot directory (model_path may be a HF hub ID)
-            if os.path.isdir(self.model_path):
-                model_dir = self.model_path
-            else:
-                try:
-                    from huggingface_hub import snapshot_download
 
-                    model_dir = snapshot_download(
-                        self.model_path,
-                        revision=self.revision,
-                        allow_patterns=["*.json"],
-                        local_files_only=True,
-                    )
-                except Exception:
-                    model_dir = None
-            if model_dir is not None:
-                hf_quant_path = os.path.join(model_dir, "hf_quant_config.json")
-                if os.path.isfile(hf_quant_path):
-                    with open(hf_quant_path) as f:
-                        hf_quant = json.load(f)
-                    quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
-                    if quant_algo:
-                        quant_cfg = {
-                            "quant_method": "modelopt",
-                            "quant_algo": quant_algo,
-                        }
-                        quant_cfg.update(hf_quant.get("quantization", {}))
+        # ModelOpt checkpoints may split quantization metadata across
+        # config.json and hf_quant_config.json. The sidecar carries global
+        # metadata such as kv_cache_quant_algo that is not always present in
+        # config.json, while config.json can carry the per-target groups needed
+        # for mixed FP8/NVFP4 layer selection.
+        hf_quant = self._load_modelopt_hf_quant_config()
+        quant_cfg = self._merge_modelopt_hf_quant_config(quant_cfg, hf_quant)
         return quant_cfg
+
+    def _load_modelopt_hf_quant_config(self) -> dict | None:
+        # Resolve the local snapshot directory (model_path may be a HF hub ID).
+        if os.path.isdir(self.model_path):
+            model_dir = self.model_path
+        else:
+            try:
+                from huggingface_hub import snapshot_download
+
+                model_dir = snapshot_download(
+                    self.model_path,
+                    revision=self.revision,
+                    allow_patterns=["*.json"],
+                    local_files_only=True,
+                )
+            except Exception:
+                model_dir = None
+        if model_dir is None:
+            return None
+
+        hf_quant_path = os.path.join(model_dir, "hf_quant_config.json")
+        if not os.path.isfile(hf_quant_path):
+            return None
+        with open(hf_quant_path) as f:
+            hf_quant = json.load(f)
+        return hf_quant if isinstance(hf_quant, dict) else None
+
+    @staticmethod
+    def _merge_modelopt_hf_quant_config(quant_cfg, hf_quant: dict | None):
+        if hf_quant is None:
+            return quant_cfg
+
+        quantization = hf_quant.get("quantization")
+        if not isinstance(quantization, dict):
+            return quant_cfg
+
+        quant_algo = quantization.get("quant_algo")
+        if not quant_algo:
+            return quant_cfg
+
+        if quant_cfg is None:
+            quant_cfg = {"quant_method": "modelopt"}
+        elif isinstance(quant_cfg, dict):
+            quant_cfg = dict(quant_cfg)
+        else:
+            return quant_cfg
+
+        modelopt_quant_method = ModelConfig._get_modelopt_quant_method(quant_algo)
+        if quant_cfg.get("quant_method") in (None, "modelopt"):
+            quant_cfg["quant_method"] = modelopt_quant_method
+        quant_cfg.setdefault("quant_algo", quant_algo)
+        for key in ("kv_cache_quant_algo", "group_size", "exclude_modules"):
+            if key in quantization:
+                quant_cfg.setdefault(key, quantization[key])
+        for key in ("config_groups", "quantized_layers"):
+            if key in quantization:
+                quant_cfg.setdefault(key, quantization[key])
+        return quant_cfg
+
+    @staticmethod
+    def _get_modelopt_quant_method(quant_algo: str) -> str:
+        quant_algo = quant_algo.upper()
+        if quant_algo == "MIXED_PRECISION":
+            return "modelopt_mixed"
+        if "NVFP4" in quant_algo or "FP4" in quant_algo:
+            return "modelopt_fp4"
+        return "modelopt"
 
     def _verify_quantization(self) -> None:
         supported_quantization = [*QUANTIZATION_METHODS]
@@ -369,12 +446,19 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "nvfp4",
+            "modelopt",
+            "modelopt_fp4",
+            "modelopt_mixed",
             "mxfp4",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",
         ]
         compatible_quantization_methods = {
+            "nvfp4": ["modelopt", "modelopt_fp4", "modelopt_mixed"],
+            "modelopt": ["nvfp4"],
+            "modelopt_fp4": ["nvfp4", "modelopt"],
+            "modelopt_mixed": ["nvfp4", "modelopt"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:

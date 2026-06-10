@@ -50,3 +50,24 @@ def test_deepseek_v31_reasoning_parser_wraps_json_schema_after_thinking():
     assert elements[0]["end"] == "</think>"
     assert elements[-1]["type"] == "json_schema"
     assert elements[-1]["json_schema"] == schema
+
+
+def test_nemotron_3_reasoning_parser_uses_qwen_style_thinking_tag():
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+
+    structural_tag = structural_tag_for_reasoning_json_schema("nemotron_3", schema)
+
+    assert structural_tag is not None
+    payload = json.loads(structural_tag)
+    elements = payload["format"]["elements"]
+    assert payload["type"] == "structural_tag"
+    assert payload["format"]["type"] == "sequence"
+    assert elements[0]["type"] == "tag"
+    assert elements[0]["begin"] == "<think>"
+    assert elements[0]["end"] == "</think>"
+    assert elements[-1]["type"] == "json_schema"
+    assert elements[-1]["json_schema"] == schema

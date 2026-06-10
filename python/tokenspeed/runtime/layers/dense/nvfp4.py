@@ -22,18 +22,17 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.ops.quantization.flashinfer import (
+    fp4_quantize,
+    prepare_nvfp4_weight_for_fp4_gemm,
+)
+from tokenspeed_kernel.registry import error_fn
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
-
-
-def _pdl_enabled() -> bool:
-    from tokenspeed.runtime.utils.pdl import pdl_enabled
-
-    return pdl_enabled()
 
 
 class Nvfp4LinearMethod(QuantizeMethodBase):
@@ -142,6 +141,8 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
         layer.input_scale_inv = Parameter(
             (1.0 / input_scale).to(torch.float32), requires_grad=False
         )
+        layer.weights_padding_cols = 0
+        layer._nvfp4_dense_kernel_name = "cublaslt_mm_nvfp4"
         if layer.interleave_linear_and_gate:
             gate_weight, linear_weight = layer.weight.chunk(2, dim=0)
             linear_gate_weight = torch.cat((linear_weight, gate_weight), dim=0)
@@ -171,6 +172,27 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             del layer.weight
             del layer.weight_scale
         else:
+            if (
+                layer.override_kernel_name is None
+                and prepare_nvfp4_weight_for_fp4_gemm is not error_fn
+            ):
+                weight, weight_scale, output_size, weights_padding_cols = (
+                    prepare_nvfp4_weight_for_fp4_gemm(
+                        layer.weight.data,
+                        layer.weight_scale.data,
+                    )
+                )
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale_interleaved = Parameter(
+                    weight_scale,
+                    requires_grad=False,
+                )
+                layer.output_size_per_partition = output_size
+                layer.weights_padding_cols = weights_padding_cols
+                layer._nvfp4_dense_kernel_name = "flashinfer_mm_nvfp4"
+                del layer.weight_scale
+                return
+
             # Swizzle block scales for CUTLASS
             layer.weight_scale_interleaved = Parameter(
                 swizzle_blockscale_2d(layer.weight_scale),
@@ -190,14 +212,22 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             # Pre-quantized path: no fp4_quantize launch. Output dtype is bf16.
             x_fp4, x_scale = x
             output_dtype = torch.bfloat16
+            if x_fp4.shape[0] == 0:
+                return x_fp4.new_empty((0, w_n), dtype=output_dtype)
 
         else:
+            if x.shape[0] == 0:
+                return x.new_empty((*x.shape[:-1], w_n))
             x_fp4, x_scale = fp4_quantize(
-                x, layer.input_scale_inv, enable_pdl=_pdl_enabled()
+                x, layer.input_scale_inv, enable_pdl=pdl_enabled()
             )
             output_dtype = x.dtype
 
-        kernel_override = layer.override_kernel_name
+        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+        if weights_padding_cols:
+            x_fp4 = torch.nn.functional.pad(x_fp4, (0, weights_padding_cols))
+
+        kernel_name = layer.override_kernel_name or layer._nvfp4_dense_kernel_name
         out = tokenspeed_kernel.mm(
             x_fp4,
             layer.weight.T,
@@ -207,10 +237,11 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             out_dtype=output_dtype,
             alpha=layer.alpha,
             quant="nvfp4",
-            enable_pdl=_pdl_enabled(),
-            override=kernel_override,
-            expected_kernel_name=kernel_override or "cublaslt_mm_nvfp4",
+            override=kernel_name,
+            expected_kernel_name=kernel_name,
         )
+        if out.shape[-1] != w_n:
+            out = out[..., :w_n]
         return out.view(x_fp4.size(0), w_n)
 
 

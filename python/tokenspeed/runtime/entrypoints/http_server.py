@@ -14,6 +14,9 @@ Architecture::
 
 from __future__ import annotations
 
+import json
+import logging
+
 import aiohttp
 import grpc
 import grpc.aio
@@ -24,9 +27,7 @@ from google.protobuf.json_format import MessageToDict
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2 as pb
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2_grpc as pb_grpc
 
-from tokenspeed.runtime.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -44,6 +45,8 @@ _STREAM_CHUNK_SIZE = 8192
 # inactivity (a genuinely hung/stalled upstream) without killing a legitimately
 # long but actively-streaming request.
 _PROXY_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
+_REASONING_EFFORT_VALUES = {"none", "low", "medium", "high"}
+_TRUTHY_STRINGS = {"1", "true", "yes", "y", "on"}
 
 
 def _stub() -> pb_grpc.TokenSpeedSchedulerStub:
@@ -123,6 +126,7 @@ async def _proxy_request(request: Request) -> StreamingResponse | Response:
     if request.url.query:
         url = f"{url}?{request.url.query}"
     body = await request.body()
+    body = _normalize_chat_completion_body(request.url.path, body)
     headers = {
         k: v
         for k, v in request.headers.items()
@@ -173,6 +177,65 @@ async def _proxy_request(request: Request) -> StreamingResponse | Response:
         )
     finally:
         await session.close()
+
+
+def _normalize_chat_completion_body(path: str, body: bytes) -> bytes:
+    """Match SGLang's OpenAI chat reasoning-field normalization.
+
+    smg currently forwards ``reasoning`` / ``reasoning_effort`` without applying
+    the SGLang protocol validator. Normalize the body in TokenSpeed's control
+    proxy so chat templates receive the same ``chat_template_kwargs`` toggles.
+    """
+    if path != "/v1/chat/completions" or not body:
+        return body
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    normalized = _normalize_sglang_chat_request(payload)
+    if normalized is payload:
+        return body
+    return json.dumps(normalized, separators=(",", ":")).encode("utf-8")
+
+
+def _normalize_sglang_chat_request(payload):
+    if not isinstance(payload, dict):
+        return payload
+
+    values = dict(payload)
+    reasoning = values.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort") or reasoning.get("reasoning_effort")
+        if effort in _REASONING_EFFORT_VALUES:
+            values["reasoning_effort"] = effort
+
+        enabled = (
+            reasoning.get("enabled")
+            if reasoning.get("enabled") is not None
+            else reasoning.get("enable", False)
+        )
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() in _TRUTHY_STRINGS
+        if enabled:
+            kwargs = _copy_chat_template_kwargs(values)
+            kwargs.setdefault("thinking", True)
+            kwargs.setdefault("enable_thinking", True)
+            values["chat_template_kwargs"] = kwargs
+
+    if values.get("reasoning_effort") == "none":
+        kwargs = _copy_chat_template_kwargs(values)
+        kwargs.setdefault("thinking", False)
+        kwargs.setdefault("enable_thinking", False)
+        values["chat_template_kwargs"] = kwargs
+
+    return values
+
+
+def _copy_chat_template_kwargs(values: dict) -> dict:
+    kwargs = values.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        return {}
+    return dict(kwargs)
 
 
 @app.api_route("/generate", methods=["GET", "POST"])

@@ -168,6 +168,9 @@ def mha_extend_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    bmm1_scale: float | None = None,
+    bmm2_scale: float | None = None,
+    out_dtype: torch.dtype | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -190,6 +193,12 @@ def mha_extend_with_kvcache(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
             shape [total_q, num_q_heads].
+        bmm1_scale: Optional query-key matmul scale for kernels that expose
+            explicit scaling.
+        bmm2_scale: Optional attention-value matmul scale for kernels that
+            expose explicit scaling.
+        out_dtype: Optional output dtype for kernels that can return a dtype
+            different from the query storage dtype.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -244,7 +253,7 @@ def mha_extend_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        kernel_kwargs = dict(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
             k_cache=k_cache,
@@ -259,6 +268,13 @@ def mha_extend_with_kvcache(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
         )
+        if bmm1_scale is not None:
+            kernel_kwargs["bmm1_scale"] = bmm1_scale
+        if bmm2_scale is not None:
+            kernel_kwargs["bmm2_scale"] = bmm2_scale
+        if out_dtype is not None:
+            kernel_kwargs["out_dtype"] = out_dtype
+        return kernel(**kernel_kwargs)
 
 
 def mha_decode_with_kvcache(
@@ -275,6 +291,9 @@ def mha_decode_with_kvcache(
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
     scheduler_metadata: torch.Tensor | None = None,
+    bmm1_scale: float | None = None,
+    bmm2_scale: float | None = None,
+    out_dtype: torch.dtype | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -292,6 +311,12 @@ def mha_decode_with_kvcache(
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
+        bmm1_scale: Optional query-key matmul scale for kernels that expose
+            explicit scaling.
+        bmm2_scale: Optional attention-value matmul scale for kernels that
+            expose explicit scaling.
+        out_dtype: Optional output dtype for kernels that can return a dtype
+            different from the query storage dtype.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
@@ -365,6 +390,12 @@ def mha_decode_with_kvcache(
         # backends would reject the unknown kwarg.
         if scheduler_metadata is not None:
             kernel_kwargs["scheduler_metadata"] = scheduler_metadata
+        if bmm1_scale is not None:
+            kernel_kwargs["bmm1_scale"] = bmm1_scale
+        if bmm2_scale is not None:
+            kernel_kwargs["bmm2_scale"] = bmm2_scale
+        if out_dtype is not None:
+            kernel_kwargs["out_dtype"] = out_dtype
         return kernel(**kernel_kwargs)
 
 

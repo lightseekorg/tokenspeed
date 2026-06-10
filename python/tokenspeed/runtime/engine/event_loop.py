@@ -169,9 +169,16 @@ class EventLoop:
 
         num_total_pages = self.max_total_num_tokens // server_args.block_size
         hf_config = getattr(self.model_config, "hf_config", None)
-        text_config = getattr(hf_config, "text_config", None) if hf_config else None
-        has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
-            text_config is not None and hasattr(text_config, "mamba2_cache_params")
+        text_config = (
+            getattr(hf_config, "text_config", hf_config) if hf_config else None
+        )
+        mamba_cache_params = (
+            getattr(text_config, "mamba2_cache_params", None) if text_config else None
+        )
+        has_mamba_layers = bool(mamba_cache_params and len(mamba_cache_params[4]) > 0)
+        has_mamba = (
+            getattr(self.model_config, "mambaish_config", None) is not None
+            or has_mamba_layers
         )
 
         model_executor_config = ModelExecutorConfig.from_server_args(
@@ -182,6 +189,7 @@ class EventLoop:
             global_rank=global_rank,
             num_total_pages=num_total_pages,
         )
+        model_executor_config.enable_mamba = mamba_pool is not None
         self.model_executor = create_model_executor(
             server_args=server_args,
             config=model_executor_config,
@@ -322,7 +330,7 @@ class EventLoop:
             ),
             disable_prefix_cache=not server_args.enable_prefix_caching,
             enable_mamba=has_mamba,
-            mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
+            mamba_cache_chunk_size=self.model_config.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             enable_mamba_l2=server_args.enable_mamba_l2,
             mamba_l2_host_slots=mamba_l2_host_slots,

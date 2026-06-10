@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 # between them so a prematurely-closed upstream session would truncate.
 _STREAM_TOKENS = ["1", "2", "3", "4", "5"]
 _STREAM_DELAY = 0.1
+_CHAT_BODIES = []
 
 
 def _build_mock_smg() -> FastAPI:
@@ -62,6 +63,14 @@ def _build_mock_smg() -> FastAPI:
             }
         )
 
+    @mock.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        body = await request.json()
+        _CHAT_BODIES.append(body)
+        return JSONResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "n'djamena"}}]}
+        )
+
     @mock.post("/flush_cache")
     async def flush_cache():
         return JSONResponse({"status": "flushed"})
@@ -82,6 +91,67 @@ def _wait(port, path, timeout=15):
         except Exception:
             time.sleep(0.2)
     return False
+
+
+class TestSglangChatNormalization(unittest.TestCase):
+    """SGLang-compatible chat-template reasoning request normalization."""
+
+    def test_reasoning_effort_none_disables_thinking(self):
+        from tokenspeed.runtime.entrypoints.http_server import (
+            _normalize_sglang_chat_request,
+        )
+
+        normalized = _normalize_sglang_chat_request(
+            {"model": "m", "reasoning_effort": "none"}
+        )
+
+        self.assertEqual(
+            normalized["chat_template_kwargs"],
+            {"thinking": False, "enable_thinking": False},
+        )
+
+    def test_reasoning_enable_turns_on_template_toggles(self):
+        from tokenspeed.runtime.entrypoints.http_server import (
+            _normalize_sglang_chat_request,
+        )
+
+        normalized = _normalize_sglang_chat_request(
+            {"model": "m", "reasoning": {"enabled": "true"}}
+        )
+
+        self.assertEqual(
+            normalized["chat_template_kwargs"],
+            {"thinking": True, "enable_thinking": True},
+        )
+
+    def test_reasoning_effort_none_preserves_explicit_template_kwargs(self):
+        from tokenspeed.runtime.entrypoints.http_server import (
+            _normalize_sglang_chat_request,
+        )
+
+        normalized = _normalize_sglang_chat_request(
+            {
+                "model": "m",
+                "reasoning_effort": "none",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        )
+
+        self.assertEqual(
+            normalized["chat_template_kwargs"],
+            {"enable_thinking": True, "thinking": False},
+        )
+
+    def test_body_normalization_only_touches_chat_completions(self):
+        from tokenspeed.runtime.entrypoints.http_server import (
+            _normalize_chat_completion_body,
+        )
+
+        body = b'{"reasoning_effort":"none"}'
+
+        self.assertEqual(_normalize_chat_completion_body("/v1/completions", body), body)
+        normalized = _normalize_chat_completion_body("/v1/chat/completions", body)
+        self.assertIn(b'"enable_thinking":false', normalized)
 
 
 class TestProxyPassthrough(unittest.TestCase):
@@ -125,6 +195,9 @@ class TestProxyPassthrough(unittest.TestCase):
 
     def _url(self, path):
         return f"http://127.0.0.1:{self.SIDECAR_PORT}{path}"
+
+    def setUp(self):
+        _CHAT_BODIES.clear()
 
     # -- bug 1: streaming session lifetime ----------------------------------
 
@@ -196,6 +269,55 @@ class TestProxyPassthrough(unittest.TestCase):
         data = r.json()
         self.assertIsInstance(data, dict)
         self.assertEqual(data["choices"][0]["text"], "paris")
+
+    def test_chat_reasoning_effort_none_disables_thinking_like_sglang(self):
+        r = requests.post(
+            self._url("/v1/chat/completions"),
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "none",
+            },
+            timeout=10,
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(_CHAT_BODIES), 1)
+        kwargs = _CHAT_BODIES[0]["chat_template_kwargs"]
+        self.assertIs(kwargs["thinking"], False)
+        self.assertIs(kwargs["enable_thinking"], False)
+
+    def test_chat_reasoning_enable_turns_on_template_toggles_like_sglang(self):
+        r = requests.post(
+            self._url("/v1/chat/completions"),
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning": {"enabled": True},
+            },
+            timeout=10,
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(_CHAT_BODIES), 1)
+        kwargs = _CHAT_BODIES[0]["chat_template_kwargs"]
+        self.assertIs(kwargs["thinking"], True)
+        self.assertIs(kwargs["enable_thinking"], True)
+
+    def test_chat_reasoning_effort_none_preserves_explicit_template_kwargs(self):
+        r = requests.post(
+            self._url("/v1/chat/completions"),
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "none",
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+            timeout=10,
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(_CHAT_BODIES), 1)
+        kwargs = _CHAT_BODIES[0]["chat_template_kwargs"]
+        self.assertIs(kwargs["thinking"], False)
+        self.assertIs(kwargs["enable_thinking"], True)
 
     # -- health proxy (plain-text passthrough) ------------------------------
 

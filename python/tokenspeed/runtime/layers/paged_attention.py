@@ -55,6 +55,8 @@ class PagedAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.k_scale = None
         self.v_scale = None
+        self.k_scale_float = None
+        self.v_scale_float = None
 
     def forward(
         self,

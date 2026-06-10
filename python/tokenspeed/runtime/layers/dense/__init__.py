@@ -17,13 +17,14 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod, ModelOptFp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.dense.w8a8_fp8 import W8A8Fp8LinearMethod
 
 __all__ = [
     "Fp8LinearMethod",
+    "ModelOptFp8LinearMethod",
     "Nvfp4LinearMethod",
     "UnquantizedLinearMethod",
     "W8A8Fp8LinearMethod",

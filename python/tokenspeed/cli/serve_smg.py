@@ -29,8 +29,12 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
+import threading
 from pathlib import Path
+
+import psutil
 
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
@@ -42,8 +46,6 @@ from tokenspeed.cli._proc import (
     wait_grpc_serving,
     wait_http_ready,
 )
-from tokenspeed.runtime.utils.network import get_free_port
-from tokenspeed.runtime.utils.process import kill_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,9 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+NEMOTRON_3_REASONING_PARSER = "nemotron_3"
+NEMOTRON_3_GATEWAY_REASONING_PARSER = "qwen3"
+NEMOTRON_3_TOOL_CALL_PARSER = "qwen_coder"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
@@ -61,6 +66,52 @@ _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
 )
+
+
+def get_free_port():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def kill_process_tree(
+    parent_pid: int | None, include_parent: bool = True, skip_pid: int | None = None
+) -> None:
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
+
+    try:
+        itself = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return
+
+    for child in itself.children(recursive=True):
+        if child.pid == skip_pid:
+            continue
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+    if include_parent:
+        try:
+            if parent_pid == os.getpid():
+                itself.kill()
+                sys.exit(0)
+
+            itself.kill()
+            itself.send_signal(signal.SIGQUIT)
+        except psutil.NoSuchProcess:
+            pass
 
 
 def _check_serve_extra_installed() -> None:
@@ -216,6 +267,37 @@ def _is_deepseek_v4_model(model_id: str | None) -> bool:
     )
 
 
+def _is_nemotron_h_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
+    normalized = model_id.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if (
+        "nemotron-3" in normalized
+        or "nemotron-h" in normalized
+        or "nemotron3" in compact
+        or "nemotronh" in compact
+    ):
+        return True
+
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return (
+        config.get("model_type") == "nemotron_h"
+        or "NemotronHForCausalLM" in architectures
+    )
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -226,7 +308,20 @@ def _args_with_default_model_parsers(
     name to defer json_schema grammars past the reasoning channel.
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
-    if not _is_deepseek_v4_model(model_id):
+    if _is_deepseek_v4_model(model_id):
+        engine_reasoning_parser = DEEPSEEK_V4_REASONING_PARSER
+        gateway_reasoning_parser = DEEPSEEK_V4_REASONING_PARSER
+        tool_call_parser = DEEPSEEK_V4_TOOL_CALL_PARSER
+    elif _is_nemotron_h_model(model_id):
+        # SGLang detects the Nemotron-3/Super template as ``nemotron_3``:
+        # Qwen-style ``<think>...</think>`` reasoning with Qwen3-Coder XML
+        # tool calls. The current smg gateway exposes that reasoning behavior
+        # under its ``qwen3`` parser name, while the engine keeps the SGLang
+        # ``nemotron_3`` name for grammar deferral and internal semantics.
+        engine_reasoning_parser = NEMOTRON_3_REASONING_PARSER
+        gateway_reasoning_parser = NEMOTRON_3_GATEWAY_REASONING_PARSER
+        tool_call_parser = NEMOTRON_3_TOOL_CALL_PARSER
+    else:
         return engine_args, gateway_args
 
     engine_result = list(engine_args)
@@ -235,10 +330,10 @@ def _args_with_default_model_parsers(
         "--reasoning-parser" not in engine_result
         and "--reasoning-parser" not in gateway_result
     ):
-        engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-        gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+        engine_result.extend(["--reasoning-parser", engine_reasoning_parser])
+        gateway_result.extend(["--reasoning-parser", gateway_reasoning_parser])
     if "--tool-call-parser" not in gateway_result:
-        gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
+        gateway_result.extend(["--tool-call-parser", tool_call_parser])
     return engine_result, gateway_result
 
 

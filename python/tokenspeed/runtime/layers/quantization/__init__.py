@@ -37,6 +37,9 @@ BASE_QUANTIZATION_METHODS: dict[str, type[QuantizationConfig]] = {
     "w8a8_fp8": W8A8Fp8Config,
     "compressed-tensors": CompressedTensorsConfig,
     "nvfp4": Nvfp4Config,
+    "modelopt": Nvfp4Config,
+    "modelopt_fp4": Nvfp4Config,
+    "modelopt_mixed": Nvfp4Config,
     "mxfp4": Mxfp4Config,
 }
 

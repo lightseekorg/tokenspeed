@@ -40,6 +40,9 @@ from tokenspeed.cli.serve_smg import (
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
     DEFAULT_REASONING_PARSER,
+    NEMOTRON_3_GATEWAY_REASONING_PARSER,
+    NEMOTRON_3_REASONING_PARSER,
+    NEMOTRON_3_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_port,
@@ -48,6 +51,7 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
     _is_deepseek_v4_model,
+    _is_nemotron_h_model,
     _prewarm_hf_tokenizer,
     _user_host_port_from_gateway_args,
     _user_model_id,
@@ -289,10 +293,80 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert DEFAULT_REASONING_PARSER not in gateway_args
 
 
+def test_nemotron_h_model_id_gets_sglang_parser_defaults():
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        NEMOTRON_3_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        NEMOTRON_3_GATEWAY_REASONING_PARSER,
+        "--tool-call-parser",
+        NEMOTRON_3_TOOL_CALL_PARSER,
+    ]
+
+
+def test_nemotron_h_parser_defaults_preserve_explicit_user_values():
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model, "--reasoning-parser", "none"],
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "none",
+            "--tool-call-parser",
+            "json",
+        ],
+    )
+
+    assert engine_args == ["--model", model, "--reasoning-parser", "none"]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "none",
+        "--tool-call-parser",
+        "json",
+    ]
+
+
+def test_nemotron_h_default_reasoning_parser_survives_gateway_defaults():
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+    _, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+    gateway_args = _gateway_args_with_defaults(gateway_args)
+
+    idx = gateway_args.index("--reasoning-parser")
+    assert gateway_args[idx + 1] == NEMOTRON_3_GATEWAY_REASONING_PARSER
+    assert DEFAULT_REASONING_PARSER not in gateway_args
+
+
 def test_local_deepseek_v4_config_is_detected(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
 
     assert _is_deepseek_v4_model(str(tmp_path))
+
+
+def test_local_nemotron_h_config_is_detected(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "nemotron_h"}))
+
+    assert _is_nemotron_h_model(str(tmp_path))
 
 
 def test_prewarm_skips_local_path(tmp_path):
@@ -664,4 +738,45 @@ def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
         DEEPSEEK_V4_REASONING_PARSER,
         "--tool-call-parser",
         DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ]
+
+
+def test_run_smg_from_args_applies_nemotron_h_parser_defaults(monkeypatch):
+    captured = {}
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+    async def fake_run_smg(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.print_logo", lambda: None)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._check_serve_extra_installed", lambda: None
+    )
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", lambda _: None
+    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
+
+    from argparse import Namespace
+
+    from tokenspeed.cli.serve_smg import run_smg_from_args
+
+    with pytest.raises(SystemExit) as exc:
+        run_smg_from_args(Namespace(), [model])
+
+    assert exc.value.code == 0
+    assert captured["engine_args"] == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        NEMOTRON_3_REASONING_PARSER,
+    ]
+    assert captured["gateway_args"][:6] == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        NEMOTRON_3_GATEWAY_REASONING_PARSER,
+        "--tool-call-parser",
+        NEMOTRON_3_TOOL_CALL_PARSER,
     ]

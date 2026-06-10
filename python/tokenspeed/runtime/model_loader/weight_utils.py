@@ -151,7 +151,12 @@ def get_quant_config(
     with open(quant_config_file) as f:
         config = json.load(f)
 
-        if model_config.quantization == "nvfp4":
+        if model_config.quantization in {
+            "nvfp4",
+            "modelopt",
+            "modelopt_fp4",
+            "modelopt_mixed",
+        }:
             if config["producer"]["name"] == "modelopt":
                 return quant_cls.from_config(config)
             else:

@@ -771,6 +771,9 @@ class ServerArgs:
             choices=[
                 "fp8",
                 "nvfp4",
+                "modelopt",
+                "modelopt_fp4",
+                "modelopt_mixed",
                 "w8a8_fp8",
                 "compressed-tensors",
             ],

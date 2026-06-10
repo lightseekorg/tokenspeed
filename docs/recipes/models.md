@@ -80,6 +80,70 @@ tokenspeed serve openai/gpt-oss-120b \
   --port 8000
 ```
 
+## Nemotron-H NVFP4
+
+Nemotron-H is a hybrid Mamba2, attention, MLP, and non-gated MoE model. Use the
+hybrid attention backend, the in-tree Triton Mamba2 kernels from
+`tokenspeed-kernel`, and FlashInfer TRT-LLM NVFP4 MoE for the `relu2` experts.
+
+```bash
+tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --served-model-name nemotron-3-super-120b-a12b \
+  --quantization modelopt_mixed \
+  --tensor-parallel-size 1 \
+  --attention-backend flashinfer \
+  --moe-backend flashinfer_trtllm \
+  --mamba-ssm-dtype float32 \
+  --max-model-len 2048 \
+  --max-num-seqs 1 \
+  --chunked-prefill-size 512 \
+  --block-size 1 \
+  --skip-server-warmup \
+  --enforce-eager \
+  --disable-overlap-schedule \
+  --host 127.0.0.1 \
+  --port 7999
+```
+
+The smg gateway binds to `--port`; TokenSpeed's OpenAI-compatible control
+server binds to the next port. With the command above, use
+`http://127.0.0.1:8000/v1/chat/completions`:
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "nemotron-3-super-120b-a12b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "what is the capital of Chad? Answer with only the city name."
+      }
+    ],
+    "max_tokens": 16,
+    "temperature": 0,
+    "reasoning_effort": "none"
+  }'
+```
+
+The `modelopt_mixed` path keeps the checkpoint's ModelOpt mixed-precision
+layout: FP8 dense projections are loaded through the FP8 path, NVFP4 experts
+through the FlashInfer TRT-LLM MoE path, and CUTLASS-capable CUDA targets use
+SGLang-compatible channelwise FP8 scale layout while preserving the checkpoint
+FP8 shard scales.
+
+The Mamba2 kernel code was vendored from `sgl-project/sglang` commit
+`03c77dc33d0a051aa15c1235407440d9d107b98f`, which carries vLLM and
+state-spaces/mamba lineage in the copied files.
+
+`ts serve` detects Nemotron-H / Nemotron-3 checkpoints and applies the SGLang
+reasoning behavior automatically: the engine uses the `nemotron_3` reasoning
+parser for grammar deferral, while the smg gateway receives its equivalent
+`qwen3` reasoning parser and `qwen_coder` tool parser. Chat-completion requests
+with `reasoning_effort: "none"` are normalized to the model template's
+`enable_thinking: false` switch before they reach the gateway, matching SGLang's
+OpenAI request handling.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

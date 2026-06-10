@@ -155,6 +155,17 @@ if platform.is_nvidia and platform.is_blackwell:
 
 if mm_fp4 is not error_fn:
 
+    def _select_flashinfer_fp4_gemm_backend() -> str:
+        # Match SGLang's ModelOpt FP4 auto selection. SM120 uses cuDNN for
+        # stability; SM100 uses CuteDSL; other FlashInfer FP4 paths use CUTLASS.
+        if platform.arch_version.major == 12:
+            return "cudnn"
+        if platform.arch_version.major == 10:
+            return "cute-dsl"
+        return "cutlass"
+
+    _FLASHINFER_FP4_GEMM_BACKEND = _select_flashinfer_fp4_gemm_backend()
+
     @register_kernel(
         "gemm",
         "mm",
@@ -177,9 +188,8 @@ if mm_fp4 is not error_fn:
         *,
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> torch.Tensor:
-        # backend="cutlass" (not "auto") to skip flashinfer's cuDNN-graph plan compile.
         return mm_fp4(
             A,
             B,
@@ -187,6 +197,6 @@ if mm_fp4 is not error_fn:
             B_scales,
             alpha,
             out_dtype,
-            backend="cutlass",
+            backend=_FLASHINFER_FP4_GEMM_BACKEND,
             enable_pdl=enable_pdl,
         )

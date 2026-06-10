@@ -109,6 +109,7 @@ class ModelExecutorConfig:
     # Force the synchronous eager grammar fallback even on CUDA. For
     # parity-testing the captured-grammar path.
     disable_capturable_grammar: bool = False
+    enable_mamba: bool = False
     mamba_cache_chunk_size: int = 64
 
     @staticmethod
@@ -157,7 +158,7 @@ class ModelExecutorConfig:
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
-            mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
+            mamba_cache_chunk_size=model_config.mamba_cache_chunk_size,
         )
 
 

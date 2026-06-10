@@ -61,6 +61,61 @@ from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
 platform = Platform.get()
 
 
+def _torch_cuda_version_at_least(major: int, minor: int) -> bool:
+    version = torch.version.cuda
+    if version is None:
+        return False
+    parts = version.split(".")
+    try:
+        detected = (int(parts[0]), int(parts[1]))
+    except (IndexError, ValueError):
+        return False
+    return detected >= (major, minor)
+
+
+def _use_cutlass_fp8_channelwise_scales() -> bool:
+    """Match SGLang's ModelOpt FP8 scale layout on CUTLASS-capable CUDA GPUs."""
+    if not platform.is_nvidia:
+        return False
+    arch = platform.arch_version
+    if arch.major >= 9:
+        return _torch_cuda_version_at_least(12, 0)
+    if arch.major == 8 and arch.minor == 9:
+        return _torch_cuda_version_at_least(12, 4)
+    return False
+
+
+def _requantize_fp8_weight_with_max_scale(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    logical_widths: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Requantize fused FP8 checkpoint weights to a shared max scale.
+
+    ModelOpt fused checkpoints can store one FP8 scale per logical shard
+    within a packed module. SGLang only normalizes those shards to a single
+    max weight scale on the non-CUTLASS fallback path; CUTLASS-capable GPUs use
+    the original per-shard scales expanded to channelwise layout.
+    """
+    max_weight_scale = weight_scale.max()
+    loaded_all_logical_scales = weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+    if not bool(loaded_all_logical_scales.item()):
+        return weight, max_weight_scale
+
+    start = 0
+    for idx, logical_width in enumerate(logical_widths):
+        end = start + logical_width
+        weight_dequant = weight[start:end, :].to(torch.float32) * weight_scale[idx]
+        weight[start:end, :] = torch.clamp(
+            weight_dequant / max_weight_scale,
+            min=platform.fp8e4m3fn.min,
+            max=platform.fp8e4m3fn.max,
+        ).to(weight.dtype)
+        start = end
+
+    return weight, max_weight_scale
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -276,9 +331,19 @@ class Fp8LinearMethod(LinearMethodBase):
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module
             else:
-                layer.weight_scale = Parameter(
-                    layer.weight_scale.data, requires_grad=False
-                )
+                if _use_cutlass_fp8_channelwise_scales():
+                    weight = layer.weight.data
+                    weight_scale = convert_to_channelwise(
+                        layer.weight_scale.data, layer.logical_widths
+                    )
+                else:
+                    weight, weight_scale = _requantize_fp8_weight_with_max_scale(
+                        layer.weight.data,
+                        layer.weight_scale.data,
+                        layer.logical_widths,
+                    )
+                    weight_scale = weight_scale.reshape(())
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 if (
                     hasattr(self.quant_config, "activation_scheme")
                     and self.quant_config.activation_scheme == "static"
@@ -290,14 +355,8 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.data, requires_grad=False
                     )
 
-                weight = layer.weight
-                weight_scale = convert_to_channelwise(
-                    layer.weight_scale, layer.logical_widths
-                )
-
                 # Update layer with new values.
                 layer.weight = Parameter(weight.t(), requires_grad=False)
-                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 if (
                     hasattr(self.quant_config, "activation_scheme")
                     and self.quant_config.activation_scheme == "static"
@@ -322,6 +381,8 @@ class Fp8LinearMethod(LinearMethodBase):
             input_2d = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
+            if input_2d.shape[0] == 0:
+                return x.new_empty(output_shape, dtype=output_dtype)
 
             override = (
                 "deep_gemm_mm_fp8_blockscale"
@@ -349,10 +410,16 @@ class Fp8LinearMethod(LinearMethodBase):
             # View input as 2D matrix for fp8 methods
             input_2d = input.view(-1, input.shape[-1])
             output_shape = [*input.shape[:-1], weight.shape[1]]
+            if input_2d.shape[0] == 0:
+                return input.new_empty(output_shape)
 
             if input_scale is not None:
                 assert input_scale.numel() == 1
-                qinput, x_scale = static_quant_fp8(input_2d, input_scale)
+                qinput, x_scale = static_quant_fp8(
+                    input_2d,
+                    input_scale,
+                    repeat_scale=_use_cutlass_fp8_channelwise_scales(),
+                )
             else:
                 qinput, x_scale = per_token_quant_fp8(input_2d)
 
@@ -364,7 +431,42 @@ class Fp8LinearMethod(LinearMethodBase):
                 A_scales=x_scale,
                 B_scales=weight_scale,
                 out_dtype=input.dtype,
+                quant="fp8",
             )
             if bias is not None:
                 output = output + bias
             return output.view(*output_shape)
+
+
+class ModelOptFp8LinearMethod(Fp8LinearMethod):
+    """Linear method for ModelOpt static FP8 checkpoints.
+
+    ModelOpt fused modules can carry one FP8 weight scale per logical shard.
+    SGLang requantizes those shards to a single max scale after loading, then
+    broadcasts that max scale to channelwise layout on CUTLASS-capable GPUs.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.block_quant:
+            super().process_weights_after_loading(layer)
+            return
+
+        layer.weight = Parameter(layer.weight.data, requires_grad=False)
+
+        if not self.quant_config.is_checkpoint_fp8_serialized:
+            super().process_weights_after_loading(layer)
+            return
+
+        weight, weight_scale = _requantize_fp8_weight_with_max_scale(
+            layer.weight.data,
+            layer.weight_scale.data,
+            layer.logical_widths,
+        )
+        if _use_cutlass_fp8_channelwise_scales():
+            weight_scale = convert_to_channelwise(weight_scale, layer.logical_widths)
+        else:
+            weight_scale = weight_scale.reshape(())
+
+        layer.weight = Parameter(weight.t(), requires_grad=False)
+        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)

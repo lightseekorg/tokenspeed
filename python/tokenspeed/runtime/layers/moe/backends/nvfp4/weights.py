@@ -79,13 +79,17 @@ def create_fp4_weights(
     hidden_size: int,
     ispp: int,
     group_size: int,
+    *,
+    is_gated: bool = True,
 ) -> None:
     from tokenspeed.runtime.utils import set_weight_attrs
 
     # FP4 packed weights: 2 FP4 values per uint8 byte
     # w13 = gate_up_proj: [num_experts, 2*intermediate, hidden//2]
+    # or up_proj for non-gated activations: [num_experts, intermediate, hidden//2]
+    w13_rows = 2 * ispp if is_gated else ispp
     w13_weight = torch.nn.Parameter(
-        torch.empty(num_local_experts, 2 * ispp, hidden_size // 2, dtype=torch.uint8),
+        torch.empty(num_local_experts, w13_rows, hidden_size // 2, dtype=torch.uint8),
         requires_grad=False,
     )
     # w2 = down_proj: [num_experts, hidden, intermediate//2]
@@ -100,7 +104,7 @@ def create_fp4_weights(
     w13_weight_scale = torch.nn.Parameter(
         torch.empty(
             num_local_experts,
-            2 * ispp,
+            w13_rows,
             hidden_size // group_size,
             dtype=torch.float8_e4m3fn,
         ),
@@ -119,8 +123,9 @@ def create_fp4_weights(
     layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
     # Per-tensor scales (float32)
+    w13_scale_shape = (num_local_experts, 2) if is_gated else (num_local_experts,)
     w13_weight_scale_2 = torch.nn.Parameter(
-        torch.empty(num_local_experts, 2, dtype=torch.float32), requires_grad=False
+        torch.empty(*w13_scale_shape, dtype=torch.float32), requires_grad=False
     )
     w2_weight_scale_2 = torch.nn.Parameter(
         torch.empty(num_local_experts, dtype=torch.float32), requires_grad=False
@@ -130,7 +135,7 @@ def create_fp4_weights(
 
     # Input scales (float32) - per-expert
     w13_input_scale = torch.nn.Parameter(
-        torch.empty(num_local_experts, 2, dtype=torch.float32), requires_grad=False
+        torch.empty(*w13_scale_shape, dtype=torch.float32), requires_grad=False
     )
     w2_input_scale = torch.nn.Parameter(
         torch.empty(num_local_experts, dtype=torch.float32), requires_grad=False

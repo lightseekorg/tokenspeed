@@ -502,6 +502,7 @@ class MHAAttnBackend(AttentionBackend):
             )
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        attention_kwargs = self._flashinfer_fp8_attention_kwargs(k_cache, layer)
         result = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=metadata.cu_extend_seq_lens,
@@ -516,6 +517,7 @@ class MHAAttnBackend(AttentionBackend):
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=self.max_context_len,
             solution=self.kernel_solution,
+            **attention_kwargs,
         )
         output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -543,6 +545,7 @@ class MHAAttnBackend(AttentionBackend):
             )
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        attention_kwargs = self._flashinfer_fp8_attention_kwargs(k_cache, layer)
         result = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -555,6 +558,7 @@ class MHAAttnBackend(AttentionBackend):
             max_seqlen_k=self.max_context_len,
             scheduler_metadata=metadata.scheduler_metadata,
             solution=self.kernel_solution,
+            **attention_kwargs,
         )
         output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -573,6 +577,25 @@ class MHAAttnBackend(AttentionBackend):
             layer.v_head_dim,
         )
         return k_cache, v_cache
+
+    def _flashinfer_fp8_attention_kwargs(
+        self,
+        k_cache: torch.Tensor,
+        layer: PagedAttention,
+    ) -> dict:
+        if self.kernel_solution != "flashinfer" or k_cache.dtype != torch.float8_e4m3fn:
+            return {}
+
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        return {
+            "bmm1_scale": k_scale * layer.scaling,
+            "bmm2_scale": 1.0,
+            "out_dtype": self.qkv_dtype,
+        }
 
     def _make_spec_metadata_buffers(
         self,

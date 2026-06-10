@@ -105,11 +105,15 @@ class WeightLoader:
                         f"model {model.__class__} does not support loading scaling factors."
                     )
             else:
-                logger.warning(
-                    "Using FP8 KV cache but no scaling factors provided. "
-                    "Defaulting to scaling factors of 1.0. "
-                    "This may lead to less accurate results!"
-                )
+                has_checkpoint_scales = getattr(model, "has_kv_cache_scales", None)
+                if callable(has_checkpoint_scales) and has_checkpoint_scales():
+                    logger.info("Using FP8 KV cache scaling factors from checkpoint.")
+                else:
+                    logger.warning(
+                        "Using FP8 KV cache but no scaling factors provided. "
+                        "Defaulting to scaling factors of 1.0. "
+                        "This may lead to less accurate results!"
+                    )
 
         dtype = model_config.dtype
 
