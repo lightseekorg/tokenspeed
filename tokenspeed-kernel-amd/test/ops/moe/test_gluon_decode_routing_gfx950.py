@@ -32,8 +32,7 @@ def _route(logits):
     )
 
 
-# Keep the reference in torch. Forcing the generic routing pipeline here has
-# crashed on gfx950 ROCm CI before this test reaches the Gluon output check.
+# Reference torch routing implementation.
 def _reference_route(logits):
     M, E = logits.shape
     device = logits.device

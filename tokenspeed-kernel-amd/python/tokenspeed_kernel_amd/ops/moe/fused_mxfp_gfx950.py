@@ -4595,9 +4595,8 @@ def _gluon_mxfp_fused_moe(
         top_k: routing top_k.
         swiglu_alpha / swiglu_limit: SwiGLU activation parameters.
 
-        quantize_fp8_fn, moe_experts_fn, moe_route_fn: Callbacks supplied by
-            the tokenspeed-kernel registration shim to keep this package free
-            of a runtime dependency on tokenspeed-kernel.
+        quantize_fp8_fn, moe_experts_fn, moe_route_fn: Callbacks to supply
+            quantize_fp8, moe_experts, and moe_route logic.
     """
     n_tokens = router_logits.shape[0]
 
@@ -5064,9 +5063,6 @@ def gluon_decode_routing_gfx950(
     dtype: torch.dtype | None = None,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
     """gfx950 small-M decode route implementation.
-
-    General-shape fallback is handled by the tokenspeed-kernel registration
-    shim. Direct calls into this implementation fail for unsupported shapes.
     """
     if dtype is None:
         dtype = logits.dtype
@@ -5080,5 +5076,5 @@ def gluon_decode_routing_gfx950(
 
     raise ValueError(
         "gluon_decode_routing_gfx950 only supports small-M gfx950 decode "
-        "routing shapes; fallback routing is handled by tokenspeed-kernel"
+        "routing shapes"
     )
