@@ -21,20 +21,113 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
-from tokenspeed_kernel_amd._triton import (
-    aggregate,
-    gl,
-    gluon,
-    redirect_triton_to_tokenspeed_triton,
-)
+from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, tl, triton
 
-with redirect_triton_to_tokenspeed_triton():
-    from triton_kernels.matmul import FnSpecs, FusedActivation
-    from triton_kernels.swiglu import swiglu_fn
-    from triton_kernels.tensor import RaggedTensorMetadata, Tensor
+
+@dataclass(frozen=True)
+class FnSpecs:
+    name: str
+    fn: object
+    fn_arg_names: tuple[str, ...]
+    fn_arg_do_not_specialize: tuple[str, ...] = tuple()
+    reduction_n: int = 1
+
+    @staticmethod
+    def default():
+        return FnSpecs("dflt", None, tuple())
+
+
+@dataclass(frozen=True)
+class FusedActivation:
+    specs: FnSpecs = FnSpecs.default()
+    fn_args: tuple[object, ...] = tuple()
+
+
+@dataclass
+class RaggedTensorMetadata:
+    slice_sizes: torch.Tensor
+    slice_offs: torch.Tensor
+    block_offs_data: torch.Tensor
+    block_schedule_data: torch.Tensor
+    expected_slice_size: int | None = None
+    slice_sizes_divisibility: int | None = None
+
+    def __post_init__(self):
+        assert self.block_offs_data.shape[0] == len(RaggedTensorMetadata.block_sizes())
+        assert self.block_schedule_data.shape[0] == len(
+            RaggedTensorMetadata.block_sizes()
+        )
+        assert self.block_offs_data.dtype == torch.int32
+        assert self.block_schedule_data.dtype == torch.int32
+        if self.slice_sizes is not None:
+            assert self.slice_sizes.dtype == torch.int32
+        if self.slice_offs is not None:
+            assert self.slice_offs.dtype == torch.int32
+
+    @property
+    def n_slices(self):
+        return self.slice_sizes.shape[0]
+
+    def block_offs(self, block_size):
+        return self.block_offs_data[
+            RaggedTensorMetadata.block_sizes().index(block_size)
+        ]
+
+    def block_schedule(self, block_size):
+        return self.block_schedule_data[
+            RaggedTensorMetadata.block_sizes().index(block_size)
+        ]
+
+    @staticmethod
+    def n_blocks(n_slices, n_total_rows, block_size):
+        if n_total_rows <= n_slices:
+            return n_total_rows
+        return n_slices - 1 - ((n_slices - n_total_rows - 1) // block_size)
+
+    @staticmethod
+    def max_n_blocks(n_slices, n_total_rows):
+        return RaggedTensorMetadata.n_blocks(
+            n_slices, n_total_rows, min(RaggedTensorMetadata.block_sizes())
+        )
+
+    @staticmethod
+    def block_sizes_log2():
+        return range(4, 9) if torch.version.hip is not None else range(4, 8)
+
+    @staticmethod
+    def block_sizes():
+        return [2**x for x in RaggedTensorMetadata.block_sizes_log2()]
+
+
+@triton.jit
+def _swiglu_clip(x, limit, clip_lower: tl.constexpr):
+    res = tl.minimum(x, limit)
+    if clip_lower:
+        res = tl.maximum(-limit, res)
+    return res
+
+
+@triton.jit
+def _compute_swiglu(gelu, linear, scale, alpha, limit):
+    gelu = gelu.to(tl.float32) * scale
+    if limit is not None:
+        gelu = _swiglu_clip(gelu, limit, clip_lower=False)
+    linear = linear.to(tl.float32) * scale
+    if limit is not None:
+        linear = _swiglu_clip(linear, limit, clip_lower=True)
+    s = gelu / (1 + tl.exp(-alpha * gelu))
+    return tl.fma(s, linear, s)
+
+
+@triton.jit(repr=lambda _: "_swiglu")
+def swiglu_fn(input, alpha, limit):
+    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    return _compute_swiglu(gelu, linear, 1.0, alpha, limit)
+
 
 __all__ = [
     "_gluon_mxfp_fused_moe",
@@ -56,6 +149,12 @@ def _as_int32(t):
     if t is None or t.dtype == torch.int32:
         return t
     return t.to(torch.int32)
+
+
+def _wrapped_tensor_data(obj):
+    storage = getattr(obj, "storage", None)
+    data = getattr(storage, "data", None)
+    return data if isinstance(data, torch.Tensor) else None
 
 
 _BLOCK_SIZES_TUPLE = tuple(RaggedTensorMetadata.block_sizes())
@@ -4265,9 +4364,9 @@ def _extract_gluon_raw_w(w):
         if shuffled is not None:
             return shuffled
         return w
-    if not isinstance(w, Tensor):
+    raw = _wrapped_tensor_data(w)
+    if raw is None:
         return w
-    raw = w.storage.data
     shuffled = getattr(raw, "_gluon_shuffled", None)
     if shuffled is not None:
         return shuffled
@@ -4279,9 +4378,8 @@ def _extract_gluon_raw_s(s):
     (bit-equivalent to upstream CDNA4MXScaleLayout.swizzle_data)."""
     if isinstance(s, torch.Tensor):
         return s
-    if not isinstance(s, Tensor):
-        return s
-    return s.storage.data
+    raw = _wrapped_tensor_data(s)
+    return s if raw is None else raw
 
 
 def _maybe_extract_swiglu_args(fused_activation):
