@@ -6,7 +6,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi350-bench
+    - amd-mi350-1gpu-bench
 env:
   CI: "true"
 install:
