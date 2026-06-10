@@ -22,6 +22,7 @@ from __future__ import annotations
 
 """Top-level memory executor that coordinates host and storage executors."""
 
+import logging
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -286,6 +287,24 @@ class MemoryExecutor:
             groups[kind] = (src_pages, dst_pages)
         return groups
 
+    @staticmethod
+    def _paged_transfer_summary(transfers: list) -> tuple[int, int, list[str]]:
+        group_pages: dict[str, int] = {}
+        for transfer in transfers:
+            group_id = str(getattr(transfer, "group_id", "unknown"))
+            src_pages = getattr(transfer, "src_pages", [])
+            dst_pages = getattr(transfer, "dst_pages", [])
+            page_pairs = {
+                (int(src_page), int(dst_page))
+                for src_page, dst_page in zip(src_pages, dst_pages)
+            }
+            group_pages[group_id] = group_pages.get(group_id, 0) + len(page_pairs)
+        return (
+            len(group_pages),
+            sum(group_pages.values()),
+            [f"{group_id}:{pages}" for group_id, pages in sorted(group_pages.items())],
+        )
+
     def set_mamba_layerwise_cow(
         self, cow_dst_pages_by_src: dict[int, list[int]] | None
     ) -> None:
@@ -348,6 +367,20 @@ class MemoryExecutor:
                     paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
                 )
                 if paged_transfers:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        group_count, page_count, group_pages = (
+                            self._paged_transfer_summary(paged_transfers)
+                        )
+                        logger.debug(
+                            "[cache_op][paged_l2] writeback schedule "
+                            "op_id=%s groups=%s pages=%s group_pages=%s "
+                            "is_retract=%s",
+                            op_id,
+                            group_count,
+                            page_count,
+                            group_pages,
+                            is_retract,
+                        )
                     self.host_exec.enqueue_paged_cache_writeback(
                         op_id,
                         paged_transfers,
@@ -402,6 +435,18 @@ class MemoryExecutor:
                     paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
                 )
                 if paged_transfers:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        group_count, page_count, group_pages = (
+                            self._paged_transfer_summary(paged_transfers)
+                        )
+                        logger.debug(
+                            "[cache_op][paged_l2] loadback schedule "
+                            "op_id=%s groups=%s pages=%s group_pages=%s",
+                            op_id,
+                            group_count,
+                            page_count,
+                            group_pages,
+                        )
                     self.host_exec.enqueue_paged_cache_loadback(
                         op_id,
                         paged_transfers,
