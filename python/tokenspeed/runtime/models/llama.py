@@ -222,41 +222,56 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         """RoPE + attention (pre-o_proj), with optional fused KV pre-write.
 
-        When the backend supports KV pre-write, fused rope writes KV directly
-        into the cache so the attention call can run with ``save_kv_cache=False``
-        (saves one kernel launch). Subclasses (e.g. Eagle3 draft head) override
-        this hook to insert spec-decode behaviour around the same scaffolding.
+        When the backend supports KV pre-write *and* ``create_fused_set_kv_buffer_arg``
+        accepts the layer's scales, fused rope writes KV directly into the cache
+        so the attention call can run with ``save_kv_cache=False`` (saves one
+        kernel launch). Otherwise we fall back to plain RoPE + ``self.attn(q, k, v)``
+        so the backend writes KV the normal way — without this fallback, layers
+        with non-trivial k/v scales silently lose their KV writes. Subclasses
+        (e.g. Eagle3 draft head) override this hook to insert spec-decode
+        behaviour around the same scaffolding.
         """
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            q_rope = self._fused_rope_kv_write(positions, q, k, v, ctx, out_cache_loc)
-            return self.attn(
-                q_rope,
-                None,
-                None,
-                save_kv_cache=False,
-                ctx=ctx,
-                out_cache_loc=out_cache_loc,
-            )
+            fused_kv_arg = self._build_fused_kv_arg(v, ctx, out_cache_loc)
+            if fused_kv_arg is not None:
+                q_rope = self._fused_rope_kv_write(positions, q, k, fused_kv_arg)
+                return self.attn(
+                    q_rope,
+                    None,
+                    None,
+                    save_kv_cache=False,
+                    ctx=ctx,
+                    out_cache_loc=out_cache_loc,
+                )
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
+
+    def _build_fused_kv_arg(
+        self,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ):
+        """Try to build the fused RoPE+KV-write descriptor; returns ``None`` if
+        the helper rejects the layer (e.g. non-trivial k/v scales)."""
+        n = v.shape[0]
+        return create_fused_set_kv_buffer_arg(
+            value=v.view(n, self.num_kv_heads, self.head_dim),
+            layer=self.attn,
+            out_cache_loc=out_cache_loc,
+            token_to_kv_pool=ctx.token_to_kv_pool,
+        )
 
     def _fused_rope_kv_write(
         self,
         positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
-        v: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
+        fused_kv_arg,
     ) -> torch.Tensor:
-        """Fused RoPE that writes KV into cache and returns the rope'd Q."""
+        """Fused RoPE that writes KV into cache (via ``fused_kv_arg``) and
+        returns the rope'd Q."""
         n = q.shape[0]
-        fused_kv_arg = create_fused_set_kv_buffer_arg(
-            value=v.view(n, self.num_kv_heads, self.head_dim),
-            layer=self.attn,
-            out_cache_loc=out_cache_loc,
-            token_to_kv_pool=ctx.token_to_kv_pool,
-        )
         q_rope = torch.empty((n, self.q_size), dtype=q.dtype, device=q.device)
         self.rotary_emb(
             positions,
