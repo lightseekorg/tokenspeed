@@ -37,6 +37,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
+from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -218,10 +219,13 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        # Llama Eagle3 narrows for any non-idle catch-up (EXTEND/MIXED/
-        # TARGET_VERIFY/DECODE); Qwen/DeepSeek keep is_decode() only.
+        # Llama Eagle3 and Qwen3.5 NextN narrow for any non-idle catch-up
+        # (EXTEND/MIXED/TARGET_VERIFY/DECODE); DeepSeek keeps is_decode() only.
         draft_first_step_reduce = forward_mode.is_decode() or (
-            isinstance(self.draft_model_runner.model, LlamaForCausalLMEagle3)
+            isinstance(
+                self.draft_model_runner.model,
+                (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
+            )
             and not forward_mode.is_idle()
         )
 

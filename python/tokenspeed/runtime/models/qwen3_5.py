@@ -710,16 +710,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.q_norm.variance_epsilon,
         )
 
-    def self_attention(
+    def _project_qkv_rope(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        """Full attention forward pass."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """qkv_proj + split + rope (+ optional gate). ``gate`` is ``None`` when ``attn_output_gate=False``."""
         qkv, _ = self.qkv_proj(hidden_states)
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -737,22 +734,47 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 self.head_dim,
                 self.rotary_emb.rotary_dim,
             )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._apply_qk_norm(q, k)
-            q, k = self.rotary_emb(positions, q, k)
+            return q, k, v, gate
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, None
 
+    def _attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: torch.Tensor | None,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Backend attention call + optional gate apply. Subclasses override."""
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
-
-        if self.attn_output_gate:
+        if gate is not None:
             sigmoid_mul(attn_output, gate)
+        return attn_output
 
-        if ctx.draft_first_step_reduce:
-            # Slice attn_output to [bs, H] so o_proj runs on live rows only.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Full attention forward pass."""
+        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
+        attn_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _maybe_narrow_residual(
+        self,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Hook: subclasses narrow residual to match a sliced attn output."""
+        return residual
 
     def forward(
         self,
@@ -778,9 +800,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
             )
-            if ctx.draft_first_step_reduce:
-                # Gather residual to self_attention's [bs, H].
-                residual = residual.index_select(0, ctx.gather_ids)
+            residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -816,14 +836,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return hidden_states
 
 
-ALL_DECODER_LAYER_TYPES = {
-    "attention": Qwen3_5AttentionDecoderLayer,
-    "linear_attention": Qwen3_5LinearDecoderLayer,
-}
-
-
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
+
+    ATTENTION_LAYER_CLS: type = Qwen3_5AttentionDecoderLayer
+    LINEAR_LAYER_CLS: type = Qwen3_5LinearDecoderLayer
 
     def __init__(
         self,
@@ -849,10 +866,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             tp_group=self.mapping.attn.tp_group,
         )
 
-        # Decoder layers
+        layer_cls_by_type = {
+            "attention": self.ATTENTION_LAYER_CLS,
+            "linear_attention": self.LINEAR_LAYER_CLS,
+        }
+
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
+            layer_class = layer_cls_by_type[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:
