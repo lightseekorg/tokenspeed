@@ -23,11 +23,13 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
+    attn_merge_state,
     mha_decode_scheduler_metadata,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
-    mha_merge_state,
     mha_prefill,
+    mla_decode_with_kvcache,
+    mla_prefill,
 )
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import (
@@ -59,7 +61,9 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
-    "mha_merge_state",
+    "mla_prefill",
+    "mla_decode_with_kvcache",
+    "attn_merge_state",
     "mha_decode_scheduler_metadata",
     # quantization
     "quantize_fp8",

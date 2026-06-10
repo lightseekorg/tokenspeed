@@ -1,5 +1,5 @@
 tokenspeed-deepep==1.2.1.post20251110
-tokenspeed-deepgemm==2.5.0.post20260424
+tokenspeed-deepgemm==2.5.0.post20260604
 tilelang==0.1.11
 apache-tvm-ffi<=0.1.11
 tokenspeed-flashmla==1.0.0.post20260429

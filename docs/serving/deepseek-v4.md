@@ -28,7 +28,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
 |---|---|
 | `--data-parallel-size 4` + `--enable-expert-parallel` | V4 ships with EP=4 weight sharding. |
 | `--kv-cache-dtype fp8_e4m3` | V4 SWA cache rows are uint8-packed FP8 NoPE + BF16 RoPE + UE8M0 scale; FP8 e4m3 is the only supported KV dtype. |
-| `--moe-backend mega_moe` | Activates the DeepGEMM `fp8_fp4_mega_moe` fused experts. Requires `tokenspeed-deepgemm>=2.5.0.post20260424`. |
+| `--moe-backend mega_moe` | Activates the DeepGEMM `fp8_fp4_mega_moe` fused experts. Requires `tokenspeed-deepgemm>=2.5.0.post20260604`. |
 | `--attention-use-fp4-indexer-cache` | Stores indexer keys as MXFP4 (`[values \| ue8m0 scales]`); the FP8 fallback path is reference-only. |
 | `--enable-mixed-batch` | Lets the scheduler issue prefill and decode requests in the same iteration. Off by default globally; opt in per workload. |
 | `--trust-remote-code` | The HF config uses model-class architectures registered via remote code. |
@@ -123,7 +123,7 @@ default runs against `--no-enable-prefix-caching` ablations.
 ## Hardware / dependency requirements
 
 - 4× NVIDIA Blackwell SM100 (B200) GPUs.
-- `tokenspeed-deepgemm>=2.5.0.post20260424` (mega_moe + FP4 indexer symbols).
+- `tokenspeed-deepgemm>=2.5.0.post20260604` (mega_moe + FP4 indexer symbols).
 - `tilelang==0.1.11` (fast mHC fused kernels). Pulled in automatically via
   `tokenspeed-kernel`'s `pyproject.toml`.
 - `flash_mla` (provided by `tokenspeed-flashmla`) — required for sparse decode
