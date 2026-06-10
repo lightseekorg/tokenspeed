@@ -626,11 +626,8 @@ class MambaAttnBackend(AttentionBackend):
         mamba_track_indices: torch.Tensor,
         extend_seq_lens: torch.Tensor,
     ):
-        """Compute src/dst indices for extracting intermediate SSM states.
-
-        Indexes directly into the raw flashinfer checkpoint buffer (convention B:
-        ckpts[k] = state after processing chunk k = FLA h[k+1]).
-        """
+        """Compute src/dst indices for extracting intermediate SSM states."""
+        # flashinfer ckpts[k] = state after processing chunk k = FLA h[k+1]
         num_fi_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
         offset = torch.zeros_like(num_fi_ckpts)
         offset[1:] = torch.cumsum(num_fi_ckpts[:-1], dim=0)
@@ -639,7 +636,7 @@ class MambaAttnBackend(AttentionBackend):
         offset_m = offset[track_mask]
         dst_m = mamba_track_indices[track_mask]
 
-        # We want FLA h[lens//C] = flashinfer ckpts[lens//C - 1].
+        # FLA h[lens//C] = flashinfer ckpts[lens//C - 1].
         # track_mask guarantees lens_m >= FLA_CHUNK_SIZE so lens_m // C >= 1.
         track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE - 1)
         track_ssm_h_dst = dst_m
@@ -1120,7 +1117,7 @@ class MambaAttnBackend(AttentionBackend):
                     )
                 self._gdn_fastpath_checked = True
             if need_h_track:
-                core_attn_out, last_recurrent_state, fi_checkpoints, _ = (
+                core_attn_out, last_recurrent_state, fi_h_checkpoints, _ = (
                     gdn_flashinfer.gdn_chunk_prefill(
                         l2norm_fwd(query),
                         l2norm_fwd(key),
@@ -1148,7 +1145,7 @@ class MambaAttnBackend(AttentionBackend):
             ssm_states[cache_indices] = last_recurrent_state
 
             if need_h_track:
-                ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_checkpoints[
+                ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
                     self.forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
 

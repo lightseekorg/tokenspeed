@@ -142,19 +142,25 @@ def gdn_chunk_prefill(
     per_seq_lens = None
     if output_h:
         per_seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
-        per_seq_ckpts_fi = per_seq_lens // CHUNK_SIZE
-        total_ckpts_fi = int(per_seq_ckpts_fi.sum().item())
+        # flashinfer-native checkpoint count: only full chunks emit a checkpoint.
+        per_seq_h_ckpts = per_seq_lens // CHUNK_SIZE
+        total_h_ckpts = int(per_seq_h_ckpts.sum().item())
         H_state = fi_initial_state.shape[1]
         D_state = fi_initial_state.shape[-1]
         state_checkpoints = torch.empty(
-            total_ckpts_fi, H_state, D_state, D_state,
-            device=fi_initial_state.device, dtype=torch.float32,
+            total_h_ckpts,
+            H_state,
+            D_state,
+            D_state,
+            device=fi_initial_state.device,
+            dtype=torch.float32,
         )
         checkpoint_cu_starts = torch.zeros(
-            per_seq_ckpts_fi.numel() + 1,
-            device=fi_initial_state.device, dtype=torch.int64,
+            per_seq_h_ckpts.numel() + 1,
+            device=fi_initial_state.device,
+            dtype=torch.int64,
         )
-        checkpoint_cu_starts[1:] = torch.cumsum(per_seq_ckpts_fi, dim=0)
+        checkpoint_cu_starts[1:] = torch.cumsum(per_seq_h_ckpts, dim=0)
 
     out, final_state = _chunk_gated_delta_rule(
         q3.contiguous(),
@@ -163,11 +169,8 @@ def gdn_chunk_prefill(
         g=torch.exp(g2).float().contiguous(),
         beta=beta2.float().contiguous(),
         scale=scale,
-        # flashinfer requires fp32 state; runtime ssm dtype may be bf16.
         initial_state=fi_initial_state,
         output_final_state=True,
-        # flashinfer casts cu_seqlens per path internally (int32 for sm100), so
-        # pass it through rather than forcing a dtype.
         cu_seqlens=cu_seqlens,
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
@@ -183,7 +186,6 @@ def gdn_chunk_prefill(
         return out, final_state_fla
 
     # Return raw flashinfer checkpoints in FLA state layout [total_fi, H, K, V].
-    # The caller indexes directly using flashinfer-native offsets, avoiding the
-    # expensive per-seq loop that used to splice initial_state into slot 0.
-    fi_ckpts_fla = state_checkpoints.transpose(-1, -2)
-    return out, final_state_fla, fi_ckpts_fla, checkpoint_cu_starts
+    # The caller indexes directly using flashinfer-native offsets
+    h_ckpts_fla = state_checkpoints.transpose(-1, -2)
+    return out, final_state_fla, h_ckpts_fla, checkpoint_cu_starts
