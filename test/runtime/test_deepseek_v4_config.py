@@ -2109,7 +2109,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 metadata.seq_lens_cpu,
-                torch.tensor([5, 9, 12], dtype=torch.int32),
+                torch.tensor([5, 0, 0], dtype=torch.int32),
             )
         )
         self.assertTrue(
@@ -2157,6 +2157,41 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.equal(decode.query_lens_cpu, torch.tensor([1, 1], dtype=torch.int32))
         )
 
+    def test_deepseek_v4_extend_metadata_sizes_tokens_from_cpu_lens(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=8,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=576,
+                context_len=256,
+            )
+        )
+        backend.init_forward_metadata(
+            bs=1,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([5], dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            req_to_page=torch.tensor([[10]], dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        )
+
+        metadata = backend.forward_metadata
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata.token_to_req_indices.numel(), 5)
+        self.assertEqual(metadata.num_prefill_tokens, 5)
+        self.assertTrue(
+            torch.equal(
+                metadata.token_to_req_indices,
+                torch.tensor([0, 0, 0, 0, 0], dtype=torch.int32),
+            )
+        )
+
     def test_deepseek_v4_mixed_metadata_accepts_prefill_prefix_lens_only(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
@@ -2192,7 +2227,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 metadata.seq_lens_cpu,
-                torch.tensor([5, 9, 12, 6], dtype=torch.int32),
+                torch.tensor([5, 9, 12, 0], dtype=torch.int32),
             )
         )
         self.assertTrue(
@@ -2389,6 +2424,73 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIs(backend.forward_metadata, mixed_metadata)
         self.assertTrue(torch.equal(out[:3], torch.ones((3, 1, 2))))
         self.assertTrue(torch.equal(out[3:], torch.full((2, 1, 2), 2.0)))
+
+    def test_deepseek_v4_chunked_prefill_uses_cpu_query_lens_offsets(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=8,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=576,
+                context_len=256,
+                deepseek_v4_prefill_chunk_size=2,
+            )
+        )
+        backend.init_forward_metadata(
+            bs=3,
+            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 3, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([2, 3, 1], dtype=torch.int32),
+        )
+        calls = []
+
+        def fake_prefill_chunk(**kwargs):
+            metadata = backend.forward_metadata
+            q = kwargs["q"]
+            calls.append(
+                (
+                    q.shape[0],
+                    kwargs["positions"].tolist(),
+                    metadata.req_pool_indices.tolist(),
+                    metadata.token_to_req_indices.tolist(),
+                    metadata.query_lens_cpu.tolist(),
+                )
+            )
+            return q.new_full((q.shape[0], 1, 2), float(len(calls)))
+
+        backend._forward_deepseek_v4_prefill_chunk = fake_prefill_chunk
+        out = backend.forward_deepseek_v4_prefill(
+            q=torch.zeros((6, 1, 2), dtype=torch.float32),
+            positions=torch.arange(6, dtype=torch.int64),
+            token_to_kv_pool=SimpleNamespace(),
+            layer_id=0,
+            kind="mla",
+            compress_ratio=4,
+            num_local_heads=1,
+            padded_heads=1,
+            head_dim=2,
+            window_size=4,
+            softmax_scale=1.0,
+            attn_sink=torch.zeros(1),
+            topk_indices=None,
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                (5, [0, 1, 2, 3, 4], [0, 1], [0, 0, 1, 1, 1], [2, 3]),
+                (1, [5], [2], [0], [1]),
+            ],
+        )
+        self.assertTrue(torch.equal(out[:5], torch.ones((5, 1, 2))))
+        self.assertTrue(torch.equal(out[5:], torch.full((1, 1, 2), 2.0)))
 
     def test_deepseek_v4_spec_metadata_requires_uniform_pack(self):
         backend = DeepseekV4AttentionBackend(
