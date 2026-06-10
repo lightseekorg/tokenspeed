@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
     gated_delta_rule as gdn_flashinfer,
 )
 from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+    causal_conv1d_qkv_split_gdn_prefill,
     fused_qkv_split_gdn_prefill,
 )
 
@@ -988,6 +989,11 @@ class MambaAttnBackend(AttentionBackend):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        key_split_dim = key_dim // attn_tp_size
+        value_split_dim = value_dim // attn_tp_size
+        num_heads = key_split_dim // head_k_dim
+        num_value_heads = value_split_dim // head_v_dim
+
         if is_target_verify:
             draft_token_num = kwargs.get(
                 "draft_token_num", self.speculative_num_draft_tokens
@@ -1012,6 +1018,15 @@ class MambaAttnBackend(AttentionBackend):
             )
             # needn't contiguous here.
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                num_q_heads=num_heads,
+                num_k_heads=num_heads,
+                num_v_heads=num_value_heads,
+                head_q=head_k_dim,
+                head_k=head_k_dim,
+                head_v=head_v_dim,
+            )
         else:
             conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
@@ -1037,33 +1052,45 @@ class MambaAttnBackend(AttentionBackend):
                 conv_states[self.forward_metadata.track_ssm_h_dst] = mixed_qkv_t[
                     :, self.forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv_t,
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
-
-        key_split_dim = key_dim // attn_tp_size
-        value_split_dim = value_dim // attn_tp_size
-        num_heads = key_split_dim // head_k_dim
-        num_value_heads = value_split_dim // head_v_dim
-
-        query, key, value = fused_qkv_split_gdn_prefill(
-            mixed_qkv,
-            num_q_heads=num_heads,
-            num_k_heads=num_heads,
-            num_v_heads=num_value_heads,
-            head_q=head_k_dim,
-            head_k=head_k_dim,
-            head_v=head_v_dim,
-        )
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv_t,
+                    conv_weights,
+                    bias,
+                    activation=activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    num_q_heads=num_heads,
+                    num_k_heads=num_heads,
+                    num_v_heads=num_value_heads,
+                    head_q=head_k_dim,
+                    head_k=head_k_dim,
+                    head_v=head_v_dim,
+                )
+            else:
+                query, key, value = causal_conv1d_qkv_split_gdn_prefill(
+                    mixed_qkv_t,
+                    conv_weights,
+                    bias,
+                    conv_states,
+                    query_start_loc,
+                    extend_seq_lens_cpu,
+                    num_q_heads=num_heads,
+                    num_k_heads=num_heads,
+                    num_v_heads=num_value_heads,
+                    head_q=head_k_dim,
+                    head_k=head_k_dim,
+                    head_v=head_v_dim,
+                    total_seq_len=seq_len,
+                    cache_indices=cache_indices,
+                    has_initial_state=has_initial_states,
+                    activation=activation,
+                )
 
         if is_target_verify:
             draft_token_num = kwargs.get(
