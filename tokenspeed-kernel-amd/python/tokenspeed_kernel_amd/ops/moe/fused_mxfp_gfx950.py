@@ -28,6 +28,8 @@ import torch
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, tl, triton
 
 
+# Local copies from triton_kernels/matmul.py for the activation metadata
+# object passed through the tokenspeed-kernel MoE API.
 @dataclass(frozen=True)
 class FnSpecs:
     name: str
@@ -47,6 +49,7 @@ class FusedActivation:
     fn_args: tuple[object, ...] = tuple()
 
 
+# Local copy from triton_kernels/tensor_details/ragged_tensor.py.
 @dataclass
 class RaggedTensorMetadata:
     slice_sizes: torch.Tensor
@@ -103,6 +106,7 @@ class RaggedTensorMetadata:
         return [2**x for x in RaggedTensorMetadata.block_sizes_log2()]
 
 
+# Local copies from triton_kernels/swiglu_details/_swiglu.py.
 @triton.jit
 def _swiglu_clip(x, limit, clip_lower: tl.constexpr):
     res = tl.minimum(x, limit)
