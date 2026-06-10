@@ -65,14 +65,13 @@ logger = get_colorful_logger(__name__)
 class LlamaAttention(BaseLlamaAttention):
     """Eagle3 draft head attention.
 
-    Inherits ``__init__`` (with ``qkv_input_size=2*hidden_size`` to accommodate
-    the [embed || hidden] concat) and ``forward`` (= empty-shape handling +
-    qkv projection + o_proj scaffolding) from base.
-
-    Overrides ``_attn`` to add the draft-first-step dispatch B: trim
-    cache_seqlens, slice q to one live row per request, and route the attention
-    call as ``DECODE`` (fused KV pre-write path) or post-slice attn_output
-    (non-fused fallback). Inactive draft steps delegate to base.
+    Inherits ``__init__`` (with ``qkv_input_size=2*hidden_size`` for the
+    [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj scaffolding)
+    from base. Overrides ``_attn`` so the draft's first step skips dead
+    catch-up rows: on backends that support fused KV pre-write, q is sliced
+    to one live row per request and dispatched as DECODE; otherwise the
+    fallback runs the full N-row attn and post-slices the output. Inactive
+    draft steps delegate to base.
     """
 
     def _attn(
@@ -90,11 +89,13 @@ class LlamaAttention(BaseLlamaAttention):
         if ctx.accept_lengths is None:
             return super()._attn(positions, q, k, v, ctx, out_cache_loc)
 
-        # Active dispatch B: correction + q-slice + DECODE (fused) or post-slice (non-fused).
-        self._apply_correction(ctx)
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
             fused_kv_arg = self._build_fused_kv_arg(v, ctx, out_cache_loc)
             if fused_kv_arg is not None:
+                # Trim only on the sliced single-token decode path; the
+                # post-slice fallback below still runs full N-row attn and
+                # needs the original seq_lens.
+                self._apply_correction(ctx)
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
                 ).index_select(0, ctx.gather_ids)
