@@ -692,11 +692,11 @@ _CASES = [
         _moe_route_biased_topk,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_cdna4,
+        "cdna4",
         "moe",
         "route",
-        "triton_kernels_routing",
+        "gluon_decode_routing_gfx950",
         _moe_route_ragged_metadata,
     ),
     _case(
