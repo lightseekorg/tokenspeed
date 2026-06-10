@@ -45,6 +45,13 @@ echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip "setuptools<82" wheel
 
 echo "=== Step 3: Install tokenspeed-kernel ==="
+
+if [ "${INSTALL_TOKENSPEED_KERNEL_AMD_FROM_SOURCE:-0}" = "1" ]; then
+    cd "${WORKSPACE}"
+    pip3 install --force-reinstall --no-deps \
+        "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
+fi
+
 cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"
 TOKENSPEED_KERNEL_BACKEND=rocm \
