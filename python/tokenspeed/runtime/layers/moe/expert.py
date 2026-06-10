@@ -28,7 +28,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
-from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_all2all_backend
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
@@ -118,8 +118,24 @@ class MoELayer(torch.nn.Module):
             prefix=prefix,
             a2a_backend=get_all2all_backend().value,
         )
-        self.routing_config = routing_config
 
+        # Routing config
+        self.routing_config = routing_config
+        self._correction_bias = routing_config.get("correction_bias", None)
+        self._routing_method_type = routing_config.get(
+            "routing_method_type", RoutingMethodType.DeepSeekV3
+        )
+        self._routing_logits_dtype = torch.bfloat16
+        if self._routing_method_type in (
+            RoutingMethodType.DeepSeekV3,
+            RoutingMethodType.MiniMax2,
+        ):
+            self._routing_logits_dtype = torch.float32
+        self._n_group = routing_config.get("n_group", 0)
+        self._topk_group = routing_config.get("topk_group", 0)
+        self._routed_scaling_factor = routing_config.get("routed_scaling_factor", 1.0)
+
+        # Quantization config
         self._quant_kind = "unquant"
         if quant_config is not None and not should_ignore_quant_layer(
             prefix=self.prefix,
@@ -145,6 +161,7 @@ class MoELayer(torch.nn.Module):
                 "nccl",
                 mapping.moe.tp_ep_group,
             )
+
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,

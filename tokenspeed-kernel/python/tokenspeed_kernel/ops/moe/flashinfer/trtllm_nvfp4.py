@@ -61,47 +61,64 @@ if platform.is_nvidia:
         priority=Priority.SPECIALIZED,
     )
     def flashinfer_trtllm_nvfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
+        _group_size = 16
+        _correction_bias = getattr(w, "_correction_bias", None)
+        _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
+
         num_experts = w.w13_weight.shape[0]
+        # intermediate_size_per_partition = half of w13 rows (gate + up)
         intermediate_size = w.w13_weight.shape[1] // 2
         hidden_size = w.w13_weight.shape[2] * 2
-        group_size = getattr(getattr(w, "quant_config", None), "group_size", 16)
 
+        # Fix 1: Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)].
+        # The fused gated-act reorder interleaves [first_half, second_half] as
+        # [row0_first, row0_second, row1_first, row1_second, ...].
+        # It expects [W3(Up), W1(Gate)] so that the interleaved result pairs
+        # each up-proj row with its corresponding gate-proj row correctly.
         half_w = w.w13_weight.shape[1] // 2
         w1_weight = w.w13_weight.data[:, :half_w, :].clone()
         w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
         w.w13_weight.data[:, half_w:, :] = w1_weight
+        del w1_weight
 
         half_s = w.w13_weight_scale.shape[1] // 2
         w1_scale = w.w13_weight_scale.data[:, :half_s, :].clone()
         w.w13_weight_scale.data[:, :half_s, :] = w.w13_weight_scale.data[:, half_s:, :]
         w.w13_weight_scale.data[:, half_s:, :] = w1_scale
+        del w1_scale
 
-        cache = {}
+        # Shuffle weights and scales using fused-kernel permute indices.
+        cache: dict = {}
         epilogue_tile_m = 128
+
+        # View as fp8 for permutation (uint8 and fp8_e4m3fn are both 1 byte)
         w13_fp4 = w.w13_weight.data.view(torch.float8_e4m3fn).reshape(
             num_experts, 2 * intermediate_size, hidden_size // 2
         )
         w13_scales = w.w13_weight_scale.data.view(torch.float8_e4m3fn).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // group_size
+            num_experts, 2 * intermediate_size, hidden_size // _group_size
         )
         w2_fp4 = w.w2_weight.data.view(torch.float8_e4m3fn).reshape(
             num_experts, hidden_size, intermediate_size // 2
         )
         w2_scales = w.w2_weight_scale.data.view(torch.float8_e4m3fn).reshape(
-            num_experts, hidden_size, intermediate_size // group_size
+            num_experts, hidden_size, intermediate_size // _group_size
         )
 
         w13_weights_shuffled = []
         w13_scales_shuffled = []
         w2_weights_shuffled = []
         w2_scales_shuffled = []
+
         for idx in range(num_experts):
+            # W1/W3 (gemm1) weight permutation
             perm = maybe_get_cached_w3_w1_permute_indices(
                 cache, w13_fp4[idx].view(torch.uint8), epilogue_tile_m
             )
             w13_weights_shuffled.append(
                 w13_fp4[idx].view(torch.uint8)[perm.to(w13_fp4.device)].contiguous()
             )
+            # W1/W3 scale permutation + interleave
             perm_sf = maybe_get_cached_w3_w1_permute_indices(
                 cache,
                 w13_scales[idx].view(torch.uint8),
@@ -115,12 +132,14 @@ if platform.is_nvidia:
                     .contiguous()
                 )
             )
+            # W2 (gemm2) weight permutation
             perm2 = get_w2_permute_indices_with_cache(
                 cache, w2_fp4[idx].view(torch.uint8), epilogue_tile_m
             )
             w2_weights_shuffled.append(
                 w2_fp4[idx].view(torch.uint8)[perm2.to(w2_fp4.device)].contiguous()
             )
+            # W2 scale permutation + interleave
             perm2_sf = get_w2_permute_indices_with_cache(
                 cache,
                 w2_scales[idx].view(torch.uint8),
@@ -135,13 +154,14 @@ if platform.is_nvidia:
                 )
             )
 
+        # Stack and store shuffled weights (uint8)
         w.gemm1_weights_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w13_weights_shuffled), requires_grad=False
         )
         w.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w13_scales_shuffled)
             .view(torch.float8_e4m3fn)
-            .reshape(num_experts, 2 * intermediate_size, hidden_size // group_size),
+            .reshape(num_experts, 2 * intermediate_size, hidden_size // _group_size),
             requires_grad=False,
         )
         w.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
@@ -150,18 +170,31 @@ if platform.is_nvidia:
         w.gemm2_scales_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w2_scales_shuffled)
             .view(torch.float8_e4m3fn)
-            .reshape(num_experts, hidden_size, intermediate_size // group_size),
+            .reshape(num_experts, hidden_size, intermediate_size // _group_size),
             requires_grad=False,
         )
 
+        # Free original weights (replaced by shuffled versions)
+        del w.w13_weight
+        del w.w2_weight
+        del w.w13_weight_scale
+        del w.w2_weight_scale
+
+        # Compute fused-kernel scales.
+        # Reduce w13_weight_scale_2: take per-expert value.
         w13_ws2 = w.w13_weight_scale_2[:, 0]
+        # Input scales (max across shards) for alpha computation
         w13_input_scale = w.w13_input_scale.max().to(torch.float32)
         w2_input_scale = w.w2_input_scale.max().to(torch.float32)
+
+        # Store input_scale_quant for runtime fp4_quantize
         w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
         w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
+
         w.w13_input_scale_quant = torch.nn.Parameter(
             w13_input_scale_quant, requires_grad=False
         )
+        # Fused-kernel alphas: input_scale * weight_scale_2
         w.g1_alphas = torch.nn.Parameter(
             (w13_input_scale * w13_ws2).to(torch.float32), requires_grad=False
         )
@@ -173,8 +206,20 @@ if platform.is_nvidia:
             (w2_input_scale_quant * w.g1_alphas).to(torch.float32),
             requires_grad=False,
         )
+        # Store intermediate_size_per_partition for the executor
         w.intermediate_size_per_partition = intermediate_size
-        return None
+
+        # Free per-shard scales that are no longer needed
+        del w.w13_weight_scale_2
+        del w.w2_weight_scale_2
+        del w.w13_input_scale
+        del w.w2_input_scale
+
+        # The fused MoE kernel requires routing bias dtype to match
+        # routing logits dtype. Cast here (post weight-load) so the captured
+        # bias reflects the loaded values, not the empty Parameter.
+        if _correction_bias is not None:
+            _correction_bias = _correction_bias.to(_routing_logits_dtype)
 
     @register_kernel(
         "moe",
@@ -214,34 +259,31 @@ if platform.is_nvidia:
         num_tokens_global: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
         do_finalize: bool = True,
+        enable_pdl: bool = False,
     ):
-        routing_config = getattr(w, "routing_config", {})
-        if not isinstance(routing_config, dict):
-            routing_config = {}
-        routing_value = lambda name, default: (
-            routing_config[name]
-            if name in routing_config
-            else getattr(w, name, default)
-        )
-        routing_method_type = routing_value("routing_method_type", 2)
-        routing_logits_dtype = (
-            torch.float32 if int(routing_method_type) in {2, 7} else torch.bfloat16
-        )
-        routing_bias = routing_value("correction_bias", None)
-        if routing_bias is not None:
-            routing_bias = routing_bias.to(routing_logits_dtype)
+        _spec = getattr(w, "_spec", None)
+        _correction_bias = getattr(w, "_correction_bias", None)
+        _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
+        _n_group = getattr(w, "_n_group", 0)
+        _topk_group = getattr(w, "_topk_group", 0)
+        _routed_scaling_factor = getattr(w, "_routed_scaling_factor", 1.0)
+        _routing_method_type = getattr(w, "_routing_method_type", 0)
 
+        num_tokens = x.shape[0]
+
+        # Quantize input to FP4 using the fused-kernel scale layout.
         hs_fp4, hs_scale = fp4_quantize(
             x,
             w.w13_input_scale_quant,
             is_sf_swizzled_layout=False,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
         )
-        local_experts = getattr(
-            w, "num_local_experts", w.gemm1_weights_fp4_shuffled.shape[0]
-        )
+
+        routing_bias = _correction_bias
+        routing_logits = router_logits.to(_routing_logits_dtype)
+
         result = trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits.to(routing_logits_dtype),
+            routing_logits=routing_logits,
             routing_bias=routing_bias,
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale.view(torch.float8_e4m3fn),
@@ -261,22 +303,29 @@ if platform.is_nvidia:
             output1_scale_scalar=w.g1_scale_c.data,
             output1_scale_gate_scalar=w.g1_alphas.data,
             output2_scale_scalar=w.g2_alphas.data,
-            num_experts=getattr(w, "num_experts"),
-            top_k=getattr(w, "top_k"),
-            n_group=routing_value("n_group", 0),
-            topk_group=routing_value("topk_group", 0),
+            num_experts=_spec.num_experts,
+            top_k=_spec.top_k,
+            n_group=_n_group,
+            topk_group=_topk_group,
             intermediate_size=w.intermediate_size_per_partition,
-            local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
-            local_num_experts=local_experts,
-            routed_scaling_factor=routing_value("routed_scaling_factor", 1.0),
-            routing_method_type=routing_method_type,
+            local_expert_offset=_spec.ep_rank * _spec.num_local_experts,
+            local_num_experts=_spec.num_local_experts,
+            routed_scaling_factor=_routed_scaling_factor,
+            routing_method_type=_routing_method_type,
             do_finalize=do_finalize,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            tune_max_num_tokens=next_power_of_2(num_tokens),
         )
-        if not do_finalize:
-            gemm2_out, expert_weights, expanded_idx = result
-            if expert_weights.dtype == torch.float32:
-                n, k = expert_weights.size()
-                expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
-            return (gemm2_out, expert_weights, expanded_idx)
-        return result[0]
+        if do_finalize:
+            return result[0]
+        # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx]
+        gemm2_out, expert_weights, expanded_idx = result
+        # Flashinfer's Python wrapper allocates expert_weights with
+        # ``routing_logits.dtype`` (fp32 for DSv3), but the C++ routing
+        # kernel writes bf16 contiguously for DeepSeekV3 routing
+        # into the buffer. Only the first half holds valid data; reading
+        # as fp32 interprets two adjacent bf16s as one fp32. Reinterpret
+        # to bf16 and keep the live prefix.
+        if expert_weights.dtype == torch.float32:
+            n, k = expert_weights.size()
+            expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
+        return (gemm2_out, expert_weights, expanded_idx)
