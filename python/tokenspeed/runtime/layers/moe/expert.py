@@ -120,7 +120,7 @@ class MoELayer(torch.nn.Module):
         )
 
         # Routing config
-        self.routing_config = routing_config
+        self.routing_config = routing_config or {}
         self._correction_bias = routing_config.get("correction_bias", None)
         self._routing_method_type = routing_config.get(
             "routing_method_type", RoutingMethodType.DeepSeekV3
