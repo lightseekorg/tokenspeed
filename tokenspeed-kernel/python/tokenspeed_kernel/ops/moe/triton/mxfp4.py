@@ -319,6 +319,7 @@ def triton_kernels_mxfp4_moe_apply(
     num_tokens_global: int | None = None,
     max_num_tokens_per_gpu: int | None = None,
     do_finalize: bool = True,
+    enable_pdl: bool = False,
 ):
     top_k = getattr(w, "top_k")
     ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(

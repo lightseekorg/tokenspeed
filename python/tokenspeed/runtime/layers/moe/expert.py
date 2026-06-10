@@ -33,6 +33,7 @@ from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class MoELayer(torch.nn.Module):
@@ -238,6 +239,7 @@ class MoELayer(torch.nn.Module):
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
+                enable_pdl=pdl_enabled(),
             )
         else:
             return tokenspeed_kernel.moe_apply(
@@ -250,4 +252,5 @@ class MoELayer(torch.nn.Module):
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
+                enable_pdl=pdl_enabled(),
             )

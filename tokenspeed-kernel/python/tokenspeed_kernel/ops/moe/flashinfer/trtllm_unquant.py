@@ -153,6 +153,7 @@ if platform.is_nvidia:
         num_tokens_global: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
         do_finalize: bool = True,
+        enable_pdl: bool = False,
     ):
         routing_config = getattr(w, "routing_config", {})
         if not isinstance(routing_config, dict):

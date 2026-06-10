@@ -390,6 +390,7 @@ if platform.is_nvidia:
         num_tokens_global: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
         do_finalize: bool = True,
+        enable_pdl: bool = False,
     ):
         hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
         hidden_original = getattr(w, "hidden_size_original", hidden_padded)

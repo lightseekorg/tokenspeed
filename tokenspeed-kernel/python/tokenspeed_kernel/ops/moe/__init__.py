@@ -150,6 +150,7 @@ def moe_plan(
     apply_spec = registry.get_by_name(kernel.name)
     if apply_spec is None:
         raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
+
     process_weights_kernel = select_kernel(
         "moe",
         "process_weights",
@@ -210,6 +211,8 @@ def moe_apply(
     num_tokens_global: int | None = None,
     max_num_tokens_per_gpu: int | None = None,
     do_finalize: bool = True,
+    # launch config
+    enable_pdl: bool = False,
 ):
     """Apply a planned MoE kernel.
 
@@ -243,4 +246,5 @@ def moe_apply(
         num_tokens_global=num_tokens_global,
         max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
     )
