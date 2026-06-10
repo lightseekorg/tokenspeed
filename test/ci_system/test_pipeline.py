@@ -13,6 +13,7 @@ from pipeline import (
     extract_perf_summary_rows,
     format_perf_reference_markdown_table,
     format_perf_reference_table,
+    is_amd_runner,
     is_gb200_runner,
     resolve_score_threshold_for_runner,
     should_run_nvidia_gpu_cleanup,
@@ -47,6 +48,16 @@ def test_stale_process_patterns_match_existing_targets():
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
 
 
+def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
+    assert is_amd_runner("linux-mi355-1gpu-lightseek")
+    assert is_amd_runner("amd-mi35x-1gpu-test")
+    assert is_amd_runner("amd-mi35x-4gpu-test")
+    assert is_amd_runner("amd-mi350-1gpu-bench")
+    assert is_amd_runner("amd-mi350-4gpu-bench")
+    assert not is_amd_runner("b200-1gpu")
+    assert not is_amd_runner("gb200-4gpu-perf")
+
+
 def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert is_gb200_runner("gb200-1gpu")
     assert is_gb200_runner("gb200-4gpu-perf")
@@ -58,6 +69,8 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("linux-mi355-2gpu-lightseek")
+    assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
+    assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
 
 
 def test_extract_evalscope_score_from_pipe_table():
