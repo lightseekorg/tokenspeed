@@ -237,6 +237,10 @@ if _amd_gluon is not None:
         kwargs.setdefault("quantize_fp8_fn", quantize_fp8)
         kwargs.setdefault("moe_experts_fn", moe_experts)
         kwargs.setdefault("moe_route_fn", moe_route)
+        kwargs.setdefault(
+            "enable_warp_decode",
+            not _GLUON_DISABLED_ENV and current_platform().is_cdna4,
+        )
         return _amd_gluon._gluon_mxfp_fused_moe(*args, **kwargs)
 
     @register_kernel(
