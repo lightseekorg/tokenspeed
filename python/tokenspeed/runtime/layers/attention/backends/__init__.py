@@ -56,3 +56,4 @@ if platform.is_nvidia:
     from tokenspeed.runtime.layers.attention.backends import trtllm_mla  # noqa: F401
 
 from tokenspeed.runtime.layers.attention.backends import mha  # noqa: F401
+from tokenspeed.runtime.layers.attention.backends import mla  # noqa: F401

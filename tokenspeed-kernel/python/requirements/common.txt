@@ -1,4 +1,4 @@
-apache-tvm-ffi>=0.1.5
+apache-tvm-ffi>=0.1.5,<=0.1.11
 numpy
 packaging
 PyYAML>=6.0

@@ -34,6 +34,7 @@ import tokenspeed_triton.profiler as proton
 from tokenspeed_triton import language as tl
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.language.core import _aggregate as aggregate
+from tokenspeed_triton.language.extra import libdevice
 from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "TensorDescriptor",
     "gl",
     "gluon",
+    "libdevice",
     "proton",
     "redirect_triton_to_tokenspeed_triton",
     "tl",

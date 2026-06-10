@@ -156,6 +156,18 @@ def reduce_scatter(
     return backend.reduce_scatter(tensor, group)
 
 
+def all_to_all_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> None:
+    """Even-split all_to_all into a pre-allocated output buffer."""
+    if backend is None:
+        backend = get_global_backend()
+    backend.all_to_all_single(output, input, group)
+
+
 # ---------------------------------------------------------------------------
 # Fused ops (comm + residual + norm)
 # ---------------------------------------------------------------------------

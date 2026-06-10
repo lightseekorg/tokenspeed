@@ -155,8 +155,8 @@ class Eagle(BaseDrafter):
         draft_input: EagleDraftInput,
         bs: int,
         input_num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (input_ids, unpadded_input_lengths, gather_ids) for the first draft step.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (input_ids, gather_ids) for the first draft step.
 
         The first-step input shape matches the base model's: ragged
         ``[prefill_part || decode_part]`` under MIXED, full prefill chunks
@@ -198,12 +198,11 @@ class Eagle(BaseDrafter):
                 )
         else:
             input_ids = draft_input.base_model_output
-            unpadded_input_lengths = draft_input.accept_lengths
             gather_ids = (
                 self.padded_gather_ids_offsets_buf[:bs] + draft_input.accept_lengths
             )
 
-        return input_ids, unpadded_input_lengths, gather_ids
+        return input_ids, gather_ids
 
     @nvtx_range("draft_first_step", color="purple")
     def _run_first_step(
@@ -215,7 +214,7 @@ class Eagle(BaseDrafter):
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
 
-        input_ids, _, gather_ids = self._get_first_step_input(
+        input_ids, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
