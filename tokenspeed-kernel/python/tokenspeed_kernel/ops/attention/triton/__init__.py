@@ -26,6 +26,12 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.mha_decode import decode_attention_fwd
 from tokenspeed_kernel.ops.attention.triton.mha_prefill import prefill_attention_fwd
+from tokenspeed_kernel.ops.attention.triton.mla_decode import (  # noqa: F401
+    triton_mla_decode_with_kvcache,
+)
+from tokenspeed_kernel.ops.attention.triton.mla_prefill import (  # noqa: F401
+    triton_mla_prefill,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
