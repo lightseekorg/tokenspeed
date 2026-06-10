@@ -232,6 +232,11 @@ if _amd_gluon is not None:
         tags={"throughput", "latency"},
     )
     def _gluon_mxfp_fused_moe(*args, **kwargs) -> torch.Tensor:
+        from tokenspeed_kernel.ops.quantization import quantize_fp8
+
+        kwargs.setdefault("quantize_fp8_fn", quantize_fp8)
+        kwargs.setdefault("moe_experts_fn", moe_experts)
+        kwargs.setdefault("moe_route_fn", moe_route)
         return _amd_gluon._gluon_mxfp_fused_moe(*args, **kwargs)
 
     @register_kernel(

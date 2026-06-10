@@ -4573,6 +4573,9 @@ def _gluon_mxfp_fused_moe(
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
     top_k: int,
+    quantize_fp8_fn,
+    moe_experts_fn,
+    moe_route_fn,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
 ) -> torch.Tensor:
@@ -4592,17 +4595,13 @@ def _gluon_mxfp_fused_moe(
         top_k: routing top_k.
         swiglu_alpha / swiglu_limit: SwiGLU activation parameters.
 
-    Lazy-imports the top-level ``moe_route`` / ``moe_experts`` /
-    ``quantize_fp8`` to avoid a circular import (this module is imported
-    by ``tokenspeed_kernel.ops.moe.__init__`` which defines those).
+        quantize_fp8_fn, moe_experts_fn, moe_route_fn: Callbacks supplied by
+            the tokenspeed-kernel registration shim to keep this package free
+            of a runtime dependency on tokenspeed-kernel.
     """
-    # Lazy imports to avoid the circular dependency described above.
-    from tokenspeed_kernel import quantize_fp8
-    from tokenspeed_kernel.ops.moe import moe_experts, moe_route
-
     n_tokens = router_logits.shape[0]
 
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = moe_route(
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = moe_route_fn(
         router_logits,
         top_k,
         sm_first=False,
@@ -4619,7 +4618,7 @@ def _gluon_mxfp_fused_moe(
     if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         gemm1_input = hidden_states
     else:
-        gemm1_input = quantize_fp8(
+        gemm1_input = quantize_fp8_fn(
             hidden_states,
             scale=w13_act_scale,
             solution="triton",
@@ -4627,7 +4626,7 @@ def _gluon_mxfp_fused_moe(
 
     gluon_traits = {"weight_dtype": "mxfp4"}
 
-    intermediate_cache = moe_experts(
+    intermediate_cache = moe_experts_fn(
         gemm1_input,
         w13_weight,
         w13_bias,
@@ -4652,13 +4651,13 @@ def _gluon_mxfp_fused_moe(
     ):
         gemm2_input = intermediate_cache
     else:
-        gemm2_input = quantize_fp8(
+        gemm2_input = quantize_fp8_fn(
             intermediate_cache,
             scale=w2_act_scale,
             solution="triton",
         )
 
-    return moe_experts(
+    return moe_experts_fn(
         gemm2_input,
         w2_weight,
         w2_bias,
