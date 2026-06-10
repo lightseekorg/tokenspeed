@@ -101,42 +101,11 @@ def _missing_amd_gluon_package(*args, **kwargs):
 
 
 if _amd_gluon is not None:
-    _extract_gluon_raw_s = _amd_gluon._extract_gluon_raw_s
     _extract_gluon_raw_w = _amd_gluon._extract_gluon_raw_w
-    gluon_mxfp_combine = _amd_gluon.gluon_mxfp_combine
-    gluon_mxfp_dispatch_swiglu = _amd_gluon.gluon_mxfp_dispatch_swiglu
     shuffle_weight_for_gluon_dot_layout = _amd_gluon.shuffle_weight_for_gluon_dot_layout
-    SMALLM_MAX_M = _amd_gluon.SMALLM_MAX_M
-    FUSED_ROUTE_MAX_M = _amd_gluon.FUSED_ROUTE_MAX_M
-    GLUON_ROUTE_DTYPES = _amd_gluon.GLUON_ROUTE_DTYPES
-    GLUON_ROUTE_MAX_E = _amd_gluon.GLUON_ROUTE_MAX_E
-    GLUON_ROUTE_MAX_G = _amd_gluon.GLUON_ROUTE_MAX_G
-    gluon_fused_route = _amd_gluon.gluon_fused_route
-
-    def gluon_route_supported(
-        logits: torch.Tensor,
-        topk: int,
-        dtype: torch.dtype | None = None,
-    ) -> bool:
-        if not current_platform().is_cdna4:
-            return False
-        return _amd_gluon.gluon_route_supported(logits, topk, dtype)
-
 else:
-    _extract_gluon_raw_s = _missing_amd_gluon_package
     _extract_gluon_raw_w = _missing_amd_gluon_package
-    gluon_mxfp_combine = _missing_amd_gluon_package
-    gluon_mxfp_dispatch_swiglu = _missing_amd_gluon_package
     shuffle_weight_for_gluon_dot_layout = _missing_amd_gluon_package
-    SMALLM_MAX_M = 16
-    FUSED_ROUTE_MAX_M = SMALLM_MAX_M
-    GLUON_ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-    GLUON_ROUTE_MAX_E = 1024
-    GLUON_ROUTE_MAX_G = 64
-    gluon_fused_route = _missing_amd_gluon_package
-
-    def gluon_route_supported(*args, **kwargs) -> bool:
-        return False
 
 
 def _gluon_kernel_priority() -> int:
@@ -292,25 +261,21 @@ if _amd_gluon is not None:
         n_tokens = logits.shape[0]
         if (
             not sm_first
-            and n_tokens <= SMALLM_MAX_M
-            and gluon_route_supported(logits, n_expts_act, dtype)
+            and n_tokens <= _amd_gluon.SMALLM_MAX_M
+            and current_platform().is_cdna4
+            and _amd_gluon.gluon_route_supported(logits, n_expts_act, dtype)
         ):
-            return gluon_fused_route(logits, n_expts_act, dtype=dtype)
+            return _amd_gluon.gluon_fused_route(logits, n_expts_act, dtype=dtype)
 
         generic = KernelRegistry.get().get_impl("triton_kernels_routing")
         return generic(logits, n_expts_act, sm_first, dtype)
 
-else:
-    _gluon_mxfp_ragged_matmul = _missing_amd_gluon_package
-    _gluon_mxfp_fused_moe = _missing_amd_gluon_package
-    gluon_decode_routing_gfx950 = _missing_amd_gluon_package
 
 __all__ = [
     "ExpertLocationDispatchInfo",
     "topk_ids_logical_to_physical",
     "transform_select_experts_inputs",
     "_extract_gluon_raw_w",
-    "SMALLM_MAX_M",
     "shuffle_weight_for_gluon_dot_layout",
     "moe_route",
     "moe_dispatch",

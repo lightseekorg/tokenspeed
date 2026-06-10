@@ -3,10 +3,7 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel  # noqa: F401  (registers moe kernels)
 import torch
-from tokenspeed_kernel.ops.moe import (
-    SMALLM_MAX_M,
-    moe_route,
-)
+from tokenspeed_kernel.ops.moe import moe_route
 from tokenspeed_kernel.platform import current_platform
 
 requires_gfx950 = pytest.mark.skipif(
@@ -144,7 +141,7 @@ def test_small_m_routing_matches_reference(M):
 
 @requires_gfx950
 def test_direct_large_m_rejects_fallback_shape():
-    M = SMALLM_MAX_M + 16
+    M = _amd_gluon().SMALLM_MAX_M + 16
     gen = torch.Generator(device="cuda").manual_seed(7)
     logits = torch.randn(M, E, device="cuda", dtype=torch.bfloat16, generator=gen)
 
