@@ -42,7 +42,7 @@ echo "=== Step 1: apt deps ==="
 sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-python3 -m pip install --upgrade pip setuptools wheel
+python3 -m pip install --upgrade pip "setuptools<82" wheel
 
 echo "=== Step 3: Install tokenspeed-kernel ==="
 
