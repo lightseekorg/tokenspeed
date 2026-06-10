@@ -54,6 +54,7 @@ from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
 from tokenspeed.runtime.cache.transfer.deepseek_v4_pool import (
     DeepseekV4CachePool,
     _count_page_spans,
+    _count_src_dst_spans,
     _ordered_page_pairs,
 )
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
@@ -294,24 +295,39 @@ class MemoryExecutor:
     @staticmethod
     def _paged_transfer_summary(
         transfers: list,
-    ) -> tuple[int, int, int, list[str], list[str]]:
+    ) -> tuple[int, int, int, int, int, list[str], list[str], list[str], list[str]]:
         group_pages: dict[str, int] = {}
         group_spans: dict[str, int] = {}
+        group_src_spans: dict[str, int] = {}
+        group_dst_spans: dict[str, int] = {}
         for transfer in transfers:
             group_id = str(getattr(transfer, "group_id", "unknown"))
             src_pages = getattr(transfer, "src_pages", [])
             dst_pages = getattr(transfer, "dst_pages", [])
             page_pairs = _ordered_page_pairs(src_pages, dst_pages)
+            src_spans, dst_spans = _count_src_dst_spans(page_pairs)
             group_pages[group_id] = group_pages.get(group_id, 0) + len(page_pairs)
             group_spans[group_id] = group_spans.get(group_id, 0) + _count_page_spans(
                 page_pairs
             )
+            group_src_spans[group_id] = group_src_spans.get(group_id, 0) + src_spans
+            group_dst_spans[group_id] = group_dst_spans.get(group_id, 0) + dst_spans
         return (
             len(group_pages),
             sum(group_pages.values()),
             sum(group_spans.values()),
+            sum(group_src_spans.values()),
+            sum(group_dst_spans.values()),
             [f"{group_id}:{pages}" for group_id, pages in sorted(group_pages.items())],
             [f"{group_id}:{spans}" for group_id, spans in sorted(group_spans.items())],
+            [
+                f"{group_id}:{spans}"
+                for group_id, spans in sorted(group_src_spans.items())
+            ],
+            [
+                f"{group_id}:{spans}"
+                for group_id, spans in sorted(group_dst_spans.items())
+            ],
         )
 
     def set_mamba_layerwise_cow(
@@ -381,20 +397,30 @@ class MemoryExecutor:
                             group_count,
                             page_count,
                             span_count,
+                            src_span_count,
+                            dst_span_count,
                             group_pages,
                             group_spans,
+                            group_src_spans,
+                            group_dst_spans,
                         ) = self._paged_transfer_summary(paged_transfers)
                         logger.debug(
                             "[cache_op][paged_l2] writeback schedule "
                             "op_id=%s groups=%s pages=%s spans=%s "
-                            "group_pages=%s group_spans=%s "
+                            "src_spans=%s dst_spans=%s group_pages=%s "
+                            "group_spans=%s group_src_spans=%s "
+                            "group_dst_spans=%s "
                             "is_retract=%s",
                             op_id,
                             group_count,
                             page_count,
                             span_count,
+                            src_span_count,
+                            dst_span_count,
                             group_pages,
                             group_spans,
+                            group_src_spans,
+                            group_dst_spans,
                             is_retract,
                         )
                     self.host_exec.enqueue_paged_cache_writeback(
@@ -456,19 +482,29 @@ class MemoryExecutor:
                             group_count,
                             page_count,
                             span_count,
+                            src_span_count,
+                            dst_span_count,
                             group_pages,
                             group_spans,
+                            group_src_spans,
+                            group_dst_spans,
                         ) = self._paged_transfer_summary(paged_transfers)
                         logger.debug(
                             "[cache_op][paged_l2] loadback schedule "
                             "op_id=%s groups=%s pages=%s spans=%s "
-                            "group_pages=%s group_spans=%s",
+                            "src_spans=%s dst_spans=%s group_pages=%s "
+                            "group_spans=%s group_src_spans=%s "
+                            "group_dst_spans=%s",
                             op_id,
                             group_count,
                             page_count,
                             span_count,
+                            src_span_count,
+                            dst_span_count,
                             group_pages,
                             group_spans,
+                            group_src_spans,
+                            group_dst_spans,
                         )
                     self.host_exec.enqueue_paged_cache_loadback(
                         op_id,

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from typing import Iterable, NamedTuple
 
@@ -63,6 +64,15 @@ def _new_cache_stream(priority: int | None = None):
         return device_module.Stream(priority=priority)
     except (RuntimeError, TypeError):
         return device_module.Stream()
+
+
+def _new_timing_event_if_debug():
+    if not logger.isEnabledFor(logging.DEBUG):
+        return None
+    try:
+        return device_module.Event(enable_timing=True)
+    except TypeError:
+        return None
 
 
 def page_ids_to_token_indices(
@@ -109,6 +119,8 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
 class _Ack(NamedTuple):
     finish_event: object  # device_module.Event
     op_ids: list[int]
+    timing_start_event: object | None = None  # device_module.Event
+    timing_finish_event: object | None = None  # device_module.Event
 
 
 class HostExecutor:
@@ -370,6 +382,10 @@ class HostExecutor:
                 producer_event = counter.events[producer_id]
                 producer_event.start_event.record()
                 producer_event.start_event.wait(self.load_stream)
+                timing_start_event = _new_timing_event_if_debug()
+                timing_finish_event = _new_timing_event_if_debug()
+                if timing_start_event is not None:
+                    timing_start_event.record()
 
                 unit = self._merge_units(units)
                 src_indices, dst_indices = self._prepare_indices(unit, pool)
@@ -399,9 +415,18 @@ class HostExecutor:
                     self._record_if_cuda(cow_src_indices, self.load_stream)
                 if cow_dst_indices is not None:
                     self._record_if_cuda(cow_dst_indices, self.load_stream)
+                if timing_finish_event is not None:
+                    timing_finish_event.record()
 
                 op_ids = _ordered_unique(unit.op_id for unit in units)
-                self.ack_load_queue.append(_Ack(producer_event.finish_event, op_ids))
+                self.ack_load_queue.append(
+                    _Ack(
+                        producer_event.finish_event,
+                        op_ids,
+                        timing_start_event,
+                        timing_finish_event,
+                    )
+                )
                 producer_map = self._producer_map[kind]
                 for op_id in op_ids:
                     producer_map[op_id] = producer_id
@@ -415,6 +440,10 @@ class HostExecutor:
                 producer_event = self._paged_counter.events[producer_id]
                 producer_event.start_event.record()
                 producer_event.start_event.wait(self.load_stream)
+                timing_start_event = _new_timing_event_if_debug()
+                timing_finish_event = _new_timing_event_if_debug()
+                if timing_start_event is not None:
+                    timing_start_event.record()
                 transfers = [
                     transfer
                     for unit in self.paged_load_queue
@@ -423,8 +452,17 @@ class HostExecutor:
                 for layer_index in range(self.paged_pool.num_layers()):
                     self.paged_pool.loadback_paged(transfers, layer_index)
                     producer_event.complete(layer_index)
+                if timing_finish_event is not None:
+                    timing_finish_event.record()
                 op_ids = _ordered_unique(unit.op_id for unit in self.paged_load_queue)
-                self.ack_load_queue.append(_Ack(producer_event.finish_event, op_ids))
+                self.ack_load_queue.append(
+                    _Ack(
+                        producer_event.finish_event,
+                        op_ids,
+                        timing_start_event,
+                        timing_finish_event,
+                    )
+                )
                 for op_id in op_ids:
                     self._paged_producer_map[op_id] = producer_id
                 while len(self._paged_producer_map) > self._producer_map_limit:
@@ -562,6 +600,29 @@ class HostExecutor:
         for ack in self.ack_load_queue:
             if not ack.finish_event.query():
                 remaining.append(ack)
+            else:
+                elapsed_ms = None
+                if (
+                    ack.timing_start_event is not None
+                    and ack.timing_finish_event is not None
+                ):
+                    try:
+                        elapsed_ms = ack.timing_start_event.elapsed_time(
+                            ack.timing_finish_event
+                        )
+                    except (AttributeError, RuntimeError, ValueError):
+                        elapsed_ms = None
+                if elapsed_ms is None:
+                    logger.debug(
+                        "[cache_op] loadback done op_ids=%s elapsed_ms=N/A",
+                        ack.op_ids,
+                    )
+                else:
+                    logger.debug(
+                        "[cache_op] loadback done op_ids=%s elapsed_ms=%.3f",
+                        ack.op_ids,
+                        elapsed_ms,
+                    )
         self.ack_load_queue[:] = remaining
         return results
 

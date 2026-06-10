@@ -81,6 +81,19 @@ def _count_page_spans(pairs: Iterable[PagePair]) -> int:
     return spans
 
 
+def _count_src_dst_spans(pairs: Iterable[PagePair]) -> tuple[int, int]:
+    src_spans = 0
+    dst_spans = 0
+    prev_pair: PagePair | None = None
+    for src_page, dst_page in pairs:
+        if prev_pair is None or src_page != prev_pair[0] + 1:
+            src_spans += 1
+        if prev_pair is None or dst_page != prev_pair[1] + 1:
+            dst_spans += 1
+        prev_pair = (src_page, dst_page)
+    return src_spans, dst_spans
+
+
 class DeepseekV4CachePool:
     """Group-paged DeepSeek V4 L2 transfer pool.
 

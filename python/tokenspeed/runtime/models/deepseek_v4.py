@@ -27,8 +27,10 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
 
@@ -146,6 +148,7 @@ _platform = current_platform()
 
 
 logger = get_colorful_logger(__name__)
+SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS = 500.0
 
 
 def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
@@ -3907,6 +3910,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
+        timing_enabled = (
+            logger.isEnabledFor(logging.DEBUG)
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_extend_or_mixed()
+        )
+        layer_tic = time.perf_counter() if timing_enabled else None
+        phase_wall_ms: dict[str, float] = {}
+
+        def phase_start():
+            return time.perf_counter() if timing_enabled else None
+
+        def phase_done(name: str, tic) -> None:
+            if tic is None:
+                return
+            elapsed_ms = (time.perf_counter() - tic) * 1000
+            phase_wall_ms[name] = round(phase_wall_ms.get(name, 0.0) + elapsed_ms, 3)
+
         residual = hidden_states
         with nvtx_range("hc_attn_pre"):
             hidden_states, post, comb = mhc_pre(
@@ -3920,6 +3940,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         with nvtx_range("attn_norm"):
             hidden_states = self.attn_norm(hidden_states)
+        tic = phase_start()
         with nvtx_range("attn_total"):
             hidden_states = self.attn(
                 positions,
@@ -3929,6 +3950,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 swa_slot_mapping,
                 compressor_slot_cache,
             )
+        phase_done("attn_total", tic)
         with nvtx_range("hc_attn_post"):
             hidden_states = mhc_post(hidden_states, residual, post, comb)
 
@@ -3953,15 +3975,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
         else:
             token_counts = None
+            tic = phase_start()
             with nvtx_range("pre_mlp_comm"):
                 hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
+            phase_done("pre_mlp_comm", tic)
             if self.ffn.gate.is_hash_moe:
+                tic = phase_start()
                 with nvtx_range("pre_mlp_input_ids_comm"):
                     ffn_input_ids = self._pre_mlp_input_ids_comm(input_ids, ctx)
+                phase_done("pre_mlp_input_ids_comm", tic)
+            tic = phase_start()
             with nvtx_range("moe_get_num_tokens"):
                 num_global_tokens, max_num_tokens_per_gpu = (
                     self.comm_manager.get_num_tokens(ctx)
                 )
+            phase_done("moe_get_num_tokens", tic)
+        tic = phase_start()
         with nvtx_range("ffn_total"):
             hidden_states = self.ffn(
                 hidden_states,
@@ -3971,13 +4000,35 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ctx=ctx if use_mega_moe else None,
                 comm_manager=self.comm_manager if use_mega_moe else None,
             )
+        phase_done("ffn_total", tic)
         if not use_mega_moe:
+            tic = phase_start()
             with nvtx_range("post_mlp_comm"):
                 hidden_states, _ = self.comm_manager.post_mlp_comm(
                     hidden_states, None, ctx
                 )
+            phase_done("post_mlp_comm", tic)
         with nvtx_range("hc_ffn_post"):
             hidden_states = mhc_post(hidden_states, residual, post, comb)
+        if timing_enabled and layer_tic is not None:
+            total_ms = (time.perf_counter() - layer_tic) * 1000
+            if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+                logger.debug(
+                    "[DeepSeekV4][slow_layer] layer=%s total_ms=%.3f "
+                    "phase_wall_ms=%s input_tokens=%s num_extends=%s "
+                    "global_num_tokens=%s global_bs=%s use_mega_moe=%s "
+                    "token_counts=%s max_tokens_per_gpu=%s",
+                    self.layer_id,
+                    total_ms,
+                    phase_wall_ms,
+                    ctx.input_num_tokens,
+                    ctx.num_extends,
+                    getattr(ctx, "global_num_tokens", None),
+                    getattr(ctx, "global_bs", None),
+                    use_mega_moe,
+                    token_counts,
+                    max_num_tokens_per_gpu,
+                )
         return hidden_states
 
 

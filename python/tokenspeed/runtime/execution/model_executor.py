@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+SLOW_PREFILL_LOG_THRESHOLD_MS = 1000.0
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -99,6 +101,8 @@ class ModelExecutorConfig:
     device: str
     gpu_id: int
     global_rank: int
+    attn_dp_rank: int
+    attn_tp_rank: int
     num_total_pages: int
     decode_log_interval: int
     cudagraph_capture_sizes: list[int] | None
@@ -160,6 +164,8 @@ class ModelExecutorConfig:
             device=server_args.device,
             gpu_id=gpu_id,
             global_rank=global_rank,
+            attn_dp_rank=server_args.mapping.attn.dp_rank,
+            attn_tp_rank=server_args.mapping.attn.tp_rank,
             num_total_pages=num_total_pages,
             decode_log_interval=server_args.decode_log_interval,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
@@ -585,6 +591,12 @@ class ModelExecutor:
             runtime.min_bs,
         )
 
+    def _consume_layerwise_wait_debug(self, sync: bool = False):
+        counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+        if counter is None or not hasattr(counter, "consume_debug_wait_records"):
+            return [], 0
+        return counter.consume_debug_wait_records(sync=sync)
+
     @maybe_inference_mode()
     def _forward_step(
         self,
@@ -917,6 +929,11 @@ class ModelExecutor:
                 num_queue_reqs,
             )
 
+        forward_tic = (
+            time.perf_counter()
+            if not is_decode and logger.isEnabledFor(logging.DEBUG)
+            else None
+        )
         result = self.execute_forward_op(
             forward_op,
             sampling_params_list,
@@ -927,6 +944,57 @@ class ModelExecutor:
             multimodal_context=multimodal_context,
             capture_next_input_ids=capture_next_input_ids,
         )
+        if forward_tic is not None:
+            forward_elapsed_ms = (time.perf_counter() - forward_tic) * 1000
+            if self.config.global_rank == 0:
+                logger.debug(
+                    "[Scheduler][forward] prefill done elapsed_ms=%.3f "
+                    "num_extends=%s batch=%s input_lengths=%s prefix_lens=%s "
+                    "request_ids=%s",
+                    forward_elapsed_ms,
+                    num_extends,
+                    bs,
+                    forward_op.input_lengths,
+                    forward_op.extend_prefix_lens,
+                    forward_op.request_ids,
+                )
+            if forward_elapsed_ms >= SLOW_PREFILL_LOG_THRESHOLD_MS:
+                logger.debug(
+                    "[Scheduler][forward][slow] prefill elapsed_ms=%.3f "
+                    "global_rank=%s attn_dp_rank=%s attn_tp_rank=%s "
+                    "num_extends=%s batch=%s input_lengths=%s prefix_lens=%s "
+                    "request_ids=%s dp_global_num_tokens=%s dp_global_bs=%s "
+                    "dp_all_decode_or_idle=%s",
+                    forward_elapsed_ms,
+                    self.config.global_rank,
+                    self.config.attn_dp_rank,
+                    self.config.attn_tp_rank,
+                    num_extends,
+                    bs,
+                    forward_op.input_lengths,
+                    forward_op.extend_prefix_lens,
+                    forward_op.request_ids,
+                    dp_global_num_tokens,
+                    dp_global_bs,
+                    dp_all_decode_or_idle,
+                )
+                layer_wait_samples, pending_layer_waits = (
+                    self._consume_layerwise_wait_debug(sync=True)
+                )
+                phase_wall_ms = getattr(self, "_last_forward_phase_wall_ms", {})
+                if phase_wall_ms or layer_wait_samples or pending_layer_waits:
+                    logger.debug(
+                        "[Scheduler][forward][slow_detail] "
+                        "global_rank=%s request_ids=%s phase_wall_ms=%s "
+                        "layer_wait_samples=%s pending_layer_waits=%s",
+                        self.config.global_rank,
+                        forward_op.request_ids,
+                        phase_wall_ms,
+                        layer_wait_samples,
+                        pending_layer_waits,
+                    )
+            else:
+                self._consume_layerwise_wait_debug(sync=False)
 
         if is_decode and (
             self.config.global_rank == 0
@@ -1282,7 +1350,19 @@ class ModelExecutor:
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
         self._active_positions_override = None
+        phase_timing_enabled = logger.isEnabledFor(logging.DEBUG) and num_extends > 0
+        phase_wall_ms: dict[str, float] = {}
 
+        def phase_start():
+            return time.perf_counter() if phase_timing_enabled else None
+
+        def phase_done(name: str, tic) -> None:
+            if tic is None:
+                return
+            elapsed_ms = (time.perf_counter() - tic) * 1000
+            phase_wall_ms[name] = round(phase_wall_ms.get(name, 0.0) + elapsed_ms, 3)
+
+        tic = phase_start()
         with nvtx_range("pre_fill_setup", color="orange"):
             has_retract = num_extends <= 0 and any(
                 x != -1 for x in getattr(forward_op, "hist_token_lens", [])
@@ -1293,14 +1373,18 @@ class ModelExecutor:
             # complete before reading them.
             torch.cuda.current_stream().wait_stream(self.execution_stream)
             self.execution_stream.wait_stream(torch.cuda.current_stream())
+        phase_done("pre_fill_setup", tic)
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
+            tic = phase_start()
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
             )
+            phase_done("fill_input_buffers", tic)
+            tic = phase_start()
             skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
                 forward_op, bs
             )
@@ -1309,7 +1393,9 @@ class ModelExecutor:
                 multimodal_context=multimodal_context,
                 total_tokens=total_tokens,
             )
+            phase_done("input_postprocess", tic)
 
+            tic = phase_start()
             forward_mode = ForwardMode.from_num_extends(
                 num_extends,
                 bs,
@@ -1351,6 +1437,7 @@ class ModelExecutor:
                             self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
                             mamba_pool_indices[:bs][retract_mask],
                         )
+            phase_done("mamba_state_ops", tic)
 
             grammar_completion = None
 
@@ -1360,6 +1447,7 @@ class ModelExecutor:
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
             else:
+                tic = phase_start()
                 gather_ids = None
                 if num_extends > 0:
                     num_decodes = bs - num_extends
@@ -1421,6 +1509,8 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
+                phase_done("forward_context", tic)
+                tic = phase_start()
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
                     grammar_completion = setup_grammar_step(
@@ -1447,11 +1537,13 @@ class ModelExecutor:
                         sampling_params_list=sampling_params_list,
                         num_tokens_per_req=self.config.output_length,
                     )
+                phase_done("sampling_prep", tic)
 
                 with nvtx_range(
                     f"forward_step ext={num_extends} dec={bs - num_extends}",
                     color="blue",
                 ):
+                    tic = phase_start()
                     mamba_kwargs = (
                         {
                             "mamba_pool_indices": self.input_buffers.mamba_pool_indices_buf[
@@ -1470,6 +1562,8 @@ class ModelExecutor:
                         if self.input_buffers.has_mamba
                         else {}
                     )
+                    phase_done("mamba_kwargs", tic)
+                    tic = phase_start()
                     paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
                         forward_op,
                         device=self.device,
@@ -1483,7 +1577,9 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
+                    phase_done("paged_cache_tables", tic)
                     self._log_dp_sampling_route(bs, ctx)
+                    tic = phase_start()
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -1508,8 +1604,10 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
+                    phase_done("forward_step", tic)
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
+                tic = phase_start()
                 self._update_runtime_state(
                     req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                     output_tokens=output_tokens,
@@ -1522,7 +1620,9 @@ class ModelExecutor:
                     bs,
                     num_extends,
                 )
+                phase_done("runtime_state_update", tic)
 
+            tic = phase_start()
             with nvtx_range("output_d2h", color="green"):
                 next_input_ids = None
                 if (
@@ -1566,7 +1666,9 @@ class ModelExecutor:
 
                 copy_event = torch.cuda.Event()
                 copy_event.record()
+            phase_done("output_d2h", tic)
 
+        self._last_forward_phase_wall_ms = phase_wall_ms
         return ModelExecutionResult(
             output_tokens=output_tokens,
             output_lengths=output_lengths,

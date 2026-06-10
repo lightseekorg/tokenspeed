@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Iterable
 
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
@@ -55,6 +56,9 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_indices: tuple[int, ...] = ()
+        self._debug_wait_records: list[tuple[int, int, object, object]] = []
+        self._debug_sample_layers = {0, max(0, num_layers // 2), max(0, num_layers - 1)}
+        self._debug_record_limit = 96
 
     def update_producer(self):
         next_index = (self.producer_index + 1) % self.num_counters
@@ -76,9 +80,54 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if not self.consumer_indices:
             return
+        record_wait = (
+            logger.isEnabledFor(logging.DEBUG)
+            and threshold in self._debug_sample_layers
+            and len(self._debug_wait_records) < self._debug_record_limit
+        )
         for consumer_index in self.consumer_indices:
-            self.events[consumer_index].wait(threshold)
+            if record_wait:
+                start_event = device_module.Event(enable_timing=True)
+                end_event = device_module.Event(enable_timing=True)
+                start_event.record()
+                self.events[consumer_index].wait(threshold)
+                end_event.record()
+                self._debug_wait_records.append(
+                    (consumer_index, threshold, start_event, end_event)
+                )
+            else:
+                self.events[consumer_index].wait(threshold)
+
+    def consume_debug_wait_records(self, sync: bool = False):
+        records = []
+        pending = 0
+        for (
+            consumer_index,
+            layer_index,
+            start_event,
+            end_event,
+        ) in self._debug_wait_records:
+            if sync:
+                end_event.synchronize()
+            if not end_event.query():
+                pending += 1
+                continue
+            try:
+                elapsed_ms = start_event.elapsed_time(end_event)
+            except (AttributeError, RuntimeError, ValueError):
+                pending += 1
+                continue
+            records.append(
+                {
+                    "producer": consumer_index,
+                    "layer": layer_index,
+                    "wait_ms": round(float(elapsed_ms), 3),
+                }
+            )
+        self._debug_wait_records.clear()
+        return records, pending
 
     def reset(self):
         self.producer_index = -1
         self.consumer_indices = ()
+        self._debug_wait_records.clear()

@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import faulthandler
+import logging
 import signal
 import time
 from collections import OrderedDict
@@ -1157,11 +1158,13 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        sync_tic = time.perf_counter()
         dist.all_gather_into_tensor(
             self._dp_global_info,
             self._dp_local_info,
             group=self.world_cpu_group,
         )
+        sync_elapsed_ms = (time.perf_counter() - sync_tic) * 1000
         global_num_tokens = self._dp_global_info[:, 0].tolist()
         global_batch_size = self._dp_global_info[:, 1].tolist()
         global_forward_mode = self._dp_global_info[:, 2].tolist()
@@ -1176,6 +1179,25 @@ class EventLoop:
             )
             for mode in global_forward_mode
         )
+        if logger.isEnabledFor(logging.DEBUG) and sync_elapsed_ms >= 20.0:
+            logger.debug(
+                "[Scheduler][forward][dp_sync] elapsed_ms=%.3f "
+                "global_rank=%s dp_rank=%s local_tokens=%s local_batch=%s "
+                "local_mode=%s global_num_tokens=%s global_batch_size=%s "
+                "global_forward_mode=%s need_idle_forward=%s "
+                "all_decode_or_idle=%s",
+                sync_elapsed_ms,
+                self.global_rank,
+                self.dp_rank,
+                num_tokens,
+                batch_size,
+                int(forward_mode),
+                global_num_tokens,
+                global_batch_size,
+                global_forward_mode,
+                need_idle_forward,
+                all_decode_or_idle,
+            )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
             global_batch_size=global_batch_size,

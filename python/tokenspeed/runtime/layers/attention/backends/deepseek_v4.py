@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Optional
 
 import torch
@@ -55,8 +57,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _split_paged_cache_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+
+logger = get_colorful_logger(__name__)
+SLOW_DEEPSEEK_V4_ATTN_LOG_THRESHOLD_MS = 250.0
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
 
@@ -1441,6 +1447,20 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
             )
 
+        timing_enabled = logger.isEnabledFor(logging.DEBUG)
+        total_tic = time.perf_counter() if timing_enabled else None
+        phase_wall_ms: dict[str, float] = {}
+
+        def phase_start():
+            return time.perf_counter() if timing_enabled else None
+
+        def phase_done(name: str, tic) -> None:
+            if tic is None:
+                return
+            elapsed_ms = (time.perf_counter() - tic) * 1000
+            phase_wall_ms[name] = round(phase_wall_ms.get(name, 0.0) + elapsed_ms, 3)
+
+        tic = phase_start()
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
             if q.shape[1] == padded_heads:
                 q_padded = q.contiguous()
@@ -1451,6 +1471,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     device=q.device,
                 )
                 q_padded[:, : q.shape[1]].copy_(q)
+        phase_done("pad_q", tic)
+        tic = phase_start()
         with nvtx_range(f"attn_{kind}_prefill_workspace"):
             kv_workspace, indices, lens = self._prefill_workspace(
                 positions=positions,
@@ -1461,6 +1483,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 head_dim=head_dim,
                 topk_indices=topk_indices,
             )
+        phase_done("workspace", tic)
+        tic = phase_start()
         with nvtx_range(f"attn_{kind}_prefill_flashmla"):
             out, _, _ = flash_mla_sparse_fwd(
                 q=q_padded,
@@ -1470,6 +1494,36 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 attn_sink=attn_sink,
                 topk_length=lens,
             )
+        phase_done("flashmla", tic)
+        if timing_enabled and total_tic is not None:
+            total_ms = (time.perf_counter() - total_tic) * 1000
+            if total_ms >= SLOW_DEEPSEEK_V4_ATTN_LOG_THRESHOLD_MS:
+                try:
+                    max_seq_len = int(metadata.seq_lens.max().item())
+                    max_query_len = int(metadata.query_lens.max().item())
+                    max_lens = int(lens.max().item())
+                except Exception:
+                    max_seq_len = -1
+                    max_query_len = -1
+                    max_lens = -1
+                logger.debug(
+                    "[DeepSeekV4][slow_attn_prefill] layer=%s kind=%s "
+                    "ratio=%s total_ms=%.3f phase_wall_ms=%s tokens=%s "
+                    "reqs=%s max_seq_len=%s max_query_len=%s max_lens=%s "
+                    "workspace_shape=%s indices_shape=%s",
+                    layer_id,
+                    kind,
+                    compress_ratio,
+                    total_ms,
+                    phase_wall_ms,
+                    q.shape[0],
+                    int(metadata.num_prefill_reqs or metadata.seq_lens.numel()),
+                    max_seq_len,
+                    max_query_len,
+                    max_lens,
+                    tuple(kv_workspace.shape),
+                    tuple(indices.shape),
+                )
         return out[:, :num_local_heads]
 
     def forward_deepseek_v4_prefill(
