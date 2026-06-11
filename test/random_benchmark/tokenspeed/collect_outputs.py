@@ -49,15 +49,6 @@ def _float(summary: dict, key: str) -> float:
         return 0.0
 
 
-def _output_tps(summary: dict) -> float:
-    output_tps = _float(summary, "Output Throughput (tok/s)")
-    if output_tps:
-        return output_tps
-    return _float(summary, "Req Throughput (req/s)") * _float(
-        summary, "Avg Output Tokens"
-    )
-
-
 def collect(sweep_dir: Path, num_gpus: int):
     rows = []
     for summary_path in sorted(sweep_dir.rglob("benchmark_summary.json")):
@@ -72,7 +63,7 @@ def collect(sweep_dir: Path, num_gpus: int):
 
         tpot_ms = _float(summary, "TPOT (ms)")
         tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
-        output_tps = _output_tps(summary)
+        output_tps = _float(summary, "Output Throughput (tok/s)")
         cache_hit = _float(summary, "KV Cache Hit Rate (%)")
         decoded_per_iter = _float(summary, "Decoded Tok/Iter") or _float(
             summary, "Avg Decoded Tokens/Iter"
