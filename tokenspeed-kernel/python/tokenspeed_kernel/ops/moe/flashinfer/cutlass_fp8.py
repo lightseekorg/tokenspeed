@@ -88,7 +88,6 @@ if platform.is_nvidia:
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
             "fp8_scale_block_shape": frozenset({(128, 128)}),
-            "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
         priority=Priority.PERFORMANT,

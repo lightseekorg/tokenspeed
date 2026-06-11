@@ -143,7 +143,6 @@ if platform.is_nvidia:
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
             "ispp_alignment": frozenset({64}),
-            "internal_activation_dtype": frozenset({"fp4"}),
             "supports_bias": frozenset({False}),
         },
         priority=Priority.PERFORMANT,
