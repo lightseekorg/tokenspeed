@@ -67,6 +67,7 @@ _MODEL_CASES = [
         "txn545/Qwen3.5-35B-A3B-NVFP4",
         extra_kwargs={
             "attention_backend": "trtllm",
+            "moe_backend": "flashinfer_trtllm",
             "quantization": "nvfp4",
         },
         is_thinking_model=True,
