@@ -20,9 +20,6 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 from tokenspeed_kernel.platform import (
@@ -39,97 +36,24 @@ with redirect_triton_to_tokenspeed_triton():
     import triton_kernels.matmul_details  # noqa: F401
     import triton_kernels.matmul_details.opt_flags  # noqa: F401
     import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.swiglu  # noqa: F401
     import triton_kernels.tensor  # noqa: F401
     import triton_kernels.tensor_details  # noqa: F401
     import triton_kernels.tensor_details.layout  # noqa: F401
-    import triton_kernels.topk  # noqa: F401
 
 import triton_kernels.matmul_details.opt_flags as opt_flags
-from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from triton_kernels.matmul import (
     FlexCtx,
-    FnSpecs,
-    FusedActivation,
     PrecisionConfig,
-    matmul,
 )
-from triton_kernels.matmul_details.opt_flags import scoped_opt_flags_constraints
 from triton_kernels.numerics import InFlexData
-from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import (
     FP4,
-    RaggedTensorMetadata,
     convert_layout,
-    make_ragged_tensor_metadata,
     wrap_torch_tensor,
 )
 from triton_kernels.tensor_details import layout
-from triton_kernels.topk import topk
 
 platform = current_platform()
-
-
-"""
-def _is_bf16_mxfp4(x, w, precision_config):
-    if precision_config is None:
-        return False
-    if getattr(precision_config, "b_mx_scale", None) is None:
-        return False
-    x_dtype = getattr(x, "dtype", None)
-    if x_dtype not in (torch.float16, torch.bfloat16):
-        return False
-    w_bw = getattr(getattr(w, "dtype", None), "bitwidth", None)
-    return w_bw == 4
-
-
-def _lds_guard_should_apply(x, w, precision_config):
-    if scoped_opt_flags_constraints is None:
-        return False
-    if not current_platform().is_cdna4:
-        return False
-    return _is_bf16_mxfp4(x, w, precision_config)
-
-
-@contextmanager
-def _maybe_lds_guard(x, w, precision_config):
-    if not _lds_guard_should_apply(x, w, precision_config):
-        yield
-        return
-    with scoped_opt_flags_constraints({"block_m": 64, "block_n": 128, "block_k": 256}):
-        yield
-
-
-def _routing(
-    logits: torch.Tensor,
-    n_expts_act: int,
-    sm_first: bool = False,
-    dtype: torch.dtype | None = None,
-) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if dtype is None:
-        dtype = logits.dtype
-
-    assert logits.ndim == 2, "router_logits must be (n_tokens, n_expts_tot)"
-    n_tokens, _ = logits.shape
-
-    assert sm_first is False, "sm_first=True not supported for triton_kernels routing"
-    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
-    mask_metadata = sparse.mask_metadata
-
-    col_sorted = mask_metadata.col_sorted_indx
-    gather_indx = col_sorted // n_expts_act
-    scatter_indx = col_sorted
-
-    vals_flat = sparse.vals.reshape(-1)
-    if dtype is not None and vals_flat.dtype != dtype:
-        vals_flat = vals_flat.to(dtype)
-    gate_scal = vals_flat[scatter_indx]
-
-    n_total_rows = n_tokens * n_expts_act
-    ragged_metadata = make_ragged_tensor_metadata(mask_metadata.col_sum, n_total_rows)
-
-    return ragged_metadata, gather_indx, scatter_indx, gate_scal
-"""
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -316,9 +240,6 @@ if platform.is_amd:
             w2_precision_config=getattr(w, "w2_precision_config", None),
             w13_act_scale=w.w13_act_scale,
             w2_act_scale=w.w2_act_scale,
-            quantize_fp8_fn=quantize_fp8_fn,  # FIXME
-            moe_experts_fn=moe_experts_fn,  # FIXME
-            moe_route_fn=moe_route_fn,  # FIXME
             top_k=top_k,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
