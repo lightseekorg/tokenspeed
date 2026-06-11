@@ -48,7 +48,7 @@ if platform.is_nvidia:
         ),
         signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"unquant"})},
-        priority=Priority.PERFORMANT + 1,
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_cutlass_unquant_moe_process_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
@@ -82,7 +82,7 @@ if platform.is_nvidia:
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
-        priority=Priority.PERFORMANT + 1,
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_cutlass_unquant_moe_apply(
         plan: dict,

@@ -55,7 +55,7 @@ if platform.is_nvidia:
         traits={"weight_dtype": frozenset({"nvfp4"})},
         # DeepEP needs an EP process group in the plan, so it
         # must not become the generic NVFP4 auto-selected solution.
-        priority=Priority.REFERENCE,
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_cutedsl_deepep_nvfp4_moe_process_weights(
         plan: dict, w: torch.nn.Module
@@ -146,7 +146,7 @@ if platform.is_nvidia:
             "internal_activation_dtype": frozenset({"fp4"}),
             "supports_bias": frozenset({False}),
         },
-        priority=Priority.REFERENCE,
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_cutedsl_deepep_nvfp4_moe_apply(
         plan: dict,

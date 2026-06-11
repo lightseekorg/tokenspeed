@@ -47,7 +47,7 @@ if platform.is_nvidia:
         ),
         signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"fp8"})},
-        priority=Priority.PERFORMANT + 2,
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_cutlass_fp8_moe_process_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
@@ -91,7 +91,7 @@ if platform.is_nvidia:
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
-        priority=Priority.PERFORMANT + 2,
+        priority=Priority.PERFORMANT,
     )
     def flashinfer_cutlass_fp8_moe_apply(
         plan: dict,
