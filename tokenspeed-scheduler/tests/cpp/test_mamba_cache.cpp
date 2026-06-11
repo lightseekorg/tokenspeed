@@ -194,12 +194,56 @@ TEST_F(MambaCacheTest, KVEvictionTriggersMambaEviction) {
     auto match = prefix_cache_->Match(tokens);
     TreeNode* node = match.device.last_node;
     EXPECT_TRUE(node->HasMamba());
+    const std::int32_t slots_before = mamba_alloc_->AvailableSlots();
 
     prefix_cache_->GetDeviceManager().SetEvictionCallback([this](TreeNode* n) { hybrid_prefix_cache_->OnKVEvict(n); });
+    // Untrack the pruned node before it is freed so this single-node tree's
+    // terminal is destroyed cleanly by the eviction prune.
+    prefix_cache_->GetRadixTree().SetNodeDestroyCallback(
+        [this](TreeNode* n) { hybrid_prefix_cache_->OnNodeDestroyed(n); });
 
     prefix_cache_->EnsureCapacityByEvict<ResourceType::Device>(kDevicePages);
 
-    EXPECT_FALSE(node->HasMamba());
+    // `node` has been pruned (KV-empty leaf with no children) and freed, so we
+    // must not dereference it. OnKVEvict released its mamba slot back to the
+    // pool; assert via the allocator instead.
+    EXPECT_EQ(mamba_alloc_->AvailableSlots(), slots_before + 1);
+}
+
+// Production-path regression for the dashllm1.log segfault. A mamba-bearing
+// node can end up tracked in mamba_leaves_ while it no longer holds device KV
+// (mamba is tracked at a coarser cadence than KV pages, and mamba Evict promotes
+// KV-less ancestors into mamba_leaves_). When RadixTree::PruneEmptyByNode later
+// frees such a node as an empty ancestor, nothing in the per-tier KV eviction
+// callbacks untracks it -> mamba_leaves_ keeps a dangling pointer, and the next
+// MambaEvictionManager::Evict dereferences it. The node-destroy callback wired
+// here (as Scheduler wires it) drops the node from mamba_leaves_ before prune
+// frees it. Run under ASAN: pre-fix this trips heap-use-after-free in
+// MambaEvictionManager::Evict; post-fix it is clean.
+TEST_F(MambaCacheTest, PruneOfMambaNodeUntracksSoLaterEvictIsSafe) {
+    prefix_cache_->GetRadixTree().SetNodeDestroyCallback(
+        [this](TreeNode* n) { hybrid_prefix_cache_->OnNodeDestroyed(n); });
+
+    // Insert a mamba node (2 pages of KV + a mamba slot), tracked in
+    // mamba_leaves_.
+    auto tokens = MakeAlignedTokens(2, kPageSize);
+    InsertKVAndMamba(tokens);
+    TreeNode* mamba_node = prefix_cache_->Match(tokens).device.last_node;
+    ASSERT_TRUE(mamba_node->HasMamba());
+
+    // Detach its device KV WITHOUT firing the KV eviction callback, leaving the
+    // node KV-empty but still mamba-tracked. This is the state mamba Evict /
+    // demote can leave a KV-less ancestor in: present in mamba_leaves_, absent
+    // from the KV LRU.
+    mamba_node->DetachResource<ResourceType::Device>();
+
+    // Prune it through the real tree path that frees production nodes. The
+    // node-destroy callback must untrack it from mamba_leaves_ before the
+    // unique_ptr is dropped.
+    prefix_cache_->GetRadixTree().PruneEmptyByNode(mamba_node);
+
+    // Walk mamba_leaves_. If the freed node lingered, this is a use-after-free.
+    hybrid_prefix_cache_->EnsureMambaCapacityByEvict(kMambaSlots + 1);
 }
 
 class MambaL2CacheTest : public ::testing::Test {

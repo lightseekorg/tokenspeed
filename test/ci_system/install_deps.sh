@@ -9,7 +9,7 @@ set -e
 # to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AMD_RUNNER_LABEL_PATTERNS=(linux-mi350* linux-mi355*)
+AMD_RUNNER_LABEL_PATTERNS=(*mi350* *mi355* *mi35x*)
 
 for pat in "${AMD_RUNNER_LABEL_PATTERNS[@]}"; do
     if [[ "${CI_RUNNER_LABEL:-}" == ${pat} ]]; then
@@ -109,7 +109,7 @@ echo "=== Step 5: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
 # python/pyproject.toml; pip resolves them from PyPI as part of the
 # editable install below.
-pip_install_with_retry pip3 install -e "./python[cuda_${SM}]" \
+pip_install_with_retry pip3 install -e "./python" \
     --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
 
 # ============================================================
@@ -127,9 +127,36 @@ if [ "${INSTALL_TOKENSPEED_MLA_FROM_SOURCE:-0}" = "1" ]; then
 fi
 
 # ============================================================
-# Step 7: Fix Triton ptxas (CUDA 13+ only)
+# Step 7: Pin critical kernel deps to exact versions
 # ============================================================
-echo "=== Step 7: Fix Triton ptxas ==="
+echo "=== Step 7: Pin critical kernel deps ==="
+CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
+pin_version() {
+    # Extract "<pkg>==<version>" for an exact-pinned package in cuda.txt.
+    local pkg="$1"
+    grep -E "^${pkg}==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
+}
+CUDA_MAJOR="${CUDA_VERSION%%.*}"
+PINNED_KERNEL_DEPS=()
+for pkg in nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR} \
+           flashinfer-python flashinfer-cubin; do
+    spec="$(pin_version "${pkg}")"
+    if [ -n "${spec}" ]; then
+        PINNED_KERNEL_DEPS+=("${spec}")
+    fi
+done
+if [ "${#PINNED_KERNEL_DEPS[@]}" -gt 0 ]; then
+    echo "Force-reinstalling pinned kernel deps: ${PINNED_KERNEL_DEPS[*]}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${PINNED_KERNEL_DEPS[@]}"
+else
+    echo "No pinned kernel deps found in ${CUDA_REQ}; skipping."
+fi
+
+# ============================================================
+# Step 8: Fix Triton ptxas (CUDA 13+ only)
+# ============================================================
+echo "=== Step 8: Fix Triton ptxas ==="
 if [ "${CUDA_VERSION%%.*}" = "13" ]; then
     TRITON_BIN="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin"
     if [ -d "${TRITON_BIN}" ]; then

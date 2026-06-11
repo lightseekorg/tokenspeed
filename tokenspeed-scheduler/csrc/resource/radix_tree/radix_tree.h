@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -53,6 +54,15 @@ public:
     std::int32_t PageSize() const { return page_size_; }
     TreeNode* Root() const { return root_.get(); }
 
+    // Invoked with each TreeNode about to be destroyed by PruneEmptyByNode,
+    // before the owning unique_ptr is dropped. Adjuncts that hold raw TreeNode*
+    // (e.g. HybridPrefixCache's mamba_leaves_ / paged_cache_snapshot_nodes_)
+    // register here to drop the dying node from their bookkeeping, so a pruned
+    // node — including an empty ancestor pruned in the same pass — never leaves
+    // a dangling pointer behind.
+    using NodeDestroyCallback = std::function<void(TreeNode*)>;
+    void SetNodeDestroyCallback(NodeDestroyCallback cb) { node_destroy_callback_ = std::move(cb); }
+
     WalkResult WalkDownUtilMismatch(token_slice aligned_tokens, TreeNode::timestamp_t access_time,
                                     TreeNode* start_node = nullptr);
 
@@ -69,6 +79,7 @@ private:
 private:
     std::int32_t page_size_;
     std::unique_ptr<TreeNode> root_;
+    NodeDestroyCallback node_destroy_callback_{};
 };
 
 }  // namespace tokenspeed

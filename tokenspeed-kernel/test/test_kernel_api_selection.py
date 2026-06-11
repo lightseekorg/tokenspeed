@@ -35,8 +35,6 @@ import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
-import tokenspeed_kernel.ops.attention.gluon.mha_decode_fp16_gfx950 as _gluon_decode
-import tokenspeed_kernel.ops.attention.gluon.mha_prefill_fp16_gfx950 as _gluon_prefill
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
@@ -50,6 +48,9 @@ import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.moe.triton_kernels as _moe_triton_kernels
 import tokenspeed_kernel.ops.moe.trtllm as _moe_trtllm
+import tokenspeed_kernel.ops.sampling as _sampling_pkg
+import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
+import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
@@ -60,8 +61,6 @@ _RELOAD_MODULES = [
     _attention_cuda,
     _attention_flash_attn,
     _attention_flashinfer,
-    _gluon_decode,
-    _gluon_prefill,
     _attention_gluon,
     _attention_triton,
     _attention_pkg,
@@ -81,6 +80,10 @@ _RELOAD_MODULES = [
     _moe_triton_kernels,
     _moe_trtllm,
     _moe_pkg,
+    # Sampling registration modules.
+    _sampling_cute_dsl,
+    _sampling_gluon,
+    _sampling_pkg,
     # Top-level public API re-exports.
     tokenspeed_kernel,
 ]
@@ -122,6 +125,10 @@ def _is_blackwell_plus(platform: PlatformInfo) -> bool:
 
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
+
+
+def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
+    return platform.is_nvidia and _sampling_cute_dsl.is_available()
 
 
 def _is_cdna4(platform: PlatformInfo) -> bool:
@@ -329,7 +336,12 @@ def _attention_merge_state() -> object:
     out_b = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     lse_a = torch.empty((4, 16), dtype=torch.float32)
     lse_b = torch.empty((4, 16), dtype=torch.float32)
-    return tokenspeed_kernel.mha_merge_state(out_a, lse_a, out_b, lse_b)
+    return tokenspeed_kernel.attn_merge_state(out_a, lse_a, out_b, lse_b)
+
+
+def _sampling_argmax() -> object:
+    logits = torch.empty((4, 4096), dtype=torch.float32, device="cuda")
+    return tokenspeed_kernel.argmax(logits)
 
 
 def _moe_route_grouped_topk() -> object:
@@ -645,6 +657,23 @@ _CASES = [
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
     ),
+    # Sampling API x architecture golden cases.
+    _case(
+        _is_nvidia_with_cute_dsl,
+        "nvidia-cutedsl",
+        "sampling",
+        "argmax",
+        "cute_dsl_argmax",
+        _sampling_argmax,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "sampling",
+        "argmax",
+        "gluon_argmax_gfx950",
+        _sampling_argmax,
+    ),
     # MoE API x architecture golden cases.
     _case(
         _is_supported_gpu,
@@ -663,11 +692,11 @@ _CASES = [
         _moe_route_biased_topk,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_cdna4,
+        "cdna4",
         "moe",
         "route",
-        "triton_kernels_routing",
+        "gluon_decode_routing_gfx950",
         _moe_route_ragged_metadata,
     ),
     _case(
@@ -803,6 +832,15 @@ def selected_kernel_spy(monkeypatch):
                 lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
                 return torch.empty_like(q), lse
             return torch.empty_like(q)
+
+        if case.family == "sampling":
+            (logits,) = args[:1]
+            out = kwargs.get("out")
+            if out is not None:
+                return out
+            return torch.empty(
+                (logits.shape[0],), dtype=torch.int64, device=logits.device
+            )
 
         return None
 

@@ -45,6 +45,12 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
         self.assertEqual(args.attention_backend, "trtllm_mla")
 
+    def test_attention_backend_accepts_mla(self):
+        args = self._build_parser().parse_args(
+            ["--model", "x", "--attention-backend", "mla"]
+        )
+        self.assertEqual(args.attention_backend, "mla")
+
     def test_attention_backend_accepts_mha_kernel_solutions(self):
         for backend in ("fa3", "fa4", "triton", "flashinfer"):
             args = self._build_parser().parse_args(
@@ -101,6 +107,14 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 registry._get_backend_cls(backend, AttentionArch.MHA),
                 MHAAttnBackend,
             )
+
+    def test_mla_backend_registered_for_mla(self):
+        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+
+        self.assertIs(
+            registry._get_backend_cls("mla", AttentionArch.MLA),
+            MLAAttnBackend,
+        )
 
     def test_sm90_defaults_to_flashmla_for_mla(self):
         platform = SimpleNamespace(is_blackwell=False, is_hopper=True)

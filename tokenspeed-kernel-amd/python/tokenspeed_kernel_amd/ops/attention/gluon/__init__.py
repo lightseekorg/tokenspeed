@@ -18,32 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Gluon attention kernels."""
+
 from __future__ import annotations
 
-from tokenspeed_kernel._triton import gl, gluon, tl
-
-_INV_LN2_VALUE = 1.4426950408889634
-_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
-
-
-@gluon.jit
-def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
-    return gl.maximum(a, b, propagate_nan=propagate_nan)
-
-
-@gluon.jit
-def max(input, axis=None, keep_dims=False):
-    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
-
-
-@gluon.aggregate
-class InputStrides:
-    stride_t: gl.constexpr
-    stride_h: gl.constexpr
-    stride_d: gl.constexpr
-
-    @gluon.jit
-    def offsets(self, token, head, dim):
-        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
-            gl.int32
-        )
+from tokenspeed_kernel_amd.ops.attention.gluon.mha_decode_fp16_gfx950 import (  # noqa: F401
+    gluon_mha_decode_fp16_gfx950,
+)
+from tokenspeed_kernel_amd.ops.attention.gluon.mha_prefill_fp16_gfx950 import (  # noqa: F401
+    gluon_mha_prefill_fp16_gfx950,
+)

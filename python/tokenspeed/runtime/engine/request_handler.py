@@ -41,9 +41,12 @@ from tokenspeed.runtime.engine.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    IsSchedulerPausedReqInput,
+    PauseSchedulerReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ResumeSchedulerReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
@@ -81,10 +84,13 @@ class RequestHandler:
         send_func,
         get_load_fn=None,
         architectures: list[str] | None = None,
+        pause_controller=None,
     ) -> None:
 
         self.forward_ct = 0
         self.server_args = server_args
+        # Owns pause/resume state; shared with the event loop. See pause.py.
+        self.pause_controller = pause_controller
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -170,6 +176,14 @@ class RequestHandler:
                 # Prefix cache is owned by the scheduler path; acknowledge the
                 # control request here so API callers still get a typed reply.
                 self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
+            elif isinstance(recv_req, PauseSchedulerReqInput):
+                # State change + reply (abort/wait replies are deferred by the
+                # controller until the event loop observes a drained scheduler).
+                self.pause_controller.handle_pause(recv_req)
+            elif isinstance(recv_req, ResumeSchedulerReqInput):
+                self.pause_controller.handle_resume(recv_req)
+            elif isinstance(recv_req, IsSchedulerPausedReqInput):
+                self.pause_controller.handle_is_paused(recv_req)
             elif isinstance(recv_req, GetInternalStateReq):
                 self.send_func.send_pyobj(GetInternalStateReqOutput(internal_state={}))
             elif isinstance(recv_req, SetInternalStateReq):

@@ -191,6 +191,11 @@ class TrtllmAllReduceBackend(CommBackend):
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         return self._fallback.reduce_scatter(tensor, group)
 
+    def all_to_all_single(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> None:
+        return self._fallback.all_to_all_single(output, input, group)
+
     def token_all_gather(
         self,
         tensor: torch.Tensor,

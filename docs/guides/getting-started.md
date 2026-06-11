@@ -44,8 +44,8 @@ export PIP_BREAK_SYSTEM_PACKAGES=1
 pip install -e "./python" --no-build-isolation
 ```
 
-Install the kernel package. Its Python package metadata installs the CUDA
-kernel dependencies automatically.
+Install the kernel package. Its Python package metadata installs the selected
+backend dependencies automatically.
 
 ```bash
 pip install -e tokenspeed-kernel/python/ --no-build-isolation

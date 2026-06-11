@@ -89,6 +89,41 @@ protected:
     }
 };
 
+class PagedCacheDecodePublishTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.page_size = 1;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.decode_input_tokens = 4;
+        cfg.enable_l3_storage = false;
+
+        PagedCacheGroupConfig history{};
+        history.group_id = "fh";
+        history.rows_per_page = 2;
+        history.entry_stride_tokens = 1;
+        history.total_pages = 64;
+        history.retention = PagedCacheGroupConfig::Retention::FullHistory;
+        history.family = PagedCacheGroupFamily::History;
+        cfg.paged_cache_groups.push_back(history);
+
+        PrefixCacheAdjunctSpec spec{};
+        spec.required_groups = {"fh"};
+        cfg.prefix_cache_adjunct = spec;
+        return cfg;
+    }
+
+    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
+        }
+        return nullptr;
+    }
+};
+
 class PagedCacheTerminalContinuationTest : public ::testing::Test {
 protected:
     static constexpr std::int32_t kPageSize = 64;
@@ -337,6 +372,78 @@ TEST(PagedCacheAdmissionTest, ExistingTransportStateGroupUsesSlidingWindowCredit
     EXPECT_THROW(hybrid.AcquireForRequest("r", /*first_raw_position_of_op=*/32,
                                           /*target_raw_tokens_exclusive=*/64),
                  std::runtime_error);
+}
+
+TEST(PagedCacheRewindTest, RewindRequestReleasesRejectedTailAndKeepsCommittedPrefix) {
+    PageAllocator device_alloc(/*page_size=*/2, /*total_pages=*/16);
+    KVPrefixCache kv_cache(&device_alloc, /*host=*/nullptr);
+
+    PagedCacheGroupConfig history{};
+    history.group_id = "fh";
+    history.rows_per_page = 2;
+    history.entry_stride_tokens = 1;
+    history.total_pages = 8;
+    history.retention = PagedCacheGroupConfig::Retention::FullHistory;
+    history.family = PagedCacheGroupFamily::History;
+
+    auto history_owner = std::make_unique<PagedCacheGroupAllocator>(history);
+    HybridPrefixCache hybrid(kv_cache, /*mamba=*/nullptr, /*mamba_chunk_size=*/0);
+    hybrid.RegisterPagedCacheGroup(std::move(history_owner));
+    hybrid.EnablePagedCacheAdjunct({"fh"}, {});
+
+    ASSERT_EQ(hybrid.PagedCacheGroupAvailablePages("fh"), 7);
+    hybrid.AcquireForRequest("r", /*first_raw_position_of_op=*/0, /*target_raw_tokens_exclusive=*/8);
+    ASSERT_EQ(hybrid.GetRequestPagedCachePageIds("r", "fh").size(), 4u);
+    ASSERT_EQ(hybrid.PagedCacheGroupAvailablePages("fh"), 3);
+
+    auto tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2, /*start=*/1);
+    OwnedPages pages = device_alloc.Allocate(/*num_pages=*/2);
+    auto inserted =
+        kv_cache.Insert<ResourceType::Device>(tokens, /*prefix_pages=*/{}, std::move(pages), /*page_hashes=*/{});
+    ASSERT_NE(inserted.last_node, nullptr);
+    hybrid.CommitChunk("r", inserted.last_node);
+    ASSERT_TRUE(inserted.last_node->HasPagedCacheSnapshot());
+
+    hybrid.RewindRequest("r", /*accepted_raw_tokens=*/5);
+
+    EXPECT_EQ(hybrid.GetRequestPagedCachePageIds("r", "fh").size(), 3u);
+    EXPECT_EQ(hybrid.PagedCacheGroupAvailablePages("fh"), 4);
+    auto match = hybrid.Match(MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2, /*start=*/1));
+    EXPECT_EQ(match.paged_cache.history_hit_tokens, 4);
+}
+
+TEST_F(PagedCacheDecodePublishTest, ContinuingDecodePublishesAcceptedPagesOnly) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    SendForwardDone("r1", {3});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    // Accepted 2 tokens from a 4-token speculative reserve. The accepted truth is
+    // {1,2,3,4,5}; with except-last KV semantics, only prefix {1,2,3,4}
+    // can be published. Reserved/draft tail slots beyond that must stay local.
+    SendForwardDone("r1", {4, 5});
+    EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "fh").size(), 3u);
+
+    Submit({
+        RequestSpec{.request_id = "hit4", .tokens = {1, 2, 3, 4, 5}},
+        RequestSpec{.request_id = "probe_tail", .tokens = {1, 2, 3, 4, 5, 6}},
+    });
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_GE(fwd->extend_prefix_lens.size(), 2u);
+
+    std::unordered_map<std::string, std::int32_t> prefix_by_request;
+    for (std::size_t row = 0; row < fwd->extend_prefix_lens.size(); ++row) {
+        ASSERT_LT(row, fwd->request_ids.size());
+        prefix_by_request.emplace(fwd->request_ids[row], fwd->extend_prefix_lens[row]);
+    }
+
+    ASSERT_TRUE(prefix_by_request.contains("hit4"));
+    ASSERT_TRUE(prefix_by_request.contains("probe_tail"));
+    EXPECT_EQ(prefix_by_request.at("hit4"), 4);
+    EXPECT_EQ(prefix_by_request.at("probe_tail"), 4);
 }
 
 TEST_F(PagedCacheTerminalMixedSchedulerTest, MixedPrefillDecodePagedTablesCoverScheduledTokens) {

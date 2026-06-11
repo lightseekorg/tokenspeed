@@ -354,6 +354,14 @@ class CudaGraphWrapper:
         # During capture, use uniform dummy counts across ranks.
         if self.dp_size > 1:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
+            # global_bs must ALSO be set at capture. The draft first-step MoE
+            # all-gather (draft_first_step_reduce) sizes its TritonRSAG collective
+            # from ctx.global_bs; if left None at capture it records a single-rank
+            # layout (fallback branch in comm_manager), but at replay global_bs is
+            # the live per-rank batch list -> multi-rank layout. The mismatch makes
+            # the captured (frozen-offset) gather read uninitialized symm-mem ->
+            # NaN draft logits -> accept_rate 0. Set the matching uniform dummy.
+            ctx.global_bs = [bs] * self.world_size
 
         # Capture with is_all_greedy=False so the graph records the full
         # top_k_top_p_sampling path (greedy-only requests are served by the

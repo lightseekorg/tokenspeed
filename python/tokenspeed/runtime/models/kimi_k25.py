@@ -870,7 +870,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         **kwargs,
     ):
         if self.language_model is None:
@@ -897,7 +896,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
             input_ids,
             positions,
             out_cache_loc,
-            input_lengths,
             **kwargs,
         )
 
@@ -986,6 +984,15 @@ class KimiK25ForConditionalGeneration(nn.Module):
             raise AttributeError("language_model does not expose lm_head.")
 
         return self.language_model.lm_head
+
+    @property
+    def logits_processor(self):
+        if self.language_model is None or not hasattr(
+            self.language_model, "logits_processor"
+        ):
+            raise AttributeError("language_model does not expose logits_processor.")
+
+        return self.language_model.logits_processor
 
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get embedding and LM head weights for speculative decoding."""
