@@ -37,6 +37,55 @@ def _token_count_sweep(max_tokens: int) -> list[int]:
     return sorted(values)
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _optimal_warmup_m_values(max_tokens: int, n: int) -> list[int]:
+    """M values that cover every deep_gemm block config for output dim ``n``.
+
+    Ported from vLLM's ``_generate_optimal_warmup_m_values``. The GEMM JIT key
+    is (N, K, block_m, ...) and M is NOT a key, but ``block_m`` is selected by
+    a C++ heuristic over (M, N, num_sms) that we cannot call from Python. So we
+    enumerate the M values that can FLIP that heuristic's choice -- the
+    wave-transition boundaries (per block_m/block_n) plus every block_m
+    multiple -- which is what the plain 16-step ``_token_count_sweep`` misses.
+
+    Args:
+        max_tokens: largest M (token count) to cover.
+        n: output (N) dimension of the GEMM weight; the wave boundary depends
+            on ``ceil_div(n, block_n)``.
+    """
+    try:
+        from tokenspeed_kernel.thirdparty.deep_gemm import get_num_sms
+
+        num_sms = get_num_sms()
+    except Exception:
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    block_ms = [64, 128, 256]
+    block_ns = list(range(16, min(257, n + 1), 16))
+    m_values: set[int] = set([1, 2, 4] + list(range(8, 65, 8)))
+    # 16-step block_m values: the standard (non-grouped) GEMM heuristic picks
+    # block_m in 16-step increments up to 256 (e.g. block_m=224), which the
+    # 64/128/256 wave/multiple sweep below does not hit. M<=256 maps ~1:1 to
+    # block_m, so sweeping these M values covers those tiles.
+    m_values.update(v for v in range(16, 257, 16) if v <= max_tokens)
+    for block_m in block_ms:
+        for block_n in block_ns:
+            if block_n > n:
+                continue
+            for wave in range(1, 11):
+                m = wave * num_sms * block_m // _ceil_div(n, block_n)
+                if 1 <= m <= max_tokens:
+                    m_values.add(m)
+            for multiple in range(1, max_tokens // block_m + 1):
+                m = multiple * block_m
+                if m <= max_tokens:
+                    m_values.add(m)
+    return sorted(v for v in m_values if v <= max_tokens)
+
+
 # ---------------------------------------------------------------------------
 # mega_moe JIT warmup
 # ---------------------------------------------------------------------------
@@ -68,7 +117,7 @@ def warmup_mega_moe_jit(
         logger.warning("deep_gemm mega_moe symbols unavailable, skipping warmup")
         return
 
-    token_counts = _token_count_sweep(max_num_tokens)
+    token_counts = _optimal_warmup_m_values(max_num_tokens, hidden_size)
     logger.info(
         "Warming up mega_moe JIT: %d token counts up to %d",
         len(token_counts),
@@ -232,7 +281,6 @@ def _warmup_tf32_hc_prenorm_gemm(
         return
 
     seen: set[tuple[int, ...]] = set()
-    token_counts = _token_count_sweep(max_tokens)
     block_k = 64
     block_m = 64
 
@@ -247,6 +295,7 @@ def _warmup_tf32_hc_prenorm_gemm(
 
         fn = torch.ones(mix_hc, hc_dim, dtype=torch.float32, device=device)
 
+        token_counts = _optimal_warmup_m_values(max_tokens, hc_hidden_size)
         for num_tokens in token_counts:
             grid_size = ceil(num_tokens / block_m)
             n_splits = _compute_num_split(block_k, hc_hidden_size, grid_size)
@@ -461,7 +510,6 @@ def warmup_fp8_gemm_nt(
 
     block_size = 128
     seen: set[tuple[int, int]] = set()
-    token_counts = _token_count_sweep(max_tokens)
 
     for n, k in shapes:
         if (n, k) in seen:
@@ -478,6 +526,7 @@ def warmup_fp8_gemm_nt(
         )
         out = torch.empty(max_tokens, n, dtype=torch.bfloat16, device=device)
 
+        token_counts = _optimal_warmup_m_values(max_tokens, n)
         for num_tokens in token_counts:
             fp8_gemm_nt(
                 (a[:num_tokens], a_scales[:num_tokens]), (b, b_scales), out[:num_tokens]
