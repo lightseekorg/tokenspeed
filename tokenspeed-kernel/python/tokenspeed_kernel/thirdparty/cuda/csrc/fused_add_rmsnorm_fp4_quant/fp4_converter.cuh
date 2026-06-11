@@ -41,13 +41,6 @@ struct FP4Converter;
 template <typename TIn, bool UE8M0_SF>
 struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> || std::is_same_v<TIn, __nv_bfloat16>>>
 {
-
-    // // Define a 16 bytes packed data type.
-    // struct PackedVec
-    // {
-    //     half2 elts[4];
-    // };
-
     static constexpr int ELTS_PER_THREAD = 8;
     static constexpr int SF_VEC_SIZE = 16;
     static constexpr int THREADS_PER_WARP = 32;

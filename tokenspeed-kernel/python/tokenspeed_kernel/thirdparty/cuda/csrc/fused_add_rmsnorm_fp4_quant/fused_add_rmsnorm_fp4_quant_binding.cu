@@ -51,9 +51,7 @@ namespace tokenspeed {
 namespace fused_add_rmsnorm_fp4_quant {
 
 // Per-device cache for the warp-specialized counters (tile_ctr, cta_completion_ctr).
-// The TRT-LLM upstream caches a per-device tensor; we do the same with cudaMalloc
-// so the buffer is reused across calls and the kernel's internal counters remain
-// valid for the entire process lifetime. Initialised to zero on first use.
+// Initialised to zero on first use.
 inline tensorrt_llm::kernels::WarpSpecializedCounters* get_or_create_counters(
     int device_id, cudaStream_t stream) {
   static thread_local std::unordered_map<int, tensorrt_llm::kernels::WarpSpecializedCounters*> cache;

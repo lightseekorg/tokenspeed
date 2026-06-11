@@ -9,12 +9,6 @@
  */
 #pragma once
 
-// Tokenspeed-side compatibility shims for the TRT-LLM ws_layernorm sources.
-//
-// flashinfer's bundled nv_internal copy of cudaUtils.h renames the helpers
-// ConstInt<>/ConstBool<> to Int<>/Bool<>. Provide forwarding aliases so the
-// imported TRT-LLM kernel files can keep their original spelling.
-
 #include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm

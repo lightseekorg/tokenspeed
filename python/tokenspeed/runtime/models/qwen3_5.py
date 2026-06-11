@@ -567,8 +567,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         backend = getattr(self.mlp.experts, "backend", None)
         if backend is None or type(backend).__name__ != "Nvfp4FlashinferTrtllmBackend":
             return False
-        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-            return False
         if not hasattr(self.mlp.experts, "w13_input_scale_quant"):
             return False
         return self.comm_manager.can_fuse_post_attn_quant(
@@ -579,7 +577,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
-        residual,
+        residual,t dif
         ctx: ForwardContext,
         num_global_tokens,
         max_num_tokens_per_gpu,

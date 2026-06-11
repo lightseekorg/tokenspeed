@@ -299,15 +299,14 @@ class CommManager:
             hidden_states, residual = self.post_attn_layernorm(hidden_states, residual)
         return hidden_states, residual
 
-    # ---- Fused allreduce + post-attn RMSNorm + NVFP4 quant (prefill MoE only) ----
+    # ---- Post-attn allreduce, then fused residual + RMSNorm + NVFP4 quant
 
     def can_fuse_post_attn_quant(self, num_tokens: int, hidden_size: int) -> bool:
-        """Gating helper: True iff post_attn_reduce_norm_quant() is admissible.
+        """True iff post_attn_reduce_norm_quant() is admissible.
 
         Conditions (kept centralised so callers don't replicate them):
           * The current layer is MoE and its TP comm pattern is allreduce.
-          * The 4-pattern allreduce+norm fusion does NOT apply (otherwise that
-            path is preferred and we shouldn't intercept it).
+          * The 4-pattern allreduce+norm fusion does NOT apply.
           * hidden_size in [2048, 16384] and divisible by 16 (kernel constraint).
           * GPU is SM90 (Hopper) or newer.
           * The ``enable_fused_rmsnorm_fp4_quant`` server arg is enabled.
@@ -324,8 +323,6 @@ class CommManager:
         if not global_server_args_dict.get("enable_fused_rmsnorm_fp4_quant", False):
             return False
 
-        # SM check: cache once per process. We ask torch (already initialised by
-        # the time decoder.forward is called) rather than calling cudaGetDeviceProperties.
         sm_major = getattr(self, "_sm_major_cache", None)
         if sm_major is None:
             try:
@@ -350,7 +347,7 @@ class CommManager:
         Returns a 4-tuple ``(hp_norm, residual_out, fp4_packed_uint8, sf_uint8)``:
           * ``hp_norm``: bf16/fp16 normed activations for the MoE gate /
             shared-expert path (same layout as the original
-            ``post_attn_reduce_norm`` first return).
+            ``post_attn_reduce_norm`` hidden states return).
           * ``residual_out``: pre-norm sum (input + residual) used as the next
             layer's residual input.
           * ``fp4_packed_uint8``: ``[M, hidden_size // 2]`` uint8 packed FP4
@@ -361,10 +358,7 @@ class CommManager:
         """
         from tokenspeed_kernel.thirdparty.cuda import fused_add_rmsnorm_fp4_quant
 
-        # The 4-pattern fusion path is excluded by gating; only no-fuse remains.
         hidden_states, residual = self.post_attn_comm(hidden_states, residual, ctx)
-        # GemmaRMSNorm's effective weight is (stored weight + 1.0); the fused
-        # kernel implements vanilla RMSNorm (out = x * rsqrt(var) * weight).
         norm_weight = getattr(
             self.post_attn_layernorm, "gemma_weight", self.post_attn_layernorm.weight
         )

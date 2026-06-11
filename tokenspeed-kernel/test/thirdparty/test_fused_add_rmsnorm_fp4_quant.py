@@ -19,31 +19,7 @@
 # SOFTWARE.
 
 """Unit tests for the fused (residual+input) -> RMSNorm -> NVFP4 quantize kernel.
-
-The kernel is a port of TRT-LLM's ``ws_layernorm`` (warp-specialized) variant
-which performs the (input + residual) accumulation, RMSNorm, gamma multiply and
-NVFP4 block-scale quant entirely in fp32 and only rounds back to the input
-dtype at the very last step. The natural reference therefore is also a
-fp32-presum pipeline; comparing against a *bf16/fp16-presum* reference would
-disagree by ~1 dtype ULP (≈8e-3 for bf16), which is below any meaningful
-correctness threshold and dominated by ``rsqrt`` round-off, not algorithmic
-drift.
-
-We therefore validate against:
-
-* a **fp32-presum** PyTorch RMSNorm reference (exactly what the kernel computes
-  before the final dtype cast) for ``hp_norm`` and ``residual_out``;
-* a **dequantized** comparison for the NVFP4 outputs — both the fused and the
-  ``flashinfer.fp4_quantize`` reference are decoded back to fp32
-  (``e2m1_value * fp8_e4m3(sf) / sf_scale``) and compared with a relative
-  tolerance corresponding to ~1 e2m1 codestep. Byte-exact NVFP4 parity is not
-  achievable across implementations because block-max reductions and the
-  fp32→e4m3 SF rounding are sensitive to fp32 ULP-level differences in the
-  upstream RMSNorm output, which legitimately translates into occasional
-  +/-1 e2m1 codestep flips on quantization-boundary values.
-
 Run::
-
     pytest tokenspeed-kernel/test/thirdparty/test_fused_add_rmsnorm_fp4_quant.py -v
 """
 
@@ -89,17 +65,6 @@ def _rmsnorm_ref_fp32(
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference RMSNorm matching the kernel's fp32-presum semantics.
-
-    The fused kernel widens both ``hidden_states`` and ``residual`` to fp32
-    before the residual add, performs the variance / rsqrt / gamma multiply in
-    fp32, and only casts back to the input dtype at the final store. We mirror
-    that exactly here so the reference is comparable at fp32 precision (modulo
-    a single final-cast ULP).
-
-    Returns ``(normed, residual_out)``:
-        * ``normed``: ``[M, N]`` ``out_dtype`` — the fused ``hp_norm`` target.
-        * ``residual_out``: ``[M, N]`` ``out_dtype`` — the fused
-          ``residual_out`` target (= ``out_dtype(fp32(hs) + fp32(residual))``).
     """
     pre_norm_fp32 = hidden_states.float() + residual.float()
     inv_rms = torch.rsqrt(pre_norm_fp32.pow(2).mean(-1, keepdim=True) + eps)

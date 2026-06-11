@@ -229,10 +229,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         prequantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if self.use_deepep:
-            # _forward_deepep does its own per-rank dispatch + fp4 quant inside
-            # the dispatcher, so the post-attn fused (FP4-quant) precomputation
-            # is irrelevant there. Drop the precomputed buffers if the upstream
-            # gating slipped through; downstream behavior is unchanged.
             return self._forward_deepep(
                 hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
             )

@@ -20,8 +20,7 @@
 
 """Fused (residual + input) -> RMSNorm -> NVFP4 block-scale quantize.
 
-Wraps the TRT-LLM ws_layernorm warp-specialized kernel ported under
-``thirdparty/cuda/csrc/fused_add_rmsnorm_fp4_quant``. The kernel writes both
+Wraps the TRT-LLM ws_layernorm warp-specialized kernel. The kernel writes both
 the FP4 packed output (consumed by the MoE GEMM) and, optionally, the bf16/fp16
 high-precision normed values (consumed by the MoE gate / shared expert) in a
 single pass over the hidden states.
@@ -122,9 +121,6 @@ def fused_add_rmsnorm_fp4_quant(
     device = hidden_states.device
     m_padded = (m + _M_PADDING - 1) // _M_PADDING * _M_PADDING
 
-    # FP4 packed output: kernel writes uint32_t (8 FP4 values per int32). Allocate
-    # as int32 [m_padded, N//8] to match the kernel's stride, then expose to
-    # downstream consumers as uint8 [M, N//2] (2 FP4 values per byte).
     normed_fp4_padded_i32 = torch.empty(
         (m_padded, n // 8), dtype=torch.int32, device=device
     )
