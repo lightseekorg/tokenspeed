@@ -163,13 +163,13 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 @register_kernel(
     "moe",
     "process_weights",
-    name="triton_kernels_mxfp4_moe_process_weights",
+    name="triton_mxfp4_moe_process_weights",
     solution="triton",
     signatures=frozenset({format_signature()}),
     traits={"weight_dtype": frozenset({"mxfp4"})},
     priority=Priority.PORTABLE,
 )
-def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
+def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     MXFP_BLOCK_SIZE = 32
 
     w13_weight_bias = w.w13_weight_bias.to(torch.float32)
@@ -245,7 +245,7 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
 @register_kernel(
     "moe",
     "apply",
-    name="triton_kernels_mxfp4_moe_apply",
+    name="triton_mxfp4_moe_apply",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
@@ -266,7 +266,7 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     },
     priority=Priority.PORTABLE,
 )
-def triton_kernels_mxfp4_moe_apply(
+def triton_mxfp4_moe_apply(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
