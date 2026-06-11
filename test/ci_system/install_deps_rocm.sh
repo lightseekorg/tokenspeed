@@ -44,13 +44,14 @@ sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip "setuptools<82" wheel
 
-echo "=== Step 3: Install tokenspeed-kernel ==="
+echo "=== Step 3: Install tokenspeed-kernel packages ==="
 
-if [ "${INSTALL_TOKENSPEED_KERNEL_AMD_FROM_SOURCE:-0}" = "1" ]; then
-    cd "${WORKSPACE}"
-    pip3 install --force-reinstall --no-deps \
-        "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
-fi
+cd "${WORKSPACE}"
+# `tokenspeed-kernel` installs requirements/rocm.txt during its native build.
+# Keep the matching in-tree AMD package installed first so that exact pin is
+# satisfied even before the public wheel exists.
+pip3 install --force-reinstall --no-deps \
+    "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
 
 cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"
