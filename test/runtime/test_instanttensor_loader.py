@@ -14,6 +14,8 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -24,6 +26,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 INSTANTTENSOR_AVAILABLE = find_spec("instanttensor") is not None
+# InstantTensor is NVIDIA-only. torch.cuda.is_available() is also True on ROCm,
+# so guard on the platform vendor to keep the parity test off AMD runners.
+IS_NVIDIA = current_platform().is_nvidia
 
 
 class TestInstantTensorConfig(unittest.TestCase):
@@ -57,7 +62,7 @@ class TestInstantTensorConfig(unittest.TestCase):
             self.assertTrue(hf_weights_files[0].endswith("model.safetensors"))
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(not IS_NVIDIA, "InstantTensor requires NVIDIA GPUs")
 @unittest.skipIf(not INSTANTTENSOR_AVAILABLE, "instanttensor is not installed")
 class TestInstantTensorWeights(unittest.TestCase):
     """Iterator parity test (requires an NVIDIA GPU and instanttensor)."""
