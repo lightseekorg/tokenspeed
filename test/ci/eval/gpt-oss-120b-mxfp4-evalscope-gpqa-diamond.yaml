@@ -14,6 +14,7 @@ runner:
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_trtllm
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     amd-mi35x-2gpu-test:
+      GPT_OSS_EVAL_MOE_BACKEND: triton
       GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
       GPT_OSS_EVAL_DISABLE_PREFIX_CACHING: "1"
       GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
