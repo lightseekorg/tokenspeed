@@ -75,10 +75,9 @@ class OutputProcessorBase(nn.Module):
         input_ids: Tensor,
         positions: Tensor,
         ctx: ForwardContext,
-        input_lengths: Tensor,
         output_hidden_states: Tensor,
     ) -> LogitsProcessorOutput:
-        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.base_lm.logits_processor(
             input_ids,
             output_hidden_states,
@@ -159,13 +158,20 @@ class ExtensibleLM(nn.Module):
         ).eval()
         self.step = 0
 
+    @property
+    def logits_processor(self):
+        return self.base_lm.logits_processor
+
+    @property
+    def lm_head(self):
+        return self.base_lm.lm_head
+
     def forward(
         self,
         ctx: ForwardContext,
         input_ids: Tensor,
         positions: Tensor,
         out_cache_loc: Tensor,
-        input_lengths: Tensor,
         input_embeds: Tensor = None,
     ) -> LogitsProcessorOutput:
         # input processor: get input hidden states
@@ -184,7 +190,7 @@ class ExtensibleLM(nn.Module):
 
         # output processor: lm hidden states to logits
         logits_output: LogitsProcessorOutput = self.output_processor(
-            input_ids, positions, ctx, input_lengths, out_hidden_states
+            input_ids, positions, ctx, out_hidden_states
         )
         self.step += 1
         return logits_output

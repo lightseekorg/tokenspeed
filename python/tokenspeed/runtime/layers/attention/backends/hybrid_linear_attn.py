@@ -29,6 +29,9 @@ import torch
 from tokenspeed_kernel.ops.attention.flashinfer import (
     gated_delta_rule as gdn_flashinfer,
 )
+from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+    fused_qkv_split_gdn_prefill,
+)
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -36,7 +39,6 @@ from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from tokenspeed.runtime.layers.attention.linear.chunk import chunk_gated_delta_rule
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -49,6 +51,9 @@ from tokenspeed.runtime.layers.attention.linear.index import (
     set_total_chunks_hint_uniform,
 )
 from tokenspeed.runtime.layers.attention.linear.l2norm import l2norm_fwd
+from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
+    fused_mamba_state_copy,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -395,6 +400,14 @@ class SimpleMambaPool:
                 item_lens.append(layer_cache[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
+    def get_contiguous_buf_unit_lens(self):
+        unit_lens = []
+        for cache in self.mamba_cache:
+            for layer_id in range(cache.shape[0]):
+                layer_cache = cache[layer_id]
+                unit_lens.append(layer_cache[0, 0].nbytes)
+        return unit_lens
+
     def get_contiguous_buf_layer_ids(self):
         """Return global layer ids aligned with get_contiguous_buf_infos()."""
         return self.mamba_layer_ids * len(self.mamba_cache)
@@ -617,17 +630,18 @@ class MambaAttnBackend(AttentionBackend):
 
         Matching conv windows are gathered separately from packed pre-conv inputs.
         """
-        num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
-        offset = torch.zeros_like(num_h_states)
-        offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
+        # flashinfer ckpts[k] = state after processing chunk k = FLA h[k+1]
+        num_fi_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
+        offset = torch.zeros_like(num_fi_ckpts)
+        offset[1:] = torch.cumsum(num_fi_ckpts[:-1], dim=0)
 
         lens_m = track_lens[track_mask]
         offset_m = offset[track_mask]
-        dst_m = mamba_track_indices[track_mask]  # write to TRACKING slots
+        dst_m = mamba_track_indices[track_mask]
 
-        # h[i] is the state before chunk i, so an aligned lens maps directly to
-        # lens // FLA_CHUNK_SIZE.
-        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE)
+        # FLA h[lens//C] = flashinfer ckpts[lens//C - 1].
+        # track_mask guarantees lens_m >= FLA_CHUNK_SIZE so lens_m // C >= 1.
+        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE - 1)
         track_ssm_h_dst = dst_m
 
         return (
@@ -1042,20 +1056,18 @@ class MambaAttnBackend(AttentionBackend):
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
+        num_heads = key_split_dim // head_k_dim
+        num_value_heads = value_split_dim // head_v_dim
 
-        query, key, value = torch.split(
+        query, key, value = fused_qkv_split_gdn_prefill(
             mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
+            num_q_heads=num_heads,
+            num_k_heads=num_heads,
+            num_v_heads=num_value_heads,
+            head_q=head_k_dim,
+            head_k=head_k_dim,
+            head_v=head_v_dim,
         )
-
-        actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        num_value_heads = value.shape[1] // head_v_dim
-
-        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         if is_target_verify:
             draft_token_num = kwargs.get(
@@ -1090,40 +1102,38 @@ class MambaAttnBackend(AttentionBackend):
                 self.forward_metadata.track_ssm_final_src is not None
                 and self.forward_metadata.track_ssm_final_src.numel() > 0
             )
+            if not self._gdn_fastpath_checked:
+                if not (
+                    gdn_flashinfer.is_supported(
+                        head_k_dim, query.dtype, num_heads, num_value_heads
+                    )
+                    and head_v_dim == head_k_dim
+                ):
+                    raise RuntimeError(
+                        "GDN prefill requires the flashinfer Blackwell fast-path "
+                        "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
+                        "head_v == head_k + num_v >= num_q). Got "
+                        f"dtype={query.dtype}, head_k={head_k_dim}, "
+                        f"head_v={head_v_dim}, num_q={num_heads}, "
+                        f"num_v={num_value_heads}, "
+                        f"sm100_available={gdn_flashinfer.is_available()}."
+                    )
+                self._gdn_fastpath_checked = True
             if need_h_track:
-                core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    output_final_state=True,
-                    cu_seqlens=query_start_loc,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                    output_h=True,
+                core_attn_out, last_recurrent_state, fi_h_checkpoints, _ = (
+                    gdn_flashinfer.gdn_chunk_prefill(
+                        l2norm_fwd(query),
+                        l2norm_fwd(key),
+                        value,
+                        g,
+                        beta,
+                        scale=head_k_dim**-0.5,
+                        initial_state=recurrent_state,
+                        cu_seqlens=query_start_loc,
+                        output_h=True,
+                    )
                 )
             else:
-                if not self._gdn_fastpath_checked:
-                    if not (
-                        gdn_flashinfer.is_supported(
-                            head_k_dim, query.dtype, num_heads, num_value_heads
-                        )
-                        and head_v_dim == head_k_dim
-                    ):
-                        raise RuntimeError(
-                            "GDN prefill requires the flashinfer Blackwell fast-path "
-                            "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
-                            "head_v == head_k + num_v >= num_q). Got "
-                            f"dtype={query.dtype}, head_k={head_k_dim}, "
-                            f"head_v={head_v_dim}, num_q={num_heads}, "
-                            f"num_v={num_value_heads}, "
-                            f"sm100_available={gdn_flashinfer.is_available()}."
-                        )
-                    self._gdn_fastpath_checked = True
-                # sm100 fast-path. q/k l2norm here since the kernel ignores its
-                # own flag; the wrapper handles the gate/beta/state conventions.
                 core_attn_out, last_recurrent_state = gdn_flashinfer.gdn_chunk_prefill(
                     l2norm_fwd(query),
                     l2norm_fwd(key),
@@ -1138,21 +1148,21 @@ class MambaAttnBackend(AttentionBackend):
             ssm_states[cache_indices] = last_recurrent_state
 
             if need_h_track:
-                if h is None:
-                    raise RuntimeError(
-                        "Missing intermediate mamba states for branching track"
-                    )
-                ssm_states[self.forward_metadata.track_ssm_h_dst] = h.squeeze(0)[
+                ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
                     self.forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
 
             if need_final_track:
-                conv_states[self.forward_metadata.track_ssm_final_dst] = conv_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
-                ssm_states[self.forward_metadata.track_ssm_final_dst] = ssm_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
+                fused_mamba_state_copy(
+                    conv_states,
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
+                fused_mamba_state_copy(
+                    ssm_states,
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
 
         return core_attn_out
 

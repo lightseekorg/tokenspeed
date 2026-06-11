@@ -113,8 +113,13 @@ class MooncakeKVManagerBase:
         if bootstrap_room not in self.request_status:
             self.request_status[bootstrap_room] = status
         else:
-            #  status is only allowed to be incremented unless it is KVPoll.Failed
-            if status == KVPoll.Failed:
+            # status is only allowed to be incremented unless either side has
+            # observed a failure. Failed is sticky so a late success cannot
+            # resurrect a broken transfer.
+            if (
+                self.request_status[bootstrap_room] == KVPoll.Failed
+                or status == KVPoll.Failed
+            ):
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
                 self.request_status[bootstrap_room] = max(
@@ -138,6 +143,10 @@ class MooncakeKVBootstrapServer:
         self.tp_size_per_dp_rank = None
         self.prefill_port_table: Dict[int, Dict[int, Dict[str, Union[str, int]]]] = {}
         self.enable_mla_l1_5_cache = False
+        self.prefill_kv_item_lens = []
+        self.prefill_kv_unit_lens = []
+        self.prefill_state_item_lens = []
+        self.prefill_state_unit_lens = []
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
@@ -173,6 +182,14 @@ class MooncakeKVBootstrapServer:
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
         self.enable_mla_l1_5_cache = bool(data["enable_mla_l1_5_cache"])
+        self.prefill_kv_item_lens = data.get("kv_item_lens", self.prefill_kv_item_lens)
+        self.prefill_kv_unit_lens = data.get("kv_unit_lens", self.prefill_kv_unit_lens)
+        self.prefill_state_item_lens = data.get(
+            "state_item_lens", self.prefill_state_item_lens
+        )
+        self.prefill_state_unit_lens = data.get(
+            "state_unit_lens", self.prefill_state_unit_lens
+        )
 
         if self.world_size is None:
             self.world_size = world_size
@@ -218,6 +235,10 @@ class MooncakeKVBootstrapServer:
                 "prefill_tp_size": self.world_size,
                 "prefill_dp_size": self.dp_size,
                 "enable_mla_l1_5_cache": self.enable_mla_l1_5_cache,
+                "kv_item_lens": self.prefill_kv_item_lens,
+                "kv_unit_lens": self.prefill_kv_unit_lens,
+                "state_item_lens": self.prefill_state_item_lens,
+                "state_unit_lens": self.prefill_state_unit_lens,
             }
             return web.json_response(prefill_parallel_info, status=200)
 

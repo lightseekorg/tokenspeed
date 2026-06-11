@@ -86,6 +86,9 @@ def is_supported(
     )
 
 
+CHUNK_SIZE = 64
+
+
 def gdn_chunk_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -96,13 +99,29 @@ def gdn_chunk_prefill(
     scale: float | None,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    output_h: bool = False,
+):
     """Run one chunked GDN prefill on the sm100 kernel.
 
     q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
     g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the FLA
-    [N, H, K, V] recurrent state. Returns (out, final_state) matching the FLA
-    layout: out [B, T, Hv, D] in q.dtype, final_state [N, H, K, V].
+    [N, H, K, V] recurrent state.
+
+    Default returns ``(out, final_state)`` matching the FLA layout:
+    out [B, T, Hv, D] in q.dtype, final_state [N, H, K, V].
+
+    When ``output_h=True`` returns
+    ``(out, final_state, fi_checkpoints, checkpoint_cu_starts)`` where:
+    - ``fi_checkpoints``: raw flashinfer checkpoint buffer in FLA state layout
+      ``[total_fi_ckpts, H, K, V]`` (float32). Checkpoint ``k`` within a
+      sequence is the state *after* processing chunk ``k`` (= FLA ``h[k+1]``).
+      Per-sequence count is ``L_i // CHUNK_SIZE``.
+    - ``checkpoint_cu_starts``: int64 tensor of length ``N+1`` giving the
+      cumulative start offset of each sequence's checkpoints in
+      ``fi_checkpoints``.
+
+    The caller indexes directly with flashinfer-native offsets rather than
+    rebuilding the FLA h tensor.
     """
     batched = q.dim() == 4
     q3 = q.squeeze(0) if batched else q
@@ -115,6 +134,34 @@ def gdn_chunk_prefill(
     if scale is None:
         scale = head_dim**-0.5
 
+    # flashinfer's recurrent-state layout is [N, H, V, K]; FLA uses [N, H, K, V].
+    fi_initial_state = initial_state.float().transpose(-1, -2).contiguous()
+
+    state_checkpoints = None
+    checkpoint_cu_starts = None
+    per_seq_lens = None
+    if output_h:
+        per_seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+        # flashinfer-native checkpoint count: only full chunks emit a checkpoint.
+        per_seq_h_ckpts = per_seq_lens // CHUNK_SIZE
+        total_h_ckpts = int(per_seq_h_ckpts.sum().item())
+        H_state = fi_initial_state.shape[1]
+        D_state = fi_initial_state.shape[-1]
+        state_checkpoints = torch.empty(
+            total_h_ckpts,
+            H_state,
+            D_state,
+            D_state,
+            device=fi_initial_state.device,
+            dtype=torch.float32,
+        )
+        checkpoint_cu_starts = torch.zeros(
+            per_seq_h_ckpts.numel() + 1,
+            device=fi_initial_state.device,
+            dtype=torch.int64,
+        )
+        checkpoint_cu_starts[1:] = torch.cumsum(per_seq_h_ckpts, dim=0)
+
     out, final_state = _chunk_gated_delta_rule(
         q3.contiguous(),
         k3.contiguous(),
@@ -122,15 +169,23 @@ def gdn_chunk_prefill(
         g=torch.exp(g2).float().contiguous(),
         beta=beta2.float().contiguous(),
         scale=scale,
-        # flashinfer requires fp32 state; runtime ssm dtype may be bf16.
-        initial_state=initial_state.float().transpose(-1, -2).contiguous(),
+        initial_state=fi_initial_state,
         output_final_state=True,
-        # flashinfer casts cu_seqlens per path internally (int32 for sm100), so
-        # pass it through rather than forcing a dtype.
         cu_seqlens=cu_seqlens,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
     )
 
     out = out.to(q.dtype)
     if batched:
         out = out.unsqueeze(0)
-    return out, final_state.transpose(-1, -2)
+    final_state_fla = final_state.transpose(-1, -2)
+
+    if not output_h:
+        return out, final_state_fla
+
+    # Return raw flashinfer checkpoints in FLA state layout [total_fi, H, K, V].
+    # The caller indexes directly using flashinfer-native offsets
+    h_ckpts_fla = state_checkpoints.transpose(-1, -2)
+    return out, final_state_fla, h_ckpts_fla, checkpoint_cu_starts

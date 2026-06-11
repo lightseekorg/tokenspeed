@@ -35,6 +35,7 @@
 #include "fsm/base_event.h"
 #include "fsm/forward_states.h"
 #include "resource/types.h"
+#include "resource/radix_tree/node_range.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
 #include "resource/allocator/local_mamba_allocator.h"
@@ -56,7 +57,7 @@ void InsertHybridCache(HybridPrefixCache* hybrid_prefix_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
-                       std::int32_t page_size);
+                       std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override = nullptr);
 
 struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefillFirstChunkEvent> {
     using InvalidTransitionHandler<SchedulePrefillFirstChunkEvent>::operator();
@@ -296,7 +297,11 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     using InvalidTransitionHandler<ExtendResultEvent>::operator();
     ExtendResultEvent() = delete;
 
-    ExtendResultEvent(std::vector<std::int32_t> result_tokens) : result_tokens_(result_tokens) {}
+    ExtendResultEvent(std::string request_id, std::vector<std::int32_t> result_tokens,
+                      HybridPrefixCache* hybrid_prefix_cache = nullptr)
+        : request_id_(std::move(request_id)),
+          result_tokens_(std::move(result_tokens)),
+          hybrid_prefix_cache_(hybrid_prefix_cache) {}
 
 public:
     template <typename S>
@@ -304,6 +309,59 @@ public:
     std::remove_cvref_t<S> operator()(S&& state) {
         state.ExtendResultTokens(result_tokens_);
         return std::move(state);
+    }
+
+    Decoding operator()(Decoding&& state) {
+        TokenContainer* token_container = state.GetTokenContainer();
+        const std::int32_t old_token_size = token_container->Size();
+        state.ExtendResultTokens(result_tokens_);
+        const std::int32_t page_size = state.GetPageSize();
+        const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
+
+        if (hybrid_prefix_cache_ == nullptr) {
+            return std::move(state);
+        }
+
+        const std::int32_t accepted_token_size = token_container->Size();
+        auto publishable_pages = [page_size](std::int32_t token_size) {
+            if (page_size <= 0 || token_size <= 0) return 0;
+            return (token_size - 1) / page_size;
+        };
+        const std::int32_t old_publishable_pages = publishable_pages(old_token_size);
+        const std::int32_t new_publishable_pages = publishable_pages(accepted_token_size);
+
+        if (new_publishable_pages <= old_publishable_pages) {
+            hybrid_prefix_cache_->RewindRequest(request_id_, accepted_token_size);
+            return std::move(state);
+        }
+
+        const std::int32_t chunk_begin = accepted_token_size - static_cast<std::int32_t>(result_tokens_.size());
+        auto full_paged_tokens = state.GetFullPagedTokens(/*except_last=*/true);
+        std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(state.GetDeviceNode());
+        const std::int32_t new_page_count =
+            static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
+
+        auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
+        auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
+        auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+        auto host_node_ref = std::move(state).TakeHostNodeRef();
+
+        if (new_page_count > 0 && local_kv_allocator->PageCount() >= new_page_count) {
+            InsertHybridCache(hybrid_prefix_cache_, full_paged_tokens, device_node_ref, local_kv_allocator.get(),
+                              local_mamba_allocator.get(), chunk_begin,
+                              static_cast<std::int32_t>(result_tokens_.size()), page_size, &prefix_pages);
+            hybrid_prefix_cache_->CommitChunk(request_id_, device_node_ref->Node());
+        }
+        hybrid_prefix_cache_->RewindRequest(request_id_, accepted_token_size);
+
+        return Decoding{token_container,
+                        page_size,
+                        std::move(host_node_ref),
+                        std::move(device_node_ref),
+                        std::move(local_kv_allocator),
+                        std::move(state).TakeReqPoolIndex(),
+                        reserve,
+                        std::move(local_mamba_allocator)};
     }
 
     // Overlap scheduling can commit an already-dispatched forward result after
@@ -314,7 +372,9 @@ public:
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
+    std::string request_id_;
     std::vector<std::int32_t> result_tokens_;
+    HybridPrefixCache* hybrid_prefix_cache_{};
 };
 
 }  // namespace tokenspeed::fsm

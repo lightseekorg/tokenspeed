@@ -83,6 +83,12 @@ TreeNode* RadixTree::PruneEmptyByNode(TreeNode* node) {
         }
 
         TreeNode* parent = current->Parent();
+        // Notify adjuncts holding raw pointers to `current` before it is freed,
+        // so the destroyed node (this one or an empty ancestor pruned in the
+        // same walk) is dropped from their bookkeeping instead of dangling.
+        if (node_destroy_callback_) {
+            node_destroy_callback_(current);
+        }
         parent->RemoveChild(getFirstPage(current->Tokens(), page_size_));
         current = parent;
     }

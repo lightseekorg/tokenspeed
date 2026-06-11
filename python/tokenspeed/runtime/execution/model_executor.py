@@ -47,6 +47,12 @@ from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    DpSamplingRuntimeLimits,
+    DpSamplingTopology,
+    resolve_dp_sampling_runtime,
+    resolve_dp_sampling_support,
+)
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
@@ -62,6 +68,16 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+
+
+def _draft_idle_global_num_tokens_for_step(
+    step_idx: int,
+    global_num_tokens: list[int],
+    global_bs: list[int] | None,
+) -> list[int]:
+    if step_idx == 0 or global_bs is None:
+        return global_num_tokens
+    return global_bs
 
 
 @dataclass
@@ -100,6 +116,8 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    dp_sampling: bool = False
+    dp_sampling_min_bs: int | None = None
     use_target_verify_forward_mode: bool = False
 
     # ====== GRAMMAR =========
@@ -154,6 +172,8 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            dp_sampling=server_args.dp_sampling,
+            dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
@@ -291,6 +311,68 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+        processor = self.model_runner.model.logits_processor
+        dp_topology = DpSamplingTopology(
+            tp_rank=processor.tp_rank,
+            tp_size=processor.tp_size,
+            tp_group=processor.tp_group,
+            skip_all_gather=processor.skip_all_gather,
+            tie_word_embeddings=bool(
+                getattr(processor.config, "tie_word_embeddings", False)
+            ),
+        )
+        dp_support = resolve_dp_sampling_support(
+            requested=self.config.dp_sampling,
+            drafter_available=self.drafter is not None,
+            backend_supports_verify=bool(
+                getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
+            ),
+            topology=dp_topology,
+        )
+
+        lm_head_rows = 0
+        if dp_support.enabled:
+            lm_head_weight = self.model_runner.model.lm_head.weight
+            if lm_head_weight.ndim < 1:
+                raise RuntimeError(
+                    "dp_sampling LM head weight must be at least 1D, got "
+                    f"{lm_head_weight.ndim}D"
+                )
+            lm_head_rows = int(lm_head_weight.shape[0])
+        dp_runtime_config = resolve_dp_sampling_runtime(
+            support=dp_support,
+            lm_head_rows=lm_head_rows,
+            topology=dp_topology,
+            limits=DpSamplingRuntimeLimits(
+                runtime_vocab_size=self.config.vocab_size,
+                max_num_seqs=config.max_num_seqs,
+                data_parallel_size=config.data_parallel_size,
+                num_tokens_per_req=spec_num_tokens,
+                configured_min_bs=self.config.dp_sampling_min_bs,
+                device=self.device,
+            ),
+        )
+        self.dp_sampling_runtime_config = dp_runtime_config
+        self._last_dp_sampling_route_log: (
+            tuple[str, int, bool, int, int, bool, int] | None
+        ) = None
+        if dp_runtime_config.enabled:
+            self.sampling_backend.configure_dp_sampling(dp_runtime_config)
+            processor.configure_dp_logits_layout(dp_runtime_config)
+        logger.info(
+            "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
+            "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
+            "tp_size=%s, tp_group=%s)",
+            dp_support.requested,
+            dp_support.infra_supports,
+            dp_support.enabled,
+            dp_runtime_config.min_bs,
+            dp_support.drafter_available,
+            dp_support.backend_supports_verify,
+            dp_support.tp_size,
+            dp_support.tp_group_set,
+        )
+
         self._active_multimodal_context = None
         self._active_positions_override = None
 
@@ -390,7 +472,6 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
-            self.input_buffers.input_lengths_buf[:bs],
             req_pool_indices=req_pool_indices,
             seq_lens=self.input_buffers.seq_lens_buf[:bs],
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
@@ -463,6 +544,47 @@ class ModelExecutor:
             torch.cat([prefill_accept, decode_accept]),
         )
 
+    def _log_dp_sampling_route(self, bs: int, ctx: ForwardContext) -> None:
+        runtime = self.dp_sampling_runtime_config
+        if (
+            self.config.global_rank != 0
+            or not runtime.enabled
+            or runtime.min_bs is None
+            or runtime.topology is None
+            or ctx.forward_mode is None
+            or not (ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify())
+        ):
+            return
+
+        use_graph = self.forward_step.can_run(bs=bs, ctx=ctx)
+        effective_bs = self.forward_step.padded_bs(bs=bs, ctx=ctx) if use_graph else bs
+        tp_size = runtime.topology.tp_size
+        bucket_bs = ((effective_bs + tp_size - 1) // tp_size) * tp_size
+        dp_sampling = effective_bs >= runtime.min_bs
+        route_key = (
+            ctx.forward_mode.name,
+            bs,
+            use_graph,
+            effective_bs,
+            bucket_bs,
+            dp_sampling,
+            runtime.min_bs,
+        )
+        if route_key == self._last_dp_sampling_route_log:
+            return
+        self._last_dp_sampling_route_log = route_key
+        logger.debug(
+            "Batch-DP route: forward_mode=%s bs=%d effective_bs=%d "
+            "use_graph=%s bucket_bs=%d dp_sampling=%s min_bs=%d",
+            ctx.forward_mode.name.lower(),
+            bs,
+            effective_bs,
+            use_graph,
+            bucket_bs,
+            dp_sampling,
+            runtime.min_bs,
+        )
+
     @maybe_inference_mode()
     def _forward_step(
         self,
@@ -500,7 +622,7 @@ class ModelExecutor:
 
         # Single choke point for every (sample/verify) x (greedy/flashinfer)
         # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
-        # make cute_argmax emit the -1 sentinel. Left unclamped, that -1 poisons
+        # make sampling argmax emit the -1 sentinel. Left unclamped, that -1 poisons
         # both consumers below -- it flows into output_ids -> detokenizer (the
         # HF Rust tokenizer raises OverflowError on a negative id and kills the
         # engine) and, via the drafter, back into future_input_map as the next
@@ -892,7 +1014,6 @@ class ModelExecutor:
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
         )
-
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
@@ -932,7 +1053,6 @@ class ModelExecutor:
             input_ids=empty,
             positions=empty,
             out_cache_loc=empty,
-            input_lengths=empty,
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -942,6 +1062,11 @@ class ModelExecutor:
             for step_idx in range(self.drafter.spec_num_steps):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
+                draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
+                    step_idx,
+                    global_num_tokens,
+                    global_bs,
+                )
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
@@ -950,7 +1075,7 @@ class ModelExecutor:
                     num_extends=0,
                     input_num_tokens=0,
                     forward_mode=ForwardMode.IDLE,
-                    global_num_tokens=global_num_tokens,
+                    global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
                     draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
@@ -960,7 +1085,6 @@ class ModelExecutor:
                     input_ids=empty,
                     positions=empty,
                     out_cache_loc=empty,
-                    input_lengths=empty,
                     spec_step_idx=step_idx,
                 )
 
@@ -1298,7 +1422,6 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
-
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
                     grammar_completion = setup_grammar_step(
@@ -1361,6 +1484,7 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
+                    self._log_dp_sampling_route(bs, ctx)
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,

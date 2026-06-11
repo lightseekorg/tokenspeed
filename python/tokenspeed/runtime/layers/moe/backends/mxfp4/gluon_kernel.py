@@ -87,7 +87,7 @@ def _pad_w2_to_block_n(layer: nn.Module, block_n: int) -> None:
 
 def _attach_gluon_bpreshuffle(layer: nn.Module) -> None:
     try:
-        from tokenspeed_kernel.ops.moe.gluon import (
+        from tokenspeed_kernel.ops.moe import (
             _extract_gluon_raw_w,
             shuffle_weight_for_gluon_dot_layout,
         )

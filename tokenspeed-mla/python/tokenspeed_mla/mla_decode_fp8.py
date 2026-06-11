@@ -60,8 +60,10 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import builtin, llvm, nvvm
 from cutlass.cute.arch import Arch
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.typing import Boolean, Int32
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
@@ -87,6 +89,51 @@ except ImportError:
         create_mla_static_tile_scheduler_params,
         get_mla_decode_fold_sq_factor,
     )
+
+# Please refer to https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
+# For how to construct the Instruction Descriptor value.
+# Note: this is a WAR for WS mode MMA, need to be replaced when CuTe DSL supports.
+_IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA = 0x04200010
+_IDESC_F8E4M3_F32_M64_N128_AK_BMN_1CTA = _IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA | (
+    1 << 16
+)
+_IDESC_F8E4M3_F32_M64_N256_KMAJ_1CTA = 0x04400010
+_IDESC_F8E4M3_F32_M64_N256_AK_BMN_1CTA = _IDESC_F8E4M3_F32_M64_N256_KMAJ_1CTA | (
+    1 << 16
+)
+
+_TMEM_ROW_STRIDE = 1 << 16
+_P_COR_METADATA_FIELDS = 4
+
+
+@cute.jit
+def tcgen05_mma_ws_f8f6f4_one(
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCtC: cute.Tensor,
+    idesc_val: Int32,
+    accumulate: Boolean,
+):
+    """Issue one K-block tcgen05.mma.ws.kind::f8f6f4 instruction.
+    Should be replaced when CuTe DSL supports."""
+    d = builtin.unrealized_conversion_cast([Int32.mlir_type], [tCtC.iterator.value])
+    d = llvm.inttoptr(llvm.PointerType.get(6), d)
+
+    a = tcgen05.smem_descriptor_to_int(tCrA.iterator).ir_value()
+    b = tcgen05.smem_descriptor_to_int(tCrB.iterator).ir_value()
+    idesc = idesc_val.ir_value()
+    enable_input_d = accumulate.ir_value()
+
+    with cute.arch.elect_one():
+        nvvm.tcgen05_mma_ws(
+            nvvm.Tcgen05MMAKind.F8F6F4,
+            d,
+            a,
+            b,
+            idesc,
+            enable_input_d,
+        )
+
 
 """
 A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -220,10 +267,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
         self.cp_world = cp_world
-        self.cluster_shape_mnk = (2, 1, 1)
-        self.use_2cta_instrs = True
-        # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
-        # while warps 2-3 handle accumulation for second half [n/2, n)
+        if mma_qk_tiler_mn[0] == 128:
+            self.cluster_shape_mnk = (2, 1, 1)
+            self.use_2cta_instrs = True
+        elif mma_qk_tiler_mn[0] == 64:
+            self.cluster_shape_mnk = (1, 1, 1)
+            self.use_2cta_instrs = False
+        else:
+            raise ValueError(f"Unsupported mma_qk_tiler_mn[0]: {mma_qk_tiler_mn[0]}")
+        self.use_m64_ws = not self.use_2cta_instrs
+        # Warps 0-1 handle first N half; warps 2-3 handle second N half.
         self.warps_in_n = 2
         self.num_compute_warps = 4
         self.threads_per_warp = 32
@@ -233,6 +286,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.mma_qk_tiler_mn[1],
             mma_qk_tiler_k,
         )
+        # The M64 WS split-N epilogue helper models a 2-CTA logical C tile,
+        # so its C partition spans two M64 slices in M.
+        self.ws_splitn_epi_tiler_mn = (
+            (self.mma_qk_tiler[0] * 2, self.mma_qk_tiler[1])
+            if self.use_m64_ws
+            else self.mma_qk_tiler[:2]
+        )
+        self.ws_p_cor_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
+        self.ws_p_cor_n_groups = self.warps_in_n
         self.mma_qk_rope_tiler = (
             self.mma_qk_tiler_mn[0],
             self.mma_qk_tiler_mn[1],
@@ -269,8 +331,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # register settings
         self.softmax_reg_num = 208
-        self.correction_reg_num = 256
-        self.other_reg_num = 40
+        self.correction_reg_num = 240 if self.use_m64_ws else 256
+        self.other_reg_num = 56 if self.use_m64_ws else 40
         # Named barriers
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,
@@ -305,17 +367,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         self.load_q_stage = 1
-        self.load_k_stage = 3
-        self.load_v_stage = 2
+        if self.use_2cta_instrs:
+            self.load_k_stage = 3
+            self.load_v_stage = 2
+        else:
+            # No enough smem for WS mode
+            self.load_k_stage = 1
+            self.load_v_stage = 1
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2
         self.mma_o_stage = 2
+        self.load_k_pipeline_stage = (
+            self.iterations_qk_latent * self.load_k_stage
+            if self.use_m64_ws
+            else self.load_k_stage
+        )
+        self.load_k_rope_pipeline_stage = self.load_k_stage if self.use_m64_ws else 0
+        self.load_v_pipeline_stage = (
+            self.iterations_pv_n * self.iterations_pv_k * self.load_v_stage
+            if self.use_m64_ws
+            else self.load_v_stage
+        )
 
         self.tmem_o_offset = self.mma_s_stage * self.mma_qk_tiler[1] // self.warps_in_n
         self.correction_factor_offset = (
             self.tmem_o_offset + self.latent_dim // self.warps_in_n
         )
+        self.pv_acc_cols = self.mma_pv_tiler[1] // self.warps_in_n
 
     @cute.jit
     def __call__(
@@ -335,7 +414,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: cuda.CUstream,
-        use_pdl: cutlass.Constexpr = False,
+        use_pdl: cutlass.Constexpr = True,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
 
@@ -513,7 +592,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         self._setup_attributes()
 
-        cta_group = tcgen05.CtaGroup.TWO
+        cta_group = (
+            tcgen05.CtaGroup.TWO
+            if cutlass.const_expr(self.use_2cta_instrs)
+            else tcgen05.CtaGroup.ONE
+        )
         # the intermediate tensor p is from smem & k-major
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -531,6 +614,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.acc_dtype,
             cta_group,
             self.mma_pv_tiler[:2],
+        )
+        ws_tiled_mma_epi = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            self.acc_dtype,
+            cta_group,
+            (
+                (128, self.mma_pv_tiler[1] // self.warps_in_n)
+                if cutlass.const_expr(self.use_m64_ws)
+                else self.mma_qk_tiler[:2]
+            ),
+        )
+        ws_tiled_mma_splitn_epi = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            self.acc_dtype,
+            tcgen05.CtaGroup.TWO if cutlass.const_expr(self.use_m64_ws) else cta_group,
+            self.ws_splitn_epi_tiler_mn,
         )
 
         cta_layout_vmnk = cute.tiled_divide(
@@ -718,6 +821,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * cute.size(qk_tiled_mma.thr_id.shape)
             * self.iterations_qk_latent
         )
+        kc_latent_subtile_copy_size = cute.size_in_bytes(
+            self.k_dtype,
+            cute.select(kc_latent_smem_layout_staged, mode=[0, 1, 2]),
+        ) * cute.size(qk_tiled_mma.thr_id.shape)
         kc_rope_copy_size = (
             cute.size_in_bytes(
                 self.k_dtype,
@@ -734,10 +841,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * self.iterations_pv_n
             * self.iterations_pv_k
         )
+        vc_subtile_copy_size = cute.size_in_bytes(
+            self.v_dtype, cute.select(vc_smem_layout_staged, mode=[0, 1, 2])
+        ) * cute.size(pv_tiled_mma.thr_id.shape)
 
         self.tma_copy_q_bytes = q_latent_copy_size + q_rope_copy_size
         self.tma_copy_kc_bytes = kc_latent_copy_size + kc_rope_copy_size
-        self.tma_copy_vc_bytes = vc_copy_size
+        self.tma_copy_kc_latent_bytes = (
+            kc_latent_subtile_copy_size
+            if cutlass.const_expr(self.use_m64_ws)
+            else self.tma_copy_kc_bytes
+        )
+        self.tma_copy_kc_rope_bytes = kc_rope_copy_size
+        self.tma_copy_vc_bytes = (
+            vc_subtile_copy_size
+            if cutlass.const_expr(self.use_m64_ws)
+            else vc_copy_size
+        )
 
         tile_sched_params, grid = self._compute_grid(
             o,
@@ -751,8 +871,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         class SplitKVKernelSharedStorage:
             # Pipeline barriers
             load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_q_stage * 2]
-            load_k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_k_stage * 2]
-            load_v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_v_stage * 2]
+            load_k_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.load_k_pipeline_stage * 2
+            ]
+            load_k_rope_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.load_k_rope_pipeline_stage * 2
+            ]
+            load_v_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.load_v_pipeline_stage * 2
+            ]
             mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_s_stage * 2]
             p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_mma_stage * 2]
             p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_cor_stage * 2]
@@ -810,6 +937,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.split_kv_kernel(
             qk_tiled_mma,
             pv_tiled_mma,
+            ws_tiled_mma_epi,
+            ws_tiled_mma_splitn_epi,
             tma_atom_q_latent,
             tma_tensor_q_latent,
             tma_atom_q_rope,
@@ -916,6 +1045,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
+        tiled_mma_ws_epi: cute.TiledMma,
+        tiled_mma_ws_splitn_epi: cute.TiledMma,
         tma_atom_q_latent: Optional[cute.CopyAtom],
         mQL: cute.Tensor,
         tma_atom_q_rope: Optional[cute.CopyAtom],
@@ -1066,13 +1197,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         load_k_pipeline = self.make_and_init_load_qkv_pipeline(
             storage.load_k_mbar_ptr.data_ptr(),
             cta_layout_vmnk,
-            self.load_k_stage,
-            self.tma_copy_kc_bytes,
+            self.load_k_pipeline_stage,
+            self.tma_copy_kc_latent_bytes,
         )
+        if cutlass.const_expr(self.use_m64_ws):
+            load_k_rope_pipeline = self.make_and_init_load_qkv_pipeline(
+                storage.load_k_rope_mbar_ptr.data_ptr(),
+                cta_layout_vmnk,
+                self.load_k_rope_pipeline_stage,
+                self.tma_copy_kc_rope_bytes,
+            )
+        else:
+            load_k_rope_pipeline = load_k_pipeline
         load_v_pipeline = self.make_and_init_load_qkv_pipeline(
             storage.load_v_mbar_ptr.data_ptr(),
             cta_layout_vmnk,
-            self.load_v_stage,
+            self.load_v_pipeline_stage,
             self.tma_copy_vc_bytes,
         )
         mma_s_pipeline = self.make_and_init_mma_s_pipeline(
@@ -1149,12 +1289,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         if warp_idx == self.load_tma_k_warp_id:
             _setmaxregister_decrease(self.other_reg_num)
-            # PDL: wait for the prior kernel to finish its writes before
-            # issuing TMA loads for K (latent + rope) from GMEM.
             cute.arch.griddepcontrol_wait()
             load_k_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.load_k_stage
+                pipeline.PipelineUserType.Producer, self.load_k_pipeline_stage
             )
+            if cutlass.const_expr(self.use_m64_ws):
+                load_k_rope_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.load_k_rope_pipeline_stage
+                )
+            else:
+                load_k_rope_producer_state = load_k_producer_state
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
@@ -1172,6 +1316,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         blk_coord=blk_coord,
                         local_split_kv=local_split_kv,
                         load_k_pipeline=load_k_pipeline,
+                        load_k_rope_pipeline=load_k_rope_pipeline,
                         mPT=mPT,
                     )
                     tma_k_params = SimpleNamespace(
@@ -1181,31 +1326,36 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mCL=mCL,
                         mKR=mKR,
                         sKC=sKC_for_tma,
+                        sKC_full=sKC,
                         sKC_rope=sKC_rope_for_tma,
                     )
                     # Load K only
-                    load_k_producer_state = self.load_tma_k(
+                    (
+                        load_k_producer_state,
+                        load_k_rope_producer_state,
+                    ) = self.load_tma_k(
                         tma_common_params,
                         tma_k_params,
                         k_index,
                         k_tile_count,
                         load_k_producer_state,
+                        load_k_rope_producer_state,
                     )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
             load_k_pipeline.producer_tail(load_k_producer_state)
+            if cutlass.const_expr(self.use_m64_ws):
+                load_k_rope_pipeline.producer_tail(load_k_rope_producer_state)
 
         if warp_idx == self.load_tma_v_warp_id:
             _setmaxregister_decrease(self.other_reg_num)
-            # PDL: wait for the prior kernel to finish its writes before
-            # issuing TMA loads for Q and V from GMEM.
             cute.arch.griddepcontrol_wait()
             load_q_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_q_stage
             )
             load_v_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.load_v_stage
+                pipeline.PipelineUserType.Producer, self.load_v_pipeline_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -1278,10 +1428,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Consumer, self.load_q_stage
             )
             load_k_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_k_stage
+                pipeline.PipelineUserType.Consumer, self.load_k_pipeline_stage
             )
+            if cutlass.const_expr(self.use_m64_ws):
+                load_k_rope_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.load_k_rope_pipeline_stage
+                )
+            else:
+                load_k_rope_consumer_state = load_k_consumer_state
             load_v_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_v_stage
+                pipeline.PipelineUserType.Consumer, self.load_v_pipeline_stage
             )
             mma_s_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_s_stage
@@ -1311,10 +1467,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         local_split_kv=local_split_kv,
                         load_q_pipeline=load_q_pipeline,
                         load_k_pipeline=load_k_pipeline,
+                        load_k_rope_pipeline=load_k_rope_pipeline,
                         load_v_pipeline=load_v_pipeline,
                         tmem_ptr=tmem_ptr,
                         is_leader_cta=is_leader_cta,
                         L=mCL.shape[1],
+                        tiled_mma_ws_epi=tiled_mma_ws_epi,
+                        tiled_mma_ws_splitn_epi=tiled_mma_ws_splitn_epi,
                     )
                     mma_qk_params = SimpleNamespace(
                         mma_s_pipeline=mma_s_pipeline,
@@ -1334,6 +1493,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tiled_mma_pv,
                         load_q_consumer_state,
                         load_k_consumer_state,
+                        load_k_rope_consumer_state,
                         load_v_consumer_state,
                         mma_s_producer_state,
                         p_mma_consumer_state,
@@ -1347,6 +1507,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tiled_mma_pv,
                         load_q_consumer_state,
                         load_k_consumer_state,
+                        load_k_rope_consumer_state,
                         load_v_consumer_state,
                         mma_s_producer_state,
                         p_mma_consumer_state,
@@ -1357,8 +1518,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
             mma_s_pipeline.producer_tail(mma_s_producer_state)
             mma_o_pipeline.producer_tail(mma_o_producer_state)
-
-            # Allow any subsequent dependent kernel to be early-launched.
             cute.arch.griddepcontrol_launch_dependents()
 
             tmem.relinquish_alloc_permit()
@@ -1409,10 +1568,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
+                        tiled_mma_ws_epi=tiled_mma_ws_epi,
+                        tiled_mma_ws_splitn_epi=tiled_mma_ws_splitn_epi,
                         p_cor_pipeline=p_cor_pipeline,
                     )
                     compute_softmax_params = SimpleNamespace(
                         tiled_mma_qk=tiled_mma_qk,
+                        tiled_mma_ws_epi=tiled_mma_ws_epi,
+                        tiled_mma_ws_splitn_epi=tiled_mma_ws_splitn_epi,
                         sP=sP,
                         mma_s_pipeline=mma_s_pipeline,
                         p_mma_pipeline=p_mma_pipeline,
@@ -1476,6 +1639,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
                         tiled_mma_pv=tiled_mma_pv,
+                        tiled_mma_ws_epi=tiled_mma_ws_epi,
+                        tiled_mma_ws_splitn_epi=tiled_mma_ws_splitn_epi,
                         p_cor_pipeline=p_cor_pipeline,
                         mma_o_pipeline=mma_o_pipeline,
                     )
@@ -1542,8 +1707,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
 
-        # PDL: wait for the split-KV kernel to finish writing mAccO / mAccLSE
-        # before reading them in this reduction kernel.
         cute.arch.griddepcontrol_wait()
 
         gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
@@ -1610,14 +1773,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
-
-        # Allow any subsequent dependent kernel to be early-launched.
         cute.arch.griddepcontrol_launch_dependents()
         return
 
     @staticmethod
     def get_split_kv(
-        B: int, S: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int
+        B: int,
+        S: int,
+        K: int,
+        mma_qk_tiler_mn: tuple,
+        max_active_blocks: int,
+        m_ctas_per_tile: int = 2,
     ) -> int:
         """Get the proper split_kv value for the MLA kernel based on parameters.
 
@@ -1631,18 +1797,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type mma_qk_tiler_mn: tuple
         :param max_active_blocks: Maximum number of active blocks
         :type max_active_blocks: int
+        :param m_ctas_per_tile: Number of CTAs launched in M for one logical tile
+        :type m_ctas_per_tile: int
         :return: Split_kv value
         :rtype: int
         """
         max_splits = ceil_div(K, mma_qk_tiler_mn[1])
-        blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+        blocks_per_batch = max(1, max_active_blocks // B // (S * m_ctas_per_tile))
         split_heur = min(max_splits, blocks_per_batch)
-        # {$nv-internal-release begin}
-        # Keep split selection in scalar form to avoid dynamic int_tuple make_tile issues.
-        # {$nv-internal-release end}
         k_waves = ceil_div(max_splits, split_heur)
         split_wave_aware = ceil_div(max_splits, k_waves)
-        max_split_kv = 32
+        max_split_kv = 64 if m_ctas_per_tile == 1 else 32
         return min(split_wave_aware, max_split_kv)
 
     @staticmethod
@@ -1677,9 +1842,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             split_kv = block_split_kvs[blk_coord[2]]
 
         k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
-        # {$nv-internal-release begin}
-        # Keep tile counts in scalar form to avoid dynamic int_tuple make_tile issues.
-        # {$nv-internal-release end}
         k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
         k_index = blk_coord[3] * k_tile_per_cta
         k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
@@ -1716,8 +1878,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tSgQL = thr_mma_qk.partition_A(gQL)
         tSgQR = thr_mma_qk.partition_A(gQR)
 
-        # smem: ((atom_v, rest_v), STAGE)
-        # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
         tQsQ, tQLgQL_mkl = cpasync.tma_partition(
             q_params.tma_atom_q_latent,
             0,
@@ -1770,7 +1930,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_index: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         load_k_producer_state: pipeline.PipelineState,
-    ) -> pipeline.PipelineState:
+        load_k_rope_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
         """Load K tensors (latent + rope) for all k tiles.
 
         :param common_params: The common parameters (blk_coord, load_k_pipeline, mPT)
@@ -1835,25 +1996,30 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             k_params.sKC_rope,
             tSgKR,
         )
-
         # set extra params
         common_params.mPT = mPT
+        k_params.tSgCL = tSgCL
+        k_params.tSgKR = tSgKR
         k_params.tCLgCL = tCLgCL
         k_params.tKRgKR = tKRgKR
         k_params.tKCsKC = tKCsKC
         k_params.tKCsKC_rope = tKCsKC_rope
 
         while k_tile_count > 0:
-            load_k_producer_state = self.load_tma_k_one_k_tile(
+            (
+                load_k_producer_state,
+                load_k_rope_producer_state,
+            ) = self.load_tma_k_one_k_tile(
                 common_params,
                 k_params,
                 k_index,
                 load_k_producer_state,
+                load_k_rope_producer_state,
             )
             k_index += 1
             k_tile_count -= 1
 
-        return load_k_producer_state
+        return load_k_producer_state, load_k_rope_producer_state
 
     @cute.jit
     def load_tma_v(
@@ -1909,9 +2075,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         v_params.tVCsVC = tVCsVC
 
         while k_tile_count > 0:
-            # {$nv-internal-release begin}
-            # Keep state values explicit for CuteDSL AST lowering.
-            # {$nv-internal-release end}
             load_v_producer_state = self.load_tma_v_one_k_tile(
                 common_params,
                 v_params,
@@ -1929,7 +2092,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_params: SimpleNamespace,
         k_index: cutlass.Int32,
         load_k_producer_state: pipeline.PipelineState,
-    ) -> pipeline.PipelineState:
+        load_k_rope_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
         """Load one k-tile of K latent/rope tensors.
 
         :param common_params: The common parameters
@@ -1961,33 +2125,102 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     + i
                 ]
             )
-        # get the mbar ptr from pipeline.
-        tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
-            load_k_producer_state
-        )
-        common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
-        for i in range(self.iterations_qk_latent):
-            for k in range(page_per_tile):
-                # load k latent
-                cute.copy(
-                    k_params.tma_atom_c_latent,
-                    k_params.tCLgCL[None, i, k_idx[k]],
-                    k_params.tKCsKC[None, k, 0, (i, load_k_producer_state.index)],
-                    tma_bar_ptr=tma_bar_ptr,
+        if cutlass.const_expr(self.use_m64_ws):
+            for i in cutlass.range_constexpr(self.iterations_qk_latent):
+                tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
+                    load_k_producer_state
                 )
+                common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
+                for k in cutlass.range_constexpr(page_per_tile):
+                    if cutlass.const_expr(page_per_tile > 1):
+                        sKC_page_base = cute.domain_offset(
+                            ((k * self.page_size, 0), 0, 0, (i, 0)),
+                            k_params.sKC_full,
+                        )
+                        sKC_page = cute.make_tensor(
+                            sKC_page_base.iterator, k_params.sKC.layout
+                        )
+                        tKCsKC_page, tCLgCL_page = cpasync.tma_partition(
+                            k_params.tma_atom_c_latent,
+                            0,
+                            cute.make_layout(1),
+                            sKC_page,
+                            k_params.tSgCL,
+                        )
+                        cute.copy(
+                            k_params.tma_atom_c_latent,
+                            tCLgCL_page[None, i, k_idx[k]],
+                            tKCsKC_page[None, 0, 0, (0, 0)],
+                            tma_bar_ptr=tma_bar_ptr,
+                        )
+                    else:
+                        cute.copy(
+                            k_params.tma_atom_c_latent,
+                            k_params.tCLgCL[None, i, k_idx[k]],
+                            k_params.tKCsKC[None, k, 0, (i, 0)],
+                            tma_bar_ptr=tma_bar_ptr,
+                        )
+                load_k_producer_state.advance()
 
-        for i in cutlass.range_constexpr(self.iterations_qk_rope):
-            for k in cutlass.range_constexpr(page_per_tile):
-                # load k rope
-                cute.copy(
-                    k_params.tma_atom_c_rope,
-                    k_params.tKRgKR[None, i, k_idx[k]],
-                    k_params.tKCsKC_rope[None, k, 0, load_k_producer_state.index],
-                    tma_bar_ptr=tma_bar_ptr,
-                )
-        load_k_producer_state.advance()
+            tma_bar_ptr = common_params.load_k_rope_pipeline.producer_get_barrier(
+                load_k_rope_producer_state
+            )
+            common_params.load_k_rope_pipeline.producer_acquire(
+                load_k_rope_producer_state
+            )
+            for i in cutlass.range_constexpr(self.iterations_qk_rope):
+                for k in cutlass.range_constexpr(page_per_tile):
+                    if cutlass.const_expr(page_per_tile > 1):
+                        sKC_rope_page = cute.domain_offset(
+                            ((k * self.page_size, 0), 0, 0, 0),
+                            k_params.sKC_rope,
+                        )
+                        tKCsKC_rope_page, tKRgKR_page = cpasync.tma_partition(
+                            k_params.tma_atom_c_rope,
+                            0,
+                            cute.make_layout(1),
+                            sKC_rope_page,
+                            k_params.tSgKR,
+                        )
+                        cute.copy(
+                            k_params.tma_atom_c_rope,
+                            tKRgKR_page[None, i, k_idx[k]],
+                            tKCsKC_rope_page[None, 0, 0, 0],
+                            tma_bar_ptr=tma_bar_ptr,
+                        )
+                    else:
+                        cute.copy(
+                            k_params.tma_atom_c_rope,
+                            k_params.tKRgKR[None, i, k_idx[k]],
+                            k_params.tKCsKC_rope[None, k, 0, 0],
+                            tma_bar_ptr=tma_bar_ptr,
+                        )
+            load_k_rope_producer_state.advance()
+        else:
+            tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
+                load_k_producer_state
+            )
+            common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
+            for i in range(self.iterations_qk_latent):
+                for k in range(page_per_tile):
+                    cute.copy(
+                        k_params.tma_atom_c_latent,
+                        k_params.tCLgCL[None, i, k_idx[k]],
+                        k_params.tKCsKC[None, k, 0, (i, load_k_producer_state.index)],
+                        tma_bar_ptr=tma_bar_ptr,
+                    )
 
-        return load_k_producer_state
+            for i in cutlass.range_constexpr(self.iterations_qk_rope):
+                for k in cutlass.range_constexpr(page_per_tile):
+                    cute.copy(
+                        k_params.tma_atom_c_rope,
+                        k_params.tKRgKR[None, i, k_idx[k]],
+                        k_params.tKCsKC_rope[None, k, 0, load_k_producer_state.index],
+                        tma_bar_ptr=tma_bar_ptr,
+                    )
+            load_k_producer_state.advance()
+
+        return load_k_producer_state, load_k_rope_producer_state
 
     @cute.jit
     def load_tma_v_one_k_tile(
@@ -2020,34 +2253,63 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 if page_per_tile == 1
                 else common_params.mPT[k_index * page_per_tile + i]
             )
-        # get the mbar ptr from pipeline.
-        tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
-            load_v_producer_state
-        )
-        common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
-        for j in cutlass.range_constexpr(self.iterations_pv_n):
-            for i in cutlass.range_constexpr(self.iterations_pv_k):
-                if cutlass.const_expr(page_per_tile > 1):
-                    for k in cutlass.range_constexpr(page_per_subtile):
-                        k_idx_i = k_idx[k + i * page_per_subtile]
+        if cutlass.const_expr(self.use_m64_ws):
+            for j in cutlass.range_constexpr(self.iterations_pv_n):
+                for i in cutlass.range_constexpr(self.iterations_pv_k):
+                    tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
+                        load_v_producer_state
+                    )
+                    common_params.load_v_pipeline.producer_acquire(
+                        load_v_producer_state
+                    )
+                    if cutlass.const_expr(page_per_tile > 1):
+                        for k in cutlass.range_constexpr(page_per_subtile):
+                            k_idx_i = k_idx[k + i * page_per_subtile]
+                            cute.copy(
+                                v_params.tma_atom_c_latent_transpose,
+                                v_params.tCLTgCLT[None, j, 0, k_idx_i],
+                                v_params.tVCsVC[None, 0, k, ((j, i), 0)],
+                                tma_bar_ptr=tma_bar_ptr,
+                            )
+                    else:
                         cute.copy(
                             v_params.tma_atom_c_latent_transpose,
-                            v_params.tCLTgCLT[None, j, 0, k_idx_i],
+                            v_params.tCLTgCLT[None, j, i, k_idx[0]],
+                            v_params.tVCsVC[None, 0, 0, ((j, i), 0)],
+                            tma_bar_ptr=tma_bar_ptr,
+                        )
+                    load_v_producer_state.advance()
+        else:
+            tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
+                load_v_producer_state
+            )
+            common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
+            for j in cutlass.range_constexpr(self.iterations_pv_n):
+                for i in cutlass.range_constexpr(self.iterations_pv_k):
+                    if cutlass.const_expr(page_per_tile > 1):
+                        for k in cutlass.range_constexpr(page_per_subtile):
+                            k_idx_i = k_idx[k + i * page_per_subtile]
+                            cute.copy(
+                                v_params.tma_atom_c_latent_transpose,
+                                v_params.tCLTgCLT[None, j, 0, k_idx_i],
+                                v_params.tVCsVC[
+                                    None,
+                                    0,
+                                    k,
+                                    ((j, i), load_v_producer_state.index),
+                                ],
+                                tma_bar_ptr=tma_bar_ptr,
+                            )
+                    else:
+                        cute.copy(
+                            v_params.tma_atom_c_latent_transpose,
+                            v_params.tCLTgCLT[None, j, i, k_idx[0]],
                             v_params.tVCsVC[
-                                None, 0, k, ((j, i), load_v_producer_state.index)
+                                None, 0, 0, ((j, i), load_v_producer_state.index)
                             ],
                             tma_bar_ptr=tma_bar_ptr,
                         )
-                else:
-                    cute.copy(
-                        v_params.tma_atom_c_latent_transpose,
-                        v_params.tCLTgCLT[None, j, i, k_idx[0]],
-                        v_params.tVCsVC[
-                            None, 0, 0, ((j, i), load_v_producer_state.index)
-                        ],
-                        tma_bar_ptr=tma_bar_ptr,
-                    )
-        load_v_producer_state.advance()
+            load_v_producer_state.advance()
         return load_v_producer_state
 
     @cute.jit
@@ -2061,6 +2323,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tiled_mma_pv: cute.TiledMma,
         load_q_consumer_state: pipeline.PipelineState,
         load_k_consumer_state: pipeline.PipelineState,
+        load_k_rope_consumer_state: pipeline.PipelineState,
         load_v_consumer_state: pipeline.PipelineState,
         mma_s_producer_state: pipeline.PipelineState,
         p_mma_consumer_state: pipeline.PipelineState,
@@ -2068,6 +2331,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     ) -> tuple[
         cute.TiledMma,
         cute.TiledMma,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
@@ -2112,24 +2377,42 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tOrP = tiled_mma_pv.make_fragment_A(pv_params.sP)
         tOrVC = tiled_mma_pv.make_fragment_B(pv_params.sVC)
 
-        tStS_shape = tiled_mma_qk.partition_shape_C(
-            cute.select(self.mma_qk_tiler, mode=[0, 1])
-        )
-        tStS_staged_fake = tiled_mma_qk.make_fragment_C(
-            cute.append(tStS_shape, self.mma_s_stage)
-        )
+        if cutlass.const_expr(self.use_m64_ws):
+            tStS_shape = common_params.tiled_mma_ws_splitn_epi.partition_shape_C(
+                self.ws_splitn_epi_tiler_mn
+            )
+            tStS_staged_fake = common_params.tiled_mma_ws_splitn_epi.make_fragment_C(
+                cute.append(tStS_shape, self.mma_s_stage)
+            )
+        else:
+            tStS_shape = tiled_mma_qk.partition_shape_C(
+                cute.select(self.mma_qk_tiler, mode=[0, 1])
+            )
+            tStS_staged_fake = tiled_mma_qk.make_fragment_C(
+                cute.append(tStS_shape, self.mma_s_stage)
+            )
         # use real tmem ptr for tStS
         tStS_staged = cute.make_tensor(common_params.tmem_ptr, tStS_staged_fake.layout)
-        tOtO_shape = tiled_mma_pv.partition_shape_C(
-            cute.select(self.mma_pv_tiler, mode=[0, 1])
+        tOtO_shape = (
+            common_params.tiled_mma_ws_epi.partition_shape_C(
+                (128, self.mma_pv_tiler[1] // self.warps_in_n)
+            )
+            if cutlass.const_expr(self.use_m64_ws)
+            else tiled_mma_pv.partition_shape_C(
+                cute.select(self.mma_pv_tiler, mode=[0, 1])
+            )
         )
         # mma O has 1 stage.
-        tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
+        tOtO = (
+            common_params.tiled_mma_ws_epi.make_fragment_C(tOtO_shape)
+            if cutlass.const_expr(self.use_m64_ws)
+            else tiled_mma_pv.make_fragment_C(tOtO_shape)
+        )
         tOtO_layout = cute.append(
             tOtO.layout,
             cute.make_layout(
                 common_params.L // self.mma_pv_tiler[1],
-                stride=self.mma_pv_tiler[1] // self.warps_in_n,
+                stride=self.pv_acc_cols,
             ),
         )
         tOtO_staged = cute.make_tensor(
@@ -2155,6 +2438,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tiled_mma_qk,
                 load_q_consumer_state,
                 load_k_consumer_state,
+                load_k_rope_consumer_state,
                 mma_s_producer_state,
             ) = self.mma_qk(
                 common_params,
@@ -2162,6 +2446,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tiled_mma_qk,
                 load_q_consumer_state,
                 load_k_consumer_state,
+                load_k_rope_consumer_state,
                 mma_s_producer_state,
                 wait_q=True,
             )
@@ -2172,6 +2457,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tiled_mma_qk,
                     load_q_consumer_state,
                     load_k_consumer_state,
+                    load_k_rope_consumer_state,
                     mma_s_producer_state,
                 ) = self.mma_qk(
                     common_params,
@@ -2179,6 +2465,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tiled_mma_qk,
                     load_q_consumer_state,
                     load_k_consumer_state,
+                    load_k_rope_consumer_state,
                     mma_s_producer_state,
                     wait_q=False,
                 )
@@ -2218,6 +2505,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tiled_mma_pv,
             load_q_consumer_state,
             load_k_consumer_state,
+            load_k_rope_consumer_state,
             load_v_consumer_state,
             mma_s_producer_state,
             p_mma_consumer_state,
@@ -2232,10 +2520,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tiled_mma_qk: cute.TiledMma,
         load_q_consumer_state: pipeline.PipelineState,
         load_k_consumer_state: pipeline.PipelineState,
+        load_k_rope_consumer_state: pipeline.PipelineState,
         mma_s_producer_state: pipeline.PipelineState,
         wait_q: bool,
     ) -> tuple[
         cute.TiledMma,
+        pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
@@ -2264,34 +2554,70 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         load_k_pipeline = common_params.load_k_pipeline
         if cutlass.const_expr(wait_q):
             load_q_pipeline.consumer_wait(load_q_consumer_state)
-        load_k_pipeline.consumer_wait(load_k_consumer_state)
-        for q_stage in range(self.iterations_qk_latent):
-            kc_stage = load_k_consumer_state.index
-            for k_block in cutlass.range_constexpr(cute.size(qk_params.tSrQ.shape[2])):
-                cute.gemm(
-                    tiled_mma_qk,
-                    tStS,
-                    qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
-                    qk_params.tSrKC[None, None, k_block, (q_stage, kc_stage)],
-                    tStS,
-                )
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+        if cutlass.const_expr(self.use_m64_ws):
+            for q_stage in cutlass.range_constexpr(self.iterations_qk_latent):
+                load_k_pipeline.consumer_wait(load_k_consumer_state)
+                for k_block in cutlass.range_constexpr(
+                    cute.size(qk_params.tSrQ.shape[2])
+                ):
+                    tcgen05_mma_ws_f8f6f4_one(
+                        qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
+                        qk_params.tSrKC[None, None, k_block, (q_stage, 0)],
+                        tStS,
+                        Int32(_IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA),
+                        Boolean(q_stage != 0 or k_block != 0),
+                    )
+                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+                load_k_pipeline.consumer_release(load_k_consumer_state)
+                load_k_consumer_state.advance()
 
-        for q_stage in range(self.iterations_qk_rope):
-            kc_stage = load_k_consumer_state.index
-            for k_block in cutlass.range_constexpr(
-                self.rope_dim // tiled_mma_qk.shape_mnk[2]
-            ):
-                cute.gemm(
-                    tiled_mma_qk,
-                    tStS,
-                    qk_params.tSrQ_rope[None, None, k_block, q_stage],
-                    qk_params.tSrKC_rope[None, None, k_block, kc_stage],
-                    tStS,
-                )
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
-        load_k_pipeline.consumer_release(load_k_consumer_state)
-        load_k_consumer_state.advance()
+            load_k_rope_pipeline = common_params.load_k_rope_pipeline
+            load_k_rope_pipeline.consumer_wait(load_k_rope_consumer_state)
+            for q_stage in cutlass.range_constexpr(self.iterations_qk_rope):
+                for k_block in cutlass.range_constexpr(
+                    self.rope_dim // tiled_mma_qk.shape_mnk[2]
+                ):
+                    tcgen05_mma_ws_f8f6f4_one(
+                        qk_params.tSrQ_rope[None, None, k_block, q_stage],
+                        qk_params.tSrKC_rope[None, None, k_block, 0],
+                        tStS,
+                        Int32(_IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA),
+                        Boolean(True),
+                    )
+                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+            load_k_rope_pipeline.consumer_release(load_k_rope_consumer_state)
+            load_k_rope_consumer_state.advance()
+        else:
+            load_k_pipeline.consumer_wait(load_k_consumer_state)
+            for q_stage in range(self.iterations_qk_latent):
+                kc_stage = load_k_consumer_state.index
+                for k_block in cutlass.range_constexpr(
+                    cute.size(qk_params.tSrQ.shape[2])
+                ):
+                    cute.gemm(
+                        tiled_mma_qk,
+                        tStS,
+                        qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
+                        qk_params.tSrKC[None, None, k_block, (q_stage, kc_stage)],
+                        tStS,
+                    )
+                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+
+            for q_stage in range(self.iterations_qk_rope):
+                kc_stage = load_k_consumer_state.index
+                for k_block in cutlass.range_constexpr(
+                    self.rope_dim // tiled_mma_qk.shape_mnk[2]
+                ):
+                    cute.gemm(
+                        tiled_mma_qk,
+                        tStS,
+                        qk_params.tSrQ_rope[None, None, k_block, q_stage],
+                        qk_params.tSrKC_rope[None, None, k_block, kc_stage],
+                        tStS,
+                    )
+                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+            load_k_pipeline.consumer_release(load_k_consumer_state)
+            load_k_consumer_state.advance()
         if cutlass.const_expr(wait_q):
             load_q_consumer_state.advance()
 
@@ -2301,6 +2627,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tiled_mma_qk,
             load_q_consumer_state,
             load_k_consumer_state,
+            load_k_rope_consumer_state,
             mma_s_producer_state,
         )
 
@@ -2343,34 +2670,72 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         accumulate_flag = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
         mma_o_pipeline = pv_params.mma_o_pipeline
 
-        load_v_pipeline.consumer_wait(load_v_consumer_state)
-        vc_stage = load_v_consumer_state.index
-        for acc_stage in range(self.iterations_pv_n):
-            mma_o_pipeline.producer_acquire(mma_o_producer_state)
-            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
-            for p_stage in range(self.iterations_pv_k):
-                tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
-                for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
-                    cute.gemm(
-                        tiled_mma_pv,
-                        tOtO,
-                        pv_params.tOrP[
-                            None,
-                            None,
-                            k_block,
-                            (p_stage, p_mma_consumer_state.index),
-                        ],
-                        pv_params.tOrVC[
-                            None, None, k_block, ((acc_stage, p_stage), vc_stage)
-                        ],
-                        tOtO,
-                    )
-                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+        if cutlass.const_expr(self.use_m64_ws):
+            for acc_stage in cutlass.range_constexpr(self.iterations_pv_n):
+                mma_o_pipeline.producer_acquire(mma_o_producer_state)
+                tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
+                for p_stage in cutlass.range_constexpr(self.iterations_pv_k):
+                    load_v_pipeline.consumer_wait(load_v_consumer_state)
+                    tOtO_m64 = pv_params.tOtO_staged[None, None, None, acc_stage]
+                    for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
+                        idesc = (
+                            _IDESC_F8E4M3_F32_M64_N256_AK_BMN_1CTA
+                            if cutlass.const_expr(self.mma_pv_tiler[1] == 256)
+                            else _IDESC_F8E4M3_F32_M64_N128_AK_BMN_1CTA
+                        )
+                        tcgen05_mma_ws_f8f6f4_one(
+                            pv_params.tOrP[
+                                None,
+                                None,
+                                k_block,
+                                (p_stage, p_mma_consumer_state.index),
+                            ],
+                            pv_params.tOrVC[
+                                None, None, k_block, ((acc_stage, p_stage), 0)
+                            ],
+                            tOtO_m64,
+                            Int32(idesc),
+                            Boolean(
+                                accumulate_flag
+                                if p_stage == 0 and k_block == 0
+                                else True
+                            ),
+                        )
+                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                    load_v_pipeline.consumer_release(load_v_consumer_state)
+                    load_v_consumer_state.advance()
 
-            mma_o_pipeline.producer_commit(mma_o_producer_state)
-            mma_o_producer_state.advance()
-        load_v_pipeline.consumer_release(load_v_consumer_state)
-        load_v_consumer_state.advance()
+                mma_o_pipeline.producer_commit(mma_o_producer_state)
+                mma_o_producer_state.advance()
+        else:
+            load_v_pipeline.consumer_wait(load_v_consumer_state)
+            vc_stage = load_v_consumer_state.index
+            for acc_stage in range(self.iterations_pv_n):
+                mma_o_pipeline.producer_acquire(mma_o_producer_state)
+                tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
+                for p_stage in range(self.iterations_pv_k):
+                    tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
+                    for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
+                        cute.gemm(
+                            tiled_mma_pv,
+                            tOtO,
+                            pv_params.tOrP[
+                                None,
+                                None,
+                                k_block,
+                                (p_stage, p_mma_consumer_state.index),
+                            ],
+                            pv_params.tOrVC[
+                                None, None, k_block, ((acc_stage, p_stage), vc_stage)
+                            ],
+                            tOtO,
+                        )
+                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+
+                mma_o_pipeline.producer_commit(mma_o_producer_state)
+                mma_o_producer_state.advance()
+            load_v_pipeline.consumer_release(load_v_consumer_state)
+            load_v_consumer_state.advance()
         pv_params.p_mma_pipeline.consumer_release(p_mma_consumer_state)
         p_mma_consumer_state.advance()
 
@@ -2608,18 +2973,50 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             row_max_new = row_max
 
         # pad for 4x32b
-        corr_layout = cute.make_layout(
-            (tAcc.shape[0], (4, tAcc.shape[1][1]), self.mma_s_stage),
-            stride=(tAcc.stride[0], (1, tAcc.stride[1][1]), 4),
-        )
+        if cutlass.const_expr(self.use_2cta_instrs):
+            corr_layout = cute.make_layout(
+                (
+                    tAcc.shape[0],
+                    (_P_COR_METADATA_FIELDS, tAcc.shape[1][1]),
+                    self.mma_s_stage,
+                ),
+                stride=(
+                    tAcc.stride[0],
+                    (1, tAcc.stride[1][1]),
+                    _P_COR_METADATA_FIELDS,
+                ),
+            )
+        elif cutlass.const_expr(self.use_m64_ws):
+            corr_layout = cute.make_layout(
+                (
+                    self.ws_p_cor_rows,
+                    (_P_COR_METADATA_FIELDS, self.ws_p_cor_n_groups),
+                    self.p_cor_stage,
+                ),
+                stride=(
+                    _TMEM_ROW_STRIDE,
+                    (1, self.ws_p_cor_rows * _TMEM_ROW_STRIDE),
+                    _P_COR_METADATA_FIELDS,
+                ),
+            )
+        else:
+            corr_layout = cute.make_layout(
+                (tAcc.shape[0], _P_COR_METADATA_FIELDS, self.mma_s_stage),
+                stride=(tAcc.stride[0], 1, _P_COR_METADATA_FIELDS),
+            )
         tCor = cute.make_tensor(
             common_params.tmem_ptr + self.correction_factor_offset,
             corr_layout,
         )
         cCor = cute.make_identity_tensor(tCor.shape)
-        corr_tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
-        )
+        if cutlass.const_expr(self.use_2cta_instrs or self.use_m64_ws):
+            corr_tmem_store_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
+            )
+        else:
+            corr_tmem_store_atom = cute.make_copy_atom(
+                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(4)), self.acc_dtype
+            )
         corr_tmem_store_tiled_copy = tcgen05.make_tmem_copy(corr_tmem_store_atom, tCor)
         corr_tmem_store_thr_copy = corr_tmem_store_tiled_copy.get_slice(tidx)
         cCor_for_copy = corr_tmem_store_thr_copy.partition_S(cCor)
@@ -2702,18 +3099,25 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mma_s_try_token = softmax_params.mma_s_pipeline.consumer_try_wait(
             mma_s_consumer_state
         )
-        softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
         softmax_params.mma_s_pipeline.consumer_wait(
             mma_s_consumer_state, try_wait_token=mma_s_try_token
         )
 
         # load S from tmem
-        tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
-            cute.select(self.mma_qk_tiler, mode=[0, 1])
-        )
-        tStS_staged_fake = softmax_params.tiled_mma_qk.make_fragment_C(
-            cute.append(tStS_shape, self.mma_s_stage)
-        )
+        if cutlass.const_expr(self.use_m64_ws):
+            tStS_shape = softmax_params.tiled_mma_ws_splitn_epi.partition_shape_C(
+                self.ws_splitn_epi_tiler_mn
+            )
+            tStS_staged_fake = softmax_params.tiled_mma_ws_splitn_epi.make_fragment_C(
+                cute.append(tStS_shape, self.mma_s_stage)
+            )
+        else:
+            tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
+                cute.select(self.mma_qk_tiler, mode=[0, 1])
+            )
+            tStS_staged_fake = softmax_params.tiled_mma_qk.make_fragment_C(
+                cute.append(tStS_shape, self.mma_s_stage)
+            )
         tStS_staged = cute.make_tensor(common_params.tmem_ptr, tStS_staged_fake.layout)
         tStS = tStS_staged[None, None, None, mma_s_consumer_state.index]
 
@@ -2725,9 +3129,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         cS = cute.make_identity_tensor(cute.select(cta_qk_tiler, mode=[0, 1]))
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
+        if cutlass.const_expr(self.use_2cta_instrs or self.use_m64_ws):
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            )
+        else:
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(16)), self.acc_dtype
+            )
         tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
 
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
@@ -2762,14 +3171,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_s_consumer_state.advance()
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
+                    qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(self.is_causal):
                         if cutlass.const_expr(self.fold_sq_factor > 1):
+                            qk_row = tTR_tS[i][0]
                             q_tok = (
                                 common_params.blk_coord[1] * self.fold_sq_factor
-                                + (
-                                    tTR_tS[i][0]
-                                    + common_params.blk_coord[0] * cta_m_rows
-                                )
+                                + (qk_row + common_params.blk_coord[0] * cta_m_rows)
                                 // self.num_heads
                             )
                         else:
@@ -2795,7 +3203,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tTR_rAcc[i] = (
                         tTR_rAcc[i]
                         if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                            qk_col + self.mma_qk_tiler[1] * k_index,
                             k_bound,
                         )
                         else self.acc_dtype(-1.0e6)
@@ -2896,7 +3304,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
                 ],
             )
-
         # find correction factor
         correction_factor = cute.math.exp2(
             (row_max - row_max_new) * softmax_params.softmax_scale_log2, fastmath=True
@@ -2939,7 +3346,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # quantize
         tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
 
-        # create sP
+        # Acquire close to STS so softmax work can overlap with downstream MMA.
+        softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
         sP = softmax_params.sP[None, None, None, (None, p_mma_producer_state.index)]
         sP_mk_view = cute.make_tensor(
             sP.iterator,
@@ -2954,9 +3362,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ),
             ),
         )
-        # {$nv-internal-release begin}
-        # Use the PISL path for the PV stage.
-        # {$nv-internal-release end}
         # change to PISL
         sP_wo_swizzle_iter = cute.recast_ptr(sP.iterator, swizzle_=None)
         swizzle_bits = (
@@ -3038,15 +3443,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
         """
 
-        tOtO_shape = tiled_mma_pv.partition_shape_C(
-            cute.select(self.mma_pv_tiler, mode=[0, 1])
-        )
-        tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
+        if cutlass.const_expr(self.use_m64_ws):
+            tOtO_shape = common_params.tiled_mma_ws_epi.partition_shape_C(
+                (128, self.mma_pv_tiler[1] // self.warps_in_n)
+            )
+            tOtO = common_params.tiled_mma_ws_epi.make_fragment_C(tOtO_shape)
+        else:
+            tOtO_shape = tiled_mma_pv.partition_shape_C(
+                cute.select(self.mma_pv_tiler, mode=[0, 1])
+            )
+            tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
         tOtO_layout = cute.append(
             tOtO.layout,
             cute.make_layout(
                 common_params.L // self.mma_pv_tiler[1],
-                stride=self.mma_pv_tiler[1] // self.warps_in_n,
+                stride=self.pv_acc_cols,
             ),
         )
         tOtO = cute.make_tensor(
@@ -3056,13 +3467,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         tAcc = tOtO[(None, None), 0, 0]
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
+        if cutlass.const_expr(self.use_m64_ws):
+            if cutlass.const_expr(self.mma_pv_tiler[1] == 256):
+                tmem_load_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)),
+                    self.acc_dtype,
+                )
+            else:
+                tmem_load_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)),
+                    self.acc_dtype,
+                )
+        elif cutlass.const_expr(self.use_2cta_instrs):
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            )
+        else:
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)), self.acc_dtype
+            )
         tmem_load_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
-        # {$nv-internal-release begin}
-        # Use the known compute-thread count for tiled-copy slice selection.
-        # {$nv-internal-release end}
         tmem_load_thr_copy = tmem_load_tiled_copy.get_slice(
             common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         )
@@ -3123,8 +3547,37 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ),
             )
         tTR_tAcc = tmem_load_thr_copy.partition_S(tAcc)
-        tTR_gO = tmem_load_thr_copy.partition_D(gO)
-        tTR_cO = tmem_load_thr_copy.partition_D(cO)
+        if cutlass.const_expr(self.use_m64_ws):
+            if cutlass.const_expr(self.mma_pv_tiler[1] == 256):
+                gO_phys = cute.make_tensor(
+                    gO.iterator,
+                    cute.make_layout(
+                        ((64, 2), (64, 2)),
+                        stride=(
+                            (
+                                gO.stride[0],
+                                (self.mma_pv_tiler[1] // self.warps_in_n)
+                                * gO.stride[1],
+                            ),
+                            (gO.stride[1], 64 * gO.stride[1]),
+                        ),
+                    ),
+                )
+                cO_phys = cute.make_identity_tensor((128, 128))
+            else:
+                gO_phys = cute.make_tensor(
+                    gO.iterator,
+                    cute.make_layout(
+                        ((64, 2), 64),
+                        stride=((gO.stride[0], 64 * gO.stride[1]), gO.stride[1]),
+                    ),
+                )
+                cO_phys = cute.make_identity_tensor((128, 64))
+            tTR_gO = tmem_load_thr_copy.partition_D(gO_phys)
+            tTR_cO = tmem_load_thr_copy.partition_D(cO_phys)
+        else:
+            tTR_gO = tmem_load_thr_copy.partition_D(gO)
+            tTR_cO = tmem_load_thr_copy.partition_D(cO)
         tTR_rAcc = cute.make_fragment_like(tTR_gO, self.acc_dtype)
         return tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc  # type: ignore[return-value]
 
@@ -3155,17 +3608,49 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         _, tAcc, _, _, _, _ = self._tmem_load_partition(
             common_params, common_params.tiled_mma_pv, 0
         )
-        corr_layout = cute.make_layout(
-            (tAcc.shape[0], (4, tAcc.shape[1][1]), self.p_cor_stage),
-            stride=(tAcc.stride[0], (1, tAcc.stride[1][1]), 4),
-        )
+        if cutlass.const_expr(self.use_2cta_instrs):
+            corr_layout = cute.make_layout(
+                (
+                    tAcc.shape[0],
+                    (_P_COR_METADATA_FIELDS, tAcc.shape[1][1]),
+                    self.p_cor_stage,
+                ),
+                stride=(
+                    tAcc.stride[0],
+                    (1, tAcc.stride[1][1]),
+                    _P_COR_METADATA_FIELDS,
+                ),
+            )
+        elif cutlass.const_expr(self.use_m64_ws):
+            corr_layout = cute.make_layout(
+                (
+                    self.ws_p_cor_rows,
+                    (_P_COR_METADATA_FIELDS, self.ws_p_cor_n_groups),
+                    self.p_cor_stage,
+                ),
+                stride=(
+                    _TMEM_ROW_STRIDE,
+                    (1, self.ws_p_cor_rows * _TMEM_ROW_STRIDE),
+                    _P_COR_METADATA_FIELDS,
+                ),
+            )
+        else:
+            corr_layout = cute.make_layout(
+                (tAcc.shape[0], _P_COR_METADATA_FIELDS, self.p_cor_stage),
+                stride=(tAcc.stride[0], 1, _P_COR_METADATA_FIELDS),
+            )
         tCor = cute.make_tensor(
             common_params.tmem_ptr + self.correction_factor_offset, corr_layout
         )
         cCor = cute.make_identity_tensor(tCor.shape)
-        corr_tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
-        )
+        if cutlass.const_expr(self.use_2cta_instrs or self.use_m64_ws):
+            corr_tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
+            )
+        else:
+            corr_tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(4)), self.acc_dtype
+            )
         corr_tmem_load_tiled_copy = tcgen05.make_tmem_copy(corr_tmem_load_atom, tCor)
         corr_tmem_load_thr_copy = corr_tmem_load_tiled_copy.get_slice(tidx)
         tCor_for_copy = corr_tmem_load_thr_copy.partition_S(tCor)
@@ -3224,9 +3709,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 )
 
                 # tmem store tiled copy
-                tmem_store_atom = cute.make_copy_atom(
-                    tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-                )
+                if cutlass.const_expr(self.use_m64_ws):
+                    if cutlass.const_expr(self.mma_pv_tiler[1] == 256):
+                        tmem_store_atom = cute.make_copy_atom(
+                            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
+                            self.acc_dtype,
+                        )
+                    else:
+                        tmem_store_atom = cute.make_copy_atom(
+                            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(8)),
+                            self.acc_dtype,
+                        )
+                elif cutlass.const_expr(self.use_2cta_instrs):
+                    tmem_store_atom = cute.make_copy_atom(
+                        tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
+                        self.acc_dtype,
+                    )
+                else:
+                    tmem_store_atom = cute.make_copy_atom(
+                        tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                        self.acc_dtype,
+                    )
                 tmem_store_tiled_copy = tcgen05.make_tmem_copy(tmem_store_atom, tAcc)
 
                 # load o
@@ -3308,41 +3811,65 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # Full TMEM load to registers
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
 
-            # Subtiled elementwise + STG: elementwise of subtile N+1 overlaps
-            # with STG of subtile N via instruction-level parallelism.
-            # tTR_rAcc shape: ((V, 1), 1, rest_tiles) where rest_tiles = 4.
-            # Split along rest_tiles (mode 2) for subtiling.
-            num_epi_subtiles = tTR_rAcc.shape[2]
-            vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
-
-            # Prepare output fragment for type conversion
-            tR2G_rO_src = None
-            tR2G_rO_dst = tTR_gO
-            if cutlass.const_expr(common_params.mAccO is None):
-                tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-            else:
-                tR2G_rO_src = tTR_rAcc
-
-            for d_sub in cutlass.range_constexpr(num_epi_subtiles):
-                # Elementwise: scale and normalize (using pre-computed epi_scale)
-                for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
-                    tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
-
-                # Type convert per subtile using vectorized load/to/store
-                # (scalar f32→fp8 cvt is not supported by hardware)
+            if cutlass.const_expr(self.use_m64_ws):
+                num_epi_subtiles = cute.size(tTR_rAcc, mode=[2])
+                vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
                 if cutlass.const_expr(common_params.mAccO is None):
-                    tR2G_rO_src[None, None, d_sub].store(
-                        tTR_rAcc[None, None, d_sub].load().to(self.o_dtype)
-                    )
+                    tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
+                else:
+                    tR2G_rO_src = tTR_rAcc
 
-                # Store this subtile to global memory using autovec_copy
-                # for vectorized stores (STG.128).
-                if cute.elem_less(tTR_cO[0][0], common_params.H):
-                    cute.autovec_copy(
-                        tR2G_rO_src[None, None, d_sub],
-                        tR2G_rO_dst[None, None, d_sub],
-                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                    )
+                for d_sub in cutlass.range_constexpr(num_epi_subtiles):
+                    for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
+                        tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
+
+                    if cutlass.const_expr(common_params.mAccO is None):
+                        tR2G_rO_src[None, None, d_sub].store(
+                            tTR_rAcc[None, None, d_sub].load().to(self.o_dtype)
+                        )
+
+                    if cute.elem_less(tTR_cO[0][0] % 64, common_params.H):
+                        cute.autovec_copy(
+                            tR2G_rO_src[None, None, d_sub],
+                            tTR_gO[None, None, d_sub],
+                            l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                        )
+            else:
+                # Subtiled elementwise + STG: elementwise of subtile N+1 overlaps
+                # with STG of subtile N via instruction-level parallelism.
+                # tTR_rAcc shape: ((V, 1), 1, rest_tiles) where rest_tiles = 4.
+                # Split along rest_tiles (mode 2) for subtiling.
+                num_epi_subtiles = tTR_rAcc.shape[2]
+                vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
+
+                # Prepare output fragment for type conversion
+                tR2G_rO_src = None
+                tR2G_rO_dst = tTR_gO
+                if cutlass.const_expr(common_params.mAccO is None):
+                    tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
+                else:
+                    tR2G_rO_src = tTR_rAcc
+
+                for d_sub in cutlass.range_constexpr(num_epi_subtiles):
+                    # Elementwise: scale and normalize (using pre-computed epi_scale)
+                    for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
+                        tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
+
+                    # Type convert per subtile using vectorized load/to/store
+                    # (scalar f32→fp8 cvt is not supported by hardware)
+                    if cutlass.const_expr(common_params.mAccO is None):
+                        tR2G_rO_src[None, None, d_sub].store(
+                            tTR_rAcc[None, None, d_sub].load().to(self.o_dtype)
+                        )
+
+                    # Store this subtile to global memory using autovec_copy
+                    # for vectorized stores (STG.128).
+                    if cute.elem_less(tTR_cO[0][0], common_params.H):
+                        cute.autovec_copy(
+                            tR2G_rO_src[None, None, d_sub],
+                            tR2G_rO_dst[None, None, d_sub],
+                            l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                        )
 
             # store the lse to global memory
             cta_pv_tiler = (
@@ -3376,7 +3903,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         ),
                         (1, 1, 1),
                     )
-                    if cutlass.const_expr(self.warps_in_n == 2):
+                    if cutlass.const_expr(self.use_m64_ws):
+                        if cute.elem_less(cLSE[tidx][0], common_params.H):
+                            gLSE[tidx] = lse
+                    elif cutlass.const_expr(self.warps_in_n == 2):
                         if cute.elem_less(cLSE[tidx][0], common_params.H):
                             gLSE[tidx] = lse
             else:
@@ -3410,7 +3940,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                     (1, 1, 1),
                 )
-                if cutlass.const_expr(self.warps_in_n == 2):
+                if cutlass.const_expr(self.use_m64_ws):
+                    if cute.elem_less(cLSE[tidx][0], common_params.H):
+                        gLSE[tidx] = lse
+                elif cutlass.const_expr(self.warps_in_n == 2):
                     if cute.elem_less(cLSE[tidx][0], common_params.H):
                         gLSE[tidx] = lse
 
@@ -3781,11 +4314,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # page size equals 1 is prohibited by tma specification, not 128B aligned.
         if mma_qk_tiler_mn[1] % page_size != 0 or page_size == 1:
             return False
-        if mma_qk_tiler_mn[0] != mma_pv_tiler_mn[0] or mma_qk_tiler_mn[0] != 128:
+        if mma_qk_tiler_mn[0] != mma_pv_tiler_mn[0] or mma_qk_tiler_mn[0] not in (
+            64,
+            128,
+        ):
+            return False
+        if mma_qk_tiler_mn[0] == 64 and (
+            mma_qk_tiler_mn[1] != 128 or mma_pv_tiler_mn[1] not in (128, 256)
+        ):
             return False
         if is_var_split_kv and not is_var_seq:
             return False
         if H <= 0 or H > mma_qk_tiler_mn[0]:
+            return False
+        # When H < M tile, fold S_q into H to fill the MMA M dimension
+        # H*S can be < M tile (padding with zeros via TMA OOB); it just can't exceed it
+        if (
+            mma_qk_tiler_mn[0] == 64
+            and H < mma_qk_tiler_mn[0]
+            and H * S > mma_qk_tiler_mn[0]
+        ):
             return False
         if S < 1:
             return False
@@ -3884,6 +4432,10 @@ def run(
     :raises ValueError: If input shapes are incompatible or head dimension is unsupported
     :raises RuntimeError: If GPU is unavailable for computation
     """
+
+    if num_heads * seq_len_q <= 64:
+        mma_qk_tiler_mn = (64, 128)
+        mma_pv_tiler_mn = (64, 256)
 
     print("Running Blackwell MLA test with:")
     print(f"  batch_size: {batch_size}")
@@ -4077,6 +4629,7 @@ def run(
                         cache_seqs_ref[b].item(),
                         mma_qk_tiler_mn,
                         max_active_clusters * cluster_shape_mnk[0],
+                        cluster_shape_mnk[0],
                     )
                 )
             split_kv = torch.max(block_split_kvs_ref).item()
@@ -4091,6 +4644,7 @@ def run(
                 cache_seqs_ref[0].item(),
                 mma_qk_tiler_mn,
                 max_active_clusters * cluster_shape_mnk[0],
+                cluster_shape_mnk[0],
             )
         return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
 
@@ -4118,7 +4672,7 @@ def run(
     page_table_ref, page_table, page_table_torch = create_page_table(
         batch_size, seq_len_k, is_var_seq, page_size
     )
-    cluster_shape_mnk = (2, 1, 1)
+    cluster_shape_mnk = (2, 1, 1) if mma_qk_tiler_mn[0] == 128 else (1, 1, 1)
     hardware_info = utils.HardwareInfo()
     max_active_clusters = hardware_info.get_max_active_clusters(
         cluster_shape_mnk[0] * cluster_shape_mnk[1]
@@ -4370,9 +4924,7 @@ def run(
         )
 
         if out_dtype in [cutlass.Float8E5M2, cutlass.Float8E4M3FN]:
-            # {$nv-internal-release begin}
             # Avoid cute.testing.convert here because it can bus-error in local and CI runs.
-            # {$nv-internal-release end}
             # convert o back to f32 for comparison
             o_fp32, o_fp32_torch = cutlass_torch.cute_tensor_like(
                 torch.empty(*o_torch.shape, dtype=torch.float32),
@@ -4665,6 +5217,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "-softmax_scale",
         "--softmax_scale",
         type=float,
         default=0.0416,
@@ -4750,7 +5303,6 @@ if __name__ == "__main__":
         args.use_cold_l2,
         is_causal=args.is_causal,
     )
-
     print(f"Execution time (mla + reduction): {exec_time:.4f} microseconds")
 
     print("PASS")

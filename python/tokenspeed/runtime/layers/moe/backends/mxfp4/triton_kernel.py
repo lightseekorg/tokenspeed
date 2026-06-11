@@ -255,7 +255,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
                 sm_first=False,
                 dtype=router_logits.dtype,
                 traits={"output_type": "ragged_metadata"},
-                expected_kernel_name="triton_kernels_routing",
+                expected_kernel_name="gluon_decode_routing_gfx950",
             )
         )
 

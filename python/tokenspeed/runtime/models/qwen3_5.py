@@ -1249,7 +1249,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -1263,7 +1262,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 input_ids,
                 positions,
                 out_cache_loc,
-                input_lengths,
                 **kwargs,
             )
 
@@ -1286,7 +1284,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_embeds=input_embeds,
             **model_kwargs,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids,
             hidden_states,

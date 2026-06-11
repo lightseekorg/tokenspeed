@@ -21,47 +21,148 @@
 
 from __future__ import annotations
 
-import os
+from dataclasses import dataclass
 from typing import Any
 
 import torch
-from tokenspeed_kernel._triton import (
-    aggregate,
-    gl,
-    gluon,
-    redirect_triton_to_tokenspeed_triton,
-)
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import (
-    ScaleFormat,
-    dense_tensor_format,
-    format_signature,
-    tensor_format,
-)
+from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, tl, triton
 
-with redirect_triton_to_tokenspeed_triton():
-    from triton_kernels.matmul import FnSpecs, FusedActivation
-    from triton_kernels.swiglu import swiglu_fn
-    from triton_kernels.tensor import RaggedTensorMetadata, Tensor
+
+# Local copies from triton_kernels/matmul.py for the activation metadata
+# object passed through the tokenspeed-kernel MoE API.
+@dataclass(frozen=True)
+class FnSpecs:
+    name: str
+    fn: object
+    fn_arg_names: tuple[str, ...]
+    fn_arg_do_not_specialize: tuple[str, ...] = tuple()
+    reduction_n: int = 1
+
+    @staticmethod
+    def default():
+        return FnSpecs("dflt", None, tuple())
+
+
+@dataclass(frozen=True)
+class FusedActivation:
+    specs: FnSpecs = FnSpecs.default()
+    fn_args: tuple[object, ...] = tuple()
+
+
+# Local copy from triton_kernels/tensor_details/ragged_tensor.py.
+@dataclass
+class RaggedTensorMetadata:
+    slice_sizes: torch.Tensor
+    slice_offs: torch.Tensor
+    block_offs_data: torch.Tensor
+    block_schedule_data: torch.Tensor
+    expected_slice_size: int | None = None
+    slice_sizes_divisibility: int | None = None
+
+    def __post_init__(self):
+        assert self.block_offs_data.shape[0] == len(RaggedTensorMetadata.block_sizes())
+        assert self.block_schedule_data.shape[0] == len(
+            RaggedTensorMetadata.block_sizes()
+        )
+        assert self.block_offs_data.dtype == torch.int32
+        assert self.block_schedule_data.dtype == torch.int32
+        if self.slice_sizes is not None:
+            assert self.slice_sizes.dtype == torch.int32
+        if self.slice_offs is not None:
+            assert self.slice_offs.dtype == torch.int32
+
+    @property
+    def n_slices(self):
+        return self.slice_sizes.shape[0]
+
+    def block_offs(self, block_size):
+        return self.block_offs_data[
+            RaggedTensorMetadata.block_sizes().index(block_size)
+        ]
+
+    def block_schedule(self, block_size):
+        return self.block_schedule_data[
+            RaggedTensorMetadata.block_sizes().index(block_size)
+        ]
+
+    @staticmethod
+    def n_blocks(n_slices, n_total_rows, block_size):
+        if n_total_rows <= n_slices:
+            return n_total_rows
+        return n_slices - 1 - ((n_slices - n_total_rows - 1) // block_size)
+
+    @staticmethod
+    def max_n_blocks(n_slices, n_total_rows):
+        return RaggedTensorMetadata.n_blocks(
+            n_slices, n_total_rows, min(RaggedTensorMetadata.block_sizes())
+        )
+
+    @staticmethod
+    def block_sizes_log2():
+        return range(4, 9) if torch.version.hip is not None else range(4, 8)
+
+    @staticmethod
+    def block_sizes():
+        return [2**x for x in RaggedTensorMetadata.block_sizes_log2()]
+
+
+# Local copies from triton_kernels/swiglu_details/_swiglu.py.
+@triton.jit
+def _swiglu_clip(x, limit, clip_lower: tl.constexpr):
+    res = tl.minimum(x, limit)
+    if clip_lower:
+        res = tl.maximum(-limit, res)
+    return res
+
+
+@triton.jit
+def _compute_swiglu(gelu, linear, scale, alpha, limit):
+    gelu = gelu.to(tl.float32) * scale
+    if limit is not None:
+        gelu = _swiglu_clip(gelu, limit, clip_lower=False)
+    linear = linear.to(tl.float32) * scale
+    if limit is not None:
+        linear = _swiglu_clip(linear, limit, clip_lower=True)
+    s = gelu / (1 + tl.exp(-alpha * gelu))
+    return tl.fma(s, linear, s)
+
+
+@triton.jit(repr=lambda _: "_swiglu")
+def swiglu_fn(input, alpha, limit):
+    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    return _compute_swiglu(gelu, linear, 1.0, alpha, limit)
+
 
 __all__ = [
     "_gluon_mxfp_fused_moe",
     "_gluon_mxfp_ragged_matmul",
     "gluon_mxfp_combine",
     "gluon_mxfp_dispatch_swiglu",
+    "FUSED_ROUTE_MAX_M",
+    "SMALLM_MAX_M",
+    "GLUON_ROUTE_DTYPES",
+    "GLUON_ROUTE_MAX_E",
+    "GLUON_ROUTE_MAX_G",
+    "gluon_fused_route",
+    "gluon_route_supported",
+    "gluon_decode_routing_gfx950",
 ]
 
-_GLUON_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
-_GLUON_DISABLED_ENV = (
-    os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
-)
+
+# Stage2 split-K factor (applied across the whole small-M decode path).
+_WARP_DECODE_S2_SPLIT_K = 4
 
 
 def _as_int32(t):
     if t is None or t.dtype == torch.int32:
         return t
     return t.to(torch.int32)
+
+
+def _wrapped_tensor_data(obj):
+    storage = getattr(obj, "storage", None)
+    data = getattr(storage, "data", None)
+    return data if isinstance(data, torch.Tensor) else None
 
 
 _BLOCK_SIZES_TUPLE = tuple(RaggedTensorMetadata.block_sizes())
@@ -4271,9 +4372,9 @@ def _extract_gluon_raw_w(w):
         if shuffled is not None:
             return shuffled
         return w
-    if not isinstance(w, Tensor):
+    raw = _wrapped_tensor_data(w)
+    if raw is None:
         return w
-    raw = w.storage.data
     shuffled = getattr(raw, "_gluon_shuffled", None)
     if shuffled is not None:
         return shuffled
@@ -4285,9 +4386,8 @@ def _extract_gluon_raw_s(s):
     (bit-equivalent to upstream CDNA4MXScaleLayout.swizzle_data)."""
     if isinstance(s, torch.Tensor):
         return s
-    if not isinstance(s, Tensor):
-        return s
-    return s.storage.data
+    raw = _wrapped_tensor_data(s)
+    return s if raw is None else raw
 
 
 def _maybe_extract_swiglu_args(fused_activation):
@@ -4317,79 +4417,6 @@ def _global_scale_passthrough(scale):
     return float(scale)
 
 
-def _kernel_priority() -> int:
-    if _GLUON_DISABLED_ENV:
-        return Priority.PORTABLE + 1  # 5
-    return Priority.SPECIALIZED + 2  # 14
-
-
-_MXFP4_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.uint8,
-    granularity="block",
-    block_shape=(32,),
-)
-_FP8_PER_TENSOR_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="tensor",
-)
-
-_FUSED_WEIGHT_MXFP4 = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT)
-
-
-def _experts_fp8_mxfp4_signatures() -> frozenset:
-    return frozenset(
-        {
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fn,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fnuz,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-        }
-    )
-
-
-_common = dict(
-    solution="gluon",
-    signatures=_experts_fp8_mxfp4_signatures(),
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    priority=_kernel_priority(),
-    tags={"throughput", "latency"},
-)
-
-
-@register_kernel(
-    "moe",
-    "experts",
-    name="gluon_dispatch_gemm",
-    features={"ragged_metadata", "dispatch_gemm"},
-    **_common,
-)
-@register_kernel(
-    "moe",
-    "experts",
-    name="gluon_gemm_combine",
-    features={"ragged_metadata", "gemm_combine"},
-    **_common,
-)
 def _gluon_mxfp_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -4522,7 +4549,7 @@ def _gluon_mxfp_ragged_matmul(
         import logging
         import traceback
 
-        logger = logging.getLogger("tokenspeed_kernel.ops.moe.gluon")
+        logger = logging.getLogger("tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950")
         logger.warning(
             "_gluon_mxfp_ragged_matmul falling back to upstream: %s: %s",
             type(exc).__name__,
@@ -4537,52 +4564,212 @@ def _gluon_mxfp_ragged_matmul(
     return
 
 
-_GLUON_FUSED_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.float16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fnuz,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-    }
-)
+def _gluon_mxfp4_fp8_warp_decode_moe(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    w13_weight,
+    w2_weight,
+    *,
+    w13_bias=None,
+    w2_bias=None,
+    w13_precision_config=None,
+    w2_precision_config=None,
+    w13_act_scale: torch.Tensor,
+    w2_act_scale: torch.Tensor,
+    top_k: int,
+    quantize_fp8_fn,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+) -> torch.Tensor | None:
+    """Small-M direct warp-decode MoE for GPT-OSS FP8 x MXFP4 path."""
+    if hidden_states.ndim != 2 or router_logits.ndim != 2:
+        return None
+    n_tokens = int(router_logits.shape[0])
+    n_experts = int(router_logits.shape[1])
+    if n_tokens > SMALLM_MAX_M:
+        return None
+    if not gluon_route_supported(router_logits, top_k, router_logits.dtype):
+        return None
+    if w13_precision_config is None or w2_precision_config is None:
+        return None
+
+    # Both weights and scales unwrap to their raw uint8 storage the same way.
+    w13_raw = _extract_gluon_raw_s(w13_weight)
+    w2_raw = _extract_gluon_raw_s(w2_weight)
+    w13_scale = _extract_gluon_raw_s(getattr(w13_precision_config, "b_mx_scale", None))
+    w2_scale = _extract_gluon_raw_s(getattr(w2_precision_config, "b_mx_scale", None))
+    if not all(
+        isinstance(t, torch.Tensor) for t in (w13_raw, w2_raw, w13_scale, w2_scale)
+    ):
+        return None
+    if w13_raw.ndim != 3 or w2_raw.ndim != 3:
+        return None
+    if w13_raw.dtype != torch.uint8 or w2_raw.dtype != torch.uint8:
+        return None
+    if w13_scale.dtype != torch.uint8 or w2_scale.dtype != torch.uint8:
+        return None
+
+    D = int(hidden_states.shape[1])
+    if int(w13_raw.shape[1]) * 2 != D:
+        return None
+    two_i = int(w13_raw.shape[2])
+    if two_i % 2 != 0:
+        return None
+    I = two_i // 2
+    if int(w2_raw.shape[1]) * 2 != I:
+        return None
+    N = int(w2_raw.shape[2])
+
+    # Stage1 computes the dense top-k inside the kernel; allocate its outputs.
+    router_logits_c = router_logits.contiguous()
+    topk_ids = torch.empty(
+        (n_tokens, top_k), dtype=torch.int32, device=router_logits.device
+    )
+    topk_weights = torch.empty(
+        (n_tokens, top_k), dtype=router_logits.dtype, device=router_logits.device
+    )
+
+    # Current GPT-OSS path uses FP8 E4M3 activations with per-tensor scale.
+    if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        x_fp8 = hidden_states
+    else:
+        x_fp8 = quantize_fp8_fn(hidden_states, scale=w13_act_scale, solution="triton")
+    # Pass the FP8 tensor straight to Gluon.  ``view(torch.uint8)`` materializes a
+    # copy for float8 tensors on this stack and dominates small-M latency.
+
+    inter = torch.empty(
+        (n_tokens * top_k, I), dtype=x_fp8.dtype, device=hidden_states.device
+    )
+    out_dtype = getattr(w2_precision_config, "out_dtype", None) or torch.bfloat16
+    out = torch.empty((n_tokens, N), dtype=out_dtype, device=hidden_states.device)
+
+    # The kernels only read the bias pointer when HAS_BIAS; allocate the
+    # placeholder solely for the absent ones.
+    dummy_bias = (
+        _make_dummy(hidden_states.device, torch.float32, 1)
+        if (w13_bias is None or w2_bias is None)
+        else None
+    )
+    b13 = w13_bias if w13_bias is not None else dummy_bias
+    b2 = w2_bias if w2_bias is not None else dummy_bias
+
+    BLOCK_K = 128
+    S1_BLOCK_N = 8 if n_tokens <= 4 else 16
+    S1_M_DUP = 8 if n_tokens <= 4 else 16
+    S2_BLOCK_N = 8 if n_tokens <= 1 else 16
+    S2_M_DUP = 4
+    s1_grid = (n_tokens * ((I + S1_BLOCK_N - 1) // S1_BLOCK_N),)
+    _warp_decode_topk_stage1_fp8_mxfp4_kernel[s1_grid](
+        x_fp8,
+        router_logits_c,
+        w13_raw,
+        w13_scale,
+        topk_ids,
+        topk_weights,
+        inter,
+        n_tokens,
+        n_experts,
+        D,
+        I,
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        router_logits_c.stride(0),
+        topk_ids.stride(0),
+        topk_weights.stride(0),
+        w13_raw.stride(0),
+        w13_raw.stride(-2),
+        w13_raw.stride(-1),
+        w13_scale.stride(0),
+        w13_scale.stride(-2),
+        w13_scale.stride(-1),
+        inter.stride(0),
+        inter.stride(1),
+        w13_act_scale,
+        w2_act_scale,
+        b13,
+        D_PACKED=D // 2,
+        TOPK=top_k,
+        EP=_route_next_pow2(n_experts),
+        TKP=_route_next_pow2(top_k),
+        X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=S1_BLOCK_N,
+        M_DUP=S1_M_DUP,
+        HAS_BIAS=w13_bias is not None,
+        SWIGLU_ALPHA=float(swiglu_alpha),
+        SWIGLU_LIMIT=float(swiglu_limit),
+        num_warps=1,
+    )
+
+    n_tiles2 = (N + S2_BLOCK_N - 1) // S2_BLOCK_N
+    s2_split_k = _WARP_DECODE_S2_SPLIT_K
+    if s2_split_k > 1:
+        out_partial = torch.empty(
+            (s2_split_k, n_tokens, N), dtype=torch.float32, device=hidden_states.device
+        )
+        s2_dst = out_partial
+        s2_stride_om = out_partial.stride(1)
+        s2_stride_on = out_partial.stride(2)
+        s2_stride_ok = out_partial.stride(0)
+        s2_grid = (n_tokens * n_tiles2 * s2_split_k,)
+    else:
+        s2_dst = out
+        s2_stride_om = out.stride(0)
+        s2_stride_on = out.stride(1)
+        s2_stride_ok = 0
+        s2_grid = (n_tokens * n_tiles2,)
+    _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
+        inter,
+        w2_raw,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        s2_dst,
+        n_tokens,
+        N,
+        I,
+        inter.stride(0),
+        inter.stride(1),
+        w2_raw.stride(0),
+        w2_raw.stride(-2),
+        w2_raw.stride(-1),
+        w2_scale.stride(0),
+        w2_scale.stride(-2),
+        w2_scale.stride(-1),
+        s2_stride_om,
+        s2_stride_on,
+        s2_stride_ok,
+        w2_act_scale,
+        b2,
+        I_PACKED=I // 2,
+        TOPK=top_k,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=S2_BLOCK_N,
+        M_DUP=S2_M_DUP,
+        HAS_BIAS=w2_bias is not None,
+        SPLIT_K=s2_split_k,
+        num_warps=1,
+    )
+    if s2_split_k > 1:
+        R_BLOCK_N = 256
+        r_grid = (n_tokens * ((N + R_BLOCK_N - 1) // R_BLOCK_N),)
+        _warp_decode_stage2_reduce[r_grid](
+            out_partial,
+            out,
+            n_tokens,
+            N,
+            out_partial.stride(0),
+            out_partial.stride(1),
+            out_partial.stride(2),
+            out.stride(0),
+            out.stride(1),
+            SPLIT_K=s2_split_k,
+            BLOCK_N=R_BLOCK_N,
+            num_warps=1,
+        )
+    return out
 
 
-@register_kernel(
-    "moe",
-    "fused",
-    name="gluon_mxfp4_fp8_fused_moe",
-    features={"self_routing"},
-    solution="gluon",
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    signatures=_GLUON_FUSED_SIGNATURES,
-    traits={"activation_dtype": frozenset({"fp8"})},
-    priority=_kernel_priority(),
-    tags={"throughput", "latency"},
-)
 def _gluon_mxfp_fused_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -4596,6 +4783,10 @@ def _gluon_mxfp_fused_moe(
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
     top_k: int,
+    quantize_fp8_fn,
+    moe_experts_fn,
+    moe_route_fn,
+    enable_warp_decode: bool = True,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
 ) -> torch.Tensor:
@@ -4615,23 +4806,65 @@ def _gluon_mxfp_fused_moe(
         top_k: routing top_k.
         swiglu_alpha / swiglu_limit: SwiGLU activation parameters.
 
-    Lazy-imports the top-level ``moe_route`` / ``moe_experts`` /
-    ``quantize_fp8`` to avoid a circular import (this module is imported
-    by ``tokenspeed_kernel.ops.moe.__init__`` which defines those).
+        quantize_fp8_fn, moe_experts_fn, moe_route_fn: Callbacks to supply
+            quantize_fp8, moe_experts, and moe_route logic.
+        enable_warp_decode: Whether to try the gfx950 small-M warp-decode path.
     """
-    # Lazy imports to avoid the circular dependency described above.
-    from tokenspeed_kernel import quantize_fp8
-    from tokenspeed_kernel.ops.moe import moe_experts, moe_route
-
     n_tokens = router_logits.shape[0]
 
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = moe_route(
+    # Warp-decode small-M MoE is the fastest path for the M<=16 decode regime.
+    # It self-guards (returns None) for any shape it does not cover; the
+    # tokenspeed-kernel registration wrapper owns the environment/platform gate.
+    if enable_warp_decode:
+        try:
+            warp_out = _gluon_mxfp4_fp8_warp_decode_moe(
+                hidden_states,
+                router_logits,
+                w13_weight,
+                w2_weight,
+                w13_bias=w13_bias,
+                w2_bias=w2_bias,
+                w13_precision_config=w13_precision_config,
+                w2_precision_config=w2_precision_config,
+                w13_act_scale=w13_act_scale,
+                w2_act_scale=w2_act_scale,
+                top_k=top_k,
+                quantize_fp8_fn=quantize_fp8_fn,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_limit=swiglu_limit,
+            )
+            if warp_out is not None:
+                return warp_out
+        except Exception as exc:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(
+                "tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950"
+            ).warning(
+                "warp-decode small-M path falling back: %s: %s",
+                type(exc).__name__,
+                exc,
+                exc_info=exc,
+            )
+
+    # Decode-small GPT-OSS routing is launch-overhead dominated. Prefer the
+    # single-kernel Gluon route for the M<=16 single-block-collapse regime;
+    # fall back to the generic Triton route for larger/unsupported shapes.
+    route_expected_kernel = (
+        "gluon_decode_routing_gfx950"
+        if (
+            n_tokens <= SMALLM_MAX_M
+            and gluon_route_supported(router_logits, top_k, router_logits.dtype)
+        )
+        else "triton_kernels_routing"
+    )
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = moe_route_fn(
         router_logits,
         top_k,
         sm_first=False,
         dtype=router_logits.dtype,
         traits={"output_type": "ragged_metadata"},
-        expected_kernel_name="triton_kernels_routing",
+        expected_kernel_name=route_expected_kernel,
     )
 
     act = FusedActivation(
@@ -4642,7 +4875,7 @@ def _gluon_mxfp_fused_moe(
     if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         gemm1_input = hidden_states
     else:
-        gemm1_input = quantize_fp8(
+        gemm1_input = quantize_fp8_fn(
             hidden_states,
             scale=w13_act_scale,
             solution="triton",
@@ -4650,7 +4883,7 @@ def _gluon_mxfp_fused_moe(
 
     gluon_traits = {"weight_dtype": "mxfp4"}
 
-    intermediate_cache = moe_experts(
+    intermediate_cache = moe_experts_fn(
         gemm1_input,
         w13_weight,
         w13_bias,
@@ -4675,13 +4908,13 @@ def _gluon_mxfp_fused_moe(
     ):
         gemm2_input = intermediate_cache
     else:
-        gemm2_input = quantize_fp8(
+        gemm2_input = quantize_fp8_fn(
             intermediate_cache,
             scale=w2_act_scale,
             solution="triton",
         )
 
-    return moe_experts(
+    return moe_experts_fn(
         gemm2_input,
         w2_weight,
         w2_bias,
@@ -4697,4 +4930,925 @@ def _gluon_mxfp_fused_moe(
         features={"ragged_metadata", "gemm_combine"},
         traits=gluon_traits,
         expected_kernel_name="gluon_gemm_combine",
+    )
+
+
+# ===========================================================================
+# Small-M (decode) fused MoE routing in Gluon.
+#
+# Decode routing is launch-overhead bound. For ``M <= SMALLM_MAX_M`` this
+# replaces the generic ``triton_kernels_routing`` pipeline (~12 kernel
+# launches) with a single Gluon kernel, producing output bit-for-bit identical
+# to the generic path. Larger M falls back; the caller gates on the bound.
+#
+# Why M <= 16 makes this exact: 16 is the smallest RaggedTensorMetadata block
+# size, so every nonzero expert holds exactly one block (single-block collapse)
+# and the gather/scatter placement is stable. The kernel fuses the in-kernel
+# top-k, histogram/cumsum, single-block schedule, and a register-only counting
+# sort, reproducing ``moe_route(traits={"output_type": "ragged_metadata"})``:
+# ``RaggedTensorMetadata`` + gather_indx/scatter_indx/gate_scal of length
+# ``G = M*topk``. Metadata shapes are queried from ``RaggedTensorMetadata`` so
+# they match ``make_ragged_tensor_metadata`` on HIP and non-HIP alike.
+# ===========================================================================
+
+# Number of block-size rows in RaggedTensorMetadata for the active platform
+# ([16,32,64,128,256] -> 5 on HIP, [16,32,64,128] -> 4 otherwise). Derived
+# from the library so the metadata shapes match make_ragged_tensor_metadata
+# exactly on every target.
+_ROUTE_NB = len(RaggedTensorMetadata.block_sizes())
+
+# Token-count bound for the small-M fused route. 16 == the smallest
+# RaggedTensorMetadata block size, so for M <= 16 every expert's token count is
+# ``col_sum <= M <= 16``, i.e. exactly one block, and the single-block schedule
+# collapse is exact. The caller dispatches only ``M <= SMALLM_MAX_M`` to the
+# Gluon kernel (decode, where it wins ~6x on routing) and keeps the generic
+# ``triton_kernels_routing`` pipeline for larger M.
+SMALLM_MAX_M = 16
+# Backwards-compatible alias for the small-M bound.
+FUSED_ROUTE_MAX_M = SMALLM_MAX_M
+
+# Configs the Gluon routing path supports; everything else falls back to the
+# generic triton_kernels_routing pipeline.
+GLUON_ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+GLUON_ROUTE_MAX_E = 1024  # next_pow2(E) bins / EP-wide tiles stay bounded
+# Upper bound on G = M*topk. The stable-sort rank tile is [GP, GP] and the
+# kernel's layouts assume the single-wavefront regime (GP <= 64); configs that
+# would exceed it fall back to the generic pipeline.
+GLUON_ROUTE_MAX_G = 64
+
+# torch gate dtype -> gluon element type (for the in-kernel softmax cast that
+# reproduces topk_forward's ``softmax(...).to(x_dtype)`` rounding exactly).
+_ROUTE_GL_DTYPE = {
+    torch.float16: gl.float16,
+    torch.bfloat16: gl.bfloat16,
+    torch.float32: gl.float32,
+}
+
+
+@gluon.jit
+def _route_add(a, b):
+    return a + b
+
+
+@gluon.jit
+def _fused_topk(
+    Logits,  # [M, E]   X_DTYPE   (raw routing logits)
+    stride_lm,  # logits row stride
+    gmask,  # [GP]   bool     g < G
+    tok,  # [GP]      int32    g // TOPK
+    slot,  # [GP]     int32    g %  TOPK
+    M: gl.constexpr,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    MP: gl.constexpr,  # next_pow2(M)
+    EP: gl.constexpr,  # next_pow2(E)
+    GP: gl.constexpr,  # next_pow2(M*topk)
+    TKP: gl.constexpr,  # next_pow2(topk)
+    X_DTYPE: gl.constexpr,  # gate element type (logits dtype)
+    L1: gl.constexpr,  # 1D blocked layout used by the consuming kernel
+    LT: gl.constexpr,  # 2D blocked layout for the [MP, EP] logits tile
+):
+    """Fused in-kernel top-k matching ``topk_forward(apply_softmax=True)``.
+
+    Selects, per token row, the top ``TOPK`` experts by logit value (ties to
+    the smaller expert id, descending value order) and     the softmax gate over
+    the selected logits -- reproducing the triton kernels ``_topk_forward``
+    semantics without a separate launch or a ``y_vals``/``y_indx`` global
+    round-trip.
+    Returns flat ``(idx[GP] int32, vals[GP] X_DTYPE)`` in token-major gate
+    order (``g = token*TOPK + slot``), ready for the counting sort.
+    """
+    NEG: gl.constexpr = float("-inf")
+    # ---- load the [MP, EP] logits tile (invalid lanes -> -inf) -------------
+    row = gl.expand_dims(gl.arange(0, MP, layout=gl.SliceLayout(1, LT)), 1)  # [MP,1]
+    col = gl.expand_dims(gl.arange(0, EP, layout=gl.SliceLayout(0, LT)), 0)  # [1,EP]
+    lmask = (row < M) & (col < E)
+    cur = gl.load(Logits + row * stride_lm + col, mask=lmask, other=NEG).to(gl.float32)
+
+    # ---- iterative arg-max top-k (descending value, smaller-id tie-break) --
+    # Equivalent to streaming_topk's packed sort: max value wins, ties resolve
+    # to the smaller expert index; the iteration emits experts in descending
+    # value order, matching topk_forward's output slot order. Results are
+    # written column-by-column into [MP, TKP] tiles (no python lists, which
+    # gluon tracing does not support).
+    big = gl.full([MP, EP], E, gl.int32, layout=LT)
+    tcol = gl.expand_dims(gl.arange(0, TKP, layout=gl.SliceLayout(0, LT)), 0)  # [1,TKP]
+    val_t = gl.full([MP, TKP], -1e30, gl.float32, layout=LT)  # finite -inf-ish
+    idx_t = gl.zeros([MP, TKP], gl.int32, layout=LT)
+    for _r in gl.static_range(TOPK):
+        vmax = gl.max(cur, axis=1, keep_dims=True)  # [MP,1]
+        ismax = (cur == vmax) & (col < E)
+        amax = gl.min(gl.where(ismax, col, big), axis=1, keep_dims=True)  # [MP,1]
+        sel = tcol == _r  # [1,TKP]
+        val_t = gl.where(sel, vmax, val_t)  # write column _r
+        idx_t = gl.where(sel, amax, idx_t)
+        cur = gl.where(col == amax, NEG, cur)  # drop chosen expert
+
+    # ---- softmax over the selected logits (matches tl.softmax in fp32) -----
+    # z = x - max(x); num = exp(z); den = sum(num); gate = fdiv(num, den).
+    # Padding columns (TOPK..TKP) hold -1e30 -> exp(-) == 0 -> ignored.
+    rmax = gl.max(val_t, axis=1, keep_dims=True)  # [MP,1]
+    num = gl.exp(val_t - rmax)  # [MP,TKP]
+    den = gl.sum(num, axis=1, keep_dims=True)  # [MP,1]
+    gate_t = gl.fdiv(num, den)  # [MP,TKP] fp32
+
+    # ---- flatten per-slot columns into the flat [GP] gate order -----------
+    z_i = gl.zeros([MP, TKP], gl.int32, layout=LT)
+    z_f = gl.zeros([MP, TKP], gl.float32, layout=LT)
+    idx = gl.zeros([GP], gl.int32, layout=L1)
+    valsf = gl.zeros([GP], gl.float32, layout=L1)
+    for _r in gl.static_range(TOPK):
+        sel = tcol == _r  # [1,TKP]
+        idx_r = gl.convert_layout(gl.sum(gl.where(sel, idx_t, z_i), axis=1), L1)
+        gat_r = gl.convert_layout(gl.sum(gl.where(sel, gate_t, z_f), axis=1), L1)
+        take = (slot == _r) & gmask
+        idx = gl.where(take, gl.gather(idx_r, tok, axis=0), idx)
+        valsf = gl.where(take, gl.gather(gat_r, tok, axis=0), valsf)
+    # cast like topk_forward's softmax(...).to(x_dtype) before the gate store.
+    return idx, valsf.to(X_DTYPE)
+
+
+# ===========================================================================
+# Small-M (M <= 16): single-workgroup, stable-order, single-block collapse.
+# ===========================================================================
+@gluon.jit
+def _fused_route_small_m(
+    Logits,  # [M, E]       X_DTYPE (raw routing logits)
+    SliceSizes,  # [E]          int32
+    SliceOffs,  # [E+1]         int32
+    BlockOffs,  # [NB, E+1]     int32
+    BlockSched,  # [NB, MAXBLK] int32
+    GatherIndx,  # [G]          int32
+    ScatterIndx,  # [G]         int32
+    GateScal,  # [G]           dtype
+    stride_lm,  # logits row stride
+    M: gl.constexpr,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    MP: gl.constexpr,  # next_pow2(M)
+    GP: gl.constexpr,  # next_pow2(M*topk)
+    EP: gl.constexpr,  # next_pow2(E)
+    TKP: gl.constexpr,  # next_pow2(topk)
+    MAXBLK: gl.constexpr,  # == M*topk
+    MAXBLKP: gl.constexpr,  # next_pow2(MAXBLK)
+    NB_C: gl.constexpr,  # number of block-size rows (NB)
+    X_DTYPE: gl.constexpr,  # gate element type (logits dtype)
+    NW_C: gl.constexpr,  # num_warps (1 for the M<=2 decode hot path, else 4)
+    bo_stride: gl.constexpr,  # block_offs row stride  == E+1
+    bs_stride: gl.constexpr,  # block_sched row stride == MAXBLK
+):
+    G: gl.constexpr = M * TOPK
+    # Layouts are parametric in NW_C. At M<=2 a single warp (NW_C=1) removes the
+    # cross-warp s_barrier stalls (LDS reductions over 4 warps) that dominated
+    # the decode hot path; for larger small-M the O(G^2) rank tile + top-k want
+    # 4 warps, so NW_C=4 there.
+    LE: gl.constexpr = gl.BlockedLayout([1], [64], [NW_C], [0])  # 1D (EP)
+    LG: gl.constexpr = gl.BlockedLayout([1], [64], [NW_C], [0])  # 1D (GP)
+    LB: gl.constexpr = gl.BlockedLayout([1], [64], [NW_C], [0])  # 1D (MAXBLKP)
+    LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NW_C, 1], [1, 0])  # 2D
+
+    # ---- fused top-k: compute (expert id, softmax gate) per gate in-kernel,
+    # replacing the separate topk_forward launch + y_vals/y_indx round-trip.
+    g = gl.arange(0, GP, layout=LG)
+    gmask = g < G
+    tok = (g // TOPK).to(gl.int32)
+    slot = (g % TOPK).to(gl.int32)
+    idx, vals = _fused_topk(
+        Logits,
+        stride_lm,
+        gmask,
+        tok,
+        slot,
+        M,
+        E,
+        TOPK,
+        MP,
+        EP,
+        GP,
+        TKP,
+        X_DTYPE,
+        LG,
+        LT,
+    )
+
+    # ---- histogram -> slice_sizes -----------------------------------------
+    e = gl.arange(0, EP, layout=LE)
+    emask = e < E
+    hist = gl.histogram(idx, EP, mask=gmask, layout=LE)
+    gl.store(SliceSizes + e, hist, mask=emask)
+
+    # ---- slice_offs = [0] + cumsum(slice_sizes) ---------------------------
+    # Store exclusive prefixes at 0..E-1; index E (the total) is the only entry
+    # the inclusive scan uniquely supplies, so write just that one element
+    # rather than re-writing 1..E-1 with identical values.
+    incl = gl.associative_scan(hist, 0, _route_add)
+    col_offs = incl - hist
+    last = e == (E - 1)
+    gl.store(SliceOffs + e, col_offs, mask=emask)
+    gl.store(SliceOffs + e + 1, incl, mask=emask & last)
+
+    # ---- block_offs_data / block_schedule_data ----------------------------
+    # Single-block collapse: at M <= 16 every nonzero expert is exactly one
+    # block at every block size, so all NB rows are identical and the packed
+    # block value is just the expert id.
+    n_blk = (hist > 0).to(gl.int32)
+    blk_incl = gl.associative_scan(n_blk, 0, _route_add)
+    blk_excl = blk_incl - n_blk
+    n_total = gl.sum(n_blk, 0)
+    jb = gl.arange(0, MAXBLKP, layout=LB)
+    jbmask = jb < MAXBLK
+    neg_fill = gl.full([MAXBLKP], -1, gl.int32, layout=LB)
+    for k in gl.static_range(NB_C):
+        gl.store(BlockOffs + k * bo_stride + e, blk_excl, mask=emask)
+        gl.store(BlockOffs + k * bo_stride + e + 1, blk_incl, mask=emask & last)
+        # Fill -1 only in the tail (jb >= n_total). It is disjoint from the
+        # scatter targets [0, n_total) below, so the compiler cannot reorder
+        # the two stores into an alias that clobbers scattered ids.
+        gl.store(
+            BlockSched + k * bs_stride + jb,
+            neg_fill,
+            mask=jbmask & (jb >= n_total),
+        )
+        # Packed value is the bare expert id (single block, so block index 0).
+        gl.store(
+            BlockSched + k * bs_stride + blk_excl,
+            e,
+            mask=(hist > 0) & emask,
+        )
+
+    # ---- stable per-expert rank -------------------------------------------
+    # rank[g] = #{j<g : idx[j]==idx[g]}. idx is in registers post-fuse, so use
+    # a [GP,GP] compare tile reduced over j; cheap since GP <= 64.
+    idx_row = gl.expand_dims(gl.convert_layout(idx, gl.SliceLayout(1, LT)), 1)
+    idx_col = gl.expand_dims(gl.convert_layout(idx, gl.SliceLayout(0, LT)), 0)
+    g_row = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(1, LT)), 1)
+    g_col = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(0, LT)), 0)
+    match = ((idx_row == idx_col) & (g_col < g_row)).to(gl.int32)
+    rank = gl.convert_layout(gl.sum(match, axis=1), LG)
+
+    # ---- scatter to destination = slice_offs[expert] + rank ---------------
+    pos = gl.gather(col_offs, idx, axis=0) + rank
+    gl.store(GatherIndx + pos, tok, mask=gmask)
+    gl.store(ScatterIndx + pos, g.to(gl.int32), mask=gmask)
+    gl.store(GateScal + pos, vals, mask=gmask)
+
+
+# ===========================================================================
+# Host wrappers for the small-M fused route
+# ===========================================================================
+def _route_next_pow2(x: int) -> int:
+    return 1 << (max(1, x) - 1).bit_length()
+
+
+@gluon.jit
+def _add_expert_bias(acc, bias_base, col, bound, mfma_layout: gl.constexpr):
+    """Broadcast-add a per-expert column bias into an MFMA accumulator.
+
+    The bias is loaded along N then converted into the accumulator's column
+    slice layout, which keeps the broadcast-add convert-compatible with acc.
+    """
+    b = gl.load(bias_base + col, mask=bound, other=0.0).to(gl.float32)
+    b = gl.convert_layout(b, gl.SliceLayout(0, mfma_layout))
+    return acc + b[None, :]
+
+
+@gluon.constexpr_function
+def _warp_decode_mfma_layouts(m_dup, block_n, block_k_scale):
+    """MFMA + dot-operand + e8m0 scale layouts shared by the warp-decode kernels.
+
+    get_mfma_layout is not reused: it asserts num_warps in (4, 8), whereas warp
+    decode runs a single warp ([1, 1] warps_per_cta).
+    """
+    mfma = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 1]
+    )
+    dot_a = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=16)
+    dot_b = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=16)
+    a_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_a, [m_dup, block_k_scale])
+    b_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_b, [block_n, block_k_scale])
+    return mfma, dot_a, dot_b, a_scale, b_scale
+
+
+@gluon.jit
+def _mxfp4_scale_offset(n_idx, k_scale_idx, stride_wsk, stride_wsn):
+    """Byte offset into a CDNA4-swizzled MXFP4 scale tensor.
+
+    Storage is (..., K_SCALE_PAD*32, N_PAD/32); the swizzle packs the 32-wide N
+    block and the K-scale position into one linear axis.
+    """
+    row = n_idx.to(gl.uint32)
+    lin = (
+        (k_scale_idx // 8) * 128
+        + (k_scale_idx % 4) * 32
+        + (row % 16) * 4
+        + ((k_scale_idx % 8) // 4) * 2
+        + ((row % 32) // 16)
+    )
+    return (row // 32).to(gl.int64) * stride_wsn + lin.to(gl.int64) * stride_wsk
+
+
+@gluon.jit
+def _swiglu_gate_up(gate, linear, alpha: gl.constexpr, limit: gl.constexpr):
+    """SwiGLU on separate gate/up MFMA accumulators (pre-split form)."""
+    if limit > 0.0:
+        gate = gl.minimum(gate, limit)
+        linear = gl.clamp(linear, -limit, limit)
+    return (gate / (1.0 + gl.exp(-alpha * gate))) * (linear + 1.0)
+
+
+@gluon.jit
+def _warp_decode_stage1_compute(
+    token,
+    slot,
+    expert,
+    pid_n,
+    X,
+    W,
+    WScale,
+    Y,
+    M,
+    D,
+    I,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    D_PACKED: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    M_DUP: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+):
+    """Gate/up MFMA + bias + SwiGLU + store for one (token, slot, expert).
+
+    Shared by the fused and direct-topk stage1 kernels, which differ only in how
+    they select ``expert`` and map the program id.
+    """
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    _layouts: gl.constexpr = _warp_decode_mfma_layouts(M_DUP, BLOCK_N, BLOCK_K_SCALE)
+    mfma_layout: gl.constexpr = _layouts[0]
+    dot_a_layout: gl.constexpr = _layouts[1]
+    dot_b_layout: gl.constexpr = _layouts[2]
+    a_scale_layout: gl.constexpr = _layouts[3]
+    b_scale_layout: gl.constexpr = _layouts[4]
+    am = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, dot_a_layout))[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    n_gate = pid_n * BLOCK_N + bn
+    n_up = I + n_gate
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, b_scale_layout))[None, :]
+    n_gate_s = pid_n * BLOCK_N + bsn
+    n_up_s = I + n_gate_s
+    a_scale = gl.full((M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout)
+
+    acc_g = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+    acc_u = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+    if (token < M) & (expert >= 0):
+        w_base = W + expert.to(gl.int64) * stride_we
+        ws_base = WScale + expert.to(gl.int64) * stride_wse
+        for kt in range(gl.cdiv(D, BLOCK_K)):
+            k_elem = kt * BLOCK_K + ak
+            k_pack = kt * BLOCK_K_PACKED + bk
+            a = gl.load(
+                X
+                + token.to(gl.int64) * stride_xm
+                + k_elem.to(gl.int64) * stride_xk
+                + am.to(gl.int64) * 0,
+                mask=k_elem < D,
+                other=0.0,
+            )
+            b_g = gl.load(
+                w_base
+                + k_pack.to(gl.int64) * stride_wk
+                + n_gate.to(gl.int64) * stride_wn,
+                mask=(k_pack < D_PACKED) & (n_gate < I),
+                other=0,
+            )
+            b_u = gl.load(
+                w_base
+                + k_pack.to(gl.int64) * stride_wk
+                + n_up.to(gl.int64) * stride_wn,
+                mask=(k_pack < D_PACKED) & (n_gate < I),
+                other=0,
+            )
+            sg = kt * BLOCK_K_SCALE + bsk
+            off_g = _mxfp4_scale_offset(n_gate_s, sg, stride_wsk, stride_wsn)
+            off_u = _mxfp4_scale_offset(n_up_s, sg, stride_wsk, stride_wsn)
+            s_g = gl.load(
+                ws_base + off_g, mask=(sg < (D // 32)) & (n_gate_s < I), other=0
+            )
+            s_u = gl.load(
+                ws_base + off_u, mask=(sg < (D // 32)) & (n_gate_s < I), other=0
+            )
+            acc_g = gl.amd.cdna4.mfma_scaled(
+                a=a,
+                a_scale=a_scale,
+                a_format="e4m3",
+                b=b_g,
+                b_scale=s_g,
+                b_format="e2m1",
+                acc=acc_g,
+            )
+            acc_u = gl.amd.cdna4.mfma_scaled(
+                a=a,
+                a_scale=a_scale,
+                a_format="e4m3",
+                b=b_u,
+                b_scale=s_u,
+                b_format="e2m1",
+                acc=acc_u,
+            )
+    x_scale = gl.load(x_global_scale_ptr).to(gl.float32)
+    acc_g = acc_g * x_scale
+    acc_u = acc_u * x_scale
+    if HAS_BIAS:
+        bias_n = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+        )
+        w13_base = w13_bias + expert.to(gl.int64) * (2 * I)
+        bound = (token < M) & (bias_n < I)
+        acc_g = _add_expert_bias(acc_g, w13_base, bias_n, bound, mfma_layout)
+        acc_u = _add_expert_bias(acc_u, w13_base + I, bias_n, bound, mfma_layout)
+    out_scale = gl.load(out_quant_scale_ptr).to(gl.float32)
+    out = _swiglu_gate_up(acc_g, acc_u, SWIGLU_ALPHA, SWIGLU_LIMIT) / out_scale
+    sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
+    sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
+    col = pid_n * BLOCK_N + sn
+    row = token * TOPK + slot
+    gl.store(
+        Y
+        + row.to(gl.int64) * stride_ym
+        + col.to(gl.int64) * stride_yn
+        + sm.to(gl.int64) * 0,
+        out.to(Y.dtype.element_ty),
+        mask=(token < M) & (sm == 0) & (col < I),
+    )
+
+
+@gluon.jit
+def _warp_decode_topk_stage1_fp8_mxfp4_kernel(
+    X,
+    Logits,
+    W,
+    WScale,
+    TopkIdsOut,
+    TopkWeightsOut,
+    Y,
+    M,
+    E,
+    D,
+    I,
+    stride_xm,
+    stride_xk,
+    stride_lm,
+    stride_tim,
+    stride_twm,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    D_PACKED: gl.constexpr,
+    TOPK: gl.constexpr,
+    EP: gl.constexpr,
+    TKP: gl.constexpr,
+    X_DTYPE: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    M_DUP: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+):
+    """Fused dense top-k + direct top-k stage1 for small-M warp decode."""
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(I, BLOCK_N)
+    token = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    # ---- direct top-k for this token (duplicated per N tile to save a launch) ----
+    LE: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    LT: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    e = gl.arange(0, EP, layout=LE)
+    emask = e < E
+    cur = gl.load(
+        Logits + token.to(gl.int64) * stride_lm + e,
+        mask=(token < M) & emask,
+        other=float("-inf"),
+    ).to(gl.float32)
+    t = gl.arange(0, TKP, layout=LT)
+    val_t = gl.full([TKP], -1e30, gl.float32, layout=LT)
+    idx_t = gl.zeros([TKP], gl.int32, layout=LT)
+    big = gl.full([EP], E, gl.int32, layout=LE)
+    for r in gl.static_range(TOPK):
+        vmax = gl.max(cur, axis=0)
+        ismax = (cur == vmax) & emask
+        amax = gl.min(gl.where(ismax, e, big), axis=0)
+        sel = t == r
+        val_t = gl.where(sel, vmax, val_t)
+        idx_t = gl.where(sel, amax, idx_t)
+        cur = gl.where(e == amax, float("-inf"), cur)
+    rmax = gl.max(val_t, axis=0)
+    num = gl.exp(val_t - rmax)
+    den = gl.sum(num, axis=0)
+    gate_t = gl.fdiv(num, den)
+    if pid_n == 0:
+        gl.store(
+            TopkIdsOut + token.to(gl.int64) * stride_tim + t,
+            idx_t,
+            mask=(token < M) & (t < TOPK),
+        )
+        gl.store(
+            TopkWeightsOut + token.to(gl.int64) * stride_twm + t,
+            gate_t.to(TopkWeightsOut.dtype.element_ty),
+            mask=(token < M) & (t < TOPK),
+        )
+
+    for slot in gl.static_range(TOPK):
+        slot_sel = t == slot
+        expert = gl.sum(
+            gl.where(slot_sel, idx_t, gl.zeros([TKP], gl.int32, layout=LT)), axis=0
+        )
+        _warp_decode_stage1_compute(
+            token,
+            slot,
+            expert,
+            pid_n,
+            X,
+            W,
+            WScale,
+            Y,
+            M,
+            D,
+            I,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wk,
+            stride_wn,
+            stride_wse,
+            stride_wsk,
+            stride_wsn,
+            stride_ym,
+            stride_yn,
+            x_global_scale_ptr,
+            out_quant_scale_ptr,
+            w13_bias,
+            D_PACKED,
+            TOPK,
+            BLOCK_K,
+            BLOCK_N,
+            M_DUP,
+            HAS_BIAS,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+        )
+
+
+@gluon.jit
+def _warp_decode_stage2_fp8_mxfp4_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    TopkWeights,
+    Out,
+    M,
+    N,
+    I,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_om,
+    stride_on,
+    stride_ok,
+    x_global_scale_ptr,
+    w2_bias,
+    I_PACKED: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    M_DUP: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+):
+    """Direct top-k stage2: FP8 intermediate x MXFP4 W2 -> BF16 output.
+
+    With SPLIT_K > 1 the K (intermediate) reduction is partitioned across
+    SPLIT_K CTAs per output tile; each writes an fp32 partial into slice
+    ``pid_k`` of the destination, reduced by ``_warp_decode_stage2_reduce``.
+    Bias is added only by the first slice so it is not counted SPLIT_K times.
+    """
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    pid = gl.program_id(axis=0)
+    num_n = gl.cdiv(N, BLOCK_N)
+    if SPLIT_K == 1:
+        pid_k = 0
+        pid_token = pid // num_n
+        pid_n = pid % num_n
+    else:
+        per_k = M * num_n
+        pid_k = pid // per_k
+        rem = pid % per_k
+        pid_token = rem // num_n
+        pid_n = rem % num_n
+    num_kt = gl.cdiv(I, BLOCK_K)
+    kt_per = gl.cdiv(num_kt, SPLIT_K)
+    kt_start = pid_k * kt_per
+    _layouts: gl.constexpr = _warp_decode_mfma_layouts(M_DUP, BLOCK_N, BLOCK_K_SCALE)
+    mfma_layout: gl.constexpr = _layouts[0]
+    dot_a_layout: gl.constexpr = _layouts[1]
+    dot_b_layout: gl.constexpr = _layouts[2]
+    a_scale_layout: gl.constexpr = _layouts[3]
+    b_scale_layout: gl.constexpr = _layouts[4]
+    am = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, dot_a_layout))[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, b_scale_layout))[None, :]
+    n_cols = pid_n * BLOCK_N + bn
+    n_cols_s = pid_n * BLOCK_N + bsn
+    acc_total = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+    if pid_token < M:
+        for slot in gl.static_range(0, TOPK):
+            expert = gl.load(
+                TopkIds + pid_token * TOPK + slot, mask=pid_token < M, other=-1
+            )
+            gate = gl.load(
+                TopkWeights + pid_token * TOPK + slot,
+                mask=pid_token < M,
+                other=0.0,
+            ).to(gl.float32)
+            if expert >= 0:
+                row = pid_token * TOPK + slot
+                w_base = W + expert.to(gl.int64) * stride_we
+                ws_base = WScale + expert.to(gl.int64) * stride_wse
+                acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+                for kt in range(kt_start, kt_start + kt_per):
+                    k_elem = kt * BLOCK_K + ak
+                    k_pack = kt * BLOCK_K_PACKED + bk
+                    a = gl.load(
+                        X
+                        + row.to(gl.int64) * stride_xm
+                        + k_elem.to(gl.int64) * stride_xk
+                        + am.to(gl.int64) * 0,
+                        mask=k_elem < I,
+                        other=0.0,
+                    )
+                    a_scale = gl.full(
+                        (M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout
+                    )
+                    b = gl.load(
+                        w_base
+                        + k_pack.to(gl.int64) * stride_wk
+                        + n_cols.to(gl.int64) * stride_wn,
+                        mask=(k_pack < I_PACKED) & (n_cols < N),
+                        other=0,
+                    )
+                    sk = kt * BLOCK_K_SCALE + bsk
+                    off_s = _mxfp4_scale_offset(n_cols_s, sk, stride_wsk, stride_wsn)
+                    s = gl.load(
+                        ws_base + off_s, mask=(sk < (I // 32)) & (n_cols_s < N), other=0
+                    )
+                    acc = gl.amd.cdna4.mfma_scaled(
+                        a=a,
+                        a_scale=a_scale,
+                        a_format="e4m3",
+                        b=b,
+                        b_scale=s,
+                        b_format="e2m1",
+                        acc=acc,
+                    )
+                acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
+                if HAS_BIAS:
+                    bias_n = pid_n * BLOCK_N + gl.arange(
+                        0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+                    )
+                    w2_base = w2_bias + expert.to(gl.int64) * N
+                    if SPLIT_K == 1:
+                        bias_bound = bias_n < N
+                    else:
+                        bias_bound = (bias_n < N) & (pid_k == 0)
+                    acc = _add_expert_bias(
+                        acc, w2_base, bias_n, bias_bound, mfma_layout
+                    )
+                acc_total += gate * acc
+    sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
+    sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
+    col = pid_n * BLOCK_N + sn
+    out_base = (
+        Out
+        + pid_token.to(gl.int64) * stride_om
+        + col.to(gl.int64) * stride_on
+        + sm.to(gl.int64) * 0
+    )
+    if SPLIT_K > 1:
+        out_base = out_base + pid_k.to(gl.int64) * stride_ok
+    gl.store(
+        out_base,
+        acc_total.to(Out.dtype.element_ty),
+        mask=(pid_token < M) & (sm == 0) & (col < N),
+    )
+
+
+@gluon.jit
+def _warp_decode_stage2_reduce(
+    Partial,
+    Out,
+    M,
+    N,
+    stride_pk,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    SPLIT_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """Sum the SPLIT_K stage2 partials into the bf16 output in one launch."""
+    pid = gl.program_id(axis=0)
+    num_n = gl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_n
+    pid_n = pid % num_n
+    LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
+    n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
+    bound = (pid_m < M) & (n < N)
+    acc = gl.zeros([BLOCK_N], gl.float32, layout=LAYOUT)
+    for k in gl.static_range(SPLIT_K):
+        acc += gl.load(
+            Partial
+            + k * stride_pk
+            + pid_m.to(gl.int64) * stride_pm
+            + n.to(gl.int64) * stride_pn,
+            mask=bound,
+            other=0.0,
+        )
+    gl.store(
+        Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
+        acc.to(Out.dtype.element_ty),
+        mask=bound,
+    )
+
+
+def _route_small_m(logits, topk, dtype):
+    """M <= 16: 1-kernel stable-order fused route (top-k fused in-kernel)."""
+    M, E = logits.shape
+    G = M * topk
+    device = logits.device
+    logits = logits.contiguous()
+
+    slice_sizes = torch.empty(E, dtype=torch.int32, device=device)
+    slice_offs = torch.empty(E + 1, dtype=torch.int32, device=device)
+    block_offs_data = torch.empty(_ROUTE_NB, E + 1, dtype=torch.int32, device=device)
+    # Query the library for the block-schedule width so it stays exact on any
+    # platform rather than hardcoding the small-M value.
+    maxblk = RaggedTensorMetadata.max_n_blocks(E, G)
+    block_schedule_data = torch.empty(
+        _ROUTE_NB, maxblk, dtype=torch.int32, device=device
+    )
+    gather_indx = torch.empty(G, dtype=torch.int32, device=device)
+    scatter_indx = torch.empty(G, dtype=torch.int32, device=device)
+    gate_scal = torch.empty(G, dtype=dtype, device=device)
+
+    # M<=2 is the launch-bound decode hot path: a single warp removes the
+    # cross-warp s_barrier stalls. Larger small-M has enough work (O(G^2) rank
+    # tile + top-k) to benefit from 4 warps.
+    nw = 1 if M <= 2 else 4
+
+    _fused_route_small_m[(1,)](
+        logits,
+        slice_sizes,
+        slice_offs,
+        block_offs_data,
+        block_schedule_data,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+        logits.stride(0),
+        M=M,
+        E=E,
+        TOPK=topk,
+        MP=_route_next_pow2(M),
+        GP=_route_next_pow2(G),
+        EP=_route_next_pow2(E),
+        TKP=_route_next_pow2(topk),
+        MAXBLK=maxblk,
+        MAXBLKP=_route_next_pow2(maxblk),
+        NB_C=_ROUTE_NB,
+        X_DTYPE=_ROUTE_GL_DTYPE[logits.dtype],
+        NW_C=nw,
+        bo_stride=block_offs_data.stride(0),
+        bs_stride=block_schedule_data.stride(0),
+        num_warps=nw,
+    )
+
+    ragged = RaggedTensorMetadata(
+        slice_sizes, slice_offs, block_offs_data, block_schedule_data
+    )
+    return ragged, gather_indx, scatter_indx, gate_scal
+
+
+def gluon_route_supported(
+    logits: torch.Tensor,
+    topk: int,
+    dtype: torch.dtype | None = None,
+) -> bool:
+    """Whether the unified Gluon routing path supports this configuration.
+
+    Guards the structural assumptions the Gluon kernels make so unsupported
+    configs fall back to the generic ``triton_kernels_routing`` pipeline:
+    a 2D float ``logits`` tensor,     a supported gate ``dtype``, a sane ``topk``
+    and an expert count whose ``next_pow2`` keeps the histogram bins / EP-wide
+    tiles bounded.
+    """
+    if logits.ndim != 2:
+        return False
+    if dtype is None:
+        dtype = logits.dtype
+    if logits.dtype not in GLUON_ROUTE_DTYPES or dtype not in GLUON_ROUTE_DTYPES:
+        return False
+    M, E = logits.shape
+    if topk < 1 or topk > E:
+        return False
+    if E < 1 or E > GLUON_ROUTE_MAX_E:
+        return False
+    # G = M*topk drives the [GP, GP] rank tile / single-wavefront layouts.
+    if M * topk > GLUON_ROUTE_MAX_G:
+        return False
+    return True
+
+
+def gluon_fused_route(
+    logits: torch.Tensor,
+    topk: int,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Small-M (decode) fused MoE routing.
+
+    Reproduces ``moe_route(traits={"output_type": "ragged_metadata"})`` in a
+    single Gluon kernel, returning ``(ragged_metadata, gather_indx,
+    scatter_indx, gate_scal)`` bit-for-bit identical to the generic pipeline.
+    Valid for ``M <= SMALLM_MAX_M`` (the single-block-collapse regime); callers
+    gate on that bound and fall back to the generic pipeline for larger ``M``.
+    """
+    if dtype is None:
+        dtype = logits.dtype
+    M = logits.shape[0]
+    if M > SMALLM_MAX_M:
+        raise ValueError(
+            f"gluon_fused_route requires M <= {SMALLM_MAX_M} "
+            f"(single-block-collapse regime); got M={M}. Route larger M "
+            "through the generic triton_kernels_routing pipeline."
+        )
+    return _route_small_m(logits, topk, dtype)
+
+
+def gluon_decode_routing_gfx950(
+    logits: torch.Tensor,
+    n_expts_act: int,
+    sm_first: bool = False,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """gfx950 small-M decode route implementation."""
+    if dtype is None:
+        dtype = logits.dtype
+    n_tokens = logits.shape[0]
+    if (
+        not sm_first
+        and n_tokens <= SMALLM_MAX_M
+        and gluon_route_supported(logits, n_expts_act, dtype)
+    ):
+        return gluon_fused_route(logits, n_expts_act, dtype=dtype)
+
+    raise ValueError(
+        "gluon_decode_routing_gfx950 only supports small-M gfx950 decode "
+        "routing shapes"
     )

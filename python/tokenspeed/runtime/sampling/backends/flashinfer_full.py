@@ -91,6 +91,8 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     mask. Both remain silently-ignored no-ops.
     """
 
+    _SUPPORTS_DP_VERIFY = False
+
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)

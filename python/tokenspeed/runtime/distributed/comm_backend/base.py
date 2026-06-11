@@ -54,6 +54,15 @@ class CommBackend(ABC):
     @abstractmethod
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor: ...
 
+    @abstractmethod
+    def all_to_all_single(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> None:
+        """Even-split all_to_all. output and input must have same numel
+        divisible by len(group).
+        """
+        ...
+
     # ---- Token-aware ops (uneven token distribution) ----
 
     @abstractmethod

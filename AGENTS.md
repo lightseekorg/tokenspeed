@@ -38,3 +38,4 @@ Inside the root tokenspeed-kernel/ directory:
   new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py` or `attention/triton/`.
+* When defining new public APIs, explain arguments and returns in docstring.

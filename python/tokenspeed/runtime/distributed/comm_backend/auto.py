@@ -115,6 +115,11 @@ class AutoBackend(CommBackend):
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         return self._nccl.reduce_scatter(tensor, group)
 
+    def all_to_all_single(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> None:
+        return self._nccl.all_to_all_single(output, input, group)
+
     def send(self, tensor: torch.Tensor, dst: int, group: Group) -> None:
         return self._nccl.send(tensor, dst, group)
 

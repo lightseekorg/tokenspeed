@@ -50,6 +50,10 @@ class PrefillParallelInfo:
     tp_size: int
     dp_size: int
     enable_mla_l1_5_cache: bool
+    kv_item_lens: tuple[int, ...] = ()
+    kv_unit_lens: tuple[int, ...] = ()
+    state_item_lens: tuple[int, ...] = ()
+    state_unit_lens: tuple[int, ...] = ()
 
     @property
     def prefill_tp_size_per_dp_rank(self):
@@ -111,45 +115,13 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
         self.bootstrap_token_table: Dict[int, int] = {}
         self.spec_candidate_ids_table: Dict[int, list[int]] = {}
+        self._pending_bootstrap_token_table: Dict[int, int] = {}
+        self._pending_spec_candidate_ids_table: Dict[int, list[int]] = {}
 
         def decode_thread():
             while True:
                 parts = self.server_socket.recv_multipart()
-                (
-                    bootstrap_room,
-                    status,
-                    prefill_rank,
-                    bootstrap_token,
-                    spec_candidate_ids,
-                ) = parse_prefill_status_message(parts)
-
-                if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = (
-                            self.required_prefill_response_num_table[bootstrap_room]
-                        )
-                        arrived_response_num = len(
-                            self.prefill_response_tracker[bootstrap_room]
-                        )
-                        if arrived_response_num == expected_response_num:
-                            # Store token before marking Success so generate_events()
-                            # can read it atomically in the same iteration.
-                            if bootstrap_token != -1:
-                                self.bootstrap_token_table[bootstrap_room] = (
-                                    bootstrap_token
-                                )
-                            if spec_candidate_ids is not None:
-                                self.spec_candidate_ids_table[bootstrap_room] = (
-                                    spec_candidate_ids
-                                )
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                if status == KVPoll.Failed:
-                    self.record_failure(
-                        bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
-                    )
-                self.update_status(bootstrap_room, status)
+                self._handle_prefill_status(*parse_prefill_status_message(parts))
 
         def heartbeat_checker():
             while True:
@@ -207,6 +179,60 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
 
         threading.Thread(target=decode_thread).start()
         threading.Thread(target=heartbeat_checker).start()
+
+    def _handle_prefill_status(
+        self,
+        bootstrap_room: int,
+        status: int,
+        prefill_rank: int,
+        bootstrap_token: int,
+        spec_candidate_ids: list[int] | None,
+    ) -> None:
+        if status == KVPoll.Success:
+            if bootstrap_room not in self.request_status:
+                return
+
+            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            if bootstrap_token != -1:
+                self._pending_bootstrap_token_table.setdefault(
+                    bootstrap_room, bootstrap_token
+                )
+            if spec_candidate_ids is not None:
+                self._pending_spec_candidate_ids_table.setdefault(
+                    bootstrap_room, spec_candidate_ids
+                )
+
+            expected_response_num = self.required_prefill_response_num_table.get(
+                bootstrap_room, 1
+            )
+            arrived_response_num = len(self.prefill_response_tracker[bootstrap_room])
+            if arrived_response_num < expected_response_num:
+                return
+
+            # Store metadata before marking Success so generate_events() can read
+            # it atomically in the same iteration. In heterogeneous TP, the rank
+            # carrying bootstrap metadata is not guaranteed to be the last rank
+            # whose transfer completes, so preserve the first valid value seen.
+            if bootstrap_room in self._pending_bootstrap_token_table:
+                self.bootstrap_token_table[bootstrap_room] = (
+                    self._pending_bootstrap_token_table.pop(bootstrap_room)
+                )
+            if bootstrap_room in self._pending_spec_candidate_ids_table:
+                self.spec_candidate_ids_table[bootstrap_room] = (
+                    self._pending_spec_candidate_ids_table.pop(bootstrap_room)
+                )
+            self.update_status(bootstrap_room, KVPoll.Success)
+            return
+
+        if status == KVPoll.Failed:
+            self.record_failure(
+                bootstrap_room,
+                "Failed to get kvcache from prefill instance, it might be dead",
+            )
+            self.update_status(bootstrap_room, KVPoll.Failed)
+            return
+
+        self.update_status(bootstrap_room, status)
 
     def pop_bootstrap_token(self, bootstrap_room: int) -> int:
         """Pop and return the bootstrap_token for the given room, or -1 if absent."""

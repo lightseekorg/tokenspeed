@@ -26,25 +26,19 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon
-from tokenspeed_kernel.ops.attention.gluon.utils import (
+from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2,
     _INV_LN2_VALUE,
     InputStrides,
     max,
     maximum,
 )
-from tokenspeed_kernel.platform import (
-    ArchVersion,
-    CapabilityRequirement,
-    current_platform,
-)
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 cdiv = gl.cdiv
+_GFX950_SM_COUNT = 256
 
 
 # ===-----------------------------------------------------------------------===#
@@ -118,7 +112,7 @@ class AttentionConfig:
         v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
         load_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
         store_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        reduce_layout = gl.BlockedLayout([1], [64], [1], [0])
+        reduce_layout = gl.BlockedLayout([1, 1], [1, 64], [1, 1], [1, 0])
         k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
             [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
@@ -624,8 +618,6 @@ def _mha_decode_reduce_fp16(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
-    IS_SLIDING: gl.constexpr,
-    WINDOW_LEFT: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -637,55 +629,52 @@ def _mha_decode_reduce_fp16(
         HEAD_DIM,
         BLOCK_M,
         BLOCK_N,
-        IS_SLIDING,
-        WINDOW_LEFT,
+        False,  # IS_SLIDING
+        -1,  # WINDOW_LEFT
         InputStrides(1, 1, 1),
     )
     batch = gl.program_id(0)
     q_head = gl.program_id(1)
     cache_len = gl.load(cache_seqlens_ptr + batch)
-    if cfg.IS_SLIDING:
-        window_len = min(cache_len, cfg.WINDOW_LEFT)
-        kv_start = cache_len - window_len
-    else:
-        kv_start = cache_len - cache_len
-    first_page = kv_start // cfg.PAGE_SIZE
+    first_page = 0
     end_page = cdiv(cache_len, cfg.PAGE_SIZE)
     num_pages = end_page - first_page
     pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
-    offs_d = gl.arange(0, cfg.HEAD_DIM, layout=cfg.reduce_layout)
-    if HAS_SINK:
-        m_i = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
-        l_i = gl.full((), value=1.0, dtype=gl.float32)
-    else:
-        m_i = gl.full((), value=-float("inf"), dtype=gl.float32)
-        l_i = gl.full((), value=0.0, dtype=gl.float32)
-    acc = gl.full([cfg.HEAD_DIM], value=0.0, dtype=gl.float32, layout=cfg.reduce_layout)
 
-    for split_id in range(0, cfg.NUM_KV_SPLITS):
-        split_start_page = first_page + split_id * pages_per_split
-        split_end_page = min(split_start_page + pages_per_split, end_page)
-        split_start = split_start_page * cfg.PAGE_SIZE
-        split_end = min(split_end_page * cfg.PAGE_SIZE, cache_len)
-        if split_start < split_end:
-            mid_o_base = (
-                (batch * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + split_id
-            ) * cfg.HEAD_DIM
-            mid_lse_offset = (
-                batch * cfg.NUM_Q_HEADS + q_head
-            ) * cfg.NUM_KV_SPLITS + split_id
-            part_o = cdna4.buffer_load(mid_o_ptr, mid_o_base + offs_d)
-            part_lse = gl.load(mid_lse_ptr + mid_lse_offset)
-            m_new = maximum(m_i, part_lse)
-            alpha = gl.exp2(m_i - m_new)
-            beta = gl.exp2(part_lse - m_new)
-            acc = acc * alpha + part_o * beta
-            l_i = l_i * alpha + beta
-            m_i = m_new
+    # SPLIT_TILE pads NUM_KV_SPLITS up to a power of 2.
+    SPLIT_TILE: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
+    offs_s = gl.arange(0, SPLIT_TILE, layout=gl.SliceLayout(1, cfg.reduce_layout))
+    offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.reduce_layout))
+    # split_valid masks out empty splits and the power-of-2 padding tail.
+    split_start_page = first_page + offs_s * pages_per_split
+    split_end_page_raw = split_start_page + pages_per_split
+    split_end_page = gl.where(
+        split_end_page_raw < end_page, split_end_page_raw, end_page
+    )
+    split_start_tok = split_start_page * cfg.PAGE_SIZE
+    split_end_raw = split_end_page * cfg.PAGE_SIZE
+    split_end_tok = gl.where(split_end_raw < cache_len, split_end_raw, cache_len)
+    split_valid = (split_start_tok < split_end_tok) & (offs_s < cfg.NUM_KV_SPLITS)
+    # Load every split's partial output and lse.
+    base = (batch * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
+    part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
+    o_off = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]
+    part_o = cdna4.buffer_load(mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0)
+
+    # Global softmax max over all splits (folding in the sink).
+    m_i = max(part_lse, axis=0)
+    if HAS_SINK:
+        sink = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
+        m_i = maximum(m_i, sink)
+    # Weighted sum of the split partials, normalized by the total softmax mass.
+    beta = gl.exp2(part_lse - m_i)
+    l_i = gl.sum(beta, axis=0)
+    if HAS_SINK:
+        l_i = l_i + gl.exp2(sink - m_i)
+    acc = gl.sum(part_o * beta[:, None], axis=0)
 
     out_base = (batch * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
-    l_i_recip = 1.0 / l_i
-    output = acc * l_i_recip
+    output = acc * (1.0 / l_i)
     output = output.to(out_ptr.dtype.element_ty)
     cdna4.buffer_store(output, out_ptr, out_base + offs_d)
 
@@ -696,6 +685,7 @@ def _select_num_kv_splits(
     num_kv_heads: int,
     num_groups: int,
     num_pages: int,
+    sm_count: int,
 ) -> int:
     """Pick num_kv_splits to balance occupancy against reduce overhead.
 
@@ -705,20 +695,25 @@ def _select_num_kv_splits(
 
     Return the smaller of two candidate counts: splits_for_occupancy (enough to
     fill ~wave_target waves of CUs) and splits_for_pages (~min_pages_per_split
-    pages per split, but at least min(min_page_splits, num_pages) so a short
-    context still splits without launching empty work).
+    pages per split), with the pages candidate clamped to [min_page_splits,
+    max_page_splits] so a short context still splits without launching empty work
+    and a long one does not over-split where reduce cost outgrows the decode win.
     """
     wave_target = 2
-    min_pages_per_split = 8
+    min_pages_per_split = 2
     min_page_splits = 8
+    max_page_splits = 32
 
     base_ctas = batch * num_kv_heads * num_groups
-    target_ctas = current_platform().sm_count * wave_target
+    target_ctas = sm_count * wave_target
     splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas
+
     splits_for_pages = num_pages // min_pages_per_split
-    page_splits_floor = min(min_page_splits, num_pages)
-    if splits_for_pages < page_splits_floor:
-        splits_for_pages = page_splits_floor
+    min_page_splits = min(min_page_splits, num_pages)
+    if splits_for_pages < min_page_splits:
+        splits_for_pages = min_page_splits
+    if splits_for_pages > max_page_splits:
+        splits_for_pages = max_page_splits
     return min(splits_for_occupancy, splits_for_pages)
 
 
@@ -759,6 +754,7 @@ def get_config(
         num_kv_heads=k_cache.shape[2],
         num_groups=num_groups,
         num_pages=num_pages,
+        sm_count=_GFX950_SM_COUNT,
     )
     return LaunchConfig(
         num_q_heads=q.shape[1],
@@ -775,29 +771,6 @@ def get_config(
     )
 
 
-@register_kernel(
-    "attention",
-    "mha_decode_with_kvcache",
-    name="gluon_mha_decode_fp16_gfx950",
-    solution="gluon",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.SPECIALIZED,
-    traits={
-        "head_dim": frozenset({64}),
-        "page_size": frozenset({64}),
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False}),
-        "return_lse": frozenset({False}),
-    },
-)
 def gluon_mha_decode_fp16_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -911,8 +884,6 @@ def gluon_mha_decode_fp16_gfx950(
             config.block_m,
             config.block_n,
             has_sink,
-            config.is_sliding,
-            config.window_left,
             num_warps=1,
         )
     return output

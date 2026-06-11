@@ -41,6 +41,13 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from tokenspeed.runtime.sampling.dp_sampling_config import (
+    DpSamplingRuntimeConfig,
+)
+from tokenspeed.runtime.sampling.logits_layout import (
+    LogitsLayoutExecutor,
+    LogitsLayoutPlan,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -54,6 +61,7 @@ class LogitsProcessorOutput:
     # Used by speculative decoding.
     # The last hidden layers
     hidden_states: torch.Tensor | None = None
+    logits_layout_plan: LogitsLayoutPlan | None = None
 
     ## Part 2: Populated by the active SamplingBackend during sample()/verify().
     # The logprobs of the next tokens.                              shape: [#seq]
@@ -85,7 +93,6 @@ class LogitsMetadata:
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
-    extend_seq_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: list[int] | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
@@ -108,21 +115,13 @@ class LogitsMetadata:
     gathered_buffer: torch.Tensor | None = None
     # Buffer to gather logits from all ranks.
     forward_batch_gathered_buffer: torch.Tensor | None = None
-    # Number of tokens to sample per DP rank
-    global_num_tokens_for_logprob_cpu: torch.Tensor | None = None
-    global_num_tokens_for_logprob_gpu: torch.Tensor | None = None
 
     @classmethod
-    def from_forward_context(
-        cls,
-        ctx: ForwardContext,
-        input_lengths: torch.Tensor,
-    ):
+    def from_forward_context(cls, ctx: ForwardContext):
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
-            extend_seq_lens=input_lengths,
         )
 
 
@@ -188,7 +187,11 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.skip_all_gather = skip_all_gather
+        self.dp_sampling_enabled = False
+        self.dp_num_tokens_per_req = 1
+        self.dp_sampling_min_bs = 0
         self.logit_scale = logit_scale
+        self._logits_layout_executor: LogitsLayoutExecutor | None = None
 
         if tp_rank is None:
             assert tp_size is None
@@ -211,6 +214,56 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
+    def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
+        if (
+            not runtime.enabled
+            or runtime.topology is None
+            or runtime.min_bs is None
+            or runtime.max_bucket_bs is None
+            or runtime.vocab_size is None
+            or runtime.device is None
+        ):
+            raise RuntimeError("enabled DP sampling runtime is incomplete")
+        topology = runtime.topology
+        self.dp_sampling_enabled = True
+        self.dp_num_tokens_per_req = runtime.num_tokens_per_req
+        self.dp_sampling_min_bs = runtime.min_bs
+        self._logits_layout_executor = LogitsLayoutExecutor(
+            tp_rank=topology.tp_rank,
+            tp_size=topology.tp_size,
+            tp_group=topology.tp_group,
+            max_bucket_bs=runtime.max_bucket_bs,
+            num_tokens_per_req=runtime.num_tokens_per_req,
+            vocab_size=runtime.vocab_size,
+            device=runtime.device,
+        )
+
+    def _resolve_logits_layout_plan(
+        self,
+        hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> LogitsLayoutPlan | None:
+        if not self.dp_sampling_enabled:
+            return None
+        if not (
+            logits_metadata.forward_mode.is_decode()
+            or logits_metadata.forward_mode.is_target_verify()
+        ):
+            return None
+        n = self.dp_num_tokens_per_req
+        rows = hidden_states.shape[0]
+        assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
+        effective_bs = rows // n
+        bucket_bs = ((effective_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
+        if effective_bs < self.dp_sampling_min_bs:
+            return None
+        return LogitsLayoutPlan(
+            effective_bs=effective_bs,
+            bucket_bs=bucket_bs,
+            tp_size=self.tp_size,
+            num_tokens_per_req=n,
+        )
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia:
@@ -252,13 +305,10 @@ class LogitsProcessor(nn.Module):
                     pruned_states = hidden_states[gather_ids]
                     if aux_hidden_states is not None:
                         aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
-            elif logits_metadata.forward_mode.is_extend_or_mixed():
-                # Fallback for prefill callers that do not precompute gather_ids.
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-                pruned_states = hidden_states[last_index]
-                if aux_hidden_states is not None:
-                    aux_pruned_states = [h[last_index] for h in aux_hidden_states]
             else:
+                assert (
+                    not logits_metadata.forward_mode.is_extend_or_mixed()
+                ), "EXTEND/MIXED forward must set gather_ids on ForwardContext"
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
@@ -311,7 +361,12 @@ class LogitsProcessor(nn.Module):
             )
 
         # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+        logits_layout_plan = self._resolve_logits_layout_plan(
+            pruned_states, logits_metadata
+        )
+        logits = self._get_logits(
+            pruned_states, lm_head, logits_metadata, plan=logits_layout_plan
+        )
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
@@ -356,6 +411,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                logits_layout_plan=logits_layout_plan,
             )
         else:
             input_logprobs = logits[input_logprob_indices]
@@ -419,6 +475,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: torch.Tensor | None = None,
+        plan: LogitsLayoutPlan | None = None,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -426,6 +483,21 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        dp_sampling = plan is not None
+        assert (not dp_sampling) or self.dp_sampling_enabled, (
+            "DP logits layout plan was provided but LogitsProcessor was not "
+            "configured with dp_sampling"
+        )
+
+        if dp_sampling and self.skip_all_gather:
+            if self._logits_layout_executor is None:
+                raise RuntimeError(
+                    "dp_sampling logits layout executor is not configured"
+                )
+            hidden_states = self._logits_layout_executor.slice_hidden_states(
+                hidden_states, plan
+            )
+
         if hasattr(lm_head, "weight"):
             if self._use_fused_lm_head:
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
@@ -440,7 +512,13 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self.tp_size > 1 and not self.skip_all_gather:
+        if dp_sampling and not self.skip_all_gather:
+            if self._logits_layout_executor is None:
+                raise RuntimeError(
+                    "dp_sampling logits layout executor is not configured"
+                )
+            logits = self._logits_layout_executor.swap_batch_vocab(logits, plan)
+        elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
             if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 self._all_gather_state = self._init_all_gather_state(lm_head)
 

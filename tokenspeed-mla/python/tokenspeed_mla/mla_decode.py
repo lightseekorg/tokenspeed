@@ -39,7 +39,10 @@ from tokenspeed_mla.mla_decode_fp8 import (
 from tokenspeed_mla.mla_decode_fp16 import (
     BlackwellMultiHeadLatentAttentionForwardFP16,
 )
-from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
+from tokenspeed_mla.mla_helpers import (
+    get_mla_decode_fold_sq_factor,
+    select_mla_decode_tilers,
+)
 from tokenspeed_mla.utils import (
     get_max_active_clusters,
     get_num_sm,
@@ -54,14 +57,36 @@ def _get_split_kv_and_workspace_size(
     H: int,
     kv_lora_rank: int,
     max_active_blocks: int,
+    max_seq_len: int,
+    torch_dtype: torch.dtype,
+    mma_qk_tiler_mn: tuple[int, int],
 ) -> Tuple[int, int]:
     """Cache split_kv and workspace_size since they are deterministic for the same params."""
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        B, q_len, max_active_blocks
-    )
-    workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-        H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
-    )
+    is_fp8 = torch_dtype == torch.float8_e4m3fn
+    if is_fp8 and mma_qk_tiler_mn[0] == 64:
+        # M64 launches one CTA per M tile. Reuse the FP8 kernel's wave-aware
+        # split heuristic so serving matches the standalone mla_decode_fp8.py
+        # benchmark path instead of under-splitting like the 2-CTA M128 path.
+        split_kv = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
+            B,
+            q_len,
+            max_seq_len,
+            mma_qk_tiler_mn,
+            max_active_blocks,
+            1,
+        )
+        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
+            H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+        )
+    else:
+        split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
+            B, q_len, max_active_blocks
+        )
+        workspace_size = (
+            BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
+                H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+            )
+        )
     return split_kv, workspace_size
 
 
@@ -76,12 +101,16 @@ def _check_can_implement(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
+    compute_capability: tuple[int, int],
 ) -> None:
     """Check if the kernel supports the given configuration (cached)."""
-    mma_qk_tiler_mn = (128, 128)
-    mma_pv_tiler_mn = (128, 256)
-
     is_fp8 = torch_dtype == torch.float8_e4m3fn
+    mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
+        num_heads,
+        seq_len_q,
+        is_fp8=is_fp8,
+        compute_capability=compute_capability,
+    )
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
@@ -132,6 +161,7 @@ def _get_compiled_mla_kernel(
     cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
+    compute_capability: tuple[int, int] = (0, 0),
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -141,14 +171,15 @@ def _get_compiled_mla_kernel(
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
-    # Tile sizes for Blackwell mma.
-    # (128, 128) for QK and (128, 256) for PV.
-    mma_qk_tiler_mn = (128, 128)
-    mma_pv_tiler_mn = (128, 256)
-    # 2 CTAs along M (num_heads)
-    cluster_shape_mnk = (2, 1, 1)
-
     is_fp8 = torch_dtype == torch.float8_e4m3fn
+    mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
+        num_heads,
+        seq_len_q,
+        is_fp8=is_fp8,
+        compute_capability=compute_capability,
+    )
+    # 2 CTAs for M=128 path; 1 CTA for M=64 path.
+    cluster_shape_mnk = (2, 1, 1) if mma_qk_tiler_mn[0] == 128 else (1, 1, 1)
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
@@ -448,10 +479,17 @@ def tokenspeed_mla_decode(
     # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
-    # H=128: standard config. When H is smaller than M tile, fold only by a
-    # factor that exactly divides q_len; otherwise leave q_len on the scheduler
-    # dimension.
-    mma_m_tile = 128
+    is_fp8 = q_dtype == torch.float8_e4m3fn
+    compute_capability = torch.cuda.get_device_capability(query.device)
+    mma_qk_tiler_mn, _ = select_mla_decode_tilers(
+        H,
+        q_len,
+        is_fp8=is_fp8,
+        compute_capability=compute_capability,
+    )
+    # Fold only by a factor that exactly divides q_len; otherwise leave q_len
+    # on the scheduler dimension.
+    mma_m_tile = mma_qk_tiler_mn[0]
     fold_sq_factor = get_mla_decode_fold_sq_factor(H, q_len, mma_m_tile)
 
     # Effective dimensions used by split_kv/workspace accounting.
@@ -461,7 +499,14 @@ def tokenspeed_mla_decode(
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
-        B, q_len_eff, H_eff, kv_lora_rank, max_active_blocks
+        B,
+        q_len_eff,
+        H_eff,
+        kv_lora_rank,
+        max_active_blocks,
+        max_seq_len,
+        q_dtype,
+        mma_qk_tiler_mn,
     )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
@@ -547,6 +592,7 @@ def tokenspeed_mla_decode(
         is_persistent=is_persistent,
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
+        compute_capability=compute_capability,
     )
 
     # Get compiled kernel (cached after first compile)
@@ -569,6 +615,7 @@ def tokenspeed_mla_decode(
         cp_world=cp_world,
         use_pdl=enable_pdl,
         return_lse=return_lse,
+        compute_capability=compute_capability,
     )
 
     # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros
