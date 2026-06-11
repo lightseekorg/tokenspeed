@@ -1193,7 +1193,7 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, triton_kernel, flashinfer_mxfp4, marlin, etc.",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
         )
         parser.add_argument(
             "--draft-moe-backend",
