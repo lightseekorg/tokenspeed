@@ -173,11 +173,12 @@ def moe_plan(
         "weight_dtype": weight_dtype,
         "apply_kernel_name": apply_spec.name,
         "process_weights_kernel_name": process_weights_spec.name,
-        "solution": apply_spec.solution,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
         "support_routing": support_routing,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "solution": apply_spec.solution,
+        "internal_activation_dtype": internal_activation_dtype,
     }
 
 
