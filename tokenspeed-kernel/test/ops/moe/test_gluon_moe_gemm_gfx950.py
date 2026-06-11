@@ -29,12 +29,13 @@ RTOL = 0.01
 
 KEY_NUM_TOKEN_VALUES = (1, 2, 16, 17, 64, 4096, 8192)
 KEY_NUM_TOKENS = [
-    pytest.param(1, id="tokens1_routedM2"), pytest.param(2, id="tokens2_routedM4"),
+    pytest.param(1, id="tokens1_routedM2"),
+    pytest.param(2, id="tokens2_routedM4"),
     pytest.param(16, id="tokens16_routedM32"),
     pytest.param(17, id="tokens17_routedM34_blockm_regression"),
     pytest.param(64, id="tokens64_routedM128"),
     pytest.param(4096, id="tokens4096_routedM8192"),
-    pytest.param(8192, id="tokens8192_routedM16384")
+    pytest.param(8192, id="tokens8192_routedM16384"),
 ]
 
 
@@ -91,14 +92,10 @@ def _make_mxfp4_weight_bytes(
 ) -> torch.Tensor:
     nibbles = torch.tensor(WEIGHT_NIBBLES, device=device, dtype=torch.uint8)
     lo = nibbles[
-        torch.randint(
-            0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator
-        )
+        torch.randint(0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator)
     ]
     hi = nibbles[
-        torch.randint(
-            0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator
-        )
+        torch.randint(0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator)
     ]
     return lo | (hi << 4)
 
@@ -124,19 +121,22 @@ def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
     return RawMxfp4Weights(
         w13_weight=_make_mxfp4_weight_bytes(
             (E, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
-            device=device, generator=generator
+            device=device,
+            generator=generator,
         ),
         w13_scale=_make_e8m0_scales(
             (E, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // MXFP4_BLOCK),
-            device=device, generator=generator
+            device=device,
+            generator=generator,
         ),
         w2_weight=_make_mxfp4_weight_bytes(
             (E, HIDDEN_SIZE, INTERMEDIATE_SIZE // 2), device=device, generator=generator
         ),
         w2_scale=_make_e8m0_scales(
             (E, HIDDEN_SIZE, INTERMEDIATE_SIZE // MXFP4_BLOCK),
-            device=device, generator=generator
-        )
+            device=device,
+            generator=generator,
+        ),
     )
 
 
@@ -160,7 +160,7 @@ def _make_backend():
     return gluon_kernel.Mxfp4GluonKernelBackend(
         BackendKey("gfx950", "mxfp4", "gluon"),
         spec,
-        Mxfp4Config(is_checkpoint_mxfp4_serialized=True, is_w4a8_fp8=True)
+        Mxfp4Config(is_checkpoint_mxfp4_serialized=True, is_w4a8_fp8=True),
     )
 
 
@@ -243,8 +243,11 @@ def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(19000 + num_tokens)
     exact_values = (
         torch.randint(
-            -4, 5, (num_tokens * TOPK, INTERMEDIATE_SIZE),
-            device="cuda", generator=generator
+            -4,
+            5,
+            (num_tokens * TOPK, INTERMEDIATE_SIZE),
+            device="cuda",
+            generator=generator,
         ).to(torch.float32)
         / 16.0
     ).to(torch.bfloat16)
