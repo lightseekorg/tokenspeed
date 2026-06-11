@@ -529,22 +529,6 @@ def _moe_apply_mxfp4_triton() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_apply_mxfp4_gluon_gfx950() -> object:
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="swiglu",
-        ispp=128,
-        internal_activation_dtype="fp8",
-        with_bias=True,
-    )
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_moe_apply"
-    assert plan["process_weights_kernel_name"] == "gluon_mxfp4_moe_process_weights"
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
-
-
 def _case(
     matches: Callable[[PlatformInfo], bool],
     arch: str,
@@ -795,8 +779,8 @@ _CASES = [
         _moe_apply_mxfp4_trtllm,
     ),
     _case(
-        _is_nvidia,
-        "nvidia",
+        _is_hopper,
+        "hopper",
         "moe",
         "apply",
         "triton_mxfp4_moe_apply",
@@ -807,8 +791,8 @@ _CASES = [
         "cdna4",
         "moe",
         "apply",
-        "gluon_mxfp4_moe_apply",
-        _moe_apply_mxfp4_gluon_gfx950,
+        "triton_mxfp4_moe_apply",
+        _moe_apply_mxfp4_triton,
     ),
 ]
 

@@ -347,7 +347,7 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4_trtllm",
     ),
     _moe_apply_site(
-        "gluon_mxfp4_moe_apply",
+        "triton_mxfp4_moe_apply",
         {
             "weight_dtype": "mxfp4",
             "activation": "swiglu",
@@ -357,7 +357,7 @@ _MANUAL_CALL_SITES: list[CallSite] = [
             "internal_activation_dtype": "fp8",
             "supports_bias": True,
         },
-        "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4_gluon",
+        "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4_fp8",
     ),
 ]
 
