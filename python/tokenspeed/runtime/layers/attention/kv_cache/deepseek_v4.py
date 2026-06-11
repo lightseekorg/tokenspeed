@@ -40,6 +40,7 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_compressed_slot_mapping,
+    deepseek_v4_paged_compressed_slot_mapping,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -672,6 +673,26 @@ class DeepseekV4CacheMetadata:
                 is_valid_token=is_valid_token,
             )
             return mapping[: positions.numel()]
+        if block_table is not self.block_table:
+            base_offsets = self.paged_cache_block_table_base_offsets.get(
+                v4_compressed_kv_group_id(compress_ratio)
+            )
+            if (
+                positions.is_cuda
+                and token_to_req_indices.is_cuda
+                and block_table.is_cuda
+                and (base_offsets is None or base_offsets.is_cuda)
+            ):
+                mapping = deepseek_v4_paged_compressed_slot_mapping(
+                    positions=positions,
+                    token_to_req_indices=token_to_req_indices,
+                    block_table=block_table,
+                    block_size=kv_cache_block_size,
+                    compress_ratio=compress_ratio,
+                    base_offsets=base_offsets,
+                )
+                return _mask_invalid_graph_tokens(mapping, is_valid_token)
+
         compressed_pos = torch.div(
             positions.to(torch.int64), compress_ratio, rounding_mode="floor"
         )

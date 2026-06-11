@@ -53,6 +53,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_paged_compressed_slot_mapping,
+)
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_save_compressor_state as _triton_save_compressor_state,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (

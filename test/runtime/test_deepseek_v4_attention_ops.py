@@ -36,6 +36,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
     deepseek_v4_hca_compress_kv_cache_insert,
+    deepseek_v4_paged_compressed_slot_mapping,
     deepseek_v4_prepare_indexer_q_mxfp4,
     dequantize_deepseek_v4_fp8_ds_mla_cache,
     fused_qnorm_rope_kv_insert,
@@ -1663,6 +1664,57 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             )
         )
         self.assertTrue(torch.equal(out[5:].cpu(), torch.full((3,), -1)))
+
+    def test_paged_compressed_slot_mapping_matches_reference(self):
+        device = torch.device("cuda")
+        positions = torch.tensor(
+            [3, 4, 7, 8, 11, 15, 16],
+            device=device,
+            dtype=torch.int64,
+        )
+        req_indices = torch.tensor(
+            [0, 0, 0, 1, 1, 1, 1],
+            device=device,
+            dtype=torch.int32,
+        )
+        block_table = torch.tensor(
+            [
+                [10, 11, -1],
+                [20, 21, 22],
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+        base_offsets = torch.tensor([0, 1], device=device, dtype=torch.int32)
+
+        actual = deepseek_v4_paged_compressed_slot_mapping(
+            positions=positions,
+            token_to_req_indices=req_indices,
+            block_table=block_table,
+            block_size=2,
+            compress_ratio=4,
+            base_offsets=base_offsets,
+        )
+        torch.cuda.synchronize()
+
+        expected = []
+        for pos, req in zip(positions.cpu().tolist(), req_indices.cpu().tolist()):
+            if (pos + 1) % 4 != 0:
+                expected.append(-1)
+                continue
+            compressed_pos = pos // 4
+            page = compressed_pos // 2 - int(base_offsets.cpu()[req])
+            offset = compressed_pos % 2
+            if page < 0 or page >= block_table.shape[1]:
+                expected.append(-1)
+                continue
+            page_id = int(block_table.cpu()[req, page])
+            expected.append(page_id * 2 + offset if page_id >= 0 else -1)
+
+        torch.testing.assert_close(
+            actual.cpu(),
+            torch.tensor(expected, dtype=torch.int64),
+        )
 
     def test_sparse_prefill_dequantize_and_gather_matches_reference(self):
         torch.manual_seed(9234)

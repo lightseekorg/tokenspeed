@@ -43,6 +43,7 @@ __all__ = [
     "deepseek_v4_combine_dense_swa_indices",
     "deepseek_v4_combine_topk_swa_indices",
     "deepseek_v4_compressed_slot_mapping",
+    "deepseek_v4_paged_compressed_slot_mapping",
     "deepseek_v4_compute_global_topk_indices_and_lens",
     "deepseek_v4_decode_swa_indices_and_lens",
     "deepseek_v4_dequantize_and_gather_k_cache",
@@ -1683,6 +1684,96 @@ def deepseek_v4_compressed_slot_mapping(
         compress_ratio=compress_ratio,
         pad_id=-1,
         candidate_block=1024,
+    )
+    return slot_mapping
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def _deepseek_v4_paged_compressed_slot_mapping_kernel(
+    slot_mapping_ptr,
+    positions_ptr,
+    req_indices_ptr,
+    block_table_ptr,
+    block_table_base_offsets_ptr,
+    block_table_stride,
+    block_table_rows: tl.constexpr,
+    block_table_cols: tl.constexpr,
+    num_tokens,
+    block_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    pad_id: tl.constexpr,
+    has_base_offsets: tl.constexpr,
+    candidate_block: tl.constexpr,
+):
+    block_id = tl.program_id(0)
+    offsets = block_id * candidate_block + tl.arange(0, candidate_block)
+    mask = offsets < num_tokens
+
+    req_idx = tl.load(req_indices_ptr + offsets, mask=mask, other=-1).to(tl.int64)
+    positions = tl.load(positions_ptr + offsets, mask=mask, other=-1).to(tl.int64)
+    valid_req = (req_idx >= 0) & (req_idx < block_table_rows)
+    valid_boundary = ((positions + 1) % compress_ratio) == 0
+
+    compressed_pos = positions // compress_ratio
+    page_indices = compressed_pos // block_size
+    if has_base_offsets:
+        safe_req_for_base = tl.maximum(tl.minimum(req_idx, block_table_rows - 1), 0)
+        base_offsets = tl.load(
+            block_table_base_offsets_ptr + safe_req_for_base,
+            mask=mask & valid_req,
+            other=0,
+        ).to(tl.int64)
+        page_indices = page_indices - base_offsets
+
+    valid_page = (page_indices >= 0) & (page_indices < block_table_cols)
+    safe_req = tl.maximum(tl.minimum(req_idx, block_table_rows - 1), 0)
+    safe_page = tl.maximum(tl.minimum(page_indices, block_table_cols - 1), 0)
+    valid = mask & valid_req & valid_page & valid_boundary
+    page_ids = tl.load(
+        block_table_ptr + safe_req * block_table_stride + safe_page,
+        mask=valid,
+        other=-1,
+    ).to(tl.int64)
+    valid = valid & (page_ids >= 0)
+    slots = page_ids * block_size + (compressed_pos % block_size)
+    values = tl.where(valid, slots, pad_id)
+    tl.store(slot_mapping_ptr + offsets, values, mask=mask)
+
+
+def deepseek_v4_paged_compressed_slot_mapping(
+    *,
+    positions: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    compress_ratio: int,
+    base_offsets: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build compressed KV slot mapping for paged DeepSeek V4 cache groups."""
+
+    num_tokens = positions.numel()
+    if out is None:
+        out = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
+    slot_mapping = out[:num_tokens]
+    if num_tokens == 0:
+        return slot_mapping
+
+    _deepseek_v4_paged_compressed_slot_mapping_kernel[(triton.cdiv(num_tokens, 256),)](
+        slot_mapping,
+        positions,
+        token_to_req_indices[:num_tokens],
+        block_table,
+        base_offsets,
+        block_table.stride(0),
+        block_table.shape[0],
+        block_table.shape[1],
+        num_tokens,
+        block_size=block_size,
+        compress_ratio=compress_ratio,
+        pad_id=-1,
+        has_base_offsets=base_offsets is not None,
+        candidate_block=256,
     )
     return slot_mapping
 

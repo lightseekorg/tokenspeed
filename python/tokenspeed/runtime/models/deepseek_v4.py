@@ -2910,9 +2910,9 @@ class DeepseekV4Compressor(nn.Module):
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
         cache_metadata = metadata.cache
-        # state/compressed slot mappings depend only on (per-step state, ratio), so reuse
-        # them across layers of the same ratio within a step. Attn-compressor path only:
-        # the indexer-compressor passes an explicit state_block_table and is excluded.
+        # State/compressed slot mappings are per-step metadata. Reuse them across
+        # layers when the cache group shape is identical; the indexer-compressor
+        # passes an explicit state_block_table and is excluded from the state memo.
         memo = compressor_slot_cache if state_block_table is None else None
         if state_block_table is None:
             state_block_table = cache_metadata.compressor_state_block_tables.get(
@@ -2977,9 +2977,14 @@ class DeepseekV4Compressor(nn.Module):
             return kv, score
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
-        compressed_hit = (
-            memo.get(("compressed", self.compress_ratio)) if memo is not None else None
+        use_decode_cache = ctx.forward_mode is not None and ctx.forward_mode.is_decode()
+        compressed_key = (
+            "compressed",
+            self.compress_ratio,
+            kv_cache_block_size,
+            use_decode_cache,
         )
+        compressed_hit = memo.get(compressed_key) if memo is not None else None
         if compressed_hit is not None:
             compressed_slots = compressed_hit
         else:
@@ -2993,13 +2998,11 @@ class DeepseekV4Compressor(nn.Module):
                     query_start_loc=metadata.query_start_loc,
                     seq_lens=metadata.seq_lens,
                     kv_cache_block_size=kv_cache_block_size,
-                    use_decode_cache=(
-                        ctx.forward_mode is not None and ctx.forward_mode.is_decode()
-                    ),
+                    use_decode_cache=use_decode_cache,
                     is_valid_token=valid_token,
                 )
             if memo is not None:
-                memo[("compressed", self.compress_ratio)] = compressed_slots
+                memo[compressed_key] = compressed_slots
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -3463,18 +3466,35 @@ class DeepseekV4Indexer(nn.Module):
                 self.compress_ratio,
                 indexer_block_size,
             )
-            compressed_slots = cache_metadata.compressed_slot_mapping(
-                positions,
-                self.compress_ratio,
-                token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
-                query_start_loc=metadata.query_start_loc,
-                seq_lens=metadata.seq_lens,
-                kv_cache_block_size=indexer_block_size,
-                use_decode_cache=(
-                    ctx.forward_mode is not None and ctx.forward_mode.is_decode()
-                ),
-                is_valid_token=valid_token,
+            use_decode_cache = (
+                ctx.forward_mode is not None and ctx.forward_mode.is_decode()
             )
+            compressed_key = (
+                "compressed",
+                self.compress_ratio,
+                indexer_block_size,
+                use_decode_cache,
+            )
+            compressed_slots = (
+                compressor_slot_cache.get(compressed_key)
+                if compressor_slot_cache is not None
+                else None
+            )
+            if compressed_slots is None:
+                compressed_slots = cache_metadata.compressed_slot_mapping(
+                    positions,
+                    self.compress_ratio,
+                    token_to_req_indices=metadata.token_to_req_indices[
+                        : positions.numel()
+                    ],
+                    query_start_loc=metadata.query_start_loc,
+                    seq_lens=metadata.seq_lens,
+                    kv_cache_block_size=indexer_block_size,
+                    use_decode_cache=use_decode_cache,
+                    is_valid_token=valid_token,
+                )
+                if compressor_slot_cache is not None:
+                    compressor_slot_cache[compressed_key] = compressed_slots
         _deepseek_v4_phase_done(phase_wall_ms, "indexer_compressed_slot_mapping", tic)
         tic = _deepseek_v4_phase_start(timing_enabled)
         with nvtx_range("indexer_cache_insert"):
@@ -4332,9 +4352,8 @@ class DeepseekV4Model(nn.Module):
             positions,
             out_cache_loc,
         )
-        # Per-(step, ratio) compressor slot mappings are identical across layers of the
-        # same ratio; memoize within the step (filled lazily by the first compressor of
-        # each ratio, reused by the rest).
+        # Per-step cache slot mappings are identical across layers when their
+        # cache group shape matches; fill lazily and reuse within the step.
         compressor_slot_cache: dict = {}
         for layer in self.layers:
             hidden_states = layer(
