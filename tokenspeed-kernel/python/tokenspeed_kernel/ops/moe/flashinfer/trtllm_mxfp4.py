@@ -166,7 +166,7 @@ if platform.is_nvidia:
         "moe",
         "process_weights",
         name="flashinfer_trtllm_mxfp4_moe_process_weights",
-        solution="flashinfer_mxfp4",
+        solution="flashinfer_trtllm",
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
@@ -307,7 +307,7 @@ if platform.is_nvidia:
         w.intermediate_size_per_partition = ispp_padded
         w.hidden_size_padded = hidden_padded
         w.hidden_size_original = getattr(w, "hidden_size", hidden_padded)
-        w._flashinfer_mxfp4_autotuned = False
+        w._flashinfer_trtllm_autotuned = False
         return None
 
     def _call_mxfp4_moe(
@@ -356,7 +356,7 @@ if platform.is_nvidia:
         "moe",
         "apply",
         name="flashinfer_trtllm_mxfp4_moe_apply",
-        solution="flashinfer_mxfp4",
+        solution="flashinfer_trtllm",
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
@@ -398,8 +398,8 @@ if platform.is_nvidia:
             return x.new_empty(0, hidden_original)
 
         precision = plan.get(
-            "flashinfer_mxfp4_moe_precision",
-            getattr(w, "flashinfer_mxfp4_moe_precision", "default"),
+            "flashinfer_trtllm_moe_precision",
+            getattr(w, "flashinfer_trtllm_moe_precision", "default"),
         )
         if precision == "bf16":
             if x.dtype != torch.bfloat16:
@@ -418,7 +418,7 @@ if platform.is_nvidia:
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
         else:
             raise NotImplementedError(
-                f"Unknown flashinfer_mxfp4_moe_precision: {precision}"
+                f"Unknown flashinfer_trtllm_moe_precision: {precision}"
             )
 
         if x_quant.shape[-1] != hidden_padded:
@@ -433,10 +433,10 @@ if platform.is_nvidia:
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
 
-        if not getattr(w, "_flashinfer_mxfp4_autotuned", False):
+        if not getattr(w, "_flashinfer_trtllm_autotuned", False):
             with autotune():
                 _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
-            w._flashinfer_mxfp4_autotuned = True
+            w._flashinfer_trtllm_autotuned = True
 
         result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
         if hidden_original != hidden_padded:

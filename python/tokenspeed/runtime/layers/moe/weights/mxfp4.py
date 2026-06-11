@@ -45,7 +45,7 @@ def create_mxfp4_weight_pair(
     ispp = spec.intermediate_size // spec.tp_size
     platform = current_platform()
     hidden_size_padded = spec.hidden_size
-    if platform.is_blackwell and solution == "flashinfer_mxfp4":
+    if platform.is_blackwell and solution == "flashinfer_trtllm":
         ispp_padded = round_up(ispp, 256)
         hidden_size_padded = round_up(spec.hidden_size, 256)
     else:

@@ -59,7 +59,7 @@ _MODEL_CASES = [
     ModelCase(
         "openai/gpt-oss-20b",
         extra_kwargs={
-            "moe_backend": "flashinfer_mxfp4",
+            "moe_backend": "flashinfer_trtllm",
             "disable_prefill_graph": True,
         },
     ),
