@@ -34,6 +34,7 @@ from tokenspeed_kernel_amd.ops.moe.utils import (
     topk,
 )
 
+
 def _as_int32(t):
     if t is None or t.dtype == torch.int32:
         return t
