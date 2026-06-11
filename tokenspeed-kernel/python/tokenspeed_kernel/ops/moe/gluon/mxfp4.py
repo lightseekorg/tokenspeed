@@ -98,6 +98,11 @@ if platform.is_amd:
         "process_weights",
         name="gluon_mxfp4_moe_process_weights",
         solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
         signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"mxfp4"})},
         priority=Priority.SPECIALIZED,
