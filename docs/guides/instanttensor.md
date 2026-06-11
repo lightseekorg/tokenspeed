@@ -42,6 +42,30 @@ tokenspeed serve deepseek-ai/DeepSeek-R1 \
   --enable-expert-parallel
 ```
 
+## Memory considerations
+
+InstantTensor reads each checkpoint tensor **directly onto the GPU**. The
+default safetensors loader instead stages the full tensor in host (CPU) memory
+and copies only the current rank's shard to the GPU, so for tensor-parallel
+models its peak GPU usage during load is roughly one rank's shard. InstantTensor
+trades that host-RAM staging for speed, which means it needs meaningfully more
+**free VRAM** while loading.
+
+As a result, InstantTensor is best for models that leave headroom on the device.
+For a model that already nearly fills GPU memory — especially a large
+tensor-parallel model whose unsharded tensors are big — InstantTensor can run
+out of memory **during weight loading**, before the KV cache is ever allocated.
+
+If you hit a CUDA OOM inside the loader:
+
+- `--gpu-memory-utilization` will **not** help — it only sizes the KV cache
+  *after* weights are loaded; the OOM here happens during the load itself.
+- `INSTANTTENSOR_BUFFER_SIZE` / `INSTANTTENSOR_MAX_FREE_MEM_USAGE` bound
+  InstantTensor's I/O staging buffer, not the resident weight tensors, so they
+  do not resolve a load-time OOM caused by the weights themselves.
+- The reliable fix is to fall back to the default loader (drop
+  `--load-format instanttensor`), which keeps full tensors in host RAM.
+
 ## Notes
 
 - InstantTensor requires NVIDIA GPUs. Requesting it on a non-NVIDIA platform
