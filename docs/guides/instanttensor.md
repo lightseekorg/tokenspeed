@@ -44,27 +44,28 @@ tokenspeed serve deepseek-ai/DeepSeek-R1 \
 
 ## Memory considerations
 
-InstantTensor reads each checkpoint tensor **directly onto the GPU**. The
-default safetensors loader instead stages the full tensor in host (CPU) memory
-and copies only the current rank's shard to the GPU, so for tensor-parallel
-models its peak GPU usage during load is roughly one rank's shard. InstantTensor
-trades that host-RAM staging for speed, which means it needs meaningfully more
-**free VRAM** while loading.
+InstantTensor reads each checkpoint tensor **directly onto the GPU**, whereas
+the default safetensors loader stages the full tensor in host (CPU) memory and
+copies only the current rank's shard to the GPU. InstantTensor's own overhead is
+small: it uses a GPU staging buffer (dynamically sized, configurable) that is
+released before the KV cache is sized, plus a little fixed runtime overhead, so
+its post-load GPU footprint is close to the default loader.
 
-As a result, InstantTensor is best for models that leave headroom on the device.
-For a model that already nearly fills GPU memory — especially a large
-tensor-parallel model whose unsharded tensors are big — InstantTensor can run
-out of memory **during weight loading**, before the KV cache is ever allocated.
+Because tensors land on the GPU, a model's `load_weights` must **consume the
+weight iterator lazily** — copying each tensor into its (pre-allocated)
+parameter and then releasing it. A `load_weights` that instead collects the
+whole iterator into a list keeps every loaded tensor resident on the GPU at once
+and will OOM during loading on large models. This stays hidden with the
+CPU-staging loaders, where the buffered tensors live in plentiful host RAM.
+TokenSpeed's model loaders stream the iterator for this reason.
 
-If you hit a CUDA OOM inside the loader:
+Tuning:
 
-- `--gpu-memory-utilization` will **not** help — it only sizes the KV cache
-  *after* weights are loaded; the OOM here happens during the load itself.
 - `INSTANTTENSOR_BUFFER_SIZE` / `INSTANTTENSOR_MAX_FREE_MEM_USAGE` bound
-  InstantTensor's I/O staging buffer, not the resident weight tensors, so they
-  do not resolve a load-time OOM caused by the weights themselves.
-- The reliable fix is to fall back to the default loader (drop
-  `--load-format instanttensor`), which keeps full tensors in host RAM.
+  InstantTensor's GPU I/O staging buffer, trading a little throughput for lower
+  peak memory.
+- `--gpu-memory-utilization` only sizes the KV cache *after* weights are loaded;
+  it does not change peak memory during loading.
 
 ## Notes
 
