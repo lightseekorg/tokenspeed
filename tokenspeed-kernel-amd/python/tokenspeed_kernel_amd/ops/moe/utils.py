@@ -1,4 +1,4 @@
-"""Adopted top-k routing from https://github.com/triton-lang/triton/tree/main/python/triton_kernels"""
+"""Local copies of small triton-kernels utilities used by AMD MoE kernels."""
 
 # fmt: off
 # isort: off
@@ -9,6 +9,55 @@ from typing import Optional, TypeAlias, Union
 
 import torch
 from tokenspeed_kernel_amd._triton import tl, triton
+
+
+# activation metadata
+# ---------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class FnSpecs:
+    name: str
+    fn: object
+    fn_arg_names: tuple[str, ...]
+    fn_arg_do_not_specialize: tuple[str, ...] = tuple()
+    reduction_n: int = 1
+
+    @staticmethod
+    def default():
+        return FnSpecs("dflt", None, tuple())
+
+
+@dataclass(frozen=True)
+class FusedActivation:
+    specs: FnSpecs = FnSpecs.default()
+    fn_args: tuple[object, ...] = tuple()
+
+
+# swiglu
+# ---------------------------------------------------------------------------- #
+@triton.jit
+def _swiglu_clip(x, limit, clip_lower: tl.constexpr):
+    res = tl.minimum(x, limit)
+    if clip_lower:
+        res = tl.maximum(-limit, res)
+    return res
+
+
+@triton.jit
+def _compute_swiglu(gelu, linear, scale, alpha, limit):
+    gelu = gelu.to(tl.float32) * scale
+    if limit is not None:
+        gelu = _swiglu_clip(gelu, limit, clip_lower=False)
+    linear = linear.to(tl.float32) * scale
+    if limit is not None:
+        linear = _swiglu_clip(linear, limit, clip_lower=True)
+    s = gelu / (1 + tl.exp(-alpha * gelu))
+    return tl.fma(s, linear, s)
+
+
+@triton.jit(repr=lambda _: "_swiglu")
+def swiglu_fn(input, alpha, limit):
+    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    return _compute_swiglu(gelu, linear, 1.0, alpha, limit)
 
 
 # data types
