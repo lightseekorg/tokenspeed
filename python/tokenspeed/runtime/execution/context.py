@@ -50,7 +50,8 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
-    # Spec decode draft head's first step prunes to one live row per request.
+    # Legacy draft first-step flag; Qwen / DeepSeek NextN still set this until
+    # their attention subclasses own trim.  Llama Eagle3 uses accept_lengths.
     draft_first_step_reduce: bool = False
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
@@ -62,3 +63,9 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+
+    # --- spec-decode draft (drafter-owned buffers plumbed per forward) ---
+    # draft_seq_lens_buf: mutable per-request seq_lens alias the draft backend reads.
+    draft_seq_lens_buf: torch.Tensor | None = None
+    # accept_lengths: per-request accepted verify width for cache_seqlens correction.
+    accept_lengths: torch.Tensor | None = None

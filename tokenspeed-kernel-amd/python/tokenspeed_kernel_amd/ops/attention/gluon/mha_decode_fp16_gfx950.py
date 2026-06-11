@@ -26,25 +26,19 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon
-from tokenspeed_kernel.ops.attention.gluon.utils import (
+from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2,
     _INV_LN2_VALUE,
     InputStrides,
     max,
     maximum,
 )
-from tokenspeed_kernel.platform import (
-    ArchVersion,
-    CapabilityRequirement,
-    current_platform,
-)
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 cdiv = gl.cdiv
+_GFX950_SM_COUNT = 256
 
 
 # ===-----------------------------------------------------------------------===#
@@ -691,6 +685,7 @@ def _select_num_kv_splits(
     num_kv_heads: int,
     num_groups: int,
     num_pages: int,
+    sm_count: int,
 ) -> int:
     """Pick num_kv_splits to balance occupancy against reduce overhead.
 
@@ -710,7 +705,7 @@ def _select_num_kv_splits(
     max_page_splits = 32
 
     base_ctas = batch * num_kv_heads * num_groups
-    target_ctas = current_platform().sm_count * wave_target
+    target_ctas = sm_count * wave_target
     splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas
 
     splits_for_pages = num_pages // min_pages_per_split
@@ -759,6 +754,7 @@ def get_config(
         num_kv_heads=k_cache.shape[2],
         num_groups=num_groups,
         num_pages=num_pages,
+        sm_count=_GFX950_SM_COUNT,
     )
     return LaunchConfig(
         num_q_heads=q.shape[1],
@@ -775,29 +771,6 @@ def get_config(
     )
 
 
-@register_kernel(
-    "attention",
-    "mha_decode_with_kvcache",
-    name="gluon_mha_decode_fp16_gfx950",
-    solution="gluon",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.SPECIALIZED,
-    traits={
-        "head_dim": frozenset({64}),
-        "page_size": frozenset({64}),
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False}),
-        "return_lse": frozenset({False}),
-    },
-)
 def gluon_mha_decode_fp16_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,

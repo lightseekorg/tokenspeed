@@ -286,10 +286,24 @@ class Nvfp4FlashinferTrtllmBackend(MoEBackend):
         do_finalize: bool = True,
     ) -> torch.Tensor:
         del num_global_tokens, max_num_tokens_per_gpu
-        from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 
         x = hidden_states
         num_tokens = x.shape[0]
+        # Idle DP ranks run a dummy forward with 0 tokens. The fused
+        # kernel divides by the token count on the host and SIGFPEs on
+        # empty input, so skip the experts entirely.
+        if num_tokens == 0:
+            if do_finalize:
+                return x
+            return (
+                x,
+                x.new_empty((0, self.spec.top_k), dtype=torch.bfloat16),
+                # moe_finalize_fuse_shared expects a 1-D
+                # [num_tokens * top_k] permute map.
+                x.new_empty((0,), dtype=torch.int32),
+            )
+
+        from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 
         # Quantize input to FP4 using the fused-kernel scale layout.
         hs_fp4, hs_scale = fp4_quantize(

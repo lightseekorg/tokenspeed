@@ -26,6 +26,7 @@ ut:
     - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v
     - python3 -m pytest tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py -v
     - python3 -m pytest tokenspeed-kernel/test/thirdparty/test_cuda.py -v
+    - python3 -m pytest tokenspeed-kernel-amd/test/ -v
     - python3 -m pytest tokenspeed-kernel/test/ -v --ignore=tokenspeed-kernel/test/test_numerics.py --ignore=tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py --ignore=tokenspeed-kernel/test/thirdparty/test_cuda.py
 report:
   github_step_summary: true

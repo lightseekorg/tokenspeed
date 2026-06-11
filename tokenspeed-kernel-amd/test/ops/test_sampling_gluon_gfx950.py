@@ -22,8 +22,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling.gluon import argmax_gfx950 as gluon
-from tokenspeed_kernel.platform import current_platform
 
 MODEL_VOCABS = {
     "deepseek_v4": 129280,
@@ -35,15 +33,18 @@ MODEL_VOCABS = {
 def _is_gfx950() -> bool:
     if not torch.cuda.is_available():
         return False
-    try:
-        platform = current_platform()
-    except Exception:
-        return False
-    return platform.is_cdna4
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    return "gfx950" in arch
 
 
-pytestmark = pytest.mark.skipif(
-    not _is_gfx950(), reason="AMD GFX950 is required for Gluon argmax tests"
+if not _is_gfx950():
+    pytest.skip(
+        "AMD GFX950 is required for Gluon argmax tests", allow_module_level=True
+    )
+
+
+from tokenspeed_kernel_amd.ops.sampling.gluon import (  # noqa: E402
+    argmax_gfx950,
 )
 
 
@@ -51,7 +52,7 @@ pytestmark = pytest.mark.skipif(
 def test_argmax_matches_torch_for_dtypes(dtype):
     torch.manual_seed(0xA950)
     x = torch.randn(8, 4096, device="cuda", dtype=dtype)
-    out = gluon.argmax(x)
+    out = argmax_gfx950.argmax(x)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
@@ -70,7 +71,7 @@ def test_argmax_matches_torch_for_dtypes(dtype):
 def test_argmax_matches_torch_for_model_shapes(M, N):
     torch.manual_seed(M ^ N)
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    out = gluon.argmax(x)
+    out = argmax_gfx950.argmax(x)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
@@ -85,7 +86,7 @@ def test_argmax_matches_torch_for_model_shapes(M, N):
 )
 def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
     x = torch.full((M, N), float("nan"), device="cuda", dtype=dtype)
-    out = gluon.argmax(x)
+    out = argmax_gfx950.argmax(x)
     expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
@@ -100,7 +101,7 @@ def test_argmax_ignores_nan_but_preserves_valid_negative_infinity(M):
     x[2, 7] = 3.0
     x[2, 5] = 3.0
 
-    out = gluon.argmax(x)
+    out = argmax_gfx950.argmax(x)
     expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
     expected[:3] = torch.tensor([456, 0, 5], device="cuda", dtype=out.dtype)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
@@ -118,7 +119,9 @@ def test_argmax_returns_first_index_on_ties():
     for row, positions in enumerate(plant_positions):
         for pos in positions:
             x[row, pos] = 0.0
-    torch.testing.assert_close(gluon.argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    torch.testing.assert_close(
+        argmax_gfx950.argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
@@ -127,7 +130,7 @@ def test_argmax_writes_into_strided_caller_buffer(out_dtype):
     x = torch.randn(M, N, device="cuda", dtype=torch.float32)
     storage = torch.empty(M * 2, device="cuda", dtype=out_dtype)
     out = storage[::2]
-    returned = gluon.argmax(x, out=out)
+    returned = argmax_gfx950.argmax(x, out=out)
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
 
@@ -138,12 +141,12 @@ def test_argmax_out_buffer_under_cuda_graph():
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
     out = torch.empty(M, dtype=torch.int32, device="cuda")
 
-    gluon.argmax(x, out=out)
+    argmax_gfx950.argmax(x, out=out)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        gluon.argmax(x, out=out)
+        argmax_gfx950.argmax(x, out=out)
 
     new_x = 0.1 * torch.randn_like(x)
     x.copy_(new_x)

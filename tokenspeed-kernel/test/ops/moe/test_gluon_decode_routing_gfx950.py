@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel  # noqa: F401  (registers moe kernels)
-import tokenspeed_kernel.ops.moe.gluon as gluon_mod
 import torch
-from tokenspeed_kernel.ops.moe import moe_route
-from tokenspeed_kernel.ops.moe.gluon import (
-    SMALLM_MAX_M,
-    gluon_fused_route,
-    gluon_route_supported,
-)
-from tokenspeed_kernel.platform import current_platform
 
-requires_gfx950 = pytest.mark.skipif(
-    not (torch.cuda.is_available() and current_platform().is_cdna4),
-    reason="gluon decode routing kernel is gfx950 (CDNA4) only",
-)
+
+def _is_gfx950() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    return "gfx950" in arch
+
+
+if not _is_gfx950():
+    pytest.skip(
+        "gluon decode routing kernel is gfx950 (CDNA4) only",
+        allow_module_level=True,
+    )
+
+
+import tokenspeed_kernel  # noqa: E402,F401  (registers moe kernels)
+import tokenspeed_kernel.ops.moe as moe_mod  # noqa: E402
+from tokenspeed_kernel.ops.moe import moe_route  # noqa: E402
+
+gluon_mod = getattr(moe_mod, "_amd_gluon", None)
+if gluon_mod is None:
+    pytest.skip("tokenspeed-kernel-amd is required", allow_module_level=True)
+
+SMALLM_MAX_M = gluon_mod.SMALLM_MAX_M
+gluon_fused_route = gluon_mod.gluon_fused_route
+gluon_route_supported = gluon_mod.gluon_route_supported
 
 E = 128
 TOPK = 4
@@ -55,7 +68,6 @@ def _assert_metadata_exact(rg, rg_ref):
     assert torch.equal(rg.block_schedule_data, rg_ref.block_schedule_data)
 
 
-@requires_gfx950
 @pytest.mark.parametrize("M", SMALL_M)
 def test_small_m_routing_matches_generic(M):
     """Small-M Gluon route == generic pipeline, bit-for-bit.
@@ -77,7 +89,6 @@ def test_small_m_routing_matches_generic(M):
     assert torch.allclose(gs.float(), gs_ref.float(), atol=1e-3)
 
 
-@requires_gfx950
 def test_large_m_uses_generic_pipeline():
     """M > SMALLM_MAX_M falls through to the generic pipeline unchanged."""
     M = SMALLM_MAX_M + 16
@@ -91,7 +102,6 @@ def test_large_m_uses_generic_pipeline():
     assert int(rg.slice_sizes.sum()) == M * TOPK
 
 
-@requires_gfx950
 @pytest.mark.parametrize("M", SMALL_M)
 def test_gluon_fused_route_direct(M):
     """gluon_fused_route returns a well-formed routing result for small M."""
@@ -101,7 +111,6 @@ def test_gluon_fused_route_direct(M):
     assert ga.numel() == M * TOPK == sc.numel() == gs.numel()
 
 
-@requires_gfx950
 def test_gluon_route_supported_guards():
     """Unsupported configs report False so callers fall back safely."""
     logits = torch.randn(16, E, dtype=torch.bfloat16)

@@ -104,6 +104,10 @@ def moe_finalize_fuse_shared(
     out = torch.empty(
         num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
     )
+    # Idle DP ranks may finalize 0 tokens; the kernel launch cannot take
+    # an empty grid, so return the empty output directly.
+    if num_tokens == 0:
+        return out
     # The C++ side uses numel()==0 to mean "no shared bias"; pass an empty
     # placeholder when the caller didn't provide one. Avoids optional-tensor
     # plumbing through tvm_ffi.
