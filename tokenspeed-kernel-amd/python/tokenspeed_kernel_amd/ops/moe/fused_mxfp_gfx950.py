@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, tl, triton
@@ -132,20 +132,6 @@ def _compute_swiglu(gelu, linear, scale, alpha, limit):
 def swiglu_fn(input, alpha, limit):
     gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
     return _compute_swiglu(gelu, linear, 1.0, alpha, limit)
-
-
-__all__ = [
-    "_gluon_mxfp_fused_moe",
-    "_gluon_mxfp_ragged_matmul",
-    "gluon_mxfp_combine",
-    "gluon_mxfp_dispatch_swiglu",
-    "FUSED_ROUTE_MAX_M",
-    "SMALLM_MAX_M",
-    "GLUON_ROUTE_DTYPES",
-    "GLUON_ROUTE_MAX_E",
-    "GLUON_ROUTE_MAX_G",
-    "gluon_fused_route",
-]
 
 
 # Stage2 split-K factor (applied across the whole small-M decode path).
@@ -4416,7 +4402,7 @@ def _global_scale_passthrough(scale):
     return float(scale)
 
 
-def _gluon_mxfp_ragged_matmul(
+def gluon_mxfp_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
     bias: torch.Tensor | None,
@@ -4440,8 +4426,6 @@ def _gluon_mxfp_ragged_matmul(
     fp8_scale = getattr(lhs, "scale", None) if lhs is not None else None
 
     x_mx_scale = getattr(precision_config, "a_mx_scale", None)
-    if fp8_dtype is not None and x_mx_scale is not None:
-        return
 
     if fp8_dtype is not None:
         x_format = "e4m3"
@@ -4453,10 +4437,9 @@ def _gluon_mxfp_ragged_matmul(
         x_global_scale = 1.0
         x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
         x_scale = _extract_gluon_raw_s(x_mx_scale)
-        if not isinstance(x_scale, torch.Tensor):
-            return
+        assert isinstance(x_scale, torch.Tensor)
     else:
-        return
+        raise RuntimeError("missing required precision config for input X")
 
     if precision_config.out_dtype is not None:
         out_dtype = precision_config.out_dtype
@@ -4468,10 +4451,8 @@ def _gluon_mxfp_ragged_matmul(
     w_raw = _extract_gluon_raw_w(w)
     s_raw = _extract_gluon_raw_s(w_mx_scale)
 
-    if not isinstance(w_raw, torch.Tensor) or not isinstance(s_raw, torch.Tensor):
-        return
-    if w_raw.ndim != 3:
-        return
+    assert isinstance(w_raw, torch.Tensor) and isinstance(s_raw, torch.Tensor)
+    assert w_raw.ndim() == 3
 
     # Wrap bare tensors into ``.<attr>``-typed adapters; the launcher
     # consults gather_indx.src_indx / scatter_indx.dst_indx.
@@ -4497,70 +4478,51 @@ def _gluon_mxfp_ragged_matmul(
     gammas = extra_kwargs.get("gammas")
     out_quant_scale = extra_kwargs.get("out_quant_scale")
 
-    try:
-        if has_scatter and not has_gather:
-            # gemm + combine
-            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
-            out = gluon_mxfp_combine(
-                x_view,
-                w_raw,
-                s_raw,
-                x_scale=x_scale,
-                x_format=x_format,
-                x_global_scale=x_global_scale,
-                bias=bias,
-                a_ragged_metadata=a_ragged_metadata,
-                scatter_indx=scatter_indx,
-                gate_scal=gammas,
-                n_tokens=n_tokens,
-                n_expts_act=n_expts_act,
-                out_dtype=out_dtype,
-                scale_load_mode="swizzle",
-                w_transpose=True,
-                w_preshuffle=w_preshuffle,
-            )
-            return out
-
-        if not has_scatter and swiglu_args is not None:
-            swiglu_alpha, swiglu_limit = swiglu_args
-            w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
-            out = gluon_mxfp_dispatch_swiglu(
-                x_view,
-                w_raw,
-                s_raw,
-                x_scale=x_scale,
-                x_format=x_format,
-                x_global_scale=x_global_scale,
-                bias=bias,
-                a_ragged_metadata=a_ragged_metadata,
-                gather_indx=gather_indx,
-                out_dtype=out_dtype,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_limit=swiglu_limit,
-                scale_load_mode="swizzle",
-                w_transpose=True,
-                out_quant_scale=out_quant_scale,
-                w_preshuffle=w_preshuffle,
-            )
-            return out
-
-    except Exception as exc:  # noqa: BLE001
-        import logging
-        import traceback
-
-        logger = logging.getLogger("tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950")
-        logger.warning(
-            "_gluon_mxfp_ragged_matmul falling back to upstream: %s: %s",
-            type(exc).__name__,
-            exc,
+    if has_scatter and not has_gather:
+        # gemm + combine
+        w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
+        out = gluon_mxfp_combine(
+            x_view,
+            w_raw,
+            s_raw,
+            x_scale=x_scale,
+            x_format=x_format,
+            x_global_scale=x_global_scale,
+            bias=bias,
+            a_ragged_metadata=a_ragged_metadata,
+            scatter_indx=scatter_indx,
+            gate_scal=gammas,
+            n_tokens=n_tokens,
+            n_expts_act=n_expts_act,
+            out_dtype=out_dtype,
+            scale_load_mode="swizzle",
+            w_transpose=True,
+            w_preshuffle=w_preshuffle,
         )
-        logger.warning(
-            "  full chain:\n%s",
-            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-        )
-        return
+        return out
 
-    return
+    if not has_scatter and swiglu_args is not None:
+        swiglu_alpha, swiglu_limit = swiglu_args
+        w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
+        out = gluon_mxfp_dispatch_swiglu(
+            x_view,
+            w_raw,
+            s_raw,
+            x_scale=x_scale,
+            x_format=x_format,
+            x_global_scale=x_global_scale,
+            bias=bias,
+            a_ragged_metadata=a_ragged_metadata,
+            gather_indx=gather_indx,
+            out_dtype=out_dtype,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            scale_load_mode="swizzle",
+            w_transpose=True,
+            out_quant_scale=out_quant_scale,
+            w_preshuffle=w_preshuffle,
+        )
+        return out
 
 
 def _gluon_mxfp4_fp8_warp_decode_moe(
@@ -4767,7 +4729,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     return out
 
 
-def _gluon_mxfp_fused_moe(
+def gluon_mxfp_fused_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     w13_weight,
@@ -4802,7 +4764,7 @@ def _gluon_mxfp_fused_moe(
 
         enable_warp_decode: Whether to try the gfx950 small-M warp-decode path.
     """
-    assert hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    x_fp8 = fp8_quantize(hidden_states, w13_act_scale)
 
     n_tokens = router_logits.shape[0]
 
@@ -4810,35 +4772,23 @@ def _gluon_mxfp_fused_moe(
     # It self-guards (returns None) for any shape it does not cover; the
     # tokenspeed-kernel registration wrapper owns the environment/platform gate.
     if enable_warp_decode:
-        try:
-            warp_out = _gluon_mxfp4_fp8_warp_decode_moe(
-                hidden_states,
-                router_logits,
-                w13_weight,
-                w2_weight,
-                w13_bias=w13_bias,
-                w2_bias=w2_bias,
-                w13_precision_config=w13_precision_config,
-                w2_precision_config=w2_precision_config,
-                w13_act_scale=w13_act_scale,
-                w2_act_scale=w2_act_scale,
-                top_k=top_k,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_limit=swiglu_limit,
-            )
-            if warp_out is not None:
-                return warp_out
-        except Exception as exc:  # noqa: BLE001
-            import logging
-
-            logging.getLogger(
-                "tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950"
-            ).warning(
-                "warp-decode small-M path falling back: %s: %s",
-                type(exc).__name__,
-                exc,
-                exc_info=exc,
-            )
+        out = _gluon_mxfp4_fp8_warp_decode_moe(
+            x_fp8,
+            router_logits,
+            w13_weight,
+            w2_weight,
+            w13_bias=w13_bias,
+            w2_bias=w2_bias,
+            w13_precision_config=w13_precision_config,
+            w2_precision_config=w2_precision_config,
+            w13_act_scale=w13_act_scale,
+            w2_act_scale=w2_act_scale,
+            top_k=top_k,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+        )
+        if out is not None:
+            return out
 
     # Decode-small GPT-OSS routing is launch-overhead dominated. Prefer the
     # single-kernel Gluon route for the M<=16 single-block-collapse regime;
@@ -4863,9 +4813,9 @@ def _gluon_mxfp_fused_moe(
         (swiglu_alpha, swiglu_limit),
     )
 
-    gemm1_input = hidden_states
+    gemm1_input = x_fp8
 
-    intermediate_cache = _gluon_mxfp_ragged_matmul(
+    intermediate_cache = gluon_mxfp_ragged_matmul(
         gemm1_input,
         w13_weight,
         w13_bias,
@@ -4877,7 +4827,7 @@ def _gluon_mxfp_fused_moe(
 
     gemm2_input = intermediate_cache
 
-    return _gluon_mxfp_ragged_matmul(
+    return gluon_mxfp_ragged_matmul(
         gemm2_input,
         w2_weight,
         w2_bias,
@@ -5815,3 +5765,142 @@ def default_route(
     ragged_metadata = make_ragged_tensor_metadata(mask_metadata.col_sum, n_total_rows)
 
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
+
+
+@triton.jit
+def _fp8_quantize_kernel(
+    x_ptr,
+    out_ptr,
+    scale,
+    M,
+    N,
+    x_row_stride,
+    out_row_stride,
+    BLOCK_N: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    HAS_SCALE_TENSOR: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    m_idx = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_idx < M
+    n_idx = tl.arange(0, BLOCK_N)
+
+    if EVEN_N:
+        load_mask = m_mask[:, None]
+    else:
+        load_mask = m_mask[:, None] & (n_idx[None, :] < N)
+
+    x_off = m_idx[:, None] * x_row_stride + n_idx[None, :]
+    x = tl.load(x_ptr + x_off, mask=load_mask)
+
+    x = x.to(tl.float32)
+    if HAS_SCALE:
+        if HAS_SCALE_TENSOR:
+            scale = tl.load(scale)
+        x = x * (1.0 / scale)
+    x_fp8 = x.to(FP8_DTYPE)
+
+    out_off = m_idx[:, None] * out_row_stride + n_idx[None, :]
+    tl.store(out_ptr + out_off, x_fp8, mask=load_mask)
+
+
+def _flatten_to_2d(x: torch.Tensor):
+    assert x.stride(-1) == 1, f"expected stride-1 inner dim, got stride={x.stride(-1)}"
+    N = x.shape[-1]
+    if x.ndim == 1:
+        return 1, N, N
+    M = x.numel() // N
+    row_stride = x.stride(-2)
+    # Validate that every leading dim packs onto the next.
+    for d in range(x.ndim - 2):
+        expected = x.shape[d + 1] * x.stride(d + 1)
+        if x.stride(d) != expected:
+            raise ValueError(
+                f"cannot flatten dim {d}: stride={x.stride(d)} but expected "
+                f"shape[{d+1}]*stride[{d+1}]={expected}. Tensor shape={tuple(x.shape)}, "
+                f"stride={tuple(x.stride())}."
+            )
+    return M, N, row_stride
+
+
+def fp8_quantize(
+    x: torch.Tensor,
+    scale: float | torch.Tensor | None = None,
+    out: Optional[torch.Tensor] = None,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    assert x.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ), f"fp8_quantize input must be bf16/fp16, got {x.dtype}"
+    assert fp8_dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+    ), f"fp8_quantize unsupported fp8 dtype: {fp8_dtype}"
+    has_scale = scale is not None
+    has_scale_tensor = isinstance(scale, torch.Tensor)
+    if has_scale_tensor:
+        assert scale.numel() == 1, "scale tensor must be scalar"
+        scale = scale.contiguous()
+
+    M, N, x_row_stride = _flatten_to_2d(x)
+
+    if out is None:
+        out = torch.empty(x.shape, dtype=fp8_dtype, device=x.device)
+    else:
+        assert out.shape == x.shape and out.dtype == fp8_dtype
+    out_M, _, out_row_stride = _flatten_to_2d(out)
+    assert out_M == M
+
+    if fp8_dtype is torch.float8_e4m3fn:
+        fp8_dtype_const = tl.float8e4nv
+    elif fp8_dtype is torch.float8_e5m2:
+        fp8_dtype_const = tl.float8e5
+    else:
+        fp8_dtype_const = tl.float8e4b8
+
+    if M <= 2048:
+        block_m = 4
+    elif M <= 16384:
+        block_m = 16
+    else:
+        block_m = 32
+    num_warps = 4
+    num_stages = 2
+
+    grid = (triton.cdiv(M, block_m),)
+
+    block_n = max(1, triton.next_power_of_2(N))
+    even_n = block_n == N
+
+    _fp8_quantize_kernel[grid](
+        x,
+        out,
+        1.0 if scale is None else scale,
+        M,
+        N,
+        x_row_stride,
+        out_row_stride,
+        BLOCK_N=block_n,
+        EVEN_N=even_n,
+        FP8_DTYPE=fp8_dtype_const,
+        BLOCK_M=block_m,
+        HAS_SCALE=has_scale,
+        HAS_SCALE_TENSOR=has_scale_tensor,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
+__all__ = [
+    "gluon_mxfp_fused_moe",
+    "gluon_mxfp_ragged_matmul",
+    "gluon_mxfp_combine",
+    "gluon_mxfp_dispatch_swiglu",
+    "gluon_fused_route",
+]

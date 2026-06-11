@@ -91,7 +91,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 
 
 if platform.is_amd:
-    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import _gluon_mxfp_fused_moe
+    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import gluon_mxfp_fused_moe
 
     @register_kernel(
         "moe",
@@ -216,20 +216,7 @@ if platform.is_amd:
         swiglu_alpha = swiglu_arg.alpha if swiglu_arg else 1.702
         swiglu_limit = swiglu_arg.limit if swiglu_arg else 7.0
 
-        # All of routing, dispatch GEMM (with fused SwiGLU + FP8 output
-        # quant) and combine GEMM are encapsulated by the registered
-        # ``gluon_mxfp4_fp8_fused_moe`` kernel.  The ``self_routing``
-        # feature + ``activation_dtype=fp8`` trait + (bf16/fp16 dense or
-        # FP8 per-tensor x, mxfp4 weight) signature uniquely select the
-        # gluon implementation on gfx950.  When ``hidden_states`` is
-        # already FP8 (e.g. fused into an upstream layer), advertise the
-        # per-tensor FP8 input so the matching signature is built.
-        is_fp8_input = x.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        )
-
-        return _gluon_mxfp_fused_moe(
+        return gluon_mxfp_fused_moe(
             x,
             router_logits,
             w.w13_weight_triton_tensor,
