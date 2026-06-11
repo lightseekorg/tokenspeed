@@ -79,6 +79,11 @@ dependencies = [
     "viztracer",
 ]
 
+[project.optional-dependencies]
+# Optional, NVIDIA-only accelerator for `--load-format instanttensor`. Kept out
+# of the core runtime dependencies so the base install stays vendor-neutral.
+instanttensor = ["instanttensor>=0.1.9"]
+
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
