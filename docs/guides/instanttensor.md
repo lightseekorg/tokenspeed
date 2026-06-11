@@ -12,18 +12,10 @@ default safetensors loader, so model accuracy is unaffected.
 
 ## Installation
 
-InstantTensor is an optional, NVIDIA-only dependency and is not part of the
-core install. Install it explicitly:
-
-```bash
-pip install instanttensor
-```
-
-or via the extra:
-
-```bash
-pip install "tokenspeed[instanttensor]"
-```
+InstantTensor ships as a dependency of TokenSpeed, so a normal install already
+includes it — no extra step is needed. It is a CUDA-only package and is
+imported lazily, so it is only loaded when you actually select
+`--load-format instanttensor` on an NVIDIA GPU.
 
 ## Usage
 
