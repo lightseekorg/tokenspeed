@@ -53,6 +53,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_hca_tiled_compress_cache_insert as _triton_hca_tiled_compress_cache_insert,
+)
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_paged_compressed_slot_mapping,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -833,10 +836,12 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     rms_norm_eps: float,
     cos_sin_cache: torch.Tensor,
     kv_cache_2d: torch.Tensor,
-    kv_slot_mapping: torch.Tensor,
+    kv_slot_mapping: torch.Tensor | None,
     kv_cache_block_size: int,
     compress_ratio: int = 128,
     block_table_base_offsets: torch.Tensor | None = None,
+    kv_block_table: torch.Tensor | None = None,
+    kv_block_table_base_offsets: torch.Tensor | None = None,
     compact_rows: int | None = None,
 ) -> None:
     """Compress HCA state, normalize/RoPE/FP8-quantize, and insert KV cache.
@@ -875,14 +880,43 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     num_actual = min(
         compressor_slot_mapping.numel(),
         positions.numel(),
-        kv_slot_mapping.numel(),
     )
+    if kv_slot_mapping is not None:
+        num_actual = min(num_actual, kv_slot_mapping.numel())
     if num_actual == 0:
         return
     if not state_cache.is_cuda:
         raise ValueError(
             "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA tensors."
         )
+    if kv_slot_mapping is None and kv_block_table is None:
+        raise ValueError("HCA cache insert requires kv_slot_mapping or kv_block_table")
+
+    use_tiled_insert = (
+        compact_rows is not None and not torch.cuda.is_current_stream_capturing()
+    )
+    if use_tiled_insert:
+        _triton_hca_tiled_compress_cache_insert(
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            compressor_slot_mapping=compressor_slot_mapping,
+            state_block_table=block_table,
+            compressor_block_size=compressor_block_size,
+            rms_norm_weight=rms_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache_2d=kv_cache_2d,
+            kv_slot_mapping=kv_slot_mapping,
+            kv_cache_block_size=kv_cache_block_size,
+            block_table_base_offsets=block_table_base_offsets,
+            kv_block_table=kv_block_table,
+            kv_block_table_base_offsets=kv_block_table_base_offsets,
+            compact_rows=compact_rows,
+        )
+        return
+    if kv_slot_mapping is None:
+        raise RuntimeError("HCA fused fallback requires a dense kv_slot_mapping")
 
     _triton_fused_sparse_compress_cache_insert(
         state_cache=state_cache,

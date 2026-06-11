@@ -598,6 +598,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             dtype=torch.uint8,
         )
         compact_cache = torch.zeros_like(cache)
+        direct_compact_cache = torch.zeros_like(cache)
 
         deepseek_v4_hca_compress_kv_cache_insert(
             state_cache=state_cache,
@@ -630,6 +631,23 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             compress_ratio=compress_ratio,
             compact_rows=1,
         )
+        deepseek_v4_hca_compress_kv_cache_insert(
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            compressor_slot_mapping=state_slots,
+            block_table=block_table,
+            compressor_block_size=state_block_size,
+            rms_norm_weight=rms_weight,
+            rms_norm_eps=eps,
+            cos_sin_cache=cos_sin,
+            kv_cache_2d=direct_compact_cache,
+            kv_slot_mapping=None,
+            kv_cache_block_size=kv_cache_block_size,
+            compress_ratio=compress_ratio,
+            kv_block_table=block_table,
+            compact_rows=1,
+        )
 
         weights = torch.softmax(score.float() + ape, dim=0)
         compressed = torch.sum(kv.float() * weights, dim=0)
@@ -646,7 +664,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             .view(torch.uint8)
         )
 
-        for tested_cache in (cache, compact_cache):
+        for tested_cache in (cache, compact_cache, direct_compact_cache):
             flat_cache = tested_cache.view(-1)
             scale_base = kv_cache_block_size * SWA_TOKEN_STRIDE
             for qblock in range(7):

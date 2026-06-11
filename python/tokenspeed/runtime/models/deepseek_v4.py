@@ -276,6 +276,22 @@ def _deepseek_v4_prefill_boundary_rows(
     return max(0, rows)
 
 
+def _deepseek_v4_hca_compact_row_bound(
+    prefill_rows: int | None,
+    decode_tokens: int,
+    include_decode_tokens: bool,
+) -> int | None:
+    if prefill_rows is None:
+        return None
+    compact_rows = prefill_rows
+    if include_decode_tokens:
+        # Decode tokens may contain at most one HCA boundary row each. Use this
+        # as a compact-buffer upper bound; the kernel still filters exact
+        # boundary positions before materializing rows.
+        compact_rows += max(0, int(decode_tokens))
+    return compact_rows
+
+
 def _deepseek_v4_forward_metadata(ctx: ForwardContext):
     metadata = getattr(ctx.attn_backend, "forward_metadata", None)
     if ctx.forward_mode == ForwardMode.EXTEND:
@@ -3036,14 +3052,18 @@ class DeepseekV4Compressor(nn.Module):
             if hasattr(metadata, "decode_token_count")
             else 0
         )
-        hca_boundary_rows = (
-            _deepseek_v4_prefill_boundary_rows(metadata, self.compress_ratio)
-            if write_compressed_cache
-            and self.compress_ratio == 128
-            and not self.overlap
-            and decode_tokens == 0
-            else None
-        )
+        hca_boundary_rows: int | None = None
+        hca_compact_rows: int | None = None
+        if write_compressed_cache and self.compress_ratio == 128 and not self.overlap:
+            hca_boundary_rows = _deepseek_v4_prefill_boundary_rows(
+                metadata,
+                self.compress_ratio,
+            )
+            hca_compact_rows = _deepseek_v4_hca_compact_row_bound(
+                hca_boundary_rows,
+                decode_tokens,
+                ctx.forward_mode is not None and ctx.forward_mode.is_mixed(),
+            )
         if kv_score is None:
             tic = _deepseek_v4_phase_start(timing_enabled)
             with nvtx_range(f"{profile_prefix}_dequant_weight"):
@@ -3167,67 +3187,104 @@ class DeepseekV4Compressor(nn.Module):
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
         use_decode_cache = ctx.forward_mode is not None and ctx.forward_mode.is_decode()
-        compressed_key = (
-            "compressed",
-            self.compress_ratio,
-            kv_cache_block_size,
-            use_decode_cache,
+        hca_direct_slots = (
+            self.compress_ratio == 128
+            and hca_boundary_rows is not None
+            and decode_tokens == 0
         )
-        compressed_hit = memo.get(compressed_key) if memo is not None else None
-        compressed_slot_cache_hit = compressed_hit is not None
-        if compressed_hit is not None:
-            compressed_slots = compressed_hit
-        else:
-            tic = _deepseek_v4_phase_start(timing_enabled)
-            with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
-                compressed_slots = cache_metadata.compressed_slot_mapping(
-                    positions,
-                    self.compress_ratio,
-                    token_to_req_indices=metadata.token_to_req_indices[
-                        : positions.numel()
-                    ],
-                    query_start_loc=metadata.query_start_loc,
-                    seq_lens=metadata.seq_lens,
-                    kv_cache_block_size=kv_cache_block_size,
-                    use_decode_cache=use_decode_cache,
-                    is_valid_token=valid_token,
+        compressed_slots: torch.Tensor | None = None
+        compressed_slot_cache_hit = False
+        compressed_kv_block_table: torch.Tensor | None = None
+        compressed_kv_base_offsets: torch.Tensor | None = None
+        if hca_direct_slots:
+            compressed_kv_block_table = cache_metadata.compressed_block_table(
+                self.compress_ratio,
+                kv_cache_block_size,
+            )
+            compressed_kv_base_offsets = (
+                cache_metadata.paged_cache_block_table_base_offsets.get(
+                    v4_compressed_kv_group_id(self.compress_ratio)
                 )
-            if memo is not None:
-                memo[compressed_key] = compressed_slots
-            _deepseek_v4_phase_done(phase_wall_ms, "compressed_slot_mapping", tic)
+            )
+        else:
+            compressed_key = (
+                "compressed",
+                self.compress_ratio,
+                kv_cache_block_size,
+                use_decode_cache,
+            )
+            compressed_hit = memo.get(compressed_key) if memo is not None else None
+            compressed_slot_cache_hit = compressed_hit is not None
+            if compressed_hit is not None:
+                compressed_slots = compressed_hit
+            else:
+                tic = _deepseek_v4_phase_start(timing_enabled)
+                with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
+                    compressed_slots = cache_metadata.compressed_slot_mapping(
+                        positions,
+                        self.compress_ratio,
+                        token_to_req_indices=metadata.token_to_req_indices[
+                            : positions.numel()
+                        ],
+                        query_start_loc=metadata.query_start_loc,
+                        seq_lens=metadata.seq_lens,
+                        kv_cache_block_size=kv_cache_block_size,
+                        use_decode_cache=use_decode_cache,
+                        is_valid_token=valid_token,
+                    )
+                if memo is not None:
+                    memo[compressed_key] = compressed_slots
+                _deepseek_v4_phase_done(phase_wall_ms, "compressed_slot_mapping", tic)
         tic = _deepseek_v4_phase_start(timing_enabled)
         kv_cache_2d = pool.get_compressed_kv_buffer_2d(layer_index)
         _deepseek_v4_phase_done(phase_wall_ms, "get_compressed_kv_buffer", tic)
         tic = _deepseek_v4_phase_start(timing_enabled)
         cuda_pair = _deepseek_v4_cuda_event_start(timing_enabled, positions.device)
         with nvtx_range(f"{profile_prefix}_cache_insert"):
-            insert = (
-                deepseek_v4_csa_compress_kv_cache_insert
-                if self.compress_ratio == 4
-                else deepseek_v4_hca_compress_kv_cache_insert
-            )
-            compact_rows = (
-                hca_boundary_rows
-                if self.compress_ratio == 128 and hca_boundary_rows is not None
-                else None
-            )
-            insert(
-                state_cache=state_cache,
-                token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
-                positions=positions,
-                compressor_slot_mapping=state_slot_mapping,
-                block_table=state_block_table,
-                block_table_base_offsets=state_base_logical_page,
-                compressor_block_size=state_block_size,
-                rms_norm_weight=self.norm.weight,
-                rms_norm_eps=self.norm.variance_epsilon,
-                cos_sin_cache=cos_sin_cache,
-                kv_cache_2d=kv_cache_2d,
-                kv_slot_mapping=compressed_slots,
-                kv_cache_block_size=kv_cache_block_size,
-                compress_ratio=self.compress_ratio,
-                compact_rows=compact_rows,
-            )
+            compact_rows = hca_compact_rows
+            if self.compress_ratio == 128:
+                deepseek_v4_hca_compress_kv_cache_insert(
+                    state_cache=state_cache,
+                    token_to_req_indices=metadata.token_to_req_indices[
+                        : positions.numel()
+                    ],
+                    positions=positions,
+                    compressor_slot_mapping=state_slot_mapping,
+                    block_table=state_block_table,
+                    block_table_base_offsets=state_base_logical_page,
+                    compressor_block_size=state_block_size,
+                    rms_norm_weight=self.norm.weight,
+                    rms_norm_eps=self.norm.variance_epsilon,
+                    cos_sin_cache=cos_sin_cache,
+                    kv_cache_2d=kv_cache_2d,
+                    kv_slot_mapping=compressed_slots,
+                    kv_cache_block_size=kv_cache_block_size,
+                    compress_ratio=self.compress_ratio,
+                    kv_block_table=compressed_kv_block_table,
+                    kv_block_table_base_offsets=compressed_kv_base_offsets,
+                    compact_rows=compact_rows,
+                )
+            else:
+                assert compressed_slots is not None
+                deepseek_v4_csa_compress_kv_cache_insert(
+                    state_cache=state_cache,
+                    token_to_req_indices=metadata.token_to_req_indices[
+                        : positions.numel()
+                    ],
+                    positions=positions,
+                    compressor_slot_mapping=state_slot_mapping,
+                    block_table=state_block_table,
+                    block_table_base_offsets=state_base_logical_page,
+                    compressor_block_size=state_block_size,
+                    rms_norm_weight=self.norm.weight,
+                    rms_norm_eps=self.norm.variance_epsilon,
+                    cos_sin_cache=cos_sin_cache,
+                    kv_cache_2d=kv_cache_2d,
+                    kv_slot_mapping=compressed_slots,
+                    kv_cache_block_size=kv_cache_block_size,
+                    compress_ratio=self.compress_ratio,
+                    compact_rows=compact_rows,
+                )
         _deepseek_v4_cuda_event_done(
             cuda_events, "cache_insert", cuda_pair, positions.device
         )

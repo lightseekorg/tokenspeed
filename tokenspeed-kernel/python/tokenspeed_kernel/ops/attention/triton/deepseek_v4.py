@@ -51,6 +51,7 @@ __all__ = [
     "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
     "deepseek_v4_fused_sparse_compress_cache_insert",
     "deepseek_v4_gather_indexer_mxfp4_cache",
+    "deepseek_v4_hca_tiled_compress_cache_insert",
     "deepseek_v4_indexer_decode_metadata_compute",
     "deepseek_v4_save_compressor_state",
     "write_deepseek_v4_indexer_mxfp4_cache_cuda",
@@ -426,6 +427,410 @@ def _deepseek_v4_compact_hca_boundary_tokens_kernel(
         row = tl.atomic_add(count_ptr, 1, sem="relaxed")
         if row < MAX_ROWS:
             tl.store(token_indices_ptr + row, token_idx)
+
+
+@triton.jit
+def _deepseek_v4_compact_hca_boundary_slots_kernel(
+    positions_ptr,
+    token_to_req_indices_ptr,
+    state_slot_mapping_ptr,
+    kv_slot_mapping_ptr,
+    kv_block_table_ptr,
+    kv_block_table_base_offsets_ptr,
+    token_indices_ptr,
+    compact_kv_slots_ptr,
+    count_ptr,
+    kv_block_table_stride,
+    kv_block_table_rows: tl.constexpr,
+    kv_block_table_cols: tl.constexpr,
+    kv_cache_block_size,
+    COMPRESS_RATIO: tl.constexpr,
+    MAX_ROWS: tl.constexpr,
+    USE_KV_SLOT_MAPPING: tl.constexpr,
+    HAS_KV_BASE_OFFSETS: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    position = tl.load(positions_ptr + token_idx)
+    state_slot = tl.load(state_slot_mapping_ptr + token_idx)
+    boundary = ((position + 1) % COMPRESS_RATIO) == 0
+    keep = (state_slot >= 0) & boundary
+
+    if USE_KV_SLOT_MAPPING:
+        kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
+        keep = keep & (kv_slot >= 0)
+    else:
+        req_idx = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int64)
+        valid_req = (req_idx >= 0) & (req_idx < kv_block_table_rows)
+        compressed_pos = position // COMPRESS_RATIO
+        page_index = compressed_pos // kv_cache_block_size
+        if HAS_KV_BASE_OFFSETS:
+            safe_req_for_base = tl.maximum(
+                tl.minimum(req_idx, kv_block_table_rows - 1), 0
+            )
+            base_offset = tl.load(
+                kv_block_table_base_offsets_ptr + safe_req_for_base,
+                mask=valid_req,
+                other=0,
+            ).to(tl.int64)
+            page_index = page_index - base_offset
+        valid_page = (page_index >= 0) & (page_index < kv_block_table_cols)
+        safe_req = tl.maximum(tl.minimum(req_idx, kv_block_table_rows - 1), 0)
+        safe_page = tl.maximum(tl.minimum(page_index, kv_block_table_cols - 1), 0)
+        page_id = tl.load(
+            kv_block_table_ptr + safe_req * kv_block_table_stride + safe_page,
+            mask=valid_req & valid_page,
+            other=-1,
+        ).to(tl.int64)
+        keep = keep & valid_req & valid_page & (page_id >= 0)
+        kv_slot = page_id * kv_cache_block_size + (compressed_pos % kv_cache_block_size)
+
+    if keep:
+        row = tl.atomic_add(count_ptr, 1, sem="relaxed")
+        if row < MAX_ROWS:
+            tl.store(token_indices_ptr + row, token_idx)
+            tl.store(compact_kv_slots_ptr + row, kv_slot)
+
+
+@triton.jit
+def _deepseek_v4_hca_tiled_compress_stage1_kernel(
+    token_indices_ptr,
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    token_to_req_indices_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    block_table_ptr,
+    block_table_base_offsets_ptr,
+    block_table_stride,
+    block_table_width: tl.constexpr,
+    state_block_size,
+    tmp_ptr,
+    partial_sumsq_ptr,
+    HEAD_SIZE: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    N_DIM_BLOCKS: tl.constexpr,
+    USE_COMPACT: tl.constexpr,
+    HAS_BASE_OFFSETS: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    dim_block = tl.program_id(1)
+    if USE_COMPACT:
+        token_idx = tl.load(token_indices_ptr + row_idx)
+        if token_idx < 0:
+            return
+    else:
+        token_idx = row_idx
+
+    state_slot = tl.load(slot_mapping_ptr + token_idx)
+    if state_slot < 0:
+        return
+
+    position = tl.load(positions_ptr + token_idx)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    if HAS_BASE_OFFSETS:
+        base_logical_page = tl.load(block_table_base_offsets_ptr + req_idx)
+    else:
+        base_logical_page = tl.full((), 0, tl.int32)
+
+    tokens = tl.arange(0, COMPRESS_RATIO)
+    pos = position - COMPRESS_RATIO + 1 + tokens
+    valid_pos = pos >= 0
+    table_idx = pos // state_block_size - base_logical_page
+    valid_pos = valid_pos & (table_idx >= 0) & (table_idx < block_table_width)
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + table_idx,
+        mask=valid_pos,
+        other=-1,
+    ).to(tl.int64)
+    pos_in_block = pos % state_block_size
+
+    dim_offsets = dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    dim_mask = dim_offsets < HEAD_SIZE
+    row_base = (
+        state_cache_ptr
+        + block_numbers[:, None] * state_cache_stride0
+        + pos_in_block[:, None] * state_cache_stride1
+    )
+    combined_mask = (
+        valid_pos[:, None] & (block_numbers[:, None] >= 0) & dim_mask[None, :]
+    )
+    score = tl.load(
+        row_base + STATE_WIDTH + dim_offsets[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
+    )
+    score = tl.softmax(score, dim=0)
+    kv = tl.load(
+        row_base + dim_offsets[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
+    compressed = tl.sum(kv * score, axis=0)
+    tl.store(
+        tmp_ptr + row_idx * HEAD_SIZE + dim_offsets,
+        compressed,
+        mask=dim_mask,
+    )
+    partial = tl.sum(compressed * compressed, axis=0)
+    tl.store(partial_sumsq_ptr + row_idx * N_DIM_BLOCKS + dim_block, partial)
+
+
+@triton.jit
+def _deepseek_v4_hca_tiled_compress_stage2_kernel(
+    token_indices_ptr,
+    compact_kv_slots_ptr,
+    token_to_req_indices_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    kv_slot_mapping_ptr,
+    tmp_ptr,
+    partial_sumsq_ptr,
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    N_DIM_BLOCKS: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    USE_COMPACT: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    dim_block = tl.program_id(1)
+    if USE_COMPACT:
+        token_idx = tl.load(token_indices_ptr + row_idx)
+        kv_slot = tl.load(compact_kv_slots_ptr + row_idx)
+        if (token_idx < 0) | (kv_slot < 0):
+            return
+    else:
+        token_idx = row_idx
+        kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
+        if kv_slot < 0:
+            return
+
+    state_slot = tl.load(slot_mapping_ptr + token_idx)
+    if state_slot < 0:
+        return
+
+    position = tl.load(positions_ptr + token_idx)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+
+    sum_offsets = tl.arange(0, N_DIM_BLOCKS)
+    sumsq = tl.load(partial_sumsq_ptr + row_idx * N_DIM_BLOCKS + sum_offsets)
+    inv_rms = tl.rsqrt(tl.sum(sumsq, axis=0) / HEAD_SIZE + rms_norm_eps)
+
+    dim_offsets = dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    dim_mask = dim_offsets < HEAD_SIZE
+    compressed = tl.load(
+        tmp_ptr + row_idx * HEAD_SIZE + dim_offsets,
+        mask=dim_mask,
+        other=0.0,
+    )
+    rms_w = tl.load(rms_norm_weight_ptr + dim_offsets, mask=dim_mask, other=0.0)
+    normed = compressed * inv_rms * rms_w
+
+    kv_block = kv_slot // kv_cache_block_size
+    kv_pos = kv_slot % kv_cache_block_size
+    cache_block_ptr = k_cache_ptr + kv_block.to(tl.int64) * KV_BLOCK_STRIDE
+    fp8_ptr = cache_block_ptr + kv_pos * TOKEN_STRIDE
+    scale_ptr = (
+        cache_block_ptr + kv_cache_block_size * TOKEN_STRIDE + kv_pos * SCALE_DIM
+    )
+
+    NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
+    N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK
+    INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
+
+    if dim_block < N_NOPE_BLOCKS:
+        quant_input = normed.to(tl.bfloat16).to(tl.float32)
+        block_absmax = tl.max(tl.abs(quant_input), axis=0)
+        block_absmax = tl.maximum(block_absmax, 1.0e-4)
+        exponent = tl.ceil(tl.log2(block_absmax * INV_FP8_MAX))
+        inv_scale = tl.exp2(-exponent)
+        x_scaled = quant_input * inv_scale
+        x_fp8 = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+        tl.store(fp8_ptr + dim_offsets, x_uint8, mask=dim_offsets < NOPE_HEAD_DIM)
+        encoded = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0)
+        tl.store(scale_ptr + dim_block, encoded.to(tl.uint8))
+    else:
+        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+        NUM_PAIRS: tl.constexpr = BLOCK_DIM // 2
+        HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
+        pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+        even, odd = tl.split(pair_2d)
+        pair_idx = tl.arange(0, NUM_PAIRS)
+        compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+        cs_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+        rope_mask = pair_idx < HALF_ROPE
+        cos_v = tl.load(cs_base + pair_idx, mask=rope_mask, other=1.0)
+        sin_v = tl.load(cs_base + HALF_ROPE + pair_idx, mask=rope_mask, other=0.0)
+        new_even = even * cos_v - odd * sin_v
+        new_odd = odd * cos_v + even * sin_v
+        rotated = tl.interleave(new_even, new_odd)
+        rope_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+        rope_offsets = dim_offsets - NOPE_HEAD_DIM
+        tl.store(
+            rope_ptr + rope_offsets,
+            rotated.to(tl.bfloat16),
+            mask=(dim_offsets >= NOPE_HEAD_DIM) & dim_mask,
+        )
+
+
+def deepseek_v4_hca_tiled_compress_cache_insert(
+    *,
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    compressor_slot_mapping: torch.Tensor,
+    state_block_table: torch.Tensor,
+    compressor_block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    kv_slot_mapping: torch.Tensor | None,
+    kv_cache_block_size: int,
+    block_table_base_offsets: torch.Tensor | None = None,
+    kv_block_table: torch.Tensor | None = None,
+    kv_block_table_base_offsets: torch.Tensor | None = None,
+    compact_rows: int | None = None,
+) -> None:
+    num_actual = min(compressor_slot_mapping.numel(), positions.numel())
+    if kv_slot_mapping is not None:
+        num_actual = min(num_actual, kv_slot_mapping.numel())
+    if num_actual == 0:
+        return
+    use_compact = (
+        compact_rows is not None
+        and int(compact_rows) >= 0
+        and int(compact_rows) < num_actual
+    )
+    if use_compact:
+        rows = int(compact_rows)
+        if rows == 0:
+            return
+        token_indices = torch.empty((rows,), device=positions.device, dtype=torch.int32)
+        token_indices.fill_(-1)
+        compact_kv_slots = torch.empty(
+            (rows,), device=positions.device, dtype=torch.int64
+        )
+        compact_kv_slots.fill_(-1)
+        compact_count = torch.empty((1,), device=positions.device, dtype=torch.int32)
+        compact_count.zero_()
+        use_kv_slot_mapping = kv_slot_mapping is not None
+        if not use_kv_slot_mapping and kv_block_table is None:
+            raise ValueError(
+                "HCA compact insert requires kv_slot_mapping or kv_block_table"
+            )
+        kv_table = kv_block_table if kv_block_table is not None else state_block_table
+        _deepseek_v4_compact_hca_boundary_slots_kernel[(num_actual,)](
+            positions[:num_actual],
+            token_to_req_indices[:num_actual],
+            compressor_slot_mapping[:num_actual],
+            kv_slot_mapping[:num_actual] if kv_slot_mapping is not None else None,
+            kv_table,
+            (
+                kv_block_table_base_offsets.to(torch.int32)
+                if kv_block_table_base_offsets is not None
+                else None
+            ),
+            token_indices,
+            compact_kv_slots,
+            compact_count,
+            kv_table.stride(0),
+            kv_table.shape[0],
+            kv_table.shape[-1],
+            kv_cache_block_size,
+            COMPRESS_RATIO=128,
+            MAX_ROWS=rows,
+            USE_KV_SLOT_MAPPING=use_kv_slot_mapping,
+            HAS_KV_BASE_OFFSETS=kv_block_table_base_offsets is not None,
+            num_warps=4,
+        )
+    else:
+        rows = num_actual
+        token_indices = None
+        compact_kv_slots = None
+        if kv_slot_mapping is None:
+            raise ValueError("HCA dense insert requires kv_slot_mapping")
+
+    tmp = torch.empty(
+        (rows, DEEPSEEK_V4_HEAD_DIM), device=positions.device, dtype=torch.float32
+    )
+    partial_sumsq = torch.empty((rows, 8), device=positions.device, dtype=torch.float32)
+    use_compact_const = token_indices is not None
+    _deepseek_v4_hca_tiled_compress_stage1_kernel[(rows, 8)](
+        token_indices,
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        token_to_req_indices[:num_actual],
+        positions[:num_actual],
+        compressor_slot_mapping[:num_actual],
+        state_block_table,
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
+        state_block_table.stride(0),
+        state_block_table.shape[-1],
+        compressor_block_size,
+        tmp,
+        partial_sumsq,
+        HEAD_SIZE=DEEPSEEK_V4_HEAD_DIM,
+        STATE_WIDTH=state_cache.shape[-1] // 2,
+        COMPRESS_RATIO=128,
+        BLOCK_DIM=64,
+        N_DIM_BLOCKS=8,
+        USE_COMPACT=use_compact_const,
+        HAS_BASE_OFFSETS=block_table_base_offsets is not None,
+        num_warps=4,
+    )
+    _deepseek_v4_hca_tiled_compress_stage2_kernel[(rows, 8)](
+        token_indices,
+        compact_kv_slots,
+        token_to_req_indices[:num_actual],
+        positions[:num_actual],
+        compressor_slot_mapping[:num_actual],
+        kv_slot_mapping[:num_actual] if kv_slot_mapping is not None else None,
+        tmp,
+        partial_sumsq,
+        rms_norm_weight,
+        rms_norm_eps,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        kv_cache_2d,
+        kv_cache_block_size,
+        HEAD_SIZE=DEEPSEEK_V4_HEAD_DIM,
+        COMPRESS_RATIO=128,
+        ROPE_HEAD_DIM=DEEPSEEK_V4_ROPE_DIM,
+        FP8_MAX=DEEPSEEK_V4_FP8_MAX,
+        QUANT_BLOCK=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        BLOCK_DIM=64,
+        N_DIM_BLOCKS=8,
+        TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
+        KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
+        USE_COMPACT=use_compact_const,
+        num_warps=4,
+    )
 
 
 def deepseek_v4_fused_sparse_compress_cache_insert(

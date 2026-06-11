@@ -93,6 +93,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4MoEGate,
     _deepseek_v4_forward_metadata,
     _deepseek_v4_fused_select_experts,
+    _deepseek_v4_hca_compact_row_bound,
     _deepseek_v4_indexer_decode_max_len,
     _deepseek_v4_indexer_decode_plan,
     _deepseek_v4_indexer_prefill_max_logits_bytes,
@@ -317,6 +318,32 @@ class TestDeepseekV4Config(unittest.TestCase):
                 has_drafter=True, use_target_verify=True
             ),
             ForwardMode.TARGET_VERIFY,
+        )
+
+    def test_deepseek_v4_hca_compact_row_bound_includes_mixed_decode_tokens(self):
+        self.assertEqual(
+            _deepseek_v4_hca_compact_row_bound(
+                prefill_rows=3,
+                decode_tokens=0,
+                include_decode_tokens=False,
+            ),
+            3,
+        )
+        self.assertEqual(
+            _deepseek_v4_hca_compact_row_bound(
+                prefill_rows=3,
+                decode_tokens=2,
+                include_decode_tokens=True,
+            ),
+            5,
+        )
+        self.assertEqual(
+            _deepseek_v4_hca_compact_row_bound(
+                prefill_rows=None,
+                decode_tokens=1,
+                include_decode_tokens=True,
+            ),
+            None,
         )
 
     def test_model_runner_forwards_supported_spec_step_idx(self):
