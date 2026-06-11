@@ -138,6 +138,24 @@ class CommManager:
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )
 
+    def gather_residual(self, residual: torch.Tensor, ctx: ForwardContext):
+        """All-gather a residual left scattered by the previous layer's RSAG
+        path (e.g. for aux hidden capture); no-op when rows are already full.
+
+        Mirrors the pre_attn_comm gather conditions.
+        """
+        if self.layer_id == 0:
+            return residual
+        if not self.mapping.has_attn_tp:
+            return residual
+        if self.use_all_reduce(self.prev_is_moe):
+            return residual
+        return token_all_gather(
+            residual,
+            group=self.mapping.attn.tp_group,
+            scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
+        )
+
     def post_attn_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
