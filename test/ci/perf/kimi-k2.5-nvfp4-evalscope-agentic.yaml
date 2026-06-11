@@ -17,6 +17,7 @@ install:
 server:
   command: >-
     ts serve
+    --load-format instanttensor
     --model nvidia/Kimi-K2.5-NVFP4
     --attn-tp-size 4
     --moe-tp-size 4
