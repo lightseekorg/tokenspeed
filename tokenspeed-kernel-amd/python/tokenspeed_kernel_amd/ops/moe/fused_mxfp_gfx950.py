@@ -4843,11 +4843,20 @@ def _gluon_mxfp_fused_moe(
     # Decode-small GPT-OSS routing is launch-overhead dominated. Prefer the
     # single-kernel Gluon route for the M<=16 single-block-collapse regime;
     # fall back to the generic Triton route for larger/unsupported shapes.
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = gluon_fused_route(
-        router_logits,
-        top_k,
-        dtype=router_logits.dtype,
-    )
+    if n_tokens <= SMALLM_MAX_M and gluon_route_supported(
+        router_logits, top_k, router_logits.dtype
+    ):
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = gluon_fused_route(
+            router_logits,
+            top_k,
+            dtype=router_logits.dtype,
+        )
+    else:
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = default_route(
+            router_logits,
+            top_k,
+            dtype=router_logits.dtype,
+        )
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
@@ -5782,7 +5791,6 @@ def gluon_fused_route(
 def default_route(
     logits: torch.Tensor,
     n_expts_act: int,
-    sm_first: bool = False,
     dtype: torch.dtype | None = None,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
     if dtype is None:
@@ -5791,8 +5799,7 @@ def default_route(
     assert logits.ndim == 2, "router_logits must be (n_tokens, n_expts_tot)"
     n_tokens, _ = logits.shape
 
-    assert sm_first is False, "sm_first=True not supported for triton_kernels routing"
-    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
+    sparse = topk(logits, n_expts_act, apply_softmax=True)
     mask_metadata = sparse.mask_metadata
 
     col_sorted = mask_metadata.col_sorted_indx
