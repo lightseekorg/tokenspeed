@@ -51,7 +51,7 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
         ),
         signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"unquant"})},
@@ -123,7 +123,7 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
         ),
         signatures=format_signatures(
             "x",
