@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.moe.utils import make_ragged_tensor_metadata, topk
 
 
 # Local copies from triton_kernels/matmul.py for the activation metadata
@@ -144,8 +145,6 @@ __all__ = [
     "GLUON_ROUTE_MAX_E",
     "GLUON_ROUTE_MAX_G",
     "gluon_fused_route",
-    "gluon_route_supported",
-    "gluon_decode_routing_gfx950",
 ]
 
 
@@ -4577,11 +4576,12 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
     top_k: int,
-    quantize_fp8_fn,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
 ) -> torch.Tensor | None:
     """Small-M direct warp-decode MoE for GPT-OSS FP8 x MXFP4 path."""
+    assert hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
     if hidden_states.ndim != 2 or router_logits.ndim != 2:
         return None
     n_tokens = int(router_logits.shape[0])
@@ -4630,10 +4630,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     )
 
     # Current GPT-OSS path uses FP8 E4M3 activations with per-tensor scale.
-    if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        x_fp8 = hidden_states
-    else:
-        x_fp8 = quantize_fp8_fn(hidden_states, scale=w13_act_scale, solution="triton")
+    x_fp8 = hidden_states
     # Pass the FP8 tensor straight to Gluon.  ``view(torch.uint8)`` materializes a
     # copy for float8 tensors on this stack and dominates small-M latency.
 
@@ -4783,9 +4780,6 @@ def _gluon_mxfp_fused_moe(
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
     top_k: int,
-    quantize_fp8_fn,
-    moe_experts_fn,
-    moe_route_fn,
     enable_warp_decode: bool = True,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
@@ -4806,10 +4800,10 @@ def _gluon_mxfp_fused_moe(
         top_k: routing top_k.
         swiglu_alpha / swiglu_limit: SwiGLU activation parameters.
 
-        quantize_fp8_fn, moe_experts_fn, moe_route_fn: Callbacks to supply
-            quantize_fp8, moe_experts, and moe_route logic.
         enable_warp_decode: Whether to try the gfx950 small-M warp-decode path.
     """
+    assert hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
     n_tokens = router_logits.shape[0]
 
     # Warp-decode small-M MoE is the fastest path for the M<=16 decode regime.
@@ -4829,7 +4823,6 @@ def _gluon_mxfp_fused_moe(
                 w13_act_scale=w13_act_scale,
                 w2_act_scale=w2_act_scale,
                 top_k=top_k,
-                quantize_fp8_fn=quantize_fp8_fn,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_limit=swiglu_limit,
             )
@@ -4850,21 +4843,10 @@ def _gluon_mxfp_fused_moe(
     # Decode-small GPT-OSS routing is launch-overhead dominated. Prefer the
     # single-kernel Gluon route for the M<=16 single-block-collapse regime;
     # fall back to the generic Triton route for larger/unsupported shapes.
-    route_expected_kernel = (
-        "gluon_decode_routing_gfx950"
-        if (
-            n_tokens <= SMALLM_MAX_M
-            and gluon_route_supported(router_logits, top_k, router_logits.dtype)
-        )
-        else "triton_kernels_routing"
-    )
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = moe_route_fn(
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = gluon_fused_route(
         router_logits,
         top_k,
-        sm_first=False,
         dtype=router_logits.dtype,
-        traits={"output_type": "ragged_metadata"},
-        expected_kernel_name=route_expected_kernel,
     )
 
     act = FusedActivation(
@@ -4872,18 +4854,9 @@ def _gluon_mxfp_fused_moe(
         (swiglu_alpha, swiglu_limit),
     )
 
-    if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        gemm1_input = hidden_states
-    else:
-        gemm1_input = quantize_fp8_fn(
-            hidden_states,
-            scale=w13_act_scale,
-            solution="triton",
-        )
+    gemm1_input = hidden_states
 
-    gluon_traits = {"weight_dtype": "mxfp4"}
-
-    intermediate_cache = moe_experts_fn(
+    intermediate_cache = _gluon_mxfp_ragged_matmul(
         gemm1_input,
         w13_weight,
         w13_bias,
@@ -4891,30 +4864,11 @@ def _gluon_mxfp_fused_moe(
         gather_indx=gather_indx,
         precision_config=w13_precision_config,
         fused_activation=act,
-        dtype=gemm1_input.dtype,
-        weight_format="mxfp4",
-        fp8_scale_granularity="tensor",
-        features={"ragged_metadata", "dispatch_gemm"},
-        traits=gluon_traits,
-        expected_kernel_name="gluon_dispatch_gemm",
-        out_quant_scale=w2_act_scale,
     )
 
-    # Skip the redundant quantise when the fused ``out_quant_scale``
-    # epilogue already wrote FP8.
-    if intermediate_cache.dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ):
-        gemm2_input = intermediate_cache
-    else:
-        gemm2_input = quantize_fp8_fn(
-            intermediate_cache,
-            scale=w2_act_scale,
-            solution="triton",
-        )
+    gemm2_input = intermediate_cache
 
-    return moe_experts_fn(
+    return _gluon_mxfp_ragged_matmul(
         gemm2_input,
         w2_weight,
         w2_bias,
@@ -4924,12 +4878,6 @@ def _gluon_mxfp_fused_moe(
         gammas=gate_scal,
         n_tokens=n_tokens,
         n_expts_act=top_k,
-        dtype=gemm2_input.dtype,
-        weight_format="mxfp4",
-        fp8_scale_granularity="tensor",
-        features={"ragged_metadata", "gemm_combine"},
-        traits=gluon_traits,
-        expected_kernel_name="gluon_gemm_combine",
     )
 
 
@@ -5831,24 +5779,32 @@ def gluon_fused_route(
     return _route_small_m(logits, topk, dtype)
 
 
-def gluon_decode_routing_gfx950(
+def default_route(
     logits: torch.Tensor,
     n_expts_act: int,
     sm_first: bool = False,
     dtype: torch.dtype | None = None,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """gfx950 small-M decode route implementation."""
     if dtype is None:
         dtype = logits.dtype
-    n_tokens = logits.shape[0]
-    if (
-        not sm_first
-        and n_tokens <= SMALLM_MAX_M
-        and gluon_route_supported(logits, n_expts_act, dtype)
-    ):
-        return gluon_fused_route(logits, n_expts_act, dtype=dtype)
 
-    raise ValueError(
-        "gluon_decode_routing_gfx950 only supports small-M gfx950 decode "
-        "routing shapes"
-    )
+    assert logits.ndim == 2, "router_logits must be (n_tokens, n_expts_tot)"
+    n_tokens, _ = logits.shape
+
+    assert sm_first is False, "sm_first=True not supported for triton_kernels routing"
+    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
+    mask_metadata = sparse.mask_metadata
+
+    col_sorted = mask_metadata.col_sorted_indx
+    gather_indx = col_sorted // n_expts_act
+    scatter_indx = col_sorted
+
+    vals_flat = sparse.vals.reshape(-1)
+    if dtype is not None and vals_flat.dtype != dtype:
+        vals_flat = vals_flat.to(dtype)
+    gate_scal = vals_flat[scatter_indx]
+
+    n_total_rows = n_tokens * n_expts_act
+    ragged_metadata = make_ragged_tensor_metadata(mask_metadata.col_sum, n_total_rows)
+
+    return ragged_metadata, gather_indx, scatter_indx, gate_scal
