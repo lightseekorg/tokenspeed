@@ -70,7 +70,7 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None or ctx.forward_mode.is_idle():
+        if ctx.accept_lengths is None:
             return super()._attn(q, k, v, gate, ctx, out_cache_loc)
 
         self._apply_correction(ctx)
