@@ -4452,7 +4452,7 @@ def gluon_mxfp_ragged_matmul(
     s_raw = _extract_gluon_raw_s(w_mx_scale)
 
     assert isinstance(w_raw, torch.Tensor) and isinstance(s_raw, torch.Tensor)
-    assert w_raw.ndim() == 3
+    assert w_raw.ndim == 3
 
     # Wrap bare tensors into ``.<attr>``-typed adapters; the launcher
     # consults gather_indx.src_indx / scatter_indx.dst_indx.
