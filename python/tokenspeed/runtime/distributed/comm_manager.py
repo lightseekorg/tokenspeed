@@ -97,7 +97,9 @@ class CommManager:
         global_counts = (
             ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
         )
-        if global_counts is not None:
+        # Without DP, all ranks share the batch and the scattered table needs
+        # no global metadata, so the lookup below stays valid.
+        if global_counts is not None or not self.mapping.attn.has_dp:
             # After post_attn_comm reduce-scatter, each rank holds its
             # scattered share of its attn dp group's tokens, not the raw
             # global count; MoE collectives must size from those rows.
@@ -106,6 +108,8 @@ class CommManager:
                 scattered[self.mapping.attn.scatter_index(rank)]
                 for rank in self.mapping.moe.tp_ep_group
             ]
+        # With DP but no gathered metadata, other dp groups' counts are
+        # unknown; only the local rank's contribution can be reported.
         num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
         result = [0] * tp_ep_size
         result[self.mapping.moe.tp_ep_rank] = num_tokens

@@ -81,7 +81,9 @@ def _group_scattered_num_tokens(
         return _scattered_num_tokens_all(ctx, mapping)[start:end]
     elif group_type == ParallelGroup.MOE_TP_EP:
         tp_ep_size = mapping.moe.tp_ep_size
-        if ctx.global_num_tokens is not None:
+        # Without DP, all ranks share the batch and the scattered table needs
+        # no global metadata, so the lookup below stays valid.
+        if ctx.global_num_tokens is not None or not mapping.attn.has_dp:
             # After the attention reduce-scatter, each rank holds its
             # scattered share of its attn dp group's tokens, not the raw
             # global count; MoE collectives must size from those rows.
@@ -90,6 +92,8 @@ def _group_scattered_num_tokens(
                 scattered[mapping.attn.scatter_index(rank)]
                 for rank in mapping.moe.tp_ep_group
             ]
+        # With DP but no gathered metadata, other dp groups' counts are
+        # unknown; only the local rank's contribution can be reported.
         result = [0] * tp_ep_size
         result[mapping.moe.tp_ep_rank] = ctx.input_num_tokens
         return result
