@@ -35,7 +35,24 @@ import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
+
+# MoE
+import tokenspeed_kernel.ops.moe as _moe_pkg
+import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
+import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
+import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
+)
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
+from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
+from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import FormatSignature
@@ -48,6 +65,20 @@ from tokenspeed_kernel.signature import FormatSignature
 # ---------------------------------------------------------------------------
 
 _RELOAD_MODULES = [
+    # MoE
+    _moe_cutedsl_deepep_nvfp4,
+    _moe_cutlass_fp8,
+    _moe_cutlass_nvfp4,
+    _moe_cutlass_unquant,
+    _moe_trtllm_mxfp4,
+    _moe_trtllm_nvfp4,
+    _moe_trtllm_unquant,
+    _moe_flashinfer,
+    _moe_gluon_mxfp4,
+    _moe_gluon,
+    _moe_triton_mxfp4,
+    _moe_triton,
+    _moe_pkg,
     # GEMM
     tokenspeed_kernel.numerics.reference.gemm,
     tokenspeed_kernel.ops.gemm.deep_gemm,
@@ -229,9 +260,106 @@ _SEARCH_DIR = (
 
 _AUTO_SITES = _collect_call_sites(_SEARCH_DIR)
 
+
 # Call sites that cannot be statically extracted (partial wrappers, variable
-# expected_kernel_name, oracle-dependent num_tokens branching, etc.)
-_MANUAL_CALL_SITES: list[CallSite] = []
+# expected_kernel_name, plan-mediated selection, etc.)
+def _moe_apply_site(
+    expected: str,
+    traits: dict[str, Any],
+    location: str,
+    dtype: torch.dtype = torch.bfloat16,
+) -> CallSite:
+    return (
+        "moe",
+        "apply",
+        dtype,
+        None,
+        traits,
+        None,
+        expected,
+        location,
+    )
+
+
+_MANUAL_CALL_SITES: list[CallSite] = [
+    _moe_apply_site(
+        "flashinfer_trtllm_unquant_moe_apply",
+        {
+            "weight_dtype": "unquant",
+            "activation": "swiglu",
+            "supports_deferred_finalize": True,
+            "supports_all_to_all_ep": False,
+            "supports_ep": True,
+            "ispp": 128,
+            "internal_activation_dtype": "input",
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/unquant_deferred",
+    ),
+    _moe_apply_site(
+        "flashinfer_cutlass_fp8_moe_apply",
+        {
+            "weight_dtype": "fp8",
+            "activation": "silu",
+            "supports_all_to_all_ep": False,
+            "supports_ep": True,
+            "ispp": 128,
+            "fp8_scale_block_shape": (128, 128),
+            "internal_activation_dtype": "input",
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/fp8",
+    ),
+    _moe_apply_site(
+        "flashinfer_trtllm_nvfp4_moe_apply",
+        {
+            "weight_dtype": "nvfp4",
+            "activation": "swiglu",
+            "supports_deferred_finalize": True,
+            "supports_all_to_all_ep": False,
+            "supports_ep": True,
+            "ispp": 128,
+            "internal_activation_dtype": "fp4",
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/nvfp4_deferred",
+    ),
+    _moe_apply_site(
+        "flashinfer_cutedsl_deepep_nvfp4_moe_apply",
+        {
+            "weight_dtype": "nvfp4",
+            "activation": "swiglu",
+            "supports_all_to_all_ep": True,
+            "supports_ep": True,
+            "ispp": 128,
+            "internal_activation_dtype": "fp4",
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/nvfp4_deepep",
+    ),
+    _moe_apply_site(
+        "flashinfer_trtllm_mxfp4_moe_apply",
+        {
+            "weight_dtype": "mxfp4",
+            "activation": "swiglu",
+            "supports_all_to_all_ep": False,
+            "supports_ep": True,
+            "ispp": 128,
+            "internal_activation_dtype": "mxfp8",
+            "supports_bias": True,
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4_trtllm",
+    ),
+    _moe_apply_site(
+        "gluon_mxfp4_moe_apply",
+        {
+            "weight_dtype": "mxfp4",
+            "activation": "swiglu",
+            "supports_all_to_all_ep": False,
+            "supports_ep": False,
+            "ispp": 128,
+            "internal_activation_dtype": "fp8",
+            "supports_bias": True,
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4_gluon",
+    ),
+]
 
 _ALL_SITES = _AUTO_SITES + _MANUAL_CALL_SITES
 
