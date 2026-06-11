@@ -270,6 +270,19 @@ if platform.is_nvidia:
         _routing_method_type = getattr(w, "_routing_method_type", 0)
 
         num_tokens = x.shape[0]
+        # Idle DP ranks run a dummy forward with 0 tokens. The fused
+        # kernel divides by the token count on the host and SIGFPEs on
+        # empty input, so skip the experts entirely.
+        if num_tokens == 0:
+            if do_finalize:
+                return x
+            return (
+                x,
+                x.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
+                # moe_finalize_fuse_shared expects a 1-D
+                # [num_tokens * top_k] permute map.
+                x.new_empty((0,), dtype=torch.int32),
+            )
 
         # Quantize input to FP4 using the fused-kernel scale layout.
         hs_fp4, hs_scale = fp4_quantize(
