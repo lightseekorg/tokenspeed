@@ -535,6 +535,12 @@ def tokenspeed_mla_decode(
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+    # cp_world is the DCP world size; reject non-positive values up front. Otherwise
+    # cp_world=0 slips past the cp_rank check below (max(cp_world, 1) == 1) and reaches
+    # the kernel, which treats cp_world != 1 as DCP and divides the causal bound by
+    # self.cp_world -> div-by-zero / nonsensical local bounds deep in JIT.
+    if cp_world < 1:
+        raise ValueError(f"cp_world must be >= 1, got cp_world={cp_world}")
     # DCP (strided global-coordinate causal masking) is implemented on the fp8
     # decode kernel only; the fp16 kernel masks against the local cache length.
     is_fp8 = q_dtype == torch.float8_e4m3fn
