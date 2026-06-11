@@ -51,6 +51,9 @@ from tokenspeed.runtime.layers.attention.linear.index import (
     set_total_chunks_hint_uniform,
 )
 from tokenspeed.runtime.layers.attention.linear.l2norm import l2norm_fwd
+from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
+    fused_mamba_state_copy,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -627,17 +630,18 @@ class MambaAttnBackend(AttentionBackend):
 
         Matching conv windows are gathered separately from packed pre-conv inputs.
         """
-        num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
-        offset = torch.zeros_like(num_h_states)
-        offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
+        # flashinfer ckpts[k] = state after processing chunk k = FLA h[k+1]
+        num_fi_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
+        offset = torch.zeros_like(num_fi_ckpts)
+        offset[1:] = torch.cumsum(num_fi_ckpts[:-1], dim=0)
 
         lens_m = track_lens[track_mask]
         offset_m = offset[track_mask]
-        dst_m = mamba_track_indices[track_mask]  # write to TRACKING slots
+        dst_m = mamba_track_indices[track_mask]
 
-        # h[i] is the state before chunk i, so an aligned lens maps directly to
-        # lens // FLA_CHUNK_SIZE.
-        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE)
+        # FLA h[lens//C] = flashinfer ckpts[lens//C - 1].
+        # track_mask guarantees lens_m >= FLA_CHUNK_SIZE so lens_m // C >= 1.
+        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE - 1)
         track_ssm_h_dst = dst_m
 
         return (
@@ -1115,13 +1119,8 @@ class MambaAttnBackend(AttentionBackend):
                         f"sm100_available={gdn_flashinfer.is_available()}."
                     )
                 self._gdn_fastpath_checked = True
-            # sm100 fast-path for both code paths. q/k l2norm here since the
-            # kernel ignores its own flag; the wrapper handles the
-            # gate/beta/state conventions and, when output_h=True, returns a
-            # drop-in replacement for FLA's intermediate-h tensor so the
-            # downstream track_ssm_h_src indexing is identical.
             if need_h_track:
-                core_attn_out, last_recurrent_state, h = (
+                core_attn_out, last_recurrent_state, fi_h_checkpoints, _ = (
                     gdn_flashinfer.gdn_chunk_prefill(
                         l2norm_fwd(query),
                         l2norm_fwd(key),
@@ -1149,21 +1148,21 @@ class MambaAttnBackend(AttentionBackend):
             ssm_states[cache_indices] = last_recurrent_state
 
             if need_h_track:
-                if h is None:
-                    raise RuntimeError(
-                        "Missing intermediate mamba states for branching track"
-                    )
-                ssm_states[self.forward_metadata.track_ssm_h_dst] = h.squeeze(0)[
+                ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
                     self.forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
 
             if need_final_track:
-                conv_states[self.forward_metadata.track_ssm_final_dst] = conv_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
-                ssm_states[self.forward_metadata.track_ssm_final_dst] = ssm_states[
-                    self.forward_metadata.track_ssm_final_src
-                ]
+                fused_mamba_state_copy(
+                    conv_states,
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
+                fused_mamba_state_copy(
+                    ssm_states,
+                    self.forward_metadata.track_ssm_final_src,
+                    self.forward_metadata.track_ssm_final_dst,
+                )
 
         return core_attn_out
 

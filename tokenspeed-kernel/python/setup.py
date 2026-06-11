@@ -49,6 +49,7 @@ THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.0"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
+DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -466,7 +467,7 @@ class CudaKernelBuilder:
             return archs
 
         if not archs:
-            archs.add("100a")
+            archs.update(DEFAULT_CUDA_ARCHS)
         return archs
 
     def _site_paths(self):

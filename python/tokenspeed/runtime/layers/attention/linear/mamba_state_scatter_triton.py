@@ -169,7 +169,7 @@ def _mamba_state_snapshot_kernel(
 
 
 def fused_mamba_state_copy(
-    pool: torch.Tensor,  # [num_layers, pool_size, *state_shape]
+    pool: torch.Tensor,  # [num_layers, pool_size, *state_shape] or [pool_size, *state_shape]
     src_indices: torch.Tensor,  # [num_valid]
     dst_indices: torch.Tensor,  # [num_valid]
     cache_lengths: torch.Tensor | None = None,  # [num_valid], for page filter
@@ -183,8 +183,14 @@ def fused_mamba_state_copy(
     cache_lengths is provided, also skips entries where
     cache_lengths[i] % page_size != 0.
 
+    Supports both 3D pool tensors ``[num_layers, pool_size, *state_shape]``
+    and 2D per-layer slices ``[pool_size, *state_shape]`` (which may be
+    non-contiguous views into a larger cache).  For 2D inputs the kernel
+    is launched with ``num_layers=1``.
+
     Args:
-        pool: State tensor [num_layers, pool_size, *state_shape], must be contiguous.
+        pool: State tensor, either 3D [num_layers, pool_size, *state_shape]
+            or 2D [pool_size, *state_shape].
         src_indices: Source slot indices [num_valid], int32 or int64.
         dst_indices: Destination slot indices [num_valid], int32 or int64.
         cache_lengths: Per-entry cache lengths for page-boundary filtering.
@@ -198,8 +204,6 @@ def fused_mamba_state_copy(
 
     if not pool.is_cuda:
         raise ValueError("fused_mamba_state_copy only supports CUDA tensors.")
-    if not pool.is_contiguous():
-        raise ValueError("pool tensor must be contiguous")
     if pool.ndim < 2:
         raise ValueError(f"pool must be at least 2D, got {pool.ndim}D")
     if src_indices.shape[0] != dst_indices.shape[0]:
@@ -207,19 +211,25 @@ def fused_mamba_state_copy(
             f"indices length mismatch: {src_indices.shape[0]} vs {dst_indices.shape[0]}"
         )
 
-    num_layers = pool.shape[0]
-    pool_size = pool.shape[1]
-
-    # Elements per (layer, slot) entry
-    elem_per_entry = pool.numel() // (num_layers * pool_size)
-
-    layer_stride = pool.stride(0)
-    req_stride = pool.stride(1)
+    if pool.ndim == 2:
+        num_layers = 1
+        pool_size = pool.shape[0]
+        elem_per_entry = pool.numel() // pool_size
+        layer_stride = 0  # unused when num_layers=1 (pid_layer is always 0)
+        req_stride = pool.stride(0)
+    else:
+        num_layers = pool.shape[0]
+        pool_size = pool.shape[1]
+        elem_per_entry = pool.numel() // (num_layers * pool_size)
+        layer_stride = pool.stride(0)
+        req_stride = pool.stride(1)
 
     if not src_indices.is_contiguous():
-        raise ValueError("src_indices must be contiguous")
+        src_indices = src_indices.contiguous()
     if not dst_indices.is_contiguous():
-        raise ValueError("dst_indices must be contiguous")
+        dst_indices = dst_indices.contiguous()
+    src_indices = src_indices.to(torch.int32)
+    dst_indices = dst_indices.to(torch.int32)
 
     if page_size > 0 and cache_lengths is not None:
         cache_lengths = cache_lengths.to(torch.int32)
