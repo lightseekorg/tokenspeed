@@ -68,7 +68,11 @@ class CommManager:
         if global_counts is not None:
             scattered = []
             for attn_dp_rank in range(self.mapping.attn.dp_size):
-                num_tokens = global_counts[attn_dp_rank * self.mapping.attn.tp_size]
+                # global_counts is indexed by global rank with dp stride
+                # tp_size * cp_size; cp peers report the same count.
+                num_tokens = global_counts[
+                    attn_dp_rank * self.mapping.attn.tp_size * self.mapping.attn.cp_size
+                ]
                 scattered.extend(
                     self._scatter_count(num_tokens, self.mapping.attn.tp_size)
                 )
@@ -94,8 +98,14 @@ class CommManager:
             ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
         )
         if global_counts is not None:
-            start = self.mapping.moe.dp_rank * tp_ep_size
-            return list(global_counts[start : start + tp_ep_size])
+            # After post_attn_comm reduce-scatter, each rank holds its
+            # scattered share of its attn dp group's tokens, not the raw
+            # global count; MoE collectives must size from those rows.
+            scattered = self.scattered_num_tokens(ctx)
+            return [
+                scattered[self.mapping.attn.scatter_index(rank)]
+                for rank in self.mapping.moe.tp_ep_group
+            ]
         num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
         result = [0] * tp_ep_size
         result[self.mapping.moe.tp_ep_rank] = num_tokens
