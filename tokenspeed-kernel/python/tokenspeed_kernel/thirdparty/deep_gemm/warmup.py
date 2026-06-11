@@ -125,16 +125,21 @@ def warmup_prefill_jit(
     head_dim: int = 128,
     hc_mult: int = 0,
     kv_lora_rank: int = 0,
+    index_n_heads: int = 0,
+    index_head_dim: int = 0,
+    indexer_cache_block_size: int = 64,
+    max_decode_tokens: int = 256,
     mxfp4_block_size: int = 32,
     tp_size: int = 1,
     max_tokens: int,
     device: torch.device,
 ) -> None:
-    """Pre-compile deep_gemm prefill kernels for DeepSeek V4.
+    """Pre-compile deep_gemm prefill/decode kernels for DeepSeek V4.
 
     Derives kernel shapes from model config values and warms up
-    ``tf32_hc_prenorm_gemm`` (compressor) and ``fp8_fp4_mqa_logits``
-    (indexer) kernels for representative token counts.
+    ``tf32_hc_prenorm_gemm`` (compressor), the ragged ``fp8_fp4_mqa_logits``
+    (prefill indexer), and the paged ``fp8_fp4_paged_mqa_logits`` +
+    ``get_paged_mqa_logits_metadata`` (decode indexer) kernels.
 
     Args:
         hidden_size: model hidden dimension.
@@ -142,6 +147,14 @@ def warmup_prefill_jit(
         head_dim: per-head dimension.
         hc_mult: compressor head-coupling multiplier (0 = no compressor).
         kv_lora_rank: KV LoRA rank for indexer (0 = no indexer).
+        index_n_heads: sparse-indexer head count (0 = no indexer). The indexer
+            projections are replicated (not TP-split), so this is the full
+            per-rank head count, not ``num_attention_heads // tp_size``.
+        index_head_dim: sparse-indexer per-head dim (FP4-packed in the cache).
+        indexer_cache_block_size: paged indexer KV-cache block size (BLOCK_KV).
+        max_decode_tokens: largest decode batch the server can run; the paged
+            decode-indexer warmup sweeps every 32-aligned bucket up to this so
+            no in-range decode batch JIT-compiles the metadata kernel inline.
         mxfp4_block_size: MXFP4 quantization block size.
         tp_size: attention tensor-parallel size.
         max_tokens: maximum prefill token count to warm up to.
@@ -174,6 +187,23 @@ def warmup_prefill_jit(
             ],
             max_tokens,
             device,
+        )
+        warmup_count += 1
+
+    if index_n_heads > 0 and index_head_dim > 0:
+        # Decode sparse indexer uses the PAGED MQA-logits kernel
+        # (fp8_fp4_paged_mqa_logits) plus its schedule-metadata builder
+        # (get_paged_mqa_logits_metadata) -- distinct cubins from the ragged
+        # prefill fp8_fp4_mqa_logits above, and not otherwise warmed. Without
+        # this they JIT-compile inline on the first decode (the metadata kernel
+        # re-compiles per 32-aligned decode batch bucket), stalling the engine
+        # long enough to trip the gRPC health probe.
+        _warmup_fp8_fp4_paged_mqa_logits(
+            num_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            cache_block_size=indexer_cache_block_size,
+            max_decode_tokens=max_decode_tokens,
+            device=device,
         )
         warmup_count += 1
 
@@ -316,6 +346,94 @@ def _warmup_fp8_fp4_mqa_logits(
                 max_seqlen_k=max_kv_len,
                 logits_dtype=torch.float32,
             )
+
+
+def _warmup_fp8_fp4_paged_mqa_logits(
+    *,
+    num_heads: int,
+    index_head_dim: int,
+    cache_block_size: int,
+    max_decode_tokens: int,
+    device: torch.device,
+) -> None:
+    """Pre-compile the paged decode sparse-indexer kernels.
+
+    Mirrors the decode call ``fp8_fp4_paged_mqa_logits`` and its schedule-
+    metadata builder ``get_paged_mqa_logits_metadata``. These are distinct
+    cubins from the ragged prefill ``fp8_fp4_mqa_logits`` and are not otherwise
+    warmed. The paged logits kernel is keyed on (num_heads, head_dim, block_kv)
+    -- not the batch size -- so one call warms it, but the metadata kernel is
+    keyed on the 32-aligned decode batch size, so sweep every 32-aligned bucket
+    up to the runtime decode-batch ceiling.
+
+    Args:
+        num_heads: sparse-indexer head count (``index_n_heads``).
+        index_head_dim: sparse-indexer per-head dim (e.g. 128).
+        cache_block_size: paged indexer KV-cache block size (BLOCK_KV).
+        max_decode_tokens: largest decode batch the server can run (e.g.
+            ``max_cudagraph_capture_size`` / ``max_num_seqs``). The metadata
+            kernel is swept over every 32-aligned bucket up to this value so no
+            in-range decode batch hits an uncompiled cubin.
+        device: CUDA device.
+    """
+    try:
+        from tokenspeed_kernel.thirdparty.deep_gemm import (
+            fp8_fp4_paged_mqa_logits,
+            get_num_sms,
+            get_paged_mqa_logits_metadata,
+        )
+    except ImportError:
+        logger.warning("deep_gemm paged MQA logits unavailable, skipping")
+        return
+
+    # FP4 packs 2 values per byte; the paged KV row stores the value bytes plus
+    # a single int32 scale (head_dim / 2 + sizeof(int)).
+    head_dim_bytes = index_head_dim // 2
+    row_bytes = index_head_dim // 2 + 4
+    num_sms = get_num_sms()
+
+    # The metadata kernel is JIT-keyed on the 32-aligned decode batch size, so
+    # cover every bucket up to the runtime ceiling (batches < 32 map to the 32
+    # bucket, so they are covered too).
+    top_bucket = max(32, ((max_decode_tokens + 31) // 32) * 32)
+    decode_batch_sizes = range(32, top_bucket + 1, 32)
+
+    for num_tokens in decode_batch_sizes:
+        num_blocks = max(1, num_tokens)
+        q_values = torch.zeros(
+            num_tokens, num_heads, head_dim_bytes, dtype=torch.uint8, device=device
+        )
+        q_scales = torch.zeros(num_tokens, num_heads, dtype=torch.int32, device=device)
+        cache_2d = torch.zeros(
+            num_blocks, cache_block_size * row_bytes, dtype=torch.uint8, device=device
+        )
+        kv_cache = torch.as_strided(
+            cache_2d,
+            (num_blocks, cache_block_size, 1, row_bytes),
+            (cache_2d.stride(0), row_bytes, row_bytes, 1),
+        )
+        weights = torch.ones(num_tokens, num_heads, dtype=torch.float32, device=device)
+        context_lens = torch.full(
+            (num_tokens, 1), cache_block_size, dtype=torch.int32, device=device
+        )
+        block_table = torch.arange(num_tokens, dtype=torch.int32, device=device).view(
+            num_tokens, 1
+        )
+        schedule_meta = get_paged_mqa_logits_metadata(
+            context_lens, cache_block_size, num_sms
+        )
+        fp8_fp4_paged_mqa_logits(
+            q=(q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
+            kv_cache=kv_cache,
+            weights=weights,
+            context_lens=context_lens,
+            block_table=block_table,
+            schedule_meta=schedule_meta,
+            max_context_len=cache_block_size,
+            clean_logits=False,
+            logits_dtype=torch.float32,
+        )
+    torch.cuda.synchronize()
 
 
 # ---------------------------------------------------------------------------

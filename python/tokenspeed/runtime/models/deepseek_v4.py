@@ -69,6 +69,7 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    V4_KERNEL_BLOCK_ROWS,
     deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
     deepseek_v4_indexer_mxfp4_scale_dim,
     deepseek_v4_indexer_mxfp4_value_bytes,
@@ -4171,6 +4172,14 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             head_dim=getattr(config, "head_dim", 128),
             hc_mult=getattr(config, "hc_mult", 0),
             kv_lora_rank=getattr(config, "kv_lora_rank", 0),
+            index_n_heads=getattr(config, "index_n_heads", 0),
+            index_head_dim=getattr(config, "index_head_dim", 0),
+            indexer_cache_block_size=V4_KERNEL_BLOCK_ROWS,
+            max_decode_tokens=max(
+                int(global_server_args_dict.get("max_cudagraph_capture_size", 0) or 0),
+                int(global_server_args_dict.get("max_num_seqs", 0) or 0),
+                1,
+            ),
             mxfp4_block_size=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
             tp_size=tp_size,
             max_tokens=min(getattr(config, "max_position_embeddings", 8192), 8192),
