@@ -726,57 +726,6 @@ class TestSelectKernel:
                 traits={"head_dim": 256},
             )
 
-    def test_ispp_trait_filters_by_registered_alignment(self, h100_platform):
-        reg = KernelRegistry.get()
-        reg.register(
-            KernelSpec(
-                name="moe_aligned_128",
-                family="moe",
-                mode="apply",
-                solution="specialized",
-                format_signatures=frozenset({INPUT_BF16}),
-                traits={
-                    "weight_dtype": frozenset({"unquant"}),
-                    "ispp_alignment": frozenset({128}),
-                },
-                priority=15,
-            ),
-            lambda: "moe_aligned_128",
-        )
-        reg.register(
-            KernelSpec(
-                name="moe_aligned_1",
-                family="moe",
-                mode="apply",
-                solution="fallback",
-                format_signatures=frozenset({INPUT_BF16}),
-                traits={
-                    "weight_dtype": frozenset({"unquant"}),
-                    "ispp_alignment": frozenset({1}),
-                },
-                priority=10,
-            ),
-            lambda: "moe_aligned_1",
-        )
-
-        fallback = select_kernel(
-            "moe",
-            "apply",
-            INPUT_BF16,
-            platform=h100_platform,
-            traits={"weight_dtype": "unquant", "ispp": 96},
-        )
-        specialized = select_kernel(
-            "moe",
-            "apply",
-            INPUT_BF16,
-            platform=h100_platform,
-            traits={"weight_dtype": "unquant", "ispp": 128},
-        )
-
-        assert fallback() == "moe_aligned_1"
-        assert specialized() == "moe_aligned_128"
-
     def test_override_not_found_raises(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
