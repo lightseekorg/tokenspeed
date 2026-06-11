@@ -22,10 +22,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
 
@@ -247,7 +246,6 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_moe_apply",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
         "dense",
