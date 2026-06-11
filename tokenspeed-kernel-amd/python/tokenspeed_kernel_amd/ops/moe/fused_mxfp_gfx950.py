@@ -4823,6 +4823,7 @@ def gluon_mxfp_fused_moe(
         gather_indx=gather_indx,
         precision_config=w13_precision_config,
         fused_activation=act,
+        out_quant_scale=w2_act_scale,
     )
 
     gemm2_input = intermediate_cache
