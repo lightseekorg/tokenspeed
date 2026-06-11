@@ -100,7 +100,7 @@ if platform.is_amd:
         solution="gluon",
         signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"mxfp4"})},
-        priority=Priority.PORTABLE,
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         MXFP_BLOCK_SIZE = 32
@@ -194,7 +194,7 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"fp8"}),
             "supports_bias": frozenset({True}),
         },
-        priority=Priority.PERFORMANT,
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_moe_apply(
         plan: dict,
