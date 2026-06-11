@@ -4789,6 +4789,7 @@ def run(
         workspace,
         split_kv,
         cache_seqs,
+        cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
         block_split_kvs,
         softmax_scale,
         output_scale,
@@ -4902,6 +4903,7 @@ def run(
             workspace,
             split_kv,
             cache_seqs,
+            cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -5038,6 +5040,7 @@ def run(
             workspace,
             _split_kv,
             cache_seqs,
+            cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
             block_split_kvs,
             softmax_scale,
             output_scale,
