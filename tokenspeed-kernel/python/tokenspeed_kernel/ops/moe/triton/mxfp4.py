@@ -41,7 +41,6 @@ with redirect_triton_to_tokenspeed_triton():
     import triton_kernels.topk  # noqa: F401
 
 import triton_kernels.matmul_details.opt_flags as opt_flags
-from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from triton_kernels.matmul import (
     FlexCtx,
     FnSpecs,
@@ -61,6 +60,9 @@ from triton_kernels.tensor import (
 )
 from triton_kernels.tensor_details import layout
 from triton_kernels.topk import topk
+
+# isort: off
+from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 
 platform = current_platform()
 
