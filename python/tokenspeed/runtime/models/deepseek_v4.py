@@ -4175,10 +4175,20 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             index_n_heads=getattr(config, "index_n_heads", 0),
             index_head_dim=getattr(config, "index_head_dim", 0),
             indexer_cache_block_size=V4_KERNEL_BLOCK_ROWS,
+            # With MTP/speculation the verify step flattens bs*num_draft_tokens
+            # into the decode indexer's num_tokens, so the paged-logits metadata
+            # kernel (JIT-keyed on the 32-aligned token count) hits larger
+            # buckets than plain decode. Scale the warmup ceiling by the draft
+            # factor so those buckets are covered (no-op when speculation is off).
             max_decode_tokens=max(
                 int(global_server_args_dict.get("max_cudagraph_capture_size", 0) or 0),
                 int(global_server_args_dict.get("max_num_seqs", 0) or 0),
                 1,
+            )
+            * (
+                int(global_server_args_dict.get("speculative_num_draft_tokens", 1) or 1)
+                if global_server_args_dict.get("speculative_algorithm")
+                else 1
             ),
             mxfp4_block_size=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
             tp_size=tp_size,

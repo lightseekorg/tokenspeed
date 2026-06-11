@@ -89,6 +89,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
             "speculative_algorithm": server_args.speculative_algorithm,
+            "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
