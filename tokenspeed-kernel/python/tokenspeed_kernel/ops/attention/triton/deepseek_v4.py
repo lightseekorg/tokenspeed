@@ -253,6 +253,7 @@ def deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
 
 @triton.jit
 def _deepseek_v4_fused_sparse_compress_cache_kernel(
+    token_indices_ptr,
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
@@ -282,8 +283,15 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
     TOKEN_STRIDE: tl.constexpr,
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
+    USE_COMPACT: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    row_idx = tl.program_id(0)
+    if USE_COMPACT:
+        token_idx = tl.load(token_indices_ptr + row_idx)
+        if token_idx < 0:
+            return
+    else:
+        token_idx = row_idx
 
     state_slot = tl.load(slot_mapping_ptr + token_idx)
     if state_slot < 0:
@@ -399,6 +407,27 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
     )
 
 
+@triton.jit
+def _deepseek_v4_compact_hca_boundary_tokens_kernel(
+    positions_ptr,
+    state_slot_mapping_ptr,
+    kv_slot_mapping_ptr,
+    token_indices_ptr,
+    count_ptr,
+    COMPRESS_RATIO: tl.constexpr,
+    MAX_ROWS: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    position = tl.load(positions_ptr + token_idx)
+    state_slot = tl.load(state_slot_mapping_ptr + token_idx)
+    kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
+    keep = (state_slot >= 0) & (kv_slot >= 0) & ((position + 1) % COMPRESS_RATIO == 0)
+    if keep:
+        row = tl.atomic_add(count_ptr, 1, sem="relaxed")
+        if row < MAX_ROWS:
+            tl.store(token_indices_ptr + row, token_idx)
+
+
 def deepseek_v4_fused_sparse_compress_cache_insert(
     *,
     state_cache: torch.Tensor,
@@ -416,6 +445,7 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
     compress_ratio: int,
     overlap: bool,
     block_table_base_offsets: torch.Tensor | None = None,
+    compact_rows: int | None = None,
 ) -> None:
     num_actual = min(
         compressor_slot_mapping.numel(),
@@ -424,7 +454,39 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
     )
     if num_actual == 0:
         return
-    _deepseek_v4_fused_sparse_compress_cache_kernel[(num_actual,)](
+    use_compact = (
+        compact_rows is not None
+        and int(compact_rows) >= 0
+        and int(compact_rows) < num_actual
+    )
+    if use_compact:
+        max_rows = int(compact_rows)
+        if max_rows == 0:
+            return
+        token_indices = torch.empty(
+            (max_rows,),
+            device=positions.device,
+            dtype=torch.int32,
+        )
+        token_indices.fill_(-1)
+        compact_count = torch.empty((1,), device=positions.device, dtype=torch.int32)
+        compact_count.zero_()
+        _deepseek_v4_compact_hca_boundary_tokens_kernel[(num_actual,)](
+            positions[:num_actual],
+            compressor_slot_mapping[:num_actual],
+            kv_slot_mapping[:num_actual],
+            token_indices,
+            compact_count,
+            COMPRESS_RATIO=compress_ratio,
+            MAX_ROWS=max_rows,
+            num_warps=4,
+        )
+        grid = max_rows
+    else:
+        token_indices = None
+        grid = num_actual
+    _deepseek_v4_fused_sparse_compress_cache_kernel[(grid,)](
+        token_indices,
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
@@ -458,6 +520,7 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
         TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
         SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
+        USE_COMPACT=use_compact,
         num_warps=4,
     )
 

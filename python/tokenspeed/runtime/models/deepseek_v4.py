@@ -174,6 +174,53 @@ def _deepseek_v4_phase_done(
     phase_wall_ms[name] = round(phase_wall_ms.get(name, 0.0) + elapsed_ms, 3)
 
 
+def _deepseek_v4_cuda_event_start(
+    enabled: bool,
+    device: torch.device | None,
+) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+    if not enabled or device is None or device.type != "cuda":
+        return None
+    try:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(torch.cuda.current_stream(device))
+        return start, end
+    except (RuntimeError, ValueError):
+        return None
+
+
+def _deepseek_v4_cuda_event_done(
+    events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]],
+    name: str,
+    event_pair: tuple[torch.cuda.Event, torch.cuda.Event] | None,
+    device: torch.device | None,
+) -> None:
+    if event_pair is None or device is None or device.type != "cuda":
+        return
+    _, end = event_pair
+    try:
+        end.record(torch.cuda.current_stream(device))
+    except (RuntimeError, ValueError):
+        return
+    events.append((name, event_pair[0], end))
+
+
+def _deepseek_v4_cuda_events_read(
+    events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]],
+) -> tuple[dict[str, float], int]:
+    elapsed: dict[str, float] = {}
+    pending = 0
+    for name, start, end in events:
+        try:
+            if not end.query():
+                pending += 1
+                continue
+            elapsed[name] = round(float(start.elapsed_time(end)), 3)
+        except (RuntimeError, ValueError):
+            pending += 1
+    return elapsed, pending
+
+
 def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
     return (
         metadata is not None
@@ -196,6 +243,37 @@ def _deepseek_v4_indexer_token_split(
     ):
         return 0, int(total_tokens)
     return int(total_tokens), 0
+
+
+def _deepseek_v4_prefill_boundary_rows(
+    metadata,
+    compress_ratio: int,
+) -> int | None:
+    seq_lens_cpu = getattr(metadata, "seq_lens_cpu", None)
+    query_lens_cpu = getattr(metadata, "query_lens_cpu", None)
+    num_prefill_reqs = int(getattr(metadata, "num_prefill_reqs", 0) or 0)
+    if seq_lens_cpu is None or query_lens_cpu is None or num_prefill_reqs <= 0:
+        return None
+    seq_lens = _deepseek_v4_cpu_int_list(
+        seq_lens_cpu,
+        "prefill seq_lens_cpu",
+        start=0,
+        end=num_prefill_reqs,
+    )
+    query_lens = _deepseek_v4_cpu_int_list(
+        query_lens_cpu,
+        "prefill query_lens_cpu",
+        start=0,
+        end=num_prefill_reqs,
+    )
+    rows = 0
+    ratio = max(1, int(compress_ratio))
+    for seq_len, query_len in zip(seq_lens, query_lens):
+        seq_len = max(0, int(seq_len))
+        query_len = max(0, int(query_len))
+        prefix_len = max(0, seq_len - query_len)
+        rows += seq_len // ratio - prefix_len // ratio
+    return max(0, rows)
 
 
 def _deepseek_v4_forward_metadata(ctx: ForwardContext):
@@ -1059,10 +1137,15 @@ def _deepseek_v4_indexer_prefill_metadata(
     compress_ratio: int,
     num_prefill_tokens: int,
 ) -> DeepseekV4IndexerPrefillMetadata:
+    timing_enabled = logger.isEnabledFor(logging.DEBUG)
+    total_tic = _deepseek_v4_phase_start(timing_enabled)
+    phase_wall_ms: dict[str, float] = {}
+    cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
     device = block_table.device
     if num_prefill_tokens <= 0:
         return DeepseekV4IndexerPrefillMetadata.empty(device)
 
+    tic = _deepseek_v4_phase_start(timing_enabled)
     seq_lens_cpu = getattr(metadata, "seq_lens_cpu", None)
     query_lens_cpu = getattr(metadata, "query_lens_cpu", None)
     num_prefill_reqs = int(getattr(metadata, "num_prefill_reqs", 0) or 0)
@@ -1083,6 +1166,7 @@ def _deepseek_v4_indexer_prefill_metadata(
         compress_ratio=compress_ratio,
         num_tokens=num_prefill_tokens,
     )
+    _deepseek_v4_phase_done(phase_wall_ms, "cpu_lens_chunks", tic)
     if not chunks:
         out = DeepseekV4IndexerPrefillMetadata.empty(device)
         cache[cache_key] = out
@@ -1097,7 +1181,9 @@ def _deepseek_v4_indexer_prefill_metadata(
     slot_offset = 0
     cu_seq_offset = 0
     row_offset = 0
+    cuda_tensor_elems = 0
     for chunk in chunks:
+        tic = _deepseek_v4_phase_start(timing_enabled)
         slots, cu_seqlen_k_start, cu_seqlen_k_end, seq_lens_k, max_seqlen_k = (
             _deepseek_v4_indexer_prefill_request_gather_plan(
                 seq_lens_cpu=seq_lens_cpu,
@@ -1118,6 +1204,9 @@ def _deepseek_v4_indexer_prefill_metadata(
             req_start=chunk.req_start,
             req_end=chunk.req_end,
         )
+        _deepseek_v4_phase_done(phase_wall_ms, "per_chunk_plan", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
+        cuda_pair = _deepseek_v4_cuda_event_start(timing_enabled, device)
         compressed_lens = torch.div(
             seq_lens_cpu[chunk.req_start : chunk.req_end].to(
                 dtype=torch.int32,
@@ -1133,6 +1222,20 @@ def _deepseek_v4_indexer_prefill_metadata(
         )
         cu_seq_lens[:1] = 0
         torch.cumsum(compressed_lens, dim=0, out=cu_seq_lens[1:])
+        cuda_tensor_elems += (
+            compressed_lens.numel()
+            + cu_seq_lens.numel()
+            + cu_seqlen_k_start.numel()
+            + cu_seqlen_k_end.numel()
+            + seq_lens_k.numel()
+        )
+        _deepseek_v4_cuda_event_done(
+            cuda_events,
+            "cuda_tensor_build",
+            cuda_pair,
+            device,
+        )
+        _deepseek_v4_phase_done(phase_wall_ms, "cuda_tensor_build", tic)
         slot_end = slot_offset + slot_count
         cu_seq_end = cu_seq_offset + cu_seq_lens.numel()
         row_end = row_offset + seq_lens_k.numel()
@@ -1162,6 +1265,8 @@ def _deepseek_v4_indexer_prefill_metadata(
         cu_seq_offset = cu_seq_end
         row_offset = row_end
 
+    tic = _deepseek_v4_phase_start(timing_enabled)
+    cuda_pair = _deepseek_v4_cuda_event_start(timing_enabled, device)
     out = DeepseekV4IndexerPrefillMetadata(
         chunks=tuple(chunk_plans),
         chunk_specs=torch.tensor(
@@ -1220,7 +1325,36 @@ def _deepseek_v4_indexer_prefill_metadata(
             else torch.empty(0, dtype=torch.int32, device=device)
         ),
     )
+    _deepseek_v4_cuda_event_done(cuda_events, "cat_pack", cuda_pair, device)
+    _deepseek_v4_phase_done(phase_wall_ms, "cat_pack", tic)
+    tic = _deepseek_v4_phase_start(timing_enabled)
     cache[cache_key] = out
+    _deepseek_v4_phase_done(phase_wall_ms, "cache_put", tic)
+    if timing_enabled and total_tic is not None:
+        total_ms = (time.perf_counter() - total_tic) * 1000
+        if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+            phase_cuda_ms, pending_cuda_events = _deepseek_v4_cuda_events_read(
+                cuda_events
+            )
+            logger.debug(
+                "[DeepSeekV4][slow_indexer_prefill_metadata] total_ms=%.3f "
+                "phase_wall_ms=%s phase_cuda_ms=%s pending_cuda_events=%s "
+                "cache_hit=false cache_key=%s num_prefill_reqs=%s "
+                "num_prefill_tokens=%s chunks=%s max_gather_rows=%s "
+                "sum_gather_rows=%s cuda_tensor_elems=%s device=%s build_slots=false",
+                total_ms,
+                phase_wall_ms,
+                phase_cuda_ms,
+                pending_cuda_events,
+                cache_key,
+                num_prefill_reqs,
+                num_prefill_tokens,
+                len(chunk_plans),
+                out.max_gather_rows(),
+                sum(max(0, chunk.slot_end - chunk.slot_start) for chunk in chunk_plans),
+                cuda_tensor_elems,
+                device,
+            )
     return out
 
 
@@ -2893,7 +3027,25 @@ class DeepseekV4Compressor(nn.Module):
             if not write_compressed_cache
             else f"compressor_c{self.compress_ratio}"
         )
+        timing_enabled = _deepseek_v4_timing_enabled(ctx)
+        total_tic = _deepseek_v4_phase_start(timing_enabled)
+        phase_wall_ms: dict[str, float] = {}
+        cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        decode_tokens = (
+            metadata.decode_token_count()
+            if hasattr(metadata, "decode_token_count")
+            else 0
+        )
+        hca_boundary_rows = (
+            _deepseek_v4_prefill_boundary_rows(metadata, self.compress_ratio)
+            if write_compressed_cache
+            and self.compress_ratio == 128
+            and not self.overlap
+            and decode_tokens == 0
+            else None
+        )
         if kv_score is None:
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with nvtx_range(f"{profile_prefix}_dequant_weight"):
                 weight_shape = (
                     self.fused_wkv_wgate.output_size_per_partition,
@@ -2906,9 +3058,12 @@ class DeepseekV4Compressor(nn.Module):
                 kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
                 if kv_score is None:
                     kv_score = torch.matmul(hidden_states.float(), weight.float().T)
+            _deepseek_v4_phase_done(phase_wall_ms, "compute_kv_score", tic)
         kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
         if state_cache is None:
+            tic = _deepseek_v4_phase_start(timing_enabled)
             state_cache = pool.get_compressor_state_buffer(layer_index)
+            _deepseek_v4_phase_done(phase_wall_ms, "get_state_buffer", tic)
         cache_metadata = metadata.cache
         # State/compressed slot mappings are per-step metadata. Reuse them across
         # layers when the cache group shape is identical; the indexer-compressor
@@ -2934,10 +3089,12 @@ class DeepseekV4Compressor(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
+        state_slot_cache_hit = state_slot_mapping is not None
         if state_slot_mapping is None:
             state_hit = (
                 memo.get(("state", self.compress_ratio)) if memo is not None else None
             )
+            state_slot_cache_hit = state_hit is not None
             if state_hit is not None:
                 state_slot_mapping, state_block_table = state_hit
             else:
@@ -2962,6 +3119,8 @@ class DeepseekV4Compressor(nn.Module):
                         state_slot_mapping,
                         state_block_table,
                     )
+        tic = _deepseek_v4_phase_start(timing_enabled)
+        cuda_pair = _deepseek_v4_cuda_event_start(timing_enabled, positions.device)
         with nvtx_range(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
                 kv=kv,
@@ -2973,7 +3132,37 @@ class DeepseekV4Compressor(nn.Module):
                 block_size=state_block_size,
                 compress_ratio=self.compress_ratio,
             )
+        _deepseek_v4_cuda_event_done(
+            cuda_events, "save_state", cuda_pair, positions.device
+        )
+        _deepseek_v4_phase_done(phase_wall_ms, "save_state", tic)
         if not write_compressed_cache:
+            if timing_enabled and total_tic is not None:
+                total_ms = (time.perf_counter() - total_tic) * 1000
+                if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+                    phase_cuda_ms, pending_cuda_events = _deepseek_v4_cuda_events_read(
+                        cuda_events
+                    )
+                    logger.debug(
+                        "[DeepSeekV4][slow_compressor] layer=%s ratio=%s "
+                        "write_compressed_cache=%s total_ms=%.3f phase_wall_ms=%s "
+                        "phase_cuda_ms=%s pending_cuda_events=%s input_tokens=%s "
+                        "decode_tokens=%s hca_boundary_rows=%s compact_rows=%s "
+                        "state_slot_cache_hit=%s compressed_slot_cache_hit=%s",
+                        layer_index,
+                        self.compress_ratio,
+                        write_compressed_cache,
+                        total_ms,
+                        phase_wall_ms,
+                        phase_cuda_ms,
+                        pending_cuda_events,
+                        positions.numel(),
+                        decode_tokens,
+                        hca_boundary_rows,
+                        None,
+                        state_slot_cache_hit,
+                        None,
+                    )
             return kv, score
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
@@ -2985,9 +3174,11 @@ class DeepseekV4Compressor(nn.Module):
             use_decode_cache,
         )
         compressed_hit = memo.get(compressed_key) if memo is not None else None
+        compressed_slot_cache_hit = compressed_hit is not None
         if compressed_hit is not None:
             compressed_slots = compressed_hit
         else:
+            tic = _deepseek_v4_phase_start(timing_enabled)
             with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
                 compressed_slots = cache_metadata.compressed_slot_mapping(
                     positions,
@@ -3003,11 +3194,22 @@ class DeepseekV4Compressor(nn.Module):
                 )
             if memo is not None:
                 memo[compressed_key] = compressed_slots
+            _deepseek_v4_phase_done(phase_wall_ms, "compressed_slot_mapping", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
+        kv_cache_2d = pool.get_compressed_kv_buffer_2d(layer_index)
+        _deepseek_v4_phase_done(phase_wall_ms, "get_compressed_kv_buffer", tic)
+        tic = _deepseek_v4_phase_start(timing_enabled)
+        cuda_pair = _deepseek_v4_cuda_event_start(timing_enabled, positions.device)
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
                 if self.compress_ratio == 4
                 else deepseek_v4_hca_compress_kv_cache_insert
+            )
+            compact_rows = (
+                hca_boundary_rows
+                if self.compress_ratio == 128 and hca_boundary_rows is not None
+                else None
             )
             insert(
                 state_cache=state_cache,
@@ -3020,11 +3222,44 @@ class DeepseekV4Compressor(nn.Module):
                 rms_norm_weight=self.norm.weight,
                 rms_norm_eps=self.norm.variance_epsilon,
                 cos_sin_cache=cos_sin_cache,
-                kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
+                kv_cache_2d=kv_cache_2d,
                 kv_slot_mapping=compressed_slots,
                 kv_cache_block_size=kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
+                compact_rows=compact_rows,
             )
+        _deepseek_v4_cuda_event_done(
+            cuda_events, "cache_insert", cuda_pair, positions.device
+        )
+        _deepseek_v4_phase_done(phase_wall_ms, "cache_insert", tic)
+        if timing_enabled and total_tic is not None:
+            total_ms = (time.perf_counter() - total_tic) * 1000
+            if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+                phase_cuda_ms, pending_cuda_events = _deepseek_v4_cuda_events_read(
+                    cuda_events
+                )
+                logger.debug(
+                    "[DeepSeekV4][slow_compressor] layer=%s ratio=%s "
+                    "write_compressed_cache=%s total_ms=%.3f phase_wall_ms=%s "
+                    "phase_cuda_ms=%s pending_cuda_events=%s input_tokens=%s "
+                    "decode_tokens=%s hca_boundary_rows=%s compact_rows=%s "
+                    "state_slot_cache_hit=%s compressed_slot_cache_hit=%s "
+                    "use_decode_cache=%s",
+                    layer_index,
+                    self.compress_ratio,
+                    write_compressed_cache,
+                    total_ms,
+                    phase_wall_ms,
+                    phase_cuda_ms,
+                    pending_cuda_events,
+                    positions.numel(),
+                    decode_tokens,
+                    hca_boundary_rows,
+                    compact_rows,
+                    state_slot_cache_hit,
+                    compressed_slot_cache_hit,
+                    use_decode_cache,
+                )
         return kv, score
 
 
@@ -3824,6 +4059,7 @@ class DeepseekV4Attention(nn.Module):
         timing_enabled = _deepseek_v4_timing_enabled(ctx)
         total_tic = _deepseek_v4_phase_start(timing_enabled)
         phase_wall_ms: dict[str, float] = {}
+        cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
@@ -3920,6 +4156,7 @@ class DeepseekV4Attention(nn.Module):
             )
 
             tic = _deepseek_v4_phase_start(timing_enabled)
+            cuda_pair = _deepseek_v4_cuda_event_start(timing_enabled, positions.device)
             with self.stream_fork.scope(
                 enable=self.stream_fork.aux_stream is not None
             ) as fork:
@@ -3944,9 +4181,16 @@ class DeepseekV4Attention(nn.Module):
                 inner_tic = _deepseek_v4_phase_start(timing_enabled)
                 run_compressor()
                 _deepseek_v4_phase_done(phase_wall_ms, "compressor", inner_tic)
+            _deepseek_v4_cuda_event_done(
+                cuda_events,
+                "indexer_stream_scope",
+                cuda_pair,
+                positions.device,
+            )
             _deepseek_v4_phase_done(phase_wall_ms, "indexer_stream_scope", tic)
         elif self.compressor is not None:
             tic = _deepseek_v4_phase_start(timing_enabled)
+            cuda_pair = _deepseek_v4_cuda_event_start(timing_enabled, positions.device)
             with self.stream_fork.scope(
                 enable=self.stream_fork.aux_stream is not None
             ) as fork:
@@ -3957,6 +4201,12 @@ class DeepseekV4Attention(nn.Module):
                 with fork.branch():
                     insert_swa_cache()
                 _deepseek_v4_phase_done(phase_wall_ms, "insert_swa_cache", inner_tic)
+            _deepseek_v4_cuda_event_done(
+                cuda_events,
+                "compressor_stream_scope",
+                cuda_pair,
+                positions.device,
+            )
             _deepseek_v4_phase_done(phase_wall_ms, "compressor_stream_scope", tic)
         else:
             tic = _deepseek_v4_phase_start(timing_enabled)
@@ -4035,11 +4285,14 @@ class DeepseekV4Attention(nn.Module):
         if timing_enabled and total_tic is not None:
             total_ms = (time.perf_counter() - total_tic) * 1000
             if total_ms >= SLOW_DEEPSEEK_V4_LAYER_LOG_THRESHOLD_MS:
+                phase_cuda_ms, pending_cuda_events = _deepseek_v4_cuda_events_read(
+                    cuda_events
+                )
                 logger.debug(
                     "[DeepSeekV4][slow_attn] layer=%s cache_layer=%s kind=%s "
                     "total_ms=%.3f phase_wall_ms=%s input_tokens=%s "
                     "num_prefill_tokens=%s num_decode_tokens=%s num_extends=%s "
-                    "forward_mode=%s",
+                    "forward_mode=%s phase_cuda_ms=%s pending_cuda_events=%s",
                     self.layer_index,
                     self.cache_layer_index,
                     self.attention_kind,
@@ -4050,6 +4303,8 @@ class DeepseekV4Attention(nn.Module):
                     metadata.decode_token_count(),
                     ctx.num_extends,
                     forward_mode,
+                    phase_cuda_ms,
+                    pending_cuda_events,
                 )
         return out
 

@@ -57,7 +57,12 @@ class LayerDoneCounter:
         self.producer_index = -1
         self.consumer_indices: tuple[int, ...] = ()
         self._debug_wait_records: list[tuple[int, int, object, object]] = []
-        self._debug_sample_layers = {0, max(0, num_layers // 2), max(0, num_layers - 1)}
+        self._debug_sample_layers = {
+            0,
+            min(3, max(0, num_layers - 1)),
+            max(0, num_layers // 2),
+            max(0, num_layers - 1),
+        }
         self._debug_record_limit = 96
 
     def update_producer(self):

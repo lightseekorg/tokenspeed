@@ -837,6 +837,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     kv_cache_block_size: int,
     compress_ratio: int = 128,
     block_table_base_offsets: torch.Tensor | None = None,
+    compact_rows: int | None = None,
 ) -> None:
     """Compress HCA state, normalize/RoPE/FP8-quantize, and insert KV cache.
 
@@ -899,6 +900,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
         compress_ratio=compress_ratio,
         overlap=False,
         block_table_base_offsets=block_table_base_offsets,
+        compact_rows=compact_rows,
     )
 
 
@@ -917,6 +919,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
     kv_cache_block_size: int,
     compress_ratio: int = 4,
     block_table_base_offsets: torch.Tensor | None = None,
+    compact_rows: int | None = None,
 ) -> None:
     """Compress CSA state and insert one `fp8_ds_mla` row per 4 tokens.
 
@@ -929,6 +932,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
         raise ValueError(
             f"CSA cache insert requires compress_ratio=4, got {compress_ratio}"
         )
+    del compact_rows
     if state_cache.dim() != 3:
         raise ValueError(f"state_cache must be 3D, got {tuple(state_cache.shape)}")
     state_width = state_cache.shape[-1] // 2
