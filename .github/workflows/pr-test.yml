@@ -70,7 +70,6 @@ jobs:
     outputs:
       matrix: ${{ steps.scan.outputs.matrix }}
       install_tokenspeed_mla_from_source: ${{ steps.detect_mla.outputs.changed }}
-      install_tokenspeed_kernel_amd_from_source: ${{ steps.detect_kernel_amd.outputs.changed }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -135,35 +134,6 @@ jobs:
             echo "changed=0" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Detect tokenspeed-kernel-amd source changes
-        id: detect_kernel_amd
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          case "${{ github.event_name }}" in
-            pull_request)
-              files=$(gh api \
-                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                --paginate -q ".[].filename")
-              ;;
-            push)
-              files=$(gh api \
-                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
-                -q ".files[].filename")
-              ;;
-            *)
-              files=""
-              ;;
-          esac
-          if printf "%s\n" "$files" | grep -q "^tokenspeed-kernel-amd/"; then
-            echo "tokenspeed-kernel-amd touched by this run; in-tree source will be installed."
-            echo "changed=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "tokenspeed-kernel-amd untouched; keeping pinned PyPI wheel."
-            echo "changed=0" >> "$GITHUB_OUTPUT"
-          fi
-
   unit-test:
     needs: scan
     if: |
@@ -187,8 +157,6 @@ jobs:
       # `install_deps.sh` will reinstall the in-tree source on top of the
       # pinned PyPI wheel. See the matching detect step in the `scan` job.
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
-      # Same source override for the AMD kernel package.
-      INSTALL_TOKENSPEED_KERNEL_AMD_FROM_SOURCE: ${{ needs.scan.outputs.install_tokenspeed_kernel_amd_from_source }}
       # Authenticate Hugging Face Hub downloads so checkpoint pulls during
       # `ts serve` startup are not throttled by the anonymous rate limit. The
       # 600s per-file `runtime-1gpu` timeout is otherwise exceeded on cold
