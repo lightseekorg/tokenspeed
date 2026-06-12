@@ -105,8 +105,9 @@ if platform.is_amd:
         ),
         signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"mxfp4"})},
-        # Lower priority than the triton implementation due to performance issue
-        priority=Priority.PORTABLE - 1,
+        # Higher priority than triton: gfx950 warp-decode (coop stage1 + tuned
+        # split-K) now outperforms the triton MoE across the decode range.
+        priority=Priority.PORTABLE + 1,
     )
     def gluon_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         MXFP_BLOCK_SIZE = 32
@@ -200,8 +201,9 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"fp8"}),
             "supports_bias": frozenset({True}),
         },
-        # Lower priority than the triton implementation due to performance issue
-        priority=Priority.PORTABLE - 1,
+        # Higher priority than triton: gfx950 warp-decode (coop stage1 + tuned
+        # split-K) now outperforms the triton MoE across the decode range.
+        priority=Priority.PORTABLE + 1,
     )
     def gluon_mxfp4_moe_apply(
         plan: dict,
