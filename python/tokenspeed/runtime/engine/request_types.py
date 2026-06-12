@@ -72,9 +72,6 @@ class FINISH_LENGTH(BaseFinishReason):
 class ABORT_CODE(Enum):
     TransferFailed = 521
     UnknownError = 522
-    # NaN detected in this request's logits (or an out-of-vocab token id
-    # escaped a sampling kernel). The request is terminated to keep the
-    # corruption from propagating; the rest of the batch continues.
     NumericalError = 523
 
 

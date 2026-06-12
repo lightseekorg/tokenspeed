@@ -106,6 +106,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    nan_guard: bool = True
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -120,9 +121,6 @@ class ModelExecutorConfig:
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     use_target_verify_forward_mode: bool = False
-
-    # Always-on NaN containment (see ServerArgs.disable_nan_guard).
-    nan_guard: bool = True
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -246,8 +244,7 @@ class ModelExecutor:
             output_length=config.output_length,
             mamba_pool=mamba_pool,
         )
-        # Always-on per-request NaN containment (see nan_guard.py). Sized
-        # like InputBuffers.max_bs, so the padded graph-bucket bs fits.
+        # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.nan_guard,
             config.max_num_seqs // max(config.data_parallel_size, 1),
@@ -620,10 +617,8 @@ class ModelExecutor:
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
 
-        # NaN guard stage 1: flag corrupted requests, sanitize logits in
-        # place before any sampling kernel (or grammar mask / logit bias —
-        # their legitimate -inf entries are applied later and survive).
-        self.nan_guard.observe_logits(logits_output, ctx)
+        # Flag NaN per request and sanitize in place, before any sampling kernel.
+        self.nan_guard.audit_logits(logits_output, ctx)
 
         candidates = (
             self.drafter.get_candidates(ctx)
@@ -648,8 +643,7 @@ class ModelExecutor:
         # access). Clamp in place (this runs inside the CUDA graph) so grammar,
         # drafter, and the return value all observe clean ids. Mirror of the
         # draft-side draft_ids.clamp_(min=0) guard.
-        # NaN guard stage 2 first: record which requests produced the bad ids
-        # — the clamp below destroys that evidence.
+        # Record which requests produced bad ids before the clamp erases them.
         self.nan_guard.merge_oov(output_tokens, ctx, self.runtime_states.vocab_size)
         output_tokens.clamp_(min=0)
 
@@ -1317,11 +1311,8 @@ class ModelExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
-            # Reset the NaN-guard flags once per step, OUTSIDE the captured
-            # graph (the in-graph detection sites only OR into the buffer, so
-            # a multi-cycle step accumulates across cycles). Ordered after the
-            # previous step's flag D2H on this same stream.
-            self.nan_guard.reset()
+            # Outside the graph: in-graph sites only OR into the flag buffer.
+            self.nan_guard.reset(bs)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1591,7 +1582,7 @@ class ModelExecutor:
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
 
-                output_nan_flags = self.nan_guard.flags_to_cpu(bs)
+                output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = torch.cuda.Event()
                 copy_event.record()

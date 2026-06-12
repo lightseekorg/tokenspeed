@@ -20,41 +20,30 @@
 
 """Per-request NaN containment for the model executor.
 
-Models and kernels cannot be assumed 100% NaN-free (driver bugs, numerical
-edge cases, memory corruption). This guard keeps one corrupted request from
-poisoning the rest of the batch: it records *which* requests produced NaN
-logits (or an out-of-vocab token id, the symptom of a sampling kernel fed
-non-finite input), sanitizes the logits in place, and ships a per-request
-flag tensor to the CPU where the output processor terminates the flagged
-requests with ``ABORT_CODE.NumericalError``.
+Models and kernels cannot be assumed 100% NaN-free. This guard records
+*which* requests produced NaN logits (or an out-of-vocab token id),
+sanitizes the logits in place, and ships a per-request flag tensor to the
+CPU where the output processor terminates the flagged requests with
+``ABORT_CODE.NumericalError``.
 
 Design constraints (all hold by construction):
 
-- **Graph-safe / no sync.** Every device op is fixed-shape and the flag
-  buffer is persistent, so the whole guard captures into CUDA graphs.
-  Flags are OR-merged in-graph and zeroed once per executor step *outside*
-  the graph, so multi-cycle decode graphs accumulate correctly.
-- **Near-zero cost.** Detection is a single fused ``amax`` reduction over
-  the logits (NaN propagates through ``amax``; no ``isnan`` intermediate
-  the size of the logits is materialized) plus a handful of ops on
-  ``[bs]``-sized vectors; sanitize is one elementwise ``nan_to_num_``.
+- **Graph-safe / no sync.** Fixed-shape device ops on a persistent flag
+  buffer; flags OR in-graph and are zeroed once per step outside it, so
+  multi-cycle decode graphs accumulate correctly.
+- **Near-zero cost.** Detection is one fused ``amax`` reduction over the
+  logits (NaN propagates through ``amax``; no ``[rows, vocab]`` mask) plus
+  ops on ``[bs]``-sized vectors; sanitize is one ``nan_to_num_``.
 - **Rank-consistent.** OOV flags derive from already-broadcast token ids;
-  logits flags rely on the same bit-identical-logits-per-rank assumption
-  the conditional sampling broadcast already depends on. All ranks
-  therefore reach identical finish decisions — a rank-divergent finish
-  would desync batch composition and wedge collectives.
+  logits flags rely on the bit-identical-logits-per-rank assumption the
+  conditional sampling broadcast already depends on.
 - **Zero branching at call sites.** ``NanGuard.create`` returns a no-op
-  singleton when disabled, so the executor's hot path has no ``if``\\ s.
+  singleton when disabled.
 
-Limitation: with Batch-DP spec-verify sampling the logits arrive
-vocab/request-sharded per rank (``logits_layout_plan is not None``), so
-per-request logits attribution is skipped for those steps; sanitize still
-applies, and the OOV backstop still covers the gathered full-batch ids.
-
-Legitimate NaN sources stay harmless: warmup/dummy batches read
-uninitialized KV and may flag padding rows, but the CPU side only consults
-flags for rids tracked in ``rid_to_state``, and the buffer is re-zeroed
-every step.
+Limitation: with Batch-DP spec-verify sampling the logits arrive sharded
+(``logits_layout_plan is not None``), so logits attribution is skipped for
+those steps; sanitize still applies and the OOV backstop still covers the
+gathered full-batch ids.
 """
 
 from __future__ import annotations
@@ -67,9 +56,8 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_context import ForwardContext
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
-# Replacement for NaN / -inf logits. Logits are fp32 here; +-1e30 (vs.
-# finfo.max) leaves headroom so a later temperature division cannot
-# overflow back to inf. Matches SGLang's sanitize constants.
+# Replacement for NaN / +-inf logits (fp32). +-1e30 leaves headroom so a
+# later temperature division cannot overflow back to inf; matches SGLang.
 _NEG_SANITIZED = -1e30
 _POS_SANITIZED = 1e30
 
@@ -79,37 +67,36 @@ class NanGuard:
 
     Lifecycle per ``execute_forward_op``::
 
-        guard.reset()                      # outside the graph
+        guard.reset(bs)                    # outside the graph
         ... per forward cycle (in-graph):
-            guard.observe_logits(logits_output, ctx)   # pre-sampling
+            guard.audit_logits(logits_output, ctx)     # pre-sampling
             guard.merge_oov(tokens, ctx, vocab_size)   # pre-clamp
-        flags = guard.flags_to_cpu(bs)     # with the output D2H batch
+        flags = guard.flags_cpu            # with the output D2H batch
     """
 
     def __init__(self, max_bs: int, device: torch.device | str) -> None:
         self.flags = torch.zeros((max_bs,), dtype=torch.int32, device=device)
+        self._bs = 0
 
     @classmethod
     def create(cls, enabled: bool, max_bs: int, device) -> NanGuard:
         return cls(max_bs, device) if enabled else _DISABLED
 
-    def reset(self) -> None:
-        """Zero the flags. Call once per executor step, outside the graph."""
+    def reset(self, bs: int) -> None:
+        """Zero the flags and pin this step's batch size; call outside the graph."""
+        self._bs = bs
         self.flags.zero_()
 
-    def observe_logits(
+    def audit_logits(
         self, logits_output: LogitsProcessorOutput, ctx: ForwardContext
     ) -> None:
         """Flag requests with NaN logits, then sanitize the logits in place.
 
-        Must run before grammar vocab masks / logit_bias are applied so
-        their legitimate ``-inf`` entries survive sanitize, and before any
-        sampling kernel sees the logits.
+        Must run before sampling and before grammar vocab masks / logit_bias,
+        so their legitimate ``-inf`` entries survive sanitize.
         """
         logits = logits_output.next_token_logits
         if logits_output.logits_layout_plan is None:
-            # amax propagates NaN: one fused reduction gives per-row NaN
-            # presence without materializing a [rows, vocab] mask.
             self._or_per_request(torch.isnan(logits.amax(dim=-1)), ctx)
         torch.nan_to_num_(
             logits, nan=_NEG_SANITIZED, posinf=_POS_SANITIZED, neginf=_NEG_SANITIZED
@@ -120,22 +107,22 @@ class NanGuard:
     ) -> None:
         """Backstop: flag requests whose sampled ids fall outside [0, vocab).
 
-        Catches sampling-kernel misbehavior (the -1 argmax sentinel, or
-        rejection-sampling UB on garbage input). Must run before the
-        executor's in-vocab clamps — they erase the evidence. Token ids are
-        already TP-rank-synced here, so the flags stay rank-consistent.
+        Catches corruption past the logits (sampler/verify kernel output) and
+        covers DP-sharded steps. Must run before the in-vocab clamps — they
+        erase the evidence. Token ids are already rank-synced here.
         """
         self._or_per_request((output_tokens < 0) | (output_tokens >= vocab_size), ctx)
 
-    def flags_to_cpu(self, bs: int) -> torch.Tensor | None:
-        """Async D2H of the first ``bs`` flags (order with the copy event)."""
-        return self.flags[:bs].to("cpu", non_blocking=True)
+    @property
+    def flags_cpu(self) -> torch.Tensor | None:
+        """Async D2H of this step's flags (order with the copy event)."""
+        return self.flags[: self._bs].to("cpu", non_blocking=True)
 
     def _or_per_request(self, rows: torch.Tensor, ctx: ForwardContext) -> None:
         """OR a per-row bool vector into per-request flags.
 
-        Row layout mirrors ``_run_sampling``: ``[num_extends]`` one row per
-        prefill request, then ``num_decodes * n`` decode/verify rows.
+        Row layout mirrors ``_run_sampling``: ``[num_extends]`` extend rows,
+        then ``num_decodes * n`` decode/verify rows.
         """
         ne = ctx.num_extends
         nd = ctx.bs - ne
@@ -152,16 +139,17 @@ class _DisabledNanGuard(NanGuard):
     def __init__(self) -> None:  # no buffer
         pass
 
-    def reset(self) -> None:
+    def reset(self, bs: int) -> None:
         pass
 
-    def observe_logits(self, logits_output, ctx) -> None:
+    def audit_logits(self, logits_output, ctx) -> None:
         pass
 
     def merge_oov(self, output_tokens, ctx, vocab_size) -> None:
         pass
 
-    def flags_to_cpu(self, bs: int) -> None:
+    @property
+    def flags_cpu(self) -> None:
         return None
 
 

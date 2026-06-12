@@ -536,8 +536,7 @@ class OutputProcesser:
             if model_execution_results.output_logprobs is not None
             else None
         )
-        # Per-request numerical-corruption flags from the NaN guard
-        # (None when --disable-nan-guard). Aligned with forward_op.request_ids.
+        # NaN-guard flags, aligned with forward_op.request_ids (None when disabled).
         nan_flags_list = (
             model_execution_results.output_nan_flags.tolist()
             if model_execution_results.output_nan_flags is not None
@@ -570,16 +569,7 @@ class OutputProcesser:
             if not request_state.prefill_finished:
                 continue
 
-            # NaN-guard containment: terminate this request before its
-            # corrupted output streams any further. The single token kept
-            # below was sanitized on GPU (NaN logits nan_to_num'ed, token id
-            # clamped in-vocab), so detokenization stays safe; the abort
-            # finish_reason tells the client the output is unreliable.
-            nan_detected = (
-                nan_flags_list is not None
-                and i < len(nan_flags_list)
-                and nan_flags_list[i]
-            )
+            nan_detected = nan_flags_list is not None and nan_flags_list[i]
             if nan_detected and not request_state.finished:
                 request_state.finished_reason = FINISH_ABORT(
                     message=(
@@ -588,8 +578,7 @@ class OutputProcesser:
                     ),
                     err_type=ABORT_CODE.NumericalError,
                 )
-                # Keep exactly one (sanitized, in-vocab) token so the extend
-                # result matches a normal mid-step finish.
+                # Keep one sanitized token so accounting matches a mid-step finish.
                 model_output_ids = model_output_ids[:1]
                 if model_output_logprobs is not None:
                     model_output_logprobs = model_output_logprobs[:1]
@@ -604,8 +593,7 @@ class OutputProcesser:
 
             # Notify caller of first output token (used by prefill node to hand off
             # bootstrap token to the KV transfer layer before streaming output).
-            # Skip the PD handoff for NaN-terminated requests — their KV is
-            # suspect and the decode side must not continue from it.
+            # NaN-terminated requests skip the handoff: their KV is suspect.
             if on_first_token is not None and model_output_ids and not nan_detected:
                 spec_candidate_ids = None
                 if model_execution_results.next_input_ids is not None and i < len(
@@ -695,9 +683,7 @@ class OutputProcesser:
             elif request_state.finished:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
-                # NaN-terminated requests finish via Abort: the C++ AbortEvent
-                # skips the radix-tree insert and host-KV writeback (target and
-                # draft), so the corrupted KV is never reused by anyone else.
+                # Abort (vs Finish) keeps corrupted KV out of the prefix caches.
                 request_changes.append(
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )

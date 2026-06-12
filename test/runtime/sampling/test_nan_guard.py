@@ -39,18 +39,18 @@ def _logits_output(logits: torch.Tensor, layout_plan=None):
     return SimpleNamespace(next_token_logits=logits, logits_layout_plan=layout_plan)
 
 
-def test_observe_logits_flags_per_extend_row():
+def test_audit_logits_flags_per_extend_row():
     guard = NanGuard(max_bs=4, device="cpu")
     logits = torch.zeros((3, 8))
     logits[1, 5] = NAN
 
-    guard.observe_logits(_logits_output(logits), _ctx(bs=3, num_extends=3))
+    guard.audit_logits(_logits_output(logits), _ctx(bs=3, num_extends=3))
 
     assert guard.flags.tolist() == [0, 1, 0, 0]
     assert torch.isfinite(logits).all()  # sanitized in place
 
 
-def test_observe_logits_reduces_verify_rows_per_decode_slot():
+def test_audit_logits_reduces_verify_rows_per_decode_slot():
     """Spec-verify layout: ne extend rows then nd*n verify rows reduce to
     one flag per request slot."""
     guard = NanGuard(max_bs=4, device="cpu")
@@ -58,34 +58,34 @@ def test_observe_logits_reduces_verify_rows_per_decode_slot():
     logits = torch.zeros((7, 8))
     logits[5, 0] = NAN  # decode slot 1 (rows 4-6), middle row
 
-    guard.observe_logits(_logits_output(logits), _ctx(bs=3, num_extends=1))
+    guard.audit_logits(_logits_output(logits), _ctx(bs=3, num_extends=1))
 
     assert guard.flags.tolist() == [0, 0, 1, 0]
 
 
-def test_observe_logits_accumulates_and_reset_clears():
+def test_audit_logits_accumulates_and_reset_clears():
     """Flags OR across cycles (multi-cycle decode graphs); reset zeroes."""
     guard = NanGuard(max_bs=2, device="cpu")
     bad = torch.full((2, 4), 0.0)
     bad[0, 0] = NAN
 
-    guard.observe_logits(_logits_output(bad.clone()), _ctx(bs=2, num_extends=2))
+    guard.audit_logits(_logits_output(bad.clone()), _ctx(bs=2, num_extends=2))
     # A clean later cycle must not clear the flag.
-    guard.observe_logits(_logits_output(torch.zeros((2, 4))), _ctx(bs=2, num_extends=2))
+    guard.audit_logits(_logits_output(torch.zeros((2, 4))), _ctx(bs=2, num_extends=2))
     assert guard.flags.tolist() == [1, 0]
 
-    guard.reset()
+    guard.reset(2)
     assert guard.flags.tolist() == [0, 0]
 
 
-def test_observe_logits_skips_attribution_for_dp_sharded_layout():
+def test_audit_logits_skips_attribution_for_dp_sharded_layout():
     """With a logits_layout_plan (Batch-DP verify), rows don't map onto this
     rank's batch: no flags, but sanitize still applies."""
     guard = NanGuard(max_bs=2, device="cpu")
     logits = torch.zeros((2, 4))
     logits[0, 0] = NAN
 
-    guard.observe_logits(
+    guard.audit_logits(
         _logits_output(logits, layout_plan=object()), _ctx(bs=2, num_extends=2)
     )
 
@@ -93,7 +93,7 @@ def test_observe_logits_skips_attribution_for_dp_sharded_layout():
     assert torch.isfinite(logits).all()
 
 
-def test_observe_logits_ignores_inf_but_sanitizes_it():
+def test_audit_logits_ignores_inf_but_sanitizes_it():
     """Only NaN flags a request — +-inf logits are legitimate (vocab masks,
     logit bias) — yet sanitize maps them to large finite values."""
     guard = NanGuard(max_bs=2, device="cpu")
@@ -101,7 +101,7 @@ def test_observe_logits_ignores_inf_but_sanitizes_it():
     logits[0, 1] = float("inf")
     logits[1, 2] = float("-inf")
 
-    guard.observe_logits(_logits_output(logits), _ctx(bs=2, num_extends=2))
+    guard.audit_logits(_logits_output(logits), _ctx(bs=2, num_extends=2))
 
     assert guard.flags.tolist() == [0, 0]
     expected = float(torch.tensor(1e30, dtype=torch.float32))
@@ -133,20 +133,21 @@ def test_disabled_guard_is_inert():
     logits = torch.zeros((1, 4))
     logits[0, 0] = NAN
 
-    guard.reset()
-    guard.observe_logits(_logits_output(logits), _ctx(bs=1, num_extends=1))
+    guard.reset(1)
+    guard.audit_logits(_logits_output(logits), _ctx(bs=1, num_extends=1))
     guard.merge_oov(torch.tensor([-1]), _ctx(bs=1, num_extends=1), vocab_size=10)
 
-    assert guard.flags_to_cpu(1) is None
+    assert guard.flags_cpu is None
     # Disabled guard must not touch the logits either.
     assert torch.isnan(logits[0, 0])
 
 
-def test_flags_to_cpu_returns_first_bs_flags():
+def test_flags_cpu_returns_this_steps_flags():
     guard = NanGuard.create(True, 4, "cpu")
+    guard.reset(2)
     guard.flags[1] = 1
 
-    flags = guard.flags_to_cpu(2)
+    flags = guard.flags_cpu
 
     assert flags.device.type == "cpu"
     assert flags.tolist() == [0, 1]
