@@ -4189,14 +4189,19 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             ),
             mxfp4_block_size=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
             tp_size=tp_size,
-            max_tokens=min(getattr(config, "max_position_embeddings", 8192), 8192),
+            # Prefill GEMM/prenorm M is capped per forward by chunked_prefill_size
+            # (continuous batching), the same ceiling mega_moe warms to. Hardcoding
+            # 8192 would leave M in (8192, chunked_prefill_size] to JIT inline.
+            max_tokens=_deepseek_v4_mega_moe_max_num_tokens(),
             device=torch.device("cuda", torch.cuda.current_device()),
         )
 
     def post_quant_warmup(self) -> None:
         """Called by the weight loader after all quant process_weights_after_loading."""
         if deep_gemm is not None:
-            deep_gemm.warmup_fp8_gemm_nt_from_model(self)
+            deep_gemm.warmup_fp8_gemm_nt_from_model(
+                self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

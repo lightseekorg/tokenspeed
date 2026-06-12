@@ -16,74 +16,30 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def _token_count_sweep(max_tokens: int) -> list[int]:
-    """Token counts covering deep_gemm block_m tile boundaries.
+def _warmup_m_values(max_tokens: int) -> list[int]:
+    """Dense set of M (token counts) covering every deep_gemm tile.
 
-    deep_gemm compiles one cubin per unique (N, K, block_m) combination.
-    The block_m tile is selected by a heuristic based on M and the number
-    of SMs. We only need one representative M per block_m to trigger
-    compilation — sweeping more M values just wastes execution time.
+    A cubin's JIT key includes ``block_m``, ``block_n`` and the ``swap_ab`` flag,
+    all chosen by a C++ heuristic over ``(M, N, num_sms[, num_groups])`` that
+    deep_gemm does NOT expose to Python (``get_best_config`` lives in ``_C.so``).
+    Modelling that selection from Python is unreliable -- the choice flips with M
+    in ways that depend on ``swap_ab`` and (for batched GEMMs) the group count.
 
-    Block_m values range from 16 to 256 in steps of 16 (15 variants).
-    We pick one M per block_m step plus a few small values for decode-like
-    paths, keeping the total under 20 calls per weight shape.
-    """
-    values: set[int] = set()
-    values.update([1, 2, 4, 8])
-    for block_m in range(16, 257, 16):
-        if block_m <= max_tokens:
-            values.add(block_m)
-    values.add(max_tokens)
-    return sorted(values)
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _optimal_warmup_m_values(max_tokens: int, n: int) -> list[int]:
-    """M values that cover every deep_gemm block config for output dim ``n``.
-
-    Ported from vLLM's ``_generate_optimal_warmup_m_values``. The GEMM JIT key
-    is (N, K, block_m, ...) and M is NOT a key, but ``block_m`` is selected by
-    a C++ heuristic over (M, N, num_sms) that we cannot call from Python. So we
-    enumerate the M values that can FLIP that heuristic's choice -- the
-    wave-transition boundaries (per block_m/block_n) plus every block_m
-    multiple -- which is what the plain 16-step ``_token_count_sweep`` misses.
+    Instead we sample M densely and let the real heuristic pick at each point,
+    compiling whatever it selects. Because the serving path only ever runs
+    ``M in [1, max_tokens]``, sampling that whole interval provably covers every
+    reachable config. The tiling changes most often at small M (``swap_ab`` flips
+    and small ``block_m``), so we step by 1 there and coarsen for large M where
+    the selected tile is stable.
 
     Args:
-        max_tokens: largest M (token count) to cover.
-        n: output (N) dimension of the GEMM weight; the wave boundary depends
-            on ``ceil_div(n, block_n)``.
+        max_tokens: largest M (token count) the serving path can reach.
     """
-    try:
-        from tokenspeed_kernel.thirdparty.deep_gemm import get_num_sms
-
-        num_sms = get_num_sms()
-    except Exception:
-        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-
-    block_ms = [64, 128, 256]
-    block_ns = list(range(16, min(257, n + 1), 16))
-    m_values: set[int] = set([1, 2, 4] + list(range(8, 65, 8)))
-    # 16-step block_m values: the standard (non-grouped) GEMM heuristic picks
-    # block_m in 16-step increments up to 256 (e.g. block_m=224), which the
-    # 64/128/256 wave/multiple sweep below does not hit. M<=256 maps ~1:1 to
-    # block_m, so sweeping these M values covers those tiles.
-    m_values.update(v for v in range(16, 257, 16) if v <= max_tokens)
-    for block_m in block_ms:
-        for block_n in block_ns:
-            if block_n > n:
-                continue
-            for wave in range(1, 11):
-                m = wave * num_sms * block_m // _ceil_div(n, block_n)
-                if 1 <= m <= max_tokens:
-                    m_values.add(m)
-            for multiple in range(1, max_tokens // block_m + 1):
-                m = multiple * block_m
-                if m <= max_tokens:
-                    m_values.add(m)
-    return sorted(v for v in m_values if v <= max_tokens)
+    dense = min(max_tokens, 2048)
+    values: set[int] = set(range(1, dense + 1))
+    values.update(range(dense, max_tokens + 1, 16))
+    values.add(max_tokens)
+    return sorted(values)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +73,7 @@ def warmup_mega_moe_jit(
         logger.warning("deep_gemm mega_moe symbols unavailable, skipping warmup")
         return
 
-    token_counts = _optimal_warmup_m_values(max_num_tokens, hidden_size)
+    token_counts = _warmup_m_values(max_num_tokens)
     logger.info(
         "Warming up mega_moe JIT: %d token counts up to %d",
         len(token_counts),
@@ -222,31 +178,20 @@ def warmup_prefill_jit(
         )
         warmup_count += 1
 
-    if kv_lora_rank > 0:
-        num_heads = num_attention_heads // tp_size
-        _warmup_fp8_fp4_mqa_logits(
-            [
-                {
-                    "num_heads": num_heads,
-                    "head_dim": head_dim,
-                    "kv_dim": kv_lora_rank,
-                    "kv_scale_dim": kv_lora_rank // mxfp4_block_size,
-                    "max_kv_len": 4096,
-                }
-            ],
-            max_tokens,
-            device,
-        )
-        warmup_count += 1
-
     if index_n_heads > 0 and index_head_dim > 0:
-        # Decode sparse indexer uses the PAGED MQA-logits kernel
-        # (fp8_fp4_paged_mqa_logits) plus its schedule-metadata builder
-        # (get_paged_mqa_logits_metadata) -- distinct cubins from the ragged
-        # prefill fp8_fp4_mqa_logits above, and not otherwise warmed. Without
-        # this they JIT-compile inline on the first decode (the metadata kernel
-        # re-compiles per 32-aligned decode batch bucket), stalling the engine
-        # long enough to trip the gRPC health probe.
+        # Sparse-indexer kernels -- distinct cubins, not covered elsewhere:
+        #   prefill: ragged  fp8_fp4_mqa_logits
+        #   decode:  paged   fp8_fp4_paged_mqa_logits + get_paged_mqa_logits_metadata
+        # The indexer projections are replicated (config.index_n_heads heads,
+        # NOT TP-split), so gate on index_n_heads -- NOT kv_lora_rank, which is
+        # absent for V4-Flash. Without these the kernels JIT-compile inline on
+        # the first prefill/decode and stall the engine past the gRPC health
+        # probe.
+        _warmup_fp8_fp4_mqa_logits(
+            num_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            device=device,
+        )
         _warmup_fp8_fp4_paged_mqa_logits(
             num_heads=index_n_heads,
             index_head_dim=index_head_dim,
@@ -295,7 +240,7 @@ def _warmup_tf32_hc_prenorm_gemm(
 
         fn = torch.ones(mix_hc, hc_dim, dtype=torch.float32, device=device)
 
-        token_counts = _optimal_warmup_m_values(max_tokens, hc_hidden_size)
+        token_counts = _warmup_m_values(max_tokens)
         for num_tokens in token_counts:
             grid_size = ceil(num_tokens / block_m)
             n_splits = _compute_num_split(block_k, hc_hidden_size, grid_size)
@@ -323,78 +268,56 @@ def _warmup_tf32_hc_prenorm_gemm(
 
 
 def _warmup_fp8_fp4_mqa_logits(
-    shapes: list[dict],
-    max_tokens: int,
+    *,
+    num_heads: int,
+    index_head_dim: int,
     device: torch.device,
+    max_kv_len: int = 4096,
 ) -> None:
+    """Pre-compile the ragged prefill sparse-indexer ``fp8_fp4_mqa_logits``.
+
+    Mirrors the prefill call (deepseek_v4.py:1392): q = (int8 values, int32
+    scales), kv = (gathered int8 values, int32 scales), ragged ``cu_seq_len``
+    of length ``num_tokens`` (not +1). FP4 packs 2 values per byte, so the
+    per-head value dim is ``index_head_dim // 2``. Batch and kv length are not
+    JIT keys, so a couple of token counts suffice.
+
+    Args:
+        num_heads: sparse-indexer head count (``index_n_heads``).
+        index_head_dim: sparse-indexer per-head dim (e.g. 128).
+        device: CUDA device.
+        max_kv_len: representative KV length to warm up to.
+    """
     try:
         from tokenspeed_kernel.thirdparty.deep_gemm import fp8_fp4_mqa_logits
     except ImportError:
         logger.warning("deep_gemm fp8_fp4_mqa_logits unavailable, skipping")
         return
 
-    token_counts = _token_count_sweep(max_tokens)
+    head_dim_bytes = index_head_dim // 2
+    for num_tokens in (1, 256):
+        q_vals = torch.zeros(
+            num_tokens, num_heads, head_dim_bytes, dtype=torch.uint8, device=device
+        ).view(torch.int8)
+        q_scales = torch.zeros(num_tokens, num_heads, dtype=torch.int32, device=device)
+        k_vals = torch.zeros(
+            max_kv_len, head_dim_bytes, dtype=torch.uint8, device=device
+        ).view(torch.int8)
+        k_scales = torch.zeros(max_kv_len, dtype=torch.int32, device=device)
+        weights = torch.ones(num_tokens, num_heads, dtype=torch.float32, device=device)
+        cu_start = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        cu_end = torch.full((num_tokens,), max_kv_len, dtype=torch.int32, device=device)
 
-    for params in shapes:
-        num_heads = params["num_heads"]
-        head_dim = params["head_dim"]
-        kv_dim = params["kv_dim"]
-        kv_scale_dim = params["kv_scale_dim"]
-        max_kv_len = params.get("max_kv_len", 4096)
-
-        for num_tokens in token_counts:
-            q_vals = torch.zeros(
-                num_tokens,
-                num_heads,
-                head_dim,
-                dtype=torch.int8,
-                device=device,
-            )
-            q_scales = torch.ones(
-                num_tokens,
-                num_heads,
-                dtype=torch.float32,
-                device=device,
-            )
-            k_vals = torch.zeros(
-                max_kv_len,
-                kv_dim,
-                dtype=torch.int8,
-                device=device,
-            )
-            k_scales = torch.ones(
-                max_kv_len,
-                kv_scale_dim,
-                dtype=torch.uint8,
-                device=device,
-            )
-            weights = torch.ones(
-                num_tokens,
-                dtype=torch.float32,
-                device=device,
-            )
-            cu_start = torch.zeros(
-                num_tokens + 1,
-                dtype=torch.int32,
-                device=device,
-            )
-            cu_end = torch.full(
-                (num_tokens + 1,),
-                max_kv_len,
-                dtype=torch.int32,
-                device=device,
-            )
-
-            fp8_fp4_mqa_logits(
-                q=(q_vals, q_scales),
-                kv=(k_vals, k_scales),
-                weights=weights,
-                cu_seq_len_k_start=cu_start,
-                cu_seq_len_k_end=cu_end,
-                clean_logits=True,
-                max_seqlen_k=max_kv_len,
-                logits_dtype=torch.float32,
-            )
+        fp8_fp4_mqa_logits(
+            q=(q_vals, q_scales),
+            kv=(k_vals, k_scales),
+            weights=weights,
+            cu_seq_len_k_start=cu_start,
+            cu_seq_len_k_end=cu_end,
+            clean_logits=False,
+            max_seqlen_k=max_kv_len,
+            logits_dtype=torch.float32,
+        )
 
 
 def _warmup_fp8_fp4_paged_mqa_logits(
@@ -526,7 +449,7 @@ def warmup_fp8_gemm_nt(
         )
         out = torch.empty(max_tokens, n, dtype=torch.bfloat16, device=device)
 
-        token_counts = _optimal_warmup_m_values(max_tokens, n)
+        token_counts = _warmup_m_values(max_tokens)
         for num_tokens in token_counts:
             fp8_gemm_nt(
                 (a[:num_tokens], a_scales[:num_tokens]), (b, b_scales), out[:num_tokens]
@@ -538,15 +461,92 @@ def warmup_fp8_gemm_nt(
     torch.cuda.synchronize()
 
 
+def warmup_fp8_einsum(
+    bmm_layers: list[tuple[torch.Tensor, torch.Tensor, int, int]],
+    max_tokens: int,
+    device: torch.device,
+) -> None:
+    """Pre-compile ``fp8_einsum("bhr,hdr->bhd")`` for is_bmm output projections.
+
+    The attention output projection (V4 ``wo_a``) runs a per-group *batched* FP8
+    GEMM via ``deep_gemm.fp8_einsum`` -- a distinct ``GemmType::Batched`` path that
+    ``warmup_fp8_gemm_nt`` does NOT cover. Its ``block_m`` grows with the prefill
+    token count M, so serving JITs new (N, K, block_m) tiles inline unless we
+    sweep M offline. The activation operand is laid out exactly as
+    ``deepseek_v4_fused_inv_rope_fp8_quant`` returns it (per-group, transposed,
+    TMA-aligned INT32 UE8M0 scales); only its values are dummy -- the kernel's
+    JIT key is shape-only.
+
+    Args:
+        bmm_layers: ``(weight, weight_scale_inv, n_groups, block_n)`` tuples taken
+            from the loaded model (real weights/scales are reused so no scale
+            layout is guessed). ``weight`` is ``[n_groups * N, K]``; per group the
+            GEMM is ``(M, K) x (N, K) -> (M, N)``.
+        max_tokens: maximum prefill token count to warm up to.
+        device: CUDA device.
+    """
+    try:
+        from tokenspeed_kernel.thirdparty.deep_gemm import fp8_einsum
+    except ImportError:
+        logger.warning("deep_gemm fp8_einsum unavailable, skipping bmm warmup")
+        return
+
+    for weight, weight_scale_inv, n_groups, block_n in bmm_layers:
+        in_dim = weight.shape[1]  # K (== r == per-group quant dim)
+        o_lora_rank = weight.shape[0] // n_groups  # N (per-group output)
+        w = weight.view(n_groups, o_lora_rank, in_dim)
+        recipe = (1, 1, block_n)
+        num_scale_blocks = in_dim // block_n
+
+        # N drives the batched GEMM's block_m heuristic, so sweep M against it.
+        for num_tokens in _warmup_m_values(max_tokens):
+            tma_aligned_t = ((num_tokens + 3) // 4) * 4
+            scale_inner = (num_scale_blocks + 3) // 4  # tma-aligned INT32 scales
+            o_fp8 = torch.zeros(
+                (n_groups, num_tokens, in_dim),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ).transpose(0, 1)
+            o_scale = (
+                torch.zeros(
+                    n_groups * scale_inner * tma_aligned_t,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                .as_strided(
+                    (n_groups, num_tokens, scale_inner),
+                    (scale_inner * tma_aligned_t, 1, tma_aligned_t),
+                )
+                .transpose(0, 1)
+            )
+            z = torch.empty(
+                (num_tokens, n_groups, o_lora_rank),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            fp8_einsum(
+                "bhr,hdr->bhd",
+                (o_fp8, o_scale),
+                (w, weight_scale_inv),
+                z,
+                recipe=recipe,
+            )
+
+    logger.info("Warmed up fp8_einsum for %d bmm shapes", len(bmm_layers))
+    torch.cuda.synchronize()
+
+
 def warmup_fp8_gemm_nt_from_model(
     model: torch.nn.Module,
     max_tokens: int = 8192,
 ) -> None:
-    """Scan a model for deep_gemm FP8 linear layers and warm up ``fp8_gemm_nt``.
+    """Scan a model for deep_gemm FP8 linear layers and warm their JIT tiles.
 
     Collects (N, K) weight shapes from all modules where
-    ``_use_deep_gemm_fp8=True`` (set by ``Fp8LinearMethod.process_weights_after_loading``),
-    excluding BMM layers (handled by ``fp8_einsum``).
+    ``_use_deep_gemm_fp8=True`` (set by ``Fp8LinearMethod.process_weights_after_loading``):
+    plain projections are warmed via ``fp8_gemm_nt`` and is_bmm projections
+    (V4 ``wo_a``) via ``fp8_einsum`` -- both grow ``block_m`` with M, so both must
+    be swept offline or they JIT inline on the first long prefill.
 
     Call after ``quant_method.process_weights_after_loading()`` has run on all
     modules so the ``_use_deep_gemm_fp8`` flag is set.
@@ -554,14 +554,34 @@ def warmup_fp8_gemm_nt_from_model(
     if torch.cuda.get_device_capability()[0] < 10:
         return
     shapes: set[tuple[int, int]] = set()
+    bmm_layers: list[tuple[torch.Tensor, torch.Tensor, int, int]] = []
+    bmm_seen: set[tuple] = set()
     for module in model.modules():
-        if getattr(module, "_use_deep_gemm_fp8", False) and not getattr(
-            module, "is_bmm", False
-        ):
+        if not getattr(module, "_use_deep_gemm_fp8", False):
+            continue
+        if getattr(module, "is_bmm", False):
+            n_groups = getattr(module, "bmm_batch_size", 0)
+            block_size = getattr(module, "_deep_gemm_block_size", None)
+            if not n_groups or not block_size:
+                continue
+            key = (tuple(module.weight.shape), n_groups, block_size[0])
+            if key in bmm_seen:
+                continue
+            bmm_seen.add(key)
+            bmm_layers.append(
+                (module.weight, module.weight_scale_inv, n_groups, block_size[0])
+            )
+        else:
             n, k = module.weight.shape
             shapes.add((n, k))
-    if not shapes:
+    if not shapes and not bmm_layers:
         return
     device = next(model.parameters()).device
-    logger.info("Pre-compiling %d deep_gemm FP8 GEMM shapes...", len(shapes))
-    warmup_fp8_gemm_nt(list(shapes), max_tokens, device)
+    if shapes:
+        logger.info("Pre-compiling %d deep_gemm FP8 GEMM shapes...", len(shapes))
+        warmup_fp8_gemm_nt(list(shapes), max_tokens, device)
+    if bmm_layers:
+        logger.info(
+            "Pre-compiling %d deep_gemm FP8 einsum (bmm) shapes...", len(bmm_layers)
+        )
+        warmup_fp8_einsum(bmm_layers, max_tokens, device)
