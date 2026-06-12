@@ -4539,51 +4539,28 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # X is stored as raw i8 in LDS and bitcast to e4m3 in mfma_scaled; pass the
     # uint8 view (an fp8 LDS buffer fails to lower).
     x_uint8 = x_fp8.view(torch.uint8)
+    # fmt: off
     _warp_decode_topk_stage1_coop_kernel[coop_grid](
-        x_uint8,
-        router_logits_c,
-        w13_raw,
-        w13_scale,
-        topk_ids,
-        topk_weights,
-        inter,
-        n_tokens,
-        n_experts,
-        D,
-        I,
-        x_uint8.stride(0),
-        x_uint8.stride(1),
-        router_logits_c.stride(0),
-        topk_ids.stride(0),
-        topk_weights.stride(0),
-        w13_raw.stride(0),
-        w13_raw.stride(-2),
-        w13_raw.stride(-1),
-        w13_scale.stride(0),
-        w13_scale.stride(-2),
-        w13_scale.stride(-1),
-        inter.stride(0),
-        inter.stride(1),
-        w13_act_scale,
-        w2_act_scale,
-        b13,
-        D_PACKED=D // 2,
-        TOPK=top_k,
+        x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
+        n_tokens, n_experts, D, I,
+        x_uint8.stride(0), x_uint8.stride(1),
+        router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
+        w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
+        w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
+        inter.stride(0), inter.stride(1),
+        w13_act_scale, w2_act_scale, b13,
+        D_PACKED=D // 2, TOPK=top_k,
         # EP/TKP: padded widths of the [tokens, experts] logits tile and the
         # top-k selection tile; >= 64*num_warps keeps the blocked layout valid.
-        EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS),
-        TKP=64 * COOP_NUM_WARPS,
+        EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS), TKP=64 * COOP_NUM_WARPS,
         X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
-        BLOCK_K=COOP_BLOCK_K,
-        BLOCK_N=COOP_BLOCK_N,
-        BLOCK_M=16,
-        NUM_BUFFERS=COOP_NUM_BUFFERS,
-        NUM_WARPS=COOP_NUM_WARPS,
+        BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
+        NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
         HAS_BIAS=w13_bias is not None,
-        SWIGLU_ALPHA=float(swiglu_alpha),
-        SWIGLU_LIMIT=float(swiglu_limit),
+        SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
         num_warps=COOP_NUM_WARPS,
     )
+    # fmt: on
 
     n_tiles2 = (N + S2_BLOCK_N - 1) // S2_BLOCK_N
     if s2_split_k > 1:
@@ -4601,55 +4578,32 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         s2_stride_on = out.stride(1)
         s2_stride_ok = 0
         s2_grid = (n_tokens * n_tiles2,)
+    # fmt: off
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
-        inter,
-        w2_raw,
-        w2_scale,
-        topk_ids,
-        topk_weights,
-        s2_dst,
-        n_tokens,
-        N,
-        I,
-        inter.stride(0),
-        inter.stride(1),
-        w2_raw.stride(0),
-        w2_raw.stride(-2),
-        w2_raw.stride(-1),
-        w2_scale.stride(0),
-        w2_scale.stride(-2),
-        w2_scale.stride(-1),
-        s2_stride_om,
-        s2_stride_on,
-        s2_stride_ok,
-        w2_act_scale,
-        b2,
-        I_PACKED=I // 2,
-        TOPK=top_k,
-        BLOCK_K=BLOCK_K,
-        BLOCK_N=S2_BLOCK_N,
-        M_DUP=S2_M_DUP,
-        HAS_BIAS=w2_bias is not None,
-        SPLIT_K=s2_split_k,
+        inter, w2_raw, w2_scale, topk_ids, topk_weights, s2_dst,
+        n_tokens, N, I,
+        inter.stride(0), inter.stride(1),
+        w2_raw.stride(0), w2_raw.stride(-2), w2_raw.stride(-1),
+        w2_scale.stride(0), w2_scale.stride(-2), w2_scale.stride(-1),
+        s2_stride_om, s2_stride_on, s2_stride_ok,
+        w2_act_scale, b2,
+        I_PACKED=I // 2, TOPK=top_k,
+        BLOCK_K=BLOCK_K, BLOCK_N=S2_BLOCK_N, M_DUP=S2_M_DUP,
+        HAS_BIAS=w2_bias is not None, SPLIT_K=s2_split_k,
         num_warps=1,
     )
+    # fmt: on
     if s2_split_k > 1:
         R_BLOCK_N = 256
         r_grid = (n_tokens * ((N + R_BLOCK_N - 1) // R_BLOCK_N),)
+        # fmt: off
         _warp_decode_stage2_reduce[r_grid](
-            out_partial,
-            out,
-            n_tokens,
-            N,
-            out_partial.stride(0),
-            out_partial.stride(1),
-            out_partial.stride(2),
-            out.stride(0),
-            out.stride(1),
-            SPLIT_K=s2_split_k,
-            BLOCK_N=R_BLOCK_N,
-            num_warps=1,
+            out_partial, out, n_tokens, N,
+            out_partial.stride(0), out_partial.stride(1), out_partial.stride(2),
+            out.stride(0), out.stride(1),
+            SPLIT_K=s2_split_k, BLOCK_N=R_BLOCK_N, num_warps=1,
         )
+        # fmt: on
     return out
 
 
@@ -5383,41 +5337,21 @@ def _warp_decode_topk_stage1_coop_kernel(
     expert = gl.sum(
         gl.where(slot_sel, idx_t, gl.zeros([TKP], gl.int32, layout=LT)), axis=0
     )
+    # Grouped by role: coords / tensors / shapes / strides / scalars / constexpr.
+    # fmt: off
     _warp_decode_stage1_coop_compute(
-        token,
-        slot,
-        expert,
-        pid_n,
-        X,
-        W,
-        WScale,
-        Y,
-        M,
-        D,
-        I,
-        stride_xm,
-        stride_xk,
-        stride_we,
-        stride_wk,
-        stride_wn,
-        stride_wse,
-        stride_wsk,
-        stride_wsn,
-        stride_ym,
-        stride_yn,
-        x_global_scale_ptr,
-        out_quant_scale_ptr,
-        w13_bias,
-        TOPK,
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
-        NUM_BUFFERS,
-        NUM_WARPS,
-        HAS_BIAS,
-        SWIGLU_ALPHA,
-        SWIGLU_LIMIT,
+        token, slot, expert, pid_n,
+        X, W, WScale, Y,
+        M, D, I,
+        stride_xm, stride_xk,
+        stride_we, stride_wk, stride_wn,
+        stride_wse, stride_wsk, stride_wsn,
+        stride_ym, stride_yn,
+        x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
+        TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
+        HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
     )
+    # fmt: on
 
 
 @gluon.jit
@@ -5497,50 +5431,20 @@ def _warp_decode_stage2_load_pair(
     I_PACKED: gl.constexpr,
 ):
     """Load the even (kt) and odd (kt+1) K-tiles of one pipeline step."""
+    # fmt: off
     a_even, b_even, s_even = _warp_decode_stage2_load_tile(
-        kt,
-        ak,
-        bk,
-        bsk,
-        am,
-        X,
-        W,
-        WScale,
-        x_row_off,
-        w_n_off,
-        ws_expert_off,
-        scale_row_off,
-        stride_xk,
-        stride_wk,
-        stride_wsk,
-        I,
-        BLOCK_K,
-        BLOCK_K_PACKED,
-        BLOCK_K_SCALE,
-        I_PACKED,
+        kt, ak, bk, bsk, am, X, W, WScale,
+        x_row_off, w_n_off, ws_expert_off, scale_row_off,
+        stride_xk, stride_wk, stride_wsk, I,
+        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
     )
     a_odd, b_odd, s_odd = _warp_decode_stage2_load_tile(
-        kt + 1,
-        ak,
-        bk,
-        bsk,
-        am,
-        X,
-        W,
-        WScale,
-        x_row_off,
-        w_n_off,
-        ws_expert_off,
-        scale_row_off,
-        stride_xk,
-        stride_wk,
-        stride_wsk,
-        I,
-        BLOCK_K,
-        BLOCK_K_PACKED,
-        BLOCK_K_SCALE,
-        I_PACKED,
+        kt + 1, ak, bk, bsk, am, X, W, WScale,
+        x_row_off, w_n_off, ws_expert_off, scale_row_off,
+        stride_xk, stride_wk, stride_wsk, I,
+        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
     )
+    # fmt: on
     return a_even, b_even, s_even, a_odd, b_odd, s_odd
 
 
@@ -5549,24 +5453,16 @@ def _warp_decode_stage2_mfma_pair(
     acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
 ):
     """Accumulate the scaled-MFMA of one even+odd K-tile pair (fp8 x mxfp4)."""
+    # fmt: off
     acc = gl.amd.cdna4.mfma_scaled(
-        a=a_even,
-        a_scale=a_scale,
-        a_format="e4m3",
-        b=b_even,
-        b_scale=s_even,
-        b_format="e2m1",
-        acc=acc,
+        a=a_even, a_scale=a_scale, a_format="e4m3",
+        b=b_even, b_scale=s_even, b_format="e2m1", acc=acc,
     )
     acc = gl.amd.cdna4.mfma_scaled(
-        a=a_odd,
-        a_scale=a_scale,
-        a_format="e4m3",
-        b=b_odd,
-        b_scale=s_odd,
-        b_format="e2m1",
-        acc=acc,
+        a=a_odd, a_scale=a_scale, a_format="e4m3",
+        b=b_odd, b_scale=s_odd, b_format="e2m1", acc=acc,
     )
+    # fmt: on
     return acc
 
 
@@ -5675,71 +5571,29 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                 # prefetch the first pair, then each iteration loads the next pair
                 # before MFMA-ing the current one (prefetch depth 2).
                 main_kt = main_end - kt_start
+                # fmt: off
                 if main_kt > 0:
-                    a_even, b_even, s_even, a_odd, b_odd, s_odd = (
-                        _warp_decode_stage2_load_pair(
-                            kt_start,
-                            ak,
-                            bk,
-                            bsk,
-                            am,
-                            X,
-                            W,
-                            WScale,
-                            x_row_off,
-                            w_n_off,
-                            ws_expert_off,
-                            scale_row_off,
-                            stride_xk,
-                            stride_wk,
-                            stride_wsk,
-                            I,
-                            BLOCK_K,
-                            BLOCK_K_PACKED,
-                            BLOCK_K_SCALE,
-                            I_PACKED,
-                        )
+                    (a_even, b_even, s_even,
+                     a_odd, b_odd, s_odd) = _warp_decode_stage2_load_pair(
+                        kt_start, ak, bk, bsk, am, X, W, WScale,
+                        x_row_off, w_n_off, ws_expert_off, scale_row_off,
+                        stride_xk, stride_wk, stride_wsk, I,
+                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
                     )
                     for kt in range(kt_start, main_end - 2, 2):
-                        (
-                            nxt_a_even,
-                            nxt_b_even,
-                            nxt_s_even,
-                            nxt_a_odd,
-                            nxt_b_odd,
-                            nxt_s_odd,
-                        ) = _warp_decode_stage2_load_pair(
-                            kt + 2,
-                            ak,
-                            bk,
-                            bsk,
-                            am,
-                            X,
-                            W,
-                            WScale,
-                            x_row_off,
-                            w_n_off,
-                            ws_expert_off,
-                            scale_row_off,
-                            stride_xk,
-                            stride_wk,
-                            stride_wsk,
-                            I,
-                            BLOCK_K,
-                            BLOCK_K_PACKED,
-                            BLOCK_K_SCALE,
-                            I_PACKED,
+                        (nxt_a_even, nxt_b_even, nxt_s_even,
+                         nxt_a_odd, nxt_b_odd, nxt_s_odd) = _warp_decode_stage2_load_pair(
+                            kt + 2, ak, bk, bsk, am, X, W, WScale,
+                            x_row_off, w_n_off, ws_expert_off, scale_row_off,
+                            stride_xk, stride_wk, stride_wsk, I,
+                            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
                         )
                         acc = _warp_decode_stage2_mfma_pair(
                             acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
                         )
                         a_even, b_even, s_even, a_odd, b_odd, s_odd = (
-                            nxt_a_even,
-                            nxt_b_even,
-                            nxt_s_even,
-                            nxt_a_odd,
-                            nxt_b_odd,
-                            nxt_s_odd,
+                            nxt_a_even, nxt_b_even, nxt_s_even,
+                            nxt_a_odd, nxt_b_odd, nxt_s_odd,
                         )
                     # Epilogue: MFMA the final prefetched pair.
                     acc = _warp_decode_stage2_mfma_pair(
@@ -5748,37 +5602,17 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                 # Masked remainder: leftover odd/partial K-tile(s) in this split.
                 for kt in range(main_end, kt_stop):
                     a_t, b_t, s_t = _warp_decode_stage2_load_tile(
-                        kt,
-                        ak,
-                        bk,
-                        bsk,
-                        am,
-                        X,
-                        W,
-                        WScale,
-                        x_row_off,
-                        w_n_off,
-                        ws_expert_off,
-                        scale_row_off,
-                        stride_xk,
-                        stride_wk,
-                        stride_wsk,
-                        I,
-                        BLOCK_K,
-                        BLOCK_K_PACKED,
-                        BLOCK_K_SCALE,
-                        I_PACKED,
+                        kt, ak, bk, bsk, am, X, W, WScale,
+                        x_row_off, w_n_off, ws_expert_off, scale_row_off,
+                        stride_xk, stride_wk, stride_wsk, I,
+                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
                         MASK_TAIL=True,
                     )
                     acc = gl.amd.cdna4.mfma_scaled(
-                        a=a_t,
-                        a_scale=a_scale,
-                        a_format="e4m3",
-                        b=b_t,
-                        b_scale=s_t,
-                        b_format="e2m1",
-                        acc=acc,
+                        a=a_t, a_scale=a_scale, a_format="e4m3",
+                        b=b_t, b_scale=s_t, b_format="e2m1", acc=acc,
                     )
+                # fmt: on
                 acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
                 if HAS_BIAS:
                     bias_n = pid_n * BLOCK_N + gl.arange(
