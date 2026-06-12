@@ -56,6 +56,7 @@ class InputBuffers:
         dummy_kv_slot: int,
         device: str = "cuda",
         has_mamba: bool = False,
+        min_padding_seq_len: int = 1,
     ):
         self.device = device
         self.page_size = page_size
@@ -64,6 +65,10 @@ class InputBuffers:
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
         self.has_mamba = has_mamba
+        # Padding rows' seq_lens; >= spec_num_tokens so the EAGLE catch-up trim
+        # (seq_lens -= spec_num_tokens - accept_len) can't underflow them. 1 for
+        # non-spec.
+        self.min_padding_seq_len = min_padding_seq_len
 
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
@@ -385,7 +390,7 @@ class InputBuffers:
             self.mrope_positions_buf[:, total_tokens:].zero_()
         if batch_size < self.max_bs:
             self.req_pool_indices_buf[batch_size:].fill_(0)
-            self.seq_lens_buf[batch_size:].fill_(1)
+            self.seq_lens_buf[batch_size:].fill_(self.min_padding_seq_len)
 
         if (
             self.has_mamba
@@ -437,4 +442,6 @@ class InputBuffers:
             # seq_lens must be >= spec_num_tokens so the drafter's prewrite
             # correction never goes negative.
             num_tokens_per_req = total_tokens // batch_size if batch_size > 0 else 1
-            self.seq_lens_buf[:batch_size].fill_(max(num_tokens_per_req, 1))
+            self.seq_lens_buf[:batch_size].fill_(
+                max(num_tokens_per_req, self.min_padding_seq_len)
+            )
