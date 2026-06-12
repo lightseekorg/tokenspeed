@@ -57,10 +57,7 @@ class ModelExecutionResult:
     output_logprobs: torch.Tensor | None = None
     # Optional next-round input rows captured for PD prefill data-plane handoff.
     next_input_ids: torch.Tensor | None = None
-    # Per-request numerical-corruption flags (int32, [bs], CPU after sync;
-    # nonzero = NaN seen in this request's logits this step, or an
-    # out-of-vocab token id escaped the sampler). None when the NaN guard is
-    # disabled. The output processor terminates flagged requests.
+    # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
 
     def sync(self) -> None:
