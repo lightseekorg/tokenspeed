@@ -47,16 +47,20 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 128, 8, 2)],
+    [(torch.bfloat16, 64, 8, 2)],
 )
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
+@pytest.mark.parametrize("is_sliding", [False, True], ids=["full", "sliding"])
 def test_mha_prefill(
     device: str,
     dtype: torch.dtype,
     head_dim: int,
     num_q_heads: int,
     num_kv_heads: int,
+    has_sink: bool,
+    is_sliding: bool,
 ) -> None:
-    seqlens_list = [17, 9, 12]
+    seqlens_list = [851, 914, 1053]
     max_seqlen = max(seqlens_list)
     cu_seqlens_cpu = [0]
     for seqlen in seqlens_list:
@@ -68,6 +72,12 @@ def test_mha_prefill(
     q = torch.randn(total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
     v = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+    sinks = (
+        torch.randn(num_q_heads, device=device, dtype=torch.float32)
+        if has_sink
+        else None
+    )
+    window_left = 127 if is_sliding else -1
 
     out = mha_prefill(
         q=q,
@@ -76,9 +86,12 @@ def test_mha_prefill(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         max_seqlen=max_seqlen,
+        window_left=window_left,
+        sinks=sinks,
     )
 
     assert out.shape == q.shape
+    assert not torch.isnan(out).any()
 
 
 @pytest.mark.parametrize(
