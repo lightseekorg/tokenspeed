@@ -247,12 +247,11 @@ class ServerArgs:
     disable_prefill_graph: bool | None = False
     prefill_graph_max_tokens: int | None = 128
     cudagraph_capture_sizes: list[int] | None = None
-    enable_nan_detection: bool = False
-    # Always-on NaN containment: sanitize non-finite logits before sampling,
-    # detect affected requests, and terminate them with an error instead of
-    # letting corruption spread (graph-safe, ~O(bs*vocab) elementwise per
-    # step). Distinct from enable_nan_detection, the sync-heavy debug knob.
-    disable_nan_guard: bool = False
+    # On-by-default NaN containment: sanitize non-finite logits before
+    # sampling, detect affected requests, and terminate them with an error
+    # instead of letting corruption spread (graph-safe, ~O(bs*vocab)
+    # elementwise per step).
+    enable_nan_detection: bool = True
     enable_nvtx: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -1573,13 +1572,15 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="Enable the NaN detection for debugging purposes.",
+            dest="enable_nan_detection",
+            default=ServerArgs.enable_nan_detection,
+            help="Explicitly enable the NaN guard (already the default).",
         )
         parser.add_argument(
-            "--disable-nan-guard",
-            action="store_true",
-            default=ServerArgs.disable_nan_guard,
-            help="Disable the always-on NaN guard. By default the engine "
+            "--disable-nan-detection",
+            action="store_false",
+            dest="enable_nan_detection",
+            help="Disable the on-by-default NaN guard. By default the engine "
             "sanitizes non-finite logits before sampling, detects requests "
             "whose logits contained NaN (or whose sampled token id escaped "
             "the vocab range), and terminates only those requests with a "

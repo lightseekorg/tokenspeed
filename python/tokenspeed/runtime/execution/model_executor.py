@@ -106,7 +106,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
-    nan_guard: bool = True
+    enable_nan_detection: bool = True
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -176,7 +176,7 @@ class ModelExecutorConfig:
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
-            nan_guard=not server_args.disable_nan_guard,
+            enable_nan_detection=server_args.enable_nan_detection,
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
@@ -246,7 +246,7 @@ class ModelExecutor:
         )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
-            config.nan_guard,
+            config.enable_nan_detection,
             config.max_num_seqs // max(config.data_parallel_size, 1),
             self.device,
         )
