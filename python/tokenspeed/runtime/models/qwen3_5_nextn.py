@@ -24,6 +24,7 @@ import logging
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -44,11 +45,6 @@ from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
 )
 from tokenspeed.runtime.utils import add_prefix
-
-# isort: off
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-
-# isort: on
 
 logger = logging.getLogger(__name__)
 
