@@ -15,9 +15,10 @@ env:
 install:
   - bash test/ci_system/install_deps.sh
 server:
+  # b300-only job: the b300 pool does not yet have the raised RLIMIT_MEMLOCK
+  # that InstantTensor's io_uring loader requires, so use the default loader.
   command: >-
     ts serve
-    --load-format instanttensor
     --model nvidia/Kimi-K2.5-NVFP4
     --attn-tp-size 4
     --moe-tp-size 4
