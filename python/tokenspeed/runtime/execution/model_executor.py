@@ -234,7 +234,6 @@ class ModelExecutor:
             dummy_kv_slot=0,
             device=self.device,
             has_mamba=(mamba_pool is not None),
-            min_padding_seq_len=spec_num_tokens,
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
