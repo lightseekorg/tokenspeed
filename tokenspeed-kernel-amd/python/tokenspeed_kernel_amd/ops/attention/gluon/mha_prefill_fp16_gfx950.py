@@ -56,7 +56,6 @@ class AttentionConfig:
     BATCH_SIZE: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
-    IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
@@ -87,7 +86,6 @@ class AttentionConfig:
         BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
-        IS_SLIDING,
         WINDOW_LEFT,
         q_strides,
         k_strides,
@@ -95,10 +93,6 @@ class AttentionConfig:
     ):
         assert HEAD_DIM == 64
         assert NUM_WARPS == 4
-        if IS_SLIDING:
-            assert WINDOW_LEFT >= 0
-        else:
-            assert WINDOW_LEFT == -1
 
         qk_layout = gl.amd.AMDMFMALayout(
             version=4,
@@ -130,7 +124,6 @@ class AttentionConfig:
         self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
-        self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
@@ -669,7 +662,7 @@ def process_single_attention_tile(
     valid = mask_offs_m[:, None] < program.seq_len
     valid &= mask_offs_n[None, :] < program.seq_len
     valid &= mask_offs_n[None, :] <= mask_offs_m[:, None]
-    if cfg.IS_SLIDING:
+    if cfg.WINDOW_LEFT >= 0:
         valid &= mask_offs_m[:, None] <= mask_offs_n[None, :] + cfg.WINDOW_LEFT
 
     qk = gl.where(valid, qk, -1.0e20)
@@ -708,7 +701,7 @@ def process_attention_tile(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
 
-    if cfg.IS_SLIDING:
+    if cfg.WINDOW_LEFT >= 0:
         kv_start = program.q_start - cfg.WINDOW_LEFT
         kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
         num_kv_tiles: gl.constexpr = (
@@ -835,7 +828,6 @@ def _mha_prefill_fp16(
     max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
-    IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
 ):
     cfg = AttentionConfig(
@@ -849,7 +841,6 @@ def _mha_prefill_fp16(
         BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
-        IS_SLIDING,
         WINDOW_LEFT,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
@@ -922,7 +913,6 @@ def _mha_prefill_sliding_fp16(
     max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
-    IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
 ):
     cfg = AttentionConfig(
@@ -936,7 +926,6 @@ def _mha_prefill_sliding_fp16(
         BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
-        IS_SLIDING,
         WINDOW_LEFT,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
@@ -983,7 +972,6 @@ class LaunchConfig(NamedTuple):
     num_warps: int
     batch_size: int
     max_seqlen: int
-    is_sliding: bool
     window_left: int
     grid: tuple[int, ...]
 
@@ -1003,8 +991,7 @@ def get_config(
     block_n = 64
     num_warps = 4
     batch_size = cu_seqlens_q.numel() - 1
-    is_sliding = window_left >= 0
-    window_left = window_left if is_sliding else -1
+    window_left = window_left if window_left >= 0 else -1
     sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
     return LaunchConfig(
         n_heads=n_heads,
@@ -1016,7 +1003,6 @@ def get_config(
         num_warps=num_warps,
         batch_size=batch_size,
         max_seqlen=max_seqlen,
-        is_sliding=is_sliding,
         window_left=window_left,
         grid=(512,),
     )
@@ -1053,7 +1039,7 @@ def gluon_mha_prefill_fp16_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    kernel = _mha_prefill_sliding_fp16 if config.is_sliding else _mha_prefill_fp16
+    kernel = _mha_prefill_sliding_fp16 if config.window_left >= 0 else _mha_prefill_fp16
     kernel[config.grid](
         q,
         k,
@@ -1082,7 +1068,6 @@ def gluon_mha_prefill_fp16_gfx950(
         config.max_seqlen,
         has_sink,
         has_lse,
-        config.is_sliding,
         config.window_left,
         num_warps=config.num_warps,
     )
