@@ -357,22 +357,25 @@ class AttentionProgram:
     @gluon.jit
     def softmax(self, qk, m_i, l_i, acc):
         cfg = self.cfg
-        HAS_INVALID: gl.constexpr = cfg.WINDOW_LEFT >= 0 and not cfg.HAS_SINK
-        row_max = max(qk, 1)
-        m_new = maximum(m_i, row_max)
-        m_new_scaled = m_new * cfg.SM_SCALE
         # In sliding window case, some rows can see fully masked tiles before
         # any valid KV. Guard the online softmax state so `-inf - -inf` does not
         # produce NaNs. This does not happen when having sink, because m_i
         # is initialized to sink value instead of -inf.
+        HAS_INVALID: gl.constexpr = cfg.WINDOW_LEFT >= 0 and not cfg.HAS_SINK
+
+        row_max = max(qk, 1)
+        m_new = maximum(m_i, row_max)
+        m_new_scaled = m_new * cfg.SM_SCALE
         if HAS_INVALID:
             invalid = m_new == -float("inf")
             m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
+
         qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
         if HAS_INVALID:
             m_diff = gl.where(invalid, 0.0, m_diff)
+
         alpha = gl.exp2(m_diff)
         l_ij = gl.sum(p, axis=1)
         l_i = l_i * alpha + l_ij
