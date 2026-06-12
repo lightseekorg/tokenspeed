@@ -126,7 +126,7 @@ class LlamaAttention(BaseLlamaAttention):
         correction = (
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
 
 
 # ---------------------------------------------------------------------------
