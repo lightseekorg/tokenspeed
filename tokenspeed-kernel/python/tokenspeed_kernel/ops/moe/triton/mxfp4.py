@@ -261,7 +261,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"fp8"}),
+        "internal_activation_dtype": frozenset({"input", "fp8"}),
         "supports_bias": frozenset({True}),
     },
     priority=Priority.PORTABLE,

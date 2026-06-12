@@ -160,8 +160,8 @@ jobs:
       # Authenticate Hugging Face Hub downloads so checkpoint pulls during
       # `ts serve` startup are not throttled by the anonymous rate limit. The
       # 600s per-file `runtime-1gpu` timeout is otherwise exceeded on cold
-      # runners (e.g. `linux-mi355-1gpu-lightseek` loading
-      # `openai/gpt-oss-120b` + EAGLE3 draft).
+      # runners (e.g. `amd-mi35x-1gpu-test` loading `openai/gpt-oss-120b` +
+      # EAGLE3 draft).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - name: Checkout code
