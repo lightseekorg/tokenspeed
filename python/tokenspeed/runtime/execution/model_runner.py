@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
+from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -92,8 +93,6 @@ class ModelRunner:
                     )
 
         global_server_args_dict_update(server_args)
-        from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
-
         initialize_moe_config(server_args)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

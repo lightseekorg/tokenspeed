@@ -18,18 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-__all__ = ["ExpertCheckpointSchema", "MoELayer"]
+from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.loader import (
+    MoECheckpointLoader,
+    MoECheckpointLoadError,
+    build_moe_checkpoint_loader,
+)
+from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 
-
-def __getattr__(name: str):
-    if name == "ExpertCheckpointSchema":
-        from tokenspeed.runtime.layers.moe.checkpoint.schema import (
-            ExpertCheckpointSchema,
-        )
-
-        return ExpertCheckpointSchema
-    if name == "MoELayer":
-        from tokenspeed.runtime.layers.moe.layer import MoELayer
-
-        return MoELayer
-    raise AttributeError(name)
+__all__ = [
+    "ExpertCheckpointSchema",
+    "MoECheckpointLoadError",
+    "MoECheckpointLoader",
+    "MoELayer",
+    "build_moe_checkpoint_loader",
+]

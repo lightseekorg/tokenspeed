@@ -27,24 +27,6 @@ Core components:
 
 <img src="./assets/perf/tokenspeed-kimi-k2.5-performance.png" alt="TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workload (Kimi K2.5, B200)" width="800" margin="10px"></img>
 
-## Preview Status
-
-This version is a preview release for reproducing the Kimi K2.5 on B200 and
-TokenSpeed MLA on B200 results from the [TokenSpeed blog](https://lightseek.org/blog/lightseek-tokenspeed.html). Several major PRs are
-still in progress and have not been merged yet.
-
-Ongoing work includes:
-
-- Model coverage: Qwen 3.6, DeepSeek V4, and MiniMax M2.7.
-- Runtime features: PD, EPLB, KV store, Mamba cache, VLM, and metrics.
-- Platform optimization: Hopper optimization, MI350 optimization, and related
-  runtime improvements.
-
-These features are still being cleaned up and will be merged into `main` over
-the next few weeks. TokenSpeed is currently under heavy development and is
-intended to showcase the new runtime design and technical direction. Do not use
-this preview release for production deployments.
-
 ## Documentation
 
 Start here:
