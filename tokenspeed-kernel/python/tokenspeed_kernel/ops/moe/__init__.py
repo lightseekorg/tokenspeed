@@ -63,6 +63,9 @@ def _build_traits(
     internal_activation_dtype: str | None,
     with_bias: bool,
 ) -> dict[str, Any]:
+    if internal_activation_dtype is None:
+        internal_activation_dtype = "input"
+
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
     if activation is not None:
         traits["activation"] = activation
@@ -78,8 +81,7 @@ def _build_traits(
         traits["ispp"] = int(ispp)
     if fp8_scale_block_shape is not None:
         traits["fp8_scale_block_shape"] = tuple(fp8_scale_block_shape)
-    if internal_activation_dtype is not None:
-        traits["internal_activation_dtype"] = internal_activation_dtype
+    traits["internal_activation_dtype"] = internal_activation_dtype
     if with_bias:
         traits["supports_bias"] = True
     return traits
@@ -113,6 +115,8 @@ def moe_plan(
         ispp: Optional intermediate size per partition for alignment checks.
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
+            "input" is a special value that uses the whatever dtype the input
+            activations have. Defaults to "input" if not set.
         with_bias: Whether the selected kernel must support expert bias tensors.
         deepep_group: Runtime-created process group used by DeepEP plans.
         solution: Optional kernel solution to force through normal selection.

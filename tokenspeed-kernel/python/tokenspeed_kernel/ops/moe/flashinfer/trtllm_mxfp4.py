@@ -375,6 +375,7 @@ if platform.is_nvidia:
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({True}),
         },
         priority=Priority.SPECIALIZED,
