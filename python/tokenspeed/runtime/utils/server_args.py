@@ -248,6 +248,11 @@ class ServerArgs:
     prefill_graph_max_tokens: int | None = 128
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
+    # Always-on NaN containment: sanitize non-finite logits before sampling,
+    # detect affected requests, and terminate them with an error instead of
+    # letting corruption spread (graph-safe, ~O(bs*vocab) elementwise per
+    # step). Distinct from enable_nan_detection, the sync-heavy debug knob.
+    disable_nan_guard: bool = False
     enable_nvtx: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -1569,6 +1574,17 @@ class ServerArgs:
             "--enable-nan-detection",
             action="store_true",
             help="Enable the NaN detection for debugging purposes.",
+        )
+        parser.add_argument(
+            "--disable-nan-guard",
+            action="store_true",
+            default=ServerArgs.disable_nan_guard,
+            help="Disable the always-on NaN guard. By default the engine "
+            "sanitizes non-finite logits before sampling, detects requests "
+            "whose logits contained NaN (or whose sampled token id escaped "
+            "the vocab range), and terminates only those requests with a "
+            "numerical error so corruption cannot spread to the rest of the "
+            "batch.",
         )
         parser.add_argument(
             "--enable-nvtx",
