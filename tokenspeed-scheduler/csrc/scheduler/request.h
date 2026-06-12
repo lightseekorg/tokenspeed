@@ -89,6 +89,7 @@ public:
     // Moves host page ownership out of the Prefetching state (only valid when Is<Prefetching>()).
     // After this call the Prefetching state's host_pages_ is empty.
     OwnedPages TakeHostPages();
+    std::int32_t GetPrefetchStartPage() const;
 
     const StorageInfo& GetStorageInfo() const { return storage_info_; }
 

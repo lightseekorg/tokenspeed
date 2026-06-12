@@ -72,4 +72,12 @@ OwnedPages Request::TakeHostPages() {
     return std::move(*s).TakeHostPages();
 }
 
+std::int32_t Request::GetPrefetchStartPage() const {
+    auto* s = std::get_if<fsm::Prefetching>(&state_);
+    if (s == nullptr) {
+        throw std::logic_error("Request::GetPrefetchStartPage: expected state=Prefetching; got state=" + StateName());
+    }
+    return s->GetPrefetchStartPage();
+}
+
 }  // namespace tokenspeed

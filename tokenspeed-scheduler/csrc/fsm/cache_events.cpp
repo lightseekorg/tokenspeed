@@ -34,7 +34,7 @@ namespace tokenspeed::fsm {
 
 State SchedulePrefetchEvent::operator()(Submitted&& state) {
     return Prefetching{state.GetTokenContainer(), state.GetPageSize(), host_allocator_->Allocate(num_pages_to_fetch_),
-                       std::move(host_node_ref_)};
+                       std::move(host_node_ref_), prefetch_start_page_};
 }
 
 State PrefetchDoneEvent::operator()(Prefetching&& state) {

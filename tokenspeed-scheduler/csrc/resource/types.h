@@ -113,6 +113,7 @@ struct CacheOpSpec {
     // L3 backup: captured at WriteBackOp creation, consumed at WriteBackDone to emit BackUpOp.
     std::vector<std::int32_t> backup_host_pages;
     std::vector<std::string> backup_rolling_hashes;
+    TreeNode* backup_host_node{nullptr};
 
     CacheOpSpec();
     ~CacheOpSpec();

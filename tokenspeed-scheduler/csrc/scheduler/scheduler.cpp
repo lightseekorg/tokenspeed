@@ -305,6 +305,7 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
                     }
                     if (n_kv_pairs > 0 && static_cast<std::int32_t>(all_hashes.size()) >= n_kv_pairs) {
                         spec.backup_rolling_hashes.assign(all_hashes.begin(), all_hashes.begin() + n_kv_pairs);
+                        spec.backup_host_node = host_node;
                         for (const auto& p : pages_to_transfer) {
                             if (p.kind == CacheKind::kKV) {
                                 spec.backup_host_pages.push_back(p.dst);

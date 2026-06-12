@@ -43,9 +43,11 @@ struct SchedulePrefetchEvent : InvalidTransitionHandler<SchedulePrefetchEvent> {
     using InvalidTransitionHandler<SchedulePrefetchEvent>::operator();
 
     SchedulePrefetchEvent() = default;
-    SchedulePrefetchEvent(std::int32_t num_pages_to_fetch, std::vector<std::string> rolling_page_hashes,
-                          PageAllocator* host_allocator, std::unique_ptr<HostNodeRef> host_node_ref)
+    SchedulePrefetchEvent(std::int32_t num_pages_to_fetch, std::int32_t prefetch_start_page,
+                          std::vector<std::string> rolling_page_hashes, PageAllocator* host_allocator,
+                          std::unique_ptr<HostNodeRef> host_node_ref)
         : num_pages_to_fetch_{num_pages_to_fetch},
+          prefetch_start_page_{prefetch_start_page},
           rolling_page_hashes_{std::move(rolling_page_hashes)},
           host_allocator_{host_allocator},
           host_node_ref_{std::move(host_node_ref)} {}
@@ -56,6 +58,7 @@ struct SchedulePrefetchEvent : InvalidTransitionHandler<SchedulePrefetchEvent> {
 
 private:
     std::int32_t num_pages_to_fetch_{};
+    std::int32_t prefetch_start_page_{};
     PageAllocator* host_allocator_{};
     std::unique_ptr<HostNodeRef> host_node_ref_;
     std::vector<std::string> rolling_page_hashes_;

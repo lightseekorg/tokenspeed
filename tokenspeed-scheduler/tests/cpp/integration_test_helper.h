@@ -113,6 +113,27 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    void SendPrefetchDone(cache_op_id op_id, const std::string& request_id, std::int32_t completed_pages,
+                          bool success = true) {
+        ExecutionEvent event;
+        event.With(CacheEvent{cache::PrefetchDone{
+            .success = success,
+            .op_id = op_id,
+            .request_id = request_id,
+            .completed_pages = completed_pages,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendBackUpDone(cache_op_id op_id, bool success = true) {
+        ExecutionEvent event;
+        event.With(CacheEvent{cache::BackUpDone{
+            .op_id = op_id,
+            .success = success,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
     // Send ExtendResult (new decode tokens) to the scheduler.
     void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens) {
         ExecutionEvent event;

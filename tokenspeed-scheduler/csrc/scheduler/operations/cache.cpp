@@ -47,6 +47,10 @@ std::optional<fsm::SchedulePrefetchEvent> Scheduler::schedulePrefetch(Request* r
     }
 
     const std::int32_t num_pages_to_fetch = storage.hit_pages;
+    if (static_cast<std::int32_t>(storage.rolling_hashes.size()) < num_pages_to_fetch) {
+        return {};
+    }
+    const std::int32_t prefetch_start_page = match.host.DepthInPage();
 
     // Lock the matched host node BEFORE eviction so it cannot be evicted.
     auto host_node_ref = std::make_unique<HostNodeRef>(match.host.last_node);
@@ -58,7 +62,8 @@ std::optional<fsm::SchedulePrefetchEvent> Scheduler::schedulePrefetch(Request* r
     std::vector<std::string> hashes(storage.rolling_hashes.begin(),
                                     storage.rolling_hashes.begin() + num_pages_to_fetch);
 
-    return fsm::SchedulePrefetchEvent{num_pages_to_fetch, std::move(hashes), &host_allocator_, std::move(host_node_ref)};
+    return fsm::SchedulePrefetchEvent{num_pages_to_fetch, prefetch_start_page, std::move(hashes), &host_allocator_,
+                                      std::move(host_node_ref)};
 }
 
 PrefetchOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefetchEvent event) {

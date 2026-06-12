@@ -32,11 +32,12 @@ namespace tokenspeed::fsm {
 
 struct Prefetching {
     Prefetching(TokenContainer* token_container, std::int32_t page_size, OwnedPages host_pages,
-                std::unique_ptr<HostNodeRef>&& host_lock)
+                std::unique_ptr<HostNodeRef>&& host_lock, std::int32_t prefetch_start_page)
         : token_container_{token_container},
           page_size_{page_size},
           host_pages_{std::move(host_pages)},
-          host_lock_{std::move(host_lock)} {}
+          host_lock_{std::move(host_lock)},
+          prefetch_start_page_{prefetch_start_page} {}
 
     ~Prefetching() = default;
 
@@ -53,12 +54,14 @@ struct Prefetching {
     OwnedPages TakeHostPages() && { return std::move(host_pages_); }
 
     TreeNode* GetHostLockNode() const { return host_lock_ ? host_lock_->Node() : nullptr; }
+    std::int32_t GetPrefetchStartPage() const { return prefetch_start_page_; }
 
 private:
     TokenContainer* token_container_{};
     std::int32_t page_size_{};
     OwnedPages host_pages_;
     std::unique_ptr<HostNodeRef> host_lock_;
+    std::int32_t prefetch_start_page_{};
 };
 
 struct PrefetchDone {

@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "resource/allocator/owned_pages.h"
@@ -59,12 +60,17 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
         OwnedPages host_owned = req->TakeHostPages();
         std::int32_t total_host = host_owned.Size();
 
+        const std::int32_t prefetch_start_page = req->GetPrefetchStartPage();
+        const std::int32_t suffix_pages =
+            std::max<std::int32_t>(0, static_cast<std::int32_t>(token_pages.size()) - prefetch_start_page);
+        TreeNode* start_node = req->GetHostLockNode();
+
         std::int32_t n = std::min(event.completed_pages, total_host);
-        std::int32_t n_tokens = std::min(n, static_cast<std::int32_t>(token_pages.size()));
+        std::int32_t n_tokens = std::min(n, suffix_pages);
 
         if (n_tokens > 0) {
-            std::vector<std::span<const std::int32_t>> insert_token_pages(token_pages.begin(),
-                                                                          token_pages.begin() + n_tokens);
+            auto insert_begin = token_pages.begin() + prefetch_start_page;
+            std::vector<std::span<const std::int32_t>> insert_token_pages(insert_begin, insert_begin + n_tokens);
 
             // Storage hashes for L3 backup (optional).
             const auto& storage = req->GetStorageInfo();
@@ -79,7 +85,8 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
             OwnedPages insert_pages = host_owned.TakeFirst(n_tokens);
 
             auto insert_result = kv_prefix_cache_.Insert<ResourceType::Host>(insert_token_pages, {},
-                                                                             std::move(insert_pages), page_hashes);
+                                                                             std::move(insert_pages), page_hashes,
+                                                                             start_node);
             completed = n;
             inserted = insert_result.inserted_num_pages;
         }
@@ -165,6 +172,9 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         backup_op.op_id = kv_prefix_cache_.AllocateCacheOpId();
         backup_op.src_pages = std::move(spec.backup_host_pages);
         backup_op.rolling_page_hashes = std::move(spec.backup_rolling_hashes);
+        if (spec.backup_host_node != nullptr) {
+            pending_backup_host_refs_[backup_op.op_id] = std::make_unique<HostNodeRef>(spec.backup_host_node);
+        }
         pending_backup_ops_.push_back(std::move(backup_op));
     }
 
@@ -177,7 +187,7 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::BackUpDone& event) {
-    // Reserved for future use (e.g. marking tree nodes as persisted).
+    pending_backup_host_refs_.erase(event.op_id);
 }
 
 }  // namespace tokenspeed

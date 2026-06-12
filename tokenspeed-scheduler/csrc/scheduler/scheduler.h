@@ -147,6 +147,7 @@ private:
     // L3 ops produced during scheduling / event handling, drained in NextExecutionPlan().
     std::vector<PrefetchOperation> pending_prefetch_ops_;
     std::vector<BackUpOperation> pending_backup_ops_;
+    std::unordered_map<cache_op_id, std::unique_ptr<HostNodeRef>> pending_backup_host_refs_;
     // Stats
     SchedulerStats stats_;
 };
