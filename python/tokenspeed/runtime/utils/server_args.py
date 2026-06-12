@@ -247,11 +247,11 @@ class ServerArgs:
     disable_prefill_graph: bool | None = False
     prefill_graph_max_tokens: int | None = 128
     cudagraph_capture_sizes: list[int] | None = None
-    # On-by-default NaN containment: sanitize non-finite logits before
-    # sampling, detect affected requests, and terminate them with an error
-    # instead of letting corruption spread (graph-safe, ~O(bs*vocab)
-    # elementwise per step).
-    enable_nan_detection: bool = True
+    # Opt-in NaN containment: sanitize non-finite logits before sampling,
+    # detect affected requests, and terminate them with an error instead of
+    # letting corruption spread (graph-safe, ~O(bs*vocab) elementwise per
+    # step).
+    enable_nan_detection: bool = False
     enable_nvtx: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -1572,20 +1572,12 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            dest="enable_nan_detection",
             default=ServerArgs.enable_nan_detection,
-            help="Explicitly enable the NaN guard (already the default).",
-        )
-        parser.add_argument(
-            "--disable-nan-detection",
-            action="store_false",
-            dest="enable_nan_detection",
-            help="Disable the on-by-default NaN guard. By default the engine "
-            "sanitizes non-finite logits before sampling, detects requests "
-            "whose logits contained NaN (or whose sampled token id escaped "
-            "the vocab range), and terminates only those requests with a "
-            "numerical error so corruption cannot spread to the rest of the "
-            "batch.",
+            help="Enable the NaN guard: sanitize non-finite logits before "
+            "sampling, detect requests whose logits contained NaN (or whose "
+            "sampled token id escaped the vocab range), and terminate only "
+            "those requests with a numerical error so corruption cannot "
+            "spread to the rest of the batch.",
         )
         parser.add_argument(
             "--enable-nvtx",

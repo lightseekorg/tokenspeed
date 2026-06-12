@@ -106,7 +106,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
-    enable_nan_detection: bool = True
+    enable_nan_detection: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
