@@ -385,19 +385,6 @@ class AttentionProgram:
         return p, m_new, l_i, acc
 
     @gluon.jit
-    def apply_sliding_mask(self, qk, offs_n):
-        cfg = self.cfg
-        offs_m = self.q_start + gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
-        )
-        kv = gl.convert_layout(offs_n, gl.SliceLayout(0, cfg.qk_layout))
-        valid = offs_m[:, None] < self.seq_len
-        valid &= kv[None, :] < self.seq_len
-        valid &= kv[None, :] <= offs_m[:, None]
-        valid &= offs_m[:, None] <= kv[None, :] + cfg.WINDOW_LEFT
-        return gl.where(valid, qk, -float("inf"))
-
-    @gluon.jit
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
@@ -797,24 +784,38 @@ def process_sliding_attention_tile(
     num_kv_tiles: gl.constexpr = (
         cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
     ) // cfg.BLOCK_N
+    offs_m = program.q_start + gl.arange(
+        0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+    )
+    mask_n = kv_start + gl.arange(
+        0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+    )
+    mask_diff = offs_m[:, None] - mask_n[None, :]
 
-    for _ in range(0, num_kv_tiles):
+    for _ in gl.static_range(num_kv_tiles):
         k_offsets, offs_n = program.make_k_offsets(kv_start)
         v_offsets = program.make_v_offsets(kv_start)
         mask = offs_n[:, None] < program.seq_len
         program.issue_load_k(k_offsets, k_smem, mask=mask)
         program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
 
+        valid = mask_diff.to(gl.uint32) <= cfg.WINDOW_LEFT
+        if kv_start + cfg.BLOCK_N > program.seq_len:
+            valid &= mask_n[None, :] < program.seq_len
+
         async_copy.wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        qk = program.apply_sliding_mask(qk, offs_n)
+        qk = gl.where(valid, qk, -float("inf"))
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         async_copy.wait_group(0)
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
         kv_start = kv_start + cfg.BLOCK_N
+
+        mask_n = mask_n + cfg.BLOCK_N
+        mask_diff = mask_diff - cfg.BLOCK_N
 
     l_i = program.apply_sinks(l_i, m_i, sink_log2)
     program.store_lse(l_i, m_i)
