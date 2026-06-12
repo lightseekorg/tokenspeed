@@ -164,7 +164,6 @@ class ServerArgs:
     draft_moe_backend: str | None = None
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
-    flashinfer_mxfp4_moe_precision: str = "default"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
 
     # KVStore
@@ -1194,7 +1193,7 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, triton_kernel, flashinfer_mxfp4, marlin, etc.",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1202,13 +1201,6 @@ class ServerArgs:
             default=ServerArgs.draft_moe_backend,
             help="MoE runner backend for the draft model in speculative decoding. "
             "If not set, defaults to --moe-backend.",
-        )
-        parser.add_argument(
-            "--flashinfer-mxfp4-moe-precision",
-            type=str,
-            choices=["default", "bf16"],
-            default=ServerArgs.flashinfer_mxfp4_moe_precision,
-            help="Computation precision of flashinfer mxfp4 moe.",
         )
         parser.add_argument(
             "--all2all-backend",

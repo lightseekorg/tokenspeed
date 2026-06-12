@@ -52,15 +52,15 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
-from tokenspeed_kernel.ops.moe.triton import (
-    stage_deepseek_v4_mega_moe_inputs as _stage_deepseek_v4_mega_moe_inputs,
-)
-from tokenspeed_kernel.ops.routing.cuda import (
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.cuda import (
     dsv3_router_gemm,
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.triton import (
+    stage_deepseek_v4_mega_moe_inputs as _stage_deepseek_v4_mega_moe_inputs,
+)
 from tokenspeed_kernel.thirdparty.trtllm import (
     fast_topk_v2,
 )
@@ -69,6 +69,7 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    V4_KERNEL_BLOCK_ROWS,
     deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
     deepseek_v4_indexer_mxfp4_scale_dim,
     deepseek_v4_indexer_mxfp4_value_bytes,
@@ -114,11 +115,11 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -2387,71 +2388,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         return y
 
-    def warmup_jit_variants(self) -> None:
-        """Pre-compile every DeepGEMM mega-MoE tile this layer can hit at runtime.
-
-        DeepGEMM JITs ``fp8_fp4_mega_moe`` on first use and selects the tile
-        (``block_m``) from the per-rank token count -- roughly
-        ``num_tokens * num_ranks * num_topk / num_experts`` mapped to a
-        ``block_m`` bucket (DeepGEMM ``heuristics/mega_moe.hpp``). CUDA-graph
-        capture only exercises decode-sized token counts, so the larger prefill
-        tiles would otherwise JIT mid-serving -- and because the kernel arms its
-        NVLink EP barrier on the same launch, a cold compile stalls one rank
-        past DeepGEMM's 30 s barrier timeout and aborts the job.
-
-        Sweeping a few token counts that cross every ``block_m`` boundary
-        compiles each tile at startup with all EP ranks in lock-step, so serving
-        never JITs on the hot path. The kernels are cached by shape + tile (not
-        by layer or activation values), so dummy activations on one module
-        cover the whole stack.
-        """
-        if deep_gemm is None or self._transformed_l1_weights is None:
-            return
-
-        device = self._transformed_l1_weights[0].device
-        cap = self.max_num_tokens
-        # Token counts spanning the block_m buckets up to the symmetric-buffer
-        # capacity. Decode-sized tiles are also covered by CUDA-graph capture;
-        # the small counts here keep the warmup self-contained.
-        token_counts = sorted(
-            {n for n in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096) if n < cap}
-            | {cap}
-        )
-
-        # The launch runs an NVLink barrier across the EP group, so every rank
-        # must enter the sweep together; align them once after weight load so a
-        # straggler cannot trip the barrier's 30 s timeout.
-        if torch.distributed.is_initialized():
-            group = pg_manager.get_process_group("nccl", self.mapping.moe.tp_ep_group)
-            torch.distributed.barrier(group=group)
-
-        for num_tokens in token_counts:
-            hidden_states = torch.randn(
-                (num_tokens, self.hidden_size),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            topk_weights = torch.full(
-                (num_tokens, self.top_k),
-                1.0 / self.top_k,
-                dtype=torch.float32,
-                device=device,
-            )
-            topk_ids = torch.randint(
-                0,
-                self.num_experts,
-                (num_tokens, self.top_k),
-                dtype=torch.int64,
-                device=device,
-            )
-            self.forward(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                activation_clamp=self.swiglu_limit,
-            )
-        torch.cuda.synchronize()
-
 
 class DeepseekV4MoE(nn.Module):
     def __init__(
@@ -2531,7 +2467,7 @@ class DeepseekV4MoE(nn.Module):
             self.topk = None
         else:
             routed_quant_config = Mxfp4Config(
-                ignored_layers=getattr(quant_config, "ignored_layers", None),
+                ignored_layers=quant_config.ignored_layers,
                 is_checkpoint_mxfp4_serialized=True,
             )
             self.experts = MoELayer(
@@ -2561,9 +2497,6 @@ class DeepseekV4MoE(nn.Module):
                 renormalize=config.norm_topk_prob,
                 correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=(
-                    self.experts.apply_routed_scaling_factor_on_output
-                ),
                 output_format=self.experts.topk_output_format,
             )
 
@@ -4164,7 +4097,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 weight_loader(param, loaded_weight)
         del params_dict, moe_loader
         self.post_load_weights()
-        self.warmup_mega_moe()
+        self.warmup_deep_gemm()
 
     def post_load_weights(self):
         mega_moe_experts: list[DeepseekV4MegaMoEExperts] = []
@@ -4177,24 +4110,98 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
 
-    def warmup_mega_moe(self) -> None:
-        """Pre-compile DeepGEMM mega-MoE tiles.
+    def warmup_deep_gemm(self) -> None:
+        """Pre-compile all DeepGEMM JIT kernels used by this model.
 
         Called after post_load_weights (not inside it) so that
         finalize_weights temporaries have been freed by GC and there is
         enough GPU memory for the symmetric buffer allocation.
         """
-        if os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") == "1":
+        if deep_gemm is None:
             return
         import gc
 
         gc.collect()
         torch.cuda.empty_cache()
+
+        self._warmup_mega_moe_jit()
+        self._warmup_prefill_jit()
+
+    def _warmup_mega_moe_jit(self) -> None:
+        if os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") == "1":
+            return
         for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts):
-                logger.info("Pre-compiling DeepGEMM mega-MoE kernel variants...")
-                module.warmup_jit_variants()
-                return
+            if not isinstance(module, DeepseekV4MegaMoEExperts):
+                continue
+            if module._transformed_l1_weights is None:
+                continue
+            logger.info("Pre-compiling DeepGEMM mega-MoE kernel variants...")
+            group = pg_manager.get_process_group(
+                "nccl",
+                module.mapping.moe.tp_ep_group,
+            )
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier(group=group)
+            deep_gemm.warmup_mega_moe_jit(
+                num_experts=module.num_experts,
+                max_num_tokens=module.max_num_tokens,
+                top_k=module.top_k,
+                hidden_size=module.hidden_size,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                transformed_l1_weights=module._transformed_l1_weights,
+                transformed_l2_weights=module._transformed_l2_weights,
+                symm_buffer=module.get_symm_buffer(),
+                activation_clamp=module.swiglu_limit,
+            )
+            return
+
+    def _warmup_prefill_jit(self) -> None:
+        if deep_gemm is None:
+            return
+        if torch.cuda.get_device_capability()[0] < 10:
+            return
+        config = self.config
+        tp_size = self.mapping.attn.tp_size if self.mapping else 1
+        logger.info("Pre-compiling DeepGEMM prefill kernel variants...")
+        deep_gemm.warmup_prefill_jit(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            head_dim=getattr(config, "head_dim", 128),
+            hc_mult=getattr(config, "hc_mult", 0),
+            kv_lora_rank=getattr(config, "kv_lora_rank", 0),
+            index_n_heads=getattr(config, "index_n_heads", 0),
+            index_head_dim=getattr(config, "index_head_dim", 0),
+            indexer_cache_block_size=V4_KERNEL_BLOCK_ROWS,
+            # With MTP/speculation the verify step flattens bs*num_draft_tokens
+            # into the decode indexer's num_tokens, so the paged-logits metadata
+            # kernel (JIT-keyed on the 32-aligned token count) hits larger
+            # buckets than plain decode. Scale the warmup ceiling by the draft
+            # factor so those buckets are covered (no-op when speculation is off).
+            max_decode_tokens=max(
+                int(global_server_args_dict.get("max_cudagraph_capture_size", 0) or 0),
+                int(global_server_args_dict.get("max_num_seqs", 0) or 0),
+                1,
+            )
+            * (
+                int(global_server_args_dict.get("speculative_num_draft_tokens", 1) or 1)
+                if global_server_args_dict.get("speculative_algorithm")
+                else 1
+            ),
+            mxfp4_block_size=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+            tp_size=tp_size,
+            # Prefill GEMM/prenorm M is capped per forward by chunked_prefill_size
+            # (continuous batching), the same ceiling mega_moe warms to. Hardcoding
+            # 8192 would leave M in (8192, chunked_prefill_size] to JIT inline.
+            max_tokens=_deepseek_v4_mega_moe_max_num_tokens(),
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+
+    def post_quant_warmup(self) -> None:
+        """Called by the weight loader after all quant process_weights_after_loading."""
+        if deep_gemm is not None:
+            deep_gemm.warmup_fp8_gemm_nt_from_model(
+                self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

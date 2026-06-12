@@ -36,17 +36,16 @@ from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
-from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
-from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm, moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.utils import get_rope_theta
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
@@ -81,7 +80,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
-from tokenspeed.runtime.layers.moe.layer import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -312,9 +311,6 @@ class DeepseekV3MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
             output_format=self.experts.topk_output_format,
         )
 
@@ -370,8 +366,6 @@ class DeepseekV3MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
         else:
-            if not self.experts.apply_routed_scaling_factor_on_output:
-                routed_expert_output *= self.routed_scaling_factor
             final_hidden_states = (
                 routed_expert_output + shared_output
                 if shared_output is not None

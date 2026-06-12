@@ -71,13 +71,11 @@ class MoeBackend(Enum):
 
     AUTO = "auto"
     TRITON = "triton"
-    TRITON_KERNEL = "triton_kernel"
-    GLUON_KERNEL = "gluon_kernel"
-    MARLIN = "marlin"
+    GLUON = "gluon"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
-    FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
     MEGA_MOE = "mega_moe"
 
@@ -87,14 +85,8 @@ class MoeBackend(Enum):
     def is_triton(self):
         return self == MoeBackend.TRITON
 
-    def is_triton_kernel(self):
-        return self == MoeBackend.TRITON_KERNEL
-
-    def is_gluon_kernel(self):
-        return self == MoeBackend.GLUON_KERNEL
-
-    def is_marlin(self):
-        return self == MoeBackend.MARLIN
+    def is_gluon(self):
+        return self == MoeBackend.GLUON
 
     def is_flashinfer_trtllm(self):
         return self == MoeBackend.FLASHINFER_TRTLLM
@@ -104,9 +96,6 @@ class MoeBackend(Enum):
 
     def is_flashinfer_cutedsl(self):
         return self == MoeBackend.FLASHINFER_CUTEDSL
-
-    def is_flashinfer_mxfp4(self):
-        return self == MoeBackend.FLASHINFER_MXFP4
 
     def is_deep_gemm_mega_moe(self):
         return self in (MoeBackend.DEEP_GEMM_MEGA_MOE, MoeBackend.MEGA_MOE)

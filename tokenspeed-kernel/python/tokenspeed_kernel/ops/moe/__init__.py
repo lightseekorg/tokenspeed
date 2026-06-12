@@ -17,550 +17,236 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-from __future__ import annotations
-
-import logging
-import os
-from typing import Any, Optional, Set
+from typing import Any
 
 # Backend registration (side-effect imports)
-import tokenspeed_kernel.numerics.reference.moe  # noqa: F401
-import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
-import tokenspeed_kernel.ops.moe.deepep  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton_kernels  # noqa: F401
-import tokenspeed_kernel.ops.moe.trtllm  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.moe.expert_location_dispatch import (  # noqa: F401
-    ExpertLocationDispatchInfo,
-    topk_ids_logical_to_physical,
-    transform_select_experts_inputs,
-)
-from tokenspeed_kernel.platform import (
-    ArchVersion,
-    CapabilityRequirement,
-    current_platform,
-)
-from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
-from tokenspeed_kernel.selection import (
-    SelectionOracle,
-    register_oracle,
-    select_kernel,
-)
-from tokenspeed_kernel.signature import (
-    ScaleFormat,
-    dense_tensor_format,
-    format_signature,
-    format_signatures,
-    tensor_format,
-)
-
-logger = logging.getLogger(__name__)
-
-
-class _MoEOracle(SelectionOracle):
-    """Adjust MoE kernel scores based on runtime traits like num_tokens."""
-
-    def adjust(self, spec, platform, traits):
-        if traits and spec.mode == "combine":
-            num_tokens = traits.get("num_tokens")
-            if num_tokens is not None:
-                is_small_batch = num_tokens <= 32
-                is_triton = spec.solution == "triton"
-                # According to micro benchmark results, torch.compile can get better performance for small token.
-                if is_small_batch and not is_triton:
-                    return 15  # prefer torch_compile for small M
-                if not is_small_batch and is_triton:
-                    return 15  # prefer triton for large M
-                return 5
-        return 10
-
-
-register_oracle("moe", _MoEOracle())
-
-try:
-    from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as _amd_gluon
-except ImportError as exc:
-    _GLUON_IMPORT_ERROR = exc
-    _amd_gluon = None
-else:
-    _GLUON_IMPORT_ERROR = None
-
-_GLUON_DISABLE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
-_GLUON_DISABLED_ENV = (
-    os.environ.get("TOKENSPEED_MOE_GLUON", "").strip().lower() in _GLUON_DISABLE_VALUES
-)
-
-
-def _missing_amd_gluon_package(*args, **kwargs):
-    raise ImportError(
-        "AMD Gluon kernels require tokenspeed-kernel-amd"
-    ) from _GLUON_IMPORT_ERROR
-
-
-if _amd_gluon is not None:
-    _extract_gluon_raw_w = _amd_gluon._extract_gluon_raw_w
-    shuffle_weight_for_gluon_dot_layout = _amd_gluon.shuffle_weight_for_gluon_dot_layout
-else:
-    _extract_gluon_raw_w = _missing_amd_gluon_package
-    shuffle_weight_for_gluon_dot_layout = _missing_amd_gluon_package
-
-
-def _gluon_kernel_priority() -> int:
-    if _GLUON_DISABLED_ENV:
-        return Priority.PORTABLE + 1
-    return Priority.SPECIALIZED + 2
-
-
-_MXFP4_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.uint8,
-    granularity="block",
-    block_shape=(32,),
-)
-_FP8_PER_TENSOR_SCALE_FORMAT = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="tensor",
-)
-
-_FUSED_WEIGHT_MXFP4 = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT)
-
-
-def _experts_fp8_mxfp4_signatures() -> frozenset:
-    return frozenset(
-        {
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fn,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fnuz,
-                    scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-                ),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-            format_signature(
-                x=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE_FORMAT),
-                weight=_FUSED_WEIGHT_MXFP4,
-            ),
-        }
-    )
-
-
-_GLUON_EXPERTS_COMMON = dict(
-    solution="gluon",
-    signatures=_experts_fp8_mxfp4_signatures(),
-    capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-    ),
-    priority=_gluon_kernel_priority(),
-    tags={"throughput", "latency"},
-)
-
-_GLUON_FUSED_SIGNATURES = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=dense_tensor_format(torch.float16),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-        format_signature(
-            x=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fnuz,
-                scale=_FP8_PER_TENSOR_SCALE_FORMAT,
-            ),
-            weight=_FUSED_WEIGHT_MXFP4,
-        ),
-    }
-)
-
-
-if _amd_gluon is not None:
-
-    @register_kernel(
-        "moe",
-        "experts",
-        name="gluon_dispatch_gemm",
-        features={"ragged_metadata", "dispatch_gemm"},
-        **_GLUON_EXPERTS_COMMON,
-    )
-    @register_kernel(
-        "moe",
-        "experts",
-        name="gluon_gemm_combine",
-        features={"ragged_metadata", "gemm_combine"},
-        **_GLUON_EXPERTS_COMMON,
-    )
-    def _gluon_mxfp_ragged_matmul(*args, **kwargs) -> torch.Tensor | None:
-        return _amd_gluon._gluon_mxfp_ragged_matmul(*args, **kwargs)
-
-    @register_kernel(
-        "moe",
-        "fused",
-        name="gluon_mxfp4_fp8_fused_moe",
-        features={"self_routing"},
-        solution="gluon",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"amd"}),
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-        ),
-        signatures=_GLUON_FUSED_SIGNATURES,
-        traits={"activation_dtype": frozenset({"fp8"})},
-        priority=_gluon_kernel_priority(),
-        tags={"throughput", "latency"},
-    )
-    def _gluon_mxfp_fused_moe(*args, **kwargs) -> torch.Tensor:
-        from tokenspeed_kernel.ops.quantization import quantize_fp8
-
-        kwargs.setdefault("quantize_fp8_fn", quantize_fp8)
-        kwargs.setdefault("moe_experts_fn", moe_experts)
-        kwargs.setdefault("moe_route_fn", moe_route)
-        kwargs.setdefault(
-            "enable_warp_decode",
-            not _GLUON_DISABLED_ENV and current_platform().is_cdna4,
-        )
-        return _amd_gluon._gluon_mxfp_fused_moe(*args, **kwargs)
-
-    @register_kernel(
-        "moe",
-        "route",
-        name="gluon_decode_routing_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=format_signatures(
-            "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-        ),
-        traits={"output_type": frozenset({"ragged_metadata"})},
-        priority=Priority.PORTABLE if _GLUON_DISABLED_ENV else Priority.SPECIALIZED,
-    )
-    def gluon_decode_routing_gfx950(
-        logits: torch.Tensor,
-        n_expts_act: int,
-        sm_first: bool = False,
-        dtype: torch.dtype | None = None,
-    ) -> tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if dtype is None:
-            dtype = logits.dtype
-        n_tokens = logits.shape[0]
-        if (
-            not sm_first
-            and n_tokens <= _amd_gluon.SMALLM_MAX_M
-            and current_platform().is_cdna4
-            and _amd_gluon.gluon_route_supported(logits, n_expts_act, dtype)
-        ):
-            return _amd_gluon.gluon_fused_route(logits, n_expts_act, dtype=dtype)
-
-        generic = KernelRegistry.get().get_impl("triton_kernels_routing")
-        return generic(logits, n_expts_act, sm_first, dtype)
-
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "ExpertLocationDispatchInfo",
-    "topk_ids_logical_to_physical",
-    "transform_select_experts_inputs",
-    "_extract_gluon_raw_w",
-    "shuffle_weight_for_gluon_dot_layout",
-    "moe_route",
-    "moe_dispatch",
-    "moe_experts",
-    "moe_combine",
-    "moe_fused",
+    "moe_apply",
+    "moe_plan",
+    "moe_process_weights",
 ]
 
-# ---------------------------------------------------------------------------
-# Interface feature constants — used by both registration and API calls
-# to ensure only signature-compatible kernels are selected.
-# ---------------------------------------------------------------------------
 
-# moe/fused interface features
-FUSED_SELF_ROUTING = "self_routing"  # kernel does routing internally (trtllm)
-FUSED_PRE_ROUTED = (
-    "pre_routed"  # caller provides topk_weights/topk_ids (marlin, cutlass, reference)
-)
-
-# Weight format values used by moe_fused(weight_format=...).
-WEIGHT_BF16 = "bf16"  # dense bfloat16 weights
-WEIGHT_FP8 = "fp8"  # FP8 block-scaled weights
-WEIGHT_MXFP4 = "mxfp4"  # MXFP4 block-scaled weights
-WEIGHT_NVFP4 = "nvfp4"  # NVFP4 block-scaled weights (CuteDSL)
-
-# moe/route trait values — used via traits={"output_type": ...}
-ROUTE_OUTPUT_TOPK = "topk"  # returns (topk_weights, topk_ids)
-ROUTE_OUTPUT_RAGGED_METADATA = (
-    "ragged_metadata"
-    # returns (ragged_metadata, gather_indx, scatter_indx, gate_scal)
-)
-
-# moe/experts interface features
-EXPERTS_DISPATCH_SORTED = (
-    "dispatch_sorted"  # expects sorted_token_ids from dispatch stage
-)
-EXPERTS_RAGGED_METADATA = (
-    "ragged_metadata"  # expects RaggedTensorMetadata + gather/scatter indices
-)
-EXPERTS_DISPATCH_GEMM = (
-    "dispatch_gemm"  # gather/dispatch tokens then GEMM (uses gather_indx)
-)
-EXPERTS_GEMM_COMBINE = (
-    "gemm_combine"  # GEMM then scatter/combine results (uses scatter_indx)
-)
+def _normalize_weight_dtype(weight_dtype: str) -> str:
+    if weight_dtype in {"bf16", "fp16", "float16", "bfloat16", "unquantized"}:
+        return "unquant"
+    return weight_dtype
 
 
-_FP8_SCALE = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="block",
-    block_shape=(128, 128),
-)
-_FP8_PER_TENSOR_SCALE = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="tensor",
-)
-_NVFP4_SCALE = ScaleFormat(
-    storage_dtype=torch.float32,
-    granularity="block",
-    block_shape=(16,),
-)
-_MXFP4_SCALE = ScaleFormat(
-    storage_dtype=torch.uint8,
-    granularity="block",
-    block_shape=(32,),
-)
+def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
+    return a2a_backend not in {None, "none"}
 
 
-def _single_dense_tensor_format_signature(role: str, storage_dtype: torch.dtype):
-    return format_signature(**{role: dense_tensor_format(storage_dtype)})
+def _validate_a2a_backend(a2a_backend: str | None) -> None:
+    if a2a_backend in {None, "none", "deepep"}:
+        return
+    raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
 
-def _moe_dispatch_format_signature(storage_dtype: torch.dtype, traits: Optional[dict]):
-    comm_strategy = (traits or {}).get("comm_strategy")
-    if storage_dtype == torch.int32 or comm_strategy == "local":
-        return _single_dense_tensor_format_signature("indices", storage_dtype)
-    return _single_dense_tensor_format_signature("x", storage_dtype)
-
-
-def _moe_fused_format_signature(
-    storage_dtype: torch.dtype,
-    weight_format: str,
+def _build_traits(
     *,
-    fp8_scale_granularity: str = "block",
-):
-    if weight_format == WEIGHT_FP8:
-        weight = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_SCALE)
-    elif weight_format == WEIGHT_NVFP4:
-        weight = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
-    elif weight_format == WEIGHT_MXFP4:
-        weight = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
-    elif weight_format == WEIGHT_BF16:
-        weight = dense_tensor_format(torch.bfloat16)
-    else:
-        raise ValueError(f"Unsupported MoE fused weight_format={weight_format!r}")
+    weight_dtype: str,
+    activation: str | None,
+    requires_deferred_finalize: bool,
+    a2a_backend: str | None,
+    ep_size: int | None,
+    ispp: int | None,
+    fp8_scale_block_shape: tuple[int, int] | None,
+    internal_activation_dtype: str | None,
+    with_bias: bool,
+) -> dict[str, Any]:
+    traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    if activation is not None:
+        traits["activation"] = activation
+    if requires_deferred_finalize:
+        traits["supports_deferred_finalize"] = True
 
-    if fp8_scale_granularity == "tensor":
-        fp8_scale_format = _FP8_PER_TENSOR_SCALE
-    elif fp8_scale_granularity == "block":
-        fp8_scale_format = _FP8_SCALE
-    else:
-        raise ValueError(f"Unsupported fp8_scale_granularity={fp8_scale_granularity!r}")
+    all_to_all_ep = _uses_all_to_all_ep(a2a_backend)
+    traits["supports_all_to_all_ep"] = all_to_all_ep
+    if all_to_all_ep or (ep_size is not None and ep_size > 1):
+        traits["supports_ep"] = True
 
-    if storage_dtype == torch.uint8 and weight_format == WEIGHT_NVFP4:
-        x = tensor_format("nvfp4", torch.uint8, scale=_NVFP4_SCALE)
-    elif storage_dtype == torch.uint8 and weight_format == WEIGHT_MXFP4:
-        x = tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE)
-    elif storage_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        x = tensor_format("scaled-fp8", storage_dtype, scale=fp8_scale_format)
-    else:
-        x = dense_tensor_format(storage_dtype)
-
-    return format_signature(x=x, weight=weight)
-
-
-def moe_route(
-    *args,
-    dtype: torch.dtype = torch.bfloat16,
-    features: Optional[Set[str]] = None,
-    traits: Optional[dict] = None,
-    expected_kernel_name: Optional[str] = None,
-    **kwargs,
-):
-    """Top-k expert routing.
-
-    Routing traits (pass via ``traits``):
-
-    * ``{"output_type": "topk"}``: returns (topk_weights, topk_ids).
-    * ``{"output_type": "ragged_metadata"}``: returns
-      (ragged_metadata, gather_indx, scatter_indx, gate_scal).
-    * ``{"biased": True/False}``: whether correction_bias is applied.
-    * ``{"grouped": True/False}``: whether grouped expert selection is used.
-    """
-    signature = _single_dense_tensor_format_signature("logits", dtype)
-    kernel = select_kernel(
-        "moe",
-        "route",
-        signature,
-        features=frozenset(features) if features else None,
-        traits=traits or {},
-        expected_kernel_name=expected_kernel_name,
-    )
-
-    return kernel(*args, **kwargs)
+    if ispp is not None:
+        traits["ispp"] = int(ispp)
+    if fp8_scale_block_shape is not None:
+        traits["fp8_scale_block_shape"] = tuple(fp8_scale_block_shape)
+    if internal_activation_dtype is not None:
+        traits["internal_activation_dtype"] = internal_activation_dtype
+    if with_bias:
+        traits["supports_bias"] = True
+    return traits
 
 
-def moe_dispatch(
-    *args,
-    dtype: torch.dtype = torch.int32,
-    traits: Optional[dict] = None,
-    expected_kernel_name: Optional[str] = None,
-    **kwargs,
-):
-    """Dispatch tokens to experts (local permutation).
-
-    Returns ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``.
-    """
-    selection_traits = traits or {"comm_strategy": "local"}
-    signature = _moe_dispatch_format_signature(dtype, selection_traits)
-    kernel = select_kernel(
-        "moe",
-        "dispatch",
-        signature,
-        traits=selection_traits,
-        expected_kernel_name=expected_kernel_name,
-    )
-
-    return kernel(*args, **kwargs)
-
-
-def moe_experts(
-    *args,
-    dtype: torch.dtype = torch.bfloat16,
-    features: Optional[Set[str]] = None,
-    weight_format: Optional[str] = None,
-    fp8_scale_granularity: str = "block",
-    traits: Optional[dict] = None,
-    expected_kernel_name: Optional[str] = None,
-    **kwargs,
-):
-    """Expert FFN computation via MoE GEMM kernel.
-
-    Interface features (pass via ``features``):
-
-    * ``{"dispatch_sorted"}``: triton backend.
-      Expects sorted_token_ids, expert_ids, num_tokens_post_padded from
-      the dispatch stage.
-    * ``{"ragged_metadata"}``: triton_kernels backend.
-      Expects ``a_ragged_metadata`` (a ``RaggedTensorMetadata``) plus
-      ``gather_indx`` / ``scatter_indx``.
-    * ``{"dispatch_gemm"}``: gather/dispatch tokens then GEMM (uses gather_indx).
-    * ``{"gemm_combine"}``: GEMM then scatter/combine results (uses scatter_indx).
-    """
-    if weight_format is None:
-        signature = _single_dense_tensor_format_signature("x", dtype)
-    else:
-        signature = _moe_fused_format_signature(
-            dtype, weight_format, fp8_scale_granularity=fp8_scale_granularity
-        )
-    kernel = select_kernel(
-        "moe",
-        "experts",
-        signature,
-        features=frozenset(features) if features else None,
-        traits=traits or {},
-        expected_kernel_name=expected_kernel_name,
-    )
-
-    return kernel(*args, **kwargs)
-
-
-def moe_combine(
-    *args,
-    dtype: torch.dtype = torch.bfloat16,
-    traits: Optional[dict] = None,
-    expected_kernel_name: Optional[str] = None,
-    **kwargs,
-):
-    """Combine expert outputs with weighted reduction."""
-    signature = _single_dense_tensor_format_signature("x", dtype)
-    kernel = select_kernel(
-        "moe",
-        "combine",
-        signature,
-        traits=traits or {},
-        expected_kernel_name=expected_kernel_name,
-    )
-
-    return kernel(*args, **kwargs)
-
-
-def moe_fused(
-    *args,
-    dtype: torch.dtype = torch.bfloat16,
-    features: Optional[Set[str]] = None,
-    weight_format: str = WEIGHT_BF16,
-    fp8_scale_granularity: str = "block",
-    traits: Optional[dict] = None,
-    expected_kernel_name: Optional[str] = None,
-    **kwargs,
-) -> torch.Tensor:
-    """End-to-end fused MoE: route + permute + experts + combine.
-
-    Interface features (pass via ``features``):
-
-    * ``{"self_routing"}``: kernel does routing internally (trtllm).
-    * ``{"pre_routed"}``: routing already done by caller (cutlass, reference).
+def moe_plan(
+    weight_dtype: str,
+    input_dtype: torch.dtype = torch.bfloat16,
+    activation: str | None = None,
+    requires_deferred_finalize: bool = False,
+    a2a_backend: str | None = None,
+    ep_size: int | None = None,
+    ispp: int | None = None,
+    fp8_scale_block_shape: tuple[int, int] | None = None,
+    internal_activation_dtype: str | None = None,
+    with_bias: bool = False,
+    deepep_group: object | None = None,
+    solution: str | None = None,
+) -> dict:
+    """Create a MoE execution plan.
 
     Args:
-        weight_format: Weight tensor encoding used for the expert weights.
-            Supported values are:
+        weight_dtype: Logical MoE weight dtype. fp16, bf16, float16,
+            bfloat16, and unquantized aliases map to unquant.
+        input_dtype: Hidden-state dtype used for the apply-kernel signature.
+        activation: Optional activation name required by the layer.
+        requires_deferred_finalize: Require a kernel that can defer finalize.
+        a2a_backend: Optional all-to-all backend. deepep selects the DeepEP
+            solution when solution is not set.
+        ep_size: Optional expert-parallel size. Values > 1 require EP support.
+        ispp: Optional intermediate size per partition for alignment checks.
+        fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
+        internal_activation_dtype: Optional internal activation dtype requirement.
+        with_bias: Whether the selected kernel must support expert bias tensors.
+        deepep_group: Runtime-created process group used by DeepEP plans.
+        solution: Optional kernel solution to force through normal selection.
+            None leaves the concrete kernel choice to the registry.
 
-            * ``"bf16"``: dense bfloat16 weights with no scale tensor.
-            * ``"fp8"``: FP8 E4M3 weights with float32 block scales.
-              Fused MoE kernels currently register this as a fixed
-              ``block_shape=(128, 128)`` format.
-            * ``"mxfp4"``: packed MXFP4 weights stored as uint8 with uint8
-              block scales over 32-value blocks.
-            * ``"nvfp4"``: packed NVFP4 weights stored as uint8 with float32
-              block scales over 16-value blocks.
-
-            The activation/input format is selected by ``dtype``. When
-            ``dtype=torch.uint8``, ``weight_format`` disambiguates whether the
-            input is interpreted as MXFP4 or NVFP4.
+    The selected apply kernel owns plan metadata. A plan with support_routing
+    false requires precomputed top-k ids and weights when calling moe_apply.
+    Process-weights is pinned to the processor selected for the chosen apply
+    solution when weights are loaded.
     """
-    signature = _moe_fused_format_signature(
-        dtype, weight_format, fp8_scale_granularity=fp8_scale_granularity
+    weight_dtype = _normalize_weight_dtype(weight_dtype)
+    _validate_a2a_backend(a2a_backend)
+    if solution is None and a2a_backend == "deepep":
+        solution = "flashinfer_cutedsl_deepep"
+
+    traits = _build_traits(
+        weight_dtype=weight_dtype,
+        activation=activation,
+        requires_deferred_finalize=requires_deferred_finalize,
+        a2a_backend=a2a_backend,
+        ep_size=ep_size,
+        ispp=ispp,
+        fp8_scale_block_shape=fp8_scale_block_shape,
+        internal_activation_dtype=internal_activation_dtype,
+        with_bias=with_bias,
     )
-    selection_traits = dict(traits or {})
+
     kernel = select_kernel(
         "moe",
-        "fused",
-        signature,
-        features=frozenset(features) if features else None,
-        traits=selection_traits,
-        expected_kernel_name=expected_kernel_name,
+        "apply",
+        format_signature(x=dense_tensor_format(input_dtype)),
+        traits=traits,
+        solution=solution,
     )
+    registry = KernelRegistry.get()
+    apply_spec = registry.get_by_name(kernel.name)
+    if apply_spec is None:
+        raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
 
-    return kernel(*args, **kwargs)
+    process_weights_kernel = select_kernel(
+        "moe",
+        "process_weights",
+        format_signature(),
+        traits={"weight_dtype": weight_dtype},
+        solution=apply_spec.solution,
+    )
+    process_weights_spec = registry.get_by_name(process_weights_kernel.name)
+    if process_weights_spec is None:
+        raise RuntimeError(
+            f"Kernel spec not found for selected kernel {process_weights_kernel.name}"
+        )
+
+    routing_modes = apply_spec.traits.get("routing_mode", frozenset())
+    support_routing = "kernel_routing" in routing_modes
+    supports_deferred_finalize = True in apply_spec.traits.get(
+        "supports_deferred_finalize", frozenset({False})
+    )
+    return {
+        "weight_dtype": weight_dtype,
+        "apply_kernel_name": apply_spec.name,
+        "process_weights_kernel_name": process_weights_spec.name,
+        "a2a_backend": a2a_backend,
+        "deepep_group": deepep_group,
+        "support_routing": support_routing,
+        "supports_deferred_finalize": supports_deferred_finalize,
+        "solution": apply_spec.solution,
+        "internal_activation_dtype": internal_activation_dtype,
+    }
+
+
+def moe_process_weights(plan: dict, w: torch.nn.Module):
+    """Process loaded MoE weights according to a plan.
+
+    Args:
+        plan: Execution plan returned by moe_plan.
+        w: Module containing loaded MoE weights. This module is mutated in
+            place to prepare solution-specific layouts and scales.
+    """
+    kernel = select_kernel(
+        "moe",
+        "process_weights",
+        format_signature(),
+        override=plan["process_weights_kernel_name"],
+    )
+    return kernel(plan=plan, w=w)
+
+
+def moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    # top-k routing inputs
+    router_logits: torch.Tensor,
+    # top-k routing results
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    # token length
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    # launch config
+    enable_pdl: bool = False,
+):
+    """Apply a planned MoE kernel.
+
+    Args:
+        plan: Execution plan returned by moe_plan.
+        x: Hidden states with shape [tokens, hidden_size].
+        w: Module containing processed MoE weights.
+        router_logits: Router logits with shape [tokens, num_experts].
+        topk_weights: Optional precomputed expert weights with shape
+            [tokens, top_k]. Required when plan support_routing is false.
+        topk_ids: Optional precomputed expert ids with shape [tokens, top_k].
+            Required when plan support_routing is false.
+        num_tokens_global: Optional global token count for distributed MoE.
+        max_num_tokens_per_gpu: Optional per-GPU token capacity hint.
+
+    Solutions may use precomputed top-k tensors or route from logits directly.
+    """
+    kernel = select_kernel(
+        "moe",
+        "apply",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        override=plan["apply_kernel_name"],
+    )
+    return kernel(
+        plan=plan,
+        x=x,
+        w=w,
+        router_logits=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        num_tokens_global=num_tokens_global,
+        max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+    )

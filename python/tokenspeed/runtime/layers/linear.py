@@ -172,7 +172,7 @@ class LinearBase(torch.nn.Module):
 
         self.quant_config = quant_config
         if quant_config is None or should_ignore_quant_layer(
-            prefix=prefix, ignored_layers=getattr(quant_config, "ignored_layers", [])
+            prefix=prefix, ignored_layers=quant_config.ignored_layers
         ):
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
         elif isinstance(quant_config, Nvfp4Config):

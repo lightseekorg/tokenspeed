@@ -80,9 +80,8 @@ class Mxfp4Config(QuantizationConfig):
         is_checkpoint_mxfp4_serialized: bool = False,
         is_w4a8_fp8: bool = False,
     ):
-        super().__init__()
+        super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
-        self.ignored_layers = ignored_layers or []
         self.is_w4a8_fp8 = is_w4a8_fp8
 
     @classmethod

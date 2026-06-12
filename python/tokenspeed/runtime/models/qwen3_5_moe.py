@@ -38,7 +38,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
@@ -193,9 +193,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             use_grouped_topk=False,
             output_format=self.experts.topk_output_format,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
         )
         if getattr(config, "shared_expert_intermediate_size", 0) > 0:
             self.shared_expert = Qwen3_5MoeMLP(
