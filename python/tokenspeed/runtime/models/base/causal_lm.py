@@ -44,10 +44,6 @@ class BaseCausalLM(nn.Module):
 
     model_cls: type[BaseTransformerModel]
 
-    # TODO: temporary; remove in the follow-up refactoring that extends
-    # pre-attn q-slice to Qwen NextN and DeepSeek V3 NextN.
-    pre_attention_trim: bool = False
-
     def __init__(
         self,
         config: PretrainedConfig,

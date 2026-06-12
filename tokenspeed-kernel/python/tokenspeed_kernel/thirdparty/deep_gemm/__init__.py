@@ -89,6 +89,12 @@ from deep_gemm import (
     transform_sf_into_required_layout,
     transform_weights_for_mega_moe,
 )
+from tokenspeed_kernel.thirdparty.deep_gemm.warmup import (
+    warmup_fp8_gemm_nt,
+    warmup_fp8_gemm_nt_from_model,
+    warmup_mega_moe_jit,
+    warmup_prefill_jit,
+)
 
 __all__ = [
     "ceil_div",
@@ -109,4 +115,8 @@ __all__ = [
     "get_paged_mqa_logits_metadata",
     "fp8_paged_mqa_logits",
     "fp8_mqa_logits",
+    "warmup_fp8_gemm_nt",
+    "warmup_fp8_gemm_nt_from_model",
+    "warmup_mega_moe_jit",
+    "warmup_prefill_jit",
 ]

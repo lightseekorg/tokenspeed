@@ -35,7 +35,6 @@ fp8_blockwise_scaled_mm = error_fn
 per_token_group_quant_8bit = error_fn
 per_tensor_quant_fp8 = error_fn
 per_token_quant_fp8 = error_fn
-moe_align_block_size = error_fn
 fast_topk_v2 = error_fn
 
 # deep_ep_cpp MUST be loaded before trtllm_kernel.  libtensorrt_llm.so
@@ -113,27 +112,6 @@ if platform.is_nvidia:
             output.copy_(q)
             scale.copy_(s.float().squeeze(-1))
 
-        def moe_align_block_size(
-            topk_ids: torch.Tensor,
-            num_experts: int,
-            block_size: int,
-            sorted_ids: torch.Tensor,
-            expert_ids: torch.Tensor,
-            num_tokens_post_pad: torch.Tensor,
-            cumsum_buffer: torch.Tensor = None,
-            pad_sorted_token_ids: bool = False,
-        ):
-            # Kernel convention: num_experts is actually num_experts + 1.
-            actual_num_experts = num_experts - 1
-            torch.ops.trtllm.moe_align_block_size(
-                topk_ids,
-                actual_num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-            )
-
         def fast_topk_v2(
             values: torch.Tensor,
             seq_lens: torch.Tensor,
@@ -160,6 +138,5 @@ __all__ = [
     "per_token_group_quant_8bit",
     "per_tensor_quant_fp8",
     "per_token_quant_fp8",
-    "moe_align_block_size",
     "fast_topk_v2",
 ]

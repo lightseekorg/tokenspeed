@@ -406,6 +406,10 @@ class DefaultModelLoader(BaseModelLoader):
                     with device_loading_context(module, target_device):
                         module.process_weights_after_loading(module)
 
+            post_quant_warmup = getattr(model, "post_quant_warmup", None)
+            if callable(post_quant_warmup):
+                post_quant_warmup()
+
         return model.eval()
 
 
@@ -465,6 +469,10 @@ class DummyModelLoader(BaseModelLoader):
                 process_method = getattr(module, "process_weights_after_loading", None)
                 if process_method is not None:
                     module.process_weights_after_loading(module)
+
+            post_quant_warmup = getattr(model, "post_quant_warmup", None)
+            if callable(post_quant_warmup):
+                post_quant_warmup()
 
             #  For accurate performance evaluation, we assign
             # random values to the weights.
@@ -609,6 +617,11 @@ class ShardedStateLoader(BaseModelLoader):
                         state_dict.pop(key)
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        post_quant_warmup = getattr(model, "post_quant_warmup", None)
+        if callable(post_quant_warmup):
+            post_quant_warmup()
+
         return model.eval()
 
 

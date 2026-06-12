@@ -100,8 +100,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         config: dict[str, Any] | None = None,
         packed_modules_mapping: dict[str, list[str]] | None = None,
     ):
-        super().__init__()
-        self.ignored_layers = ignore
+        super().__init__(ignored_layers=ignore)
         self.quant_format = quant_format
         # Map from [target -> scheme]
         self.target_scheme_map = target_scheme_map

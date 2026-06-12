@@ -148,7 +148,7 @@ class DeepEPCudaGraphRunnerAdapter:
     @staticmethod
     def _get_buffer_cls():
         try:
-            from tokenspeed.runtime.layers.moe.dispatcher.deep_ep import (
+            from tokenspeed_kernel.ops.communication.deep_ep import (
                 DeepEPBuffer,
             )
 

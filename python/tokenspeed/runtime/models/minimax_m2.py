@@ -47,7 +47,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
@@ -81,9 +81,9 @@ logger = logging.getLogger(__name__)
 _is_nvidia = current_platform().is_nvidia
 
 if _is_nvidia:
-    from tokenspeed_kernel.ops.routing.cuda import fp32_router_gemm
+    from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm
 
-from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 
 MoELayer = _MoELayer
 
@@ -163,9 +163,6 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             correction_bias=self.routing_bias,
             routed_scaling_factor=1.0,
             output_format=self.experts.topk_output_format,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
         )
 
     def get_moe_routed_weights(self):

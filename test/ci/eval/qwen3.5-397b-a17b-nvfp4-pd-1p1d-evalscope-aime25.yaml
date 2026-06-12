@@ -1,0 +1,38 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.5-397b-a17b-nvfp4-pd-1p1d-aime25
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - gb200-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    LB_HOST=127.0.0.1
+    LB_PORT=8000
+    MAX_MODEL_LEN=80000
+    bash test/ci_system/serve_qwen35_397b_nvfp4_pd_1p1d.sh
+  ready:
+    url: http://127.0.0.1:8000/v1/models
+    timeout: 2400
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model nvidia/Qwen3.5-397B-A17B-NVFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime25
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
+report:
+  github_step_summary: true
+score_threshold: 0.86
