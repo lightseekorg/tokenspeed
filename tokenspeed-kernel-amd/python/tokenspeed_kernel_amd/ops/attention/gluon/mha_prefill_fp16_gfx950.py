@@ -357,12 +357,22 @@ class AttentionProgram:
     @gluon.jit
     def softmax(self, qk, m_i, l_i, acc):
         cfg = self.cfg
+        HAS_INVALID: gl.constexpr = cfg.WINDOW_LEFT >= 0 and not cfg.HAS_SINK
         row_max = max(qk, 1)
         m_new = maximum(m_i, row_max)
         m_new_scaled = m_new * cfg.SM_SCALE
+        # In sliding window case, some rows can see fully masked tiles before
+        # any valid KV. Guard the online softmax state so `-inf - -inf` does not
+        # produce NaNs. This does not happen when having sink, because m_i
+        # is initialized to sink value instead of -inf.
+        if HAS_INVALID:
+            invalid = m_new == -float("inf")
+            m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
         qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
+        if HAS_INVALID:
+            m_diff = gl.where(invalid, 0.0, m_diff)
         alpha = gl.exp2(m_diff)
         l_ij = gl.sum(p, axis=1)
         l_i = l_i * alpha + l_ij
@@ -372,32 +382,17 @@ class AttentionProgram:
         return p, m_new, l_i, acc
 
     @gluon.jit
-    def softmax_masked(self, qk, valid, m_i, l_i, acc):
+    def apply_sliding_mask(self, qk, offs_n):
         cfg = self.cfg
-        qk = gl.where(valid, qk, -float("inf"))
-        row_max = max(qk, 1)
-        row_max_is_neg_inf = row_max == -float("inf")
-        m_new = gl.where(row_max_is_neg_inf, m_i, maximum(m_i, row_max))
-        m_new_scaled = m_new * cfg.SM_SCALE
-        m_new_scaled_safe = gl.where(row_max_is_neg_inf, 0.0, m_new_scaled)
-        p = gl.where(
-            valid, gl.exp2(qk * cfg.SM_SCALE - m_new_scaled_safe[:, None]), 0.0
+        offs_m = self.q_start + gl.arange(
+            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
         )
-
-        same_state = m_i == m_new
-        m_i_scaled_safe = gl.where(same_state, 0.0, m_i * cfg.SM_SCALE)
-        m_new_scaled_for_alpha = gl.where(same_state, 0.0, m_new_scaled)
-        alpha = gl.where(
-            same_state,
-            1.0,
-            gl.exp2(m_i_scaled_safe - m_new_scaled_for_alpha),
-        )
-        l_i = l_i * alpha + gl.sum(p, axis=1)
-        acc = acc * alpha[:, None]
-
-        p = p.to(self.q_ptr.dtype.element_ty)
-        p = gl.convert_layout(p, cfg.p_layout)
-        return p, m_new, l_i, acc
+        kv = gl.convert_layout(offs_n, gl.SliceLayout(0, cfg.qk_layout))
+        valid = offs_m[:, None] < self.seq_len
+        valid &= kv[None, :] < self.seq_len
+        valid &= kv[None, :] <= offs_m[:, None]
+        valid &= offs_m[:, None] <= kv[None, :] + cfg.WINDOW_LEFT
+        return gl.where(valid, qk, -float("inf"))
 
     @gluon.jit
     def apply_sinks(self, l_i, m_i, sink_log2):
@@ -794,9 +789,6 @@ def process_sliding_attention_tile(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
 
-    offs_m = program.q_start + gl.arange(
-        0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
-    )
     kv_start = program.q_start - cfg.WINDOW_LEFT
     kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
     num_kv_tiles: gl.constexpr = (
@@ -813,12 +805,8 @@ def process_sliding_attention_tile(
         async_copy.wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        kv = gl.convert_layout(offs_n, gl.SliceLayout(0, cfg.qk_layout))
-        valid = offs_m[:, None] < program.seq_len
-        valid &= kv[None, :] < program.seq_len
-        valid &= kv[None, :] <= offs_m[:, None]
-        valid &= offs_m[:, None] <= kv[None, :] + cfg.WINDOW_LEFT
-        p, m_i, l_i, acc = program.softmax_masked(qk, valid, m_i, l_i, acc)
+        qk = program.apply_sliding_mask(qk, offs_n)
+        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         async_copy.wait_group(0)
         v = program.shared_load_v(v_smem)
