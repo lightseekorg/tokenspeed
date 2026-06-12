@@ -247,10 +247,6 @@ class ServerArgs:
     disable_prefill_graph: bool | None = False
     prefill_graph_max_tokens: int | None = 128
     cudagraph_capture_sizes: list[int] | None = None
-    # Opt-in NaN containment: sanitize non-finite logits before sampling,
-    # detect affected requests, and terminate them with an error instead of
-    # letting corruption spread (graph-safe, ~O(bs*vocab) elementwise per
-    # step).
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
     enable_p2p_check: bool = False
@@ -1572,7 +1568,6 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            default=ServerArgs.enable_nan_detection,
             help="Enable the NaN guard: sanitize non-finite logits before "
             "sampling, detect requests whose logits contained NaN (or whose "
             "sampled token id escaped the vocab range), and terminate only "
