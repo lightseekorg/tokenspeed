@@ -56,7 +56,11 @@ def _scattered_num_tokens_all(ctx: ForwardContext, mapping: Mapping) -> List[int
     if ctx.global_num_tokens is not None:
         scattered: List[int] = []
         for attn_dp_rank in range(mapping.attn.dp_size):
-            num_tokens = ctx.global_num_tokens[attn_dp_rank * mapping.attn.tp_size]
+            # global_num_tokens is indexed by global rank with dp stride
+            # tp_size * cp_size; cp peers report the same count.
+            num_tokens = ctx.global_num_tokens[
+                attn_dp_rank * mapping.attn.tp_size * mapping.attn.cp_size
+            ]
             scattered.extend(_scatter_count(num_tokens, mapping.attn.tp_size))
         return scattered
     return _scatter_count(ctx.input_num_tokens, mapping.attn.tp_size)
@@ -77,9 +81,19 @@ def _group_scattered_num_tokens(
         return _scattered_num_tokens_all(ctx, mapping)[start:end]
     elif group_type == ParallelGroup.MOE_TP_EP:
         tp_ep_size = mapping.moe.tp_ep_size
-        if ctx.global_num_tokens is not None:
-            start = mapping.moe.dp_rank * tp_ep_size
-            return list(ctx.global_num_tokens[start : start + tp_ep_size])
+        # Without DP, all ranks share the batch and the scattered table needs
+        # no global metadata, so the lookup below stays valid.
+        if ctx.global_num_tokens is not None or not mapping.attn.has_dp:
+            # After the attention reduce-scatter, each rank holds its
+            # scattered share of its attn dp group's tokens, not the raw
+            # global count; MoE collectives must size from those rows.
+            scattered = _scattered_num_tokens_all(ctx, mapping)
+            return [
+                scattered[mapping.attn.scatter_index(rank)]
+                for rank in mapping.moe.tp_ep_group
+            ]
+        # With DP but no gathered metadata, other dp groups' counts are
+        # unknown; only the local rank's contribution can be reported.
         result = [0] * tp_ep_size
         result[mapping.moe.tp_ep_rank] = ctx.input_num_tokens
         return result

@@ -52,30 +52,6 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
-# Global debug tracking for decode_prefix_len transmission
-DEBUG_PREFIX_TRACKER = {}
-
-
-def debug_prefix_log(
-    operation: str, request_id: str, prefix_len: int, additional_info: str = ""
-):
-    """Debug utility to track decode_prefix_len transmission"""
-    global DEBUG_PREFIX_TRACKER
-    timestamp = time.time()
-    DEBUG_PREFIX_TRACKER[request_id] = {
-        "timestamp": timestamp,
-        "operation": operation,
-        "prefix_len": prefix_len,
-        "additional_info": additional_info,
-    }
-    logger.debug(
-        "[PREFIX_DEBUG] %s: req=%s, prefix_len=%s, info=%s",
-        operation,
-        request_id,
-        prefix_len,
-        additional_info,
-    )
-
 
 class CommonKVManager(BaseKVManager):
     def __init__(

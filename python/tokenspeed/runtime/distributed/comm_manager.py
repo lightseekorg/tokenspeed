@@ -68,7 +68,11 @@ class CommManager:
         if global_counts is not None:
             scattered = []
             for attn_dp_rank in range(self.mapping.attn.dp_size):
-                num_tokens = global_counts[attn_dp_rank * self.mapping.attn.tp_size]
+                # global_counts is indexed by global rank with dp stride
+                # tp_size * cp_size; cp peers report the same count.
+                num_tokens = global_counts[
+                    attn_dp_rank * self.mapping.attn.tp_size * self.mapping.attn.cp_size
+                ]
                 scattered.extend(
                     self._scatter_count(num_tokens, self.mapping.attn.tp_size)
                 )
@@ -93,9 +97,19 @@ class CommManager:
         global_counts = (
             ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
         )
-        if global_counts is not None:
-            start = self.mapping.moe.dp_rank * tp_ep_size
-            return list(global_counts[start : start + tp_ep_size])
+        # Without DP, all ranks share the batch and the scattered table needs
+        # no global metadata, so the lookup below stays valid.
+        if global_counts is not None or not self.mapping.attn.has_dp:
+            # After post_attn_comm reduce-scatter, each rank holds its
+            # scattered share of its attn dp group's tokens, not the raw
+            # global count; MoE collectives must size from those rows.
+            scattered = self.scattered_num_tokens(ctx)
+            return [
+                scattered[self.mapping.attn.scatter_index(rank)]
+                for rank in self.mapping.moe.tp_ep_group
+            ]
+        # With DP but no gathered metadata, other dp groups' counts are
+        # unknown; only the local rank's contribution can be reported.
         num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
         result = [0] * tp_ep_size
         result[self.mapping.moe.tp_ep_rank] = num_tokens
@@ -120,6 +134,24 @@ class CommManager:
 
         return token_all_gather(
             hidden_states,
+            group=self.mapping.attn.tp_group,
+            scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
+        )
+
+    def gather_residual(self, residual: torch.Tensor, ctx: ForwardContext):
+        """All-gather a residual left scattered by the previous layer's RSAG
+        path (e.g. for aux hidden capture); no-op when rows are already full.
+
+        Mirrors the pre_attn_comm gather conditions.
+        """
+        if self.layer_id == 0:
+            return residual
+        if not self.mapping.has_attn_tp:
+            return residual
+        if self.use_all_reduce(self.prev_is_moe):
+            return residual
+        return token_all_gather(
+            residual,
             group=self.mapping.attn.tp_group,
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )

@@ -55,7 +55,7 @@ RUNNER_SM_PREFIXES = (
     (("b300", "gb300"), "sm103"),
 )
 
-AMD_RUNNER_PREFIXES = ("linux-mi355", "amd-mi35x-", "amd-mi350-")
+AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
 GB200_RUNNER_PREFIXES = ("gb200",)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
