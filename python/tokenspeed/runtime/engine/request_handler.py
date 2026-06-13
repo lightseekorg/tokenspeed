@@ -42,10 +42,13 @@ from tokenspeed.runtime.engine.io_struct import (
     GetLoadReqInput,
     GetLoadReqOutput,
     IsSchedulerPausedReqInput,
+    IsSleepingReqInput,
     PauseSchedulerReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     ResumeSchedulerReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
@@ -85,12 +88,16 @@ class RequestHandler:
         get_load_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
+        memory_controller=None,
     ) -> None:
 
         self.forward_ct = 0
         self.server_args = server_args
         # Owns pause/resume state; shared with the event loop. See pause.py.
         self.pause_controller = pause_controller
+        # Owns release/resume_memory_occupation (data plane). See
+        # memory_occupation.py. Shares the pause controller's drain machinery.
+        self.memory_controller = memory_controller
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -184,6 +191,13 @@ class RequestHandler:
                 self.pause_controller.handle_resume(recv_req)
             elif isinstance(recv_req, IsSchedulerPausedReqInput):
                 self.pause_controller.handle_is_paused(recv_req)
+            elif isinstance(recv_req, ReleaseMemoryOccupationReqInput):
+                # Deferred: pauses + drains, then frees GPU memory and replies.
+                self.memory_controller.handle_release(recv_req)
+            elif isinstance(recv_req, ResumeMemoryOccupationReqInput):
+                self.memory_controller.handle_resume(recv_req)
+            elif isinstance(recv_req, IsSleepingReqInput):
+                self.memory_controller.handle_is_sleeping(recv_req)
             elif isinstance(recv_req, GetInternalStateReq):
                 self.send_func.send_pyobj(GetInternalStateReqOutput(internal_state={}))
             elif isinstance(recv_req, SetInternalStateReq):

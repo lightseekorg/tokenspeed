@@ -41,6 +41,8 @@ and replies immediately.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from tokenspeed.runtime.engine.io_struct import (
     IsSchedulerPausedReqInput,
@@ -50,6 +52,21 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     ResumeSchedulerReqOutput,
 )
+
+
+@dataclass
+class _PendingDrain:
+    """A deferred action resolved when the scheduler drains.
+
+    ``on_drained`` runs once ``scheduler_drained`` is true: it sends the success
+    reply and, for a memory release, frees GPU memory. ``on_cancelled`` runs if a
+    resume arrives before the drain completes: it sends the failure reply to the
+    correct communicator (pause vs release use different ZMQ channels, so the
+    action carries its own reply rather than the controller hard-coding one).
+    """
+
+    on_drained: Callable[[], None]
+    on_cancelled: Callable[[], None]
 
 
 class PauseState(enum.IntEnum):
@@ -99,8 +116,14 @@ class PauseController:
         self.state = PauseState.UNPAUSED
         # RequestSpecs withheld from the scheduler while paused; flushed on resume.
         self.buffered_specs: list = []
-        # Deferred reply for abort/wait; held until the scheduler drains.
-        self._pending_reply: PauseSchedulerReqOutput | None = None
+        # Deferred post-drain action for abort/wait pause OR memory release; held
+        # until the scheduler drains. Single-consumer: only one may be armed.
+        self._pending_drain: _PendingDrain | None = None
+        # True once GPU memory has actually been released (data plane). Distinct
+        # from forward_blocked: PAUSED_ALL alone still permits DP idle forwards,
+        # which run the model (touch weights) and must be suppressed while the
+        # weights region is unmapped.
+        self.released: bool = False
         # Set by a pause(mode="abort"); consumed once by the event loop to
         # cancel in-flight requests already in the scheduler.
         self._abort_all_pending = False
@@ -152,6 +175,38 @@ class PauseController:
         specs, self.buffered_specs = self.buffered_specs, []
         return specs
 
+    # -- generic drain machinery (shared by pause and memory release) ----------
+
+    @property
+    def is_drain_pending(self) -> bool:
+        return self._pending_drain is not None
+
+    def request_drain(
+        self,
+        *,
+        abort_inflight: bool,
+        on_drained: Callable[[], None],
+        on_cancelled: Callable[[], None],
+    ) -> bool:
+        """Start a wait-style drain (PAUSED_NEW, cancel grammar-queued) and arm a
+        post-drain action. Returns False if a drain is already pending (the
+        caller should send its own busy reply). ``abort_inflight=True`` also
+        cancels in-flight requests (abort mode); False lets them finish (wait
+        mode / memory release)."""
+        if self._pending_drain is not None:
+            return False
+        self.state = PauseState.PAUSED_NEW
+        self._pending_drain = _PendingDrain(on_drained, on_cancelled)
+        self._cancel_grammar_pending = True
+        if abort_inflight:
+            self._abort_all_pending = True
+        return True
+
+    def set_released(self, released: bool) -> None:
+        """Mark GPU memory released (freeze fully) or restored (unpause)."""
+        self.released = released
+        self.state = PauseState.PAUSED_ALL if released else PauseState.UNPAUSED
+
     # -- control-request handlers (driven by the request handler) -------------
 
     def handle_pause(self, req: PauseSchedulerReqInput) -> None:
@@ -163,13 +218,13 @@ class PauseController:
             )
             return
 
-        # Reject any new pause while an abort/wait pause is still draining: its
-        # reply is a single-consumer promise (``_pending_reply``), so a second
-        # pause would overwrite it and strand the first caller forever on its ZMQ
-        # await — only one reply ever fires per pending pause. ``keep`` never sets
-        # ``_pending_reply``, so it can't be the *first* pause here, but it must
-        # not clobber a draining one either.
-        if self._pending_reply is not None:
+        # Reject any new pause while an abort/wait pause or memory release is
+        # still draining: the post-drain action is a single-consumer promise
+        # (``_pending_drain``), so a second drain would overwrite it and strand
+        # the first caller forever on its ZMQ await. ``keep`` never arms a drain,
+        # so it can't be the *first* pause here, but it must not clobber a
+        # draining one either.
+        if self._pending_drain is not None:
             self._send.send_pyobj(
                 PauseSchedulerReqOutput(
                     success=False, message="a pause is already in progress"
@@ -186,13 +241,36 @@ class PauseController:
         # abort / wait: stop admitting new requests, keep stepping so in-flight
         # requests drain, and reply once the scheduler is empty. Both also
         # cancel grammar-queued (still-compiling) pre-pause requests.
-        self.state = PauseState.PAUSED_NEW
-        self._pending_reply = PauseSchedulerReqOutput(success=True)
-        self._cancel_grammar_pending = True
-        if req.mode == "abort":
-            self._abort_all_pending = True
+        self.request_drain(
+            abort_inflight=(req.mode == "abort"),
+            on_drained=lambda: self._send.send_pyobj(
+                PauseSchedulerReqOutput(success=True)
+            ),
+            on_cancelled=lambda: self._send.send_pyobj(
+                PauseSchedulerReqOutput(
+                    success=False, message="resumed before pause drained"
+                )
+            ),
+        )
 
     def handle_resume(self, req: ResumeSchedulerReqInput) -> None:
+        # Reject a scheduler-level resume while GPU memory is still released.
+        # ``released`` is owned by the memory controller (its ``set_released``
+        # is the sole writer); clearing it here would flip the state to
+        # UNPAUSED without remapping the weights/KV regions, so the next admit
+        # or DP idle forward would touch unmapped memory. The caller must wake
+        # via ``resume_memory_occupation`` instead.
+        if self.released:
+            self._send.send_pyobj(
+                ResumeSchedulerReqOutput(
+                    success=False,
+                    message=(
+                        "memory is released; call resume_memory_occupation to "
+                        "wake before resuming the scheduler"
+                    ),
+                )
+            )
+            return
         # If a wait/abort pause is still awaiting its drain reply, it has NOT
         # drained — ``maybe_finish_drain`` clears ``_pending_reply`` the instant
         # it does. We must still reply (resume uses a separate communicator and
@@ -200,15 +278,13 @@ class PauseController:
         # the reply must be a failure: acking success here would tell a
         # weight-swapping caller it is safe to proceed while pre-pause requests
         # are still in flight under the old weights.
-        if self._pending_reply is not None:
-            self._send.send_pyobj(
-                PauseSchedulerReqOutput(
-                    success=False, message="resumed before pause drained"
-                )
-            )
-            self._pending_reply = None
+        if self._pending_drain is not None:
+            action = self._pending_drain
+            self._pending_drain = None
+            action.on_cancelled()
         # Buffered specs are flushed by the event loop on its next admission
-        # pass (state is already UNPAUSED by then).
+        # pass (state is already UNPAUSED by then). ``released`` is intentionally
+        # NOT touched here — see the guard above; only set_released() writes it.
         self.state = PauseState.UNPAUSED
         self._abort_all_pending = False
         self._cancel_grammar_pending = False
@@ -220,10 +296,16 @@ class PauseController:
     # -- per-iteration drain check (driven by the event loop) -----------------
 
     def maybe_finish_drain(self, scheduler) -> None:
-        """Resolve a deferred abort/wait reply once the scheduler has drained."""
-        if self._pending_reply is None:
+        """Resolve a deferred pause/release action once the scheduler has drained.
+
+        The action is cleared *before* it runs so a release's ``on_drained`` can
+        re-arm controller state (``set_released``) without tripping the
+        single-consumer guard.
+        """
+        if self._pending_drain is None:
             return
         if not scheduler_drained(scheduler):
             return
-        self._send.send_pyobj(self._pending_reply)
-        self._pending_reply = None
+        action = self._pending_drain
+        self._pending_drain = None
+        action.on_drained()
