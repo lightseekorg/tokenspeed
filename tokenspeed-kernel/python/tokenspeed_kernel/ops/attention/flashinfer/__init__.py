@@ -44,38 +44,24 @@ trtllm_batch_decode_with_kv_cache_mla = error_fn
 trtllm_ragged_attention_deepseek = error_fn
 
 if platform.is_nvidia:
-    try:
-        from flashinfer.decode import (
-            BatchDecodeWithPagedKVCacheWrapper,
-            trtllm_batch_decode_with_kv_cache,
-            trtllm_batch_decode_with_kv_cache_mla,
-        )
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
-    except ImportError:
-        pass
-
-    try:
-        from flashinfer.prefill import (
-            BatchPrefillWithPagedKVCacheWrapper,
-            BatchPrefillWithRaggedKVCacheWrapper,
-            trtllm_batch_context_with_kv_cache,
-            trtllm_ragged_attention_deepseek,
-        )
-    except ImportError:
-        pass
+    from flashinfer.decode import (
+        BatchDecodeWithPagedKVCacheWrapper,
+        trtllm_batch_decode_with_kv_cache,
+        trtllm_batch_decode_with_kv_cache_mla,
+    )
+    from flashinfer.prefill import (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+        cudnn_batch_prefill_with_kv_cache,
+        trtllm_batch_context_with_kv_cache,
+        trtllm_ragged_attention_deepseek,
+    )
 
 if platform.is_nvidia and platform.is_blackwell:
-    try:
-        from flashinfer.mla import (
-            BatchMLAPagedAttentionWrapper,
-            trtllm_batch_decode_with_kv_cache_mla,
-        )
-    except ImportError:
-        pass
+    from flashinfer.mla import (
+        BatchMLAPagedAttentionWrapper,
+        trtllm_batch_decode_with_kv_cache_mla,
+    )
 
 
 # ------------------------------------------------------------------------------
