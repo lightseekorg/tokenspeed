@@ -122,9 +122,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
             (1, 0),
         )
+
         # TRTLLM kernels require fp32 sinks.
         if sinks is not None and sinks.dtype != torch.float32:
             sinks = sinks.to(torch.float32)
+
         return trtllm_batch_context_with_kv_cache(
             query=q,
             kv_cache=(
@@ -191,6 +193,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         # TRTLLM kernels require fp32 sinks
         if sinks is not None and sinks.dtype != torch.float32:
             sinks = sinks.to(torch.float32)
+
         return trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=(
