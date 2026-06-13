@@ -635,7 +635,7 @@ _CASES = [
         "blackwell-non-sm100",
         "attention",
         "mha_prefill",
-        "flashinfer_mha_prefill",
+        "triton_mha_prefill",
         _attention_prefill,
     ),
     _case(
