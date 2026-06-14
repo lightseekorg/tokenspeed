@@ -164,6 +164,14 @@ def _build_buffer_layout_pair(
     prefill_tp_size: int,
     decode_tp_size: int,
 ):
+    """Build compatible logical layouts for one prefill/decode buffer pair.
+
+    Besides normal TP sharding and fully replicated buffers, this handles GQA
+    KV caches where prefill TP is larger than the number of distinct KV heads.
+    In that case multiple prefill TP ranks carry the same KV head, so the
+    transfer plan uses one representative rank from each replica group.
+    """
+
     if prefill_unit_len != decode_unit_len:
         raise ValueError(
             f"prefill/decode unit sizes differ for {buffer_kind.value}: "
@@ -184,12 +192,25 @@ def _build_buffer_layout_pair(
     decode_local_units = decode_item_len // decode_unit_len
     prefill_global_units = prefill_local_units * prefill_tp_size
     decode_global_units = decode_local_units * decode_tp_size
+    prefill_tp_replica_group_size = 1
     if prefill_global_units == decode_global_units:
         logical_axis = sharded_axis
         logical_size = decode_global_units
     elif prefill_item_len == decode_item_len:
         logical_axis = "replicated"
         logical_size = decode_local_units
+    elif (
+        sharded_axis == "kv_head"
+        and decode_global_units % prefill_local_units == 0
+        and decode_global_units // prefill_local_units <= prefill_tp_size
+        and prefill_tp_size % (decode_global_units // prefill_local_units) == 0
+    ):
+        logical_axis = sharded_axis
+        logical_size = decode_global_units
+        prefill_distinct_tp_size = decode_global_units // prefill_local_units
+        prefill_tp_replica_group_size = (
+            prefill_tp_size // prefill_distinct_tp_size
+        )
     else:
         raise ValueError(
             f"unsupported heterogeneous TP buffer layout for {buffer_kind.value}: "
@@ -207,6 +228,7 @@ def _build_buffer_layout_pair(
             page_size=1,
             bytes_per_logical_unit=decode_unit_len,
             item_stride_bytes=prefill_item_len,
+            tp_replica_group_size=prefill_tp_replica_group_size,
         ),
         BufferLayout(
             buffer_index=buffer_index,

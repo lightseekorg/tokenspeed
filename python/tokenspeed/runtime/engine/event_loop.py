@@ -106,6 +106,25 @@ def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
 _PAUSED_IDLE_SLEEP_S = 0.001
 
 
+def _forward_op_executes_model_forward(
+    forward_op, *, is_disagg_decode: bool
+) -> bool:
+    """Return whether ``forward_op`` will enter the model forward path.
+
+    On decode-side PD, EXTEND ops only start remote KV receive; the model
+    forward runs after the remote prefill completes and the scheduler advances
+    the request into decode. Treating those EXTEND ops as model work makes
+    idle DP ranks enter dummy collectives that the active rank will not match.
+    """
+    if forward_op is None:
+        return False
+    if sum(forward_op.input_lengths) <= 0:
+        return False
+    if is_disagg_decode and forward_op.num_extends() > 0:
+        return False
+    return True
+
+
 class _NullSender:
     """No-op ZMQ sender for non-rank-0 workers."""
 
@@ -1098,9 +1117,13 @@ class EventLoop:
         """
         import torch.distributed as dist
 
-        num_tokens = sum(forward_op.input_lengths) if forward_op is not None else 0
-        batch_size = len(forward_op.request_ids) if forward_op is not None else 0
-        if forward_op is None:
+        executes_model_forward = _forward_op_executes_model_forward(
+            forward_op,
+            is_disagg_decode=isinstance(self.pd_kv_transfer, DisaggDecodeExecutor),
+        )
+        num_tokens = sum(forward_op.input_lengths) if executes_model_forward else 0
+        batch_size = len(forward_op.request_ids) if executes_model_forward else 0
+        if not executes_model_forward:
             forward_mode = ForwardMode.IDLE
         else:
             forward_mode = ForwardMode.from_num_extends(
