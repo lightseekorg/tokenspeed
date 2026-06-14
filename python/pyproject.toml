@@ -45,7 +45,7 @@ dependencies = [
     "msgspec",
     "ninja",
     "numpy",
-    "openai==2.33.0",
+    "openai>=2.24.1",
     "openai-harmony",
     "orjson",
     "packaging",
