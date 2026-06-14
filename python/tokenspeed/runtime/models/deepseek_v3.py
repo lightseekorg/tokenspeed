@@ -1285,8 +1285,15 @@ class DeepseekV3Model(nn.Module):
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):
             if aux_hidden_states is not None and i in self.layers_to_capture:
-                aux_hidden_states.append(
+                # Under RSAG the inter-layer hidden/residual are reduce-
+                # scattered across the attn TP group; aux consumers (e.g. the
+                # EAGLE3 drafter) expect full rows, so gather before capturing.
+                aux = (
                     hidden_states + residual if residual is not None else hidden_states
+                )
+                gathered = self.layers[i].comm_manager.gather_residual(aux, ctx)
+                aux_hidden_states.append(
+                    gathered if gathered is aux else gathered.clone()
                 )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]

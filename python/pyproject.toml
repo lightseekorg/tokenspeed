@@ -45,7 +45,7 @@ dependencies = [
     "msgspec",
     "ninja",
     "numpy",
-    "openai==2.33.0",
+    "openai>=2.24.1",
     "openai-harmony",
     "orjson",
     "packaging",
@@ -71,11 +71,11 @@ dependencies = [
     "torch==2.11.0",
     "torchvision",
     "tqdm",
-    "transformers==5.6.2",
+    "transformers==5.12.0",
     "uv",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.33",
+    "xgrammar==0.2.2",
     "viztracer",
 ]
 

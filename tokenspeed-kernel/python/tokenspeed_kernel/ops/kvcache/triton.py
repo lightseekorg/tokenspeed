@@ -29,6 +29,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
+_ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -483,14 +484,15 @@ def transfer_kv_all_layer(
     words_per_chunk = 32
     total_words = item_size // 4
     num_chunks = triton.cdiv(total_words, words_per_chunk)
-    grid = (
-        _recommended_program_count(
-            length=length,
-            element_size=item_size,
-            num_layers=num_layers,
-            device=src_indices.device,
-        ),
+    num_programs = _recommended_program_count(
+        length=length,
+        element_size=item_size,
+        num_layers=num_layers,
+        device=src_indices.device,
     )
+    if _ALL_LAYER_GRID_CAP > 0:
+        num_programs = min(num_programs, _ALL_LAYER_GRID_CAP)
+    grid = (num_programs,)
     if _is_nvidia and total_words % words_per_chunk == 0:
         _kv_transfer_all_layer_cs32_kernel[grid](
             dst_k_layers,
