@@ -99,7 +99,7 @@ class LlamaAttention(BaseLlamaAttention):
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
                 ).index_select(0, ctx.gather_ids)
-                return ctx.attn_backend.forward(
+                attn_output = ctx.attn_backend.forward(
                     q_rope,
                     None,
                     None,
@@ -110,6 +110,12 @@ class LlamaAttention(BaseLlamaAttention):
                     ctx.bs,
                     save_kv_cache=False,
                 )
+                step_counter = ctx.attn_backend.step_counter
+                if step_counter is not None and not ctx.forward_mode.is_decode_or_idle():
+                    # The backend call above intentionally uses DECODE metadata,
+                    # bypassing EXTEND-side layerwise cache-step accounting.
+                    step_counter.record_cache()
+                return attn_output
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
             0, ctx.gather_ids

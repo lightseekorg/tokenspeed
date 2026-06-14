@@ -88,6 +88,11 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             ctx.bs,
             save_kv_cache=True,
         )
+        step_counter = ctx.attn_backend.step_counter
+        if step_counter is not None and not ctx.forward_mode.is_decode_or_idle():
+            # The backend call above intentionally uses DECODE metadata, which
+            # bypasses the backend's EXTEND-side layerwise cache-step accounting.
+            step_counter.record_cache()
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
