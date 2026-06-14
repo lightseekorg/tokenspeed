@@ -1486,11 +1486,13 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                 ):
                     quant_block_size = 1
-                    if (
-                        self.quant_config is not None
-                        and self.quant_config.weight_block_size is not None
-                    ):
-                        quant_block_size = self.quant_config.weight_block_size[0]
+                    # ``weight_block_size`` exists only on block-FP8 configs;
+                    # elsewhere (e.g. compressed-tensors INT4) q/kv_a_proj is unquantized.
+                    weight_block_size = getattr(
+                        self.quant_config, "weight_block_size", None
+                    )
+                    if self.quant_config is not None and weight_block_size is not None:
+                        quant_block_size = weight_block_size[0]
                     begin_size_mp = {
                         "q_a_proj": 0,
                         "kv_a_proj_with_mqa": self.config.q_lora_rank,
