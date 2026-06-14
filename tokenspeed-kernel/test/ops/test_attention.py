@@ -39,11 +39,6 @@ torch.manual_seed(42)
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
 
-pytestmark = pytest.mark.skipif(
-    not (platform.is_nvidia or platform.is_amd),
-    reason="Unified attention tests require an NVIDIA or AMD GPU.",
-)
-
 
 def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.Tensor:
     init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
