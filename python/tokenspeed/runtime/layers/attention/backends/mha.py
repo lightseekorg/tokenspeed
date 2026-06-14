@@ -108,6 +108,10 @@ class MHAAttnBackend(AttentionBackend):
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_prefill_metadata: MHAPrefillMetadata | None = None
 
+    # ------------------------------------------------------------------
+    # Metadata initialization
+    # ------------------------------------------------------------------
+
     def init_forward_metadata(
         self,
         bs: int,
@@ -280,6 +284,10 @@ class MHAAttnBackend(AttentionBackend):
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward_decode(
         self,
@@ -476,6 +484,10 @@ class MHAAttnBackend(AttentionBackend):
         )
         output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    # ------------------------------------------------------------------
+    # Helper methods
+    # ------------------------------------------------------------------
 
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
