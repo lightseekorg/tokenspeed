@@ -117,4 +117,25 @@ TEST_F(PagedCacheFamilySplitTest, StateDetachDoesNotBreakHistoryChain) {
     EXPECT_EQ(match.paged_cache.prefix_len_tokens, 768);
 }
 
+// Regression: ~HybridPrefixCache must drop snapshots still on tree nodes before
+// its allocators die. The nodes outlive hybrid_ (Scheduler order), so otherwise
+// their OwnedPages deallocate into a freed allocator at teardown (UAF under ASan).
+TEST_F(PagedCacheFamilySplitTest, DestructorReleasesAttachedSnapshots) {
+    const std::int32_t num_pages = 768 / kPageSize;
+    TreeNode* terminal = InsertDevicePages(num_pages, /*token_start=*/1);
+    ASSERT_NE(terminal, nullptr);
+
+    TreeNode* n256 = kv_cache_->GetRadixTree().SplitAt(terminal, 256);
+    ASSERT_NE(n256, nullptr);
+    hybrid_->AttachPagedCacheSnapshotToNode(n256, MakeCompleteSnapshot(256));
+    ASSERT_TRUE(n256->HasPagedCacheSnapshot());
+
+    // Destroy the hybrid cache first, mirroring Scheduler teardown order.
+    hybrid_.reset();
+
+    // The destructor detached the snapshot while its allocator was still alive;
+    // n256 (owned by kv_cache_) outlives hybrid_ and now carries no snapshot.
+    EXPECT_FALSE(n256->HasPagedCacheSnapshot());
+}
+
 }  // namespace tokenspeed::test

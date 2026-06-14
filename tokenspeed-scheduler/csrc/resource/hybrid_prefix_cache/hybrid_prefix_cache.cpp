@@ -48,6 +48,17 @@ HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkA
       mamba_eviction_manager_{mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
+HybridPrefixCache::~HybridPrefixCache() {
+    // Snapshots on KVPrefixCache's tree nodes hold OwnedPages borrowed from
+    // paged_cache_allocators_, but Scheduler destroys this object before
+    // KVPrefixCache. Release them now so the pages return to still-live
+    // allocators instead of deallocating into a freed allocator during
+    // ~KVPrefixCache (heap-use-after-free).
+    while (!paged_cache_snapshot_nodes_.empty()) {
+        DetachPagedCacheSnapshotFromNode(*paged_cache_snapshot_nodes_.begin());
+    }
+}
+
 MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
     auto match = kv_prefix_cache_.Match(token_ids, intent);
     augmentMatch(match);

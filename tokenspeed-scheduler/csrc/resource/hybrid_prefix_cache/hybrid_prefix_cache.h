@@ -51,6 +51,10 @@ public:
     HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size,
                       MambaHostAllocator* mamba_host_allocator = nullptr);
 
+    // Detaches any paged-cache snapshots still on tree nodes before the
+    // PagedCacheGroupAllocator members they borrow from are destroyed.
+    ~HybridPrefixCache();
+
     MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
                       MatchIntent intent = MatchIntent::PrefixReuse);
