@@ -486,8 +486,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         if q_lora_rank is None:
             raise ValueError("GLM DSA requires q_lora_rank.")
-        if tuple(getattr(quant_config, "weight_block_size", ()) or ()) == (128, 128):
-            self.fused_qkv_a_proj_with_mqa._use_deep_gemm_fp8 = True
+        # NOTE: do NOT force ``_use_deep_gemm_fp8`` here. On the unified-MoE
+        # kernel, the deep_gemm dense FP8 block-scale path requires the weight
+        # scales to be pre-transformed into the ue8m0 / MN-major layout, which
+        # ``Fp8LinearMethod.process_weights_after_loading`` only does when
+        # ``scale_fmt == "ue8m0"`` (it also sets the flag itself in that case).
+        # Forcing the flag here bypasses that transform and feeds raw block
+        # scales to ``deep_gemm_mm_fp8_blockscale`` -> NaN. Let process_weights
+        # decide: it enables deep_gemm with the proper transform, otherwise the
+        # default block-scale GEMM (override=None) runs correctly.
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=1e-6)
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=1e-6)
         self.fused_qk_layernorm = FusedRMSNorm(
@@ -1701,6 +1708,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 block_scale,
                 torch.bfloat16,
             )
+        # The fused QKV-A weight may be zero-padded on its output dim to a
+        # multiple of 128 so the FP8 block-scale GEMM stays numerically valid
+        # (see GlmMoeDsaForCausalLM._pad_fused_qkv_a_proj_for_fp8_blockscale).
+        # Drop the padding columns before the split / comm. No-op when the
+        # projection output already matches the logical width.
+        _qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        if qkv.shape[-1] != _qkv_width:
+            qkv = qkv[..., :_qkv_width]
         with cuda_perf_range("glm5:attn_pre_comm", logger=logger):
             qkv = comm_manager.pre_attn_comm(qkv, ctx)
         q_a, latent_cache = qkv.split(
@@ -2392,6 +2407,39 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 )
 
         super().load_weights(base_weights())
+        self._pad_fused_qkv_a_proj_for_fp8_blockscale()
+
+    def _pad_fused_qkv_a_proj_for_fp8_blockscale(self) -> None:
+        """Pad the fused QKV-A projection output dim to a multiple of 128.
+
+        The FP8 block-scale dense GEMM (deep_gemm / default mm path) requires
+        the output dim ``N`` to be a multiple of the 128 scale block; it returns
+        NaN otherwise. GLM-5.1's fused QKV-A projection has
+        ``N = q_lora_rank + kv_lora_rank + qk_rope_head_dim`` (e.g. 2624) which
+        is not 128-aligned, so attention output goes NaN on the very first
+        layer. DeepSeek dodges this by keeping the equivalent projection in
+        bf16; here we instead zero-pad the FP8 weight rows up to the next 128
+        multiple. ``weight_scale_inv`` already has ``ceil(N/128)`` row blocks
+        (so it covers the padded rows), and the downstream
+        ``qkv.split([q_lora_rank, kv_lora_rank + qk_rope_head_dim])`` ignores
+        the padding rows, so the result is unchanged for the real outputs.
+        """
+        fp8_dtypes = (torch.float8_e4m3fn, getattr(torch, "float8_e4m3fnuz", None))
+        fp8_dtypes = tuple(d for d in fp8_dtypes if d is not None)
+        for layer in getattr(self.model, "layers", []):
+            attn = getattr(layer, "self_attn", None)
+            proj = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+            weight = getattr(proj, "weight", None)
+            if weight is None or weight.dtype not in fp8_dtypes:
+                continue
+            n = weight.shape[0]
+            if n % 128 == 0:
+                continue
+            n_pad = ((n + 127) // 128) * 128
+            pad = weight.new_zeros(n_pad - n, weight.shape[1])
+            proj.weight = torch.nn.Parameter(
+                torch.cat([weight.data, pad], dim=0), requires_grad=False
+            )
 
 
 EntryClass = [GlmMoeDsaForCausalLM]
