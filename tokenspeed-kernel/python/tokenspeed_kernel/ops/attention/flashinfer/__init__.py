@@ -83,7 +83,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
-            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         ),
         priority=Priority.SPECIALIZED,
         traits={
@@ -159,7 +161,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
-            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         ),
         priority=Priority.SPECIALIZED,
         traits={
