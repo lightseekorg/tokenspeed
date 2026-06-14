@@ -66,7 +66,7 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
         "--world-size",
         str(WORLD_SIZE),
         "--moe-backend",
-        "flashinfer_mxfp4",
+        "flashinfer_trtllm",
     ] + list(extra_args)
     return subprocess.Popen(cmd, env=os.environ.copy())
 

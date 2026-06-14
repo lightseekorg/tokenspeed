@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -35,9 +35,6 @@ fp8_min = platform.fp8e4m3fn.min
 if _is_nvidia:
     from tokenspeed_kernel.ops.quantization.flashinfer import (
         fp8_blockscale_quantize_runner_sm90 as _flashinfer_fp8_blockscale_quantize_runner_sm90,
-    )
-    from tokenspeed_kernel.thirdparty.trtllm import (
-        per_tensor_quant_fp8 as _trtllm_per_tensor_quant_fp8,
     )
     from tokenspeed_kernel.thirdparty.trtllm import (
         per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
@@ -548,64 +545,3 @@ def static_quant_fp8(
     )
     x_s = x_s_repeat if repeat_scale else x_s
     return x_q, x_s
-
-
-def scaled_fp8_quant(
-    input: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
-    num_token_padding: Optional[int] = None,
-    use_per_token_if_dynamic: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-
-    if _is_amd:
-        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-        shape = input.shape
-        if num_token_padding:
-            shape = (max(num_token_padding, input.shape[0]), shape[1])
-        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
-
-        if scale is None:
-            # Dynamic scaling
-            if use_per_token_if_dynamic:
-                scale = torch.empty(
-                    (shape[0], 1), device=input.device, dtype=torch.float32
-                )
-                torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                    output, input.contiguous(), scale, None
-                )
-            else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
-        else:
-            # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
-            torch.ops._C.static_scaled_fp8_quant(output, input, scale)
-
-        return output, scale
-    else:
-        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-        shape = input.shape
-        if num_token_padding:
-            shape = (max(num_token_padding, input.shape[0]), shape[1])
-        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
-
-        if scale is None:
-            # Dynamic scaling
-            if use_per_token_if_dynamic:
-                scale = torch.empty(
-                    (shape[0], 1), device=input.device, dtype=torch.float32
-                )
-                _trtllm_per_token_quant_fp8(input, output, scale)
-            else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                _trtllm_per_tensor_quant_fp8(input, output, scale)
-        else:
-            # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
-            _trtllm_per_tensor_quant_fp8(input, output, scale)
-
-        return output, scale

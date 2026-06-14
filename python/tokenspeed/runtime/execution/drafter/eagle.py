@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.cute_dsl import argmax as cute_argmax
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -36,7 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -155,8 +155,8 @@ class Eagle(BaseDrafter):
         draft_input: EagleDraftInput,
         bs: int,
         input_num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (input_ids, unpadded_input_lengths, gather_ids) for the first draft step.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (input_ids, gather_ids) for the first draft step.
 
         The first-step input shape matches the base model's: ragged
         ``[prefill_part || decode_part]`` under MIXED, full prefill chunks
@@ -198,12 +198,11 @@ class Eagle(BaseDrafter):
                 )
         else:
             input_ids = draft_input.base_model_output
-            unpadded_input_lengths = draft_input.accept_lengths
             gather_ids = (
                 self.padded_gather_ids_offsets_buf[:bs] + draft_input.accept_lengths
             )
 
-        return input_ids, unpadded_input_lengths, gather_ids
+        return input_ids, gather_ids
 
     @nvtx_range("draft_first_step", color="purple")
     def _run_first_step(
@@ -215,25 +214,16 @@ class Eagle(BaseDrafter):
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
 
-        input_ids, _, gather_ids = self._get_first_step_input(
+        input_ids, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        draft_first_step_reduce = forward_mode.is_decode()
-
-        # TODO: remove the isinstance/flag gate together with pre_attention_trim
-        # once Qwen NextN and DeepSeek V3 NextN also pre-slice q.
-        draft_model = self.draft_model_runner.model
-        if (
-            draft_first_step_reduce
-            and self.attn_backend.support_kv_cache_prewrite
-            and isinstance(draft_model, BaseCausalLM)
-            and draft_model.pre_attention_trim
-        ):
-            correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
-                self.draft_seq_lens_buf.dtype
-            )
-            self.draft_seq_lens_buf[:bs].sub_(correction)
+        # Llama Eagle3 narrows for any non-idle catch-up (EXTEND/MIXED/
+        # TARGET_VERIFY/DECODE); Qwen/DeepSeek keep is_decode() only.
+        draft_first_step_reduce = forward_mode.is_decode() or (
+            isinstance(self.draft_model_runner.model, LlamaForCausalLMEagle3)
+            and not forward_mode.is_idle()
+        )
 
         draft_first_mode = (
             ForwardMode.DRAFT_EXTEND
@@ -255,6 +245,8 @@ class Eagle(BaseDrafter):
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
             draft_first_step_reduce=draft_first_step_reduce,
+            draft_seq_lens_buf=self.draft_seq_lens_buf,
+            accept_lengths=draft_input.accept_lengths,
         )
 
         return self.draft_model_runner.forward(
@@ -352,7 +344,7 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = cute_argmax(logits_output.next_token_logits)
+                draft_ids = sampling_argmax(logits_output.next_token_logits)
                 draft_ids.clamp_(min=0)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
@@ -422,7 +414,7 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output = self._run_first_step(bs, draft_input)
 
-        draft_ids = cute_argmax(logits_output.next_token_logits)
+        draft_ids = sampling_argmax(logits_output.next_token_logits)
         draft_ids.clamp_(min=0)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 

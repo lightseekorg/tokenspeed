@@ -21,6 +21,7 @@
 import struct
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -32,6 +33,14 @@ from tokenspeed.runtime.pd.base.conn import (
     KVPoll,
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
+from tokenspeed.runtime.pd.transfer_plan import (
+    BufferKind,
+    BufferLayout,
+    ParallelLayout,
+    PDTransferPlanner,
+    RankTransferPlan,
+    encode_transfer_fragments,
+)
 from tokenspeed.runtime.pd.utils import (
     PageTransferMetadata,
 )
@@ -62,6 +71,18 @@ def _get_prefill_parallel_info_from_server(
                 dp_size=int(prefill_parallel_info["prefill_dp_size"]),
                 enable_mla_l1_5_cache=bool(
                     prefill_parallel_info["enable_mla_l1_5_cache"]
+                ),
+                kv_item_lens=tuple(
+                    int(x) for x in prefill_parallel_info.get("kv_item_lens", [])
+                ),
+                kv_unit_lens=tuple(
+                    int(x) for x in prefill_parallel_info.get("kv_unit_lens", [])
+                ),
+                state_item_lens=tuple(
+                    int(x) for x in prefill_parallel_info.get("state_item_lens", [])
+                ),
+                state_unit_lens=tuple(
+                    int(x) for x in prefill_parallel_info.get("state_unit_lens", [])
                 ),
             )
         else:
@@ -96,60 +117,284 @@ def _get_bootstrap_info_from_server(bootstrap_addr, engine_rank, target_dp_group
         return None
 
 
-def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo):
-    # Currently, we don't allow prefill instance and decode instance to
-    # have different TP sizes per DP rank, except for models using MLA.
+@dataclass(frozen=True)
+class ReceiverRoutePlan:
+    target_tp_rank: int | None
+    target_tp_ranks: tuple[int, ...]
+    required_prefill_response_num: int
+    default_required_dst_info_num: int
+    transfer_plan: RankTransferPlan | None = None
+    supports_remote_spec_candidates: bool = True
+
+    def required_dst_info_num_for_tp_rank(self, tp_rank: int) -> int:
+        if self.transfer_plan is None:
+            return self.default_required_dst_info_num
+        return self.transfer_plan.required_dst_info_num_for_prefill_rank(tp_rank)
+
+    def fragments_for_tp_rank(self, tp_rank: int):
+        if self.transfer_plan is None:
+            return ()
+        return self.transfer_plan.fragments_by_prefill_rank.get(tp_rank, ())
+
+
+def _buffer_kind_for_layer_offset(
+    kv_args, layer_index: int, offset_index: int
+) -> BufferKind:
+    is_draft = layer_index >= getattr(kv_args, "target_layer_num", len(kv_args.offsets))
+    if is_draft:
+        return BufferKind.DRAFT_K if offset_index == 0 else BufferKind.DRAFT_V
+    return BufferKind.TARGET_K if offset_index == 0 else BufferKind.TARGET_V
+
+
+def _unit_lens_or_default(unit_lens, item_lens):
+    if unit_lens:
+        return tuple(int(x) for x in unit_lens)
+    return tuple(1 for _ in item_lens)
+
+
+def _build_buffer_layout_pair(
+    *,
+    buffer_index: int,
+    buffer_kind: BufferKind,
+    sharded_axis: str,
+    prefill_item_len: int,
+    decode_item_len: int,
+    prefill_unit_len: int,
+    decode_unit_len: int,
+    prefill_tp_size: int,
+    decode_tp_size: int,
+):
+    if prefill_unit_len != decode_unit_len:
+        raise ValueError(
+            f"prefill/decode unit sizes differ for {buffer_kind.value}: "
+            f"prefill={prefill_unit_len}, decode={decode_unit_len}"
+        )
+    if prefill_item_len % prefill_unit_len != 0:
+        raise ValueError(
+            f"prefill item length is not unit-aligned for {buffer_kind.value}: "
+            f"item={prefill_item_len}, unit={prefill_unit_len}"
+        )
+    if decode_item_len % decode_unit_len != 0:
+        raise ValueError(
+            f"decode item length is not unit-aligned for {buffer_kind.value}: "
+            f"item={decode_item_len}, unit={decode_unit_len}"
+        )
+
+    prefill_local_units = prefill_item_len // prefill_unit_len
+    decode_local_units = decode_item_len // decode_unit_len
+    prefill_global_units = prefill_local_units * prefill_tp_size
+    decode_global_units = decode_local_units * decode_tp_size
+    if prefill_global_units == decode_global_units:
+        logical_axis = sharded_axis
+        logical_size = decode_global_units
+    elif prefill_item_len == decode_item_len:
+        logical_axis = "replicated"
+        logical_size = decode_local_units
+    else:
+        raise ValueError(
+            f"unsupported heterogeneous TP buffer layout for {buffer_kind.value}: "
+            f"prefill_item={prefill_item_len}, decode_item={decode_item_len}, "
+            f"prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}, "
+            f"unit={decode_unit_len}"
+        )
+
+    return (
+        BufferLayout(
+            buffer_index=buffer_index,
+            buffer_kind=buffer_kind,
+            logical_axis=logical_axis,
+            logical_size=logical_size,
+            page_size=1,
+            bytes_per_logical_unit=decode_unit_len,
+            item_stride_bytes=prefill_item_len,
+        ),
+        BufferLayout(
+            buffer_index=buffer_index,
+            buffer_kind=buffer_kind,
+            logical_axis=logical_axis,
+            logical_size=logical_size,
+            page_size=1,
+            bytes_per_logical_unit=decode_unit_len,
+            item_stride_bytes=decode_item_len,
+        ),
+    )
+
+
+def _build_kv_buffer_layouts(
+    kv_args, prefill_parallel_info: PrefillParallelInfo, decode_tp_size: int
+):
+    prefill_tp_size = prefill_parallel_info.prefill_tp_size_per_dp_rank
+    prefill_kv_item_lens = tuple(prefill_parallel_info.kv_item_lens)
+    if not prefill_kv_item_lens:
+        prefill_kv_item_lens = tuple(
+            int(x) * decode_tp_size // prefill_tp_size for x in kv_args.kv_item_lens
+        )
+    prefill_kv_unit_lens = _unit_lens_or_default(
+        prefill_parallel_info.kv_unit_lens, prefill_kv_item_lens
+    )
+    decode_kv_unit_lens = _unit_lens_or_default(
+        getattr(kv_args, "kv_unit_lens", []), kv_args.kv_item_lens
+    )
+
+    prefill_buffers = []
+    decode_buffers = []
+    for layer_index, ptr_offsets in enumerate(kv_args.offsets):
+        for offset_index, ptr_offset in enumerate(ptr_offsets):
+            buffer_kind = _buffer_kind_for_layer_offset(
+                kv_args, layer_index, offset_index
+            )
+            prefill_buffer, decode_buffer = _build_buffer_layout_pair(
+                buffer_index=ptr_offset,
+                buffer_kind=buffer_kind,
+                sharded_axis="kv_head",
+                prefill_item_len=int(prefill_kv_item_lens[ptr_offset]),
+                decode_item_len=int(kv_args.kv_item_lens[ptr_offset]),
+                prefill_unit_len=int(prefill_kv_unit_lens[ptr_offset]),
+                decode_unit_len=int(decode_kv_unit_lens[ptr_offset]),
+                prefill_tp_size=prefill_tp_size,
+                decode_tp_size=decode_tp_size,
+            )
+            prefill_buffers.append(prefill_buffer)
+            decode_buffers.append(decode_buffer)
+
+    decode_state_item_lens = tuple(getattr(kv_args, "state_item_lens", []) or [])
+    prefill_state_item_lens = tuple(prefill_parallel_info.state_item_lens)
+    if not prefill_state_item_lens:
+        prefill_state_item_lens = tuple(
+            int(x) * decode_tp_size // prefill_tp_size for x in decode_state_item_lens
+        )
+    prefill_state_unit_lens = _unit_lens_or_default(
+        prefill_parallel_info.state_unit_lens, prefill_state_item_lens
+    )
+    decode_state_unit_lens = _unit_lens_or_default(
+        getattr(kv_args, "state_unit_lens", []), decode_state_item_lens
+    )
+
+    for state_index, decode_item_len in enumerate(decode_state_item_lens):
+        prefill_buffer, decode_buffer = _build_buffer_layout_pair(
+            buffer_index=state_index,
+            buffer_kind=BufferKind.MAMBA_STATE,
+            sharded_axis="state_channel",
+            prefill_item_len=int(prefill_state_item_lens[state_index]),
+            decode_item_len=int(decode_item_len),
+            prefill_unit_len=int(prefill_state_unit_lens[state_index]),
+            decode_unit_len=int(decode_state_unit_lens[state_index]),
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=decode_tp_size,
+        )
+        prefill_buffers.append(prefill_buffer)
+        decode_buffers.append(decode_buffer)
+    return tuple(prefill_buffers), tuple(decode_buffers)
+
+
+def _build_non_mla_route_plan(kv_mgr, prefill_parallel_info: PrefillParallelInfo):
+    prefill_tp_size = prefill_parallel_info.prefill_tp_size_per_dp_rank
+    decode_tp_size = kv_mgr.world_size // kv_mgr.dp_size
+    decode_tp_rank = kv_mgr.kv_args.engine_rank % decode_tp_size
+    prefill_buffers, decode_buffers = _build_kv_buffer_layouts(
+        kv_mgr.kv_args,
+        prefill_parallel_info,
+        decode_tp_size,
+    )
+    planner = PDTransferPlanner(
+        prefill_layout=ParallelLayout(
+            role="prefill",
+            world_size=prefill_tp_size,
+            dp_size=1,
+        ),
+        decode_layout=ParallelLayout(
+            role="decode",
+            world_size=decode_tp_size,
+            dp_size=1,
+        ),
+        prefill_buffers=prefill_buffers,
+        decode_buffers=decode_buffers,
+    )
+    transfer_plan = planner.plan_for_decode_rank(decode_tp_rank)
+    target_tp_ranks = tuple(transfer_plan.target_prefill_ranks)
+    target_tp_rank = (
+        target_tp_ranks[0] if transfer_plan.plan_kind == "identity" else None
+    )
+    default_required_dst_info_num = (
+        transfer_plan.required_dst_info_num_for_prefill_rank(target_tp_ranks[0])
+        if target_tp_ranks
+        else 1
+    )
+    return ReceiverRoutePlan(
+        target_tp_rank=target_tp_rank,
+        target_tp_ranks=target_tp_ranks,
+        required_prefill_response_num=transfer_plan.required_prefill_response_num,
+        default_required_dst_info_num=default_required_dst_info_num,
+        transfer_plan=transfer_plan,
+        supports_remote_spec_candidates=transfer_plan.plan_kind == "identity",
+    )
+
+
+def _legacy_mla_route_plan(
+    *,
+    target_tp_rank: int | None,
+    target_tp_ranks,
+    required_dst_info_num: int,
+    required_prefill_response_num: int,
+) -> ReceiverRoutePlan:
+    return ReceiverRoutePlan(
+        target_tp_rank=target_tp_rank,
+        target_tp_ranks=tuple(target_tp_ranks),
+        required_prefill_response_num=required_prefill_response_num,
+        default_required_dst_info_num=required_dst_info_num,
+    )
+
+
+def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePlan:
     prefill_tp_size_per_dp_rank = prefill_parallel_info.prefill_tp_size_per_dp_rank
     local_tp_size_per_dp_rank = kv_mgr.world_size // kv_mgr.dp_size
 
     if prefill_parallel_info.enable_mla_l1_5_cache:
         assert kv_mgr.is_mla_backend, "PD with  is not yet supported for non-MLA models"
-        target_tp_rank = None  # make all tp ranks not dummy rank
-        target_tp_ranks = [i for i in range(prefill_tp_size_per_dp_rank)]
-        required_dst_info_num = local_tp_size_per_dp_rank
-        required_prefill_response_num = prefill_tp_size_per_dp_rank
-    elif local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
+        return _legacy_mla_route_plan(
+            target_tp_rank=None,
+            target_tp_ranks=range(prefill_tp_size_per_dp_rank),
+            required_dst_info_num=local_tp_size_per_dp_rank,
+            required_prefill_response_num=prefill_tp_size_per_dp_rank,
+        )
+
+    if not kv_mgr.is_mla_backend:
+        return _build_non_mla_route_plan(kv_mgr, prefill_parallel_info)
+
+    if local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
         target_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-        target_tp_ranks = [target_tp_rank]
-        required_dst_info_num = 1
-        required_prefill_response_num = 1
-    elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
-        assert (
-            kv_mgr.is_mla_backend
-        ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
+        return _legacy_mla_route_plan(
+            target_tp_rank=target_tp_rank,
+            target_tp_ranks=(target_tp_rank,),
+            required_dst_info_num=1,
+            required_prefill_response_num=1,
+        )
+
+    if local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
         target_tp_rank = (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank) // (
             local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
         )
-        target_tp_ranks = [target_tp_rank]
-        required_dst_info_num = local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
-        required_prefill_response_num = 1
-    else:
-        assert (
-            kv_mgr.is_mla_backend
-        ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
+        return _legacy_mla_route_plan(
+            target_tp_rank=target_tp_rank,
+            target_tp_ranks=(target_tp_rank,),
+            required_dst_info_num=local_tp_size_per_dp_rank
+            // prefill_tp_size_per_dp_rank,
+            required_prefill_response_num=1,
+        )
 
-        # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
-        target_tp_ranks = [
-            rank
-            for rank in range(
-                (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank)
-                * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
-                (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank + 1)
-                * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
-            )
-        ]
-        # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
-        # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
-        # or the KVPoll will never be set correctly
-        target_tp_rank = target_tp_ranks[0]
-        required_dst_info_num = 1
-        required_prefill_response_num = 1
-
-    return (
-        target_tp_rank,
-        target_tp_ranks,
-        required_dst_info_num,
-        required_prefill_response_num,
+    target_tp_ranks = tuple(
+        range(
+            (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank)
+            * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
+            (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank + 1)
+            * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
+        )
+    )
+    return _legacy_mla_route_plan(
+        target_tp_rank=target_tp_ranks[0],
+        target_tp_ranks=target_tp_ranks,
+        required_dst_info_num=1,
+        required_prefill_response_num=1,
     )
 
 
@@ -188,22 +433,20 @@ class MooncakeKVReceiver:
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
 
-        (
-            target_tp_rank,
-            target_tp_ranks,
-            required_dst_info_num,
-            required_prefill_response_num,
-        ) = _calc(self.kv_mgr, prefill_parallel_info)
-        self.required_dst_info_num = required_dst_info_num
+        route_plan = _calc(self.kv_mgr, prefill_parallel_info)
+        self.route_plan = route_plan
+        self.supports_remote_spec_candidates = (
+            route_plan.supports_remote_spec_candidates
+        )
+        self.required_dst_info_num = route_plan.default_required_dst_info_num
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
-            required_prefill_response_num
+            route_plan.required_prefill_response_num
         )
         target_dp_group = self.bootstrap_room % prefill_parallel_info.dp_size
-        bootstrap_key = f"{self.bootstrap_addr}_{target_dp_group}_{target_tp_rank}"
+        target_tp_key = ",".join(str(rank) for rank in route_plan.target_tp_ranks)
+        bootstrap_key = f"{self.bootstrap_addr}_{target_dp_group}_{target_tp_key}"
         if bootstrap_key not in self.kv_mgr.connection_pool:
-            bootstrap_infos = self._get_bootstrap_infos(
-                target_dp_group, target_tp_rank, target_tp_ranks
-            )
+            bootstrap_infos = self._get_bootstrap_infos(target_dp_group, route_plan)
             if bootstrap_infos is None:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
@@ -255,9 +498,9 @@ class MooncakeKVReceiver:
                 )
                 return prefill_parallel_info
 
-    def _get_bootstrap_infos(self, target_dp_group, target_tp_rank, target_tp_ranks):
+    def _get_bootstrap_infos(self, target_dp_group, route_plan: ReceiverRoutePlan):
         bootstrap_infos = []
-        for _target_tp_rank in target_tp_ranks:
+        for _target_tp_rank in route_plan.target_tp_ranks:
             bootstrap_info = _get_bootstrap_info_from_server(
                 self.bootstrap_addr,
                 _target_tp_rank,
@@ -266,7 +509,14 @@ class MooncakeKVReceiver:
             if bootstrap_info is not None:
                 #  only support MLA for now: select one prefill rank as real rank
                 bootstrap_info["is_dummy"] = not bool(
-                    _target_tp_rank == target_tp_rank or target_tp_rank is None
+                    _target_tp_rank == route_plan.target_tp_rank
+                    or route_plan.target_tp_rank is None
+                )
+                bootstrap_info["required_dst_info_num"] = (
+                    route_plan.required_dst_info_num_for_tp_rank(_target_tp_rank)
+                )
+                bootstrap_info["transfer_fragments"] = route_plan.fragments_for_tp_rank(
+                    _target_tp_rank
                 )
                 logger.debug(
                     "Fetched bootstrap info: %s for DP %s TP %s",
@@ -360,43 +610,49 @@ class MooncakeKVReceiver:
             )
             sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        get_local_ip_by_remote().encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        str(self.required_dst_info_num).encode("ascii"),
-                        # Send decode_prefix_len as additional message part
-                        (
-                            str(self.decode_prefix_len).encode("ascii")
-                            if not is_dummy
-                            else b""
-                        ),
-                        (
-                            str(int(self.dst_enable_mla_l1_5_cache)).encode("ascii")
-                            if not is_dummy
-                            else b""
-                        ),
-                        (
-                            dst_page_transfer_mask.tobytes()
-                            if (not is_dummy and dst_page_transfer_mask is not None)
-                            else b""
-                        ),
-                        (
-                            dst_page_local_indices.tobytes()
-                            if (not is_dummy and dst_page_local_indices is not None)
-                            else b""
-                        ),
-                        (
-                            mamba_indices.tobytes()
-                            if (not is_dummy and mamba_indices is not None)
-                            else b""
-                        ),
-                    ]
-                )
+                message_parts = [
+                    str(self.bootstrap_room).encode("ascii"),
+                    get_local_ip_by_remote().encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    kv_indices.tobytes() if not is_dummy else b"",
+                    str(aux_index).encode("ascii") if not is_dummy else b"",
+                    str(
+                        bootstrap_info.get(
+                            "required_dst_info_num", self.required_dst_info_num
+                        )
+                    ).encode("ascii"),
+                    # Send decode_prefix_len as additional message part
+                    (
+                        str(self.decode_prefix_len).encode("ascii")
+                        if not is_dummy
+                        else b""
+                    ),
+                    (
+                        str(int(self.dst_enable_mla_l1_5_cache)).encode("ascii")
+                        if not is_dummy
+                        else b""
+                    ),
+                    (
+                        dst_page_transfer_mask.tobytes()
+                        if (not is_dummy and dst_page_transfer_mask is not None)
+                        else b""
+                    ),
+                    (
+                        dst_page_local_indices.tobytes()
+                        if (not is_dummy and dst_page_local_indices is not None)
+                        else b""
+                    ),
+                    (
+                        mamba_indices.tobytes()
+                        if (not is_dummy and mamba_indices is not None)
+                        else b""
+                    ),
+                ]
+                transfer_fragments = bootstrap_info.get("transfer_fragments", ())
+                if not is_dummy and transfer_fragments:
+                    message_parts.extend(encode_transfer_fragments(transfer_fragments))
+                sock.send_multipart(message_parts)
             self.init_time = time.time()
 
     def poll(self) -> KVPoll:

@@ -32,7 +32,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
@@ -102,15 +102,13 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     prefix=add_prefix("lm_head", prefix),
                 )
 
-        if self.mapping.attn.has_dp:
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
-        else:
-            self.logits_processor = LogitsProcessor(
-                config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
 
     def get_hot_token_id(self):
         return None

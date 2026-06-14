@@ -92,6 +92,12 @@ Scheduler::Scheduler(SchedulerConfig config)
             [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
         kv_prefix_cache_.GetHostManager().SetEvictionCallback(
             [this](TreeNode* node) { hybrid_prefix_cache_->OnKVHostEvict(node); });
+        // Prune frees TreeNodes (including empty ancestors) outside the per-tier
+        // eviction callbacks; un-register them from the adjunct sets before the
+        // node is destroyed so mamba_leaves_ / paged-cache membership never
+        // dangles.
+        kv_prefix_cache_.GetRadixTree().SetNodeDestroyCallback(
+            [this](TreeNode* node) { hybrid_prefix_cache_->OnNodeDestroyed(node); });
 
         for (const auto& cfg : config_.paged_cache_groups) {
             PagedCacheGroupConfig copy = cfg;

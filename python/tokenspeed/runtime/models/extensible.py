@@ -158,6 +158,14 @@ class ExtensibleLM(nn.Module):
         ).eval()
         self.step = 0
 
+    @property
+    def logits_processor(self):
+        return self.base_lm.logits_processor
+
+    @property
+    def lm_head(self):
+        return self.base_lm.lm_head
+
     def forward(
         self,
         ctx: ForwardContext,

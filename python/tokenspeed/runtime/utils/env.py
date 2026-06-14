@@ -58,7 +58,6 @@ global_server_args_dict: dict = {
     "max_model_len": ServerArgs.max_model_len,
     "max_num_seqs": ServerArgs.max_num_seqs,
     "moe_backend": ServerArgs.moe_backend,
-    "flashinfer_mxfp4_moe_precision": ServerArgs.flashinfer_mxfp4_moe_precision,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
@@ -89,6 +88,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
             "speculative_algorithm": server_args.speculative_algorithm,
+            "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
@@ -104,7 +104,6 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_model_len": server_args.max_model_len,
             "max_num_seqs": server_args.max_num_seqs,
             "moe_backend": server_args.moe_backend,
-            "flashinfer_mxfp4_moe_precision": server_args.flashinfer_mxfp4_moe_precision,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,
@@ -240,6 +239,7 @@ class Envs:
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
+    TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)

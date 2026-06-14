@@ -58,6 +58,8 @@ namespace tokenspeed {
 
 namespace {
 
+constexpr std::int32_t kLocalMambaSlotsPerRequest = 2;
+
 std::int32_t CountMambaDeviceLoadBackSlots(const std::vector<TreeNode*>& nodes) {
     std::int32_t slots = 0;
     for (TreeNode* node : nodes) {
@@ -147,8 +149,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             match_result.mamba_cow_src_index = mamba_node->MambaSlotIndex();
         }
     }
-    if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() && mamba_allocator_ &&
-        mamba_allocator_->AvailableSlots() < 1) {
+    if (mamba_allocator_ && mamba_allocator_->AvailableSlots() < kLocalMambaSlotsPerRequest) {
         return {};
     }
 
@@ -289,6 +290,9 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
         if (mamba_recovery_node->HasMamba()) {
             match_result.mamba_cow_src_index = mamba_recovery_node->MambaSlotIndex();
         }
+    }
+    if (mamba_allocator_ && mamba_allocator_->AvailableSlots() < kLocalMambaSlotsPerRequest) {
+        return {};
     }
 
     return fsm::ScheduleDecodeFromRetractedEvent{

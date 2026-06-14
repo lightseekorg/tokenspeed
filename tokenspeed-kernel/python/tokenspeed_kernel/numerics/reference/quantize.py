@@ -32,6 +32,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _FP8_DTYPE = Platform.get().fp8e4m3fn.dtype
 _FP8_FINFO = torch.finfo(_FP8_DTYPE)

@@ -470,7 +470,7 @@ def test_greedy_sample_pattern_under_cuda_graph():
 
 # ---------------------------------------------------------------------------
 # Pure-torch fallback on hosts without the CuTe DSL kernel — exercises the
-# code path AMD ROCm / CPU-only / sm_80 / sm_120+ / missing-nvidia-cutlass-dsl
+# code path CPU-only / sm_80 / sm_120+ / missing-nvidia-cutlass-dsl
 # would take. Selected at import time via the module-level dispatch in
 # cute_dsl.py; we reach it here by calling the underscore-prefixed
 # implementation directly so the test runs regardless of the host hardware.
@@ -509,9 +509,7 @@ def test_argmax_pair_torch_fallback_on_cpu_tensor():
 
 
 def test_public_binding_dispatch_matches_arch():
-    """Public ``argmax`` / ``argmax_pair`` names are bound at import time:
-    NVIDIA hosts with cute available → cute fast path; everyone else → torch
-    fallback. This test pins that contract."""
+    """The CuTe module owns only the NVIDIA CuTe direct API."""
     if cute_dsl.is_available():
         assert cute_dsl.argmax is cute_dsl._argmax_cute
         assert cute_dsl.argmax_pair is cute_dsl._argmax_pair_cute

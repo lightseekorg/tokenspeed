@@ -101,6 +101,10 @@ Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
 about.
 
+When `--dp-sampling` is enabled, the logits processor owns the per-forward
+logits layout decision and carries the resulting plan to the sampling backend
+with the logits output.
+
 ## Reasoning And Tool Calling
 
 | Parameter | Purpose |

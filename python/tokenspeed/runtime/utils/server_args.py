@@ -164,7 +164,6 @@ class ServerArgs:
     draft_moe_backend: str | None = None
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
-    flashinfer_mxfp4_moe_precision: str = "default"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
 
     # KVStore
@@ -190,6 +189,8 @@ class ServerArgs:
     attention_backend: str | None = None
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
+    dp_sampling: bool = False
+    dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
     mha_extend_mode: Literal["paged", "ragged"] = "paged"
@@ -1192,7 +1193,7 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, triton_kernel, flashinfer_mxfp4, marlin, etc.",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1200,13 +1201,6 @@ class ServerArgs:
             default=ServerArgs.draft_moe_backend,
             help="MoE runner backend for the draft model in speculative decoding. "
             "If not set, defaults to --moe-backend.",
-        )
-        parser.add_argument(
-            "--flashinfer-mxfp4-moe-precision",
-            type=str,
-            choices=["default", "bf16"],
-            default=ServerArgs.flashinfer_mxfp4_moe_precision,
-            help="Computation precision of flashinfer mxfp4 moe.",
         )
         parser.add_argument(
             "--all2all-backend",
@@ -1258,6 +1252,7 @@ class ServerArgs:
         # Kernel backend
         attention_backend_choices = [
             "mha",
+            "mla",
             "fa3",
             "fa4",
             "triton",
@@ -1291,7 +1286,7 @@ class ServerArgs:
                 "MHA extend strategy for prefix-cache/chunked-prefill batches. "
                 "'paged' uses one paged KV-cache attention kernel over full visible KV; "
                 "'ragged' uses ragged current-chunk prefill plus paged cached-prefix "
-                "attention and merges with mha_merge_state."
+                "attention and merges with merge_state."
             ),
         )
         parser.add_argument(
@@ -1308,6 +1303,22 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+        )
+        parser.add_argument(
+            "--dp-sampling",
+            action="store_true",
+            default=ServerArgs.dp_sampling,
+            help=(
+                "Enable Batch-DP spec-verify sampling. Backend selection defaults "
+                "to auto; override with TOKENSPEED_DP_SAMPLING_BACKEND."
+            ),
+        )
+        parser.add_argument(
+            "--dp-sampling-min-bs",
+            type=int,
+            default=ServerArgs.dp_sampling_min_bs,
+            help="Minimum effective decode batch for Batch-DP spec-verify. "
+            "Defaults to 2 * TP size.",
         )
         parser.add_argument(
             "--attention-use-fp4-indexer-cache",

@@ -35,11 +35,11 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -50,6 +50,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Compressor,
     DeepseekV4DecoderLayer,
     DeepseekV4MegaMoEExperts,
+    _deepseek_v4_swa_slot_mapping,
     hc_head,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -174,12 +175,18 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
         e_out, _ = self.e_proj(input_embeds)
         hidden_states = h_out + e_out.unsqueeze(-2)
 
+        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+            ctx,
+            positions,
+            out_cache_loc,
+        )
         return self.mtp_block(
             positions,
             hidden_states,
             ctx,
             out_cache_loc,
             input_ids,
+            swa_slot_mapping,
         )
 
     def compute_logits_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -288,7 +295,6 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 bias=False,
                 prefix=add_prefix("lm_head", prefix),
             )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -299,12 +305,13 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 tp_group=self.mapping.attn.tp_group,
                 prefix=add_prefix("lm_head", prefix),
             )
-            self.logits_processor = LogitsProcessor(
-                config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
-            )
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
 
     def get_hot_token_id(self):
         return None

@@ -82,7 +82,7 @@ CI_MODELS = [
             "disable_prefill_graph": True,
             "max_total_tokens": 32768,
             "max_model_len": 16384,
-            **({"moe_backend": "flashinfer_mxfp4"} if _BLACKWELL_SYSTEM else {}),
+            **({"moe_backend": "flashinfer_trtllm"} if _BLACKWELL_SYSTEM else {}),
             "speculative_algorithm": "EAGLE3",
             "speculative_draft_model_path": "nvidia/gpt-oss-120b-Eagle3-long-context",
             "speculative_num_steps": 3,

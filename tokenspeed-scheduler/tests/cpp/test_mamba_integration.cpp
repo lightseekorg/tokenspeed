@@ -152,6 +152,55 @@ TEST_F(MambaDecodeCapacityTest, PrefillDoneDecodeCapacityMissRetractsInsteadOfTh
     ASSERT_EQ(writebacks.size(), 1u);
 }
 
+class MambaDecodeAdmissionTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.role = Role::kD;
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 24;
+        cfg.max_batch_size = 16;
+        cfg.max_scheduled_tokens = 1024;
+        return cfg;
+    }
+
+    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) return fwd;
+        }
+        return nullptr;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(PDEvent{pd::BootstrappedEvent{request_id}});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(MambaDecodeAdmissionTest, SubmittedBatchStopsAtLocalMambaPairCapacity) {
+    std::vector<RequestSpec> requests;
+    for (int i = 0; i < 16; ++i) {
+        requests.push_back(MakeRequestSpec("r" + std::to_string(i), 1));
+    }
+    Submit(requests);
+    for (const auto& request : requests) {
+        SendBootstrapped(request.request_id);
+    }
+
+    auto plan = PlanOnce();
+    const auto* fwd = GetForward(plan);
+    ASSERT_NE(fwd, nullptr);
+
+    ASSERT_EQ(fwd->request_ids.size(), 12u);
+    for (std::size_t i = 0; i < fwd->request_ids.size(); ++i) {
+        EXPECT_GE(fwd->mamba_working_indices[i], 0) << fwd->request_ids[i];
+        EXPECT_GE(fwd->mamba_checkpoint_dst_indices[i], 0) << fwd->request_ids[i];
+    }
+    EXPECT_EQ(scheduler_->WaitingSize(), 4u);
+    EXPECT_EQ(scheduler_->PrefillSize(), 12u);
+}
+
 class MambaUnalignedCheckpointTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

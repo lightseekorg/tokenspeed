@@ -156,6 +156,10 @@ public:
     // at the live sliding window. Commit cursor untouched. Idempotent.
     std::vector<std::int32_t> ReleaseSkipped(std::int32_t window_lower_bound);
 
+    // Drop request-local owned tail pages beyond the accepted raw-token boundary.
+    // Borrowed prefix pages and already committed pages are retained.
+    std::vector<std::int32_t> RewindTail(std::int32_t target_raw_tokens_exclusive);
+
     // Release everything; owned via RAII, borrowed by clearing. Used by finish/abort/retract.
     std::vector<std::int32_t> ReleaseAll();
 

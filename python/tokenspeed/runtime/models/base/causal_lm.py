@@ -44,10 +44,6 @@ class BaseCausalLM(nn.Module):
 
     model_cls: type[BaseTransformerModel]
 
-    # TODO: temporary; remove in the follow-up refactoring that extends
-    # pre-attn q-slice to Qwen NextN and DeepSeek V3 NextN.
-    pre_attention_trim: bool = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -112,11 +108,9 @@ class BaseCausalLM(nn.Module):
 
     def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
 
-        if self.mapping.attn.has_dp:
-            return LogitsProcessor(config, skip_all_gather=True)
-
         return LogitsProcessor(
             config,
+            skip_all_gather=self.mapping.attn.has_dp,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,

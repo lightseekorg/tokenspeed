@@ -29,14 +29,11 @@ from typing import Callable
 import pytest
 import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
-import tokenspeed_kernel.numerics.reference.moe as _moe_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
-import tokenspeed_kernel.ops.attention.gluon.mha_decode_fp16_gfx950 as _gluon_decode
-import tokenspeed_kernel.ops.attention.gluon.mha_prefill_fp16_gfx950 as _gluon_prefill
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
@@ -44,13 +41,24 @@ import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
-import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
-import tokenspeed_kernel.ops.moe.deepep as _moe_deepep
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
+import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel.ops.moe.triton_kernels as _moe_triton_kernels
-import tokenspeed_kernel.ops.moe.trtllm as _moe_trtllm
+import tokenspeed_kernel.ops.sampling as _sampling_pkg
+import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
+import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer import (
+    cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
+)
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
+from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
+from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
@@ -60,8 +68,6 @@ _RELOAD_MODULES = [
     _attention_cuda,
     _attention_flash_attn,
     _attention_flashinfer,
-    _gluon_decode,
-    _gluon_prefill,
     _attention_gluon,
     _attention_triton,
     _attention_pkg,
@@ -73,14 +79,23 @@ _RELOAD_MODULES = [
     _gemm_trtllm,
     _gemm_pkg,
     # MoE registration modules.
-    _moe_reference,
-    _moe_cuda,
-    _moe_deepep,
+    _moe_cutedsl_deepep_nvfp4,
+    _moe_cutlass_fp8,
+    _moe_cutlass_nvfp4,
+    _moe_cutlass_unquant,
+    _moe_trtllm_mxfp4,
+    _moe_trtllm_nvfp4,
+    _moe_trtllm_unquant,
     _moe_flashinfer,
+    _moe_gluon_mxfp4,
+    _moe_gluon,
+    _moe_triton_mxfp4,
     _moe_triton,
-    _moe_triton_kernels,
-    _moe_trtllm,
     _moe_pkg,
+    # Sampling registration modules.
+    _sampling_cute_dsl,
+    _sampling_gluon,
+    _sampling_pkg,
     # Top-level public API re-exports.
     tokenspeed_kernel,
 ]
@@ -120,8 +135,16 @@ def _is_blackwell_plus(platform: PlatformInfo) -> bool:
     return platform.is_blackwell_plus
 
 
+def _is_hopper_plus(platform: PlatformInfo) -> bool:
+    return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
+
+
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
+
+
+def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
+    return platform.is_nvidia and _sampling_cute_dsl.is_available()
 
 
 def _is_cdna4(platform: PlatformInfo) -> bool:
@@ -329,145 +352,197 @@ def _attention_merge_state() -> object:
     out_b = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     lse_a = torch.empty((4, 16), dtype=torch.float32)
     lse_b = torch.empty((4, 16), dtype=torch.float32)
-    return tokenspeed_kernel.mha_merge_state(out_a, lse_a, out_b, lse_b)
+    return tokenspeed_kernel.attn_merge_state(out_a, lse_a, out_b, lse_b)
 
 
-def _moe_route_grouped_topk() -> object:
-    return tokenspeed_kernel.moe_route(
-        dtype=torch.bfloat16,
-        traits={
-            "output_type": "topk",
-            "biased": False,
-            "grouped": True,
-            "ep": False,
-        },
+def _sampling_argmax() -> object:
+    logits = torch.empty((4, 4096), dtype=torch.float32, device="cuda")
+    return tokenspeed_kernel.argmax(logits)
+
+
+def _moe_apply_unquant_trtllm() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        requires_deferred_finalize=True,
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+    )
+    assert plan["apply_kernel_name"] == "flashinfer_trtllm_unquant_moe_apply"
+    assert (
+        plan["process_weights_kernel_name"]
+        == "flashinfer_trtllm_unquant_moe_process_weights"
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        do_finalize=False,
     )
 
 
-def _moe_route_biased_topk() -> object:
-    return tokenspeed_kernel.moe_route(
-        dtype=torch.bfloat16,
-        traits={
-            "output_type": "topk",
-            "biased": True,
-            "grouped": False,
-            "ep": False,
-        },
+def _moe_apply_unquant_cutlass() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+    )
+    assert plan["apply_kernel_name"] == "flashinfer_cutlass_unquant_moe_apply"
+    assert (
+        plan["process_weights_kernel_name"]
+        == "flashinfer_cutlass_unquant_moe_process_weights"
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_fp8_cutlass() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=2,
+        ispp=128,
+        fp8_scale_block_shape=(128, 128),
+        internal_activation_dtype="input",
+    )
+    assert plan["apply_kernel_name"] == "flashinfer_cutlass_fp8_moe_apply"
+    assert (
+        plan["process_weights_kernel_name"]
+        == "flashinfer_cutlass_fp8_moe_process_weights"
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_nvfp4_trtllm() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        requires_deferred_finalize=True,
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+    )
+    assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_moe_apply"
+    assert (
+        plan["process_weights_kernel_name"]
+        == "flashinfer_trtllm_nvfp4_moe_process_weights"
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        do_finalize=False,
     )
 
 
-def _moe_route_ragged_metadata() -> object:
-    return tokenspeed_kernel.moe_route(
-        dtype=torch.bfloat16,
-        traits={"output_type": "ragged_metadata"},
+def _moe_apply_nvfp4_cutlass() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+        solution="flashinfer_cutlass",
     )
-
-
-def _moe_dispatch_local() -> object:
-    return tokenspeed_kernel.moe_dispatch(
-        dtype=torch.int32,
-        traits={"comm_strategy": "local"},
+    assert plan["apply_kernel_name"] == "flashinfer_cutlass_nvfp4_moe_apply"
+    assert (
+        plan["process_weights_kernel_name"]
+        == "flashinfer_cutlass_nvfp4_moe_process_weights"
     )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_dispatch_deepep() -> object:
-    return tokenspeed_kernel.moe_dispatch(
-        dtype=torch.bfloat16,
-        traits={"comm_strategy": "deep_ep"},
+def _moe_apply_nvfp4_deepep_cutedsl() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        a2a_backend="deepep",
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+        deepep_group=object(),
+        solution="flashinfer_cutedsl",
     )
-
-
-def _moe_combine_small() -> object:
-    return tokenspeed_kernel.moe_combine(
-        dtype=torch.bfloat16,
-        traits={"num_tokens": 8, "comm_strategy": None},
+    assert plan["apply_kernel_name"] == "flashinfer_cutedsl_deepep_nvfp4_moe_apply"
+    assert (
+        plan["process_weights_kernel_name"]
+        == "flashinfer_cutedsl_deepep_nvfp4_moe_process_weights"
     )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_combine_large() -> object:
-    return tokenspeed_kernel.moe_combine(
-        dtype=torch.bfloat16,
-        traits={"num_tokens": 128, "comm_strategy": None},
+def _moe_apply_mxfp4_trtllm() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+        with_bias=True,
     )
-
-
-def _moe_combine_deepep() -> object:
-    return tokenspeed_kernel.moe_combine(
-        dtype=torch.bfloat16,
-        traits={"comm_strategy": "deep_ep"},
+    assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_moe_apply"
+    assert (
+        plan["process_weights_kernel_name"]
+        == "flashinfer_trtllm_mxfp4_moe_process_weights"
     )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_experts_dispatch_sorted() -> object:
-    return tokenspeed_kernel.moe_experts(
-        dtype=torch.bfloat16,
-        features={"dispatch_sorted"},
+def _moe_apply_mxfp4_triton() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ispp=128,
+        internal_activation_dtype="fp8",
+        with_bias=True,
     )
+    assert plan["apply_kernel_name"] == "triton_mxfp4_moe_apply"
+    assert plan["process_weights_kernel_name"] == "triton_mxfp4_moe_process_weights"
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_experts_dispatch_gemm() -> object:
-    return tokenspeed_kernel.moe_experts(
-        dtype=torch.bfloat16,
-        features={"ragged_metadata", "dispatch_gemm"},
+def _moe_apply_mxfp4_gluon() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ispp=128,
+        internal_activation_dtype="fp8",
+        with_bias=True,
     )
-
-
-def _moe_experts_gemm_combine() -> object:
-    return tokenspeed_kernel.moe_experts(
-        dtype=torch.bfloat16,
-        features={"ragged_metadata", "gemm_combine"},
-    )
-
-
-def _moe_fused_self_routing_bf16() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"self_routing"},
-        weight_format="bf16",
-    )
-
-
-def _moe_fused_self_routing_mxfp4() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"self_routing"},
-        weight_format="mxfp4",
-    )
-
-
-def _moe_fused_prerouted_nvfp4_cutlass() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"pre_routed"},
-        weight_format="nvfp4",
-        traits={
-            "tp": True,
-            "ep": True,
-            "cuda_graph": False,
-        },
-    )
-
-
-def _moe_fused_prerouted_nvfp4_cutedsl() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.uint8,
-        features={"pre_routed"},
-        weight_format="nvfp4",
-        traits={
-            "tp": False,
-            "ep": True,
-            "cuda_graph": True,
-        },
-    )
-
-
-def _moe_fused_prerouted_bf16_reference() -> object:
-    return tokenspeed_kernel.moe_fused(
-        dtype=torch.bfloat16,
-        features={"pre_routed"},
-        weight_format="bf16",
-        traits={"tp": False, "ep": False},
-    )
+    assert plan["apply_kernel_name"] == "gluon_mxfp4_moe_apply"
+    assert plan["process_weights_kernel_name"] == "gluon_mxfp4_moe_process_weights"
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _case(
@@ -645,134 +720,95 @@ _CASES = [
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
     ),
+    # Sampling API x architecture golden cases.
+    _case(
+        _is_nvidia_with_cute_dsl,
+        "nvidia-cutedsl",
+        "sampling",
+        "argmax",
+        "cute_dsl_argmax",
+        _sampling_argmax,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "sampling",
+        "argmax",
+        "gluon_argmax_gfx950",
+        _sampling_argmax,
+    ),
     # MoE API x architecture golden cases.
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_hopper,
+        "hopper",
         "moe",
-        "route",
-        "torch_compile_grouped_topk",
-        _moe_route_grouped_topk,
+        "apply",
+        "flashinfer_cutlass_unquant_moe_apply",
+        _moe_apply_unquant_cutlass,
     ),
     _case(
-        _is_nvidia,
-        "nvidia",
+        _is_hopper_plus,
+        "hopper-plus",
         "moe",
-        "route",
-        "cuda_routing_flash",
-        _moe_route_biased_topk,
+        "apply",
+        "flashinfer_cutlass_fp8_moe_apply",
+        _moe_apply_fp8_cutlass,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_blackwell_sm100,
+        "blackwell-sm100",
         "moe",
-        "route",
-        "triton_kernels_routing",
-        _moe_route_ragged_metadata,
+        "apply",
+        "flashinfer_trtllm_unquant_moe_apply",
+        _moe_apply_unquant_trtllm,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_blackwell_sm100,
+        "blackwell-sm100",
         "moe",
-        "dispatch",
-        "triton_moe_align_block_size",
-        _moe_dispatch_local,
+        "apply",
+        "flashinfer_trtllm_nvfp4_moe_apply",
+        _moe_apply_nvfp4_trtllm,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_blackwell_sm100,
+        "blackwell-sm100",
         "moe",
-        "dispatch",
-        "deepep_moe_scatter",
-        _moe_dispatch_deepep,
+        "apply",
+        "flashinfer_cutlass_nvfp4_moe_apply",
+        _moe_apply_nvfp4_cutlass,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_blackwell_plus,
+        "blackwell-plus",
         "moe",
-        "combine",
-        "torch_compile_moe_sum_reduce",
-        _moe_combine_small,
+        "apply",
+        "flashinfer_cutedsl_deepep_nvfp4_moe_apply",
+        _moe_apply_nvfp4_deepep_cutedsl,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_blackwell_sm100,
+        "blackwell-sm100",
         "moe",
-        "combine",
-        "triton_moe_sum_reduce",
-        _moe_combine_large,
+        "apply",
+        "flashinfer_trtllm_mxfp4_moe_apply",
+        _moe_apply_mxfp4_trtllm,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_hopper,
+        "hopper",
         "moe",
-        "combine",
-        "deepep_moe_gather",
-        _moe_combine_deepep,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "experts",
-        "triton_moe_fused_experts",
-        _moe_experts_dispatch_sorted,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "experts",
-        "triton_kernels_dispatch_gemm",
-        _moe_experts_dispatch_gemm,
-    ),
-    _case(
-        _is_supported_gpu,
-        "supported-gpu",
-        "moe",
-        "experts",
-        "triton_kernels_gemm_combine",
-        _moe_experts_gemm_combine,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
-        "flashinfer_trtllm_bf16_fused_moe",
-        _moe_fused_self_routing_bf16,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
-        "flashinfer_trtllm_fp4_fused_moe",
-        _moe_fused_self_routing_mxfp4,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
-        "flashinfer_cutlass_fused_moe",
-        _moe_fused_prerouted_nvfp4_cutlass,
-    ),
-    _case(
-        _is_nvidia,
-        "nvidia",
-        "moe",
-        "fused",
-        "flashinfer_cutedsl_nvfp4_fused_moe",
-        _moe_fused_prerouted_nvfp4_cutedsl,
+        "apply",
+        "triton_mxfp4_moe_apply",
+        _moe_apply_mxfp4_triton,
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "moe",
-        "fused",
-        "reference_moe_fused",
-        _moe_fused_prerouted_bf16_reference,
+        "apply",
+        "gluon_mxfp4_moe_apply",
+        _moe_apply_mxfp4_gluon,
     ),
 ]
 
@@ -803,6 +839,18 @@ def selected_kernel_spy(monkeypatch):
                 lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
                 return torch.empty_like(q), lse
             return torch.empty_like(q)
+
+        if case.family == "sampling":
+            (logits,) = args[:1]
+            out = kwargs.get("out")
+            if out is not None:
+                return out
+            return torch.empty(
+                (logits.shape[0],), dtype=torch.int64, device=logits.device
+            )
+
+        if case.family == "moe":
+            return torch.empty_like(kwargs["x"])
 
         return None
 
