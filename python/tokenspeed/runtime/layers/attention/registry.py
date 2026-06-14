@@ -25,8 +25,13 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
+from tokenspeed.runtime.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -112,6 +117,8 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
         if platform.is_hopper:
             return "flashmla"
         return "trtllm_mla"
+    if arch == AttentionArch.DSA:
+        return "dsa"
     else:
         return "mha"
 
@@ -146,6 +153,7 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
 _CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
     AttentionArch.MHA: MHAConfig,
     AttentionArch.MLA: MLAConfig,
+    AttentionArch.DSA: DSAConfig,
 }
 
 
@@ -347,6 +355,7 @@ def create_attn_components(
     is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
         draft_model_config.hf_config
     )
+    is_deepseek_dsa_model = is_deepseek_dsa(model_config.hf_config)
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
         server_args.attention_backend = "deepseek_v4"
@@ -356,6 +365,8 @@ def create_attn_components(
         # Qwen3.5 GDN hybrid models always need hybrid_linear_attn.
         # Save the user's original choice for the full-attention sub-backend.
         server_args.attention_backend = "hybrid_linear_attn"
+    elif is_deepseek_dsa_model and server_args.attention_backend is None:
+        server_args.attention_backend = "dsa"
     elif server_args.attention_backend == "hybrid_linear_attn":
         logger.warning(
             "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
