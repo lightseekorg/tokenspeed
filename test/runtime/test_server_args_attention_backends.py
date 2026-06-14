@@ -116,6 +116,11 @@ class TestAttentionBackendChoices(unittest.TestCase):
             MLAAttnBackend,
         )
 
+    def test_amd_defaults_to_mla_for_mla(self):
+        platform = SimpleNamespace(is_amd=True, is_blackwell=False, is_hopper=False)
+        with mock.patch.object(registry, "current_platform", return_value=platform):
+            self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")
+
     def test_sm90_defaults_to_flashmla_for_mla(self):
         platform = SimpleNamespace(is_blackwell=False, is_hopper=True)
         with mock.patch.object(registry, "current_platform", return_value=platform):
