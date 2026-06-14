@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
-    mha_decode_scheduler_metadata,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
@@ -76,7 +75,6 @@ class MHADecodeMetadata:
     # Device-side metadata.
     page_table: torch.Tensor
     seq_lens: torch.Tensor
-    scheduler_metadata: torch.Tensor | None = None
 
 
 class MHAAttnBackend(AttentionBackend):
@@ -192,14 +190,9 @@ class MHAAttnBackend(AttentionBackend):
                         seq_lens=expanded_seq_lens,
                     )
             else:
-                scheduler_metadata = self._maybe_compute_scheduler_metadata(
-                    bs,
-                    seq_lens,
-                )
                 self.forward_decode_metadata = MHADecodeMetadata(
                     page_table=page_table,
                     seq_lens=seq_lens,
-                    scheduler_metadata=scheduler_metadata,
                 )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
@@ -479,7 +472,6 @@ class MHAAttnBackend(AttentionBackend):
             logit_cap=layer.logit_cap,
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
-            scheduler_metadata=metadata.scheduler_metadata,
             solution=self.kernel_solution,
         )
         output = self._unwrap_output(result)
@@ -575,28 +567,6 @@ class MHAAttnBackend(AttentionBackend):
         if isinstance(result, tuple):
             return result[0]
         return result
-
-    def _maybe_compute_scheduler_metadata(
-        self, bs: int, seq_lens: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Pre-compute FA3 decode scheduler metadata once per step.
-
-        Returns ``None`` when the active backend does not consume pre-computed
-        scheduler metadata (only FA3 on Hopper does); the kernel then falls
-        back to its internal prepare_varlen_num_blocks launch.
-        """
-        return mha_decode_scheduler_metadata(
-            batch_size=bs,
-            max_seqlen_q=1,
-            max_seqlen_k=self.max_context_len,
-            num_heads_q=self.tp_q_head_num,
-            num_heads_kv=self.tp_kv_head_num,
-            headdim=self.head_dim,
-            cache_seqlens=seq_lens,
-            qkv_dtype=self.qkv_dtype,
-            page_size=self.page_size,
-            causal=True,
-        )
 
 
 for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:
