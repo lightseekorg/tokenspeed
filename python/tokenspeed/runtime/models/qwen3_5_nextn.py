@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from dataclasses import replace
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
@@ -77,22 +78,20 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         q = q.index_select(0, ctx.gather_ids)
         if gate is not None:
             gate = gate.index_select(0, ctx.gather_ids)
-        attn_output = ctx.attn_backend.forward(
-            q,
-            k,
-            v,
-            self.attn,
-            out_cache_loc,
-            ctx.token_to_kv_pool,
-            ForwardMode.DECODE,
-            ctx.bs,
-            save_kv_cache=True,
-        )
-        step_counter = ctx.attn_backend.step_counter
-        if step_counter is not None and not ctx.forward_mode.is_decode_or_idle():
-            # The backend call above intentionally uses DECODE metadata, which
-            # bypasses the backend's EXTEND-side layerwise cache-step accounting.
-            step_counter.record_cache()
+        # Route through self.attn so the backend reshapes k/v and writes the KV
+        # cache (the KV write depends only on k/v, so the sliced q above is
+        # safe). Force DECODE via a ctx copy: the sliced q is one live query per
+        # request, which matches the decode metadata's [bs, 1] semantics (the
+        # extend metadata expects the full N-token segment).
+        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
+        attn_output = self.attn(q, k, v, decode_ctx, out_cache_loc)
+        if (
+            getattr(ctx.attn_backend, "step_counter", None)
+            and not ctx.forward_mode.is_decode_or_idle()
+        ):
+            # DECODE metadata above bypasses the backend's EXTEND-side layerwise
+            # cache-step accounting; record it here.
+            ctx.attn_backend.step_counter.record_cache()
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output

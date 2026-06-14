@@ -110,11 +110,13 @@ class LlamaAttention(BaseLlamaAttention):
                     ctx.bs,
                     save_kv_cache=False,
                 )
-                step_counter = ctx.attn_backend.step_counter
-                if step_counter is not None and not ctx.forward_mode.is_decode_or_idle():
+                if (
+                    getattr(ctx.attn_backend, "step_counter", None)
+                    and not ctx.forward_mode.is_decode_or_idle()
+                ):
                     # The backend call above intentionally uses DECODE metadata,
                     # bypassing EXTEND-side layerwise cache-step accounting.
-                    step_counter.record_cache()
+                    ctx.attn_backend.step_counter.record_cache()
                 return attn_output
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
