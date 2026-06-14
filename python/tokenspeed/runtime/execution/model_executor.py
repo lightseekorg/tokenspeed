@@ -459,6 +459,15 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+        # Defensive in-place clamp into the vocab range, mirroring the output
+        # side. Spec-decode writes next-round input ids (drafter output ->
+        # future_input_map -> input_ids_buf); under a captured graph a corrupt
+        # id would otherwise hit the embedding gather unguarded.
+        if self.drafter is not None:
+            with maybe_inference_mode():
+                self.input_buffers.input_ids_buf[: ctx.input_num_tokens].clamp_(
+                    0, self.runtime_states.vocab_size - 1
+                )
         positions = self._active_positions_override
         if positions is None:
             if self.config.model_is_mrope:
@@ -637,21 +646,65 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
-        if self.drafter is not None:
-            next_round_input_ids = self.drafter.run(
-                base_ctx=ctx,
-                logits_output=logits_output,
-                output_tokens=output_tokens,
-                accept_lengths=accept_lengths,
+        # The multi-step drafter is deliberately NOT captured inside the decode
+        # CUDA graph: replaying its loop freezes into a device-side spin (all
+        # ranks at 100% util) after a handful of steps on GLM5 MTP. While a
+        # capture is in progress, skip it and return the spec hidden states as a
+        # fourth output so the eager post-replay path (execute_forward_op) can
+        # run the drafter; on an eager forward, run it inline as before.
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if self.drafter is not None and not capturing:
+            self._run_drafter_and_store(
+                ctx, logits_output, output_tokens, accept_lengths
             )
-            # _update_runtime_state skips future_input_map when drafter is
-            # active — drafter writes the next-round inputs directly.
-            self.runtime_states.future_input_map[
-                self.input_buffers.req_pool_indices_buf[: ctx.bs]
-            ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        # The draft hidden states ride along so a graph replay (which skips the
+        # in-graph drafter) can hand them to the eager drafter afterwards.
+        draft_hidden = (
+            logits_output.hidden_states
+            if self.drafter is not None and capturing
+            else None
+        )
+        return output_tokens, accept_lengths, output_logprobs, draft_hidden
+
+    def _run_drafter_and_store(
+        self,
+        ctx: ForwardContext,
+        logits_output,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+    ) -> None:
+        """Run the multi-step drafter and stash next-round input ids.
+
+        Runs eagerly: either inline at the tail of an eager ``_forward_step``, or
+        right after a CUDA graph replay (the drafter is deliberately NOT captured
+        -- its multi-step loop inside a graph hangs after several replays on GLM5
+        MTP; keeping it eager sidesteps that and matches the verify-graph /
+        draft-eager split).
+        """
+        next_round_input_ids = self.drafter.run(
+            base_ctx=ctx,
+            logits_output=logits_output,
+            output_tokens=output_tokens,
+            accept_lengths=accept_lengths,
+        )
+        # _update_runtime_state skips future_input_map when drafter is
+        # active — drafter writes the next-round inputs directly.
+        #
+        # The drafter only produces rows for the DECODE requests (it does not
+        # draft for in-flight prefill/extend reqs), so in a MIXED batch
+        # ``next_round_input_ids`` has ``num_decodes = bs - num_extends`` rows,
+        # not ``bs``. Decodes are the trailing requests of the batch (extends
+        # first, see _update_runtime_state's accept/extend split), so write to
+        # the last ``num_rows`` req-pool slots. For a pure-decode batch
+        # (num_extends == 0) this is exactly ``[: ctx.bs]`` as before.
+        num_rows = next_round_input_ids.shape[0]
+        self.runtime_states.future_input_map[
+            self.input_buffers.req_pool_indices_buf[ctx.bs - num_rows : ctx.bs]
+        ] = next_round_input_ids.to(torch.int32)
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1485,7 +1538,12 @@ class ModelExecutor:
                         num_reqs=bs,
                     )
                     self._log_dp_sampling_route(bs, ctx)
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        draft_hidden,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -1509,6 +1567,24 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
+                    if self.drafter is not None and draft_hidden is not None:
+                        # A graph replay skipped the in-graph drafter; run it
+                        # eagerly on the replay outputs, at the same stream
+                        # position as the eager path (right after sampling).
+                        from tokenspeed.runtime.layers.logits_processor import (
+                            LogitsProcessorOutput,
+                        )
+
+                        with maybe_inference_mode():
+                            self._run_drafter_and_store(
+                                ctx,
+                                LogitsProcessorOutput(
+                                    next_token_logits=None,
+                                    hidden_states=draft_hidden,
+                                ),
+                                output_tokens,
+                                output_lengths,
+                            )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

@@ -69,6 +69,7 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.glm5 import (
     GlmMoeDsaDecoderLayer,
     GlmMoeDsaForCausalLM,
+    pad_fused_qkv_a_proj_weight_for_fp8_blockscale,
 )
 
 logger = logging.getLogger(__name__)
@@ -237,7 +238,6 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states, _ = self.model(
@@ -247,7 +247,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             out_cache_loc,
             captured_hidden_states=captured_hidden_states,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx, input_lengths)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
@@ -438,6 +438,11 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
 
     def post_load_weights(self):
         self_attn = self.model.decoder.self_attn
+        # The NextN draft decoder carries the same fused QKV-A projection as the
+        # main model, so it hits the same FP8 block-scale GEMM NaN when N is not
+        # 128-aligned. Without this the draft attention is NaN and the drafter
+        # accepts zero tokens (avg_accept_len stays at 1.0).
+        pad_fused_qkv_a_proj_weight_for_fp8_blockscale(self_attn)
         if (
             hasattr(self.quant_config, "weight_block_size")
             and (self.quant_config.weight_block_size is not None)

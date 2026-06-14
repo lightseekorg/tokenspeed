@@ -185,10 +185,14 @@ class CudaGraphWrapper:
 
     Callers always use the same interface::
 
-        output_tokens, output_lengths, output_logprobs = runner(
+        output_tokens, output_lengths, output_logprobs, draft_hidden = runner(
             bs, ctx, sampling_info, req_to_page,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
+
+    ``draft_hidden`` is the spec hidden-states buffer captured during a graph
+    replay (the in-graph drafter is skipped, see ModelExecutor); it is None on
+    the eager path and whenever no drafter is configured.
 
     Internally the wrapper owns both paths and calls init_forward_metadata
     with use_cuda_graph=True/False to select the appropriate backend buffers.
@@ -907,9 +911,12 @@ class CudaGraphWrapper:
             with nvtx_range("graph_replay", color="red"):
                 self.graphs[padded_bs].replay()
 
-            output_tokens, output_lengths, output_logprobs = self.output_buffers[
-                padded_bs
-            ]
+            (
+                output_tokens,
+                output_lengths,
+                output_logprobs,
+                draft_hidden,
+            ) = self.output_buffers[padded_bs]
 
             result = (
                 output_tokens[: bs * self.max_tokens_per_req],
@@ -917,6 +924,11 @@ class CudaGraphWrapper:
                 (
                     output_logprobs[: bs * self.max_tokens_per_req]
                     if output_logprobs is not None
+                    else None
+                ),
+                (
+                    draft_hidden[: bs * self.max_tokens_per_req]
+                    if draft_hidden is not None
                     else None
                 ),
             )

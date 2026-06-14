@@ -2232,6 +2232,40 @@ class GlmMoeDsaModel(DeepseekV3Model):
         self.layers_to_capture: set = set()
 
 
+def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
+    """Pad one attention module's fused QKV-A projection output dim to 128.
+
+    The FP8 block-scale dense GEMM (deep_gemm / default ``mm`` path) returns NaN
+    when the output dim ``N`` is not a multiple of the 128 scale block. GLM-5.1's
+    fused QKV-A projection has ``N = q_lora_rank + kv_lora_rank + qk_rope_head_dim``
+    (e.g. 2624), which is not 128-aligned, so attention output goes NaN. We
+    zero-pad the FP8 weight rows up to the next 128 multiple;
+    ``weight_scale_inv`` already has ``ceil(N/128)`` row blocks (covering the
+    padded rows) and the downstream ``qkv.split(...)`` drops the padding rows, so
+    real outputs are unchanged. No-op for bf16 weights or already-aligned ``N``.
+
+    Shared by the main model (per decoder layer) and the NextN draft model (its
+    single DSA decoder), both of which carry the same fused QKV-A projection.
+
+    Args:
+        attn: A GLM DSA attention module exposing ``fused_qkv_a_proj_with_mqa``.
+    """
+    fp8_dtypes = (torch.float8_e4m3fn, getattr(torch, "float8_e4m3fnuz", None))
+    fp8_dtypes = tuple(d for d in fp8_dtypes if d is not None)
+    proj = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+    weight = getattr(proj, "weight", None)
+    if weight is None or weight.dtype not in fp8_dtypes:
+        return
+    n = weight.shape[0]
+    if n % 128 == 0:
+        return
+    n_pad = ((n + 127) // 128) * 128
+    pad = weight.new_zeros(n_pad - n, weight.shape[1])
+    proj.weight = torch.nn.Parameter(
+        torch.cat([weight.data, pad], dim=0), requires_grad=False
+    )
+
+
 class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
     model_cls = GlmMoeDsaModel
 
@@ -2410,36 +2444,15 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
         self._pad_fused_qkv_a_proj_for_fp8_blockscale()
 
     def _pad_fused_qkv_a_proj_for_fp8_blockscale(self) -> None:
-        """Pad the fused QKV-A projection output dim to a multiple of 128.
+        """Pad each decoder layer's fused QKV-A projection to a 128-multiple.
 
-        The FP8 block-scale dense GEMM (deep_gemm / default mm path) requires
-        the output dim ``N`` to be a multiple of the 128 scale block; it returns
-        NaN otherwise. GLM-5.1's fused QKV-A projection has
-        ``N = q_lora_rank + kv_lora_rank + qk_rope_head_dim`` (e.g. 2624) which
-        is not 128-aligned, so attention output goes NaN on the very first
-        layer. DeepSeek dodges this by keeping the equivalent projection in
-        bf16; here we instead zero-pad the FP8 weight rows up to the next 128
-        multiple. ``weight_scale_inv`` already has ``ceil(N/128)`` row blocks
-        (so it covers the padded rows), and the downstream
-        ``qkv.split([q_lora_rank, kv_lora_rank + qk_rope_head_dim])`` ignores
-        the padding rows, so the result is unchanged for the real outputs.
+        See :func:`pad_fused_qkv_a_proj_weight_for_fp8_blockscale` for why this
+        is needed (FP8 block-scale GEMM returns NaN for non-128-aligned ``N``).
         """
-        fp8_dtypes = (torch.float8_e4m3fn, getattr(torch, "float8_e4m3fnuz", None))
-        fp8_dtypes = tuple(d for d in fp8_dtypes if d is not None)
         for layer in getattr(self.model, "layers", []):
             attn = getattr(layer, "self_attn", None)
-            proj = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
-            weight = getattr(proj, "weight", None)
-            if weight is None or weight.dtype not in fp8_dtypes:
-                continue
-            n = weight.shape[0]
-            if n % 128 == 0:
-                continue
-            n_pad = ((n + 127) // 128) * 128
-            pad = weight.new_zeros(n_pad - n, weight.shape[1])
-            proj.weight = torch.nn.Parameter(
-                torch.cat([weight.data, pad], dim=0), requires_grad=False
-            )
+            if attn is not None:
+                pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn)
 
 
 EntryClass = [GlmMoeDsaForCausalLM]
