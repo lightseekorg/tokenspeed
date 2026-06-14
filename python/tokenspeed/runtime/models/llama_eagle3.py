@@ -114,8 +114,10 @@ class LlamaAttention(BaseLlamaAttention):
                     getattr(ctx.attn_backend, "step_counter", None)
                     and not ctx.forward_mode.is_decode_or_idle()
                 ):
-                    # The backend call above intentionally uses DECODE metadata,
-                    # bypassing EXTEND-side layerwise cache-step accounting.
+                    # Under PD disaggregation the backend records a layerwise
+                    # cache step on its EXTEND path so KV transfer can track
+                    # per-layer readiness. The DECODE call above skips that, so
+                    # record it here to keep an EXTEND/MIXED catch-up in sync.
                     ctx.attn_backend.step_counter.record_cache()
                 return attn_output
         q, k = self.rotary_emb(positions, q, k)
