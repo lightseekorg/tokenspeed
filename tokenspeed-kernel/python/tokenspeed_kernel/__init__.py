@@ -41,8 +41,11 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.sampling import argmax
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
+    # exceptions
+    "NoKernelFoundError",
     # gemm
     "mm",
     # attention

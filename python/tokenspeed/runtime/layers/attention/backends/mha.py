@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
+    NoKernelFoundError,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
@@ -337,19 +338,25 @@ class MHAAttnBackend(AttentionBackend):
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         metadata = self.forward_prefill_metadata
-        if metadata.max_extend_prefix_len > 0:
-            return self._forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                metadata,
-                save_kv_cache,
-                kwargs.get("sinks"),
-            )
-        return self._forward_prefill(
+        if metadata.max_extend_prefix_len == 0:
+            try:
+                return self._forward_prefill(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    metadata,
+                    save_kv_cache,
+                    kwargs.get("sinks"),
+                )
+            except NoKernelFoundError:
+                # Fall back to extend_with_kvcache path if prefill kernel
+                # is not found.
+                pass
+
+        return self._forward_extend(
             q,
             k,
             v,
