@@ -92,12 +92,6 @@ class MHAAttnBackend(AttentionBackend):
         # Map the selected backend to the corresponding kernel solution string.
         backend_name = config.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
-        # FlashInfer no longer registers a wrapper-backed ragged prefill kernel;
-        # let pure prefill use the platform default while cached-prefix extend
-        # and decode still route through FlashInfer/TRTLLM.
-        self.prefill_kernel_solution = (
-            None if backend_name == "flashinfer" else self.kernel_solution
-        )
 
         # Static information needed for metadata construction and kernel dispatch
         self.max_context_len = config.context_len
@@ -388,7 +382,7 @@ class MHAAttnBackend(AttentionBackend):
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
-            solution=self.prefill_kernel_solution,
+            solution=self.kernel_solution,
         )
         output = self._unwrap_output(result)
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
