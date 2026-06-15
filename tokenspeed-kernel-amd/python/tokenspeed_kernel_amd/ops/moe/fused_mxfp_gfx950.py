@@ -4739,9 +4739,18 @@ def gluon_mxfp_combine(
         scale_load_mode=scale_load_mode,
         slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
+    requested_block_n = block_n
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
+    if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
+        # Match dispatch's preshuffled layout-aware promotion: the packed W
+        # layout is 128-wide, but the execution tile can consume two adjacent
+        # packed tiles through USE_SLICE_N. That halves the N-tile count for
+        # combine while preserving the same host layout.
+        block_n = 256
+    if w_preshuffle and block_n == 256 and block_m > 64:
+        block_m = 64
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
