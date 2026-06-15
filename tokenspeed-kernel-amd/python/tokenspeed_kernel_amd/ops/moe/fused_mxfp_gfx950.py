@@ -3405,7 +3405,8 @@ def _pipelined_moe_tile_compute(
         )
         if HAS_FP8_QUANT_OUT:
             scale = gl.load(out_quant_scale_ptr).to(gl.float32)
-            out = out / scale
+            inv_scale = 1.0 / scale
+            out = out * inv_scale
         out = out.to(y_ptr.dtype.element_ty)
         STORE_LAYOUT: gl.constexpr = out.type.layout
     else:
