@@ -946,6 +946,17 @@ class AsyncCopyDescriptor:
         return gl.amd.cdna4.async_copy.load_shared_relaxed(slot, layout)
 
     @gluon.jit
+    def issue_local_load_m_swizzle64(self, idx, buffer, layout: gl.constexpr):
+        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
+        slot = buffer.index(idx % NUM_BUFFERS)
+        slot_view = (
+            slot.reshape((16, 4, self.BLOCK_K))
+            .permute((1, 0, 2))
+            .reshape((64, self.BLOCK_K))
+        )
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_view, layout)
+
+    @gluon.jit
     def issue_local_load_unswizzle(
         self,
         idx,
@@ -2101,11 +2112,18 @@ class MoESliceNProgram:
     def issue_local_load_x(self, mfma_idx):
         cfg = self.cfg
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
-        x = self.x_desc.issue_local_load(
-            mfma_idx,
-            self.x_buffer,
-            cfg.dot_layout_x,
-        )
+        if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 64:
+            x = self.x_desc.issue_local_load_m_swizzle64(
+                mfma_idx,
+                self.x_buffer,
+                cfg.dot_layout_x,
+            )
+        else:
+            x = self.x_desc.issue_local_load(
+                mfma_idx,
+                self.x_buffer,
+                cfg.dot_layout_x,
+            )
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
@@ -2744,22 +2762,37 @@ def _pipelined_moe_tile_compute(
         offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
 
     rows_m = off_m + offs_xm
+    if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 64:
+        src_offs_xm = (offs_xm % 4) * 16 + (offs_xm // 4)
+    else:
+        src_offs_xm = offs_xm
+    rows_m_x = off_m + src_offs_xm
     # m_limit = per-expert tail (HAS_RAGGED_OFFS) or global M.
     pre_gather_mask = rows_m < m_limit
+    pre_gather_mask_x = rows_m_x < m_limit
     if HAS_GATHER:
         rows_m_safe = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
         rows_m = gl.load(
             gather_idx_ptr + rows_m_safe, mask=pre_gather_mask, other=0
         ).to(gl.int32)
+        rows_m_x_safe = gl.where(
+            pre_gather_mask_x, rows_m_x, gl.zeros_like(rows_m_x)
+        )
+        rows_m_x = gl.load(
+            gather_idx_ptr + rows_m_x_safe, mask=pre_gather_mask_x, other=0
+        ).to(gl.int32)
         # Post-gather rows_m is in global token-id space (size M_X);
         # mask out junk gather_idx values too. Don't conflate M_X with
         # ``M`` (= dispatched tile count, can exceed M_X for top-k>1).
         mask_m = pre_gather_mask & (rows_m < M_X)
+        mask_m_x = pre_gather_mask_x & (rows_m_x < M_X)
     else:
         # Clamp OOB lanes to 0 so the buffer_load address stays in
         # bounds during HIP graph warm-up; mask still filters.
         rows_m = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
+        rows_m_x = gl.where(pre_gather_mask_x, rows_m_x, gl.zeros_like(rows_m_x))
         mask_m = pre_gather_mask
+        mask_m_x = pre_gather_mask_x
     if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
         # Preshuffled W skips the per-element n-mask; the launcher enforces
         # 128-wide alignment and SliceN uses a scalar bottom-half predicate.
@@ -2777,18 +2810,18 @@ def _pipelined_moe_tile_compute(
             # Invalid expert-tail rows were already clamped to gather row 0.
             # Keep the global token bound check, but avoid carrying the
             # per-expert tail predicate through every X async-copy element.
-            x_mask_nonk = (rows_m < M_X)[:, None]
+            x_mask_nonk = (rows_m_x < M_X)[:, None]
         else:
             x_mask_nonk = gl.to_tensor(True)
     else:
-        x_mask_nonk = mask_m[:, None]
+        x_mask_nonk = mask_m_x[:, None]
 
     x_desc = AsyncCopyDescriptor.initialize(
         cfg,
         0,
         BLOCK_K_X,
         x_ptr,
-        rows_m,
+        rows_m_x,
         offs_xk,
         stride_xm,
         stride_xk,
