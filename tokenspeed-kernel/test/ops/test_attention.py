@@ -516,7 +516,7 @@ def test_attn_merge_state(
     num_heads: int,
     require,
 ) -> None:
-    require("attention", "mha_merge_state", solution, dtype, "out_a")
+    require("attention", "attn_merge_state", solution, dtype, "out_a")
 
     total_q = 31
     out_a = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)

@@ -596,8 +596,8 @@ _CASES = [
         _is_hopper,
         "hopper",
         "attention",
-        "mha_merge_state",
-        "triton_mha_merge_state",
+        "attn_merge_state",
+        "triton_attn_merge_state",
         _attention_merge_state,
     ),
     _case(
@@ -628,8 +628,8 @@ _CASES = [
         _is_blackwell_sm100,
         "blackwell-sm100",
         "attention",
-        "mha_merge_state",
-        "cuda_mha_merge_state",
+        "attn_merge_state",
+        "cuda_attn_merge_state",
         _attention_merge_state,
     ),
     _case(
@@ -652,8 +652,8 @@ _CASES = [
         _is_blackwell_non_sm100,
         "blackwell-non-sm100",
         "attention",
-        "mha_merge_state",
-        "cuda_mha_merge_state",
+        "attn_merge_state",
+        "cuda_attn_merge_state",
         _attention_merge_state,
     ),
     _case(
@@ -684,8 +684,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "mha_merge_state",
-        "triton_mha_merge_state",
+        "attn_merge_state",
+        "triton_attn_merge_state",
         _attention_merge_state,
     ),
     # GEMM API x architecture golden cases.
@@ -823,7 +823,7 @@ def selected_kernel_spy(monkeypatch):
             return torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
 
         if case.family == "attention":
-            if case.mode == "mha_merge_state":
+            if case.mode == "attn_merge_state":
                 return torch.empty_like(kwargs["out_a"]), torch.empty_like(
                     kwargs["lse_a"]
                 )

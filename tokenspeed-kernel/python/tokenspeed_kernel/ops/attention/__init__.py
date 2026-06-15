@@ -659,7 +659,7 @@ def attn_merge_state(
     signature = _attention_format_signature(out_a=out_a, out_b=out_b)
     kernel = select_kernel(
         "attention",
-        "mha_merge_state",
+        "attn_merge_state",
         signature,
         traits=traits,
         solution=solution,
@@ -673,7 +673,7 @@ def attn_merge_state(
     }
     ShapeCapture.get().record(
         "attention",
-        "mha_merge_state",
+        "attn_merge_state",
         kernel.name,
         out_a.dtype,
         shape_params,
@@ -681,7 +681,7 @@ def attn_merge_state(
 
     with kernel_scope(
         "attention",
-        "mha_merge_state",
+        "attn_merge_state",
         out_a.dtype,
         kernel_name=kernel.name,
         **shape_params,
