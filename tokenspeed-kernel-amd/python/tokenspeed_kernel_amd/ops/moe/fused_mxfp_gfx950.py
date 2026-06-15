@@ -2286,9 +2286,9 @@ class MoESliceNProgram:
         # the current tile, then waits for the next tile while leaving the
         # future copy in flight.
         self.async_wait_groups(2 * NB - 2)
-        x0, sx0 = self.issue_local_load_x(mfma_idx)
         w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
         w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
+        x0, sx0 = self.issue_local_load_x(mfma_idx)
         mfma_idx += 1
 
         unroll_pairs = main_iters // 2
@@ -2302,9 +2302,9 @@ class MoESliceNProgram:
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             self.async_wait_groups(2 * (NB - 1))
-            x1, sx1 = self.issue_local_load_x(mfma_idx)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
             gl.barrier()
@@ -2312,9 +2312,9 @@ class MoESliceNProgram:
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
             self.async_wait_groups(2 * (NB - 1))
-            x0, sx0 = self.issue_local_load_x(mfma_idx)
             w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
+            x0, sx0 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
         if odd_main:
@@ -2323,18 +2323,18 @@ class MoESliceNProgram:
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             self.async_wait_groups(2 * (NB - 1))
-            x1, sx1 = self.issue_local_load_x(mfma_idx)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
             # Drain + final NB iters of MFMAs (no more async_copy).
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
             self.async_wait_groups(0)
-            x0, sx0 = self.issue_local_load_x(mfma_idx)
             w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
+            x0, sx0 = self.issue_local_load_x(mfma_idx)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
         else:
@@ -2342,9 +2342,9 @@ class MoESliceNProgram:
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             self.async_wait_groups(0)
-            x1, sx1 = self.issue_local_load_x(mfma_idx)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
 
@@ -4513,6 +4513,16 @@ def gluon_mxfp_dispatch_swiglu(
             has_w_block_scale=True,
             bk=block_k,
         )
+    if persistent is None and w_preshuffle and use_slice_n:
+        grid_n = (N + block_n - 1) // block_n
+        if a_ragged_metadata is not None:
+            n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
+            grid_m_upper = RaggedTensorMetadata.n_blocks(n_slices, M, block_m)
+        else:
+            grid_m_upper, _ = _dense_grid_dims(M, block_m)
+        persistent = (grid_m_upper * grid_n) >= _PERSISTENT_TILES_THRESHOLD
+        if persistent and num_ctas is None:
+            num_ctas = _CDNA4_NUM_CUS
     out_block_n = block_n // 2
     y_dtype = torch.float8_e4m3fn if out_quant_scale is not None else out_dtype
     y = torch.empty((M, N // 2), device=x.device, dtype=y_dtype)
@@ -4593,15 +4603,9 @@ def gluon_mxfp_combine(
         scale_load_mode=scale_load_mode,
         slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
-    requested_block_n = block_n
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
-    if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
-        # Preshuffled W is packed as 128-wide tiles. Execute a 256-wide CTA by
-        # consuming two packed tiles through USE_SLICE_N so the same X tile
-        # feeds twice as much MFMA work per wait/barrier region.
-        block_n = 256
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
@@ -4683,6 +4687,16 @@ def gluon_mxfp_combine(
             has_w_block_scale=True,
             bk=block_k,
         )
+    if persistent is None and w_preshuffle:
+        grid_n = (N + block_n - 1) // block_n
+        if a_ragged_metadata is not None:
+            n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
+            grid_m_upper = RaggedTensorMetadata.n_blocks(n_slices, M, block_m)
+        else:
+            grid_m_upper, _ = _dense_grid_dims(M, block_m)
+        persistent = (grid_m_upper * grid_n) >= _PERSISTENT_TILES_THRESHOLD
+        if persistent and num_ctas is None:
+            num_ctas = _CDNA4_NUM_CUS
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
     if n_tokens is None:
         n_rows = M
