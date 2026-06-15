@@ -52,6 +52,7 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+GLM_DSA_REASONING_PARSER = "glm45"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
@@ -216,6 +217,32 @@ def _is_deepseek_v4_model(model_id: str | None) -> bool:
     )
 
 
+def _is_glm_dsa_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
+    normalized = model_id.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if "glm-5" in normalized or "glm5" in compact:
+        return True
+
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "glm_moe_dsa" or any(
+        arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"}
+        for arch in architectures
+    )
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -226,7 +253,9 @@ def _args_with_default_model_parsers(
     name to defer json_schema grammars past the reasoning channel.
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
-    if not _is_deepseek_v4_model(model_id):
+    is_deepseek_v4 = _is_deepseek_v4_model(model_id)
+    is_glm_dsa = _is_glm_dsa_model(model_id)
+    if not is_deepseek_v4 and not is_glm_dsa:
         return engine_args, gateway_args
 
     engine_result = list(engine_args)
@@ -235,9 +264,12 @@ def _args_with_default_model_parsers(
         "--reasoning-parser" not in engine_result
         and "--reasoning-parser" not in gateway_result
     ):
-        engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-        gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-    if "--tool-call-parser" not in gateway_result:
+        parser = (
+            DEEPSEEK_V4_REASONING_PARSER if is_deepseek_v4 else GLM_DSA_REASONING_PARSER
+        )
+        engine_result.extend(["--reasoning-parser", parser])
+        gateway_result.extend(["--reasoning-parser", parser])
+    if is_deepseek_v4 and "--tool-call-parser" not in gateway_result:
         gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
     return engine_result, gateway_result
 

@@ -191,8 +191,8 @@ class CudaGraphWrapper:
         )
 
     ``draft_hidden`` is the spec hidden-states buffer captured during a graph
-    replay (the in-graph drafter is skipped, see ModelExecutor); it is None on
-    the eager path and whenever no drafter is configured.
+    replay when the in-graph drafter is disabled; it is None on the eager path,
+    full-graph drafter path, and whenever no drafter is configured.
 
     Internally the wrapper owns both paths and calls init_forward_metadata
     with use_cuda_graph=True/False to select the appropriate backend buffers.
@@ -836,6 +836,7 @@ class CudaGraphWrapper:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        original_ctx_bs = ctx.bs
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
@@ -843,9 +844,19 @@ class CudaGraphWrapper:
             seq_lens = torch.nn.functional.pad(
                 self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
             )
-            req_pool_indices = torch.nn.functional.pad(
-                self.input_buffers.req_pool_indices_buf[:bs], (0, pad), value=0
+            active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
+            dummy_req_pool_index = int(self.config.max_req_pool_size)
+            dummy_req_pool_indices = torch.full(
+                (pad,),
+                dummy_req_pool_index,
+                dtype=active_req_pool_indices.dtype,
+                device=active_req_pool_indices.device,
             )
+            req_pool_indices = torch.cat(
+                [active_req_pool_indices, dummy_req_pool_indices]
+            )
+            self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
+            self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
             if mamba_pool_indices is not None:
                 mamba_pool_indices = torch.nn.functional.pad(
                     mamba_pool_indices, (0, pad), value=0
@@ -878,100 +889,105 @@ class CudaGraphWrapper:
         if getattr(self.config, "enable_mamba", False):
             mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
-        if use_graph:
-            if (
-                bs == 0
-                and paged_cache_block_tables is None
-                and self.attn_backend.uses_paged_cache_groups
-            ):
-                paged_cache_block_tables = self._capture_paged_cache_block_tables(
+        try:
+            if use_graph:
+                if (
+                    bs == 0
+                    and paged_cache_block_tables is None
+                    and self.attn_backend.uses_paged_cache_groups
+                ):
+                    paged_cache_block_tables = self._capture_paged_cache_block_tables(
+                        padded_bs,
+                        self.token_to_kv_pool,
+                    )
+                self._init_replay_metadata(
                     padded_bs,
-                    self.token_to_kv_pool,
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    req_to_page=req_to_page,
+                    forward_mode=ctx.forward_mode,
+                    num_padding=padded_bs - bs if padded_bs != bs else 0,
+                    paged_cache_block_tables=paged_cache_block_tables,
+                    paged_cache_block_table_base_offsets=(
+                        paged_cache_block_table_base_offsets
+                    ),
+                    **mamba_kwargs,
                 )
-            self._init_replay_metadata(
-                padded_bs,
-                bs,
-                req_pool_indices,
-                seq_lens,
-                req_to_page=req_to_page,
-                forward_mode=ctx.forward_mode,
-                num_padding=padded_bs - bs if padded_bs != bs else 0,
-                paged_cache_block_tables=paged_cache_block_tables,
-                paged_cache_block_table_base_offsets=(
-                    paged_cache_block_table_base_offsets
-                ),
-                **mamba_kwargs,
-            )
 
-            # Runtime prepare() is called by ModelExecutor with per-request rids
-            # BEFORE self.forward_step — we don't refill here to avoid clobbering
-            # the per-request generators with the capture-stub generator.
-            self.deepep_adapter.replay()
+                # Runtime prepare() is called by ModelExecutor with per-request rids
+                # BEFORE self.forward_step — we don't refill here to avoid clobbering
+                # the per-request generators with the capture-stub generator.
+                self.deepep_adapter.replay()
 
-            with nvtx_range("graph_replay", color="red"):
-                self.graphs[padded_bs].replay()
+                with nvtx_range("graph_replay", color="red"):
+                    self.graphs[padded_bs].replay()
 
-            (
-                output_tokens,
-                output_lengths,
-                output_logprobs,
-                draft_hidden,
-            ) = self.output_buffers[padded_bs]
-
-            result = (
-                output_tokens[: bs * self.max_tokens_per_req],
-                output_lengths[:bs],
                 (
-                    output_logprobs[: bs * self.max_tokens_per_req]
-                    if output_logprobs is not None
-                    else None
-                ),
-                (
-                    draft_hidden[: bs * self.max_tokens_per_req]
-                    if draft_hidden is not None
-                    else None
-                ),
-            )
+                    output_tokens,
+                    output_lengths,
+                    output_logprobs,
+                    draft_hidden,
+                ) = self.output_buffers[padded_bs]
 
-        else:
-            self._init_forward_metadata(
-                padded_bs,
-                ctx.num_extends,
-                req_pool_indices,
-                seq_lens,
-                req_to_page=req_to_page,
-                forward_mode=ctx.forward_mode,
-                extend_with_prefix=extend_with_prefix,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                extend_seq_lens=extend_seq_lens,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                global_num_tokens=ctx.global_num_tokens,
-                all_decode_or_idle=ctx.all_decode_or_idle,
-                capture_hidden_mode=ctx.capture_hidden_mode,
-                spec_info=spec_info,
-                paged_cache_block_tables=(
-                    paged_cache_block_tables
-                    if self.attn_backend.uses_paged_cache_groups
-                    else None
-                ),
-                paged_cache_block_table_base_offsets=(
-                    paged_cache_block_table_base_offsets
-                    if self.attn_backend.uses_paged_cache_groups
-                    else None
-                ),
-                **mamba_kwargs,
-            )
+                result = (
+                    output_tokens[: bs * self.max_tokens_per_req],
+                    output_lengths[:bs],
+                    (
+                        output_logprobs[: bs * self.max_tokens_per_req]
+                        if output_logprobs is not None
+                        else None
+                    ),
+                    (
+                        draft_hidden[: bs * self.max_tokens_per_req]
+                        if draft_hidden is not None
+                        else None
+                    ),
+                )
 
-            result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            else:
+                self._init_forward_metadata(
+                    padded_bs,
+                    ctx.num_extends,
+                    req_pool_indices,
+                    seq_lens,
+                    req_to_page=req_to_page,
+                    forward_mode=ctx.forward_mode,
+                    extend_with_prefix=extend_with_prefix,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                    extend_seq_lens=extend_seq_lens,
+                    extend_seq_lens_cpu=extend_seq_lens_cpu,
+                    positions=positions,
+                    out_cache_loc=out_cache_loc,
+                    global_num_tokens=ctx.global_num_tokens,
+                    all_decode_or_idle=ctx.all_decode_or_idle,
+                    capture_hidden_mode=ctx.capture_hidden_mode,
+                    spec_info=spec_info,
+                    paged_cache_block_tables=(
+                        paged_cache_block_tables
+                        if self.attn_backend.uses_paged_cache_groups
+                        else None
+                    ),
+                    paged_cache_block_table_base_offsets=(
+                        paged_cache_block_table_base_offsets
+                        if self.attn_backend.uses_paged_cache_groups
+                        else None
+                    ),
+                    **mamba_kwargs,
+                )
 
-        # Update mamba/GDN state after speculative verify
-        if _should_update_mamba_state_after_mtp_verify(
-            self.drafter, self.attn_backend, ctx.forward_mode
-        ):
-            accept_lengths = result[1]
-            self.attn_backend.update_mamba_state_after_mtp_verify(accept_lengths, None)
+                result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
-        return result
+            # Update mamba/GDN state after speculative verify
+            if _should_update_mamba_state_after_mtp_verify(
+                self.drafter, self.attn_backend, ctx.forward_mode
+            ):
+                accept_lengths = result[1]
+                self.attn_backend.update_mamba_state_after_mtp_verify(
+                    accept_lengths, None
+                )
+
+            return result
+        finally:
+            ctx.bs = original_ctx_bs

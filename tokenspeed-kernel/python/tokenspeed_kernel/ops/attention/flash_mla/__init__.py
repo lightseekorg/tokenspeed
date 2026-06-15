@@ -29,13 +29,20 @@ get_mla_metadata = error_fn
 
 if platform.is_nvidia and platform.is_hopper_plus:
     try:
-        from flash_mla import (
+        from sgl_kernel.flash_mla import (
             flash_mla_sparse_fwd,
             flash_mla_with_kvcache,
             get_mla_metadata,
         )
     except ImportError:
-        pass
+        try:
+            from flash_mla import (
+                flash_mla_sparse_fwd,
+                flash_mla_with_kvcache,
+                get_mla_metadata,
+            )
+        except ImportError:
+            pass
 
 # ------------------------------------------------------------------------------
 # Direct export

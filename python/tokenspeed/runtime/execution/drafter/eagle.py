@@ -138,6 +138,12 @@ class Eagle(BaseDrafter):
 
         # VLM placeholder id plumbed by ModelExecutor; None for text-only targets.
         self.mm_pad_substitute_id: int | None = None
+        hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
+        self._glm_dsa_reuse_mtp_topk = bool(
+            getattr(hf_config, "index_share_for_mtp_iteration", False)
+        )
+        self._glm_dsa_draft_prefill_topk = None
+        self._glm_dsa_draft_decode_topk = None
 
     def set_mm_pad_substitute_id(self, token_id: int) -> None:
         self.mm_pad_substitute_id = token_id
@@ -145,6 +151,22 @@ class Eagle(BaseDrafter):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _reset_glm_dsa_topk(self) -> None:
+        self._glm_dsa_draft_prefill_topk = None
+        self._glm_dsa_draft_decode_topk = None
+
+    def _seed_glm_dsa_topk(self, ctx: ForwardContext) -> None:
+        if not self._glm_dsa_reuse_mtp_topk:
+            return
+        ctx.glm_dsa_prefill_topk = self._glm_dsa_draft_prefill_topk
+        ctx.glm_dsa_decode_topk = self._glm_dsa_draft_decode_topk
+
+    def _capture_glm_dsa_topk(self, ctx: ForwardContext) -> None:
+        if not self._glm_dsa_reuse_mtp_topk:
+            return
+        self._glm_dsa_draft_prefill_topk = ctx.glm_dsa_prefill_topk
+        self._glm_dsa_draft_decode_topk = ctx.glm_dsa_decode_topk
 
     def _map_hot(self, ids: torch.Tensor) -> torch.Tensor:
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
@@ -248,8 +270,9 @@ class Eagle(BaseDrafter):
             draft_seq_lens_buf=self.draft_seq_lens_buf,
             accept_lengths=draft_input.accept_lengths,
         )
+        self._seed_glm_dsa_topk(ctx)
 
-        return self.draft_model_runner.forward(
+        logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
             positions=buffers.positions_buf[: draft_input.input_num_tokens],
@@ -257,6 +280,8 @@ class Eagle(BaseDrafter):
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
+        self._capture_glm_dsa_topk(ctx)
+        return logits_output
 
     @nvtx_range("draft_multi_step", color="purple")
     def _run_multi_step_decode(
@@ -325,6 +350,7 @@ class Eagle(BaseDrafter):
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
             )
+            self._seed_glm_dsa_topk(ctx)
 
             out_cache_loc = cache_locs[:, i - 1].contiguous()
             # Keep attention metadata on the accepted prefix; rejected verify
@@ -342,6 +368,7 @@ class Eagle(BaseDrafter):
                     captured_hidden_states=logits_output.hidden_states,
                     spec_step_idx=i,
                 )
+                self._capture_glm_dsa_topk(ctx)
 
             with nvtx_range("draft_sample", color="yellow"):
                 draft_ids = sampling_argmax(logits_output.next_token_logits)
@@ -378,6 +405,7 @@ class Eagle(BaseDrafter):
         draft_input: EagleDraftInput,
     ) -> torch.Tensor:
 
+        self._reset_glm_dsa_topk()
         bs = draft_input.accept_lengths.shape[0]
 
         # Layout: column 0 holds the last verified id (the base model's accepted token);
@@ -419,6 +447,7 @@ class Eagle(BaseDrafter):
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         if self.spec_num_steps <= 1:
+            self._reset_glm_dsa_topk()
             return next_tokens
 
         if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
@@ -429,6 +458,7 @@ class Eagle(BaseDrafter):
             # In DP we still run, because peer ranks may have completing
             # extends or decodes; diverging here would desync the drafter's
             # dense-TP / MoE-EP collectives (NCCL hang or RSAG mismatch).
+            self._reset_glm_dsa_topk()
             return next_tokens
 
         # Draft step 2+ (multi-step decode).
@@ -440,6 +470,7 @@ class Eagle(BaseDrafter):
             self._run_multi_step_decode(
                 bs, draft_ids, next_tokens, logits_output, draft_input
             )
+        self._reset_glm_dsa_topk()
         return next_tokens
 
     @override

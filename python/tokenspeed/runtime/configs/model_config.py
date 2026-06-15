@@ -64,7 +64,6 @@ _DSA_ARCHITECTURES = frozenset(
         "GlmMoeDsaForCausalLMNextN",
     }
 )
-_GLM5_ALLOW_DSA_CUDAGRAPH_ENV = "TOKENSPEED_GLM5_ALLOW_DSA_CUDAGRAPH"
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
     {
         "LongcatFlashForCausalLM",
@@ -107,16 +106,8 @@ def is_deepseek_dsa(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) in _DSA_ARCHITECTURES
 
 
-def allow_deepseek_dsa_cuda_graph() -> bool:
-    # Enabled by default: the sparse decode FlashMLA call no longer passes
-    # topk_length, so its lazily-built tile schedule depends only on static
-    # shapes and survives CUDA graph replay. Set the env to 0 to opt out.
-    return os.getenv(_GLM5_ALLOW_DSA_CUDAGRAPH_ENV, "1").lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+def supports_target_verify_forward_mode(config: PretrainedConfig) -> bool:
+    return is_deepseek_v4(config) or is_deepseek_dsa(config)
 
 
 def configure_deepseek_v4_attention(model_config) -> None:
@@ -332,20 +323,6 @@ class ModelConfig:
             configure_deepseek_dsa_attention(self)
             if server_args.attention_backend is None:
                 server_args.attention_backend = "dsa"
-            if not server_args.enforce_eager:
-                if allow_deepseek_dsa_cuda_graph():
-                    logger.info(
-                        "CUDA graph is enabled for GLM DSA sparse decode. "
-                        "Set %s=0 to fall back to eager.",
-                        _GLM5_ALLOW_DSA_CUDAGRAPH_ENV,
-                    )
-                else:
-                    logger.warning(
-                        "CUDA graph is disabled for GLM DSA via %s=0; "
-                        "decode runs eager.",
-                        _GLM5_ALLOW_DSA_CUDAGRAPH_ENV,
-                    )
-                    server_args.enforce_eager = True
         elif any(arch in _MLA_ARCHITECTURES for arch in model_architectures):
             mla_config = (
                 self.hf_text_config
@@ -379,7 +356,7 @@ class ModelConfig:
         self.use_target_verify_forward_mode = (
             getattr(server_args, "speculative_algorithm", None) is not None
             and not is_draft_worker
-            and is_deepseek_v4(self.hf_config)
+            and supports_target_verify_forward_mode(self.hf_config)
         )
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads

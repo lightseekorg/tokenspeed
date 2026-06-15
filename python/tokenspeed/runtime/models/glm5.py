@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -58,10 +57,7 @@ _DECODE_DEEPGEMM_WARNING_EMITTED = False
 _DECODE_FLASHINFER_TOPK_WARNING_EMITTED = False
 _PREFILL_DEEPGEMM_WARNING_EMITTED = False
 logger = logging.getLogger(__name__)
-_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off"})
-_GLM5_DECODE_TOPK_IMPL_ENV = "TOKENSPEED_GLM5_DECODE_TOPK_IMPL"
 
-from tokenspeed.runtime.configs.model_config import allow_deepseek_dsa_cuda_graph
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -87,12 +83,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     get_layer_id,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.perf_debug import (
-    cuda_perf_range,
-    parity_debug_enabled,
-    parity_debug_log,
-    parity_debug_preview,
-)
 
 
 @dataclass
@@ -100,27 +90,6 @@ class GlmDsaIndexerOutput:
     query: torch.Tensor
     key: torch.Tensor
     weights: torch.Tensor
-
-
-def _glm5_fused_indexer_projection_enabled() -> bool:
-    return (
-        os.getenv("TOKENSPEED_GLM5_FUSED_INDEXER_PROJ", "1").strip().lower()
-        not in _FALSE_ENV_VALUES
-    )
-
-
-def _glm5_decode_topk_impl() -> str:
-    value = os.getenv(_GLM5_DECODE_TOPK_IMPL_ENV, "flashinfer").strip().lower()
-    aliases = {
-        "flashinfer": "flashinfer",
-        "flashinfer_det": "flashinfer",
-        "deterministic": "flashinfer",
-        "fast": "fast_topk",
-        "fast_topk": "fast_topk",
-        "trtllm": "fast_topk",
-        "torch": "torch",
-    }
-    return aliases.get(value, "flashinfer")
 
 
 @dataclass
@@ -137,6 +106,46 @@ class GlmDsaPrefillTopK:
 class GlmDsaDecodeTopK:
     topk_indices: torch.Tensor
     topk_lens: torch.Tensor
+
+
+def _glm_dsa_is_decode_token_mode(forward_mode: ForwardMode | None) -> bool:
+    return forward_mode is not None and (
+        forward_mode.is_decode()
+        or forward_mode.is_mixed()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend()
+    )
+
+
+def _glm_dsa_is_pure_decode_token_mode(forward_mode: ForwardMode | None) -> bool:
+    return forward_mode is not None and (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend()
+    )
+
+
+def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
+    if layer_id is None:
+        return False
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None and layer_id < len(indexer_types):
+        return indexer_types[layer_id] in ("S", "shared")
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None and layer_id < len(pattern):
+        return pattern[layer_id] in ("S", "shared")
+    freq = int(getattr(config, "index_topk_freq", 1) or 1)
+    if freq <= 1:
+        return False
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is None:
+        return max(layer_id - 1, 0) % freq != 0
+    if offset <= 0:
+        raise ValueError(
+            "index_skip_topk_offset must be positive; offset <= 0 marks "
+            "layer 0 as shared with no prior top-k to reuse"
+        )
+    return max(layer_id - offset + 1, 0) % freq != 0
 
 
 def _build_prefill_kv_workspace_slots(
@@ -351,30 +360,23 @@ class GlmDsaIndexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._wk_weights_proj_loaded and _glm5_fused_indexer_projection_enabled():
-            with cuda_perf_range("glm5:indexer_wk_weights_proj", logger=logger):
-                key_weights, _ = self.wk_weights_proj(hidden_states)
+        if self._wk_weights_proj_loaded:
+            key_weights, _ = self.wk_weights_proj(hidden_states)
             return key_weights.split(
                 [self.index_head_dim, self.index_n_heads],
                 dim=-1,
             )
 
-        with cuda_perf_range("glm5:indexer_wk", logger=logger):
-            index_k, _ = self.wk(hidden_states)
-        with cuda_perf_range("glm5:indexer_weights_proj", logger=logger):
-            weights, _ = self.weights_proj(hidden_states)
+        index_k, _ = self.wk(hidden_states)
+        weights, _ = self.weights_proj(hidden_states)
         return index_k, weights
 
     def _compute_index_k_only(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._wk_weights_proj_loaded and _glm5_fused_indexer_projection_enabled():
-            with cuda_perf_range(
-                "glm5:indexer_wk_weights_proj_key_only", logger=logger
-            ):
-                key_weights, _ = self.wk_weights_proj(hidden_states)
+        if self._wk_weights_proj_loaded:
+            key_weights, _ = self.wk_weights_proj(hidden_states)
             return key_weights[..., : self.index_head_dim]
 
-        with cuda_perf_range("glm5:indexer_wk_key_only", logger=logger):
-            index_k, _ = self.wk(hidden_states)
+        index_k, _ = self.wk(hidden_states)
         return index_k
 
     def forward(
@@ -383,58 +385,49 @@ class GlmDsaIndexer(nn.Module):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
     ) -> GlmDsaIndexerOutput:
-        with cuda_perf_range("glm5:indexer_total", logger=logger):
-            with cuda_perf_range("glm5:indexer_wq_b", logger=logger):
-                index_q, _ = self.wq_b(q_lora)
-            index_q = index_q.view(-1, self.index_n_heads, self.index_head_dim)
-            index_k, weights = self._compute_index_k_and_weights(hidden_states)
-            with cuda_perf_range("glm5:indexer_k_norm", logger=logger):
-                index_k = self.k_norm(index_k)
+        index_q, _ = self.wq_b(q_lora)
+        index_q = index_q.view(-1, self.index_n_heads, self.index_head_dim)
+        index_k, weights = self._compute_index_k_and_weights(hidden_states)
+        index_k = self.k_norm(index_k)
 
-            if positions.numel() > 0:
-                with cuda_perf_range("glm5:indexer_rope", logger=logger):
-                    q_rope, k_rope = self.rotary_emb(
-                        positions,
-                        index_q[..., : self.rope_head_dim],
-                        index_k[:, None, : self.rope_head_dim],
-                    )
-                index_q[..., : self.rope_head_dim] = q_rope
-                index_k[:, : self.rope_head_dim] = k_rope.squeeze(1)
-
-            with cuda_perf_range("glm5:indexer_hadamard_pair", logger=logger):
-                index_q, index_k = _glm_dsa_hadamard_rotate_pair(index_q, index_k)
-            return GlmDsaIndexerOutput(
-                query=index_q,
-                key=index_k,
-                weights=weights.float() * (self.index_n_heads**-0.5),
+        if positions.numel() > 0:
+            q_rope, k_rope = self.rotary_emb(
+                positions,
+                index_q[..., : self.rope_head_dim],
+                index_k[:, None, : self.rope_head_dim],
             )
+            index_q[..., : self.rope_head_dim] = q_rope
+            index_k[:, : self.rope_head_dim] = k_rope.squeeze(1)
+
+        index_q, index_k = _glm_dsa_hadamard_rotate_pair(index_q, index_k)
+        return GlmDsaIndexerOutput(
+            query=index_q,
+            key=index_k,
+            weights=weights.float() * (self.index_n_heads**-0.5),
+        )
 
     def forward_key_only(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        with cuda_perf_range("glm5:indexer_key_only_total", logger=logger):
-            index_k = self._compute_index_k_only(hidden_states)
-            with cuda_perf_range("glm5:indexer_key_only_k_norm", logger=logger):
-                index_k = self.k_norm(index_k)
+        index_k = self._compute_index_k_only(hidden_states)
+        index_k = self.k_norm(index_k)
 
-            if positions.numel() > 0:
-                with cuda_perf_range("glm5:indexer_key_only_rope", logger=logger):
-                    dummy_q = self._get_key_only_rope_query_workspace(
-                        rows=index_k.shape[0],
-                        device=index_k.device,
-                        dtype=index_k.dtype,
-                    )
-                    _, k_rope = self.rotary_emb(
-                        positions,
-                        dummy_q,
-                        index_k[:, None, : self.rope_head_dim],
-                    )
-                index_k[:, : self.rope_head_dim] = k_rope.squeeze(1)
+        if positions.numel() > 0:
+            dummy_q = self._get_key_only_rope_query_workspace(
+                rows=index_k.shape[0],
+                device=index_k.device,
+                dtype=index_k.dtype,
+            )
+            _, k_rope = self.rotary_emb(
+                positions,
+                dummy_q,
+                index_k[:, None, : self.rope_head_dim],
+            )
+            index_k[:, : self.rope_head_dim] = k_rope.squeeze(1)
 
-            with cuda_perf_range("glm5:indexer_key_only_hadamard", logger=logger):
-                return _glm_dsa_hadamard_rotate(index_k)
+        return _glm_dsa_hadamard_rotate(index_k)
 
 
 class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
@@ -462,6 +455,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         reduce_attn_results=True,
         alt_stream: torch.cuda.Stream | None = None,
         skip_rope: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
         super().__init__(
@@ -501,17 +495,28 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             self.q_a_layernorm,
             self.kv_a_layernorm,
         )
-        self.indexer = GlmDsaIndexer(
-            config=config,
-            hidden_size=hidden_size,
-            q_lora_rank=q_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            prefix=add_prefix("indexer", prefix),
+        self.index_topk = config.index_topk
+        self.is_nextn = is_nextn
+        # NextN/MTP has its own indexer weights but may reuse the previous
+        # draft iteration's top-k. Shared target layers do not have usable
+        # indexer weights and must consume the context-carried top-k.
+        self.skip_indexer_topk = (
+            True if is_nextn else _glm_dsa_skip_indexer_topk(config, layer_id)
         )
+        if self.skip_indexer_topk and not self.is_nextn:
+            self.indexer = None
+        else:
+            self.indexer = GlmDsaIndexer(
+                config=config,
+                hidden_size=hidden_size,
+                q_lora_rank=q_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                prefix=add_prefix("indexer", prefix),
+            )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_local_topk_offsets_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
@@ -569,26 +574,35 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     @staticmethod
     def _resolve_decode_q_len(
         ctx: ForwardContext,
-        num_tokens: int,
+        num_decode_tokens: int,
         num_decode_reqs: int,
     ) -> int:
         """Per-request query rows, derived from the actual batch shape.
 
-        Spec-verify feeds spec_num_tokens rows per request while plain decode
-        and the draft model's own decode steps feed one row. The backend's
-        spec_num_tokens cannot tell these apart -- the draft attention backend
-        inherits the verify width from the shared config -- so trust the
-        input: only a decode batch whose row count exactly matches
-        reqs * spec_num_tokens is a verify batch.
+        Spec-verify and the draft first step can both feed multiple query rows
+        per request, while the draft model's later decode steps feed one row.
+        The draft attention backend inherits the target verify width from the
+        shared config, so trust the actual input row count instead of backend
+        metadata.
         """
-        spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
-        if (
-            spec_width > 1
-            and ctx.forward_mode.is_decode()
-            and num_tokens == num_decode_reqs * spec_width
-        ):
-            return spec_width
+        if num_decode_reqs > 0 and num_decode_tokens > 0:
+            q_len, rem = divmod(int(num_decode_tokens), int(num_decode_reqs))
+            if rem == 0 and q_len > 0:
+                return q_len
         return 1
+
+    @staticmethod
+    def _resolve_num_decode_tokens(
+        ctx: ForwardContext,
+        *,
+        total_tokens: int,
+        num_decode_reqs: int,
+    ) -> int:
+        if num_decode_reqs <= 0 or total_tokens <= 0:
+            return 0
+        spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
+        expected_decode_tokens = num_decode_reqs * spec_width
+        return min(int(total_tokens), int(expected_decode_tokens))
 
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
         retired = getattr(self, "_retired_decode_workspaces", None)
@@ -634,12 +648,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     def _check_decode_q_len_per_req(q_len_per_req: int) -> None:
         # Multi-step MTP verify runs num_draft_tokens query rows per request.
         # DeepGEMM paged MQA logits (our fork) and FlashMLA sparse decode are
-        # both verified bit-exact against batch expansion up to next_n = 4,
-        # which covers --speculative-num-steps 3 (3 draft + 1 bonus).
-        if not 1 <= q_len_per_req <= 4:
+        # both verified bit-exact against batch expansion up to next_n = 6,
+        # which covers --speculative-num-steps 5 (5 draft + 1 bonus).
+        if not 1 <= q_len_per_req <= 6:
             raise NotImplementedError(
-                "GLM DSA sparse decode supports 1-4 query tokens per request "
-                f"(verified next_n <= 4), got {q_len_per_req}."
+                "GLM DSA sparse decode supports 1-6 query tokens per request "
+                f"(verified next_n <= 6), got {q_len_per_req}."
             )
 
     def _write_decode_topk_offsets(
@@ -650,22 +664,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         local_topk_offsets: torch.Tensor,
         topk: int,
     ) -> None:
-        topk_impl = _glm5_decode_topk_impl()
-        if topk_impl == "flashinfer" and (
+        use_fast_topk = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        ):
-            # flashinfer top_k (even with dsa_graph_safe=True) produces wrong
-            # selections when replayed from a CUDA graph on this stack, while
-            # the trtllm fast_topk kernel replays correctly. Bake fast_topk
-            # into captured graphs; eager keeps the deterministic flashinfer
-            # path. Tie-breaks may differ between eager and replay for equal
-            # logits, which is the existing fast_topk semantic.
-            topk_impl = "fast_topk"
-        if topk_impl == "flashinfer":
+        )
+        if not use_fast_topk:
             if glm_dsa_decode_topk_deterministic is not None:
-                # Deterministic, graph-safe, index-stable tie-break (default).
-                # logits are already masked with -inf beyond each seq_len, so a
-                # per-row global top-k yields the in-sequence candidates.
+                # Deterministic, graph-safe, index-stable tie-break. Logits are
+                # already masked with -inf beyond each seq_len, so a per-row
+                # global top-k yields the in-sequence candidates.
                 glm_dsa_decode_topk_deterministic(logits, local_topk_offsets, topk)
                 return
             global _DECODE_FLASHINFER_TOPK_WARNING_EMITTED
@@ -676,8 +682,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                     "long-context parity is not guaranteed on this path."
                 )
                 _DECODE_FLASHINFER_TOPK_WARNING_EMITTED = True
-            topk_impl = "fast_topk"
-        if topk_impl == "fast_topk":
+            use_fast_topk = True
+        if use_fast_topk:
+            # flashinfer top_k (even with dsa_graph_safe=True) produces wrong
+            # selections when replayed from a CUDA graph on this stack, while
+            # the trtllm fast_topk kernel replays correctly. Bake fast_topk
+            # into captured graphs; eager keeps the deterministic flashinfer
+            # path. Tie-breaks may differ between eager and replay for equal
+            # logits, which is the existing fast_topk semantic.
+            if fast_topk_v2 is None or fast_topk_v2 is error_fn:
+                raise RuntimeError("trtllm fast_topk is unavailable")
             fast_topk_v2(
                 logits.contiguous(),
                 seq_lens_2d,
@@ -686,20 +700,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 1,
             )
             return
-
-        if topk_impl == "torch":
-            logits_cols = int(logits.shape[1])
-            offsets = self._get_decode_topk_arange(logits_cols, logits.device)
-            masked_logits = logits.masked_fill(
-                offsets.view(1, logits_cols) >= seq_lens_2d.reshape(-1, 1),
-                float("-inf"),
-            )
-            local_topk_offsets.copy_(
-                torch.topk(masked_logits, k=topk, dim=-1).indices.to(torch.int32)
-            )
-            return
-
-        raise ValueError(f"unsupported GLM5 decode top-k implementation: {topk_impl}")
 
     @staticmethod
     def _decode_seq_lens_fit_topk(
@@ -746,7 +746,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_decode_tokens: int,
         topk: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         topk_indices = self._get_decode_topk_workspace(
             "_decode_topk_indices_buffer",
             num_tokens,
@@ -759,93 +759,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             num_decode_tokens,
             device,
         )
-        local_topk_offsets = None
-        if parity_debug_enabled():
-            local_topk_offsets = self._get_full_context_debug_local_topk_offsets(
-                seq_lens=seq_lens,
-                num_decode_tokens=num_decode_tokens,
-                topk=topk,
-                device=device,
-            )
-            glm_dsa_local_topk_to_global_slots(
-                local_topk_offsets=local_topk_offsets,
-                block_table=block_tables,
-                block_size=ctx.token_to_kv_pool.page_size,
-                seq_lens=seq_lens.to(device=device, dtype=torch.int32),
-                out=topk_slice,
-                lens_out=topk_lens,
-            )
-        else:
-            glm_dsa_full_context_topk_to_global_slots(
-                seq_lens=seq_lens.to(device=device, dtype=torch.int32),
-                block_table=block_tables,
-                block_size=ctx.token_to_kv_pool.page_size,
-                topk=topk,
-                out=topk_slice,
-                lens_out=topk_lens,
-            )
-        return topk_indices, local_topk_offsets, topk_lens
-
-    def _get_full_context_debug_local_topk_offsets(
-        self,
-        *,
-        seq_lens: torch.Tensor,
-        num_decode_tokens: int,
-        topk: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        local_topk_offsets = self._get_decode_topk_workspace(
-            "_decode_local_topk_offsets_buffer",
-            num_decode_tokens,
-            topk,
-            device,
+        glm_dsa_full_context_topk_to_global_slots(
+            seq_lens=seq_lens.to(device=device, dtype=torch.int32),
+            block_table=block_tables,
+            block_size=ctx.token_to_kv_pool.page_size,
+            topk=topk,
+            out=topk_slice,
+            lens_out=topk_lens,
         )
-        offsets = self._get_decode_topk_arange(topk, device)
-        seq_lens_i32 = seq_lens.to(device=device, dtype=torch.int32)
-        local_topk_offsets.copy_(offsets.view(1, topk).expand(num_decode_tokens, topk))
-        local_topk_offsets.masked_fill_(
-            offsets.view(1, topk) >= seq_lens_i32.view(num_decode_tokens, 1),
-            -1,
-        )
-        return local_topk_offsets
-
-    def _register_decode_topk_debug_tensor(
-        self,
-        ctx: ForwardContext,
-        *,
-        path: str,
-        block_tables: torch.Tensor,
-        topk_indices: torch.Tensor,
-        local_topk_offsets: torch.Tensor | None = None,
-    ) -> None:
-        if not parity_debug_enabled():
-            return
-
-        layer_id = int(getattr(self.attn_mqa, "layer_id", -1))
-        bucket_bs = int(ctx.bs)
-        debug_by_bs = getattr(
-            ctx.attn_backend,
-            "_glm5_debug_decode_topk_by_bs",
-            None,
-        )
-        if not isinstance(debug_by_bs, dict):
-            debug_by_bs = {}
-            setattr(ctx.attn_backend, "_glm5_debug_decode_topk_by_bs", debug_by_bs)
-        debug_tensors = debug_by_bs.get(bucket_bs)
-        if not isinstance(debug_tensors, dict):
-            debug_tensors = {}
-            debug_by_bs[bucket_bs] = debug_tensors
-
-        def snapshot(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.detach().clone()
-
-        debug_tensors[layer_id] = {
-            "path": path,
-            "block_tables": snapshot(block_tables),
-            "topk_indices": snapshot(topk_indices),
-        }
-        if local_topk_offsets is not None:
-            debug_tensors[layer_id]["local_topk_offsets"] = snapshot(local_topk_offsets)
+        return topk_indices, topk_lens
 
     def _try_compute_decode_full_context_topk_indices(
         self,
@@ -854,16 +776,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_tokens: int,
         device: torch.device,
     ) -> GlmDsaDecodeTopK | None:
-        if ctx.forward_mode is None or not (
-            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
-        ):
+        if not _glm_dsa_is_decode_token_mode(ctx.forward_mode):
             return None
         if not hasattr(ctx.token_to_kv_pool, "get_index_k_buffer"):
-            return None
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
-        if capturing and not allow_deepseek_dsa_cuda_graph():
             return None
 
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
@@ -872,14 +787,23 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_decode_reqs = int(ctx.bs - ctx.num_extends)
         if num_decode_reqs <= 0 or num_tokens == 0:
             return None
-        q_len_per_req = self._resolve_decode_q_len(ctx, num_tokens, num_decode_reqs)
-        num_decode_tokens = num_decode_reqs * q_len_per_req
+        num_decode_tokens = self._resolve_num_decode_tokens(
+            ctx,
+            total_tokens=num_tokens,
+            num_decode_reqs=num_decode_reqs,
+        )
+        q_len_per_req = self._resolve_decode_q_len(
+            ctx, num_decode_tokens, num_decode_reqs
+        )
         if num_tokens < num_decode_tokens:
             raise RuntimeError(
                 "GLM DSA decode top-k token split is invalid: "
                 f"tokens={num_tokens}, decode_tokens={num_decode_tokens}"
             )
         self._check_decode_q_len_per_req(q_len_per_req)
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
 
         num_extends = int(metadata.num_extends or 0)
         seq_lens = metadata.seq_lens_k[num_extends : num_extends + num_decode_reqs]
@@ -889,7 +813,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         block_tables = metadata.block_kv_indices[
             num_extends : num_extends + num_decode_reqs
         ]
-        topk = self.indexer.index_topk
+        topk = self.index_topk
         # The fit check uses per-request seq_lens: the last verify token sees
         # the full context, so it bounds every token's visible length.
         if not self._decode_seq_lens_fit_topk(
@@ -915,8 +839,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         decode_start = num_tokens - num_decode_tokens
         cache_key = None
         if (
-            not parity_debug_enabled()
-            and ctx.forward_mode.is_decode()
+            _glm_dsa_is_pure_decode_token_mode(ctx.forward_mode)
             and num_extends == 0
             and num_tokens == num_decode_tokens
         ):
@@ -935,44 +858,21 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             if isinstance(cache, tuple) and len(cache) == 2 and cache[0] == cache_key:
                 return cache[1]
 
-        with cuda_perf_range("glm5:decode_topk_full_context", logger=logger):
-            full_topk_indices, full_local_topk_offsets, full_topk_lens = (
-                self._compute_decode_full_context_topk_indices(
-                    ctx=ctx,
-                    seq_lens=seq_lens_per_token,
-                    block_tables=block_tables_per_token,
-                    decode_start=decode_start,
-                    num_tokens=num_tokens,
-                    num_decode_tokens=num_decode_tokens,
-                    topk=topk,
-                    device=device,
-                )
+        full_topk_indices, full_topk_lens = (
+            self._compute_decode_full_context_topk_indices(
+                ctx=ctx,
+                seq_lens=seq_lens_per_token,
+                block_tables=block_tables_per_token,
+                decode_start=decode_start,
+                num_tokens=num_tokens,
+                num_decode_tokens=num_decode_tokens,
+                topk=topk,
+                device=device,
             )
+        )
         full_topk = GlmDsaDecodeTopK(
             topk_indices=full_topk_indices,
             topk_lens=full_topk_lens,
-        )
-        full_topk_slice = full_topk_indices[
-            decode_start : decode_start + num_decode_tokens
-        ]
-        self._register_decode_topk_debug_tensor(
-            ctx,
-            path="full_context",
-            block_tables=block_tables_per_token,
-            local_topk_offsets=full_local_topk_offsets,
-            topk_indices=full_topk_slice,
-        )
-        parity_debug_log(
-            "decode_topk",
-            logger=logger,
-            seq_lens=seq_lens_per_token,
-            path="full_context",
-            layer_id=getattr(self.attn_mqa, "layer_id", None),
-            decode_start=decode_start,
-            topk=topk,
-            block_tables=block_tables_per_token,
-            local_topk_offsets=full_local_topk_offsets,
-            topk_indices=full_topk_slice,
         )
         if cache_key is not None:
             setattr(
@@ -987,17 +887,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         indexer_output: GlmDsaIndexerOutput,
         ctx: ForwardContext,
     ) -> GlmDsaDecodeTopK | None:
-        if ctx.forward_mode is None or not (
-            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
-        ):
+        if not _glm_dsa_is_decode_token_mode(ctx.forward_mode):
             return None
         if not hasattr(ctx.token_to_kv_pool, "get_index_k_buffer"):
             return None
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-        if capturing and not allow_deepseek_dsa_cuda_graph():
-            return None
 
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         if metadata is None or metadata.block_kv_indices is None:
@@ -1006,8 +902,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_decode_reqs = int(ctx.bs - ctx.num_extends)
         if num_decode_reqs <= 0 or num_tokens == 0:
             return None
-        q_len_per_req = self._resolve_decode_q_len(ctx, num_tokens, num_decode_reqs)
-        num_decode_tokens = num_decode_reqs * q_len_per_req
+        num_decode_tokens = self._resolve_num_decode_tokens(
+            ctx,
+            total_tokens=num_tokens,
+            num_decode_reqs=num_decode_reqs,
+        )
+        q_len_per_req = self._resolve_decode_q_len(
+            ctx, num_decode_tokens, num_decode_reqs
+        )
         if num_tokens < num_decode_tokens:
             raise RuntimeError(
                 "GLM DSA decode top-k token split is invalid: "
@@ -1031,7 +933,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             if q_len_per_req == 1
             else block_tables.repeat_interleave(q_len_per_req, dim=0)
         )
-        topk = self.indexer.index_topk
+        topk = self.index_topk
         decode_start = num_tokens - num_decode_tokens
         full_topk = self._try_compute_decode_full_context_topk_indices(
             ctx,
@@ -1041,45 +943,20 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if full_topk is not None:
             return full_topk
 
-        with cuda_perf_range("glm5:decode_topk_deepgemm", logger=logger):
-            fast_topk_result = self._compute_decode_topk_indices_deepgemm(
-                indexer_output=indexer_output,
-                ctx=ctx,
-                seq_lens_per_token=seq_lens_per_token,
-                block_tables=block_tables,
-                block_tables_per_token=block_tables_per_token,
-                q_len_per_req=q_len_per_req,
-                decode_start=decode_start,
-                num_tokens=num_tokens,
-                num_decode_tokens=num_decode_tokens,
-                topk=topk,
-            )
+        fast_topk_result = self._compute_decode_topk_indices_deepgemm(
+            indexer_output=indexer_output,
+            ctx=ctx,
+            seq_lens_per_token=seq_lens_per_token,
+            block_tables=block_tables,
+            block_tables_per_token=block_tables_per_token,
+            q_len_per_req=q_len_per_req,
+            decode_start=decode_start,
+            num_tokens=num_tokens,
+            num_decode_tokens=num_decode_tokens,
+            topk=topk,
+        )
         if fast_topk_result is not None:
-            fast_topk_indices, fast_local_topk_offsets, fast_topk_lens = (
-                fast_topk_result
-            )
-            fast_topk_slice = fast_topk_indices[
-                decode_start : decode_start + num_decode_tokens
-            ]
-            self._register_decode_topk_debug_tensor(
-                ctx,
-                path="deepgemm",
-                block_tables=block_tables_per_token,
-                local_topk_offsets=fast_local_topk_offsets,
-                topk_indices=fast_topk_slice,
-            )
-            parity_debug_log(
-                "decode_topk",
-                logger=logger,
-                seq_lens=seq_lens_per_token,
-                path="deepgemm",
-                layer_id=getattr(self.attn_mqa, "layer_id", None),
-                decode_start=decode_start,
-                topk=topk,
-                block_tables=block_tables_per_token,
-                local_topk_offsets=fast_local_topk_offsets,
-                topk_indices=fast_topk_slice,
-            )
+            fast_topk_indices, _, fast_topk_lens = fast_topk_result
             return GlmDsaDecodeTopK(
                 topk_indices=fast_topk_indices,
                 topk_lens=fast_topk_lens,
@@ -1091,99 +968,72 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 "and is not capture-safe."
             )
 
-        with cuda_perf_range("glm5:decode_topk_fallback", logger=logger):
-            index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(
-                self.attn_mqa.layer_id
-            )
-            local_topk_offsets = self._get_decode_topk_workspace(
-                "_decode_local_topk_offsets_buffer",
-                num_decode_tokens,
-                topk,
-                indexer_output.query.device,
-            )
-            topk_indices = self._get_decode_topk_workspace(
-                "_decode_topk_indices_buffer",
-                num_tokens,
-                topk,
-                indexer_output.query.device,
-                fill_value=None,
-            )
-            topk_slice = topk_indices[decode_start : decode_start + num_decode_tokens]
-            topk_lens = self._get_decode_topk_lens_workspace(
-                num_decode_tokens,
-                indexer_output.query.device,
-            )
-            for row_idx in range(num_decode_tokens):
-                req_idx = row_idx // q_len_per_req
-                seq_len = int(seq_lens_per_token[row_idx].item())
-                if seq_len <= 0:
-                    continue
-                token_idx = decode_start + row_idx
-                row_topk = min(topk, seq_len)
-                if seq_len <= topk:
-                    local_topk_offsets[row_idx, :row_topk] = torch.arange(
-                        row_topk,
-                        dtype=torch.int32,
-                        device=indexer_output.query.device,
-                    )
-                    continue
-                offsets = torch.arange(
-                    seq_len,
-                    dtype=torch.int64,
+        index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+        local_topk_offsets = self._get_decode_topk_workspace(
+            "_decode_local_topk_offsets_buffer",
+            num_decode_tokens,
+            topk,
+            indexer_output.query.device,
+        )
+        topk_indices = self._get_decode_topk_workspace(
+            "_decode_topk_indices_buffer",
+            num_tokens,
+            topk,
+            indexer_output.query.device,
+            fill_value=None,
+        )
+        topk_slice = topk_indices[decode_start : decode_start + num_decode_tokens]
+        topk_lens = self._get_decode_topk_lens_workspace(
+            num_decode_tokens,
+            indexer_output.query.device,
+        )
+        for row_idx in range(num_decode_tokens):
+            req_idx = row_idx // q_len_per_req
+            seq_len = int(seq_lens_per_token[row_idx].item())
+            if seq_len <= 0:
+                continue
+            token_idx = decode_start + row_idx
+            row_topk = min(topk, seq_len)
+            if seq_len <= topk:
+                local_topk_offsets[row_idx, :row_topk] = torch.arange(
+                    row_topk,
+                    dtype=torch.int32,
                     device=indexer_output.query.device,
                 )
-                page_offsets = torch.div(
-                    offsets,
-                    ctx.token_to_kv_pool.page_size,
-                    rounding_mode="floor",
-                )
-                pages = (
-                    block_tables[req_idx].to(torch.int64).index_select(0, page_offsets)
-                )
-                slots = pages * ctx.token_to_kv_pool.page_size + (
-                    offsets % ctx.token_to_kv_pool.page_size
-                )
-                keys = index_k_cache.index_select(0, slots)
-                head_logits = torch.matmul(
-                    keys.float(),
-                    indexer_output.query[token_idx].float().transpose(0, 1),
-                )
-                scores = (
-                    torch.relu(head_logits * self.indexer.softmax_scale)
-                    * indexer_output.weights[token_idx].float()
-                ).sum(dim=-1)
-                selected = torch.topk(scores, k=row_topk, sorted=True).indices
-                local_topk_offsets[row_idx, :row_topk] = selected.to(torch.int32)
-
-            glm_dsa_local_topk_to_global_slots(
-                local_topk_offsets=local_topk_offsets,
-                block_table=block_tables_per_token,
-                block_size=ctx.token_to_kv_pool.page_size,
-                seq_lens=seq_lens_per_token,
-                out=topk_slice,
-                lens_out=topk_lens,
+                continue
+            offsets = torch.arange(
+                seq_len,
+                dtype=torch.int64,
+                device=indexer_output.query.device,
             )
-        fallback_topk_slice = topk_indices[
-            decode_start : decode_start + num_decode_tokens
-        ]
-        self._register_decode_topk_debug_tensor(
-            ctx,
-            path="fallback",
-            block_tables=block_tables_per_token,
+            page_offsets = torch.div(
+                offsets,
+                ctx.token_to_kv_pool.page_size,
+                rounding_mode="floor",
+            )
+            pages = block_tables[req_idx].to(torch.int64).index_select(0, page_offsets)
+            slots = pages * ctx.token_to_kv_pool.page_size + (
+                offsets % ctx.token_to_kv_pool.page_size
+            )
+            keys = index_k_cache.index_select(0, slots)
+            head_logits = torch.matmul(
+                keys.float(),
+                indexer_output.query[token_idx].float().transpose(0, 1),
+            )
+            scores = (
+                torch.relu(head_logits * self.indexer.softmax_scale)
+                * indexer_output.weights[token_idx].float()
+            ).sum(dim=-1)
+            selected = torch.topk(scores, k=row_topk, sorted=True).indices
+            local_topk_offsets[row_idx, :row_topk] = selected.to(torch.int32)
+
+        glm_dsa_local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
-            topk_indices=fallback_topk_slice,
-        )
-        parity_debug_log(
-            "decode_topk",
-            logger=logger,
+            block_table=block_tables_per_token,
+            block_size=ctx.token_to_kv_pool.page_size,
             seq_lens=seq_lens_per_token,
-            path="fallback",
-            layer_id=getattr(self.attn_mqa, "layer_id", None),
-            decode_start=decode_start,
-            topk=topk,
-            block_tables=block_tables_per_token,
-            local_topk_offsets=local_topk_offsets,
-            topk_indices=fallback_topk_slice,
+            out=topk_slice,
+            lens_out=topk_lens,
         )
         return GlmDsaDecodeTopK(topk_indices=topk_indices, topk_lens=topk_lens)
 
@@ -1201,16 +1051,11 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_decode_tokens: int,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        topk_impl = _glm5_decode_topk_impl()
         if (
             deep_gemm is None
             or topk not in (512, 1024, 2048)
             or not hasattr(ctx.token_to_kv_pool, "has_index_k_with_scale_buffer")
             or not ctx.token_to_kv_pool.has_index_k_with_scale_buffer()
-        ):
-            return None
-        if topk_impl == "fast_topk" and (
-            fast_topk_v2 is None or fast_topk_v2 is error_fn
         ):
             return None
         page_size = ctx.token_to_kv_pool.page_size
@@ -1401,12 +1246,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if ctx.req_to_page is None:
             raise RuntimeError("GLM DSA sparse prefill requires req_to_page metadata")
 
-        topk = self.indexer.index_topk
+        topk = self.index_topk
         page_size = ctx.token_to_kv_pool.page_size
         max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
-        req_pool_indices = chunk_meta.req_pool_indices[: ctx.num_extends].long()
-        block_tables = ctx.req_to_page[req_pool_indices, :max_pages].to(
+        block_tables_snapshot = getattr(ctx.attn_backend, "_prefill_block_tables", None)
+        if block_tables_snapshot is None:
+            req_pool_indices = chunk_meta.req_pool_indices[: ctx.num_extends].long()
+            block_tables_snapshot = ctx.req_to_page[req_pool_indices]
+        block_tables = block_tables_snapshot[:, :max_pages].to(
             device=indexer_output.query.device,
             dtype=torch.int32,
         )
@@ -1417,81 +1265,77 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             page_size=page_size,
             device=indexer_output.query.device,
         )
-        with cuda_perf_range("glm5:prefill_topk_deepgemm", logger=logger):
-            fast_prefill_topk = self._compute_prefill_topk_indices_deepgemm(
-                indexer_output=indexer_output,
-                ctx=ctx,
-                prefix_lens=prefix_lens,
-                extend_lens=extend_lens,
-                seq_lens=seq_lens,
-                block_tables=block_tables,
-                kv_workspace_slots=kv_workspace_slots,
-                kv_workspace_bases=kv_workspace_bases,
-                max_seq_len=max_seq_len,
-                num_prefill_tokens=num_prefill_tokens,
-                topk=topk,
-            )
+        fast_prefill_topk = self._compute_prefill_topk_indices_deepgemm(
+            indexer_output=indexer_output,
+            ctx=ctx,
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            seq_lens=seq_lens,
+            block_tables=block_tables,
+            kv_workspace_slots=kv_workspace_slots,
+            kv_workspace_bases=kv_workspace_bases,
+            max_seq_len=max_seq_len,
+            num_prefill_tokens=num_prefill_tokens,
+            topk=topk,
+        )
         if fast_prefill_topk is not None:
             return fast_prefill_topk
 
-        with cuda_perf_range("glm5:prefill_topk_fallback", logger=logger):
-            index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(
-                self.attn_mqa.layer_id
+        index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+        workspace_indices = torch.full(
+            (num_prefill_tokens, topk),
+            -1,
+            dtype=torch.int32,
+            device=indexer_output.query.device,
+        )
+        topk_lens = torch.zeros(
+            num_prefill_tokens,
+            dtype=torch.int32,
+            device=indexer_output.query.device,
+        )
+
+        token_base = 0
+        for req_idx in range(ctx.num_extends):
+            prefix_len = int(prefix_lens[req_idx].item())
+            extend_len = int(extend_lens[req_idx].item())
+            seq_len = prefix_len + extend_len
+            if extend_len <= 0:
+                continue
+
+            workspace_base = int(kv_workspace_bases[req_idx].item())
+            keys = index_k_cache.index_select(
+                0,
+                kv_workspace_slots[workspace_base : workspace_base + seq_len].to(
+                    torch.int64
+                ),
             )
-            workspace_indices = torch.full(
-                (num_prefill_tokens, topk),
-                -1,
-                dtype=torch.int32,
-                device=indexer_output.query.device,
-            )
-            topk_lens = torch.zeros(
-                num_prefill_tokens,
-                dtype=torch.int32,
-                device=indexer_output.query.device,
-            )
 
-            token_base = 0
-            for req_idx in range(ctx.num_extends):
-                prefix_len = int(prefix_lens[req_idx].item())
-                extend_len = int(extend_lens[req_idx].item())
-                seq_len = prefix_len + extend_len
-                if extend_len <= 0:
-                    continue
+            for token_offset in range(extend_len):
+                token_idx = token_base + token_offset
+                causal_len = prefix_len + token_offset + 1
+                row_topk = min(topk, causal_len)
+                if causal_len <= topk:
+                    selected = torch.arange(
+                        causal_len,
+                        dtype=torch.int32,
+                        device=indexer_output.query.device,
+                    )
+                else:
+                    head_logits = torch.matmul(
+                        keys[:causal_len].float(),
+                        indexer_output.query[token_idx].float().transpose(0, 1),
+                    )
+                    scores = (
+                        torch.relu(head_logits * self.indexer.softmax_scale)
+                        * indexer_output.weights[token_idx].float()
+                    ).sum(dim=-1)
+                    selected = torch.topk(scores, k=row_topk, sorted=True).indices.to(
+                        torch.int32
+                    )
+                workspace_indices[token_idx, :row_topk] = workspace_base + selected
+                topk_lens[token_idx] = row_topk
 
-                workspace_base = int(kv_workspace_bases[req_idx].item())
-                keys = index_k_cache.index_select(
-                    0,
-                    kv_workspace_slots[workspace_base : workspace_base + seq_len].to(
-                        torch.int64
-                    ),
-                )
-
-                for token_offset in range(extend_len):
-                    token_idx = token_base + token_offset
-                    causal_len = prefix_len + token_offset + 1
-                    row_topk = min(topk, causal_len)
-                    if causal_len <= topk:
-                        selected = torch.arange(
-                            causal_len,
-                            dtype=torch.int32,
-                            device=indexer_output.query.device,
-                        )
-                    else:
-                        head_logits = torch.matmul(
-                            keys[:causal_len].float(),
-                            indexer_output.query[token_idx].float().transpose(0, 1),
-                        )
-                        scores = (
-                            torch.relu(head_logits * self.indexer.softmax_scale)
-                            * indexer_output.weights[token_idx].float()
-                        ).sum(dim=-1)
-                        selected = torch.topk(
-                            scores, k=row_topk, sorted=True
-                        ).indices.to(torch.int32)
-                    workspace_indices[token_idx, :row_topk] = workspace_base + selected
-                    topk_lens[token_idx] = row_topk
-
-                token_base += extend_len
+            token_base += extend_len
 
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
@@ -1603,6 +1447,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 row_ends.to(torch.int32).contiguous(),
                 clean_logits=False,
             )
+            # Mirror the decode path: with clean_logits=False DeepGEMM may
+            # leave non-finite lanes inside the causal window. +inf outranks
+            # every real score, so the top-k selector would crowd out genuine
+            # candidates.
+            logits.nan_to_num_(
+                nan=float("-inf"),
+                posinf=float("-inf"),
+                neginf=float("-inf"),
+            )
             workspace_indices = torch.full(
                 (num_prefill_tokens, topk),
                 -1,
@@ -1698,12 +1551,11 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        with cuda_perf_range("glm5:attn_qkv_a_proj", logger=logger):
-            qkv = self.fused_qkv_a_proj_with_mqa(
-                hidden_states,
-                block_scale,
-                torch.bfloat16,
-            )
+        qkv = self.fused_qkv_a_proj_with_mqa(
+            hidden_states,
+            block_scale,
+            torch.bfloat16,
+        )
         # The fused QKV-A weight may be zero-padded on its output dim to a
         # multiple of 128 so the FP8 block-scale GEMM stays numerically valid
         # (see GlmMoeDsaForCausalLM._pad_fused_qkv_a_proj_for_fp8_blockscale).
@@ -1712,8 +1564,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         _qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
         if qkv.shape[-1] != _qkv_width:
             qkv = qkv[..., :_qkv_width]
-        with cuda_perf_range("glm5:attn_pre_comm", logger=logger):
-            qkv = comm_manager.pre_attn_comm(qkv, ctx)
+        qkv = comm_manager.pre_attn_comm(qkv, ctx)
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
@@ -1721,25 +1572,45 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         kv_a = latent_cache[..., : self.kv_lora_rank]
         q_norm = torch.empty_like(q_a)
         if q_a.size(0) > 0:
-            with cuda_perf_range("glm5:attn_qk_layernorm", logger=logger):
-                self.fused_qk_layernorm(
-                    input_q_a=q_a,
-                    input_kv_a=kv_a,
-                    output_q_a=q_norm,
-                )
+            self.fused_qk_layernorm(
+                input_q_a=q_a,
+                input_kv_a=kv_a,
+                output_q_a=q_norm,
+            )
 
-        full_context_decode_topk = self._try_compute_decode_full_context_topk_indices(
+        num_decodes = ctx.bs - ctx.num_extends
+        num_decode_tokens = self._resolve_num_decode_tokens(
             ctx,
-            num_tokens=hidden_states.shape[0],
-            device=hidden_states.device,
+            total_tokens=hidden_states.shape[0],
+            num_decode_reqs=num_decodes,
         )
-        key_only_indexer = (
-            full_context_decode_topk is not None
-            and ctx.forward_mode is not None
-            and ctx.forward_mode.is_decode()
-            and ctx.num_extends == 0
+        num_prefill_tokens = hidden_states.shape[0] - num_decode_tokens
+
+        carried_prefill_topk = getattr(ctx, "glm_dsa_prefill_topk", None)
+        carried_decode_topk = getattr(ctx, "glm_dsa_decode_topk", None)
+        should_compute_indexer = not self.skip_indexer_topk or (
+            self.is_nextn
+            and (
+                (num_prefill_tokens > 0 and carried_prefill_topk is None)
+                or (num_decode_tokens > 0 and carried_decode_topk is None)
+            )
         )
-        with cuda_perf_range("glm5:attn_indexer_path", logger=logger):
+
+        indexer_output = None
+        full_context_decode_topk = None
+        if should_compute_indexer:
+            full_context_decode_topk = (
+                self._try_compute_decode_full_context_topk_indices(
+                    ctx,
+                    num_tokens=hidden_states.shape[0],
+                    device=hidden_states.device,
+                )
+            )
+            key_only_indexer = (
+                full_context_decode_topk is not None
+                and _glm_dsa_is_pure_decode_token_mode(ctx.forward_mode)
+                and ctx.num_extends == 0
+            )
             indexer_output = self._forward_dsa_indexer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1749,24 +1620,26 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 comm_manager=comm_manager,
                 key_only=key_only_indexer,
             )
-        with cuda_perf_range("glm5:attn_q_b_proj", logger=logger):
-            q = self.q_b_proj(q_norm)[0]
+        q = self.q_b_proj(q_norm)[0]
 
-        num_decodes = ctx.bs - ctx.num_extends
-        num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
-        num_prefill_tokens = q.size(0) - num_decode_tokens
-        prefill_topk = (
-            self._compute_prefill_topk_indices(
-                indexer_output,
-                ctx,
-                num_prefill_tokens,
+        if not should_compute_indexer:
+            prefill_topk = carried_prefill_topk
+            decode_topk = carried_decode_topk
+        else:
+            prefill_topk = (
+                self._compute_prefill_topk_indices(
+                    indexer_output,
+                    ctx,
+                    num_prefill_tokens,
+                )
+                if indexer_output is not None
+                else None
             )
-            if indexer_output is not None
-            else None
-        )
-        decode_topk = full_context_decode_topk
-        if decode_topk is None and indexer_output is not None:
-            decode_topk = self._compute_decode_topk_indices(indexer_output, ctx)
+            decode_topk = full_context_decode_topk
+            if decode_topk is None and indexer_output is not None:
+                decode_topk = self._compute_decode_topk_indices(indexer_output, ctx)
+            ctx.glm_dsa_prefill_topk = prefill_topk
+            ctx.glm_dsa_decode_topk = decode_topk
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -1791,16 +1664,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                     attn_output[:num_prefill_tokens],
                 )
             else:
-                with cuda_perf_range("glm5:attn_sparse_prefill_path", logger=logger):
-                    self.forward_dsa_sparse_prefill(
-                        positions[:num_prefill_tokens],
-                        q[:num_prefill_tokens],
-                        latent_cache[:num_prefill_tokens],
-                        prefill_ctx,
-                        out_cache_loc[:num_prefill_tokens],
-                        attn_output[:num_prefill_tokens],
-                        prefill_topk=prefill_topk,
-                    )
+                self.forward_dsa_sparse_prefill(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                    prefill_topk=prefill_topk,
+                )
 
         if ctx.num_extends < ctx.bs:
             decode_ctx = replace(
@@ -1812,28 +1684,24 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
             decode_start = num_prefill_tokens
             decode_end = num_prefill_tokens + num_decode_tokens
-            with cuda_perf_range("glm5:attn_decode_absorb_path", logger=logger):
-                self.forward_absorb(
-                    positions[decode_start:decode_end],
-                    q[decode_start:decode_end],
-                    latent_cache[decode_start:decode_end],
-                    decode_ctx,
-                    out_cache_loc[decode_start:decode_end],
-                    attn_output[decode_start:decode_end],
-                    topk_indices=(
-                        decode_topk.topk_indices[decode_start:decode_end]
-                        if decode_topk is not None
-                        else None
-                    ),
-                    topk_lens=(
-                        decode_topk.topk_lens if decode_topk is not None else None
-                    ),
-                )
+            self.forward_absorb(
+                positions[decode_start:decode_end],
+                q[decode_start:decode_end],
+                latent_cache[decode_start:decode_end],
+                decode_ctx,
+                out_cache_loc[decode_start:decode_end],
+                attn_output[decode_start:decode_end],
+                topk_indices=(
+                    decode_topk.topk_indices[decode_start:decode_end]
+                    if decode_topk is not None
+                    else None
+                ),
+                topk_lens=(decode_topk.topk_lens if decode_topk is not None else None),
+            )
 
         if ctx.draft_first_step_reduce:
             attn_output = attn_output.index_select(0, ctx.gather_ids)
-        with cuda_perf_range("glm5:attn_o_proj", logger=logger):
-            output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output)
         return output
 
     def forward_dsa_sparse_prefill(
@@ -1847,34 +1715,31 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         *,
         prefill_topk: GlmDsaPrefillTopK,
     ) -> torch.Tensor:
-        with cuda_perf_range("glm5:attn_absorb_qkv_proj", logger=logger):
-            Q, _ = self.forward_absorb_qkv_proj(
-                q,
-                latent_cache,
-                positions,
-                ctx,
-                out_cache_loc,
-            )
-        with cuda_perf_range("glm5:attn_mqa", logger=logger):
-            attn_output = ctx.attn_backend.forward_sparse_prefill(
-                q=Q,
-                layer=self.attn_mqa,
-                token_to_kv_pool=ctx.token_to_kv_pool,
-                block_tables=prefill_topk.block_tables,
-                seq_lens=prefill_topk.seq_lens,
-                workspace_indices=prefill_topk.workspace_indices,
-                topk_lens=prefill_topk.topk_lens,
-                kv_workspace_slots=prefill_topk.kv_workspace_slots,
-                max_seq_len=prefill_topk.max_seq_len,
-            )
+        Q, _ = self.forward_absorb_qkv_proj(
+            q,
+            latent_cache,
+            positions,
+            ctx,
+            out_cache_loc,
+        )
+        attn_output = ctx.attn_backend.forward_sparse_prefill(
+            q=Q,
+            layer=self.attn_mqa,
+            token_to_kv_pool=ctx.token_to_kv_pool,
+            block_tables=prefill_topk.block_tables,
+            seq_lens=prefill_topk.seq_lens,
+            workspace_indices=prefill_topk.workspace_indices,
+            topk_lens=prefill_topk.topk_lens,
+            kv_workspace_slots=prefill_topk.kv_workspace_slots,
+            max_seq_len=prefill_topk.max_seq_len,
+        )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-        with cuda_perf_range("glm5:attn_v_proj_bmm", logger=logger):
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=output_view.transpose(0, 1),
-            )
+        torch.bmm(
+            attn_output.transpose(0, 1),
+            self.w_vc,
+            out=output_view.transpose(0, 1),
+        )
         return output
 
     def forward_absorb(
@@ -1888,14 +1753,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        with cuda_perf_range("glm5:attn_absorb_qkv_proj", logger=logger):
-            Q, K = self.forward_absorb_qkv_proj(
-                q,
-                latent_cache,
-                positions,
-                ctx,
-                out_cache_loc,
-            )
+        Q, K = self.forward_absorb_qkv_proj(
+            q,
+            latent_cache,
+            positions,
+            ctx,
+            out_cache_loc,
+        )
         return self.forward_absorb_attn_v_proj(
             Q,
             K,
@@ -1920,25 +1784,23 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if self.attention_backend not in self._MLA_KERNEL_BACKENDS:
             need_save_kv = not self.use_fused_set_kv_buffer
 
-        with cuda_perf_range("glm5:attn_mqa", logger=logger):
-            attn_output = self.attn_mqa(
-                Q,
-                K,
-                K[..., : self.kv_lora_rank],
-                ctx,
-                out_cache_loc,
-                save_kv_cache=need_save_kv,
-                topk_indices=topk_indices,
-                topk_lens=topk_lens,
-            )
+        attn_output = self.attn_mqa(
+            Q,
+            K,
+            K[..., : self.kv_lora_rank],
+            ctx,
+            out_cache_loc,
+            save_kv_cache=need_save_kv,
+            topk_indices=topk_indices,
+            topk_lens=topk_lens,
+        )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-        with cuda_perf_range("glm5:attn_v_proj_bmm", logger=logger):
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=output_view.transpose(0, 1),
-            )
+        torch.bmm(
+            attn_output.transpose(0, 1),
+            self.w_vc,
+            out=output_view.transpose(0, 1),
+        )
         return output
 
 
@@ -1984,6 +1846,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             reduce_attn_results=False,
             alt_stream=alt_stream,
             mapping=self.mapping,
+            is_nextn=is_nextn,
         )
 
         self.layer_id = layer_id
@@ -2028,68 +1891,6 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             post_attn_layernorm=self.post_attention_layernorm,
         )
 
-    @staticmethod
-    def _capture_debug_preview(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.detach().reshape(-1)[: parity_debug_preview()].clone()
-
-    @staticmethod
-    def _decode_seq_lens_for_debug(ctx: ForwardContext) -> torch.Tensor | None:
-        metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
-        if metadata is None or getattr(metadata, "seq_lens_k", None) is None:
-            return None
-        num_extends = int(getattr(metadata, "num_extends", 0) or 0)
-        num_decodes = max(0, int(ctx.bs) - int(ctx.num_extends))
-        if num_decodes <= 0:
-            return None
-        return metadata.seq_lens_k[num_extends : num_extends + num_decodes]
-
-    def _record_layer_boundary_debug(
-        self,
-        ctx: ForwardContext,
-        *,
-        stage: str,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-    ) -> None:
-        if not parity_debug_enabled():
-            return
-
-        seq_lens = self._decode_seq_lens_for_debug(ctx)
-        parity_debug_log(
-            "layer_boundary",
-            logger=logger,
-            seq_lens=seq_lens,
-            path="eager",
-            layer_id=self.layer_id,
-            stage=stage,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
-        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
-            return
-
-        debug_by_bs = getattr(
-            ctx.attn_backend,
-            "_glm5_debug_layer_boundary_by_bs",
-            None,
-        )
-        if not isinstance(debug_by_bs, dict):
-            debug_by_bs = {}
-            setattr(ctx.attn_backend, "_glm5_debug_layer_boundary_by_bs", debug_by_bs)
-        debug_tensors = debug_by_bs.get(int(ctx.bs))
-        if not isinstance(debug_tensors, dict):
-            debug_tensors = {}
-            debug_by_bs[int(ctx.bs)] = debug_tensors
-        layer_tensors = debug_tensors.get(int(self.layer_id))
-        if not isinstance(layer_tensors, dict):
-            layer_tensors = {}
-            debug_tensors[int(self.layer_id)] = layer_tensors
-
-        entry = {"hidden_preview": self._capture_debug_preview(hidden_states)}
-        if residual is not None:
-            entry["residual_preview"] = self._capture_debug_preview(residual)
-        layer_tensors[stage] = entry
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -2098,76 +1899,42 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
-        with cuda_perf_range("glm5:decoder_layer_total", logger=logger):
-            num_global_tokens, max_num_tokens_per_gpu = (
-                self.comm_manager.get_num_tokens(ctx)
-            )
+        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
+            ctx
+        )
 
-            if not ctx.forward_mode.is_idle():
-                self._record_layer_boundary_debug(
-                    ctx,
-                    stage="input",
-                    hidden_states=hidden_states,
-                    residual=residual,
-                )
-                with cuda_perf_range("glm5:input_reduce_norm", logger=logger):
-                    hidden_states, residual = self.comm_manager.input_reduce_norm(
-                        hidden_states, residual
-                    )
-                self._record_layer_boundary_debug(
-                    ctx,
-                    stage="input_reduce_norm",
-                    hidden_states=hidden_states,
-                    residual=residual,
-                )
-                with cuda_perf_range("glm5:attention_total", logger=logger):
-                    hidden_states = self.self_attn(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        ctx=ctx,
-                        out_cache_loc=out_cache_loc,
-                        comm_manager=self.comm_manager,
-                    )
-                self._record_layer_boundary_debug(
-                    ctx,
-                    stage="attention",
-                    hidden_states=hidden_states,
-                    residual=residual,
-                )
-                if ctx.draft_first_step_reduce:
-                    residual = residual.index_select(0, ctx.gather_ids)
-                with cuda_perf_range("glm5:post_attn_reduce_norm", logger=logger):
-                    hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                        hidden_states, residual, ctx
-                    )
-                self._record_layer_boundary_debug(
-                    ctx,
-                    stage="post_attn_reduce_norm",
-                    hidden_states=hidden_states,
-                    residual=residual,
-                )
-                hidden_states = self.forward_mlp(
-                    hidden_states,
-                    residual,
-                    ctx,
-                    num_global_tokens,
-                    max_num_tokens_per_gpu,
-                )
-                self._record_layer_boundary_debug(
-                    ctx,
-                    stage="mlp",
-                    hidden_states=hidden_states,
-                    residual=residual,
-                )
-            else:
-                hidden_states = self.forward_mlp(
-                    hidden_states,
-                    residual,
-                    ctx,
-                    num_global_tokens,
-                    max_num_tokens_per_gpu,
-                )
-            return hidden_states, residual
+        if not ctx.forward_mode.is_idle():
+            hidden_states, residual = self.comm_manager.input_reduce_norm(
+                hidden_states, residual
+            )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                out_cache_loc=out_cache_loc,
+                comm_manager=self.comm_manager,
+            )
+            if ctx.draft_first_step_reduce:
+                residual = residual.index_select(0, ctx.gather_ids)
+            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
+                hidden_states, residual, ctx
+            )
+            hidden_states = self.forward_mlp(
+                hidden_states,
+                residual,
+                ctx,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+            )
+        else:
+            hidden_states = self.forward_mlp(
+                hidden_states,
+                residual,
+                ctx,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+            )
+        return hidden_states, residual
 
     def forward_mlp(
         self,
@@ -2177,19 +1944,16 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
-        with cuda_perf_range("glm5:pre_mlp_comm", logger=logger):
-            hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        with cuda_perf_range("glm5:mlp_core", logger=logger):
-            if self.is_moe_layer:
-                hidden_states = self.mlp(
-                    hidden_states, num_global_tokens, max_num_tokens_per_gpu
-                )
-            else:
-                hidden_states = self.mlp(hidden_states)
-        with cuda_perf_range("glm5:post_mlp_fused", logger=logger):
-            hidden_states, residual = self.comm_manager.post_mlp_fused(
-                hidden_states, residual, ctx
+        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
+        if self.is_moe_layer:
+            hidden_states = self.mlp(
+                hidden_states, num_global_tokens, max_num_tokens_per_gpu
             )
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.comm_manager.post_mlp_fused(
+            hidden_states, residual, ctx
+        )
         return hidden_states
 
 

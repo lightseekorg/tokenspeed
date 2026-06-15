@@ -17,22 +17,52 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import importlib
+import logging
 from typing import Any
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
 ]
+
+
+def _is_optional_backend_import_error(
+    exc: ImportError, dependencies: tuple[str, ...]
+) -> bool:
+    name = getattr(exc, "name", None)
+    message = str(exc)
+    return any(
+        dependency == name or dependency in message for dependency in dependencies
+    )
+
+
+def _try_import_optional_backend(name: str, dependencies: tuple[str, ...]) -> None:
+    try:
+        importlib.import_module(f"tokenspeed_kernel.ops.moe.{name}")
+    except ImportError as exc:
+        if not _is_optional_backend_import_error(exc, dependencies):
+            raise
+        logger.warning(
+            "Skipping optional MoE backend %s because a dependency is unavailable "
+            "or incompatible: %s",
+            name,
+            exc,
+        )
+
+
+_try_import_optional_backend("gluon", ("tokenspeed_kernel_amd", "triton_kernels"))
+_try_import_optional_backend("triton", ("triton_kernels",))
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:

@@ -33,6 +33,31 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
 For K2.6, keep the same parameter shape and change the checkpoint and parser
 only if the model card requires a different value.
 
+## GLM-5 DSA
+
+GLM-5 DSA checkpoints need remote code, DSA attention, and the checkpoint's raw
+DSA config fields. TokenSpeed restores the DSA fields from `config.json`, so
+launches should not need ad-hoc `--hf-overrides` for `qk_rope_head_dim`.
+`tokenspeed serve` also defaults GLM-5 DSA launches to
+`--reasoning-parser glm45`; pass an explicit parser flag to override it.
+On Blackwell GPUs, GLM-5 DSA with FP8 KV cache uses the TRTLLM sparse attention
+path for both sparse prefill and sparse decode.
+With speculative decoding enabled, GLM-5 DSA uses `TARGET_VERIFY` /
+`DRAFT_EXTEND` and captures the drafter in the CUDA graph.
+
+```bash
+tokenspeed serve /path/to/glm-dsa-checkpoint \
+  --served-model-name glm-dsa \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --max-model-len 262144 \
+  --chunked-prefill-size 8192 \
+  --max-num-seqs 128 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
 ## Qwen3 Dense / Qwen3 30B-A3B
 
 Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.

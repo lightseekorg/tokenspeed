@@ -160,14 +160,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-        if self.quant_method != "per_token_head" and (
-            cache_k_nope.dtype in fp8_dtypes or cache_k_rope.dtype in fp8_dtypes
-        ):
-            raise RuntimeError(
-                "GLM DSA sparse decode cache requires BF16 MLA writes; use "
-                "--kv-cache-dtype auto or bfloat16 for GLM DSA."
-            )
         super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
         if self.quant_method == "per_token_head":
             return

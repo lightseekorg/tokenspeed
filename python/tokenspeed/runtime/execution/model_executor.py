@@ -119,6 +119,7 @@ class ModelExecutorConfig:
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     use_target_verify_forward_mode: bool = False
+    capture_drafter_in_cuda_graph: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -175,6 +176,7 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
+            capture_drafter_in_cuda_graph=(model_config.use_target_verify_forward_mode),
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -646,16 +648,18 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
-        # The multi-step drafter is deliberately NOT captured inside the decode
-        # CUDA graph: replaying its loop freezes into a device-side spin (all
-        # ranks at 100% util) after a handful of steps on GLM5 MTP. While a
-        # capture is in progress, skip it and return the spec hidden states as a
-        # fourth output so the eager post-replay path (execute_forward_op) can
-        # run the drafter; on an eager forward, run it inline as before.
+        # Legacy speculative models keep the drafter eager on graph replay:
+        # capture only the target verify pass and return hidden states so the
+        # post-replay path can run the drafter. Models using TARGET_VERIFY /
+        # DRAFT_EXTEND have graph-stable draft metadata and can capture the
+        # full target+drafter step.
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-        if self.drafter is not None and not capturing:
+        capture_drafter = bool(
+            capturing and getattr(self.config, "capture_drafter_in_cuda_graph", False)
+        )
+        if self.drafter is not None and (not capturing or capture_drafter):
             self._run_drafter_and_store(
                 ctx, logits_output, output_tokens, accept_lengths
             )
@@ -665,7 +669,7 @@ class ModelExecutor:
         # in-graph drafter) can hand them to the eager drafter afterwards.
         draft_hidden = (
             logits_output.hidden_states
-            if self.drafter is not None and capturing
+            if self.drafter is not None and capturing and not capture_drafter
             else None
         )
         return output_tokens, accept_lengths, output_logprobs, draft_hidden
@@ -679,11 +683,9 @@ class ModelExecutor:
     ) -> None:
         """Run the multi-step drafter and stash next-round input ids.
 
-        Runs eagerly: either inline at the tail of an eager ``_forward_step``, or
-        right after a CUDA graph replay (the drafter is deliberately NOT captured
-        -- its multi-step loop inside a graph hangs after several replays on GLM5
-        MTP; keeping it eager sidesteps that and matches the verify-graph /
-        draft-eager split).
+        Runs inline at the tail of ``_forward_step``. Legacy speculative CUDA
+        graphs call this eagerly after replay, while TARGET_VERIFY /
+        DRAFT_EXTEND models can capture this write into the full graph.
         """
         next_round_input_ids = self.drafter.run(
             base_ctx=ctx,

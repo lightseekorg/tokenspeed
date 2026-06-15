@@ -33,6 +33,16 @@ GLM_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
 GLM_DSA_SPARSE_DECODE_FP8_SCALE_BYTES = 4
 
 
+def _is_blackwell_device(device: str) -> bool:
+    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(device)
+    except (AssertionError, RuntimeError, ValueError):
+        major, _minor = torch.cuda.get_device_capability()
+    return major >= 10
+
+
 def glm_dsa_sparse_decode_row_bytes(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
@@ -68,10 +78,12 @@ class DSAConfig(MLAConfig):
     ):
         base = MLAConfig.generate(server_args, model_config, is_draft)
         if base.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise ValueError(
-                "GLM DSA currently requires --kv-cache-dtype auto or bfloat16; "
-                f"got {server_args.kv_cache_dtype}."
-            )
+            if not _is_blackwell_device(server_args.device):
+                raise ValueError(
+                    "GLM DSA FP8 KV cache currently requires the Blackwell TRTLLM "
+                    "sparse attention path; use --kv-cache-dtype auto or bfloat16 "
+                    f"on this platform, got {server_args.kv_cache_dtype}."
+                )
         return cls(
             **base.__dict__,
             index_topk=model_config.index_topk,
