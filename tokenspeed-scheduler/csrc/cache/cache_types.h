@@ -28,6 +28,16 @@
 
 namespace tokenspeed {
 
+// Per-group KV cache configuration (immutable). One spec per attention group;
+// GPT-OSS uses two: a full-attention group and a sliding-window group.
+enum class AttnKind { kFull, kSlidingWindow };
+
+struct KvCacheSpec {
+    AttnKind kind;
+    std::int32_t page_size;
+    std::int32_t sliding_window;  // 0 for full attention
+};
+
 // Shared per-request / match data types for the flat KV-cache layer. Consumed
 // by the per-type managers (FullAttnManager, and later SwaManager /
 // MambaManager), the KVCacheCoordinator, and the FSM ForwardState. Kept here --

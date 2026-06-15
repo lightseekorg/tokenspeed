@@ -32,10 +32,6 @@
 
 namespace tokenspeed {
 
-// Sliding-window-attention KV manager. Decoding the next token only attends to
-// the last `sliding_window` tokens, so a prefix hit requires a run of
-// ceil((sliding_window - 1) / page_size) contiguous cached pages covering the
-// window. Shared allocation/claim/cache/free come from KvCacheManager.
 class SwaManager : public KvCacheManager {
 public:
     SwaManager(BlockPool& pool, std::int32_t page_size, std::int32_t sliding_window)

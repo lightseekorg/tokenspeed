@@ -89,6 +89,18 @@ public:
         return true;
     }
 
+    // Pure query: how many fresh pages this table would need to absorb
+    // num_tokens, WITHOUT allocating or mutating anything. Mirrors Acquire's page
+    // math exactly (tail room first, then ceil(overflow / page_size)). Used by
+    // the coordinator to check capacity across all groups before committing.
+    std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
+        if (num_tokens <= table.tail_avail_) {
+            return 0;
+        }
+        std::int32_t over = num_tokens - table.tail_avail_;
+        return (over + page_size_ - 1) / page_size_;
+    }
+
     // Register the table's full pages [first-uncached, num_full_blocks) into the
     // pool under their page-hash keys so later requests can prefix-hit them.
     // Leading pages already carrying a hash (from a prefix hit or an earlier
