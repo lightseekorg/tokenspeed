@@ -101,6 +101,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
     def flashinfer_trtllm_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         page_table: torch.Tensor,
@@ -120,11 +121,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
                 dtype=torch.uint8,
                 device=q.device,
             )
-        cum_seq_lens_kv = torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
-            (1, 0),
-        )
-
         # TRTLLM kernels require fp32 sinks.
         if sinks is not None and sinks.dtype != torch.float32:
             sinks = sinks.to(torch.float32)

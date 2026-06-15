@@ -56,7 +56,7 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 
 
 @dataclass(kw_only=True)
-class MHAPrefillMetadata:
+class MHAExtendMetadata:
     # Device-side metadata:
     # - seq_lens: total length after this step
     # - extend_seq_lens: length of new tokens
@@ -67,6 +67,7 @@ class MHAPrefillMetadata:
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cu_extend_seq_lens: torch.Tensor
+    cum_seq_lens_kv: torch.Tensor
     extend_prefix_lens: torch.Tensor
     # Host-side metadata:
     extend_seq_lens_cpu: list[int]
@@ -110,7 +111,7 @@ class MHAAttnBackend(AttentionBackend):
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
-        self.forward_prefill_metadata: MHAPrefillMetadata | None = None
+        self.forward_extend_metadata: MHAExtendMetadata | None = None
 
     # ------------------------------------------------------------------
     # Metadata initialization
@@ -147,15 +148,20 @@ class MHAAttnBackend(AttentionBackend):
                 extend_seq_lens,
                 extend_seq_lens_cpu,
             )
+            cum_seq_lens_kv = torch.nn.functional.pad(
+                torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
             extend_prefix_lens = extend_prefix_lens[:bs]
             max_extend_seq_len = max(extend_seq_lens_cpu)
             max_extend_prefix_len = int(extend_prefix_lens_cpu[:bs].max().item())
 
-            self.forward_prefill_metadata = MHAPrefillMetadata(
+            self.forward_extend_metadata = MHAExtendMetadata(
                 page_table=page_table,
                 seq_lens=seq_lens,
                 extend_seq_lens=extend_seq_lens,
                 cu_extend_seq_lens=cu_extend_seq_lens,
+                cum_seq_lens_kv=cum_seq_lens_kv,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
@@ -362,7 +368,7 @@ class MHAAttnBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-        metadata = self.forward_prefill_metadata
+        metadata = self.forward_extend_metadata
         if metadata.max_extend_prefix_len == 0:
             try:
                 return self._forward_prefill(
@@ -401,7 +407,7 @@ class MHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        metadata: MHAPrefillMetadata,
+        metadata: MHAExtendMetadata,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -431,7 +437,7 @@ class MHAAttnBackend(AttentionBackend):
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
-        metadata: MHAPrefillMetadata,
+        metadata: MHAExtendMetadata,
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -445,6 +451,7 @@ class MHAAttnBackend(AttentionBackend):
         result = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=metadata.cu_extend_seq_lens,
+            cum_seq_lens_kv=metadata.cum_seq_lens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table,

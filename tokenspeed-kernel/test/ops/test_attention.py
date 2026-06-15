@@ -141,6 +141,8 @@ def test_mha_extend_with_kvcache(
     q = _randn((total_q, num_q_heads, head_dim), device=device, dtype=dtype)
     cu_seqlens_q = torch.cumsum(query_seqlens, dim=0, dtype=torch.int32)
     cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0))
+    cum_seq_lens_kv = torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+    cum_seq_lens_kv = torch.nn.functional.pad(cum_seq_lens_kv, (1, 0))
 
     page_table = torch.zeros(
         batch_size,
@@ -199,6 +201,7 @@ def test_mha_extend_with_kvcache(
     out = mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
         k_cache=k_cache,
         v_cache=v_cache,
         page_table=page_table,
@@ -214,6 +217,7 @@ def test_mha_extend_with_kvcache(
         triton_out, triton_lse = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,

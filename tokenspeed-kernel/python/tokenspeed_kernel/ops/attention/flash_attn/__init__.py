@@ -147,6 +147,7 @@ if (
     def fa4_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         page_table: torch.Tensor,
@@ -309,6 +310,7 @@ elif platform.is_nvidia and platform.is_hopper:
     def fa3_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         page_table: torch.Tensor,
@@ -321,10 +323,6 @@ elif platform.is_nvidia and platform.is_hopper:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        cu_seqlens_k_new = torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
-            (1, 0),
-        )
         return flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -332,7 +330,7 @@ elif platform.is_nvidia and platform.is_hopper:
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k_new=cu_seqlens_k_new,
+            cu_seqlens_k_new=cum_seq_lens_kv,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=1.0 / math.sqrt(q.shape[-1]),
             causal=is_causal,

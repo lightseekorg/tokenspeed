@@ -158,6 +158,7 @@ def triton_mha_prefill(
 def triton_mha_extend_with_kvcache(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,

@@ -315,6 +315,7 @@ def _attention_prefill() -> object:
 def _attention_extend() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
+    cum_seq_lens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
     k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     page_table = torch.empty((2, 4), dtype=torch.int32)
@@ -322,6 +323,7 @@ def _attention_extend() -> object:
     return tokenspeed_kernel.mha_extend_with_kvcache(
         q,
         cu_seqlens_q,
+        cum_seq_lens_kv,
         k_cache,
         v_cache,
         page_table,
