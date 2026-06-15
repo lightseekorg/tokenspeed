@@ -1084,6 +1084,7 @@ class WPreshuffledLdsDescriptor:
     BLOCK_K: gl.constexpr
     LOAD_BN: gl.constexpr
     load_layout: gl.constexpr
+    cache_modifier: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -1097,6 +1098,7 @@ class WPreshuffledLdsDescriptor:
         pred,
         load_layout,
         LOAD_BN=None,
+        cache_modifier="",
     ):
         self.cfg = cfg
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -1107,6 +1109,7 @@ class WPreshuffledLdsDescriptor:
         self.offsets = offsets
         self.pred = pred
         self.load_layout = gl.constexpr(load_layout)
+        self.cache_modifier = gl.constexpr(cache_modifier)
 
     @gluon.jit
     def issue_async_load(
@@ -1120,11 +1123,13 @@ class WPreshuffledLdsDescriptor:
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
         k_iter_offset = idx * self.BLOCK_K * self.stride_k
         offsets = self.offsets + k_iter_offset
+        CACHE_MODIFIER: gl.constexpr = self.cache_modifier
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             buffer.index(idx % NUM_BUFFERS),
             self.ptr,
             offsets,
             mask=self.pred,
+            cache_modifier=CACHE_MODIFIER,
         )
         if COMMIT == 1:
             gl.amd.cdna4.async_copy.commit_group()
@@ -2894,6 +2899,7 @@ def _pipelined_moe_tile_compute(
                 offsets_b_vgpr + base_off_b_vgpr,
                 pred=gl.to_tensor(True),
                 load_layout=LOAD_W_LAYOUT,
+                cache_modifier=W_CACHE_MODIFIER,
             )
     elif W_TRANSPOSE:
         w_desc = AsyncCopyDescriptor.initialize(
@@ -3349,6 +3355,7 @@ def _pipelined_moe_tile_compute(
                     pred=gl.to_tensor(True),
                     load_layout=LOAD_W_HALF_LAYOUT,
                     LOAD_BN=SUB_BN,
+                    cache_modifier=W_CACHE_MODIFIER,
                 )
                 w_desc_bot = WPreshuffledLdsDescriptor(
                     cfg,
@@ -3360,6 +3367,7 @@ def _pipelined_moe_tile_compute(
                     pred=bottom_valid,
                     load_layout=LOAD_W_HALF_LAYOUT,
                     LOAD_BN=SUB_BN,
+                    cache_modifier=W_CACHE_MODIFIER,
                 )
         elif W_TRANSPOSE:
             # LDS path, K-contig W tiles.
