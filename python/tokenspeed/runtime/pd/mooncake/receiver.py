@@ -208,9 +208,7 @@ def _build_buffer_layout_pair(
         logical_axis = sharded_axis
         logical_size = decode_global_units
         prefill_distinct_tp_size = decode_global_units // prefill_local_units
-        prefill_tp_replica_group_size = (
-            prefill_tp_size // prefill_distinct_tp_size
-        )
+        prefill_tp_replica_group_size = prefill_tp_size // prefill_distinct_tp_size
     else:
         raise ValueError(
             f"unsupported heterogeneous TP buffer layout for {buffer_kind.value}: "

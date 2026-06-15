@@ -375,9 +375,7 @@ class PDTransferPlanner:
                         f"buffer_kind={buffer.buffer_kind.value}: logical_size="
                         f"{buffer.logical_size}, effective_tp_size={effective_tp_size}"
                     )
-                item_units = (
-                    buffer.item_stride_bytes // buffer.bytes_per_logical_unit
-                )
+                item_units = buffer.item_stride_bytes // buffer.bytes_per_logical_unit
                 required_units = buffer.logical_size // effective_tp_size
                 if item_units < required_units:
                     raise UnsupportedPDLayoutError(

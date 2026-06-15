@@ -106,9 +106,7 @@ def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
 _PAUSED_IDLE_SLEEP_S = 0.001
 
 
-def _forward_op_executes_model_forward(
-    forward_op, *, is_disagg_decode: bool
-) -> bool:
+def _forward_op_executes_model_forward(forward_op, *, is_disagg_decode: bool) -> bool:
     """Return whether ``forward_op`` will enter the model forward path.
 
     On decode-side PD, EXTEND ops only start remote KV receive; the model

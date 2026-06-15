@@ -24,7 +24,9 @@ from tokenspeed.runtime.engine.event_loop import _forward_op_executes_model_forw
 class FakeForwardOp:
     def __init__(self, *, input_lengths, request_ids=None, num_extends=0):
         self.input_lengths = input_lengths
-        self.request_ids = request_ids or [f"req-{i}" for i in range(len(input_lengths))]
+        self.request_ids = request_ids or [
+            f"req-{i}" for i in range(len(input_lengths))
+        ]
         self._num_extends = num_extends
 
     def num_extends(self):
