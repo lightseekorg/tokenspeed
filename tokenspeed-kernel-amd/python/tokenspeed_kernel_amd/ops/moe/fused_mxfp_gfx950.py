@@ -4804,6 +4804,56 @@ def gluon_mxfp_dispatch_swiglu(
         persistent = (grid_m_upper * grid_n) >= _PERSISTENT_TILES_THRESHOLD
         if persistent and num_ctas is None:
             num_ctas = _CDNA4_NUM_CUS
+    group_m = None
+    xcd_swizzle = None
+    if (
+        w_preshuffle
+        and not persistent
+        and block_m == 16
+        and block_n == 256
+        and block_k == 256
+        and not use_slice_mn
+        and use_slice_n
+        and slice_size is not None
+        and slice_size < 16
+    ):
+        # The 256-token GPT-OSS prefill dispatch shape uses BM16
+        # nonpersistent SliceN. Rocprof verification favored explicit XCD
+        # spreading over the BM16 default of no launch swizzle.
+        group_m = 16
+        xcd_swizzle = _CDNA4_NUM_XCDS
+    elif (
+        w_preshuffle
+        and persistent
+        and num_ctas == _CDNA4_NUM_CUS
+        and block_m == 64
+        and block_n == 256
+        and block_k == 256
+        and not use_slice_mn
+        and use_slice_n
+        and slice_size == 32
+    ):
+        # The 1024-token GPT-OSS prefill dispatch shape uses BM64 SliceN.
+        # Selected-region rocprof verification favored larger M grouping
+        # with all-XCD spreading.
+        group_m = 32
+        xcd_swizzle = _CDNA4_NUM_XCDS
+    elif (
+        w_preshuffle
+        and persistent
+        and num_ctas == _CDNA4_NUM_CUS
+        and block_m == 32
+        and block_n == 256
+        and block_k == 256
+        and not use_slice_mn
+        and use_slice_n
+        and slice_size == 16
+    ):
+        # The 512-token GPT-OSS prefill dispatch shape uses BM32 SliceN.
+        # Selected-region rocprof verification favored larger M grouping
+        # with moderate XCD swizzling.
+        group_m = 32
+        xcd_swizzle = 4
     out_block_n = block_n // 2
     y_dtype = torch.float8_e4m3fn if out_quant_scale is not None else out_dtype
     y = torch.empty((M, N // 2), device=x.device, dtype=y_dtype)
@@ -4835,6 +4885,8 @@ def gluon_mxfp_dispatch_swiglu(
         use_slice_n=use_slice_n,
         persistent=persistent,
         num_ctas=num_ctas,
+        group_m=group_m,
+        xcd_swizzle=xcd_swizzle,
         out_quant_scale=out_quant_scale,
         w_preshuffle=w_preshuffle,
     )
@@ -5024,6 +5076,22 @@ def gluon_mxfp_combine(
     xcd_swizzle = None
     if (
         w_preshuffle
+        and not persistent
+        and block_m == 16
+        and block_n == 256
+        and block_k == 256
+        and not use_slice_mn
+        and use_slice_n
+        and slice_size is not None
+        and slice_size < 16
+    ):
+        # The 256-token GPT-OSS prefill combine shape uses BM16
+        # nonpersistent SliceN. g16/xcd8 was the best selected-region rocprof
+        # candidate and keeps the same resource profile as the default route.
+        group_m = 16
+        xcd_swizzle = _CDNA4_NUM_XCDS
+    elif (
+        w_preshuffle
         and persistent
         and num_ctas == _CDNA4_NUM_CUS
         and block_m == 64
@@ -5041,12 +5109,52 @@ def gluon_mxfp_combine(
         w_preshuffle
         and persistent
         and num_ctas == _CDNA4_NUM_CUS
+        and block_m == 128
+        and block_n == 256
+        and block_k == 256
+        and not use_slice_mn
+        and use_slice_n
+    ):
+        group_m = 16
+        xcd_swizzle = 4
+    elif (
+        w_preshuffle
+        and persistent
+        and num_ctas == _CDNA4_NUM_CUS
         and block_m == 64
         and block_n == 256
         and block_k == 256
         and not use_slice_mn
         and use_slice_n
     ):
+        # The 4096-token GPT-OSS prefill combine shape has slice_size=128.
+        # Rocprof verification showed a clear win from a larger M grouping
+        # there. The 1024-token shape has slice_size=32 and benefits from
+        # spreading work across all XCDs. 2048 keeps the established g4/xcd4
+        # checkpoint route.
+        if slice_size == 128:
+            group_m = 16
+            xcd_swizzle = 4
+        elif slice_size == 32:
+            group_m = 4
+            xcd_swizzle = _CDNA4_NUM_XCDS
+        else:
+            group_m = 4
+            xcd_swizzle = 4
+    elif (
+        w_preshuffle
+        and persistent
+        and num_ctas == _CDNA4_NUM_CUS
+        and block_m == 32
+        and block_n == 256
+        and block_k == 256
+        and not use_slice_mn
+        and use_slice_n
+        and slice_size == 16
+    ):
+        # The 512-token GPT-OSS prefill combine shape uses BM32 SliceN.
+        # Selected-region rocprof verification favored the same M grouping as
+        # the default route, but with less aggressive XCD swizzling.
         group_m = 4
         xcd_swizzle = 4
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
