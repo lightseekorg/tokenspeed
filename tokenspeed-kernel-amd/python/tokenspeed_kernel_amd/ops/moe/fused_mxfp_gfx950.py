@@ -1256,7 +1256,16 @@ class MoEPipelinedProgram:
         )
 
     @gluon.jit
-    def _load_xw(self, mfma_idx):
+    def _load_x(self, mfma_idx):
+        cfg = self.cfg
+        return self.x_desc.issue_local_load(
+            mfma_idx,
+            self.x_buffer,
+            cfg.dot_layout_x,
+        )
+
+    @gluon.jit
+    def _load_w(self, mfma_idx):
         cfg = self.cfg
         if cfg.W_VIA_VGPR:
             w = self._issue_w_vgpr(mfma_idx)
@@ -1267,11 +1276,12 @@ class MoEPipelinedProgram:
                 cfg.dot_layout_w,
                 do_permute=cfg.W_TRANSPOSE,
             )
-        x = self.x_desc.issue_local_load(
-            mfma_idx,
-            self.x_buffer,
-            cfg.dot_layout_x,
-        )
+        return w
+
+    @gluon.jit
+    def _load_xw(self, mfma_idx):
+        w = self._load_w(mfma_idx)
+        x = self._load_x(mfma_idx)
         return x, w
 
     @gluon.jit
@@ -1332,7 +1342,6 @@ class MoEPipelinedProgram:
     @gluon.jit
     def issue_local_loads(self, mfma_idx):
         cfg = self.cfg
-        x, w = self._load_xw(mfma_idx)
 
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
 
@@ -1379,6 +1388,8 @@ class MoEPipelinedProgram:
         else:
             scale_x: gl.constexpr = 0
             scale_w: gl.constexpr = 0
+
+        x, w = self._load_xw(mfma_idx)
 
         return x, w, scale_x, scale_w
 
@@ -4408,9 +4419,15 @@ def gluon_mxfp_dispatch_swiglu(
         scale_load_mode=scale_load_mode,
         slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
+    requested_block_n = block_n
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
+    if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
+        # Preshuffled W is packed as 128-wide tiles. Execute a 256-wide CTA by
+        # consuming two packed tiles through USE_SLICE_N so the same X tile
+        # feeds twice as much MFMA work per wait/barrier region.
+        block_n = 256
     if w_preshuffle and block_n == 256 and block_m > 64:
         # Preshuffled W supports BN=256 through USE_SLICE_N's two 128-wide
         # packed half-tiles; pick the BM tier that enables that path.
@@ -4576,9 +4593,15 @@ def gluon_mxfp_combine(
         scale_load_mode=scale_load_mode,
         slice_size=_ragged_slice_size(a_ragged_metadata, M),
     )
+    requested_block_n = block_n
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
+    if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
+        # Preshuffled W is packed as 128-wide tiles. Execute a 256-wide CTA by
+        # consuming two packed tiles through USE_SLICE_N so the same X tile
+        # feeds twice as much MFMA work per wait/barrier region.
+        block_n = 256
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
