@@ -423,6 +423,10 @@ class Engine(EngineBase):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         return self.llm.run(self.tokenizer_manager.resume_memory_occupation(obj))
 
+    def is_sleeping(self) -> bool:
+        """Return whether any GPU memory is currently released (data-plane sleep)."""
+        return self.llm.run(self.tokenizer_manager.is_sleeping())
+
     """
     Execute an RPC call on all scheduler processes.
     """

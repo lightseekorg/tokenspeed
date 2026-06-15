@@ -79,7 +79,6 @@ PACKAGE_LIST = [
     "requests",
     "setproctitle",
     "tiktoken",
-    "tilelang",
     "tokenspeed-deepep",
     "tokenspeed-deepgemm",
     "tokenspeed-fa3",

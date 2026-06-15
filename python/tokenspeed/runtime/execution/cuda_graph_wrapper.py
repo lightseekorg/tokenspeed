@@ -416,6 +416,9 @@ class CudaGraphWrapper:
                 self.sampling_backend.prepare_capture(
                     bs=bs, num_tokens_per_req=self.max_tokens_per_req
                 )
+            # Keep warmup seq_lens >= q_len_per_req so no query row gets an
+            # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
+            self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
             self._init_capture_metadata(bs)
             run_once()
 

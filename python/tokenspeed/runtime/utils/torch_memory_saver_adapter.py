@@ -39,13 +39,13 @@ class TorchMemorySaverAdapter(ABC):
     def configure_subprocess(self):
         raise NotImplementedError
 
-    def region(self):
+    def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
-    def pause(self):
+    def pause(self, tag: str | None = None):
         raise NotImplementedError
 
-    def resume(self):
+    def resume(self, tag: str | None = None):
         raise NotImplementedError
 
 
@@ -53,14 +53,20 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
-    def region(self):
-        return _primary_memory_saver.region()
+    def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
+        # tag defaults to "default" in the library; pass it through explicitly so
+        # weights vs kv_cache regions can be paused/resumed independently.
+        # enable_cpu_backup=True offloads (and restores) contents to CPU on
+        # pause (weights); False discards them (kv_cache).
+        return _primary_memory_saver.region(
+            tag=tag or "default", enable_cpu_backup=enable_cpu_backup
+        )
 
-    def pause(self):
-        return _primary_memory_saver.pause()
+    def pause(self, tag: str | None = None):
+        return _primary_memory_saver.pause(tag=tag)
 
-    def resume(self):
-        return _primary_memory_saver.resume()
+    def resume(self, tag: str | None = None):
+        return _primary_memory_saver.resume(tag=tag)
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
@@ -69,11 +75,11 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     @contextmanager
-    def region(self):
+    def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         yield
 
-    def pause(self):
+    def pause(self, tag: str | None = None):
         pass
 
-    def resume(self):
+    def resume(self, tag: str | None = None):
         pass

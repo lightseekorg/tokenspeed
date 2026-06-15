@@ -62,7 +62,9 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region():
+        # Tag as "kv_cache": this per-token page state is invalid once KV is
+        # discarded, so it is released/restored alongside the KV cache.
+        with memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )

@@ -41,6 +41,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
+from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
@@ -93,6 +94,7 @@ from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -371,6 +373,28 @@ class EventLoop:
         # drives the control-request side; the event loop reads the gate.
         self._pause = PauseController(self.send_to_tokenizer)
 
+        # GPU-memory data plane (release/resume_memory_occupation). Reuses the
+        # pause controller's drain machinery; frees memory via the memory-saver
+        # adapter once the scheduler drains. See memory_occupation.py.
+        # Releasing KV is only safe if any prefix cache it backs can be cleared:
+        # either prefix caching is off, or the scheduler exposes a reset. Decide
+        # once here (static config) and let the controller reject unsafe releases.
+        kv_cache_release_allowed = (
+            not self.server_args.enable_prefix_caching
+            or callable(getattr(self.scheduler, "reset_prefix_cache", None))
+        )
+        self._memory = MemoryOccupationController(
+            send_func=self.send_to_tokenizer,
+            pause_controller=self._pause,
+            adapter=TorchMemorySaverAdapter.create(
+                enable=self.server_args.enable_memory_saver
+            ),
+            enabled=self.server_args.enable_memory_saver,
+            reset_caches_fn=self._reset_caches_for_release,
+            kv_repair_fn=self._kv_repair_after_wake,
+            kv_cache_release_allowed=kv_cache_release_allowed,
+        )
+
         self.metrics = EngineMetrics(
             labels={
                 "model_name": server_args.served_model_name,
@@ -394,6 +418,7 @@ class EventLoop:
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
+            memory_controller=self._memory,
         )
 
         self.output_processor = OutputProcesser(
@@ -1168,6 +1193,40 @@ class EventLoop:
     # Pause / resume helpers
     # ------------------------------------------------------------------
 
+    def _reset_caches_for_release(self) -> None:
+        """Invalidate the prefix/radix cache before KV is discarded on release.
+
+        KV pages are re-mapped + zeroed on wake, so any retained prefix entry
+        would be stale. The unsafe case (prefix caching on with no reset) is
+        rejected up front in ``MemoryOccupationController.handle_release`` via
+        ``kv_cache_release_allowed``, so by the time we get here either a reset
+        exists or prefix caching is off (nothing to invalidate).
+        """
+        reset = getattr(self.scheduler, "reset_prefix_cache", None)
+        if callable(reset):
+            reset()
+
+    def _kv_pools(self) -> list:
+        """All KV pools whose pages are tagged ``kv_cache`` — the target pool and
+        the draft pool in speculative-decoding runs. Release/repair must walk the
+        SAME set, so both derive it here rather than enumerating pools by hand."""
+        pools = []
+        for attr in ("token_to_kv_pool", "draft_token_to_kv_pool"):
+            pool = getattr(self.model_executor, attr, None)
+            if pool is not None:
+                pools.append(pool)
+        return pools
+
+    def _kv_repair_after_wake(self) -> None:
+        """Zero re-mapped KV buffers (garbage after re-map) for every KV pool,
+        including the draft pool in spec-decode runs — its allocations are tagged
+        ``kv_cache`` too, so a wake that skipped it would feed the draft model
+        stale KV. FP8 KV scales ride with the weights region, so no scale reset
+        is needed here."""
+        for pool in self._kv_pools():
+            if hasattr(pool, "clear_kv_buffers"):
+                pool.clear_kv_buffers()
+
     def _paused_idle_step(self, prev_forward_op=None, prev_results=None) -> None:
         """Run one iteration under ``PAUSED_ALL`` (keep mode): no new forward
         work, but keep DP ranks in lockstep, service the drain check, and yield
@@ -1181,7 +1240,11 @@ class EventLoop:
 
         if self.has_dp:
             dp_metadata = self._dp_sync_and_check(None)
-            if dp_metadata.need_idle_forward:
+            # While memory is released the weights region is unmapped; an idle
+            # forward runs the model and would read freed memory. All DP ranks
+            # release together, so skipping the idle forward stays consistent
+            # across ranks (the small DP sync above still runs to keep lockstep).
+            if dp_metadata.need_idle_forward and not self._pause.released:
                 self.model_executor.execute_idle_forward(
                     dp_metadata.global_num_tokens,
                     dp_metadata.global_batch_size,
