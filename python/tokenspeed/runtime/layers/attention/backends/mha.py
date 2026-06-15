@@ -370,6 +370,8 @@ class MHAAttnBackend(AttentionBackend):
 
         metadata = self.forward_extend_metadata
         if metadata.max_extend_prefix_len == 0:
+            # When there is no cached prefix, we can first try the registered
+            # prefill kernel. If not found, we fall back to the extend path.
             try:
                 return self._forward_prefill(
                     q,
@@ -383,8 +385,7 @@ class MHAAttnBackend(AttentionBackend):
                     kwargs.get("sinks"),
                 )
             except NoKernelFoundError:
-                # Fall back to extend_with_kvcache path if prefill kernel
-                # is not found.
+
                 pass
 
         return self._forward_extend(
