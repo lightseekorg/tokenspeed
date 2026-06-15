@@ -361,8 +361,7 @@ class MHAAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
         assert (k is None) == (v is None)
-        has_kv = k is not None
-        assert has_kv
+        assert k is not None
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
