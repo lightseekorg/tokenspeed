@@ -2360,8 +2360,9 @@ class MoESliceNProgram:
 
         # Drain iter 0's top async-copy group first. For SliceN, the top group
         # contains X, W-top, and scales; the bottom group contains W-bottom.
-        # Loading X/W-top before W-bottom lets later iterations overlap the
-        # next W-bottom wait with the current bottom-half MFMA.
+        # Loading X before the bottom MFMA gives the next X tile latency slack.
+        # The hot loop delays W-top until after the current bottom MFMA so the
+        # pre-bottom wait does not also cover an unused W-top LDS read.
         self.async_wait_groups(2 * NB - 1)
         w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
         x0, sx0 = self.issue_local_load_x(mfma_idx)
@@ -2379,9 +2380,9 @@ class MoESliceNProgram:
             gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
-            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
@@ -2391,9 +2392,9 @@ class MoESliceNProgram:
             gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
-            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             x0, sx0 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
+            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
@@ -2404,9 +2405,9 @@ class MoESliceNProgram:
             gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
-            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
@@ -2771,6 +2772,17 @@ def _pipelined_moe_tile_compute(
 
     k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
+    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
+        if HAS_GATHER:
+            # Invalid expert-tail rows were already clamped to gather row 0.
+            # Keep the global token bound check, but avoid carrying the
+            # per-expert tail predicate through every X async-copy element.
+            x_mask_nonk = (rows_m < M_X)[:, None]
+        else:
+            x_mask_nonk = gl.to_tensor(True)
+    else:
+        x_mask_nonk = mask_m[:, None]
+
     x_desc = AsyncCopyDescriptor.initialize(
         cfg,
         0,
@@ -2780,7 +2792,7 @@ def _pipelined_moe_tile_compute(
         offs_xk,
         stride_xm,
         stride_xk,
-        mask_m[:, None],
+        x_mask_nonk,
         k_limit_x,
     )
     if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
