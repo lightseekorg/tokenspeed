@@ -20,7 +20,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         name="cuda_mha_merge_state",
         solution="cuda",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
+            min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(

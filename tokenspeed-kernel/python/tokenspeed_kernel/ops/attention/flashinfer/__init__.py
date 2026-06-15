@@ -79,7 +79,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         name="flashinfer_trtllm_mha_extend_with_kvcache",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
+            min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -157,7 +157,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         name="flashinfer_trtllm_mha_decode_with_kvcache",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
+            min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
