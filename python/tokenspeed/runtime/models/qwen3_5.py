@@ -1126,6 +1126,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     mapped_name = moe_loader.load(name, loaded_weight)
                     loaded_params.add(mapped_name)
                     continue
+                if moe_loader.is_expert_checkpoint_weight(name):
+                    continue
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
@@ -1559,6 +1561,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 if moe_loader.matches(name):
                     mapped_name = moe_loader.load(name, loaded_weight)
                     loaded_params.add(mapped_name)
+                    continue
+                if moe_loader.is_expert_checkpoint_weight(name):
                     continue
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.
