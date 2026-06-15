@@ -2293,14 +2293,15 @@ class MoESliceNProgram:
         main_iters = K_iters - NB
         gl.assume(main_iters >= 0)
 
-        # Drain iter 0's full tile so both N halves are in registers before
-        # compute. The hot loop issues the future async copy first, computes
-        # the current tile, then waits for the next tile while leaving the
-        # future copy in flight.
-        self.async_wait_groups(2 * NB - 2)
+        # Drain iter 0's top async-copy group first. For SliceN, the top group
+        # contains X, W-top, and scales; the bottom group contains W-bottom.
+        # Loading X/W-top before W-bottom lets later iterations overlap the
+        # next W-bottom wait with the current bottom-half MFMA.
+        self.async_wait_groups(2 * NB - 1)
         w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
-        w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
         x0, sx0 = self.issue_local_load_x(mfma_idx)
+        self.async_wait_groups(2 * NB - 2)
+        w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
         mfma_idx += 1
 
         unroll_pairs = main_iters // 2
@@ -2312,51 +2313,56 @@ class MoESliceNProgram:
             gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
+            self.async_wait_groups(2 * NB - 1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             self.async_wait_groups(2 * (NB - 1))
-            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
-            x1, sx1 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
             gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
+            self.async_wait_groups(2 * NB - 1)
+            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x0, sx0 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
             self.async_wait_groups(2 * (NB - 1))
-            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
-            x0, sx0 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
         if odd_main:
             gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
+            self.async_wait_groups(2 * NB - 1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             self.async_wait_groups(2 * (NB - 1))
-            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
-            x1, sx1 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
             # Drain + final NB iters of MFMAs (no more async_copy).
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
+            self.async_wait_groups(1)
+            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x0, sx0 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
             self.async_wait_groups(0)
-            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
-            x0, sx0 = self.issue_local_load_x(mfma_idx)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
         else:
             # Drain + final NB iters of MFMAs (no more async_copy).
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
+            self.async_wait_groups(1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             self.async_wait_groups(0)
-            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
-            x1, sx1 = self.issue_local_load_x(mfma_idx)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
 
@@ -2430,6 +2436,7 @@ def _pipelined_moe_tile_compute(
     NUM_SUBTILES: gl.constexpr = (1, 1, 1),
     EVEN_K: gl.constexpr = True,
     K_ITERS: gl.constexpr = 0,
+    N_CONST: gl.constexpr = 0,
     APPLY_X_GLOBAL_SCALE: gl.constexpr = True,
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
@@ -2459,6 +2466,7 @@ def _pipelined_moe_tile_compute(
     off_n = pid_n * BLOCK_N
     w_base_offset = expert_id * stride_we
     ws_base_offset = expert_id * stride_wse
+    N_LIMIT: gl.constexpr = N_CONST if N_CONST else 0
 
     STORE: gl.constexpr = _store_layout(
         NUM_WARPS, block_m=BLOCK_M, w_via_vgpr=W_VIA_VGPR or W_PRESHUFFLED
@@ -2816,7 +2824,12 @@ def _pipelined_moe_tile_compute(
             offs_ws_k = gl.arange(0, BLOCK_K_S_PS_W, layout=gl.SliceLayout(0, LW_S))
             row_base_w_s = off_n // cfg.PRESHUFFLE_FACTOR
             rows_n_scale = row_base_w_s + offs_ws_n
-            row_limit_w_s = (N + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
+            if N_LIMIT:
+                row_limit_w_s: gl.constexpr = (
+                    N_LIMIT + cfg.PRESHUFFLE_FACTOR - 1
+                ) // cfg.PRESHUFFLE_FACTOR
+            else:
+                row_limit_w_s = (N + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
             # See x_scale: suppress K-mask, OOB product is zero.
             k_limit_ws_load = (
                 (K // cfg.SCALE_BLOCK + 7) // 8 * 8
@@ -3130,7 +3143,12 @@ def _pipelined_moe_tile_compute(
                 BLOCK_K_W * 16
             )
             TILE_BYTES_HALF: gl.constexpr = 128 * 128
-            n_block_count = (N + 127) // 128
+            if N_LIMIT:
+                n_block_count: gl.constexpr = (N_LIMIT + 127) // 128
+                w_k_stride = gl.to_tensor(N_LIMIT)
+            else:
+                n_block_count = (N + 127) // 128
+                w_k_stride = gl.to_tensor(N)
             bot_valid = (2 * pid_n + 1) < n_block_count
             base_off_top = w_base_offset + 2 * pid_n * TILE_BYTES_HALF
             base_off_bot = base_off_top + TILE_BYTES_HALF
@@ -3139,7 +3157,7 @@ def _pipelined_moe_tile_compute(
                     cfg,
                     BLOCK_K_W,
                     w_ptr,
-                    gl.to_tensor(N),
+                    w_k_stride,
                     offsets_h + base_off_top,
                     pred=gl.to_tensor(True),
                     LOAD_BN=SUB_BN,
@@ -3148,7 +3166,7 @@ def _pipelined_moe_tile_compute(
                     cfg,
                     BLOCK_K_W,
                     w_ptr,
-                    gl.to_tensor(N),
+                    w_k_stride,
                     offsets_h + base_off_bot,
                     pred=bot_valid,
                     LOAD_BN=SUB_BN,
@@ -3159,7 +3177,7 @@ def _pipelined_moe_tile_compute(
                     BLOCK_K_W,
                     w_ptr,
                     w_ptr.dtype.element_ty,
-                    gl.to_tensor(N),
+                    w_k_stride,
                     offsets_h + base_off_top,
                     pred=gl.to_tensor(True),
                     load_layout=LOAD_W_HALF_LAYOUT,
@@ -3170,7 +3188,7 @@ def _pipelined_moe_tile_compute(
                     BLOCK_K_W,
                     w_ptr,
                     w_ptr.dtype.element_ty,
-                    gl.to_tensor(N),
+                    w_k_stride,
                     offsets_h + base_off_bot,
                     pred=bot_valid,
                     load_layout=LOAD_W_HALF_LAYOUT,
@@ -3322,14 +3340,23 @@ def _pipelined_moe_tile_compute(
         )
         out = out * scal[:, None].to(out.dtype)
 
-    actual_n = (N // 2) if DO_SWIGLU else N
+    if N_LIMIT:
+        ACTUAL_N: gl.constexpr = (N_LIMIT // 2) if DO_SWIGLU else N_LIMIT
+    else:
+        actual_n = (N // 2) if DO_SWIGLU else N
     if HAS_SCATTER:
         rows_y = gl.load(scatter_idx_ptr + offs_y_m_safe, mask=y_m_in_bounds, other=M)
-        mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
+        if N_LIMIT:
+            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < ACTUAL_N)
+        else:
+            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
         rows_y_safe = gl.where(y_m_in_bounds, rows_y, gl.zeros_like(rows_y))
         y_offs = rows_y_safe[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
     else:
-        mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < actual_n)
+        if N_LIMIT:
+            mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < ACTUAL_N)
+        else:
+            mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < actual_n)
         offs_y_m_2d_safe = offs_y_m_safe[:, None]
         y_offs = offs_y_m_2d_safe * stride_ym + offs_y_n[None, :] * stride_yn
 
@@ -3436,6 +3463,7 @@ def _pipelined_moe_kernel_scaled(
     NUM_SUBTILES: gl.constexpr = (1, 1, 1),
     EVEN_K: gl.constexpr = True,
     K_ITERS: gl.constexpr = 0,
+    N_CONST: gl.constexpr = 0,
     APPLY_X_GLOBAL_SCALE: gl.constexpr = True,
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
@@ -3459,13 +3487,19 @@ def _pipelined_moe_kernel_scaled(
 
     if USE_BLOCK_SCHEDULE:
         unpadded_m = gl.load(block_offs_ptr + N_EXPTS_TOT).to(gl.int32)
+        loop_tiles = unpadded_m * grid_n
+    else:
+        loop_tiles = NUM_TILES
 
-    for tile_idx in range(gl.program_id(0), NUM_TILES, gl.num_programs(0)):
+    for tile_idx in range(gl.program_id(0), loop_tiles, gl.num_programs(0)):
         if USE_BLOCK_SCHEDULE:
-            swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
-            grid_m_padded = NUM_TILES // grid_n
-            pid_m, pid_n = _group_m_swizzle(swizzled, grid_m_padded, grid_n, GROUP_M)
-            do_tile = pid_m < unpadded_m
+            swizzled = _xcd_chiplet_swizzle(tile_idx, loop_tiles, XCD_SWIZZLE)
+            pid_m, pid_n = _group_m_swizzle(swizzled, unpadded_m, grid_n, GROUP_M)
+            schedule_raw = gl.load(block_schedule_ptr + pid_m).to(
+                gl.uint32, bitcast=True
+            )
+            compact_idx = (schedule_raw & 0x0000FFFF).to(gl.int32)
+            block_in_expert = (schedule_raw >> 16).to(gl.int32)
         else:
             # Dense path: tile_idx packs (compact_idx, intra-expert pid);
             # GROUP_M applies WITHIN one expert (W only reusable per expert).
@@ -3475,85 +3509,77 @@ def _pipelined_moe_kernel_scaled(
             block_in_expert, pid_n = _group_m_swizzle(
                 local, BLOCKS_PER_EXPERT, grid_n, GROUP_M
             )
-            do_tile = True
 
-        if do_tile:
-            if USE_BLOCK_SCHEDULE:
-                schedule_raw = gl.load(block_schedule_ptr + pid_m).to(
-                    gl.uint32, bitcast=True
-                )
-                compact_idx = (schedule_raw & 0x0000FFFF).to(gl.int32)
-                block_in_expert = (schedule_raw >> 16).to(gl.int32)
-
-            _pipelined_moe_tile_compute(
-                x_ptr,
-                w_ptr,
-                x_scale_ptr,
-                w_scale_ptr,
-                bias_ptr,
-                y_ptr,
-                gather_idx_ptr,
-                scatter_idx_ptr,
-                gate_scal_ptr,
-                slice_offs_ptr,
-                slice_sizes_ptr,
-                stride_xm,
-                stride_xk,
-                stride_we,
-                stride_wn,
-                stride_wk,
-                stride_xsm,
-                stride_xsk,
-                stride_wse,
-                stride_wsn,
-                stride_wsk,
-                stride_yn,
-                stride_ym,
-                stride_be,
-                stride_bn,
-                M,
-                M_X,
-                N,
-                K,
-                x_global_scale_ptr,
-                out_quant_scale_ptr,
-                compact_idx,
-                block_in_expert,
-                pid_n,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BLOCK_K=BLOCK_K,
-                BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
-                X_FORMAT=X_FORMAT,
-                W_FORMAT=W_FORMAT,
-                UPCAST_INDICES=UPCAST_INDICES,
-                HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
-                HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
-                HAS_BIAS=HAS_BIAS,
-                HAS_GATHER=HAS_GATHER,
-                HAS_SCATTER=HAS_SCATTER,
-                DO_SWIGLU=DO_SWIGLU,
-                SWIGLU_ALPHA=SWIGLU_ALPHA,
-                SWIGLU_LIMIT=SWIGLU_LIMIT,
-                OUT_BLOCK_N=OUT_BLOCK_N,
-                APPLY_GATE_SCAL=APPLY_GATE_SCAL,
-                HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
-                NUM_WARPS=NUM_WARPS,
-                NUM_BUFFERS=NUM_BUFFERS,
-                SCALE_LOAD_MODE=SCALE_LOAD_MODE,
-                W_TRANSPOSE=W_TRANSPOSE,
-                NUM_SUBTILES=NUM_SUBTILES,
-                EVEN_K=EVEN_K,
-                K_ITERS=K_ITERS,
-                APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
-                USE_WARP_PIPELINE=USE_WARP_PIPELINE,
-                USE_SLICE_MN=USE_SLICE_MN,
-                USE_SLICE_N=USE_SLICE_N,
-                HAS_FP8_QUANT_OUT=HAS_FP8_QUANT_OUT,
-                W_PRESHUFFLED=W_PRESHUFFLED,
-                W_VIA_VGPR=W_VIA_VGPR,
-                W_PREFETCH=W_PREFETCH,
-            )
+        _pipelined_moe_tile_compute(
+            x_ptr,
+            w_ptr,
+            x_scale_ptr,
+            w_scale_ptr,
+            bias_ptr,
+            y_ptr,
+            gather_idx_ptr,
+            scatter_idx_ptr,
+            gate_scal_ptr,
+            slice_offs_ptr,
+            slice_sizes_ptr,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wn,
+            stride_wk,
+            stride_xsm,
+            stride_xsk,
+            stride_wse,
+            stride_wsn,
+            stride_wsk,
+            stride_yn,
+            stride_ym,
+            stride_be,
+            stride_bn,
+            M,
+            M_X,
+            N,
+            K,
+            x_global_scale_ptr,
+            out_quant_scale_ptr,
+            compact_idx,
+            block_in_expert,
+            pid_n,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
+            X_FORMAT=X_FORMAT,
+            W_FORMAT=W_FORMAT,
+            UPCAST_INDICES=UPCAST_INDICES,
+            HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
+            HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
+            HAS_BIAS=HAS_BIAS,
+            HAS_GATHER=HAS_GATHER,
+            HAS_SCATTER=HAS_SCATTER,
+            DO_SWIGLU=DO_SWIGLU,
+            SWIGLU_ALPHA=SWIGLU_ALPHA,
+            SWIGLU_LIMIT=SWIGLU_LIMIT,
+            OUT_BLOCK_N=OUT_BLOCK_N,
+            APPLY_GATE_SCAL=APPLY_GATE_SCAL,
+            HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
+            NUM_WARPS=NUM_WARPS,
+            NUM_BUFFERS=NUM_BUFFERS,
+            SCALE_LOAD_MODE=SCALE_LOAD_MODE,
+            W_TRANSPOSE=W_TRANSPOSE,
+            NUM_SUBTILES=NUM_SUBTILES,
+            EVEN_K=EVEN_K,
+            K_ITERS=K_ITERS,
+            N_CONST=N_CONST,
+            APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
+            USE_WARP_PIPELINE=USE_WARP_PIPELINE,
+            USE_SLICE_MN=USE_SLICE_MN,
+            USE_SLICE_N=USE_SLICE_N,
+            HAS_FP8_QUANT_OUT=HAS_FP8_QUANT_OUT,
+            W_PRESHUFFLED=W_PRESHUFFLED,
+            W_VIA_VGPR=W_VIA_VGPR,
+            W_PREFETCH=W_PREFETCH,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4073,6 +4099,7 @@ def _launch_kernel(
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
         K_ITERS=K_ITERS,
+        N_CONST=N if w_preshuffle and swiglu is None else 0,
         APPLY_X_GLOBAL_SCALE=apply_x_global_scale,
         USE_WARP_PIPELINE=use_warp_pipeline,
         USE_SLICE_MN=use_slice_mn,
@@ -4715,6 +4742,23 @@ def gluon_mxfp_combine(
         persistent = (grid_m_upper * grid_n) >= _PERSISTENT_TILES_THRESHOLD
         if persistent and num_ctas is None:
             num_ctas = _CDNA4_NUM_CUS
+    group_m = None
+    xcd_swizzle = None
+    if (
+        w_preshuffle
+        and persistent
+        and num_ctas == _CDNA4_NUM_CUS
+        and block_m == 64
+        and block_n == 128
+        and block_k == 256
+        and not use_slice_mn
+        and not use_slice_n
+    ):
+        # Combine's persistent BN128 path has more M tiles per N tile than
+        # dispatch's SliceN path; grouping eight M tiles improves locality
+        # without changing the global swizzle heuristic used elsewhere.
+        group_m = 8
+        xcd_swizzle = _CDNA4_NUM_XCDS
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
     if n_tokens is None:
         n_rows = M
@@ -4751,6 +4795,8 @@ def gluon_mxfp_combine(
         use_slice_n=use_slice_n,
         persistent=persistent,
         num_ctas=num_ctas,
+        group_m=group_m,
+        xcd_swizzle=xcd_swizzle,
         w_preshuffle=w_preshuffle,
     )
     if n_act_eff > 1:
