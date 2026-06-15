@@ -2375,36 +2375,39 @@ class MoESliceNProgram:
         for _ in range(0, unroll_pairs):
             # The future copy reuses the slot just local-loaded into VGPRs.
             # Synchronize the CTA before any producer wave overwrites it.
-            gl.barrier()
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            self.async_wait_groups(2 * NB - 1)
+            gl.barrier()
+            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
+            self.async_wait_groups(2 * (NB - 1))
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
+            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
 
-            gl.barrier()
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
-            self.async_wait_groups(2 * NB - 1)
+            gl.barrier()
+            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
+            self.async_wait_groups(2 * (NB - 1))
             w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             x0, sx0 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
+            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
 
         if odd_main:
-            gl.barrier()
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            self.async_wait_groups(2 * NB - 1)
+            gl.barrier()
+            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
+            self.async_wait_groups(2 * (NB - 1))
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
+            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             self.async_wait_groups(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
