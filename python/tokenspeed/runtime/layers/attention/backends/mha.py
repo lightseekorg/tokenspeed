@@ -108,6 +108,7 @@ class MHAAttnBackend(AttentionBackend):
         self.head_dim = config.head_dim
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
+        self.is_fp8 = self.kv_cache_dtype == torch.float8_e4m3fn
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
@@ -368,9 +369,10 @@ class MHAAttnBackend(AttentionBackend):
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         metadata = self.forward_extend_metadata
-        if metadata.max_extend_prefix_len == 0:
-            # When there is no cached prefix, we can first try the registered
-            # prefill kernel. If not found, we fall back to the extend path.
+        # When there is no cached prefix or the input is FP16 which doesn't
+        # need downcast, we will first try the direct prefill kernel. If no
+        # kernel found, then fall back to the extend path.
+        if metadata.max_extend_prefix_len == 0 and not self.is_fp8:
             try:
                 return self._forward_prefill(
                     q,
@@ -384,7 +386,6 @@ class MHAAttnBackend(AttentionBackend):
                     kwargs.get("sinks"),
                 )
             except NoKernelFoundError:
-
                 pass
 
         return self._forward_extend(
@@ -444,7 +445,7 @@ class MHAAttnBackend(AttentionBackend):
         if save_kv_cache:
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
+        if self.is_fp8:
             q = q.to(torch.float8_e4m3fn).contiguous()
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
@@ -482,7 +483,7 @@ class MHAAttnBackend(AttentionBackend):
         if save_kv_cache:
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
+        if self.is_fp8:
             q = q.to(torch.float8_e4m3fn).contiguous()
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
@@ -516,7 +517,7 @@ class MHAAttnBackend(AttentionBackend):
         if k is None:
             return
 
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
+        if self.is_fp8:
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
                 k=k,
