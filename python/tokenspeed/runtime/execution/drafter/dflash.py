@@ -31,7 +31,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import get_global_server_args
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -71,12 +70,12 @@ class DFlash(BaseDrafter):
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
         )
-        server_args = get_global_server_args()
+        if draft_model_runner is None:
+            raise ValueError("Native DFLASH requires a draft model runner.")
+        server_args = draft_model_runner.server_args
         if not server_args.speculative_draft_model_path:
             raise ValueError("DFLASH requires --speculative-draft-model-path.")
 
-        if draft_model_runner is None:
-            raise ValueError("Native DFLASH requires a draft model runner.")
         self.device = torch.device(draft_model_runner.device)
         self.model = draft_model_runner.model
 
