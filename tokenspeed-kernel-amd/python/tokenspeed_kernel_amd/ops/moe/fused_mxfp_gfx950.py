@@ -5148,6 +5148,7 @@ def gluon_mxfp_combine(
     ):
         group_m = 16
         xcd_swizzle = 4
+        store_layout_variant = 2
     elif (
         w_preshuffle
         and persistent
