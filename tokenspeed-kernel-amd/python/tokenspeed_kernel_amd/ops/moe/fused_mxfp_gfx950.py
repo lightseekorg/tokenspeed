@@ -3393,6 +3393,19 @@ def _pipelined_moe_tile_compute(
         )
         acc = acc + bias[None, :].to(gl.float32)
 
+    if APPLY_GATE_SCAL and not DO_SWIGLU:
+        offs_acc_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, cfg.acc_layout))
+        acc_m_in_bounds = offs_acc_m < m_limit
+        offs_acc_m_safe = gl.where(
+            acc_m_in_bounds, offs_acc_m, gl.zeros_like(offs_acc_m)
+        )
+        scal = gl.load(
+            gate_scal_ptr + offs_acc_m_safe,
+            mask=acc_m_in_bounds,
+            other=1.0,
+        )
+        acc = acc * scal[:, None].to(acc.dtype)
+
     if DO_SWIGLU:
         out = _swiglu_reduce(
             acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout
@@ -3418,7 +3431,7 @@ def _pipelined_moe_tile_compute(
     y_m_in_bounds = offs_y_m < m_limit
     offs_y_m_safe = gl.where(y_m_in_bounds, offs_y_m, gl.zeros_like(offs_y_m))
 
-    if APPLY_GATE_SCAL:
+    if APPLY_GATE_SCAL and DO_SWIGLU:
         scal = gl.load(
             gate_scal_ptr + offs_y_m_safe,
             mask=y_m_in_bounds,
