@@ -1965,6 +1965,7 @@ class MoESliceNProgram:
     w_desc_bot: AsyncCopyDescriptor | WVgprDescriptor | WPreshuffledLdsDescriptor
     x_scale_desc: AsyncCopyDescriptor | gl.constexpr
     w_scale_desc: AsyncCopyDescriptor | gl.constexpr
+    bottom_valid: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -1980,6 +1981,7 @@ class MoESliceNProgram:
         w_desc_bot,
         x_scale_desc,
         w_scale_desc,
+        bottom_valid,
     ):
         self.cfg = cfg
         self.x_buffer = x_buffer
@@ -2000,6 +2002,7 @@ class MoESliceNProgram:
         self.w_desc_bot = w_desc_bot
         self.x_scale_desc = x_scale_desc if cfg.WITH_X_MX_SCALE else gl.constexpr(0)
         self.w_scale_desc = w_scale_desc if cfg.WITH_W_MX_SCALE else gl.constexpr(0)
+        self.bottom_valid = bottom_valid
         self.base = MoEProgramBase()
 
     @gluon.jit
@@ -2010,6 +2013,7 @@ class MoESliceNProgram:
         w_desc_bot,
         x_scale_desc,
         w_scale_desc,
+        bottom_valid,
     ):
         NUM_BUFFERS: gl.constexpr = cfg.NUM_BUFFERS
         BLOCK_K_PACKED_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
@@ -2100,6 +2104,7 @@ class MoESliceNProgram:
             w_desc_bot,
             x_scale_desc,
             w_scale_desc,
+            bottom_valid,
         )
 
     @gluon.jit
@@ -2261,20 +2266,90 @@ class MoESliceNProgram:
         return w, scale_w
 
     @gluon.jit
-    def pipeline(self, loop_k):
+    def _finish_accumulator(self, c0, c1):
+        cfg = self.cfg
+        accumulator = (
+            gl.join(c0, c1).permute(0, 2, 1).reshape((cfg.BLOCK_M, cfg.BLOCK_N))
+        )
+        accumulator = gl.convert_layout(accumulator, cfg.acc_layout)
+        return accumulator
+
+    @gluon.jit
+    def _pipeline_top_only(self, loop_k):
         cfg = self.cfg
         NB: gl.constexpr = cfg.NUM_BUFFERS
-        gl.static_assert(
-            (cfg.NUM_SUBTILES[0] == 1)
-            and (cfg.NUM_SUBTILES[1] == 2)
-            and (cfg.NUM_SUBTILES[2] == 1),
-            "MoESliceNProgram requires NUM_SUBTILES=(1,2,1)",
-        )
-        gl.static_assert(
-            NB == 2,
-            "v5 local-prefetch SliceN pipeline requires exactly two LDS buffers",
-        )
+        SUBTILE_N: gl.constexpr = cfg.BLOCK_N // 2
 
+        load_idx = 0
+        mfma_idx = 0
+
+        for _ in gl.static_range(NB):
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+
+        c0 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
+        c1 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
+
+        if cfg.K_ITERS:
+            K_iters: gl.constexpr = cfg.K_ITERS
+        else:
+            K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
+        main_iters = K_iters - NB
+        gl.assume(main_iters >= 0)
+
+        self.async_wait_groups(2 * NB - 1)
+        w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
+        x0, sx0 = self.issue_local_load_x(mfma_idx)
+        mfma_idx += 1
+
+        unroll_pairs = main_iters // 2
+        odd_main = main_iters - unroll_pairs * 2
+
+        for _ in range(0, unroll_pairs):
+            gl.barrier()
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
+            c0 = self.mfma(x0, sx0, w00, sw00, c0)
+            self.async_wait_groups(2 * NB - 1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
+            mfma_idx += 1
+
+            gl.barrier()
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
+            c0 = self.mfma(x1, sx1, w10, sw10, c0)
+            self.async_wait_groups(2 * NB - 1)
+            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x0, sx0 = self.issue_local_load_x(mfma_idx)
+            mfma_idx += 1
+
+        if odd_main:
+            gl.barrier()
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
+            c0 = self.mfma(x0, sx0, w00, sw00, c0)
+            self.async_wait_groups(2 * NB - 1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
+            mfma_idx += 1
+
+            c0 = self.mfma(x1, sx1, w10, sw10, c0)
+            self.async_wait_groups(1)
+            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x0, sx0 = self.issue_local_load_x(mfma_idx)
+            c0 = self.mfma(x0, sx0, w00, sw00, c0)
+            self.async_wait_groups(0)
+        else:
+            c0 = self.mfma(x0, sx0, w00, sw00, c0)
+            self.async_wait_groups(1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
+            x1, sx1 = self.issue_local_load_x(mfma_idx)
+            c0 = self.mfma(x1, sx1, w10, sw10, c0)
+            self.async_wait_groups(0)
+
+        return self._finish_accumulator(c0, c1)
+
+    @gluon.jit
+    def _pipeline_full(self, loop_k):
+        cfg = self.cfg
+        NB: gl.constexpr = cfg.NUM_BUFFERS
         SUBTILE_N: gl.constexpr = cfg.BLOCK_N // 2
 
         load_idx = 0
@@ -2366,12 +2441,26 @@ class MoESliceNProgram:
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
 
-        accumulator = (
-            gl.join(c0, c1).permute(0, 2, 1).reshape((cfg.BLOCK_M, cfg.BLOCK_N))
-        )
-        accumulator = gl.convert_layout(accumulator, cfg.acc_layout)
+        return self._finish_accumulator(c0, c1)
 
-        return accumulator
+    @gluon.jit
+    def pipeline(self, loop_k):
+        cfg = self.cfg
+        NB: gl.constexpr = cfg.NUM_BUFFERS
+        gl.static_assert(
+            (cfg.NUM_SUBTILES[0] == 1)
+            and (cfg.NUM_SUBTILES[1] == 2)
+            and (cfg.NUM_SUBTILES[2] == 1),
+            "MoESliceNProgram requires NUM_SUBTILES=(1,2,1)",
+        )
+        gl.static_assert(
+            NB == 2,
+            "v5 local-prefetch SliceN pipeline requires exactly two LDS buffers",
+        )
+
+        if self.bottom_valid:
+            return self._pipeline_full(loop_k)
+        return self._pipeline_top_only(loop_k)
 
 
 @gluon.jit
@@ -3032,6 +3121,7 @@ def _pipelined_moe_tile_compute(
         acc = slice_mn_pgm.pipeline(K)
     elif USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
+        bottom_valid = gl.to_tensor(True)
         if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
             gl.static_assert(
                 SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
@@ -3149,7 +3239,7 @@ def _pipelined_moe_tile_compute(
             else:
                 n_block_count = (N + 127) // 128
                 w_k_stride = gl.to_tensor(N)
-            bot_valid = (2 * pid_n + 1) < n_block_count
+            bottom_valid = (2 * pid_n + 1) < n_block_count
             base_off_top = w_base_offset + 2 * pid_n * TILE_BYTES_HALF
             base_off_bot = base_off_top + TILE_BYTES_HALF
             if cfg.W_VIA_VGPR:
@@ -3168,7 +3258,7 @@ def _pipelined_moe_tile_compute(
                     w_ptr,
                     w_k_stride,
                     offsets_h + base_off_bot,
-                    pred=bot_valid,
+                    pred=bottom_valid,
                     LOAD_BN=SUB_BN,
                 )
             else:
@@ -3190,7 +3280,7 @@ def _pipelined_moe_tile_compute(
                     w_ptr.dtype.element_ty,
                     w_k_stride,
                     offsets_h + base_off_bot,
-                    pred=bot_valid,
+                    pred=bottom_valid,
                     load_layout=LOAD_W_HALF_LAYOUT,
                     LOAD_BN=SUB_BN,
                 )
@@ -3283,6 +3373,7 @@ def _pipelined_moe_tile_compute(
             w_desc_bot,
             x_scale_desc,
             w_scale_desc,
+            bottom_valid,
         )
         acc = pgm.pipeline(K)
     else:
