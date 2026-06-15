@@ -528,16 +528,15 @@ class MHAAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
                 page_size=self.page_size,
             )
-            return
-
-        token_to_kv_pool.set_kv_buffer(
-            layer,
-            out_cache_loc,
-            k,
-            v,
-            layer.k_scale,
-            layer.v_scale,
-        )
+        else:
+            token_to_kv_pool.set_kv_buffer(
+                layer,
+                out_cache_loc,
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
 
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
