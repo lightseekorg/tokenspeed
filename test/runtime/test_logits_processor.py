@@ -34,9 +34,7 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
         calls["fused"] += 1
         return torch.matmul(hidden.to(weight.dtype), weight.T)
 
-    monkeypatch.setattr(
-        logits_processor_module, "_lm_head_matmul", fake_lm_head_matmul
-    )
+    monkeypatch.setattr(logits_processor_module, "_lm_head_matmul", fake_lm_head_matmul)
 
     non_kimi = LogitsProcessor(config=SimpleNamespace(model_type="test", vocab_size=2))
     non_kimi(

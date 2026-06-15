@@ -90,9 +90,7 @@ def _is_amd_quark_dynamic_mxfp4(config: Mapping[str, Any]) -> bool:
 def _is_amd_quark_mxfp4_checkpoint(config: dict) -> bool:
     if not isinstance(config, Mapping):
         return False
-    return _is_amd_quark_w_mxfp4_a_fp8(config) or _is_amd_quark_dynamic_mxfp4(
-        config
-    )
+    return _is_amd_quark_w_mxfp4_a_fp8(config) or _is_amd_quark_dynamic_mxfp4(config)
 
 
 def _iter_ignored_layer_pattern_aliases(raw: str):
@@ -162,9 +160,7 @@ class Mxfp4Config(QuantizationConfig):
         is_w4a8_fp8 = _is_amd_quark_w_mxfp4_a_fp8(config)
         use_dynamic_mxfp4_activations = _is_amd_quark_dynamic_mxfp4(config)
         is_checkpoint_mxfp4_serialized = (
-            "mxfp4" in quant_method
-            or is_w4a8_fp8
-            or use_dynamic_mxfp4_activations
+            "mxfp4" in quant_method or is_w4a8_fp8 or use_dynamic_mxfp4_activations
         )
 
         raw_ignored = cls.get_from_keys_or(config, ["ignored_layers", "exclude"], None)

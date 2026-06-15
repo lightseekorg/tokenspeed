@@ -310,7 +310,9 @@ def _local_topk_for_ep(
     expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
     local_ids = topk_ids - expert_offset
     local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
-    local_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+    local_weights = torch.where(
+        local_mask, topk_weights, torch.zeros_like(topk_weights)
+    )
     local_ids = torch.where(local_mask, local_ids, topk_ids.new_full((), -1))
     return local_weights, local_ids, num_local_experts
 
