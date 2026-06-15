@@ -57,13 +57,10 @@ if (
     and platform.is_blackwell
     and platform.arch_version == ArchVersion(10, 0)
 ):
-    try:
-        from flash_attn.cute import (
-            flash_attn_func,
-            flash_attn_varlen_func,
-        )
-    except ImportError:
-        pass
+    from flash_attn.cute import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
 
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8
     # (and (192, 128) for DeepSeek MLA, not applicable here). Cached paths pass
@@ -83,7 +80,7 @@ if (
         signatures=format_signatures(
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "sliding_window": frozenset({False}),
@@ -91,7 +88,6 @@ if (
             "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa4_mha_prefill(
         q: torch.Tensor,
@@ -133,7 +129,7 @@ if (
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
@@ -142,7 +138,6 @@ if (
             "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa4_mha_extend_with_kvcache(
         q: torch.Tensor,
@@ -189,7 +184,7 @@ if (
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "sliding_window": frozenset({False}),
@@ -197,7 +192,6 @@ if (
             "return_lse": frozenset({False}),
             "support_logit_cap": frozenset({False}),
         },
-        tags={"latency"},
     )
     def fa4_mha_decode_with_kvcache(
         q: torch.Tensor,
@@ -227,15 +221,12 @@ if (
         return out.view_as(q)
 
 elif platform.is_nvidia and platform.is_hopper:
-    try:
-        from flash_attn_interface import (
-            flash_attn_func,
-            flash_attn_varlen_func,
-            flash_attn_with_kvcache,
-            get_scheduler_metadata,
-        )
-    except ImportError:
-        pass
+    from flash_attn_interface import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+        get_scheduler_metadata,
+    )
 
     @register_kernel(
         "attention",
@@ -249,14 +240,13 @@ elif platform.is_nvidia and platform.is_hopper:
         signatures=format_signatures(
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa3_mha_prefill(
         q: torch.Tensor,
@@ -297,7 +287,7 @@ elif platform.is_nvidia and platform.is_hopper:
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
@@ -305,7 +295,6 @@ elif platform.is_nvidia and platform.is_hopper:
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa3_mha_extend_with_kvcache(
         q: torch.Tensor,
@@ -351,7 +340,7 @@ elif platform.is_nvidia and platform.is_hopper:
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
