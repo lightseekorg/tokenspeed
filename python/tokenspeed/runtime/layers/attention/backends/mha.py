@@ -446,7 +446,7 @@ class MHAAttnBackend(AttentionBackend):
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn).contiguous()
+            q = q.to(torch.float8_e4m3fn)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         result = mha_extend_with_kvcache(
@@ -484,7 +484,7 @@ class MHAAttnBackend(AttentionBackend):
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn).contiguous()
+            q = q.to(torch.float8_e4m3fn)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         result = mha_decode_with_kvcache(
