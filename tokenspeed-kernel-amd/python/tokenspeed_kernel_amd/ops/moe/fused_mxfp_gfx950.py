@@ -1104,21 +1104,11 @@ class WPreshuffledLdsDescriptor:
         BLOCK_K_W: gl.constexpr = self.BLOCK_K
         LOAD_BN: gl.constexpr = self.LOAD_BN
         slot = buffer.index(idx % NUM_BUFFERS)
-        tile_flat = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            slot,
-            self.load_layout,
-        )
-        tile_5d = tile_flat.reshape(
-            LOAD_BN // 16,
-            BLOCK_K_W // 64,
-            4,
-            16,
-            16,
-        )
-        tile_perm = tile_5d.permute(0, 3, 1, 2, 4)
-        tile_2d = tile_perm.reshape(LOAD_BN, BLOCK_K_W)
-        tile_t = tile_2d.trans(1, 0)
-        return gl.convert_layout(tile_t, layout, assert_trivial=True)
+        slot_5d = slot.reshape((LOAD_BN // 16, BLOCK_K_W // 64, 4, 16, 16))
+        slot_perm = slot_5d.permute((0, 3, 1, 2, 4))
+        slot_2d = slot_perm.reshape((LOAD_BN, BLOCK_K_W))
+        slot_t = slot_2d.permute((1, 0))
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_t, layout)
 
 
 @gluon.jit
