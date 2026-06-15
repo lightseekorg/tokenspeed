@@ -72,7 +72,6 @@ class DFlash(BaseDrafter):
         )
         if draft_model_runner is None:
             raise ValueError("Native DFLASH requires a draft model runner.")
-
         server_args = draft_model_runner.server_args
         if not server_args.speculative_draft_model_path:
             raise ValueError("DFLASH requires --speculative-draft-model-path.")
