@@ -267,7 +267,12 @@ def shuffle_weight_for_gluon_dot_layout(
 
 
 @gluon.constexpr_function
-def _store_layout(num_warps: int, block_m: int = 0, w_via_vgpr: bool = False):
+def _store_layout(
+    num_warps: int,
+    block_m: int = 0,
+    w_via_vgpr: bool = False,
+    variant: int = 0,
+):
     # Mirrors the warps_m policy in get_mfma_layout so the MFMA acc
     # and store layouts stay convert-compatible.
     if w_via_vgpr and num_warps >= 4:
@@ -277,6 +282,12 @@ def _store_layout(num_warps: int, block_m: int = 0, w_via_vgpr: bool = False):
     else:
         warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
+    if variant == 1 and w_via_vgpr and block_m >= 64 and num_warps >= 4:
+        return gl.BlockedLayout([1, 16], [4, 16], [warps_m, warps_n], [1, 0])
+    if variant == 2 and w_via_vgpr and block_m >= 64 and num_warps >= 4:
+        return gl.BlockedLayout([1, 16], [8, 8], [warps_m, warps_n], [1, 0])
+    if w_via_vgpr and block_m >= 128 and num_warps >= 4:
+        return gl.BlockedLayout([1, 16], [4, 16], [warps_m, warps_n], [1, 0])
     return gl.BlockedLayout([1, 32], [8, 8], [warps_m, warps_n], [1, 0])
 
 
@@ -2587,6 +2598,7 @@ def _pipelined_moe_tile_compute(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
+    STORE_LAYOUT_VARIANT: gl.constexpr = 0,
 ):
     expert_id = compact_idx
 
@@ -2611,7 +2623,10 @@ def _pipelined_moe_tile_compute(
     N_LIMIT: gl.constexpr = N_CONST if N_CONST else 0
 
     STORE: gl.constexpr = _store_layout(
-        NUM_WARPS, block_m=BLOCK_M, w_via_vgpr=W_VIA_VGPR or W_PRESHUFFLED
+        NUM_WARPS,
+        block_m=BLOCK_M,
+        w_via_vgpr=W_VIA_VGPR or W_PRESHUFFLED,
+        variant=STORE_LAYOUT_VARIANT,
     )
 
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
@@ -3679,6 +3694,7 @@ def _pipelined_moe_kernel_scaled(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
+    STORE_LAYOUT_VARIANT: gl.constexpr = 0,
 ):
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
@@ -3783,6 +3799,7 @@ def _pipelined_moe_kernel_scaled(
             W_VIA_VGPR=W_VIA_VGPR,
             W_PREFETCH=W_PREFETCH,
             W_CACHE_CG=W_CACHE_CG,
+            STORE_LAYOUT_VARIANT=STORE_LAYOUT_VARIANT,
         )
 
 
@@ -3977,6 +3994,7 @@ def _launch_kernel(
     w_preshuffle: bool = False,
     y_n_const: int = 0,
     w_cache_cg: bool | None = None,
+    store_layout_variant: int = 0,
 ):
     assert x_format in _SCALED_FORMATS, f"unknown x_format={x_format!r}"
     assert w_format in _SCALED_FORMATS, f"unknown w_format={w_format!r}"
@@ -4318,6 +4336,7 @@ def _launch_kernel(
         W_VIA_VGPR=False,
         W_PREFETCH=False,
         W_CACHE_CG=bool(w_cache_cg),
+        STORE_LAYOUT_VARIANT=int(store_layout_variant),
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
@@ -5085,6 +5104,7 @@ def gluon_mxfp_combine(
     group_m = None
     xcd_swizzle = None
     w_cache_cg = None
+    store_layout_variant = 0
     if (
         w_preshuffle
         and not persistent
@@ -5146,6 +5166,7 @@ def gluon_mxfp_combine(
         if slice_size == 128:
             group_m = 16
             xcd_swizzle = 4
+            store_layout_variant = 2
         elif slice_size == 32:
             group_m = 4
             xcd_swizzle = _CDNA4_NUM_XCDS
@@ -5214,6 +5235,7 @@ def gluon_mxfp_combine(
         w_preshuffle=w_preshuffle,
         y_n_const=y_n if y_n != N else 0,
         w_cache_cg=w_cache_cg,
+        store_layout_variant=store_layout_variant,
     )
     if n_act_eff > 1:
         y = y.view(n_tokens_eff, n_act_eff, y_n).sum(dim=1)
