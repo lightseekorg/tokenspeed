@@ -597,7 +597,7 @@ _CASES = [
         "hopper",
         "attention",
         "mha_merge_state",
-        "cuda_mha_merge_state",
+        "triton_mha_merge_state",
         _attention_merge_state,
     ),
     _case(
