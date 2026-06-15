@@ -24,8 +24,8 @@
 #include <string>
 #include <vector>
 
-#include "block_pool/block_pool.h"
-#include "full_attn_manager/full_attn_manager.h"
+#include "cache/block_pool.h"
+#include "cache/full_attn_manager.h"
 #include "scheduler/page_hasher.h"
 
 namespace tokenspeed::test {

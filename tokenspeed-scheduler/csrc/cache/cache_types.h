@@ -24,7 +24,7 @@
 #include <span>
 #include <vector>
 
-#include "block_pool/block_pool.h"
+#include "cache/block_pool.h"
 
 namespace tokenspeed {
 
@@ -45,14 +45,18 @@ public:
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
 
 private:
-    friend class FullAttnManager;
+    friend class KvCacheManager;
 
     std::vector<CacheBlock*> blocks_{};
     std::int32_t tail_avail_{0};
 };
 
-// Read-only result of a prefix match. blocks holds the cached physical pages in
-// order; num_hit_blocks == blocks.size() (kept explicit for caller token math).
+// Unified prefix-match result across all managers (mirrors vLLM computed_blocks).
+// blocks maps logical page -> physical page; an unmatched / out-of-window slot is
+// a null_block hole. blocks.size() is the compute coverage (every slot, real or
+// hole, is a computed page); num_hit_blocks is the count of real cached pages
+// that need claiming (excludes holes). For full attention there are no holes, so
+// blocks.size() == num_hit_blocks.
 struct PrefixMatch {
     std::vector<CacheBlock*> blocks{};
     std::int32_t num_hit_blocks{0};

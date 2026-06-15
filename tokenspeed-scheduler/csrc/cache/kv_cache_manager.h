@@ -25,50 +25,39 @@
 #include <string>
 #include <vector>
 
-#include "block_pool/block_pool.h"
+#include "cache/block_pool.h"
 #include "cache/cache_types.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
-// Stateless full-attention KV manager over a BlockPool. Holds no per-request
-// state -- every operation acts on the BlockTable handed in. Consumes
-// pre-computed BlockHashWithGroupId keys (does not depend on page_hasher).
-class FullAttnManager {
+// Abstract base for the per-attention-type KV managers (FullAttnManager, and
+// later SwaManager / MambaManager). MatchPrefix is the only type-specific
+// operation -- the four others are shared, stateless over (pool_, page_size_)
+// plus the BlockTable handed in. Holds no per-request state.
+class KvCacheManager {
 public:
-    FullAttnManager(BlockPool& pool, std::int32_t page_size) : pool_{pool}, page_size_{page_size} {
+    KvCacheManager(BlockPool& pool, std::int32_t page_size) : pool_{pool}, page_size_{page_size} {
         _assert(page_size > 0, "page_size must be > 0");
     }
+    virtual ~KvCacheManager() = default;
 
-    FullAttnManager(const FullAttnManager&) = delete;
-    FullAttnManager& operator=(const FullAttnManager&) = delete;
+    KvCacheManager(const KvCacheManager&) = delete;
+    KvCacheManager& operator=(const KvCacheManager&) = delete;
 
-    // Read-only prefix match: walk the pre-computed page-hash keys until the
-    // first cache miss. Returns the hit blocks in order. Does NOT change ref
-    // counts -- callers claim hits via ClaimHitBlocks.
-    PrefixMatch MatchPrefix(std::span<const std::string> block_hashes) const {
-        PrefixMatch match;
-        for (const std::string& hash : block_hashes) {
-            CacheBlock* block = pool_.GetCachedBlock(hash);
-            if (block == nullptr) {
-                break;
-            }
-            match.blocks.push_back(block);
-        }
-        match.num_hit_blocks = static_cast<std::int32_t>(match.blocks.size());
-        return match;
-    }
+    // Per-attention-type prefix match. Read-only: must NOT change ref counts.
+    virtual PrefixMatch MatchPrefix(std::span<const std::string> block_hashes) const = 0;
 
-    // Claim each hit block (TouchBlock pulls it from the free list and bumps
-    // ref) and append it to the table. Must be called on a fresh table (prefill
-    // start) before any Acquire: the table's tail_avail_ is therefore already 0
-    // and the claimed full pages are never ordered after a partial tail page.
-    // Always succeeds (claiming a cached-free block never allocates); the bool
-    // return mirrors Acquire for a uniform call shape. Returns true.
+    // Claim each real hit block (TouchBlock pulls it from the free list and bumps
+    // ref) and append it to the table. null_block holes are appended as-is (they
+    // keep logical-page alignment) but never touched -- the null block is not ref
+    // counted. Must be called on a fresh table (prefill start) before any Acquire.
     bool ClaimHitBlocks(BlockTable& table, const PrefixMatch& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         for (CacheBlock* block : hit.blocks) {
-            pool_.TouchBlock(block);
+            if (!block->IsNull()) {
+                pool_.TouchBlock(block);
+            }
             table.blocks_.push_back(block);
         }
         return true;
@@ -128,7 +117,7 @@ public:
         table.tail_avail_ = 0;
     }
 
-private:
+protected:
     BlockPool& pool_;
     std::int32_t page_size_;
 };

@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "block_pool/block_pool.h"
+#include "cache/block_pool.h"
 #include "scheduler/page_hasher.h"
 
 namespace tokenspeed::test {

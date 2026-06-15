@@ -109,6 +109,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_page_hasher.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_full_attn_manager.cpp
+        tests/cpp/test_swa_manager.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_write_back.cpp
