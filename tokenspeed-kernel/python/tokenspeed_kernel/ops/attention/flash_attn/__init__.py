@@ -347,7 +347,6 @@ elif platform.is_nvidia and platform.is_hopper:
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
         },
-        tags={"latency"},
     )
     def fa3_mha_decode_with_kvcache(
         q: torch.Tensor,
@@ -360,7 +359,6 @@ elif platform.is_nvidia and platform.is_hopper:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-        scheduler_metadata: torch.Tensor | None = None,
     ) -> torch.Tensor:
         out = flash_attn_with_kvcache(
             q=q.unsqueeze(1),
@@ -373,46 +371,5 @@ elif platform.is_nvidia and platform.is_hopper:
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
-            scheduler_metadata=scheduler_metadata,
         )
         return out.view_as(q)
-
-
-# ------------------------------------------------------------------------------
-# Direct export
-# ------------------------------------------------------------------------------
-
-
-def mha_decode_scheduler_metadata(
-    *,
-    batch_size: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    num_heads_q: int,
-    num_heads_kv: int,
-    headdim: int,
-    cache_seqlens: torch.Tensor,
-    qkv_dtype: torch.dtype,
-    page_size: int,
-    causal: bool = True,
-) -> torch.Tensor | None:
-    """Pre-compute decode scheduler metadata once per scheduler step.
-
-    Only the FA3 decode kernel consumes pre-computed scheduler metadata; on
-    every other backend the kernel computes it internally and this helper
-    returns ``None`` so callers can pass through unconditionally.
-    """
-    if get_scheduler_metadata is error_fn:
-        return None
-    return get_scheduler_metadata(
-        batch_size=batch_size,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        num_heads_q=num_heads_q,
-        num_heads_kv=num_heads_kv,
-        headdim=headdim,
-        cache_seqlens=cache_seqlens,
-        qkv_dtype=qkv_dtype,
-        page_size=page_size,
-        causal=causal,
-    )
