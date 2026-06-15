@@ -4658,6 +4658,7 @@ def gluon_mxfp_dispatch_swiglu(
     N = w.shape[-1]
     div_x = 2 if x_format == "e2m1" else 1
     K = x.shape[-1] * div_x
+    slice_size = _ragged_slice_size(a_ragged_metadata, M)
     bm, bn, bk, nw = _autotune_block(
         M,
         N,
@@ -4665,18 +4666,48 @@ def gluon_mxfp_dispatch_swiglu(
         do_swiglu=True,
         x_format=x_format,
         scale_load_mode=scale_load_mode,
-        slice_size=_ragged_slice_size(a_ragged_metadata, M),
+        slice_size=slice_size,
     )
+    requested_block_m = block_m
     requested_block_n = block_n
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
+    use_small_preshuffled_m = (
+        w_preshuffle
+        and requested_block_m is None
+        and slice_size is not None
+        and slice_size < 16
+        and 1024 <= M < 2048
+    )
+    use_medium_preshuffled_m = (
+        w_preshuffle
+        and requested_block_m is None
+        and slice_size is not None
+        and slice_size <= 16
+        and 2048 <= M < 4096
+    )
+    use_large_preshuffled_m = (
+        w_preshuffle
+        and requested_block_m is None
+        and slice_size is not None
+        and slice_size >= 128
+        and M >= 16384
+    )
+    if use_small_preshuffled_m:
+        block_m = 16
+    elif use_medium_preshuffled_m:
+        block_m = 32
+    elif use_large_preshuffled_m:
+        block_m = 128
+        if use_slice_n is None:
+            use_slice_n = True
     if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
         # Preshuffled W is packed as 128-wide tiles. Execute a 256-wide CTA by
         # consuming two packed tiles through USE_SLICE_N so the same X tile
         # feeds twice as much MFMA work per wait/barrier region.
         block_n = 256
-    if w_preshuffle and block_n == 256 and block_m > 64:
+    if w_preshuffle and block_n == 256 and block_m > 64 and not use_large_preshuffled_m:
         # Preshuffled W supports BN=256 through USE_SLICE_N's two 128-wide
         # packed half-tiles; pick the BM tier that enables that path.
         block_m = 64
@@ -4761,6 +4792,8 @@ def gluon_mxfp_dispatch_swiglu(
             has_w_block_scale=True,
             bk=block_k,
         )
+    if persistent is None and use_small_preshuffled_m:
+        persistent = False
     if persistent is None and w_preshuffle and use_slice_n:
         grid_n = (N + block_n - 1) // block_n
         if a_ragged_metadata is not None:
@@ -4842,6 +4875,7 @@ def gluon_mxfp_combine(
     N = w.shape[-1]
     div_x = 2 if x_format == "e2m1" else 1
     K = x.shape[-1] * div_x
+    slice_size = _ragged_slice_size(a_ragged_metadata, M)
     bm, bn, bk, nw = _autotune_block(
         M,
         N,
@@ -4849,19 +4883,49 @@ def gluon_mxfp_combine(
         ragged=a_ragged_metadata is not None,
         x_format=x_format,
         scale_load_mode=scale_load_mode,
-        slice_size=_ragged_slice_size(a_ragged_metadata, M),
+        slice_size=slice_size,
     )
+    requested_block_m = block_m
     requested_block_n = block_n
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
+    use_small_preshuffled_m = (
+        w_preshuffle
+        and requested_block_m is None
+        and slice_size is not None
+        and slice_size < 16
+        and 1024 <= M < 2048
+    )
+    use_medium_preshuffled_m = (
+        w_preshuffle
+        and requested_block_m is None
+        and slice_size is not None
+        and slice_size <= 16
+        and 2048 <= M < 4096
+    )
+    use_large_preshuffled_m = (
+        w_preshuffle
+        and requested_block_m is None
+        and slice_size is not None
+        and slice_size >= 256
+        and M >= 32768
+    )
+    if use_small_preshuffled_m:
+        block_m = 16
+    elif use_medium_preshuffled_m:
+        block_m = 32
+    elif use_large_preshuffled_m:
+        block_m = 128
+        if use_slice_n is None:
+            use_slice_n = True
     if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
         # Match dispatch's preshuffled layout-aware promotion: the packed W
         # layout is 128-wide, but the execution tile can consume two adjacent
         # packed tiles through USE_SLICE_N. That halves the N-tile count for
         # combine while preserving the same host layout.
         block_n = 256
-    if w_preshuffle and block_n == 256 and block_m > 64:
+    if w_preshuffle and block_n == 256 and block_m > 64 and not use_large_preshuffled_m:
         block_m = 64
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
@@ -4944,6 +5008,8 @@ def gluon_mxfp_combine(
             has_w_block_scale=True,
             bk=block_k,
         )
+    if persistent is None and use_small_preshuffled_m:
+        persistent = False
     if persistent is None and w_preshuffle:
         grid_n = (N + block_n - 1) // block_n
         if a_ragged_metadata is not None:
