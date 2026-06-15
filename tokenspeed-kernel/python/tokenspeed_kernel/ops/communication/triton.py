@@ -851,9 +851,10 @@ def rsag_restore_hidden(
 # ------------------------------------------------------------------------------
 
 
-def nvidia_rsag_get_launch_config(local_numel: int) -> Tuple[int, int, int, int]:
+def nvidia_rsag_get_launch_config(
+    local_numel: int, num_blocks: int | None = None
+) -> Tuple[int, int, int, int]:
     warp_size = 32
-    max_num_blocks = 4
     max_block_size = 1024
     bytes_per_thread = 16
     numel_per_thread = 8
@@ -862,8 +863,22 @@ def nvidia_rsag_get_launch_config(local_numel: int) -> Tuple[int, int, int, int]
     ), f"The number of elements must be {bytes_per_thread} bytes aligned"
     block_size = max_block_size
     num_warps = max_block_size // warp_size
-    num_blocks = max_num_blocks
+    num_blocks = 4 if num_blocks is None else num_blocks
     return num_blocks, block_size, num_warps, numel_per_thread
+
+
+def nvidia_rsag_reduce_scatter_num_blocks(
+    token_list_in_group: list[int], hidden_size: int
+) -> int:
+    max_num_blocks = 32
+    min_num_blocks = 4
+    numel_per_program = 1024 * 8
+    max_local_numel = max(token_list_in_group) * hidden_size
+    needed_blocks = max(
+        min_num_blocks,
+        (max_local_numel + numel_per_program - 1) // numel_per_program,
+    )
+    return min(max_num_blocks, 1 << (needed_blocks - 1).bit_length())
 
 
 @triton.jit
@@ -982,11 +997,14 @@ def nvidia_create_rsag_state(
 
 
 def nvidia_rsag_multimem_reduce_scatter(
-    state: TritonCommState, local_num_tokens: int, local_token_offset: int
+    state: TritonCommState,
+    local_num_tokens: int,
+    local_token_offset: int,
+    num_blocks: int | None = None,
 ) -> None:
     num_elts = local_num_tokens * state.hidden_dim
     num_blocks, block_size, num_warps, numel_per_thread = nvidia_rsag_get_launch_config(
-        num_elts
+        num_elts, num_blocks=num_blocks
     )
     symm_mem_hdl = symm_mem.rendezvous(state.comm_buff, group=state.group)
     assert state.rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
@@ -1049,7 +1067,12 @@ def nvidia_rsag_reduce_scatter(
         hidden_states.shape[-1] == state.hidden_dim
     ), f"Mismatched shape, {hidden_states.shape[0]=} != {total_num_tokens=} or {hidden_states.shape[-1]=} != {state.hidden_dim=} {hidden_states.shape=}"
     state.comm_buff[:total_num_tokens, :].copy_(hidden_states)
-    nvidia_rsag_multimem_reduce_scatter(state, local_num_tokens, local_token_offset)
+    num_blocks = nvidia_rsag_reduce_scatter_num_blocks(
+        token_list_in_group, state.hidden_dim
+    )
+    nvidia_rsag_multimem_reduce_scatter(
+        state, local_num_tokens, local_token_offset, num_blocks=num_blocks
+    )
     output = state.comm_buff[
         local_token_offset : (local_token_offset + local_num_tokens), :
     ]
