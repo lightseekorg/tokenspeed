@@ -364,7 +364,7 @@ class DFlashDraftModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_lengths: torch.Tensor,
+        input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> LogitsProcessorOutput:

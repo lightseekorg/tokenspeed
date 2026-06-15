@@ -463,7 +463,6 @@ class DFlash(BaseDrafter):
                 input_ids=flat_ids,
                 positions=block_positions.reshape(-1),
                 out_cache_loc=cache_locs,
-                input_lengths=self.draft_input_lengths_buf[:bs],
                 captured_hidden_states=None,
                 input_embeds=input_embeds,
             )
