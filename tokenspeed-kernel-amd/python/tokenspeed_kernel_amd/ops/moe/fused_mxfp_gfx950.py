@@ -325,8 +325,8 @@ def _swiglu_split_layout(
 ) -> gl.constexpr:
     THREADS_PER_WARP = 64  # CDNA4 wavefront size.
     return gl.BlockedLayout(
-        size_per_thread=[1, 4],
-        threads_per_warp=[2, THREADS_PER_WARP // 2],
+        size_per_thread=[1, 8],
+        threads_per_warp=[4, THREADS_PER_WARP // 4],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
@@ -4859,6 +4859,18 @@ def gluon_mxfp_combine(
         # without changing the global swizzle heuristic used elsewhere.
         group_m = 8
         xcd_swizzle = _CDNA4_NUM_XCDS
+    elif (
+        w_preshuffle
+        and persistent
+        and num_ctas == _CDNA4_NUM_CUS
+        and block_m == 64
+        and block_n == 256
+        and block_k == 256
+        and not use_slice_mn
+        and use_slice_n
+    ):
+        group_m = 4
+        xcd_swizzle = 4
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
     if n_tokens is None:
         n_rows = M
