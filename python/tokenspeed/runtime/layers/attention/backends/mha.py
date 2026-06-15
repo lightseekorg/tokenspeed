@@ -124,10 +124,10 @@ class MHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
-        extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor | None = None,
+        extend_seq_lens_cpu: torch.Tensor | None = None,
+        extend_prefix_lens: torch.Tensor | None = None,
+        extend_prefix_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
@@ -141,6 +141,10 @@ class MHAAttnBackend(AttentionBackend):
         )
 
         if forward_mode.is_extend_or_mixed():
+            assert extend_seq_lens is not None
+            assert extend_seq_lens_cpu is not None
+            assert extend_prefix_lens is not None
+            assert extend_prefix_lens_cpu is not None
             extend_seq_lens = extend_seq_lens[:bs]
             extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
             cu_extend_seq_lens, cu_extend_seq_lens_cpu = self._make_cu_extend_seq_lens(
