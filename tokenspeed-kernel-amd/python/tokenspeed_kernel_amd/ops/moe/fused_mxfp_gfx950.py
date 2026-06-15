@@ -2400,8 +2400,8 @@ class MoESliceNProgram:
             self.async_wait_groups(2 * (NB - 1))
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
-            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             self.async_wait_groups(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
@@ -2412,8 +2412,8 @@ class MoESliceNProgram:
             self.async_wait_groups(2 * (NB - 1))
             x0, sx0 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
-            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
+            w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             self.async_wait_groups(2 * (NB - 1))
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
@@ -2425,8 +2425,8 @@ class MoESliceNProgram:
             self.async_wait_groups(2 * (NB - 1))
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
-            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
+            w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             self.async_wait_groups(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
