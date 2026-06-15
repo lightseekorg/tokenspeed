@@ -4190,7 +4190,7 @@ def _launch_kernel(
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
         K_ITERS=K_ITERS,
-        N_CONST=N if w_preshuffle and swiglu is None else 0,
+        N_CONST=N if w_preshuffle else 0,
         Y_N_CONST=int(y_n_const),
         APPLY_X_GLOBAL_SCALE=apply_x_global_scale,
         USE_WARP_PIPELINE=use_warp_pipeline,
