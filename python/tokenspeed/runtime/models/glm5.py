@@ -1557,17 +1557,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 * self.indexer.softmax_scale
             ).squeeze(-1)
 
-            index_k_with_scale_cache = (
-                ctx.token_to_kv_pool.get_index_k_with_scale_buffer(
-                    self.attn_mqa.layer_id
-                )
+            # The packed FP8 index-K cache is block-split per page, so gather
+            # token rows through the pool helper rather than indexing raw rows.
+            k_fp8, k_scale = ctx.token_to_kv_pool.gather_index_k_with_scale(
+                self.attn_mqa.layer_id,
+                kv_workspace_slots,
             )
-            gathered_k = index_k_with_scale_cache.index_select(
-                0,
-                kv_workspace_slots.to(torch.int64),
-            )
-            k_fp8 = gathered_k[:, : self.indexer.index_head_dim].view(q_fp8.dtype)
-            k_scale = gathered_k[:, self.indexer.index_head_dim :].view(torch.float32)
+            k_fp8 = k_fp8.view(q_fp8.dtype)
             kv_fp8 = (k_fp8.contiguous(), k_scale.squeeze(-1).contiguous())
 
             req_ids = torch.arange(

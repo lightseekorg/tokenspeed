@@ -141,7 +141,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
             buf[tgt_loc_flat] = buf[src_loc_flat]
         for buf in self.index_k_with_scale_buffer:
             if buf is not None:
-                buf[tgt_loc_flat] = buf[src_loc_flat]
+                # Packed FP8 index-K is block-split per page, so a single
+                # token's bytes are NOT a contiguous row; move the FP8 values
+                # and FP32 scales through their block-split views instead.
+                fp8_view, scale_view = self._index_k_with_scale_block_views(buf)
+                ps = self.page_size
+                tgt_page = tgt_loc_flat // ps
+                tgt_slot = tgt_loc_flat % ps
+                src_page = src_loc_flat // ps
+                src_slot = src_loc_flat % ps
+                fp8_view[tgt_page, tgt_slot] = fp8_view[src_page, src_slot]
+                scale_view[tgt_page, tgt_slot] = scale_view[src_page, src_slot]
 
     def set_mla_kv_buffer(
         self,
@@ -204,6 +214,78 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_k_buffer[layer_id][loc] = index_k
         self._set_index_k_with_scale_buffer(layer_id, loc, index_k)
 
+    def _index_k_with_scale_block_views(
+        self, buf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-page block-split views into a packed FP8 index-K buffer.
+
+        DeepGEMM's ``fp8_paged_mqa_logits`` expects each page of ``page_size``
+        tokens to be laid out as ``[page_size * head_dim FP8 values]`` followed
+        by ``[page_size * num_groups FP32 scales]`` (block-split), NOT a
+        per-token ``[fp8 | scale]`` interleave. The two ``as_strided`` views
+        below alias the same storage as ``buf`` so writes land in place.
+
+        Args:
+            buf: Packed FP8 index-K buffer of shape ``[num_slots, row_bytes]``
+                and dtype ``uint8``, where ``row_bytes == head_dim +
+                num_groups * 4`` and ``num_slots`` is a multiple of
+                ``page_size``.
+
+        Returns:
+            ``(fp8_view, scale_view)`` where ``fp8_view`` has shape
+            ``[num_pages, page_size, head_dim]`` (FP8 e4m3) and ``scale_view``
+            has shape ``[num_pages, page_size, num_groups]`` (float32), both
+            indexed as ``view[page, slot_in_page]``.
+        """
+        ps = self.page_size
+        hd = self.index_head_dim
+        ng = hd // 128
+        row = hd + ng * 4
+        num_pages = buf.shape[0] // ps
+        page_bytes = ps * row
+        flat = buf.reshape(-1)
+        fp8_view = torch.as_strided(
+            flat.view(torch.float8_e4m3fn),
+            (num_pages, ps, hd),
+            (page_bytes, hd, 1),
+        )
+        scale_view = torch.as_strided(
+            flat.view(torch.float32),
+            (num_pages, ps, ng),
+            (page_bytes // 4, ng, 1),
+            (ps * hd) // 4,
+        )
+        return fp8_view, scale_view
+
+    def gather_index_k_with_scale(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather per-token FP8 index-K values and scales from the cache.
+
+        The packed FP8 index-K buffer is stored block-split per page (see
+        :meth:`_index_k_with_scale_block_views`), so the non-paged prefill
+        scoring kernel (``fp8_mqa_logits``), which consumes contiguous
+        ``(k_fp8, k_scale)`` tensors, must gather token rows through the
+        block-split views rather than indexing raw rows.
+
+        Args:
+            layer_id: Layer whose index-K cache to read.
+            slots: 1D int tensor of global token slot indices to gather.
+
+        Returns:
+            ``(k_fp8, k_scale)`` where ``k_fp8`` has shape
+            ``[num_slots, head_dim]`` (FP8 e4m3) and ``k_scale`` has shape
+            ``[num_slots, num_groups]`` (float32).
+        """
+        buf = self.get_index_k_with_scale_buffer(layer_id)
+        fp8_view, scale_view = self._index_k_with_scale_block_views(buf)
+        slots = slots.to(torch.long)
+        page = slots // self.page_size
+        slot_in_page = slots % self.page_size
+        k_fp8 = fp8_view[page, slot_in_page]
+        k_scale = scale_view[page, slot_in_page]
+        return k_fp8, k_scale
+
     def _set_index_k_with_scale_buffer(
         self,
         layer_id: int,
@@ -234,10 +316,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 self._index_k_with_scale_warning_emitted = True
             return
 
-        value_view = buf[:, : self.index_head_dim].view(index_k_fp8.dtype)
-        scale_view = buf[:, self.index_head_dim :].view(torch.float32)
-        value_view[loc] = index_k_fp8.view(-1, self.index_head_dim)
-        scale_view[loc] = index_k_scale.view(-1, self.index_head_dim // 128)
+        fp8_view, scale_view = self._index_k_with_scale_block_views(buf)
+        loc = loc.to(torch.long)
+        page = loc // self.page_size
+        slot_in_page = loc % self.page_size
+        fp8_view[page, slot_in_page] = index_k_fp8.view(-1, self.index_head_dim)
+        scale_view[page, slot_in_page] = index_k_scale.view(
+            -1, self.index_head_dim // 128
+        )
 
     def get_contiguous_buf_infos(self):
         data_ptrs, data_lens, item_lens = super().get_contiguous_buf_infos()
