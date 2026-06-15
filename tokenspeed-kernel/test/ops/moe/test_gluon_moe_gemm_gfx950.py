@@ -4,11 +4,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.moe.triton_kernels import FnSpecs, FusedActivation, swiglu_fn
+from tokenspeed_kernel.ops.moe.gluon.mxfp4 import gluon_mxfp4_moe_process_weights
+from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
+    _routing,
+    fp8_quantize,
+    triton_mxfp4_moe_process_weights,
+)
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.selection import kernel_override
+from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe
+from triton_kernels.matmul import FnSpecs, FusedActivation, matmul
+from triton_kernels.swiglu import swiglu_fn
 
 HIDDEN_SIZE = 2880
 INTERMEDIATE_SIZE = 2880
@@ -40,10 +46,8 @@ KEY_NUM_TOKENS = [
 
 
 def test_gluon_dot_preshuffle_records_layout_block_n() -> None:
-    from tokenspeed_kernel.ops.moe import shuffle_weight_for_gluon_dot_layout
-
     w = torch.arange(128 * 128, dtype=torch.uint8).reshape(128, 128)
-    shuffled = shuffle_weight_for_gluon_dot_layout(w, block_n=128)
+    shuffled = gluon_moe.shuffle_weight_for_gluon_dot_layout(w, block_n=128)
 
     assert shuffled.is_shuffled_for_gluon_dot is True
     assert shuffled.original_k_pk == 128
@@ -224,39 +228,33 @@ def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
     )
 
 
-def _make_backend():
-    from tokenspeed.runtime.layers.moe.backends.mxfp4 import gluon_kernel
-    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
-    from tokenspeed.runtime.layers.quantization import Mxfp4Config
-
-    spec = MoELayerSpec(
-        top_k=TOPK,
-        num_experts=E,
-        num_local_experts=E,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        activation="swiglu",
-        tp_rank=0,
-        tp_size=1,
-        ep_rank=0,
-        ep_size=1,
+def _make_weight_module(raw: RawMxfp4Weights) -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.activation = "swiglu"
+    layer.swiglu_arg = None
+    layer.w13_weight = torch.nn.Parameter(raw.w13_weight.clone(), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        raw.w13_scale.clone(), requires_grad=False
     )
-    return gluon_kernel.Mxfp4GluonKernelBackend(
-        BackendKey("gfx950", "mxfp4", "gluon"),
-        spec,
-        Mxfp4Config(is_checkpoint_mxfp4_serialized=True, is_w4a8_fp8=True),
+    layer.w2_weight = torch.nn.Parameter(raw.w2_weight.clone(), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(raw.w2_scale.clone(), requires_grad=False)
+    layer.w13_weight_bias = torch.nn.Parameter(
+        torch.zeros(E, 2 * INTERMEDIATE_SIZE, device=raw.w13_weight.device),
+        requires_grad=False,
     )
-
-
-def _copy_raw_weights(layer: torch.nn.Module, raw: RawMxfp4Weights) -> None:
-    layer.w13_weight.data.copy_(raw.w13_weight)
-    layer.w13_weight_scale.data.copy_(raw.w13_scale)
-    layer.w2_weight.data.copy_(raw.w2_weight)
-    layer.w2_weight_scale.data.copy_(raw.w2_scale)
-    layer.w13_weight_bias.data.zero_()
-    layer.w2_weight_bias.data.zero_()
-    layer.w13_input_scale.data.fill_(W13_ACT_SCALE)
-    layer.w2_input_scale.data.fill_(W2_ACT_SCALE)
+    layer.w2_weight_bias = torch.nn.Parameter(
+        torch.zeros(E, HIDDEN_SIZE, device=raw.w13_weight.device),
+        requires_grad=False,
+    )
+    layer.w13_input_scale = torch.nn.Parameter(
+        torch.full((E,), W13_ACT_SCALE, device=raw.w13_weight.device),
+        requires_grad=False,
+    )
+    layer.w2_input_scale = torch.nn.Parameter(
+        torch.full((E,), W2_ACT_SCALE, device=raw.w13_weight.device),
+        requires_grad=False,
+    )
+    return layer
 
 
 def _make_preprocessed_weights(
@@ -264,23 +262,12 @@ def _make_preprocessed_weights(
     *,
     preshuffle: bool,
 ) -> Mxfp4Weights:
-    backend = _make_backend()
-    layer = torch.nn.Module()
-    layer.activation = "swiglu"
-    layer.swiglu_arg = None
-    backend.create_layer_weights(layer, with_bias=True)
-    layer.to(raw.w13_weight.device)
-    _copy_raw_weights(layer, raw)
-
+    layer = _make_weight_module(raw)
+    plan = {"internal_activation_dtype": "fp8"}
     if preshuffle:
-        from tokenspeed.runtime.layers.moe.backends.mxfp4 import gluon_kernel
-
-        gluon_kernel._pad_w2_to_block_n(layer, GLUON_COMBINE_BLOCK_N)
-
-    backend.process_weights_after_loading(layer)
-
-    if preshuffle:
-        gluon_kernel._attach_gluon_bpreshuffle(layer)
+        gluon_mxfp4_moe_process_weights(plan, layer)
+    else:
+        triton_mxfp4_moe_process_weights(plan, layer)
 
     return Mxfp4Weights(
         w13_weight=layer.w13_weight_triton_tensor,
@@ -335,10 +322,9 @@ def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
         ).to(torch.float32)
         / 16.0
     ).to(torch.bfloat16)
-    return tokenspeed_kernel.quantize_fp8(
+    return fp8_quantize(
         exact_values,
         scale=scale,
-        solution="triton",
     )
 
 
@@ -355,57 +341,44 @@ def _compute_triton_reference(
 ) -> TritonReference:
     hidden_states, router_logits = _make_hidden_and_router(num_tokens)
 
-    with kernel_override("moe", "route", "triton_kernels_routing"):
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
-            tokenspeed_kernel.moe_route(
-                router_logits,
-                TOPK,
-                sm_first=False,
-                dtype=router_logits.dtype,
-                traits={"output_type": "ragged_metadata"},
-                expected_kernel_name="triton_kernels_routing",
-            )
-        )
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
+        router_logits,
+        TOPK,
+        sm_first=False,
+        dtype=router_logits.dtype,
+    )
 
     assert int(ragged_metadata.slice_sizes.sum()) == num_tokens * TOPK
 
-    gemm1_input = tokenspeed_kernel.quantize_fp8(
+    gemm1_input = fp8_quantize(
         hidden_states,
         scale=weights.w13_act_scale,
-        solution="triton",
     )
     gemm2_input = _make_gemm2_input(num_tokens, weights.w2_act_scale)
 
     with torch.no_grad():
-        with kernel_override("moe", "experts", "triton_kernels_dispatch_gemm"):
-            gemm1_output = tokenspeed_kernel.moe_experts(
-                gemm1_input,
-                weights.w13_weight,
-                weights.w13_bias,
-                a_ragged_metadata=ragged_metadata,
-                gather_indx=gather_indx,
-                precision_config=weights.w13_precision_config,
-                fused_activation=_swiglu_activation(),
-                dtype=hidden_states.dtype,
-                features={"ragged_metadata", "dispatch_gemm"},
-                expected_kernel_name="triton_kernels_dispatch_gemm",
-            )
+        gemm1_output = matmul(
+            gemm1_input,
+            weights.w13_weight,
+            weights.w13_bias,
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            precision_config=weights.w13_precision_config,
+            fused_activation=_swiglu_activation(),
+        )
 
-        with kernel_override("moe", "experts", "triton_kernels_gemm_combine"):
-            gemm2_output = tokenspeed_kernel.moe_experts(
-                gemm2_input,
-                weights.w2_weight,
-                weights.w2_bias,
-                a_ragged_metadata=ragged_metadata,
-                scatter_indx=scatter_indx,
-                precision_config=weights.w2_precision_config,
-                gammas=gate_scal,
-                n_tokens=num_tokens,
-                n_expts_act=TOPK,
-                dtype=hidden_states.dtype,
-                features={"ragged_metadata", "gemm_combine"},
-                expected_kernel_name="triton_kernels_gemm_combine",
-            )
+        gemm2_routed = matmul(
+            gemm2_input,
+            weights.w2_weight,
+            weights.w2_bias,
+            a_ragged_metadata=ragged_metadata,
+            scatter_indx=scatter_indx,
+            precision_config=weights.w2_precision_config,
+            gammas=gate_scal,
+        )
+        gemm2_output = gemm2_routed.view(num_tokens, TOPK, gemm2_routed.shape[-1]).sum(
+            dim=1
+        )
 
     torch.cuda.synchronize()
     return TritonReference(
@@ -436,41 +409,27 @@ def _run_gluon_gemms(
     weights: Mxfp4Weights,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
-        with kernel_override("moe", "experts", "gluon_dispatch_gemm"):
-            gemm1_output = tokenspeed_kernel.moe_experts(
-                reference.gemm1_input,
-                weights.w13_weight,
-                weights.w13_bias,
-                a_ragged_metadata=reference.ragged_metadata,
-                gather_indx=reference.gather_indx,
-                precision_config=weights.w13_precision_config,
-                fused_activation=_swiglu_activation(),
-                dtype=reference.gemm1_input.dtype,
-                weight_format="mxfp4",
-                fp8_scale_granularity="tensor",
-                features={"ragged_metadata", "dispatch_gemm"},
-                traits={"weight_dtype": "mxfp4"},
-                expected_kernel_name="gluon_dispatch_gemm",
-            )
+        gemm1_output = gluon_moe.gluon_mxfp_ragged_matmul(
+            reference.gemm1_input,
+            weights.w13_weight,
+            weights.w13_bias,
+            a_ragged_metadata=reference.ragged_metadata,
+            gather_indx=reference.gather_indx,
+            precision_config=weights.w13_precision_config,
+            fused_activation=_swiglu_activation(),
+        )
 
-        with kernel_override("moe", "experts", "gluon_gemm_combine"):
-            gemm2_output = tokenspeed_kernel.moe_experts(
-                reference.gemm2_input,
-                weights.w2_weight,
-                weights.w2_bias,
-                a_ragged_metadata=reference.ragged_metadata,
-                scatter_indx=reference.scatter_indx,
-                precision_config=weights.w2_precision_config,
-                gammas=reference.gate_scal,
-                n_tokens=reference.gate_scal.shape[0] // TOPK,
-                n_expts_act=TOPK,
-                dtype=reference.gemm2_input.dtype,
-                weight_format="mxfp4",
-                fp8_scale_granularity="tensor",
-                features={"ragged_metadata", "gemm_combine"},
-                traits={"weight_dtype": "mxfp4"},
-                expected_kernel_name="gluon_gemm_combine",
-            )
+        gemm2_output = gluon_moe.gluon_mxfp_ragged_matmul(
+            reference.gemm2_input,
+            weights.w2_weight,
+            weights.w2_bias,
+            a_ragged_metadata=reference.ragged_metadata,
+            scatter_indx=reference.scatter_indx,
+            precision_config=weights.w2_precision_config,
+            gammas=reference.gate_scal,
+            n_tokens=reference.gate_scal.shape[0] // TOPK,
+            n_expts_act=TOPK,
+        )
 
     torch.cuda.synchronize()
     return gemm1_output, gemm2_output
