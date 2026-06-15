@@ -64,7 +64,10 @@ if _is_nvidia:
     )
 
 from tokenspeed_kernel.ops.attention.triton.context import context_attention_fwd
-from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
+from tokenspeed_kernel.ops.attention.triton.qkv_rotary import (
+    packed_qkv_complex_rotary,
+    packed_qkv_neox_rotary,
+)
 
 # CUDA-graph bucketing for the cuDNN vision prefill backend: batch and max
 # seqlen are quantized so a small set of captured graphs covers the request
@@ -382,6 +385,11 @@ class VisionAttention(nn.Module):
             self._backend_fn is vision_attn_fa4
             and self.position_embedding_mode == "complex_rope"
         )
+        self._use_packed_qkv_rotary = (
+            self._backend_fn is vision_attn_fa4
+            and self.customized_position_embedding_applier is None
+        )
+        self._copy_v_after_packed_qkv_rotary = False
         self._workspace_buffer = workspace_buffer
 
         self.qkv_proj = QKVParallelLinear(
@@ -437,13 +445,34 @@ class VisionAttention(nn.Module):
         )
 
         qkv, _ = self.qkv_proj(x)
-        cos = None
-        sin = None
 
+        use_packed_qkv_rotary = (
+            self._use_packed_qkv_rotary
+            and position_embeddings is None
+            and rotary_pos_emb_cos is not None
+            and rotary_pos_emb_sin is not None
+        )
         use_packed_qkv_complex_rotary = (
             self._use_packed_qkv_complex_rotary and position_embeddings is not None
         )
-        if use_packed_qkv_complex_rotary:
+        cos = rotary_pos_emb_cos if use_packed_qkv_rotary else None
+        sin = rotary_pos_emb_sin if use_packed_qkv_rotary else None
+
+        if use_packed_qkv_rotary:
+            if cos.size(-1) * 2 == self.head_size:
+                cos = torch.cat([cos, cos], dim=-1)
+                sin = torch.cat([sin, sin], dim=-1)
+            q, k, v = packed_qkv_neox_rotary(
+                qkv,
+                self.q_size,
+                self.kv_size,
+                head,
+                self.head_size,
+                cos,
+                sin,
+                copy_v=self._copy_v_after_packed_qkv_rotary,
+            )
+        elif use_packed_qkv_complex_rotary:
             q, k, v = packed_qkv_complex_rotary(
                 qkv,
                 self.q_size,
@@ -451,26 +480,35 @@ class VisionAttention(nn.Module):
                 head,
                 self.head_size,
                 position_embeddings,
+                copy_v=self._copy_v_after_packed_qkv_rotary,
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            q = q.reshape(bsz * s, head, -1).contiguous()
-            k = k.reshape(bsz * s, kv_head, -1).contiguous()
-            v = v.reshape(bsz * s, kv_head, -1).contiguous()
+            q = q.reshape(bsz * s, head, -1)
+            k = k.reshape(bsz * s, kv_head, -1)
+            v = v.reshape(bsz * s, kv_head, -1)
 
-        if not use_packed_qkv_complex_rotary and position_embeddings is not None:
-            if self.customized_position_embedding_applier is not None:
-                q, k = self.customized_position_embedding_applier(
-                    q, k, position_embeddings, x_shape
-                )
-            else:
-                cos, sin = position_embeddings
-        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            cos = rotary_pos_emb_cos
-            sin = rotary_pos_emb_sin
+            cos = None
+            sin = None
 
-        if cos is not None and sin is not None:
+            if position_embeddings is not None:
+                if self.customized_position_embedding_applier is not None:
+                    q, k = self.customized_position_embedding_applier(
+                        q, k, position_embeddings, x_shape
+                    )
+                else:
+                    cos, sin = position_embeddings
+            elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+                cos = rotary_pos_emb_cos
+                sin = rotary_pos_emb_sin
+
+        if (
+            not use_packed_qkv_rotary
+            and not use_packed_qkv_complex_rotary
+            and cos is not None
+            and sin is not None
+        ):
             original_shape = q.shape
 
             # [total_tokens, head, head_size]
