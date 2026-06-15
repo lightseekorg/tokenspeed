@@ -30,6 +30,10 @@ from tokenspeed_kernel import (
     mha_extend_with_kvcache,
     mha_prefill,
 )
+from tokenspeed_kernel.ops.kvcache.triton import (
+    fused_fp8_set_kv_buffer,
+    gather_page_table_with_padding,
+)
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -102,6 +106,7 @@ class MHAAttnBackend(AttentionBackend):
         self.tp_kv_head_num = max(num_kv_heads // config.attn_tp_size, 1)
         self.head_dim = config.head_dim
         self.qkv_dtype = config.dtype
+        self.kv_cache_dtype = config.kv_cache_dtype
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
@@ -214,6 +219,9 @@ class MHAAttnBackend(AttentionBackend):
             )
             self.cuda_graph_page_table = page_table
             self.cuda_graph_seq_lens = seq_lens
+            self.cuda_graph_base_page_table = torch.zeros(
+                (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
+            )
             self.cuda_graph_page_table.zero_()
         else:
             # Alias controller's seq_lens_buf — backend never mutates it.
@@ -264,16 +272,33 @@ class MHAAttnBackend(AttentionBackend):
         assert not forward_mode.is_extend_or_mixed()
 
         if self.spec_num_tokens > 1 and not self.is_draft:
-            base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            base_page_table = self.cuda_graph_base_page_table
+            gather_page_table_with_padding(
+                req_to_page=req_to_page,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out=base_page_table,
+                bs=bs,
+                max_num_pages=self.max_num_pages,
+                page_size=self.page_size,
+                dummy_slot=0,
+            )
             self._fill_spec_metadata(
                 self.cuda_graph_page_table[: bs * self.spec_num_tokens, :],
                 self.cuda_graph_seq_lens[: bs * self.spec_num_tokens],
-                base_page_table,
+                base_page_table[:bs, :],
                 seq_lens[:bs],
             )
         else:
-            self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
-                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            gather_page_table_with_padding(
+                req_to_page=req_to_page,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out=self.cuda_graph_page_table,
+                bs=bs,
+                max_num_pages=self.max_num_pages,
+                page_size=self.page_size,
+                dummy_slot=0,
             )
 
         if bs in self.cuda_graph_decode_metadata:
@@ -395,14 +420,7 @@ class MHAAttnBackend(AttentionBackend):
         output = self._unwrap_output(result)
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
         if save_kv_cache:
-            token_to_kv_pool.set_kv_buffer(
-                layer,
-                out_cache_loc,
-                k,
-                v,
-                layer.k_scale,
-                layer.v_scale,
-            )
+            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         return output
 
     def _forward_extend(
@@ -418,14 +436,10 @@ class MHAAttnBackend(AttentionBackend):
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         if save_kv_cache:
-            token_to_kv_pool.set_kv_buffer(
-                layer,
-                out_cache_loc,
-                k,
-                v,
-                layer.k_scale,
-                layer.v_scale,
-            )
+            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
+
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn).contiguous()
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         result = mha_extend_with_kvcache(
@@ -459,14 +473,10 @@ class MHAAttnBackend(AttentionBackend):
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         if save_kv_cache:
-            token_to_kv_pool.set_kv_buffer(
-                layer,
-                out_cache_loc,
-                k,
-                v,
-                layer.k_scale,
-                layer.v_scale,
-            )
+            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
+
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn).contiguous()
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         result = mha_decode_with_kvcache(
@@ -487,6 +497,40 @@ class MHAAttnBackend(AttentionBackend):
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
+
+    def _save_kv_cache(
+        self,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+    ) -> None:
+        if k is None:
+            return
+
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            fused_fp8_set_kv_buffer(
+                k=k,
+                v=v,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_loc=out_cache_loc,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+                page_size=self.page_size,
+            )
+            return
+
+        token_to_kv_pool.set_kv_buffer(
+            layer,
+            out_cache_loc,
+            k,
+            v,
+            layer.k_scale,
+            layer.v_scale,
+        )
 
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
