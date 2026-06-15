@@ -2139,10 +2139,6 @@ class MoESliceNProgram:
         self.x_desc.issue_async_load(
             load_idx, self.x_buffer, pred, USE_MASK=USE_MASK, COMMIT=0
         )
-        if not cfg.W_VIA_VGPR:
-            self.w_desc_top.issue_async_load(
-                load_idx, self.w_buffer_top, pred, USE_MASK=USE_MASK, COMMIT=0
-            )
         if cfg.SCALE_VIA_LDS:
             if cfg.WITH_X_MX_SCALE:
                 self.x_scale_desc.issue_async_load(
@@ -2160,6 +2156,10 @@ class MoESliceNProgram:
                     USE_MASK=USE_MASK,
                     COMMIT=0,
                 )
+        if not cfg.W_VIA_VGPR:
+            self.w_desc_top.issue_async_load(
+                load_idx, self.w_buffer_top, pred, USE_MASK=USE_MASK, COMMIT=0
+            )
         gl.amd.cdna4.async_copy.commit_group()
         return load_idx
 
@@ -3379,7 +3379,11 @@ def _pipelined_moe_tile_compute(
         else:
             acc = pgm.pipeline(K)
 
-    if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE:
+    FUSE_X_GLOBAL_WITH_GATE: gl.constexpr = (
+        APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE and APPLY_GATE_SCAL and not DO_SWIGLU
+    )
+
+    if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE and not FUSE_X_GLOBAL_WITH_GATE:
         x_global_scale = gl.load(x_global_scale_ptr)
         acc = acc * x_global_scale
 
@@ -3404,6 +3408,9 @@ def _pipelined_moe_tile_compute(
             mask=acc_m_in_bounds,
             other=1.0,
         )
+        if FUSE_X_GLOBAL_WITH_GATE:
+            x_global_scale = gl.load(x_global_scale_ptr)
+            scal = scal * x_global_scale
         acc = acc * scal[:, None].to(acc.dtype)
 
     if DO_SWIGLU:
