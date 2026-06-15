@@ -78,21 +78,20 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         q = q.index_select(0, ctx.gather_ids)
         if gate is not None:
             gate = gate.index_select(0, ctx.gather_ids)
-        # The catch-up runs as DECODE over the sliced live rows (see the class
-        # docstring). Going through self.attn keeps the standard k/v reshape and
-        # KV-cache write that every other attention call relies on, rather than
-        # invoking the backend directly.
+        # Dispatch as DECODE over the sliced live rows via self.attn (see the
+        # class docstring), which keeps the standard k/v reshape and KV write.
+        # A ctx copy overrides only the forward mode; record_kv_cache (keyed off
+        # the real mode) forces the backend's PD layerwise cache-step record that
+        # DECODE would otherwise skip on an EXTEND/MIXED catch-up.
         decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-        attn_output = self.attn(q, k, v, decode_ctx, out_cache_loc)
-        if (
-            getattr(ctx.attn_backend, "step_counter", None)
-            and not ctx.forward_mode.is_decode_or_idle()
-        ):
-            # Under PD disaggregation the backend records a layerwise cache step
-            # on its EXTEND path so KV transfer can track per-layer readiness.
-            # The DECODE dispatch above skips that, so record it here to keep an
-            # EXTEND/MIXED catch-up in sync.
-            ctx.attn_backend.step_counter.record_cache()
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            decode_ctx,
+            out_cache_loc,
+            record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
+        )
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output

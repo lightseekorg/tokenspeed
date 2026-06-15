@@ -138,11 +138,29 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode,
         bs: int,
         save_kv_cache: bool = True,
+        record_kv_cache: bool | None = None,
         **kwargs,
     ):
-        """Run forward on an attention layer with explicit scheduler metadata."""
+        """Run forward on an attention layer with explicit scheduler metadata.
+
+        ``record_kv_cache`` overrides the PD layerwise cache-step recording:
+        ``None`` keeps the default (record on the EXTEND-side path), an explicit
+        bool forces it so a DECODE-dispatched draft catch-up can still record.
+        """
+        # Anchor the record to the KV write: before forward_extend when the KV
+        # was pre-written (save_kv_cache=False), after it otherwise.
+        if record_kv_cache is None:
+            record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
+        else:
+            record_cache = record_kv_cache
+        record_cache = record_cache and getattr(self, "step_counter", None) is not None
+        pre_attn_record = record_cache and not save_kv_cache
+        post_attn_record = record_cache and save_kv_cache
+
+        if pre_attn_record:
+            self.step_counter.record_cache()
         if forward_mode.is_decode():
-            return self.forward_decode(
+            ret = self.forward_decode(
                 q,
                 k,
                 v,
@@ -154,13 +172,6 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         else:
-            if (
-                not forward_mode.is_idle()
-                and getattr(self, "step_counter", None)
-                and not save_kv_cache
-            ):
-                self.step_counter.record_cache()
-
             ret = self.forward_extend(
                 q,
                 k,
@@ -173,14 +184,9 @@ class AttentionBackend(ABC):
                 forward_mode=forward_mode,
                 **kwargs,
             )
-
-            if (
-                not forward_mode.is_idle()
-                and getattr(self, "step_counter", None)
-                and save_kv_cache
-            ):
-                self.step_counter.record_cache()
-            return ret
+        if post_attn_record:
+            self.step_counter.record_cache()
+        return ret
 
     def forward_decode(
         self,

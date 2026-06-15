@@ -99,7 +99,10 @@ class LlamaAttention(BaseLlamaAttention):
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
                 ).index_select(0, ctx.gather_ids)
-                attn_output = ctx.attn_backend.forward(
+                # record_kv_cache (keyed off the real mode) forces the backend's
+                # PD layerwise cache-step record that the DECODE dispatch would
+                # otherwise skip on an EXTEND/MIXED catch-up.
+                return ctx.attn_backend.forward(
                     q_rope,
                     None,
                     None,
@@ -109,17 +112,8 @@ class LlamaAttention(BaseLlamaAttention):
                     ForwardMode.DECODE,
                     ctx.bs,
                     save_kv_cache=False,
+                    record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
                 )
-                if (
-                    getattr(ctx.attn_backend, "step_counter", None)
-                    and not ctx.forward_mode.is_decode_or_idle()
-                ):
-                    # Under PD disaggregation the backend records a layerwise
-                    # cache step on its EXTEND path so KV transfer can track
-                    # per-layer readiness. The DECODE call above skips that, so
-                    # record it here to keep an EXTEND/MIXED catch-up in sync.
-                    ctx.attn_backend.step_counter.record_cache()
-                return attn_output
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
             0, ctx.gather_ids
