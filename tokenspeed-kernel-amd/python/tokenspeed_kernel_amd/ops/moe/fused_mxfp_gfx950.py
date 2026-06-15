@@ -482,6 +482,7 @@ class MoEConfig:
 
     NUM_SUBTILES: gl.constexpr
     EVEN_K: gl.constexpr
+    K_ITERS: gl.constexpr
     USE_GATHER: gl.constexpr
     USE_MFMA_SCALED: gl.constexpr
     NUM_LOADS_IN_BATCH: gl.constexpr
@@ -521,6 +522,7 @@ class MoEConfig:
         index_type,
         NUM_SUBTILES=(1, 1, 1),
         EVEN_K=True,
+        K_ITERS=0,
         USE_GATHER=False,
         NUM_WARPS=4,
         W_PRESHUFFLED=False,
@@ -562,6 +564,7 @@ class MoEConfig:
 
         self.NUM_SUBTILES = gl.constexpr(NUM_SUBTILES)
         self.EVEN_K = gl.constexpr(EVEN_K)
+        self.K_ITERS = gl.constexpr(K_ITERS)
         self.USE_GATHER = gl.constexpr(USE_GATHER)
         _SCALED_FORMATS = ("e2m1", "e4m3", "e5m2")
         self.USE_MFMA_SCALED = gl.constexpr(
@@ -1406,7 +1409,10 @@ class MoEPipelinedProgram:
         accumulator = gl.zeros(
             (cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout
         )
-        K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
+        if cfg.K_ITERS:
+            K_iters: gl.constexpr = cfg.K_ITERS
+        else:
+            K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
         # Two-buffer local-prefetch pipeline, unrolled by 2:
         #   async_copy(k + 2) -> freed LDS buffer
@@ -1821,7 +1827,10 @@ class MoESliceMNProgram:
         c_tr = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c_br = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
 
-        K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
+        if cfg.K_ITERS:
+            K_iters: gl.constexpr = cfg.K_ITERS
+        else:
+            K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
         # K-tail mask absorbed via USE_MASK=-1 in-loop (no dedicated peel).
         main_iters = K_iters - NB
         gl.assume(main_iters >= 2)
@@ -2277,7 +2286,10 @@ class MoESliceNProgram:
         c0 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c1 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
 
-        K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
+        if cfg.K_ITERS:
+            K_iters: gl.constexpr = cfg.K_ITERS
+        else:
+            K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
         main_iters = K_iters - NB
         gl.assume(main_iters >= 0)
 
@@ -2417,6 +2429,7 @@ def _pipelined_moe_tile_compute(
     W_TRANSPOSE: gl.constexpr = False,
     NUM_SUBTILES: gl.constexpr = (1, 1, 1),
     EVEN_K: gl.constexpr = True,
+    K_ITERS: gl.constexpr = 0,
     APPLY_X_GLOBAL_SCALE: gl.constexpr = True,
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
@@ -2467,6 +2480,7 @@ def _pipelined_moe_tile_compute(
         index_type,
         NUM_SUBTILES,
         EVEN_K,
+        K_ITERS,
         USE_GATHER,
         NUM_WARPS,
         W_PRESHUFFLED=W_PRESHUFFLED,
@@ -3421,6 +3435,7 @@ def _pipelined_moe_kernel_scaled(
     W_TRANSPOSE: gl.constexpr = False,
     NUM_SUBTILES: gl.constexpr = (1, 1, 1),
     EVEN_K: gl.constexpr = True,
+    K_ITERS: gl.constexpr = 0,
     APPLY_X_GLOBAL_SCALE: gl.constexpr = True,
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
@@ -3529,6 +3544,7 @@ def _pipelined_moe_kernel_scaled(
                 W_TRANSPOSE=W_TRANSPOSE,
                 NUM_SUBTILES=NUM_SUBTILES,
                 EVEN_K=EVEN_K,
+                K_ITERS=K_ITERS,
                 APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
                 USE_WARP_PIPELINE=USE_WARP_PIPELINE,
                 USE_SLICE_MN=USE_SLICE_MN,
@@ -3948,6 +3964,7 @@ def _launch_kernel(
     else:
         NUM_SUBTILES = (1, 1, 1)
     EVEN_K = K % block_k == 0
+    K_ITERS = (K + block_k - 1) // block_k
 
     needs_scale_load = apply_x_global_scale and not has_x_block_scale
     if not needs_scale_load:
@@ -4055,6 +4072,7 @@ def _launch_kernel(
         W_TRANSPOSE=w_transpose,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
+        K_ITERS=K_ITERS,
         APPLY_X_GLOBAL_SCALE=apply_x_global_scale,
         USE_WARP_PIPELINE=use_warp_pipeline,
         USE_SLICE_MN=use_slice_mn,
