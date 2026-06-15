@@ -2586,6 +2586,7 @@ def _pipelined_moe_tile_compute(
     W_PRESHUFFLED: gl.constexpr = False,
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
+    W_CACHE_CG: gl.constexpr = False,
 ):
     expert_id = compact_idx
 
@@ -2639,7 +2640,7 @@ def _pipelined_moe_tile_compute(
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
 
-    W_CACHE_MODIFIER: gl.constexpr = ".cg" if BLOCK_M <= 32 else ""
+    W_CACHE_MODIFIER: gl.constexpr = ".cg" if W_CACHE_CG else ""
 
     X_ELEM_BITS: gl.constexpr = x_ptr.dtype.element_ty.primitive_bitwidth
     W_ELEM_BITS: gl.constexpr = w_ptr.dtype.element_ty.primitive_bitwidth
@@ -3677,6 +3678,7 @@ def _pipelined_moe_kernel_scaled(
     W_PRESHUFFLED: gl.constexpr = False,
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
+    W_CACHE_CG: gl.constexpr = False,
 ):
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
@@ -3780,6 +3782,7 @@ def _pipelined_moe_kernel_scaled(
             W_PRESHUFFLED=W_PRESHUFFLED,
             W_VIA_VGPR=W_VIA_VGPR,
             W_PREFETCH=W_PREFETCH,
+            W_CACHE_CG=W_CACHE_CG,
         )
 
 
@@ -3973,6 +3976,7 @@ def _launch_kernel(
     out_quant_scale: torch.Tensor | float | None = None,
     w_preshuffle: bool = False,
     y_n_const: int = 0,
+    w_cache_cg: bool | None = None,
 ):
     assert x_format in _SCALED_FORMATS, f"unknown x_format={x_format!r}"
     assert w_format in _SCALED_FORMATS, f"unknown w_format={w_format!r}"
@@ -4130,6 +4134,8 @@ def _launch_kernel(
         group_m = 1
     if xcd_swizzle > 1 and num_tiles_total % xcd_swizzle != 0:
         xcd_swizzle = 1
+    if w_cache_cg is None:
+        w_cache_cg = block_m <= 32
 
     bias_buf = bias if bias is not None else _make_dummy(x.device, torch.float32)
     gather_buf = (
@@ -4311,6 +4317,7 @@ def _launch_kernel(
         W_PRESHUFFLED=w_preshuffle,
         W_VIA_VGPR=False,
         W_PREFETCH=False,
+        W_CACHE_CG=bool(w_cache_cg),
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
@@ -4806,6 +4813,7 @@ def gluon_mxfp_dispatch_swiglu(
             num_ctas = _CDNA4_NUM_CUS
     group_m = None
     xcd_swizzle = None
+    w_cache_cg = None
     if (
         w_preshuffle
         and not persistent
@@ -4838,6 +4846,7 @@ def gluon_mxfp_dispatch_swiglu(
         # with all-XCD spreading.
         group_m = 32
         xcd_swizzle = _CDNA4_NUM_XCDS
+        w_cache_cg = True
     elif (
         w_preshuffle
         and persistent
@@ -4889,6 +4898,7 @@ def gluon_mxfp_dispatch_swiglu(
         xcd_swizzle=xcd_swizzle,
         out_quant_scale=out_quant_scale,
         w_preshuffle=w_preshuffle,
+        w_cache_cg=w_cache_cg,
     )
     return y
 
@@ -5074,6 +5084,7 @@ def gluon_mxfp_combine(
             num_ctas = _CDNA4_NUM_CUS
     group_m = None
     xcd_swizzle = None
+    w_cache_cg = None
     if (
         w_preshuffle
         and not persistent
@@ -5138,6 +5149,7 @@ def gluon_mxfp_combine(
         elif slice_size == 32:
             group_m = 4
             xcd_swizzle = _CDNA4_NUM_XCDS
+            w_cache_cg = True
         else:
             group_m = 4
             xcd_swizzle = 4
@@ -5201,6 +5213,7 @@ def gluon_mxfp_combine(
         xcd_swizzle=xcd_swizzle,
         w_preshuffle=w_preshuffle,
         y_n_const=y_n if y_n != N else 0,
+        w_cache_cg=w_cache_cg,
     )
     if n_act_eff > 1:
         y = y.view(n_tokens_eff, n_act_eff, y_n).sum(dim=1)
