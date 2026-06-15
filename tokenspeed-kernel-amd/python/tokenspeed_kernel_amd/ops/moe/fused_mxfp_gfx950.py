@@ -277,7 +277,7 @@ def _store_layout(num_warps: int, block_m: int = 0, w_via_vgpr: bool = False):
     else:
         warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
-    return gl.BlockedLayout([1, 8], [2, 32], [warps_m, warps_n], [1, 0])
+    return gl.BlockedLayout([1, 32], [8, 8], [warps_m, warps_n], [1, 0])
 
 
 @gluon.constexpr_function
