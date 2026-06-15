@@ -957,6 +957,28 @@ class AsyncCopyDescriptor:
         return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_view, layout)
 
     @gluon.jit
+    def issue_local_load_m_swizzle128(self, idx, buffer, layout: gl.constexpr):
+        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
+        slot = buffer.index(idx % NUM_BUFFERS)
+        slot_view = (
+            slot.reshape((32, 4, self.BLOCK_K))
+            .permute((1, 0, 2))
+            .reshape((128, self.BLOCK_K))
+        )
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_view, layout)
+
+    @gluon.jit
+    def issue_local_load_m_swizzle32(self, idx, buffer, layout: gl.constexpr):
+        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
+        slot = buffer.index(idx % NUM_BUFFERS)
+        slot_view = (
+            slot.reshape((16, 2, self.BLOCK_K))
+            .permute((1, 0, 2))
+            .reshape((32, self.BLOCK_K))
+        )
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_view, layout)
+
+    @gluon.jit
     def issue_local_load_unswizzle(
         self,
         idx,
@@ -2112,8 +2134,20 @@ class MoESliceNProgram:
     def issue_local_load_x(self, mfma_idx):
         cfg = self.cfg
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
-        if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 64:
+        if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 128:
+            x = self.x_desc.issue_local_load_m_swizzle128(
+                mfma_idx,
+                self.x_buffer,
+                cfg.dot_layout_x,
+            )
+        elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 64:
             x = self.x_desc.issue_local_load_m_swizzle64(
+                mfma_idx,
+                self.x_buffer,
+                cfg.dot_layout_x,
+            )
+        elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 32:
+            x = self.x_desc.issue_local_load_m_swizzle32(
                 mfma_idx,
                 self.x_buffer,
                 cfg.dot_layout_x,
@@ -2762,8 +2796,12 @@ def _pipelined_moe_tile_compute(
         offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
 
     rows_m = off_m + offs_xm
-    if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 64:
+    if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 128:
+        src_offs_xm = (offs_xm % 4) * 32 + (offs_xm // 4)
+    elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 64:
         src_offs_xm = (offs_xm % 4) * 16 + (offs_xm // 4)
+    elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 32:
+        src_offs_xm = (offs_xm % 2) * 16 + (offs_xm // 2)
     else:
         src_offs_xm = offs_xm
     rows_m_x = off_m + src_offs_xm
