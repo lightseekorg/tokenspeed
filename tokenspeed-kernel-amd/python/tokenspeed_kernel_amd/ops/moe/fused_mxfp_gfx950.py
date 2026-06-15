@@ -2526,6 +2526,7 @@ def _pipelined_moe_tile_compute(
     EVEN_K: gl.constexpr = True,
     K_ITERS: gl.constexpr = 0,
     N_CONST: gl.constexpr = 0,
+    Y_N_CONST: gl.constexpr = 0,
     APPLY_X_GLOBAL_SCALE: gl.constexpr = True,
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
@@ -3432,20 +3433,22 @@ def _pipelined_moe_tile_compute(
         )
         out = out * scal[:, None].to(out.dtype)
 
-    if N_LIMIT:
+    if Y_N_CONST:
+        ACTUAL_N: gl.constexpr = Y_N_CONST
+    elif N_LIMIT:
         ACTUAL_N: gl.constexpr = (N_LIMIT // 2) if DO_SWIGLU else N_LIMIT
     else:
         actual_n = (N // 2) if DO_SWIGLU else N
     if HAS_SCATTER:
         rows_y = gl.load(scatter_idx_ptr + offs_y_m_safe, mask=y_m_in_bounds, other=M)
-        if N_LIMIT:
+        if Y_N_CONST or N_LIMIT:
             mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < ACTUAL_N)
         else:
             mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
         rows_y_safe = gl.where(y_m_in_bounds, rows_y, gl.zeros_like(rows_y))
         y_offs = rows_y_safe[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
     else:
-        if N_LIMIT:
+        if Y_N_CONST or N_LIMIT:
             mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < ACTUAL_N)
         else:
             mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < actual_n)
@@ -3556,6 +3559,7 @@ def _pipelined_moe_kernel_scaled(
     EVEN_K: gl.constexpr = True,
     K_ITERS: gl.constexpr = 0,
     N_CONST: gl.constexpr = 0,
+    Y_N_CONST: gl.constexpr = 0,
     APPLY_X_GLOBAL_SCALE: gl.constexpr = True,
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MN: gl.constexpr = False,
@@ -3663,6 +3667,7 @@ def _pipelined_moe_kernel_scaled(
             EVEN_K=EVEN_K,
             K_ITERS=K_ITERS,
             N_CONST=N_CONST,
+            Y_N_CONST=Y_N_CONST,
             APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
             USE_WARP_PIPELINE=USE_WARP_PIPELINE,
             USE_SLICE_MN=USE_SLICE_MN,
@@ -3863,6 +3868,7 @@ def _launch_kernel(
     xcd_swizzle: int | None = None,
     out_quant_scale: torch.Tensor | float | None = None,
     w_preshuffle: bool = False,
+    y_n_const: int = 0,
 ):
     assert x_format in _SCALED_FORMATS, f"unknown x_format={x_format!r}"
     assert w_format in _SCALED_FORMATS, f"unknown w_format={w_format!r}"
@@ -4192,6 +4198,7 @@ def _launch_kernel(
         EVEN_K=EVEN_K,
         K_ITERS=K_ITERS,
         N_CONST=N if w_preshuffle and swiglu is None else 0,
+        Y_N_CONST=int(y_n_const),
         APPLY_X_GLOBAL_SCALE=apply_x_global_scale,
         USE_WARP_PIPELINE=use_warp_pipeline,
         USE_SLICE_MN=use_slice_mn,
@@ -4879,7 +4886,11 @@ def gluon_mxfp_combine(
     else:
         n_tokens_eff = int(n_tokens)
         n_rows = n_tokens_eff * n_act_eff
-    y = torch.empty((n_rows, N), device=x.device, dtype=out_dtype)
+    # Preshuffled W may be padded in N to satisfy the packed layout. Keep the
+    # padded N for tiling/W strides, but store only the caller-visible width.
+    logical_n = int(getattr(w, "original_n", N))
+    y_n = logical_n if w_preshuffle and logical_n < N else N
+    y = torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
     _launch_kernel(
         x,
         w,
@@ -4911,13 +4922,13 @@ def gluon_mxfp_combine(
         group_m=group_m,
         xcd_swizzle=xcd_swizzle,
         w_preshuffle=w_preshuffle,
+        y_n_const=y_n if y_n != N else 0,
     )
     if n_act_eff > 1:
-        y = y.view(n_tokens_eff, n_act_eff, N).sum(dim=1)
+        y = y.view(n_tokens_eff, n_act_eff, y_n).sum(dim=1)
     # Unpad N if the caller padded W for w_preshuffle. Padded W bytes
     # are 0 and padded scales are 127 so acc[:, N:N_padded] == 0.
-    logical_n = int(getattr(w, "original_n", N))
-    if logical_n != N:
+    if logical_n != y.shape[-1]:
         y = y[..., :logical_n].contiguous()
     return y
 
