@@ -240,9 +240,11 @@ def test_mha_extend_with_kvcache(
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer"])
+@pytest.mark.parametrize("seqlen_q", [1, 4], ids=["q1", "q4"])
 def test_mha_decode_with_kvcache(
     device: str,
     solution: str,
+    seqlen_q: int,
     dtype: torch.dtype,
     head_dim: int,
     num_q_heads: int,
@@ -255,12 +257,16 @@ def test_mha_decode_with_kvcache(
     page_size = 64
     max_cache_seqlen = 256
     prefix_seqlens = torch.tensor([63, 129, 17, 191], device=device, dtype=torch.int32)
-    cache_seqlens = prefix_seqlens + 1
+    cache_seqlens = prefix_seqlens + seqlen_q
     num_blocks_per_seq = (cache_seqlens + page_size - 1) // page_size
     max_num_blocks_per_seq = (max_cache_seqlen + page_size - 1) // page_size
     total_num_blocks = int(num_blocks_per_seq.sum().item())
 
-    q = _randn((batch_size, num_q_heads, head_dim), device=device, dtype=dtype)
+    q = _randn(
+        (batch_size * seqlen_q, num_q_heads, head_dim),
+        device=device,
+        dtype=dtype,
+    )
 
     page_table = torch.zeros(
         batch_size,
@@ -323,10 +329,42 @@ def test_mha_decode_with_kvcache(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max_cache_seqlen,
+        max_seqlen_q=seqlen_q,
         solution=solution,
     )
 
     assert out.shape == q.shape
+    if seqlen_q > 1 and dtype not in _FP8_DTYPES:
+        expanded_page_table = page_table[:, None, :].expand(
+            batch_size,
+            seqlen_q,
+            max_num_blocks_per_seq,
+        )
+        expanded_page_table = expanded_page_table.reshape(
+            batch_size * seqlen_q,
+            max_num_blocks_per_seq,
+        ).contiguous()
+        offsets = torch.arange(
+            seqlen_q - 1,
+            -1,
+            -1,
+            device=device,
+            dtype=torch.int32,
+        )
+        expanded_cache_seqlens = (
+            (cache_seqlens[:, None] - offsets).reshape(-1).contiguous()
+        )
+        expanded_out = mha_decode_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=expanded_page_table,
+            cache_seqlens=expanded_cache_seqlens,
+            max_seqlen_k=max_cache_seqlen,
+            solution=solution,
+        )
+
+        torch.testing.assert_close(out, expanded_out, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(
