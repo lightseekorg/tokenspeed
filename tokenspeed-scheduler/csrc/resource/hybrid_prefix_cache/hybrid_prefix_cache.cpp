@@ -1501,8 +1501,7 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
         last_committed = target;
     }
 
-    const bool terminal_state_committed =
-        commitTerminalContinuationSnapshot(tables, terminal, chunk_depth);
+    const bool terminal_state_committed = commitTerminalContinuationSnapshot(tables, terminal, chunk_depth);
 
     // Release superseded interior continuation-state snapshots.
     //
@@ -1530,8 +1529,8 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
         for (const auto& gid : paged_cache_continuation_state_groups_) {
             auto alloc_it = paged_cache_allocators_.find(gid);
             if (alloc_it != paged_cache_allocators_.end() && alloc_it->second != nullptr) {
-                max_state_window = std::max(
-                    max_state_window, alloc_it->second->Config().sliding_window_tokens.value_or(0));
+                max_state_window =
+                    std::max(max_state_window, alloc_it->second->Config().sliding_window_tokens.value_or(0));
             }
         }
         for (TreeNode* cur = terminal->Parent(); cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
