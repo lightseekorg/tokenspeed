@@ -149,48 +149,6 @@ def _maybe_lds_guard(x, w, precision_config):
         yield
 
 
-def _matmul(
-    x,
-    w,
-    bias=None,
-    a_ragged_metadata=None,
-    gather_indx=None,
-    scatter_indx=None,
-    precision_config=None,
-    fused_activation=None,
-    epilogue=None,
-    betas=None,
-    gammas=None,
-    out_alpha=None,
-    y=None,
-    n_tokens=None,
-    n_expts_act=None,
-    **_ignored,
-):
-    with _maybe_lds_guard(x, w, precision_config):
-        out = matmul(
-            x,
-            w,
-            bias,
-            a_ragged_metadata=a_ragged_metadata,
-            gather_indx=gather_indx,
-            scatter_indx=scatter_indx,
-            precision_config=precision_config,
-            fused_activation=fused_activation,
-            epilogue=epilogue,
-            betas=betas,
-            gammas=gammas,
-            out_alpha=out_alpha,
-            c=y,
-        )
-    if scatter_indx is not None and n_expts_act is not None and n_expts_act > 1:
-        assert (
-            n_tokens is not None
-        ), "n_tokens required when n_expts_act > 1 for top-k reduction"
-        return out.view(n_tokens, n_expts_act, out.shape[-1]).sum(dim=1)
-    return out
-
-
 def _routing(
     logits: torch.Tensor,
     n_expts_act: int,
@@ -542,15 +500,16 @@ def triton_mxfp4_moe_apply(
     else:
         gemm1_input = x
 
-    intermediate_cache = _matmul(
-        gemm1_input,
-        w13_weight,
-        w13_bias,
-        a_ragged_metadata=ragged_metadata,
-        gather_indx=gather_indx,
-        precision_config=w13_pc,
-        fused_activation=act,
-    )
+    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc):
+        intermediate_cache = matmul(
+            gemm1_input,
+            w13_weight,
+            w13_bias,
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            precision_config=w13_pc,
+            fused_activation=act,
+        )
     if act is None:
         intermediate_cache = _silu_gate_up(
             intermediate_cache,
@@ -568,14 +527,16 @@ def triton_mxfp4_moe_apply(
     else:
         gemm2_input = intermediate_cache
 
-    return _matmul(
-        gemm2_input,
-        w2_weight,
-        w2_bias,
-        a_ragged_metadata=ragged_metadata,
-        precision_config=w2_pc,
-        scatter_indx=scatter_indx,
-        gammas=gate_scal,
-        n_tokens=n_tokens,
-        n_expts_act=top_k,
-    )
+    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc):
+        output = matmul(
+            gemm2_input,
+            w2_weight,
+            w2_bias,
+            a_ragged_metadata=ragged_metadata,
+            precision_config=w2_pc,
+            scatter_indx=scatter_indx,
+            gammas=gate_scal,
+        )
+    if top_k > 1:
+        return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
+    return output
