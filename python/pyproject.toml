@@ -41,7 +41,6 @@ dependencies = [
     "fastapi",
     "hf_transfer",
     "huggingface_hub",
-    "instanttensor>=0.1.9",
     "modelscope",
     "msgspec",
     "ninja",
