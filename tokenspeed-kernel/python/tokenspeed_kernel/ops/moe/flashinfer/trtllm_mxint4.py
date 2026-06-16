@@ -39,8 +39,9 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signature, format_signatures
+from tokenspeed_kernel.preprocessing import register_weight_preprocessor
+from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
@@ -152,21 +153,17 @@ if platform.is_nvidia:
         w2_scales = torch.stack(w2_scales_shuffled)
         return w13_weights, w13_scales, w2_weights, w2_scales
 
-    @register_kernel(
+    @register_weight_preprocessor(
         "moe",
-        "process_weights",
-        name="flashinfer_trtllm_mxint4_moe_process_weights",
-        solution="flashinfer_trtllm",
+        name="flashinfer_trtllm_mxint4_moe_weights",
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"mxint4"})},
-        priority=Priority.SPECIALIZED,
     )
-    def flashinfer_trtllm_mxint4_moe_process_weights(plan: dict, w: torch.nn.Module):
+    def flashinfer_trtllm_mxint4_moe_weights(plan: dict, w: torch.nn.Module):
         num_experts = w.w13_weight_packed.shape[0]
 
         # Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)]. The flashinfer fused
@@ -222,6 +219,10 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_mxint4_moe_apply",
         solution="flashinfer_trtllm",
+        weight_preprocessor=WeightPreprocessorRef(
+            "flashinfer_trtllm_mxint4_moe_weights",
+            required=True,
+        ),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

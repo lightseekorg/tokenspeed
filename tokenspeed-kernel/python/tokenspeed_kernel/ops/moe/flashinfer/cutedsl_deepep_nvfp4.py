@@ -29,8 +29,9 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signature, format_signatures
+from tokenspeed_kernel.preprocessing import register_weight_preprocessor
+from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
@@ -42,24 +43,16 @@ if platform.is_nvidia:
     )
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
-    @register_kernel(
+    @register_weight_preprocessor(
         "moe",
-        "process_weights",
-        name="flashinfer_cutedsl_deepep_nvfp4_moe_process_weights",
-        solution="flashinfer_cutedsl",
+        name="flashinfer_cutedsl_deepep_nvfp4_moe_weights",
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
         ),
-        signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"nvfp4"})},
-        # DeepEP needs an EP process group in the plan, so it
-        # must not become the generic NVFP4 auto-selected solution.
-        priority=Priority.PERFORMANT,
     )
-    def flashinfer_cutedsl_deepep_nvfp4_moe_process_weights(
-        plan: dict, w: torch.nn.Module
-    ):
+    def flashinfer_cutedsl_deepep_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         w13_ws2 = w.w13_weight_scale_2[:, 0]
         w13_input_scale = w.w13_input_scale.max().to(torch.float32)
         w2_input_scale = w.w2_input_scale.max().to(torch.float32)
@@ -126,6 +119,10 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_cutedsl_deepep_nvfp4_moe_apply",
         solution="flashinfer_cutedsl",
+        weight_preprocessor=WeightPreprocessorRef(
+            "flashinfer_cutedsl_deepep_nvfp4_moe_weights",
+            required=True,
+        ),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
