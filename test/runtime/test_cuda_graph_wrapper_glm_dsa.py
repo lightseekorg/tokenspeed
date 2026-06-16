@@ -14,10 +14,14 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper  # noqa: E402
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (  # noqa: E402
+    CudaGraphWrapper,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
-from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput  # noqa: E402
+from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
+    LogitsProcessorOutput,
+)
 
 
 class _FakeGraph:
@@ -113,6 +117,31 @@ def test_call_restores_ctx_bs_when_replay_fails() -> None:
         )
 
     assert ctx.bs == 3
+
+
+def test_can_run_respects_backend_cuda_graph_batch_limit() -> None:
+    wrapper = object.__new__(CudaGraphWrapper)
+    wrapper.disable = False
+    wrapper.dp_size = 1
+    wrapper.disable_padding = False
+    wrapper.max_bs = 1
+    wrapper.graphs = {1: object()}
+    ctx = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    assert wrapper.can_run(bs=1, ctx=ctx)
+    assert not wrapper.can_run(bs=2, ctx=ctx)
+
+
+def test_can_run_is_false_when_backend_disables_cuda_graph() -> None:
+    wrapper = object.__new__(CudaGraphWrapper)
+    wrapper.disable = True
+    wrapper.dp_size = 1
+    wrapper.disable_padding = False
+    wrapper.max_bs = 0
+    wrapper.graphs = {}
+    ctx = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    assert not wrapper.can_run(bs=1, ctx=ctx)
 
 
 def _make_executor_for_capture_drafter(capture_drafter: bool) -> ModelExecutor:

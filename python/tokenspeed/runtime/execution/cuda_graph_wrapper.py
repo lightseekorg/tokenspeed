@@ -234,7 +234,13 @@ class CudaGraphWrapper:
         self.vocab_size = config.vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
-        self.max_bs = max(self.capture_bs)
+        backend_max_graph_bs = getattr(attn_backend, "max_cuda_graph_batch_size", None)
+        if backend_max_graph_bs is not None:
+            backend_max_graph_bs = int(backend_max_graph_bs)
+            self.capture_bs = [
+                bs for bs in self.capture_bs if bs <= backend_max_graph_bs
+            ]
+        self.max_bs = max(self.capture_bs) if self.capture_bs else 0
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
@@ -297,7 +303,7 @@ class CudaGraphWrapper:
         self.output_buffers: dict[int, tuple] = {}
 
         self._forward_func: Callable | None = forward_func
-        self.disable = config.enforce_eager
+        self.disable = config.enforce_eager or len(self.capture_bs) == 0
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         if not self.disable:
             self.capture()

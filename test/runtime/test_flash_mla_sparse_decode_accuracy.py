@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_with_kvcache,
     get_mla_metadata,

@@ -207,6 +207,11 @@ class DSABackend(AttentionBackend):
         self._prefill_query_workspace_num_heads: int | None = None
         self._decode_query_workspace_num_heads: int | None = None
         self._prefill_block_tables: torch.Tensor | None = None
+        # Real GLM5.2 FP8 long-output validation on B200 shows CUDA graph
+        # replay can corrupt DSA sparse decode after long reasoning, even for
+        # bs=1. Disable decode graph capture for this backend and keep the
+        # TRTLLM sparse decode path on eager until the replay state is fixed.
+        self.max_cuda_graph_batch_size = 0
         # Only graph-captured decode workspaces must survive a regrow. Eager
         # buffers are not referenced by replay and can be released normally.
         self._decode_query_workspace_captured = False
@@ -894,9 +899,13 @@ class DSABackend(AttentionBackend):
                 "Build/install `tokenspeed-kernel/python` with FlashInfer TRTLLM "
                 "decode support."
             )
-        if q.dtype != torch.bfloat16:
+        allow_fp8_query = (
+            self.data_type == torch.float8_e4m3fn and q.dtype == torch.float8_e4m3fn
+        )
+        if q.dtype != torch.bfloat16 and not allow_fp8_query:
             raise RuntimeError(
-                "GLM DSA sparse prefill requires BF16 query tensors, " f"got {q.dtype}."
+                "GLM DSA sparse prefill requires BF16 query tensors, or FP8 query "
+                f"tensors on the TRTLLM FP8 KV path, got {q.dtype}."
             )
         if topk_lens.shape[0] != q.shape[0]:
             raise RuntimeError(
@@ -977,9 +986,15 @@ class DSABackend(AttentionBackend):
                 "GLM DSA sparse decode does not support "
                 "kv_cache_quant_method='per_token_head' yet."
             )
-        if q.dtype != torch.bfloat16:
+        allow_trtllm_fp8_query = (
+            getattr(self, "_sparse_decode_impl", "trtllm") == "trtllm"
+            and getattr(self, "data_type", torch.bfloat16) == torch.float8_e4m3fn
+            and q.dtype == torch.float8_e4m3fn
+        )
+        if q.dtype != torch.bfloat16 and not allow_trtllm_fp8_query:
             raise RuntimeError(
-                "GLM DSA sparse decode requires BF16 query tensors, " f"got {q.dtype}."
+                "GLM DSA sparse decode requires BF16 query tensors, or FP8 query "
+                f"tensors on the TRTLLM FP8 KV path, got {q.dtype}."
             )
         if save_kv_cache:
             assert k is not None
@@ -1088,7 +1103,6 @@ class DSABackend(AttentionBackend):
         topk_lens: torch.Tensor | None = None,
         q_len_per_req: int = 1,
     ) -> torch.Tensor:
-        del topk_lens
         if trtllm_batch_decode_with_kv_cache_mla is error_fn:
             raise RuntimeError(
                 "GLM DSA plain sparse decode requires TRTLLM sparse MLA. "
@@ -1103,6 +1117,16 @@ class DSABackend(AttentionBackend):
         ):
             raise RuntimeError("GLM DSA plain sparse decode requires decode metadata.")
         num_extends = int(metadata.num_extends or 0)
+        available_reqs = max(0, int(metadata.seq_lens_k.shape[0]) - num_extends)
+        if available_reqs < num_reqs:
+            if available_reqs <= 0 or q.shape[0] % available_reqs != 0:
+                raise RuntimeError(
+                    "GLM DSA plain sparse decode metadata batch mismatch: "
+                    f"seq_lens={available_reqs}, requests={num_reqs}, "
+                    f"q_tokens={q.shape[0]}."
+                )
+            num_reqs = available_reqs
+            q_len_per_req = q.shape[0] // available_reqs
         seq_lens = metadata.seq_lens_k[num_extends : num_extends + num_reqs]
         if seq_lens.numel() != num_reqs:
             raise RuntimeError(
@@ -1118,18 +1142,36 @@ class DSABackend(AttentionBackend):
                 f"q_len_per_req={q_len_per_req}."
             )
         if q_len_per_req > 1:
-            offsets = torch.arange(
-                1 - q_len_per_req,
-                1,
-                device=seq_lens.device,
-                dtype=seq_lens.dtype,
-            )
+            if getattr(self, "is_draft", False):
+                offsets = torch.arange(
+                    q_len_per_req,
+                    device=seq_lens.device,
+                    dtype=seq_lens.dtype,
+                )
+            else:
+                offsets = torch.arange(
+                    1 - q_len_per_req,
+                    1,
+                    device=seq_lens.device,
+                    dtype=seq_lens.dtype,
+                )
             seq_lens = (
                 (seq_lens.view(-1, 1) + offsets.view(1, -1))
                 .clamp_min_(0)
                 .reshape(-1)
                 .contiguous()
             )
+        if topk_lens is not None:
+            if topk_lens.dim() != 1 or topk_lens.numel() != num_tokens:
+                raise RuntimeError(
+                    "GLM DSA TRTLLM sparse decode top-k length mismatch: "
+                    f"lens={tuple(topk_lens.shape)}, q_tokens={num_tokens}."
+                )
+            # The TRTLLM sparse MLA kernel interprets seq_lens against the
+            # provided sparse block table, not the original dense KV context.
+            # Passing full context lengths lets rows with -1-padded top-k
+            # entries read past the sparse table under multi-token MTP decode.
+            seq_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
 
         q = q.view(num_tokens, 1, layer.tp_q_head_num, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn:

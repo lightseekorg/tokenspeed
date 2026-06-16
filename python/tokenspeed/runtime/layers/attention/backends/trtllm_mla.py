@@ -207,6 +207,7 @@ class TRTLLMMLABackend(AttentionBackend):
         if (
             forward_mode.is_decode()
             or forward_mode.is_mixed()
+            or forward_mode.is_target_verify()
             or (forward_mode.is_extend() and self.is_draft)
         ):
             self._init_decode_metadata(

@@ -51,7 +51,6 @@ next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length
 
 if platform.is_nvidia:
     from flashinfer.fused_moe import RoutingMethodType, trtllm_fp8_block_scale_moe
-
     from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
     try:
