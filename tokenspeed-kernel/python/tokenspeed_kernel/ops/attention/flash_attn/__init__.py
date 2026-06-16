@@ -200,23 +200,24 @@ if (
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
+        max_seqlen_q: int = 1,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
         batch_size = cache_seqlens.shape[0]
-        q_reshaped = q.view(batch_size, 1, q.shape[1], q.shape[2])
+        q_reshaped = q.view(batch_size, max_seqlen_q, q.shape[1], q.shape[2])
         out, _ = flash_attn_varlen_func(
             q=q_reshaped,
             k=k_cache,
             v=v_cache,
             seqused_k=cache_seqlens,
             page_table=page_table,
-            max_seqlen_q=1,
+            max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=1.0 / math.sqrt(q.shape[-1]),
-            causal=False,
+            causal=max_seqlen_q > 1,
         )
         return out.view_as(q)
 
@@ -355,19 +356,21 @@ elif platform.is_nvidia and platform.is_hopper:
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
+        max_seqlen_q: int = 1,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        batch_size = cache_seqlens.shape[0]
         out = flash_attn_with_kvcache(
-            q=q.unsqueeze(1),
+            q=q.view(batch_size, max_seqlen_q, q.shape[1], q.shape[2]),
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             softmax_scale=1.0 / math.sqrt(q.shape[-1]),
-            causal=False,
+            causal=max_seqlen_q > 1,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,

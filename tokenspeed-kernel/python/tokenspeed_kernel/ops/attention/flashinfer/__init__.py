@@ -175,6 +175,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
+        max_seqlen_q: int = 1,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -207,6 +208,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             window_left=window_left,
             sinks=sinks,
             out_dtype=q.dtype,
+            q_len_per_req=max_seqlen_q,
         )
 
 
