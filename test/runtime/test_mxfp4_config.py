@@ -36,7 +36,16 @@ def _amd_quark_mxfp4_config(
     }
 
 
-def test_amd_quark_dynamic_mxfp4_metadata_selects_mxfp4() -> None:
+def _mock_platform(monkeypatch, *, is_amd: bool) -> None:
+    monkeypatch.setattr(
+        mxfp4_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=is_amd),
+    )
+
+
+def test_amd_quark_dynamic_mxfp4_metadata_selects_mxfp4(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
     config = _amd_quark_mxfp4_config(_fp4_e8m0_per_group(is_dynamic=True))
 
     assert Mxfp4Config.override_quantization_method(config, None) == "mxfp4"
@@ -51,11 +60,7 @@ def test_amd_quark_dynamic_mxfp4_metadata_selects_mxfp4() -> None:
 
 
 def test_amd_quark_metadata_is_not_promoted_on_non_amd(monkeypatch) -> None:
-    monkeypatch.setattr(
-        mxfp4_module,
-        "current_platform",
-        lambda: SimpleNamespace(is_amd=False),
-    )
+    _mock_platform(monkeypatch, is_amd=False)
     config = _amd_quark_mxfp4_config(_fp4_e8m0_per_group(is_dynamic=True))
 
     assert Mxfp4Config.override_quantization_method(config, None) is None
@@ -66,7 +71,8 @@ def test_amd_quark_metadata_is_not_promoted_on_non_amd(monkeypatch) -> None:
     assert quant_config.is_w4a8_fp8 is False
 
 
-def test_amd_quark_w4a8_fp8_metadata_selects_mxfp4() -> None:
+def test_amd_quark_w4a8_fp8_metadata_selects_mxfp4(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
     config = _amd_quark_mxfp4_config({"dtype": "fp8_e4m3"})
 
     assert Mxfp4Config.override_quantization_method(config, None) == "mxfp4"
@@ -77,7 +83,8 @@ def test_amd_quark_w4a8_fp8_metadata_selects_mxfp4() -> None:
     assert quant_config.is_w4a8_fp8 is True
 
 
-def test_amd_quark_excludes_match_runtime_layer_names() -> None:
+def test_amd_quark_excludes_match_runtime_layer_names(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
     config = _amd_quark_mxfp4_config(
         _fp4_e8m0_per_group(is_dynamic=True),
         exclude=[
@@ -103,7 +110,8 @@ def test_amd_quark_excludes_match_runtime_layer_names() -> None:
     )
 
 
-def test_incomplete_amd_quark_metadata_is_not_promoted() -> None:
+def test_incomplete_amd_quark_metadata_is_not_promoted(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
     config = _amd_quark_mxfp4_config(
         {
             "dtype": "fp4",
