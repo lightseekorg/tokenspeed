@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "cache/block_pool.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -53,6 +54,21 @@ public:
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     // Tokens still fillable in the last (tail) page before a new page is needed.
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
+
+    // Evict the physical page at logical slot `index`, replacing it with a null
+    // hole, and return the displaced block so the caller can free it. Returns
+    // nullptr if the slot is already a null hole (idempotent). The table's length
+    // is unchanged -- the hole preserves logical-page -> slot alignment.
+    CacheBlock* EvictToNull(std::int32_t index, CacheBlock* null_block) {
+        _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()),
+                "EvictToNull index out of range");
+        CacheBlock* old = blocks_[index];
+        if (old == null_block) {
+            return nullptr;
+        }
+        blocks_[index] = null_block;
+        return old;
+    }
 
 private:
     friend class KvCacheManager;

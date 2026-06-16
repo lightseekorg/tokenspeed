@@ -228,5 +228,186 @@ TEST(SwaManagerTest, InheritedCacheFullBlocksMakesPagesHittable) {
     EXPECT_EQ(m.blocks.back()->BlockId(), a.Blocks()[0]->BlockId());
 }
 
+TEST(BlockTableTest, EvictToNullReturnsOldBlockAndPunchesHole) {
+    BlockPool pool(8);
+    SwaManager mgr(pool, 4, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 8));  // 2 real pages
+    ASSERT_EQ(table.NumBlocks(), 2);
+    CacheBlock* page0 = table.Blocks()[0];
+    ASSERT_FALSE(page0->IsNull());
+
+    CacheBlock* old = table.EvictToNull(0, pool.NullBlock());
+    EXPECT_EQ(old, page0);                       // returns the displaced block
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());    // slot is now a null hole
+    EXPECT_EQ(table.NumBlocks(), 2);             // length unchanged (no shrink)
+}
+
+TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
+    BlockPool pool(8);
+    SwaManager mgr(pool, 4, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 4));  // 1 real page
+    table.EvictToNull(0, pool.NullBlock());                 // first: punches hole
+    CacheBlock* again = table.EvictToNull(0, pool.NullBlock());  // second: already null
+    EXPECT_EQ(again, nullptr);                   // returns nullptr on already-null
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());
+}
+
+TEST(SwaManagerTest, AdvanceWindowMirrorsVllmBoundarySequence) {
+    // Mirrors vLLM test_sliding_window_remove_skipped_blocks: block_size=2,
+    // sliding_window=4. skipped = max(0, n - 4 + 1) = max(0, n - 3);
+    // skipped_blocks = skipped / 2.
+    BlockPool pool(32);
+    SwaManager mgr(pool, /*page_size=*/2, /*sliding_window=*/4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 10));  // 5 real pages (10 tokens / page 2)
+    ASSERT_EQ(table.NumBlocks(), 5);
+    CacheBlock* p0 = table.Blocks()[0];
+    CacheBlock* p1 = table.Blocks()[1];
+    CacheBlock* p2 = table.Blocks()[2];
+    CacheBlock* p3 = table.Blocks()[3];
+    CacheBlock* p4 = table.Blocks()[4];
+
+    // n=0: skipped 0 -> nothing freed.
+    mgr.AdvanceWindow(table, 0);
+    EXPECT_FALSE(table.Blocks()[0]->IsNull());
+
+    // n=4: skipped 1, blocks 0 -> page 0 still holds an in-window token, no free.
+    mgr.AdvanceWindow(table, 4);
+    EXPECT_FALSE(table.Blocks()[0]->IsNull());
+
+    // n=5: skipped 2, blocks 1 -> page 0 fully out -> punched to null.
+    std::int32_t free_before5 = pool.NumFreeBlocks();
+    mgr.AdvanceWindow(table, 5);
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());
+    EXPECT_FALSE(table.Blocks()[1]->IsNull());
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before5 + 1);  // p0 returned
+
+    // n=6: skipped 3, blocks 1 -> page 1 still has an in-window token; page 0
+    // already null -> no change.
+    mgr.AdvanceWindow(table, 6);
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());
+    EXPECT_FALSE(table.Blocks()[1]->IsNull());
+
+    // n=7: skipped 4, blocks 2 -> page 1 punched; page 0 already null -> break.
+    std::int32_t free_before7 = pool.NumFreeBlocks();
+    mgr.AdvanceWindow(table, 7);
+    EXPECT_TRUE(table.Blocks()[1]->IsNull());
+    EXPECT_FALSE(table.Blocks()[2]->IsNull());
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before7 + 1);  // only p1 returned
+
+    // n=11: skipped 8, blocks 4 -> pages 2 and 3 punched; page 4 stays.
+    std::int32_t free_before11 = pool.NumFreeBlocks();
+    mgr.AdvanceWindow(table, 11);
+    EXPECT_TRUE(table.Blocks()[2]->IsNull());
+    EXPECT_TRUE(table.Blocks()[3]->IsNull());
+    EXPECT_FALSE(table.Blocks()[4]->IsNull());
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before11 + 2);  // p2, p3 returned
+    EXPECT_EQ(table.NumBlocks(), 5);  // length never shrinks
+
+    (void)p0; (void)p1; (void)p2; (void)p3; (void)p4;
+}
+
+TEST(SwaManagerTest, AdvanceWindowEarlyReturnInsideWindow) {
+    BlockPool pool(32);
+    SwaManager mgr(pool, 4, 16);  // big window
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 8));  // 2 pages, 8 tokens <= window
+    std::int32_t free_before = pool.NumFreeBlocks();
+    mgr.AdvanceWindow(table, 8);  // skipped = 8 - 16 + 1 < 0 -> early return
+    EXPECT_FALSE(table.Blocks()[0]->IsNull());
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+}
+
+TEST(SwaManagerTest, AdvanceWindowCapsToAllocatedBlocks) {
+    BlockPool pool(32);
+    SwaManager mgr(pool, 4, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 8));  // 2 pages
+    // Huge num_computed_tokens -> skipped_blocks would exceed NumBlocks(); must
+    // cap and not go out of bounds.
+    mgr.AdvanceWindow(table, 1000);
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());
+    EXPECT_TRUE(table.Blocks()[1]->IsNull());
+    EXPECT_EQ(table.NumBlocks(), 2);  // still 2 slots, both null
+}
+
+TEST(SwaManagerTest, AdvanceWindowEvictsFirstSlidOutFirst) {
+    // page_size 2, window 4. Free pages 0 and 1, then the next allocation should
+    // reuse page 0 (the first slid out) before page 1.
+    // Pool is sized to exactly fit the 4 acquired pages (+1 null block) so the
+    // free list is empty after Acquire; the only blocks the next AllocateBlocks
+    // can hand back are the just-freed pages. This exposes the FIFO order *among*
+    // the freed batch -- with a larger pool, pre-existing free blocks at the LRU
+    // head would be handed out first and the FIFO-among-freed property would be
+    // unobservable (freed blocks return to the free-list tail, reused last).
+    BlockPool pool(5);
+    SwaManager mgr(pool, 2, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 8));  // 4 pages
+    CacheBlock* p0 = table.Blocks()[0];
+    CacheBlock* p1 = table.Blocks()[1];
+    mgr.AdvanceWindow(table, 8);  // skipped 5, blocks 2 -> free pages 0,1
+    ASSERT_TRUE(table.Blocks()[0]->IsNull());
+    ASSERT_TRUE(table.Blocks()[1]->IsNull());
+
+    // Next single allocation reuses the first-slid-out page (p0).
+    std::vector<CacheBlock*> reused = pool.AllocateBlocks(1);
+    ASSERT_EQ(reused.size(), 1u);
+    EXPECT_EQ(reused.front()->BlockId(), p0->BlockId());
+    (void)p1;
+}
+
+TEST(SwaManagerTest, AdvanceWindowFreedCachedPageStaysPrefixReusable) {
+    BlockPool pool(32);
+    SwaManager mgr(pool, 2, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 8));  // 4 pages
+    const std::string h0 = RealKey({1, 1}, 0);
+    // Register page 0's content so it carries a hash.
+    mgr.CacheFullBlocks(table, std::vector<std::string>{h0}, 1);
+    CacheBlock* p0 = table.Blocks()[0];
+    EXPECT_TRUE(p0->IsCached());
+
+    mgr.AdvanceWindow(table, 8);  // frees pages 0,1; p0 returns with hash intact
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());
+    // The freed-but-cached page is still prefix-hittable.
+    EXPECT_EQ(pool.GetCachedBlock(h0), p0);
+}
+
+TEST(SwaManagerTest, AdvanceWindowLeavesTailAvailUnchanged) {
+    BlockPool pool(32);
+    SwaManager mgr(pool, 4, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(table, 10));  // 3 pages, last partial: tail_avail = 2
+    EXPECT_EQ(table.TailAvailableTokens(), 2);
+    mgr.AdvanceWindow(table, 10);  // skipped 7, blocks 1 -> frees front full page
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());
+    EXPECT_EQ(table.TailAvailableTokens(), 2);  // tail untouched
+}
+
+TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
+    // Steady state: repeatedly Acquire one page worth of tokens then AdvanceWindow.
+    // page_size 2, window 4 -> active physical pages should stay bounded around
+    // ceil(window/page_size)=2, not grow without limit.
+    BlockPool pool(64);
+    SwaManager mgr(pool, 2, 4);
+    BlockTable table;
+    std::int32_t n = 0;
+    std::int32_t baseline_free = pool.NumFreeBlocks();
+    for (int step = 0; step < 20; ++step) {
+        n += 2;                          // two new tokens -> one new page
+        ASSERT_TRUE(mgr.Acquire(table, 2));
+        mgr.AdvanceWindow(table, n);
+    }
+    // Active (non-free) physical pages = baseline_free - current_free. With a
+    // 4-token window over page_size 2, at most ~2-3 pages are ever live.
+    std::int32_t active = baseline_free - pool.NumFreeBlocks();
+    EXPECT_LE(active, 3);
+    // The table itself grows (holes accumulate), but physical pages are bounded.
+    EXPECT_GT(table.NumBlocks(), 3);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

@@ -36,6 +36,14 @@ public:
     CacheGroup(KvCacheSpec spec, std::uint32_t group_id, std::unique_ptr<KvCacheManager> manager)
         : spec_{spec}, group_id_{group_id}, manager_{std::move(manager)} {}
 
+    // Move-only: owns the manager via unique_ptr. Copy is implicitly deleted by
+    // the unique_ptr member; stated explicitly so the contract is visible
+    // (mirrors CacheBlock). Move is needed to store groups in a std::vector.
+    CacheGroup(const CacheGroup&) = delete;
+    CacheGroup& operator=(const CacheGroup&) = delete;
+    CacheGroup(CacheGroup&&) = default;
+    CacheGroup& operator=(CacheGroup&&) = default;
+
     KvCacheManager& Manager() { return *manager_; }
     const KvCacheManager& Manager() const { return *manager_; }
     const KvCacheSpec& Spec() const { return spec_; }
