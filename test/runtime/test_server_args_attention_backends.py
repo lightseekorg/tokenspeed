@@ -19,7 +19,6 @@ import contextlib
 import io
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
@@ -116,12 +115,8 @@ class TestAttentionBackendChoices(unittest.TestCase):
             MLAAttnBackend,
         )
 
-    def test_sm90_defaults_to_flashmla_for_mla(self):
-        platform = SimpleNamespace(is_blackwell=False, is_hopper=True)
-        with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(
-                registry._get_default_backend_name(AttentionArch.MLA), "flashmla"
-            )
+    def test_defaults_to_mla_for_mla(self):
+        self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")
 
     def test_mha_config_propagates_speculative_settings(self):
         server_args = SimpleNamespace(

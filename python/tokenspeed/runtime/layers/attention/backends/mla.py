@@ -302,7 +302,7 @@ class MLAAttnBackend(AttentionBackend):
         num_extends = metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        if q_len_per_req > 1 and self.is_draft:
+        if q_len_per_req > 1:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             page_table = metadata.page_table[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0

@@ -771,6 +771,7 @@ class ServerArgs:
             default=ServerArgs.quantization,
             choices=[
                 "fp8",
+                "mxfp4",
                 "nvfp4",
                 "w8a8_fp8",
                 "compressed-tensors",

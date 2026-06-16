@@ -36,7 +36,9 @@ _is_nvidia = current_platform().is_nvidia
 __all__ = [
     "store_kv_cache",
     "transfer_kv_all_layer",
+    "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
+    "transfer_kv_per_layer_mla",
 ]
 
 
@@ -445,6 +447,165 @@ def transfer_kv_per_layer(
         kv_cache_src_stride,
         kv_cache_dst_stride,
         BLOCK_SIZE=block_size,
+    )
+
+
+@triton.jit
+def _kv_transfer_per_layer_mla_kernel(
+    cache_dst_ptr,
+    indices_dst_ptr,
+    cache_src_ptr,
+    indices_src_ptr,
+    cache_src_stride,
+    cache_dst_stride,
+    ELEMENT_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    pos_src = tl.load(indices_src_ptr + pid).to(tl.int64)
+    pos_dst = tl.load(indices_dst_ptr + pid).to(tl.int64)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < ELEMENT_DIM
+
+    src = tl.load(cache_src_ptr + pos_src * cache_src_stride + offs, mask=mask)
+    tl.store(cache_dst_ptr + pos_dst * cache_dst_stride + offs, src, mask=mask)
+
+
+@triton.jit
+def _kv_transfer_all_layer_mla_kernel(
+    ptr_dst_ptr,
+    indices_dst_ptr,
+    ptr_src_ptr,
+    indices_src_ptr,
+    length,
+    num_layers: tl.constexpr,
+    cache_src_stride_words,
+    cache_dst_stride_words,
+    total_words,
+    WORDS_PER_CHUNK: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    word_offsets = tl.arange(0, WORDS_PER_CHUNK)
+
+    for idx in range(pid, length, num_programs):
+        pos_src = tl.load(indices_src_ptr + idx).to(tl.int64)
+        pos_dst = tl.load(indices_dst_ptr + idx).to(tl.int64)
+        src_slot_offset = pos_src * cache_src_stride_words
+        dst_slot_offset = pos_dst * cache_dst_stride_words
+
+        for layer in range(num_layers):
+            cache_src_ptr = tl.load(ptr_src_ptr + layer).to(tl.pointer_type(tl.uint32))
+            cache_dst_ptr = tl.load(ptr_dst_ptr + layer).to(tl.pointer_type(tl.uint32))
+
+            for chunk in range(NUM_CHUNKS):
+                chunk_offsets = chunk * WORDS_PER_CHUNK + word_offsets
+                mask = chunk_offsets < total_words
+                src_offsets = src_slot_offset + chunk_offsets
+                dst_offsets = dst_slot_offset + chunk_offsets
+                src_offsets = tl.max_contiguous(
+                    tl.multiple_of(src_offsets, 4), WORDS_PER_CHUNK
+                )
+                dst_offsets = tl.max_contiguous(
+                    tl.multiple_of(dst_offsets, 4), WORDS_PER_CHUNK
+                )
+
+                src = tl.load(
+                    cache_src_ptr + src_offsets,
+                    mask=mask,
+                    other=0,
+                    cache_modifier=".cg",
+                )
+                tl.store(
+                    cache_dst_ptr + dst_offsets,
+                    src,
+                    mask=mask,
+                    cache_modifier=".cs",
+                )
+
+
+def transfer_kv_per_layer_mla(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    block_quota: int | None = None,
+) -> None:
+    del block_quota
+
+    if item_size % src.element_size() != 0:
+        raise ValueError("item_size must be divisible by the MLA cache element size.")
+    element_dim = item_size // src.element_size()
+
+    length = src_indices.numel()
+    if length == 0:
+        return
+
+    cache_src_flat = src.view(-1, element_dim)
+    cache_dst_flat = dst.view(-1, element_dim)
+    block_size = _next_power_of_two(element_dim)
+
+    _kv_transfer_per_layer_mla_kernel[(length,)](
+        cache_dst_flat,
+        dst_indices,
+        cache_src_flat,
+        src_indices,
+        cache_src_flat.stride(0),
+        cache_dst_flat.stride(0),
+        ELEMENT_DIM=element_dim,
+        BLOCK_SIZE=block_size,
+    )
+
+
+def transfer_kv_all_layer_mla(
+    src_layers: torch.Tensor,
+    dst_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+    block_quota: int | None = None,
+) -> None:
+    del block_quota
+
+    length = src_indices.numel()
+    if length == 0:
+        return
+
+    if item_size % 4 != 0:
+        raise ValueError(
+            "Triton MLA all-layer kernel requires item_size to be a multiple of "
+            "4 bytes."
+        )
+
+    words_per_chunk = 32
+    total_words = item_size // 4
+    num_chunks = triton.cdiv(total_words, words_per_chunk)
+    grid = (
+        _recommended_program_count(
+            length=length,
+            element_size=item_size,
+            num_layers=num_layers,
+            device=src_indices.device,
+        ),
+    )
+    _kv_transfer_all_layer_mla_kernel[grid](
+        dst_layers,
+        dst_indices,
+        src_layers,
+        src_indices,
+        length,
+        num_layers=num_layers,
+        cache_src_stride_words=item_size // 4,
+        cache_dst_stride_words=item_size // 4,
+        total_words=total_words,
+        WORDS_PER_CHUNK=words_per_chunk,
+        NUM_CHUNKS=num_chunks,
+        num_warps=1,
+        num_stages=1,
     )
 
 

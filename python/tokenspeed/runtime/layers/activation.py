@@ -23,7 +23,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from tokenspeed_kernel.platform import current_platform
@@ -35,7 +34,10 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_amd = current_platform().is_amd
 
-if not _is_amd:
+if _is_amd:
+    from tokenspeed_kernel.ops.activation.triton import silu_and_mul
+
+else:
     from tokenspeed_kernel.ops.activation.flashinfer import (
         silu_and_mul,
     )
@@ -46,10 +48,7 @@ logger = get_colorful_logger(__name__)
 class SiluAndMul(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, fp8_out: bool = False) -> torch.Tensor:
-        if _is_amd:
-            d = x.shape[-1] // 2
-            return F.silu(x[..., :d]) * x[..., d:]
-        else:
+        if not _is_amd:
 
             def get_tma_aligned_scale(x):
                 aligned_size = (x.shape[-2] + 3) // 4 * 4
@@ -79,6 +78,12 @@ class SiluAndMul(torch.nn.Module):
                 out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
                 silu_and_mul(x, out, enable_pdl=pdl_enabled())
                 return out
+
+        if fp8_out:
+            raise NotImplementedError("AMD fp8_out silu_and_mul is not implemented")
+        d = x.shape[-1] // 2
+        out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+        return silu_and_mul(x, out, enable_pdl=pdl_enabled())
 
 
 @triton.jit

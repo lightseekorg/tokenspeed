@@ -28,7 +28,12 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     create_per_token_group_quant_fp8_output_scale,
 )
 
-__all__ = ["fused_gate_sigmoid_mul_add", "fused_swiglu_fp8_ue8m0", "sigmoid_mul"]
+__all__ = [
+    "fused_gate_sigmoid_mul_add",
+    "fused_swiglu_fp8_ue8m0",
+    "sigmoid_mul",
+    "silu_and_mul",
+]
 
 
 @triton.jit
@@ -221,6 +226,79 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return x
+
+
+@triton.jit
+def _silu_and_mul_kernel(
+    x_ptr,
+    out_ptr,
+    n_elements,
+    hidden_dim: tl.constexpr,
+    input_stride_row: tl.constexpr,
+    out_stride_row: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    row = offsets // hidden_dim
+    col = offsets % hidden_dim
+    gate_addrs = x_ptr + row * input_stride_row + col
+    up_addrs = gate_addrs + hidden_dim
+
+    gate = tl.load(gate_addrs, mask=mask).to(tl.float32)
+    up = tl.load(up_addrs, mask=mask).to(tl.float32)
+    out = gate * tl.sigmoid(gate) * up
+    tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
+
+
+def silu_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Fused ``SiLU(x[..., :D]) * x[..., D:]``.
+
+    ``x`` is interpreted as ``[..., 2 * D]`` with gate values in the first half
+    and up values in the second half. The output has shape ``[..., D]``.
+    """
+    del enable_pdl
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+
+    hidden_dim = x.shape[-1] // 2
+    output_shape = (*x.shape[:-1], hidden_dim)
+    if out is None:
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    elif tuple(out.shape) != output_shape:
+        raise ValueError(f"out shape must be {output_shape}, got {tuple(out.shape)}")
+
+    if out.stride(-1) != 1:
+        raise ValueError("out must have stride(-1) == 1")
+
+    flat_x = x.reshape(-1, x.shape[-1])
+    flat_out = out.reshape(-1, hidden_dim)
+    n = flat_out.numel()
+    if n == 0:
+        return out
+
+    BLOCK_SIZE = 1024
+    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    _silu_and_mul_kernel[grid](
+        flat_x,
+        flat_out,
+        n,
+        hidden_dim=hidden_dim,
+        input_stride_row=flat_x.stride(0),
+        out_stride_row=flat_out.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------

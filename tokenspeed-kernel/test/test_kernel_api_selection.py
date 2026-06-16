@@ -545,6 +545,79 @@ def _moe_apply_mxfp4_gluon() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
+def _moe_apply_mxfp4_precomputed_tp() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        internal_activation_dtype="input",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_mxfp4_precomputed_ep() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=4,
+        internal_activation_dtype="input",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def test_mxfp4_ep_topk_localization_masks_remote_experts() -> None:
+    w = torch.nn.Module()
+    w.num_experts = 8
+    w.num_local_experts = 2
+    w.ep_rank = 2
+    w.ep_size = 4
+    topk_weights = torch.tensor(
+        [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor([[0, 4, 5], [6, 7, 3]], dtype=torch.int64)
+
+    local_weights, local_ids, num_experts = _moe_triton_mxfp4._local_topk_for_ep(
+        topk_weights,
+        topk_ids,
+        w,
+    )
+
+    assert num_experts == 2
+    torch.testing.assert_close(
+        local_weights,
+        torch.tensor([[0.0, 0.2, 0.3], [0.0, 0.0, 0.0]], dtype=torch.float32),
+    )
+    assert torch.equal(
+        local_ids,
+        torch.tensor([[-1, 0, 1], [-1, -1, -1]], dtype=torch.int64),
+    )
+
+
 def _case(
     matches: Callable[[PlatformInfo], bool],
     arch: str,
@@ -809,6 +882,22 @@ _CASES = [
         "apply",
         "gluon_mxfp4_moe_apply",
         _moe_apply_mxfp4_gluon,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_mxfp4_precomputed_moe_apply",
+        _moe_apply_mxfp4_precomputed_tp,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_mxfp4_ep_precomputed_moe_apply",
+        _moe_apply_mxfp4_precomputed_ep,
     ),
 ]
 

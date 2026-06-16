@@ -49,6 +49,9 @@ _is_amd = current_platform().is_amd
 
 if _is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
+    from tokenspeed_kernel.ops.layernorm.triton import (
+        rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
+    )
 else:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
@@ -411,7 +414,16 @@ class FusedRMSNorm(nn.Module):
             Tuple of (normalized_q_a, normalized_kv_a)
         """
         if _is_amd:
-            raise NotImplementedError("Fused RMSNorm is not implemented on HIP yet")
+            triton_rmsnorm_fused_parallel(
+                input1=input_q_a,
+                weight1=self.weight_q_a,
+                output1=output_q_a if output_q_a is not None else input_q_a,
+                input2=input_kv_a,
+                weight2=self.weight_kv_a,
+                output2=output_kv_a if output_kv_a is not None else input_kv_a,
+                eps=self.q_a_norm.variance_epsilon,
+                enable_pdl=pdl_enabled(),
+            )
         else:
             rmsnorm_fused_parallel(
                 input1=input_q_a,
