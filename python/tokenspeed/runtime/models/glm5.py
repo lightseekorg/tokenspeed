@@ -814,10 +814,20 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 return False
             max_static_context = int(block_tables.shape[1]) * int(page_size)
             return max_static_context <= int(topk)
-        # ``seq_lens`` aliases a scheduler-owned buffer that is updated in place
-        # between decode steps.  Include the tensor version in the cache key so
-        # an early True result (all lengths <= topk) cannot survive past the
-        # first >topk step and keep using the full-context shortcut.
+        if seq_lens.is_cuda:
+            # Avoid synchronizing the decode hot path just to discover whether
+            # a tiny-context shortcut applies.  The common long-context path is
+            # seq_lens > topk, so falling back to the indexer is conservative.
+            if block_tables is None or page_size is None:
+                return False
+            max_static_context = int(block_tables.shape[1]) * int(page_size)
+            return max_static_context <= int(topk)
+
+        # CPU test path: ``seq_lens`` aliases a scheduler-owned buffer that is
+        # updated in place between decode steps.  Include the tensor version in
+        # the cache key so an early True result (all lengths <= topk) cannot
+        # survive past the first >topk step and keep using the full-context
+        # shortcut.
         seq_lens_version = GlmMoeDsaAttention._tensor_version_or_none(seq_lens)
         if seq_lens_version is None:
             return bool((seq_lens <= topk).all().item())

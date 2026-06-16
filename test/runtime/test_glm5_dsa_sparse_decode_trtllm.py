@@ -127,6 +127,41 @@ def test_glm_dsa_sparse_dispatch_rejects_unknown_impl() -> None:
         backend._set_sparse_decode_impl("unknown")
 
 
+def test_glm_dsa_backend_allows_cuda_graph_capture(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dsa_mod,
+        "TRTLLMMLABackend",
+        lambda config: SimpleNamespace(),
+    )
+
+    config = SimpleNamespace(
+        device="cuda",
+        num_attention_heads=2,
+        attn_tp_size=1,
+        num_kv_heads=1,
+        dtype=torch.bfloat16,
+        head_dim=576,
+        is_draft=False,
+        speculative_num_draft_tokens=6,
+        context_len=4096,
+        page_size=64,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+        kv_cache_dim=576,
+        scaling=0.5,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        index_topk=16,
+        index_head_dim=128,
+        index_n_heads=2,
+    )
+
+    backend = DSABackend(config)
+
+    assert getattr(backend, "max_cuda_graph_batch_size", None) is None
+
+
 def test_glm_dsa_seq_lens_fit_topk_cache_tracks_in_place_updates() -> None:
     metadata = SimpleNamespace()
     seq_lens_buf = torch.tensor([4, 4, 0, 0], dtype=torch.int32)
@@ -400,7 +435,9 @@ def test_glm_dsa_fp8_kv_allowed_on_blackwell(monkeypatch) -> None:
     assert config.kv_cache_dtype == torch.float8_e4m3fn
 
 
-def test_glm_dsa_disables_cuda_graph_replay_for_sparse_decode(monkeypatch) -> None:
+def test_glm_dsa_keeps_cuda_graph_replay_enabled_for_sparse_decode(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         dsa_mod,
         "TRTLLMMLABackend",
@@ -430,7 +467,7 @@ def test_glm_dsa_disables_cuda_graph_replay_for_sparse_decode(monkeypatch) -> No
         )
     )
 
-    assert backend.max_cuda_graph_batch_size == 0
+    assert getattr(backend, "max_cuda_graph_batch_size", None) is None
 
 
 def test_trtllm_mla_target_verify_initializes_decode_metadata(

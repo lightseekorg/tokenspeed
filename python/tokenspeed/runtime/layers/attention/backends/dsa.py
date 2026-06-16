@@ -207,11 +207,6 @@ class DSABackend(AttentionBackend):
         self._prefill_query_workspace_num_heads: int | None = None
         self._decode_query_workspace_num_heads: int | None = None
         self._prefill_block_tables: torch.Tensor | None = None
-        # Real GLM5.2 FP8 long-output validation on B200 shows CUDA graph
-        # replay can corrupt DSA sparse decode after long reasoning, even for
-        # bs=1. Disable decode graph capture for this backend and keep the
-        # TRTLLM sparse decode path on eager until the replay state is fixed.
-        self.max_cuda_graph_batch_size = 0
         # Only graph-captured decode workspaces must survive a regrow. Eager
         # buffers are not referenced by replay and can be released normally.
         self._decode_query_workspace_captured = False
