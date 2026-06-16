@@ -364,6 +364,10 @@ class FlashInferSamplingBackend(SamplingBackend):
                 logits, sampled
             )
 
+        # Keep a stream-ordered device dependency on the sampled ids before
+        # runtime-state updates and non-blocking D2H reads consume them.
+        sampled.add_(0)
+
         bs = logits.shape[0]
 
         return sampled, self._ones_buf[:bs]
@@ -587,6 +591,10 @@ class FlashInferSamplingBackend(SamplingBackend):
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
                 logits, predict
             )
+
+        # Preserve the packed-buffer alias while forcing downstream consumers
+        # to wait on the FlashInfer sampling/verification output.
+        predict.add_(0)
 
         return predict, accept_length
 

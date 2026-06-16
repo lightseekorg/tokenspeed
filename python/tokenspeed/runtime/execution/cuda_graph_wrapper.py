@@ -337,8 +337,34 @@ class CudaGraphWrapper:
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
 
+    def _prepare_capture_inputs(self, bs: int):
+        self.input_buffers.fill_dummy_decode_buffers(
+            batch_size=bs,
+            total_tokens=bs * self.max_tokens_per_req,
+        )
+
+    @staticmethod
+    def _clear_glm_dsa_metadata_caches(*backends) -> None:
+        for backend in backends:
+            if backend is None:
+                continue
+            metadata_objects = []
+            for attr in ("forward_decode_metadata", "forward_prefill_metadata"):
+                metadata = getattr(backend, attr, None)
+                if metadata is not None:
+                    metadata_objects.append(metadata)
+            for attr in ("cuda_graph_decode_metadata", "cuda_graph_prefill_metadata"):
+                metadata_map = getattr(backend, attr, None)
+                if isinstance(metadata_map, dict):
+                    metadata_objects.extend(metadata_map.values())
+            for metadata in metadata_objects:
+                for attr in tuple(vars(metadata)):
+                    if attr.startswith("_glm_dsa_") and attr.endswith("_cache"):
+                        delattr(metadata, attr)
+
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
+        self._prepare_capture_inputs(bs)
 
         capture_forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -433,6 +459,7 @@ class CudaGraphWrapper:
         # so the graph captures reads against a clean baseline.
         if self.sampling_backend is not None:
             self.sampling_backend.reset_capture_state()
+        self._clear_glm_dsa_metadata_caches(self.attn_backend, self.draft_attn_backend)
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -445,6 +472,7 @@ class CudaGraphWrapper:
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
         self._init_capture_metadata(bs)
+        self._clear_glm_dsa_metadata_caches(self.attn_backend, self.draft_attn_backend)
 
         self.deepep_adapter.capture()
 

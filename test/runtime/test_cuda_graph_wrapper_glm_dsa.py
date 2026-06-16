@@ -18,6 +18,7 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (  # noqa: E402
     CudaGraphWrapper,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.input_buffer import InputBuffers  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
 from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsProcessorOutput,
@@ -142,6 +143,54 @@ def test_can_run_is_false_when_backend_disables_cuda_graph() -> None:
     ctx = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
     assert not wrapper.can_run(bs=1, ctx=ctx)
+
+
+def test_prepare_capture_inputs_uses_spec_verify_width() -> None:
+    wrapper = object.__new__(CudaGraphWrapper)
+    wrapper.max_tokens_per_req = 6
+    wrapper.input_buffers = InputBuffers(
+        max_bs=4,
+        max_num_tokens=24,
+        page_size=64,
+        dummy_kv_slot=123,
+        device="cpu",
+    )
+    wrapper.input_buffers.seq_lens_buf.zero_()
+
+    CudaGraphWrapper._prepare_capture_inputs(wrapper, bs=3)
+
+    assert torch.equal(
+        wrapper.input_buffers.seq_lens_buf[:3],
+        torch.tensor([6, 6, 6], dtype=torch.int32),
+    )
+    assert torch.equal(
+        wrapper.input_buffers.out_cache_loc_buf[:18],
+        torch.full((18,), 123, dtype=torch.int32),
+    )
+
+
+def test_clear_glm_dsa_metadata_caches_keeps_unrelated_state() -> None:
+    decode_metadata = SimpleNamespace(
+        _glm_dsa_seq_lens_fit_topk_cache=object(),
+        _glm_dsa_full_context_topk_cache=object(),
+        other_cache=object(),
+    )
+    graph_metadata = SimpleNamespace(
+        _glm_dsa_graph_cache=object(),
+        preserved=True,
+    )
+    backend = SimpleNamespace(
+        forward_decode_metadata=decode_metadata,
+        cuda_graph_decode_metadata={1: graph_metadata},
+    )
+
+    CudaGraphWrapper._clear_glm_dsa_metadata_caches(backend)
+
+    assert not hasattr(decode_metadata, "_glm_dsa_seq_lens_fit_topk_cache")
+    assert not hasattr(decode_metadata, "_glm_dsa_full_context_topk_cache")
+    assert hasattr(decode_metadata, "other_cache")
+    assert not hasattr(graph_metadata, "_glm_dsa_graph_cache")
+    assert graph_metadata.preserved
 
 
 def _make_executor_for_capture_drafter(capture_drafter: bool) -> ModelExecutor:

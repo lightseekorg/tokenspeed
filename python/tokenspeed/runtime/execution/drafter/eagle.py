@@ -434,6 +434,8 @@ class Eagle(BaseDrafter):
                 indices,
                 out=next_tokens[num_extends:, 0],
             )
+        if self.spec_num_steps > 0:
+            next_tokens[:, 1:] = next_tokens[:, :1]
 
         # Seed the draft attn backend's aliased seq_lens for the first step.
         self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])

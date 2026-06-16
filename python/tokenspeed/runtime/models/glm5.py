@@ -85,6 +85,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     get_layer_id,
 )
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 @dataclass
@@ -1500,10 +1501,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             return None
 
         seq_len_sum = int(seq_lens.sum().item())
-        logits_bytes = num_prefill_tokens * max(seq_len_sum, 1) * 4
-        if logits_bytes > 512 * 1024 * 1024:
-            return None
-
+        max_logits_mb = int(
+            global_server_args_dict["deepseek_v4_indexer_prefill_max_logits_mb"]
+        )
         try:
             q = indexer_output.query[:num_prefill_tokens].contiguous()
             q_2d = q.view(-1, self.indexer.index_head_dim)
@@ -1559,23 +1559,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             row_starts = seq_cu.index_select(0, token_req)
             row_ends = row_starts + causal_lens
 
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8,
-                kv_fp8,
-                weights.contiguous(),
-                row_starts.to(torch.int32).contiguous(),
-                row_ends.to(torch.int32).contiguous(),
-                clean_logits=False,
-            )
-            # Mirror the decode path: with clean_logits=False DeepGEMM may
-            # leave non-finite lanes inside the causal window. +inf outranks
-            # every real score, so the top-k selector would crowd out genuine
-            # candidates.
-            logits.nan_to_num_(
-                nan=float("-inf"),
-                posinf=float("-inf"),
-                neginf=float("-inf"),
-            )
             workspace_indices = torch.full(
                 (num_prefill_tokens, topk),
                 -1,
@@ -1585,13 +1568,44 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             trtllm_ops = getattr(torch.ops, "trtllm", None)
             if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
                 return None
-            trtllm_ops.indexer_topk_prefill(
-                logits.contiguous(),
-                row_starts.to(torch.int32).contiguous(),
-                row_ends.to(torch.int32).contiguous(),
-                workspace_indices,
-                topk,
-            )
+
+            # Keep each materialized logits tile within the same memory budget
+            # that was known-good for long-context correctness, instead of
+            # falling back to the much slower BF16 indexer once the full chunk
+            # would exceed the budget.
+            seq_len_sum = max(seq_len_sum, 1)
+            max_logits_bytes = max(1, max_logits_mb) * 1024 * 1024
+            max_query_rows = max(1, max_logits_bytes // (seq_len_sum * 4))
+
+            row_starts_i32 = row_starts.to(torch.int32).contiguous()
+            row_ends_i32 = row_ends.to(torch.int32).contiguous()
+            for start in range(0, num_prefill_tokens, max_query_rows):
+                end = min(start + max_query_rows, num_prefill_tokens)
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8[start:end].contiguous(),
+                    kv_fp8,
+                    weights[start:end].contiguous(),
+                    row_starts_i32[start:end].contiguous(),
+                    row_ends_i32[start:end].contiguous(),
+                    clean_logits=False,
+                    max_seqlen_k=int(causal_lens[start:end].max().item()),
+                )
+                # Mirror the decode path: with clean_logits=False DeepGEMM may
+                # leave non-finite lanes inside the causal window. +inf outranks
+                # every real score, so the top-k selector would crowd out genuine
+                # candidates.
+                logits.nan_to_num_(
+                    nan=float("-inf"),
+                    posinf=float("-inf"),
+                    neginf=float("-inf"),
+                )
+                trtllm_ops.indexer_topk_prefill(
+                    logits.contiguous(),
+                    row_starts_i32[start:end].contiguous(),
+                    row_ends_i32[start:end].contiguous(),
+                    workspace_indices[start:end],
+                    topk,
+                )
             valid_topk = workspace_indices >= 0
             workspace_indices = torch.where(
                 valid_topk,

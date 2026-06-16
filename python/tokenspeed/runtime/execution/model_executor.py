@@ -176,7 +176,10 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
-            capture_drafter_in_cuda_graph=(model_config.use_target_verify_forward_mode),
+            capture_drafter_in_cuda_graph=(
+                model_config.use_target_verify_forward_mode
+                and not envs.TOKENSPEED_DISABLE_DRAFTER_CUDA_GRAPH_CAPTURE.get()
+            ),
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
