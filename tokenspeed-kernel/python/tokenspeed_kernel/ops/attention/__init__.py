@@ -359,7 +359,7 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        kernel_kwargs = dict(
+        return kernel(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -371,7 +371,6 @@ def mha_decode_with_kvcache(
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
         )
-        return kernel(**kernel_kwargs)
 
 
 # ===-----------------------------------------------------------------------===#
