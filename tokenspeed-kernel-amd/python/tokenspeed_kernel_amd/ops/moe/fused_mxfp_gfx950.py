@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
@@ -384,7 +385,12 @@ def get_mfma_layout(
     instr_shape = [16, 16, 128] if use_mfma_scaled else [16, 16, 32]
     # tpw=[2,2] required when scales preshuffle through LDS (the 5-D
     # unswizzle view absorbs one 2x2 MFMA block per warp per K-iter).
-    tiles_per_warp = [2, 2] if scale_preshuffle else [1, 1]
+    # AITER's M=16 W4A8 Triton kernel uses tpw=[1,2]; keep it env-gated
+    # because other Gluon scale-preshuffle kernels historically expect [2,2].
+    if scale_preshuffle and block_m <= 16 and _PREFILL_STAGE1_TPW12:
+        tiles_per_warp = [1, 2]
+    else:
+        tiles_per_warp = [2, 2] if scale_preshuffle else [1, 1]
     return gl.amd.cdna4.AMDMFMALayout(
         version=4,
         instr_shape=instr_shape,
@@ -727,19 +733,29 @@ class MoEProgramBase:
     @gluon.jit
     def issue_global_loads(self, load_idx, pred=1, USE_MASK: gl.constexpr = -1):
         cfg = self.cfg
-        self.x_desc.issue_async_load(load_idx, self.x_buffer, pred, USE_MASK=USE_MASK)
+        slot_idx = load_idx % cfg.NUM_BUFFERS
+        return self.issue_global_loads_slot(load_idx, slot_idx, pred, USE_MASK)
+
+    @gluon.jit
+    def issue_global_loads_slot(
+        self, load_idx, slot_idx, pred=1, USE_MASK: gl.constexpr = -1
+    ):
+        cfg = self.cfg
+        self.x_desc.issue_async_load_slot(
+            load_idx, self.x_buffer, slot_idx, pred, USE_MASK=USE_MASK
+        )
         if not cfg.W_VIA_VGPR:
-            self.w_desc.issue_async_load(
-                load_idx, self.w_buffer, pred, USE_MASK=USE_MASK
+            self.w_desc.issue_async_load_slot(
+                load_idx, self.w_buffer, slot_idx, pred, USE_MASK=USE_MASK
             )
         if cfg.SCALE_VIA_LDS:
             if cfg.WITH_X_MX_SCALE:
-                self.x_scale_desc.issue_async_load(
-                    load_idx, self.x_scale_buffer, pred, USE_MASK=USE_MASK
+                self.x_scale_desc.issue_async_load_slot(
+                    load_idx, self.x_scale_buffer, slot_idx, pred, USE_MASK=USE_MASK
                 )
             if cfg.WITH_W_MX_SCALE:
-                self.w_scale_desc.issue_async_load(
-                    load_idx, self.w_scale_buffer, pred, USE_MASK=USE_MASK
+                self.w_scale_desc.issue_async_load_slot(
+                    load_idx, self.w_scale_buffer, slot_idx, pred, USE_MASK=USE_MASK
                 )
         return load_idx + 1
 
@@ -785,6 +801,15 @@ def _scale_async_blocked_layout(
         [warps_nonk, warps_k],
         [1, 0],
     )
+
+
+@gluon.constexpr_function
+def _direct_shared_layout(H: gl.constexpr, W: gl.constexpr):
+    H_i = int(H)
+    W_i = int(W)
+    inner = [[0, 1 << i] for i in range(W_i.bit_length() - 1)]
+    outer = [[1 << i, 0] for i in range(H_i.bit_length() - 1)]
+    return gl.PaddedSharedLayout([[1024, 32]], inner + outer, [], [H_i, W_i])
 
 
 @gluon.aggregate
@@ -888,6 +913,21 @@ class AsyncCopyDescriptor:
         COMMIT: gl.constexpr = 1,
     ):
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
+        slot_idx = idx % NUM_BUFFERS
+        self.issue_async_load_slot(
+            idx, buffer, slot_idx, pred, USE_MASK=USE_MASK, COMMIT=COMMIT
+        )
+
+    @gluon.jit
+    def issue_async_load_slot(
+        self,
+        idx,
+        buffer,
+        slot_idx,
+        pred=1,
+        USE_MASK: gl.constexpr = -1,
+        COMMIT: gl.constexpr = 1,
+    ):
         EVEN_K: gl.constexpr = self.cfg.EVEN_K
         if USE_MASK == -1:
             USE_MASK_RESOLVED: gl.constexpr = 0 if EVEN_K else 1
@@ -895,12 +935,12 @@ class AsyncCopyDescriptor:
             USE_MASK_RESOLVED: gl.constexpr = USE_MASK
         CACHE_MODIFIER: gl.constexpr = self.cache_modifier
         off_k_step = idx * self.BLOCK_K
-        offsets = self.offsets + off_k_step * self.stride_k
+        ptr_iter = self.ptr + off_k_step * self.stride_k
         if USE_MASK_RESOLVED == 0:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                buffer.index(idx % NUM_BUFFERS),
-                self.ptr,
-                offsets,
+                buffer.index(slot_idx),
+                ptr_iter,
+                self.offsets,
                 cache_modifier=CACHE_MODIFIER,
             )
         else:
@@ -914,9 +954,9 @@ class AsyncCopyDescriptor:
             mask_k = gl.expand_dims(off_k_step + self.off_k, self.op_idx) < self.k_limit
             mask = mask_k & self.masks_nonk
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                buffer.index(idx % NUM_BUFFERS),
-                self.ptr,
-                offsets,
+                buffer.index(slot_idx),
+                ptr_iter,
+                self.offsets,
                 mask=mask,
                 cache_modifier=CACHE_MODIFIER,
             )
@@ -928,7 +968,14 @@ class AsyncCopyDescriptor:
         self, idx, buffer, layout: gl.constexpr, do_permute: gl.constexpr = False
     ):
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
-        slot = buffer.index(idx % NUM_BUFFERS)
+        slot_idx = idx % NUM_BUFFERS
+        return self.issue_local_load_slot(slot_idx, buffer, layout, do_permute)
+
+    @gluon.jit
+    def issue_local_load_slot(
+        self, slot_idx, buffer, layout: gl.constexpr, do_permute: gl.constexpr = False
+    ):
+        slot = buffer.index(slot_idx)
         if do_permute:
             slot = slot.permute([1, 0])
         return gl.amd.cdna4.async_copy.load_shared_relaxed(slot, layout)
@@ -944,7 +991,22 @@ class AsyncCopyDescriptor:
         BLOCK_K_SCALE: gl.constexpr,
     ):
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
-        slot = buffer.index(idx % NUM_BUFFERS)
+        slot_idx = idx % NUM_BUFFERS
+        return self.issue_local_load_unswizzle_slot(
+            slot_idx, buffer, layout, BLOCK_NONK_PS, BLOCK_NONK, BLOCK_K_SCALE
+        )
+
+    @gluon.jit
+    def issue_local_load_unswizzle_slot(
+        self,
+        slot_idx,
+        buffer,
+        layout: gl.constexpr,
+        BLOCK_NONK_PS: gl.constexpr,
+        BLOCK_NONK: gl.constexpr,
+        BLOCK_K_SCALE: gl.constexpr,
+    ):
+        slot = buffer.index(slot_idx)
         slot_7d = slot.reshape((BLOCK_NONK_PS, BLOCK_K_SCALE // 8, 4, 16, 2, 2, 1))
         slot_perm = slot_7d.permute((0, 5, 3, 1, 4, 2, 6))
         slot_2d = slot_perm.reshape((BLOCK_NONK, BLOCK_K_SCALE))
@@ -1162,16 +1224,22 @@ class MoEPipelinedProgram:
     @gluon.jit
     def _load_xw(self, mfma_idx):
         cfg = self.cfg
-        x = self.x_desc.issue_local_load(
-            mfma_idx,
+        slot_idx = mfma_idx % cfg.NUM_BUFFERS
+        return self._load_xw_slot(mfma_idx, slot_idx)
+
+    @gluon.jit
+    def _load_xw_slot(self, mfma_idx, slot_idx):
+        cfg = self.cfg
+        x = self.x_desc.issue_local_load_slot(
+            slot_idx,
             self.x_buffer,
             cfg.dot_layout_x,
         )
         if cfg.W_VIA_VGPR:
             w = self._issue_w_vgpr(mfma_idx)
         else:
-            w = self.w_desc.issue_local_load(
-                mfma_idx,
+            w = self.w_desc.issue_local_load_slot(
+                slot_idx,
                 self.w_buffer,
                 cfg.dot_layout_w,
                 do_permute=cfg.W_TRANSPOSE,
@@ -1181,8 +1249,14 @@ class MoEPipelinedProgram:
     @gluon.jit
     def _load_x_scales(self, mfma_idx):
         cfg = self.cfg
-        x = self.x_desc.issue_local_load(
-            mfma_idx,
+        slot_idx = mfma_idx % cfg.NUM_BUFFERS
+        return self._load_x_scales_slot(mfma_idx, slot_idx)
+
+    @gluon.jit
+    def _load_x_scales_slot(self, mfma_idx, slot_idx):
+        cfg = self.cfg
+        x = self.x_desc.issue_local_load_slot(
+            slot_idx,
             self.x_buffer,
             cfg.dot_layout_x,
         )
@@ -1191,8 +1265,8 @@ class MoEPipelinedProgram:
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
                 if cfg.SCALE_VIA_LDS:
-                    scale_x = self.x_scale_desc.issue_local_load_unswizzle(
-                        mfma_idx,
+                    scale_x = self.x_scale_desc.issue_local_load_unswizzle_slot(
+                        slot_idx,
                         self.x_scale_buffer,
                         cfg.layout_x_scale,
                         cfg.BLOCK_M_PRESHUFFLED,
@@ -1210,8 +1284,8 @@ class MoEPipelinedProgram:
                 )
             if cfg.WITH_W_MX_SCALE:
                 if cfg.SCALE_VIA_LDS:
-                    scale_w = self.w_scale_desc.issue_local_load_unswizzle(
-                        mfma_idx,
+                    scale_w = self.w_scale_desc.issue_local_load_unswizzle_slot(
+                        slot_idx,
                         self.w_scale_buffer,
                         cfg.layout_w_scale,
                         cfg.BLOCK_N_PRESHUFFLED,
@@ -1236,15 +1310,21 @@ class MoEPipelinedProgram:
     @gluon.jit
     def issue_local_loads(self, mfma_idx):
         cfg = self.cfg
-        x, w = self._load_xw(mfma_idx)
+        slot_idx = mfma_idx % cfg.NUM_BUFFERS
+        return self.issue_local_loads_slot(mfma_idx, slot_idx)
+
+    @gluon.jit
+    def issue_local_loads_slot(self, mfma_idx, slot_idx):
+        cfg = self.cfg
+        x, w = self._load_xw_slot(mfma_idx, slot_idx)
 
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
                 if cfg.SCALE_VIA_LDS:
-                    scale_x = self.x_scale_desc.issue_local_load_unswizzle(
-                        mfma_idx,
+                    scale_x = self.x_scale_desc.issue_local_load_unswizzle_slot(
+                        slot_idx,
                         self.x_scale_buffer,
                         cfg.layout_x_scale,
                         cfg.BLOCK_M_PRESHUFFLED,
@@ -1263,8 +1343,8 @@ class MoEPipelinedProgram:
 
             if cfg.WITH_W_MX_SCALE:
                 if cfg.SCALE_VIA_LDS:
-                    scale_w = self.w_scale_desc.issue_local_load_unswizzle(
-                        mfma_idx,
+                    scale_w = self.w_scale_desc.issue_local_load_unswizzle_slot(
+                        slot_idx,
                         self.w_scale_buffer,
                         cfg.layout_w_scale,
                         cfg.BLOCK_N_PRESHUFFLED,
@@ -1362,8 +1442,8 @@ class MoEPipelinedProgram:
         load_idx = 0
         mfma_idx = 0
 
-        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
-            load_idx = self.issue_global_loads(load_idx)
+        for slot in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_global_loads_slot(load_idx, slot)
 
         accumulator = gl.zeros(
             (cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout
@@ -1374,16 +1454,23 @@ class MoEPipelinedProgram:
         # Drain oldest prologue batch into LDS; rest remain in flight.
         self.async_wait(cfg.NUM_BUFFERS - 2)
 
-        for _ in range(0, main_iters):
-            with gl.amd.warp_pipeline_stage("lds+tdm", priority=1):
-                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                mfma_idx += 1
-                load_idx = self.issue_global_loads(load_idx)
+        for iter_base in range(0, main_iters, cfg.NUM_BUFFERS):
+            for slot in gl.static_range(cfg.NUM_BUFFERS):
+                if iter_base + slot < main_iters:
+                    LOAD_SLOT: gl.constexpr = (slot + cfg.NUM_BUFFERS - 1) % cfg.NUM_BUFFERS
+                    with gl.amd.warp_pipeline_stage("lds+tdm", priority=1):
+                        x, w, scale_x, scale_w = self.issue_local_loads_slot(
+                            mfma_idx, slot
+                        )
+                        mfma_idx += 1
+                        load_idx = self.issue_global_loads_slot(load_idx, LOAD_SLOT)
 
-            self.async_wait(cfg.NUM_BUFFERS - 2)
+                    self.async_wait(cfg.NUM_BUFFERS - 2)
 
-            with gl.amd.warp_pipeline_stage("mfma", priority=0):
-                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+                    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+                        accumulator = self.mfma(
+                            x, scale_x, w, scale_w, accumulator
+                        )
 
         self.async_wait(0)
         for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
@@ -3037,12 +3124,845 @@ def _group_m_swizzle(
     return pid_m, pid_n
 
 
+
+@gluon.jit
+def _prefill_m16_stage1_direct_kernel(
+    X,
+    W,
+    WScale,
+    Gather,
+    SliceSizes,
+    SliceOffs,
+    BlockOffs,
+    BlockSchedule,
+    Y,
+    M,
+    M_X,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    stride_wse,
+    stride_wsn,
+    stride_wsk,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    bias_ptr,
+    N_EXPERTS: gl.constexpr,
+    NUM_TILES: gl.constexpr,
+    GRID_N: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    LOCAL_STAGE: gl.constexpr,
+    UNMASK_FULL: gl.constexpr,
+    USE_CG: gl.constexpr,
+    USE_CG_SCALE: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+):
+    """AITER-style direct-load grouped stage1 for M<=16 prefill/general path.
+
+    LOCAL_STAGE=1 attempts Triton-like TTGIR:
+        buffer_load(blocked layout) -> local_alloc/local_load -> dot layout.
+    LOCAL_STAGE=0 keeps the direct-to-dot-layout buffer_load variant.
+    """
+    pid_raw = gl.program_id(axis=0)
+    grid_n: gl.constexpr = GRID_N
+    if XCD_SWIZZLE > 1:
+        pid = _xcd_chiplet_swizzle(pid_raw, NUM_TILES, XCD_SWIZZLE)
+    else:
+        pid = pid_raw
+    grid_m_padded: gl.constexpr = NUM_TILES // GRID_N
+    pid_m, pid_n = _group_m_swizzle(pid, grid_m_padded, grid_n, GROUP_M)
+
+    unpadded_m = gl.load(BlockOffs + N_EXPERTS).to(gl.int32)
+    if pid_m >= unpadded_m:
+        return
+
+    schedule_raw = gl.load(BlockSchedule + pid_m).to(gl.uint32, bitcast=True)
+    expert = (schedule_raw & 0x0000FFFF).to(gl.int32)
+    block_in_expert = (schedule_raw >> 16).to(gl.int32)
+
+    cfg = MoEConfig(
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        "e4m3",
+        "e2m1",
+        32,
+        1,
+        True,
+        False,
+        True,
+        "swizzle",
+        gl.int32,
+        (1, 1, 1),
+        False,
+        True,
+        4,
+        W_VIA_VGPR=False,
+        W_PREFETCH=False,
+    )
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    OUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
+
+    X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
+    W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
+    LOAD_X_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K, BLOCK_M, 4, [1, 0], X_ELEM_BITS
+    )
+    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K_PACKED, BLOCK_N, 4, [0, 1], W_ELEM_BITS
+    )
+    # Match Triton/AITER local_alloc layouts for BLOCK_M=16, BLOCK_N=128,
+    # BLOCK_K=256. X load tensor is [M,K], W load tensor is [K_packed,N].
+    DIRECT_SHARED_X: gl.constexpr = gl.SwizzledSharedLayout(
+        16, 1, 16, order=[1, 0]
+    )
+    DIRECT_SHARED_W: gl.constexpr = gl.SwizzledSharedLayout(
+        16, 2, 8, order=[0, 1]
+    )
+
+    m_base = gl.load(SliceOffs + expert).to(gl.int32)
+    m_size = gl.load(SliceSizes + expert).to(gl.int32)
+    off_m = m_base + block_in_expert * BLOCK_M
+    m_limit = m_base + m_size
+    off_n = pid_n * BLOCK_N
+
+    # Dot-layout coordinates for the direct-to-dot path and scale/epilogue.
+    am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, cfg.dot_layout_x))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, cfg.dot_layout_w))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.dot_layout_w))[None, :]
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, cfg.layout_w_scale))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, cfg.layout_w_scale))[None, :]
+
+    # Blocked-load coordinates for the Triton-like local_alloc/local_load path.
+    lm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+    lk = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
+    lwk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))[:, None]
+    lwn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))[None, :]
+
+    sorted_m = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
+    in_sorted = sorted_m < m_limit
+    if UNMASK_FULL:
+        # AITER-style safe padded rows: wrap within this expert's slice for
+        # loads, and rely on the final local-row store mask to discard padded rows.
+        local_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
+        local_m = gl.max_contiguous(gl.multiple_of(local_m % m_size, BLOCK_M), BLOCK_M)
+        token_m = gl.amd.cdna4.buffer_load(
+            ptr=Gather, offsets=(m_base + local_m).to(gl.int32)
+        ).to(gl.int32)
+        valid_m = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, cfg.dot_layout_x))
+    else:
+        sorted_safe = gl.where(in_sorted, sorted_m, gl.zeros_like(sorted_m))
+        token_m = gl.amd.cdna4.buffer_load(
+            ptr=Gather, offsets=sorted_safe.to(gl.int32), mask=in_sorted, other=0
+        ).to(gl.int32)
+        valid_m = in_sorted & (token_m < M_X)
+
+    if LOCAL_STAGE:
+        sorted_m_l = off_m + lm
+        in_sorted_l = sorted_m_l < m_limit
+        if UNMASK_FULL:
+            local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+            local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
+            token_m_l = gl.amd.cdna4.buffer_load(
+                ptr=Gather, offsets=(m_base + local_m_l).to(gl.int32)
+            ).to(gl.int32)
+            valid_m_l = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+        else:
+            sorted_safe_l = gl.where(in_sorted_l, sorted_m_l, gl.zeros_like(sorted_m_l))
+            token_m_l = gl.amd.cdna4.buffer_load(
+                ptr=Gather, offsets=sorted_safe_l.to(gl.int32), mask=in_sorted_l, other=0
+            ).to(gl.int32)
+            valid_m_l = in_sorted_l & (token_m_l < M_X)
+
+    n_cols = off_n + bn
+    n_cols_s = off_n + bsn
+    a_scale = gl.full((BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=cfg.layout_x_scale)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+
+    total_kt = gl.cdiv(K, BLOCK_K)
+    num_full = K // BLOCK_K
+    for kt in range(0, num_full):
+        k_scale_idx = kt * BLOCK_K_SCALE + bsk
+        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(
+            n_cols_s, k_scale_idx, stride_wsk, stride_wsn
+        )
+        if UNMASK_FULL:
+            if USE_CG_SCALE:
+                s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off.to(gl.int32), cache=".cg")
+            else:
+                s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off.to(gl.int32))
+        else:
+            if USE_CG_SCALE:
+                s = gl.amd.cdna4.buffer_load(
+                    ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0, cache=".cg"
+                )
+            else:
+                s = gl.amd.cdna4.buffer_load(
+                    ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0
+                )
+        if LOCAL_STAGE:
+            k_elem_l = kt * BLOCK_K + lk
+            k_pack_l = kt * BLOCK_K_PACKED + lwk
+            n_cols_l = off_n + lwn
+            x_off_l = (
+                gl.expand_dims(token_m_l, 1).to(gl.int64) * stride_xm
+                + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+            )
+            w_off_l = (
+                expert.to(gl.int64) * stride_we
+                + k_pack_l.to(gl.int64) * stride_wk
+                + n_cols_l.to(gl.int64) * stride_wn
+            )
+            if UNMASK_FULL:
+                a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32))
+                if USE_CG:
+                    b_l = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off_l.to(gl.int32), cache=".cg")
+                else:
+                    b_l = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off_l.to(gl.int32))
+            else:
+                a_l = gl.amd.cdna4.buffer_load(
+                    ptr=X,
+                    offsets=x_off_l.to(gl.int32),
+                    mask=gl.expand_dims(valid_m_l, 1),
+                    other=0.0,
+                )
+                if USE_CG:
+                    b_l = gl.amd.cdna4.buffer_load(
+                        ptr=W,
+                        offsets=w_off_l.to(gl.int32),
+                        mask=n_cols_l < N,
+                        other=0,
+                        cache=".cg",
+                    )
+                else:
+                    b_l = gl.amd.cdna4.buffer_load(
+                        ptr=W,
+                        offsets=w_off_l.to(gl.int32),
+                        mask=n_cols_l < N,
+                        other=0,
+                    )
+            a_smem = gl.allocate_shared_memory(
+                X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
+            )
+            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+            b_smem = gl.allocate_shared_memory(
+                W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
+            )
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
+        else:
+            k_elem = kt * BLOCK_K + ak
+            k_pack = kt * BLOCK_K_PACKED + bk
+            x_off = token_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
+            w_off = (
+                expert.to(gl.int64) * stride_we
+                + n_cols.to(gl.int64) * stride_wn
+                + k_pack.to(gl.int64) * stride_wk
+            )
+            if UNMASK_FULL:
+                a = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off.to(gl.int32))
+                if USE_CG:
+                    b = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off.to(gl.int32), cache=".cg")
+                else:
+                    b = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off.to(gl.int32))
+            else:
+                a = gl.amd.cdna4.buffer_load(
+                    ptr=X, offsets=x_off.to(gl.int32), mask=valid_m[:, None], other=0.0
+                )
+                if USE_CG:
+                    b = gl.amd.cdna4.buffer_load(
+                        ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0, cache=".cg"
+                    )
+                else:
+                    b = gl.amd.cdna4.buffer_load(
+                        ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0
+                    )
+        acc = gl.amd.cdna4.mfma_scaled(
+            a=a, a_scale=a_scale, a_format="e4m3",
+            b=b, b_scale=s, b_format="e2m1", acc=acc,
+        )
+
+    if total_kt > num_full:
+        kt = num_full
+        k_scale_idx = kt * BLOCK_K_SCALE + bsk
+        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(
+            n_cols_s, k_scale_idx, stride_wsk, stride_wsn
+        )
+        sk_valid = k_scale_idx < (K // 32)
+        if USE_CG_SCALE:
+            s = gl.amd.cdna4.buffer_load(
+                ptr=WScale,
+                offsets=s_off.to(gl.int32),
+                mask=(n_cols_s < N) & sk_valid,
+                other=0,
+                cache=".cg",
+            )
+        else:
+            s = gl.amd.cdna4.buffer_load(
+                ptr=WScale, offsets=s_off.to(gl.int32), mask=(n_cols_s < N) & sk_valid, other=0
+            )
+        if LOCAL_STAGE:
+            k_elem_l = kt * BLOCK_K + lk
+            k_pack_l = kt * BLOCK_K_PACKED + lwk
+            n_cols_l = off_n + lwn
+            x_off_l = (
+                gl.expand_dims(token_m_l, 1).to(gl.int64) * stride_xm
+                + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+            )
+            w_off_l = (
+                expert.to(gl.int64) * stride_we
+                + k_pack_l.to(gl.int64) * stride_wk
+                + n_cols_l.to(gl.int64) * stride_wn
+            )
+            a_l = gl.amd.cdna4.buffer_load(
+                ptr=X,
+                offsets=x_off_l.to(gl.int32),
+                mask=gl.expand_dims(valid_m_l, 1) & (gl.expand_dims(k_elem_l, 0) < K),
+                other=0.0,
+            )
+            if USE_CG:
+                b_l = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off_l.to(gl.int32),
+                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
+                    other=0,
+                    cache=".cg",
+                )
+            else:
+                b_l = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off_l.to(gl.int32),
+                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
+                    other=0,
+                )
+            a_smem = gl.allocate_shared_memory(
+                X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
+            )
+            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+            b_smem = gl.allocate_shared_memory(
+                W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
+            )
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
+        else:
+            k_elem = kt * BLOCK_K + ak
+            k_pack = kt * BLOCK_K_PACKED + bk
+            x_off = token_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
+            w_off = (
+                expert.to(gl.int64) * stride_we
+                + n_cols.to(gl.int64) * stride_wn
+                + k_pack.to(gl.int64) * stride_wk
+            )
+            a = gl.amd.cdna4.buffer_load(
+                ptr=X,
+                offsets=x_off.to(gl.int32),
+                mask=valid_m[:, None] & (k_elem < K),
+                other=0.0,
+            )
+            if USE_CG:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off.to(gl.int32),
+                    mask=(n_cols < N) & (k_pack < (K // 2)),
+                    other=0,
+                    cache=".cg",
+                )
+            else:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off.to(gl.int32),
+                    mask=(n_cols < N) & (k_pack < (K // 2)),
+                    other=0,
+                )
+        acc = gl.amd.cdna4.mfma_scaled(
+            a=a, a_scale=a_scale, a_format="e4m3",
+            b=b, b_scale=s, b_format="e2m1", acc=acc,
+        )
+
+    acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
+    if HAS_BIAS:
+        bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
+        if UNMASK_FULL:
+            bias = gl.load(bias_ptr + expert.to(gl.int64) * N + bias_n).to(gl.float32)
+            bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
+            acc = acc + bias[None, :]
+        else:
+            acc = _add_expert_bias(
+                acc,
+                bias_ptr + expert.to(gl.int64) * N,
+                bias_n,
+                bias_n < N,
+                cfg.acc_layout,
+            )
+
+    out = _swiglu_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout)
+    out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
+    out = (out * out_inv_scale).to(Y.dtype.element_ty)
+    STORE_LAYOUT: gl.constexpr = out.type.layout
+    sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
+    n_out = pid_n * OUT_BLOCK_N + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
+    if UNMASK_FULL:
+        local_store_m = block_in_expert * BLOCK_M + sm
+        sorted_store = m_base + local_store_m
+        valid_store = local_store_m < m_size
+        y_off = sorted_store[:, None].to(gl.int64) * stride_ym + n_out[None, :].to(gl.int64) * stride_yn
+        gl.amd.cdna4.buffer_store(
+            out,
+            Y,
+            y_off.to(gl.int32),
+            mask=valid_store[:, None],
+        )
+    else:
+        sorted_store = off_m + sm
+        valid_store = sorted_store < m_limit
+        y_off = sorted_store[:, None].to(gl.int64) * stride_ym + n_out[None, :].to(gl.int64) * stride_yn
+        gl.amd.cdna4.buffer_store(
+            out,
+            Y,
+            y_off.to(gl.int32),
+            mask=valid_store[:, None] & (n_out[None, :] < (N // 2)),
+        )
+
+
+@gluon.jit
+def _prefill_m16_stage2_direct_kernel(
+    X,
+    W,
+    WScale,
+    Scatter,
+    Gate,
+    SliceSizes,
+    SliceOffs,
+    BlockOffs,
+    BlockSchedule,
+    Y,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    stride_wse,
+    stride_wsn,
+    stride_wsk,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    bias_ptr,
+    N_EXPERTS: gl.constexpr,
+    NUM_TILES: gl.constexpr,
+    GRID_N: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    LOCAL_STAGE: gl.constexpr,
+    UNMASK_FULL: gl.constexpr,
+    USE_CG: gl.constexpr,
+    USE_CG_SCALE: gl.constexpr,
+    SORTED_OUT: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+):
+    """AITER-style direct-load grouped stage2/combine for M<=16 prefill path.
+
+    Computes sorted routed rows for one expert block and scatters weighted bf16
+    partials to Y[scatter_idx[row], n]. Host wrapper then sums TOPK rows.
+    """
+    pid_raw = gl.program_id(axis=0)
+    grid_n: gl.constexpr = GRID_N
+    if XCD_SWIZZLE > 1:
+        pid = _xcd_chiplet_swizzle(pid_raw, NUM_TILES, XCD_SWIZZLE)
+    else:
+        pid = pid_raw
+    grid_m_padded: gl.constexpr = NUM_TILES // GRID_N
+    pid_m, pid_n = _group_m_swizzle(pid, grid_m_padded, grid_n, GROUP_M)
+
+    unpadded_m = gl.load(BlockOffs + N_EXPERTS).to(gl.int32)
+    if pid_m >= unpadded_m:
+        return
+
+    schedule_raw = gl.load(BlockSchedule + pid_m).to(gl.uint32, bitcast=True)
+    expert = (schedule_raw & 0x0000FFFF).to(gl.int32)
+    block_in_expert = (schedule_raw >> 16).to(gl.int32)
+
+    cfg = MoEConfig(
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        "e4m3",
+        "e2m1",
+        32,
+        1,
+        True,
+        False,
+        True,
+        "swizzle",
+        gl.int32,
+        (1, 1, 1),
+        False,
+        True,
+        4,
+        W_VIA_VGPR=False,
+        W_PREFETCH=False,
+    )
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+
+    X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
+    W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
+    LOAD_X_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K, BLOCK_M, 4, [1, 0], X_ELEM_BITS
+    )
+    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K_PACKED, BLOCK_N, 4, [0, 1], W_ELEM_BITS
+    )
+    DIRECT_SHARED_X: gl.constexpr = gl.SwizzledSharedLayout(
+        16, 1, 16, order=[1, 0]
+    )
+    DIRECT_SHARED_W: gl.constexpr = gl.SwizzledSharedLayout(
+        16, 2, 8, order=[0, 1]
+    )
+
+    m_base = gl.load(SliceOffs + expert).to(gl.int32)
+    m_size = gl.load(SliceSizes + expert).to(gl.int32)
+    off_n = pid_n * BLOCK_N
+
+    am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, cfg.dot_layout_x))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, cfg.dot_layout_w))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.dot_layout_w))[None, :]
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, cfg.layout_w_scale))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, cfg.layout_w_scale))[None, :]
+
+    lm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+    lk = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
+    lwk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))[:, None]
+    lwn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))[None, :]
+
+    if UNMASK_FULL:
+        local_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
+        local_m = gl.max_contiguous(gl.multiple_of(local_m % m_size, BLOCK_M), BLOCK_M)
+        row_m = m_base + local_m
+        valid_m = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, cfg.dot_layout_x))
+    else:
+        local_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
+        row_m = m_base + block_in_expert * BLOCK_M + local_m
+        valid_m = row_m < (m_base + m_size)
+        row_m = gl.where(valid_m, row_m, m_base)
+
+    if LOCAL_STAGE:
+        if UNMASK_FULL:
+            local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+            local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
+            row_m_l = m_base + local_m_l
+            valid_m_l = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+        else:
+            local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+            row_m_l = m_base + block_in_expert * BLOCK_M + local_m_l
+            valid_m_l = row_m_l < (m_base + m_size)
+            row_m_l = gl.where(valid_m_l, row_m_l, m_base)
+
+    n_cols = off_n + bn
+    n_cols_s = off_n + bsn
+    a_scale = gl.full((BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=cfg.layout_x_scale)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+
+    total_kt = gl.cdiv(K, BLOCK_K)
+    num_full = K // BLOCK_K
+    for kt in range(0, num_full):
+        k_scale_idx = kt * BLOCK_K_SCALE + bsk
+        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(
+            n_cols_s, k_scale_idx, stride_wsk, stride_wsn
+        )
+        if USE_CG_SCALE:
+            s = gl.amd.cdna4.buffer_load(
+                ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0, cache=".cg"
+            )
+        else:
+            s = gl.amd.cdna4.buffer_load(
+                ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0
+            )
+        if LOCAL_STAGE:
+            k_elem_l = kt * BLOCK_K + lk
+            k_pack_l = kt * BLOCK_K_PACKED + lwk
+            n_cols_l = off_n + lwn
+            x_off_l = (
+                gl.expand_dims(row_m_l, 1).to(gl.int64) * stride_xm
+                + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+            )
+            w_off_l = (
+                expert.to(gl.int64) * stride_we
+                + k_pack_l.to(gl.int64) * stride_wk
+                + n_cols_l.to(gl.int64) * stride_wn
+            )
+            if UNMASK_FULL:
+                a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32))
+            else:
+                a_l = gl.amd.cdna4.buffer_load(
+                    ptr=X,
+                    offsets=x_off_l.to(gl.int32),
+                    mask=gl.expand_dims(valid_m_l, 1),
+                    other=0.0,
+                )
+            if USE_CG:
+                b_l = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off_l.to(gl.int32),
+                    mask=n_cols_l < N,
+                    other=0,
+                    cache=".cg",
+                )
+            else:
+                b_l = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off_l.to(gl.int32),
+                    mask=n_cols_l < N,
+                    other=0,
+                )
+            a_smem = gl.allocate_shared_memory(X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l)
+            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+            b_smem = gl.allocate_shared_memory(W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l)
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
+        else:
+            k_elem = kt * BLOCK_K + ak
+            k_pack = kt * BLOCK_K_PACKED + bk
+            x_off = row_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
+            w_off = expert.to(gl.int64) * stride_we + n_cols.to(gl.int64) * stride_wn + k_pack.to(gl.int64) * stride_wk
+            if UNMASK_FULL:
+                a = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off.to(gl.int32))
+            else:
+                a = gl.amd.cdna4.buffer_load(
+                    ptr=X, offsets=x_off.to(gl.int32), mask=valid_m[:, None], other=0.0
+                )
+            if USE_CG:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0, cache=".cg"
+                )
+            else:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0
+                )
+        acc = gl.amd.cdna4.mfma_scaled(a=a, a_scale=a_scale, a_format="e4m3", b=b, b_scale=s, b_format="e2m1", acc=acc)
+
+    if total_kt > num_full:
+        kt = num_full
+        k_scale_idx = kt * BLOCK_K_SCALE + bsk
+        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(n_cols_s, k_scale_idx, stride_wsk, stride_wsn)
+        sk_valid = k_scale_idx < (K // 32)
+        if USE_CG_SCALE:
+            s = gl.amd.cdna4.buffer_load(
+                ptr=WScale,
+                offsets=s_off.to(gl.int32),
+                mask=(n_cols_s < N) & sk_valid,
+                other=0,
+                cache=".cg",
+            )
+        else:
+            s = gl.amd.cdna4.buffer_load(
+                ptr=WScale, offsets=s_off.to(gl.int32), mask=(n_cols_s < N) & sk_valid, other=0
+            )
+        if LOCAL_STAGE:
+            k_elem_l = kt * BLOCK_K + lk
+            k_pack_l = kt * BLOCK_K_PACKED + lwk
+            n_cols_l = off_n + lwn
+            x_off_l = gl.expand_dims(row_m_l, 1).to(gl.int64) * stride_xm + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+            w_off_l = expert.to(gl.int64) * stride_we + k_pack_l.to(gl.int64) * stride_wk + n_cols_l.to(gl.int64) * stride_wn
+            a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32), mask=gl.expand_dims(valid_m_l, 1) & (gl.expand_dims(k_elem_l, 0) < K), other=0.0)
+            if USE_CG:
+                b_l = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off_l.to(gl.int32),
+                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
+                    other=0,
+                    cache=".cg",
+                )
+            else:
+                b_l = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off_l.to(gl.int32),
+                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
+                    other=0,
+                )
+            a_smem = gl.allocate_shared_memory(X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l)
+            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+            b_smem = gl.allocate_shared_memory(W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l)
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
+        else:
+            k_elem = kt * BLOCK_K + ak
+            k_pack = kt * BLOCK_K_PACKED + bk
+            x_off = row_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
+            w_off = expert.to(gl.int64) * stride_we + n_cols.to(gl.int64) * stride_wn + k_pack.to(gl.int64) * stride_wk
+            a = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off.to(gl.int32), mask=valid_m[:, None] & (k_elem < K), other=0.0)
+            if USE_CG:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off.to(gl.int32),
+                    mask=(n_cols < N) & (k_pack < (K // 2)),
+                    other=0,
+                    cache=".cg",
+                )
+            else:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=W,
+                    offsets=w_off.to(gl.int32),
+                    mask=(n_cols < N) & (k_pack < (K // 2)),
+                    other=0,
+                )
+        acc = gl.amd.cdna4.mfma_scaled(a=a, a_scale=a_scale, a_format="e4m3", b=b, b_scale=s, b_format="e2m1", acc=acc)
+
+    acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
+    if HAS_BIAS:
+        bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
+        if UNMASK_FULL:
+            bias = gl.load(bias_ptr + expert.to(gl.int64) * N + bias_n, mask=bias_n < N, other=0.0).to(gl.float32)
+            bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
+            acc = acc + bias[None, :]
+        else:
+            acc = _add_expert_bias(acc, bias_ptr + expert.to(gl.int64) * N, bias_n, bias_n < N, cfg.acc_layout)
+
+    out = acc.to(Y.dtype.element_ty)
+    STORE_LAYOUT: gl.constexpr = out.type.layout
+    sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
+    n_out = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
+    if SORTED_OUT:
+        local_store_m = block_in_expert * BLOCK_M + sm
+        sorted_store = m_base + local_store_m
+        valid_store = local_store_m < m_size
+        gate = gl.load(Gate + sorted_store, mask=valid_store, other=0.0).to(Y.dtype.element_ty)
+        out = out * gate[:, None]
+        gl.store(
+            Y
+            + sorted_store[:, None].to(gl.int64) * stride_ym
+            + n_out[None, :].to(gl.int64) * stride_yn,
+            out,
+            mask=valid_store[:, None] & (n_out[None, :] < N),
+        )
+    elif UNMASK_FULL:
+        local_store_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
+        local_store_m = gl.max_contiguous(
+            gl.multiple_of(local_store_m % m_size, BLOCK_M), BLOCK_M
+        )
+        sorted_store = m_base + local_store_m
+        scatter_row = gl.load(Scatter + sorted_store).to(gl.int32)
+        gate = gl.load(Gate + sorted_store).to(Y.dtype.element_ty)
+        out = out * gate[:, None]
+        gl.store(
+            Y
+            + scatter_row[:, None].to(gl.int64) * stride_ym
+            + n_out[None, :].to(gl.int64) * stride_yn,
+            out,
+            mask=n_out[None, :] < N,
+        )
+    else:
+        local_store_m = block_in_expert * BLOCK_M + sm
+        sorted_store = m_base + local_store_m
+        valid_store = local_store_m < m_size
+        scatter_row = gl.load(Scatter + sorted_store, mask=valid_store, other=0).to(gl.int32)
+        gate = gl.load(Gate + sorted_store, mask=valid_store, other=0.0).to(Y.dtype.element_ty)
+        out = out * gate[:, None]
+        gl.store(Y + scatter_row[:, None].to(gl.int64) * stride_ym + n_out[None, :].to(gl.int64) * stride_yn, out, mask=valid_store[:, None] & (n_out[None, :] < N))
+
+
+@gluon.jit
+def _prefill_m16_topk_reduce_kernel(
+    Partial,
+    Out,
+    M,
+    N,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    TOPK: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """Sum routed top-k rows Partial[token*TOPK+s, n] -> Out[token, n]."""
+    pid = gl.program_id(axis=0)
+    num_n = gl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_n
+    pid_n = pid % num_n
+    LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
+    n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
+    bound = (pid_m < M) & (n < N)
+    acc = gl.zeros([BLOCK_N], gl.float32, layout=LAYOUT)
+    for s in gl.static_range(TOPK):
+        acc += gl.load(
+            Partial
+            + (pid_m * TOPK + s).to(gl.int64) * stride_pm
+            + n.to(gl.int64) * stride_pn,
+            mask=bound,
+            other=0.0,
+        ).to(gl.float32)
+    gl.store(
+        Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
+        acc.to(Out.dtype.element_ty),
+        mask=bound,
+    )
+
+
+@gluon.jit
+def _prefill_m16_scatter_sorted_kernel(
+    Sorted,
+    Scatter,
+    Out,
+    G,
+    N,
+    stride_sm,
+    stride_sn,
+    stride_om,
+    stride_on,
+    BLOCK_N: gl.constexpr,
+):
+    pid = gl.program_id(axis=0)
+    num_n = gl.cdiv(N, BLOCK_N)
+    row = pid // num_n
+    pid_n = pid % num_n
+    LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
+    n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
+    bound = (row < G) & (n < N)
+    dst = gl.load(Scatter + row, mask=row < G, other=0).to(gl.int32)
+    vals = gl.load(
+        Sorted + row.to(gl.int64) * stride_sm + n.to(gl.int64) * stride_sn,
+        mask=bound,
+        other=0.0,
+    )
+    gl.store(
+        Out + dst.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
+        vals,
+        mask=bound,
+    )
+
+
 def _pipelined_moe_kernel_repr(specialization) -> str:
-    """Distinct rocprof names for schedule vs no-schedule specialization."""
+    """Distinct rocprof names for schedule/no-schedule and MoE stage role."""
     use_block_schedule = bool(specialization.constants.get("USE_BLOCK_SCHEDULE", False))
+    do_swiglu = bool(specialization.constants.get("DO_SWIGLU", False))
+    has_scatter = bool(specialization.constants.get("HAS_SCATTER", False))
+    has_fp8_quant_out = bool(specialization.constants.get("HAS_FP8_QUANT_OUT", False))
+    if do_swiglu or has_fp8_quant_out:
+        role = "dispatch_swiglu"
+    elif has_scatter:
+        role = "combine"
+    else:
+        role = "dense"
     if use_block_schedule:
-        return "_pipelined_moe_kernel_scaled_block_schedule"
-    return "_pipelined_moe_kernel_scaled"
+        return f"_pipelined_moe_kernel_scaled_block_schedule_{role}"
+    return f"_pipelined_moe_kernel_scaled_{role}"
 
 
 @gluon.jit(repr=_pipelined_moe_kernel_repr)
@@ -3799,8 +4719,9 @@ def _autotune_block(
     del ragged
     is_fp8 = x_format == "e4m3"
     if slice_size is not None and slice_size <= 16:
-        # tinny ragged decode
-        bm, bn, bk, nw = 64, 128, 256, 4
+        # Tiny ragged decode. Default keeps the prior generic-prefill choice;
+        # TS_PREFILL_BM16=1 enables the AITER-comparison experiment.
+        bm, bn, bk, nw = (16, 128, 256, 4) if _PREFILL_BM16 else (64, 128, 256, 4)
     elif slice_size is not None and slice_size <= 64 and M <= 8192:
         # mid ragged decode
         bm, bn, bk, nw = 64, 128, 256, 4
@@ -4069,6 +4990,67 @@ def gluon_mxfp_dispatch_swiglu(
     out_block_n = block_n // 2
     y_dtype = torch.float8_e4m3fn if out_quant_scale is not None else out_dtype
     y = torch.empty((M, N // 2), device=x.device, dtype=y_dtype)
+
+    if (
+        _PREFILL_STAGE1_DIRECT
+        and a_ragged_metadata is not None
+        and gather_indx is not None
+        and out_quant_scale is not None
+        and x_format == "e4m3"
+        and x_scale is None
+        and scale_load_mode == "swizzle"
+        and w_transpose
+        and block_m == 16
+        and block_n == 128
+        and block_k == 256
+        and not w_preshuffle
+    ):
+        w3 = w.transpose(-1, -2).contiguous()
+        w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
+        w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
+        stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, scale_load_mode)
+        gather_buf = gather_indx.src_indx if hasattr(gather_indx, "src_indx") else gather_indx
+        block_offs_buf = _as_int32(_ragged_block_offs(a_ragged_metadata, block_m))
+        block_schedule_buf = _as_int32(_ragged_block_schedule(a_ragged_metadata, block_m))
+        n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
+        grid_m_upper = RaggedTensorMetadata.n_blocks(n_slices, M, block_m)
+        grid_n = (N + block_n - 1) // block_n
+        x_global_scale_buf = (
+            x_global_scale.detach().reshape(-1)[:1]
+            if isinstance(x_global_scale, torch.Tensor)
+            else torch.tensor([float(x_global_scale)], dtype=torch.float32, device=x.device)
+        )
+        out_quant_scale_buf = (
+            out_quant_scale.detach().reshape(-1)[:1]
+            if isinstance(out_quant_scale, torch.Tensor)
+            else torch.tensor([float(out_quant_scale)], dtype=torch.float32, device=x.device)
+        )
+        bias_buf = bias if bias is not None else _make_dummy(x.device, torch.float32)
+        num_tiles_total = grid_m_upper * grid_n
+        _prefill_m16_stage1_direct_kernel[(num_tiles_total,)](
+            x, w3, w_scale_proc3, gather_buf,
+            _as_int32(a_ragged_metadata.slice_sizes), _as_int32(a_ragged_metadata.slice_offs),
+            block_offs_buf, block_schedule_buf, y,
+            M, int(x.shape[-2]), N, K,
+            x.stride(-2), x.stride(-1),
+            w3.stride(0), w3.stride(-2), w3.stride(-1),
+            w_scale_proc3.stride(0), stride_wsn, stride_wsk,
+            y.stride(0), y.stride(1),
+            x_global_scale_buf, out_quant_scale_buf, bias_buf,
+            N_EXPERTS=n_slices, NUM_TILES=num_tiles_total, GRID_N=grid_n,
+            GROUP_M=1, XCD_SWIZZLE=1,
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            LOCAL_STAGE=_PREFILL_STAGE1_LOCAL_STAGE,
+            UNMASK_FULL=_PREFILL_STAGE1_UNMASK_FULL,
+            USE_CG=_PREFILL_DIRECT_CG_W,
+            USE_CG_SCALE=_PREFILL_DIRECT_CG_SCALE,
+            HAS_BIAS=bias is not None,
+            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+            num_warps=num_warps,
+            num_stages=1,
+        )
+        return y
+
     _launch_kernel(
         x,
         w,
@@ -4199,6 +5181,104 @@ def gluon_mxfp_combine(
         n_tokens_eff = int(n_tokens)
         n_rows = n_tokens_eff * n_act_eff
     y = torch.empty((n_rows, N), device=x.device, dtype=out_dtype)
+
+    if (
+        _PREFILL_STAGE2_DIRECT
+        and a_ragged_metadata is not None
+        and scatter_indx is not None
+        and gate_scal is not None
+        and n_tokens is not None
+        and n_expts_act is not None
+        and x_format == "e4m3"
+        and x_scale is None
+        and scale_load_mode == "swizzle"
+        and w_transpose
+        and block_m == 16
+        and block_n == 128
+        and block_k == 256
+        and not w_preshuffle
+    ):
+        w3 = w.transpose(-1, -2).contiguous()
+        w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
+        w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
+        stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, scale_load_mode)
+        scatter_buf = scatter_indx.dst_indx if hasattr(scatter_indx, "dst_indx") else scatter_indx
+        block_offs_buf = _as_int32(_ragged_block_offs(a_ragged_metadata, block_m))
+        block_schedule_buf = _as_int32(_ragged_block_schedule(a_ragged_metadata, block_m))
+        n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
+        grid_m_upper = RaggedTensorMetadata.n_blocks(n_slices, M, block_m)
+        grid_n = (N + block_n - 1) // block_n
+        num_tiles_total = grid_m_upper * grid_n
+        x_global_scale_buf = (
+            x_global_scale.detach().reshape(-1)[:1]
+            if isinstance(x_global_scale, torch.Tensor)
+            else torch.tensor([float(x_global_scale)], dtype=torch.float32, device=x.device)
+        )
+        bias_buf = bias if bias is not None else _make_dummy(x.device, torch.float32)
+        _prefill_m16_stage2_direct_kernel[(num_tiles_total,)](
+            x, w3, w_scale_proc3, scatter_buf, gate_scal,
+            _as_int32(a_ragged_metadata.slice_sizes), _as_int32(a_ragged_metadata.slice_offs),
+            block_offs_buf, block_schedule_buf, y,
+            M, N, K,
+            x.stride(-2), x.stride(-1),
+            w3.stride(0), w3.stride(-2), w3.stride(-1),
+            w_scale_proc3.stride(0), stride_wsn, stride_wsk,
+            y.stride(0), y.stride(1),
+            x_global_scale_buf, bias_buf,
+            N_EXPERTS=n_slices, NUM_TILES=num_tiles_total, GRID_N=grid_n,
+            GROUP_M=1, XCD_SWIZZLE=1,
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            LOCAL_STAGE=_PREFILL_STAGE2_LOCAL_STAGE,
+            UNMASK_FULL=_PREFILL_STAGE2_UNMASK_FULL,
+            USE_CG=_PREFILL_DIRECT_CG_W,
+            USE_CG_SCALE=_PREFILL_DIRECT_CG_SCALE,
+            SORTED_OUT=_PREFILL_STAGE2_SORTED_OUT,
+            HAS_BIAS=bias is not None,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+        if n_act_eff > 1:
+            reduce_src = y
+            if _PREFILL_STAGE2_SORTED_OUT:
+                y_scattered = torch.empty_like(y)
+                S_BLOCK_N = 256
+                s_grid = (M * ((N + S_BLOCK_N - 1) // S_BLOCK_N),)
+                _prefill_m16_scatter_sorted_kernel[s_grid](
+                    y,
+                    scatter_buf,
+                    y_scattered,
+                    M,
+                    N,
+                    y.stride(0),
+                    y.stride(1),
+                    y_scattered.stride(0),
+                    y_scattered.stride(1),
+                    BLOCK_N=S_BLOCK_N,
+                    num_warps=1,
+                )
+                reduce_src = y_scattered
+            y_reduced = torch.empty((n_tokens_eff, N), device=x.device, dtype=out_dtype)
+            R_BLOCK_N = 256
+            r_grid = (n_tokens_eff * ((N + R_BLOCK_N - 1) // R_BLOCK_N),)
+            _prefill_m16_topk_reduce_kernel[r_grid](
+                reduce_src,
+                y_reduced,
+                n_tokens_eff,
+                N,
+                reduce_src.stride(0),
+                reduce_src.stride(1),
+                y_reduced.stride(0),
+                y_reduced.stride(1),
+                TOPK=n_act_eff,
+                BLOCK_N=R_BLOCK_N,
+                num_warps=1,
+            )
+            y = y_reduced
+        logical_n = int(getattr(w, "original_n", N))
+        if logical_n != N:
+            y = y[..., :logical_n].contiguous()
+        return y
+
     _launch_kernel(
         x,
         w,
@@ -4446,6 +5526,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     swiglu_limit: float = 7.0,
 ) -> torch.Tensor | None:
     """Small-M direct warp-decode MoE for GPT-OSS FP8 x MXFP4 path."""
+    if _WD_DISABLE:
+        return None
     assert hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
     if hidden_states.ndim != 2 or router_logits.ndim != 2:
@@ -4476,7 +5558,15 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
 
     D = int(hidden_states.shape[1])
-    if int(w13_raw.shape[1]) * 2 != D:
+    if _WD_STAGE1_W_VGPR:
+        w13_stage1 = getattr(w13_raw, "_wd_stage1_shuffled", None)
+        if w13_stage1 is not None:
+            w13_raw = w13_stage1
+    stage1_w_vgpr = bool(
+        _WD_STAGE1_W_VGPR and getattr(w13_raw, "is_shuffled_for_gluon_dot", False)
+    )
+    w13_k_pk = int(getattr(w13_raw, "original_k_pk", w13_raw.shape[1]))
+    if w13_k_pk * 2 != D:
         return None
     two_i = int(w13_raw.shape[2])
     if two_i % 2 != 0:
@@ -4532,35 +5622,86 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # BLOCK_N=64 maximizes CTAs/CU (the kernel is occupancy-bound); BLOCK_K=256
     # is the MX-scale-swizzle minimum; NUM_BUFFERS=3 is the LDS pipeline depth.
     COOP_NUM_WARPS = 4
-    COOP_BLOCK_N = 64
+    # W_VIA_VGPR's current LinearLayout helper is specialized to BLOCK_N=128.
+    COOP_BLOCK_N = 128 if stage1_w_vgpr else 64
     COOP_BLOCK_K = 256
     COOP_NUM_BUFFERS = 3
-    coop_grid = (n_tokens * ((2 * I + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
     # X is stored as raw i8 in LDS and bitcast to e4m3 in mfma_scaled; pass the
     # uint8 view (an fp8 LDS buffer fails to lower).
     x_uint8 = x_fp8.view(torch.uint8)
-    # fmt: off
-    _warp_decode_topk_stage1_coop_kernel[coop_grid](
-        x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
-        n_tokens, n_experts, D, I,
-        x_uint8.stride(0), x_uint8.stride(1),
-        router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
-        w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
-        w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
-        inter.stride(0), inter.stride(1),
-        w13_act_scale, w2_act_scale, b13,
-        D_PACKED=D // 2, TOPK=top_k,
-        # EP/TKP: padded widths of the [tokens, experts] logits tile and the
-        # top-k selection tile; >= 64*num_warps keeps the blocked layout valid.
-        EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS), TKP=64 * COOP_NUM_WARPS,
-        X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
-        BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
-        NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
-        HAS_BIAS=w13_bias is not None,
-        SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
-        num_warps=COOP_NUM_WARPS,
-    )
-    # fmt: on
+
+    if _WD_GROUPED_S1 and n_tokens >= _WD_GROUPED_MIN_M:
+        # EXPERT-MAJOR grouped stage1: route once, then one program per
+        # (expert, N-tile) loads w13[expert] ONCE and batches its routed
+        # tokens into the MFMA M-dim. Produces the same ``inter`` as coop.
+        GROUP_NUM_WARPS = COOP_NUM_WARPS
+        # BLOCK_N=128 (vs coop's 64) halves the per-expert N-tile program count
+        # and the pipeline ramp-ups; ~3us faster on the weight-bandwidth-bound
+        # grouped stage1 at M=16 (BLOCK_N=256 regresses on register pressure).
+        GROUP_BLOCK_N = 128
+        GROUP_BLOCK_K = COOP_BLOCK_K
+        GROUP_NUM_BUFFERS = COOP_NUM_BUFFERS
+        # fmt: off
+        _warp_decode_route_only_kernel[(n_tokens,)](
+            router_logits_c, topk_ids, topk_weights,
+            n_tokens, n_experts,
+            router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
+            TOPK=top_k,
+            EP=max(_route_next_pow2(n_experts), 64 * GROUP_NUM_WARPS),
+            TKP=64 * GROUP_NUM_WARPS,
+            NUM_WARPS=GROUP_NUM_WARPS,
+            num_warps=GROUP_NUM_WARPS,
+        )
+        g_num_pid_n = (2 * I + GROUP_BLOCK_N - 1) // GROUP_BLOCK_N
+        if _WD_GROUPED_GRID_ROUTE_MAJOR:
+            group_grid = (n_tokens * top_k * g_num_pid_n,)
+        else:
+            group_grid = (n_experts * g_num_pid_n,)
+        _warp_decode_stage1_grouped_kernel[group_grid](
+            x_uint8, w13_raw, w13_scale, topk_ids, inter,
+            n_tokens, n_experts, D, I,
+            x_uint8.stride(0), x_uint8.stride(1),
+            topk_ids.stride(0),
+            w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
+            w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
+            inter.stride(0), inter.stride(1),
+            w13_act_scale, w2_act_scale, b13,
+            TOPK=top_k,
+            BLOCK_M=16, BLOCK_N=GROUP_BLOCK_N, BLOCK_K=GROUP_BLOCK_K,
+            NUM_BUFFERS=GROUP_NUM_BUFFERS, NUM_WARPS=GROUP_NUM_WARPS,
+            GRID_ROUTE_MAJOR=_WD_GROUPED_GRID_ROUTE_MAJOR,
+            W_VIA_VGPR=stage1_w_vgpr,
+            HAS_BIAS=w13_bias is not None,
+            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+            num_warps=GROUP_NUM_WARPS,
+        )
+        # fmt: on
+    else:
+        coop_grid = (n_tokens * ((2 * I + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
+        # fmt: off
+        _warp_decode_topk_stage1_coop_kernel[coop_grid](
+            x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
+            n_tokens, n_experts, D, I,
+            x_uint8.stride(0), x_uint8.stride(1),
+            router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
+            w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
+            w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
+            inter.stride(0), inter.stride(1),
+            w13_act_scale, w2_act_scale, b13,
+            D_PACKED=D // 2, TOPK=top_k,
+            # EP/TKP: padded widths of the [tokens, experts] logits tile and the
+            # top-k selection tile; >= 64*num_warps keeps the blocked layout valid.
+            EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS),
+            TKP=64 * COOP_NUM_WARPS,
+            X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
+            BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
+            NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
+            W_VIA_VGPR=stage1_w_vgpr,
+            HAS_BIAS=w13_bias is not None,
+            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+            num_warps=COOP_NUM_WARPS,
+        )
+        # fmt: on
 
     n_tiles2 = (N + S2_BLOCK_N - 1) // S2_BLOCK_N
     if s2_split_k > 1:
@@ -4753,6 +5894,51 @@ SMALLM_MAX_M = 16
 # Backwards-compatible alias for the small-M bound.
 FUSED_ROUTE_MAX_M = SMALLM_MAX_M
 
+# Experimental EXPERT-MAJOR (grouped) warp-decode stage1. Read once at import.
+# When set AND n_tokens >= _WD_GROUPED_MIN_M, stage1 loads each expert's w13
+# tile ONCE and batches its routed tokens into the MFMA M-dim (weight reuse),
+# producing the exact same ``inter`` as the coop stage1 (drop-in). Default OFF
+# keeps the coop path byte-for-byte unchanged.
+_WD_DISABLE = os.environ.get("TS_WD_DISABLE", "") == "1"
+_WD_GROUPED_S1 = os.environ.get("TS_WD_GROUPED_S1", "") == "1"
+# grouped wins only at M=16; coop is faster for M<=8 (measured). Default gate 16;
+# override via TS_WD_GROUPED_MIN_M (e.g. =1) to force grouped at all M for profiling.
+_WD_GROUPED_MIN_M = int(os.environ.get("TS_WD_GROUPED_MIN_M", "16"))
+# Experimental grouped stage1 CTA scheduling. Default preserves the measured
+# expert-major launch order. ``route_major`` launches from the M*TOPK routed
+# slots and skips duplicate experts, cutting empty-expert CTAs while preserving
+# one W13 stream per active expert.
+_WD_GROUPED_GRID_MODE = os.environ.get("TS_WD_GROUPED_GRID", "expert")
+_WD_GROUPED_GRID_ROUTE_MAJOR = _WD_GROUPED_GRID_MODE in (
+    "route",
+    "route_major",
+    "route-major",
+)
+# Experimental W13 direct-to-VGPR path for warp-decode stage1. Requires process
+# weights to attach a pre-shuffled W13 tensor (``TS_WD_STAGE1_W_VGPR=1`` there
+# too); otherwise the wrapper silently keeps the LDS path.
+_WD_STAGE1_W_VGPR = os.environ.get("TS_WD_STAGE1_W_VGPR", "") == "1"
+_PREFILL_BM16 = os.environ.get("TS_PREFILL_BM16", "") == "1"
+_PREFILL_STAGE1_DIRECT = os.environ.get("TS_PREFILL_STAGE1_DIRECT", "") == "1"
+_PREFILL_STAGE1_LOCAL_STAGE = (
+    os.environ.get("TS_PREFILL_STAGE1_LOCAL_STAGE", "") == "1"
+)
+_PREFILL_STAGE1_TPW12 = os.environ.get("TS_PREFILL_STAGE1_TPW12", "") == "1"
+_PREFILL_STAGE1_UNMASK_FULL = (
+    os.environ.get("TS_PREFILL_STAGE1_UNMASK_FULL", "") == "1"
+)
+_PREFILL_STAGE2_DIRECT = os.environ.get("TS_PREFILL_STAGE2_DIRECT", "") == "1"
+_PREFILL_STAGE2_LOCAL_STAGE = (
+    os.environ.get("TS_PREFILL_STAGE2_LOCAL_STAGE", "") == "1"
+)
+_PREFILL_STAGE2_TPW12 = os.environ.get("TS_PREFILL_STAGE2_TPW12", "") == "1"
+_PREFILL_STAGE2_UNMASK_FULL = (
+    os.environ.get("TS_PREFILL_STAGE2_UNMASK_FULL", "") == "1"
+)
+_PREFILL_STAGE2_SORTED_OUT = os.environ.get("TS_PREFILL_STAGE2_SORTED_OUT", "") == "1"
+_PREFILL_DIRECT_CG_MODE = os.environ.get("TS_PREFILL_DIRECT_CG", "")
+_PREFILL_DIRECT_CG_W = _PREFILL_DIRECT_CG_MODE in ("1", "all", "w", "wscale")
+_PREFILL_DIRECT_CG_SCALE = _PREFILL_DIRECT_CG_MODE in ("1", "all", "scale", "wscale")
 # Configs the Gluon routing path supports; everything else falls back to the
 # generic triton_kernels_routing pipeline.
 GLUON_ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -5077,6 +6263,7 @@ def _warp_decode_stage1_coop_compute(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    W_VIA_VGPR: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -5112,7 +6299,7 @@ def _warp_decode_stage1_coop_compute(
         False,  # EVEN_K (D=2880 not a multiple of BLOCK_K)
         False,  # USE_GATHER
         NUM_WARPS,
-        W_VIA_VGPR=False,
+        W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=True,
     )
 
@@ -5126,23 +6313,59 @@ def _warp_decode_stage1_coop_compute(
     LOAD_X_LAYOUT: gl.constexpr = _load_layout(
         BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS
     )
-    # K-contig W (W_TRANSPOSE=True): vectorise the contiguous K_packed axis
-    # (mirrors the W_TRANSPOSE branch of _pipelined_moe_tile_compute).
-    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
-        BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
-    )
+    if cfg.W_VIA_VGPR:
+        gl.static_assert(
+            BLOCK_K_W == 128 and BLOCK_N == 128 and NUM_WARPS == 4,
+            "stage1 W_VIA_VGPR assumes BLOCK_K_W=128, BLOCK_N=128, NUM_WARPS=4",
+        )
+        LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=[
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 1024],
+                [1, 0],
+                [4, 0],
+            ],
+            lane_bases=[
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [0, 128],
+                [0, 256],
+                [0, 512],
+            ],
+            warp_bases=[[2, 0], [0, 0]],
+            block_bases=[],
+            shape=[BLOCK_N // 16, BLOCK_K_W * 16],
+        )
+    else:
+        # K-contig W (W_TRANSPOSE=True): vectorise the contiguous K_packed axis
+        # (mirrors the W_TRANSPOSE branch of _pipelined_moe_tile_compute).
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
 
     offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
-    offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
-    offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+    if cfg.W_VIA_VGPR:
+        offs_wn = gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+    else:
+        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
 
     valid = (token < M) & (expert >= 0)
     # One decode token per CTA: row 0 of the BLOCK_M tile carries the token,
     # the remaining rows are clamped/masked (buffer OOB -> 0 in LDS).
     rows_m = gl.where(offs_xm == 0, token, gl.zeros_like(offs_xm))
     mask_m = (offs_xm == 0) & valid
-    mask_n = (off_n + offs_wn) < N
+    if cfg.W_VIA_VGPR:
+        # W_VIA_VGPR requires N to be BLOCK_N-aligned and skips per-column masking.
+        mask_n = offs_wn < (BLOCK_N // 16)
+    else:
+        mask_n = (off_n + offs_wn) < N
 
     k_limit_x = gl.multiple_of(D // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(D // cfg.DIV_FACTOR_W, 16)
@@ -5159,20 +6382,36 @@ def _warp_decode_stage1_coop_compute(
         mask_m[:, None],
         k_limit_x,
     )
-    w_desc = AsyncCopyDescriptor.initialize(
-        cfg,
-        0,
-        BLOCK_K_W,
-        W,
-        off_n + offs_wn,
-        offs_wk,
-        stride_wn,
-        stride_wk,
-        mask_n[:, None],
-        k_limit_w,
-        base_offset=w_base_offset,
-        cache_modifier=W_CACHE_MODIFIER,
-    )
+    if cfg.W_VIA_VGPR:
+        # Host-preshuffled W -> VGPR direct; bypasses LDS staging for W13.
+        TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
+        offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
+            BLOCK_K_W * 16
+        )
+        base_off_b_vgpr = w_base_offset + pid_n * TILE_BYTES
+        w_desc = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            W,
+            gl.to_tensor(N),
+            offsets_b_vgpr + base_off_b_vgpr,
+            pred=valid,
+        )
+    else:
+        w_desc = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_W,
+            W,
+            off_n + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n[:, None],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
 
     # W e8m0 scales -> LDS in the post-swizzle HBM shape; issue_local_load_unswizzle
     # reconstructs [BLOCK_N, BLOCK_K_SCALE] (the 7-D reshape/permute).
@@ -5278,6 +6517,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     BLOCK_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    W_VIA_VGPR: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -5349,7 +6589,416 @@ def _warp_decode_topk_stage1_coop_kernel(
         stride_ym, stride_yn,
         x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
         TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
-        HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
+        W_VIA_VGPR, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
+    )
+    # fmt: on
+
+
+@gluon.jit
+def _warp_decode_route_only_kernel(
+    Logits,
+    TopkIdsOut,
+    TopkWeightsOut,
+    M,
+    E,
+    stride_lm,
+    stride_tim,
+    stride_twm,
+    TOPK: gl.constexpr,
+    EP: gl.constexpr,
+    TKP: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Standalone dense top-k routing pre-pass for the grouped stage1.
+
+    Byte-identical to the inline top-k folded into
+    ``_warp_decode_topk_stage1_coop_kernel`` (argmax + min-index tie-break +
+    softmax over the selected experts).  One program per token; writes
+    ``topk_ids`` / ``topk_weights`` consumed by the grouped GEMM and stage2.
+    """
+    token = gl.program_id(axis=0)
+    LE: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    e = gl.arange(0, EP, layout=LE)
+    emask = e < E
+    cur = gl.load(
+        Logits + token.to(gl.int64) * stride_lm + e,
+        mask=(token < M) & emask,
+        other=float("-inf"),
+    ).to(gl.float32)
+    t = gl.arange(0, TKP, layout=LE)
+    val_t = gl.full([TKP], -1e30, gl.float32, layout=LE)
+    idx_t = gl.zeros([TKP], gl.int32, layout=LE)
+    big = gl.full([EP], E, gl.int32, layout=LE)
+    for r in gl.static_range(TOPK):
+        vmax = gl.max(cur, axis=0)
+        ismax = (cur == vmax) & emask
+        amax = gl.min(gl.where(ismax, e, big), axis=0)
+        sel = t == r
+        val_t = gl.where(sel, vmax, val_t)
+        idx_t = gl.where(sel, amax, idx_t)
+        cur = gl.where(e == amax, float("-inf"), cur)
+    rmax = gl.max(val_t, axis=0)
+    num = gl.exp(val_t - rmax)
+    den = gl.sum(num, axis=0)
+    gate_t = gl.fdiv(num, den)
+    gl.store(
+        TopkIdsOut + token.to(gl.int64) * stride_tim + t,
+        idx_t,
+        mask=(token < M) & (t < TOPK),
+    )
+    gl.store(
+        TopkWeightsOut + token.to(gl.int64) * stride_twm + t,
+        gate_t.to(TopkWeightsOut.dtype.element_ty),
+        mask=(token < M) & (t < TOPK),
+    )
+
+
+@gluon.jit
+def _warp_decode_stage1_grouped_compute(
+    expert,
+    pid_n,
+    X,
+    W,
+    WScale,
+    TopkIds,
+    Y,
+    M,
+    E,
+    D,
+    I,
+    stride_xm,
+    stride_xk,
+    stride_tim,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    TOPK: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_VIA_VGPR: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+):
+    """EXPERT-MAJOR gate_up GEMM for one (expert, N-tile).
+
+    Loads ``w13[expert]`` once and gathers every token routed to this expert
+    into the BLOCK_M MFMA tile (row m == token m; matched rows active, others
+    masked).  Result row m is SCATTERed to ``inter[m*TOPK + slot_m]`` so the
+    output is identical to the coop stage1.  Empty experts gate all global
+    traffic off via ``has_any`` (no weight DRAM, no stores).
+
+    Mirrors ``_warp_decode_stage1_coop_compute`` (same MoEConfig / scaled-MFMA
+    pipeline); only the M-dim gather and the output scatter differ.
+    """
+    N = 2 * I
+    off_n = pid_n * BLOCK_N
+    w_base_offset = expert * stride_we
+    ws_base_offset = expert * stride_wse
+
+    cfg = MoEConfig(
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        "e4m3",
+        "e2m1",
+        32,
+        NUM_BUFFERS,
+        True,  # W_TRANSPOSE
+        False,  # WITH_X_MX_SCALE
+        True,  # WITH_W_MX_SCALE
+        "swizzle",
+        gl.int32,
+        (1, 1, 1),
+        False,  # EVEN_K
+        False,  # USE_GATHER
+        NUM_WARPS,
+        W_VIA_VGPR=W_VIA_VGPR,
+        W_PREFETCH=True,
+    )
+
+    BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
+    BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
+    OUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
+    W_CACHE_MODIFIER: gl.constexpr = ".cg" if BLOCK_M <= 32 else ""
+
+    X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
+    W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
+    LOAD_X_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS
+    )
+    if cfg.W_VIA_VGPR:
+        gl.static_assert(
+            BLOCK_K_W == 128 and BLOCK_N == 128 and NUM_WARPS == 4,
+            "stage1 W_VIA_VGPR assumes BLOCK_K_W=128, BLOCK_N=128, NUM_WARPS=4",
+        )
+        LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=[
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 1024],
+                [1, 0],
+                [4, 0],
+            ],
+            lane_bases=[
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [0, 128],
+                [0, 256],
+                [0, 512],
+            ],
+            warp_bases=[[2, 0], [0, 0]],
+            block_bases=[],
+            shape=[BLOCK_N // 16, BLOCK_K_W * 16],
+        )
+    else:
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+
+    offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+    offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
+    if cfg.W_VIA_VGPR:
+        offs_wn = gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+    else:
+        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+
+    # ---- gather: which tokens routed to this expert (row m == token m) ----
+    in_m = offs_xm < M
+    matched_x = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+    for s in gl.static_range(TOPK):
+        ids_s = gl.load(
+            TopkIds + offs_xm * stride_tim + s, mask=in_m, other=-1
+        )
+        matched_x = gl.where(ids_s == expert, 1, matched_x)
+    has_any = gl.max(matched_x, axis=0)
+
+    rows_m = gl.where(in_m, offs_xm, gl.zeros_like(offs_xm))
+    mask_m = (matched_x > 0) & in_m
+    if cfg.W_VIA_VGPR:
+        # W_VIA_VGPR requires N to be BLOCK_N-aligned and skips per-column masking.
+        mask_n = (offs_wn < (BLOCK_N // 16)) & (has_any > 0)
+    else:
+        mask_n = ((off_n + offs_wn) < N) & (has_any > 0)
+
+    k_limit_x = gl.multiple_of(D // cfg.DIV_FACTOR_X, 16)
+    k_limit_w = gl.multiple_of(D // cfg.DIV_FACTOR_W, 16)
+
+    x_desc = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_X,
+        X,
+        rows_m,
+        offs_xk,
+        stride_xm,
+        stride_xk,
+        mask_m[:, None],
+        k_limit_x,
+    )
+    if cfg.W_VIA_VGPR:
+        # Host-preshuffled W -> VGPR direct; bypasses LDS staging for W13.
+        TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
+        offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
+            BLOCK_K_W * 16
+        )
+        base_off_b_vgpr = w_base_offset + pid_n * TILE_BYTES
+        w_desc = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            W,
+            gl.to_tensor(N),
+            offsets_b_vgpr + base_off_b_vgpr,
+            pred=has_any > 0,
+        )
+    else:
+        w_desc = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_W,
+            W,
+            off_n + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n[:, None],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+
+    BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
+    BLOCK_K_S_PS_W: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
+    LW_S: gl.constexpr = cfg.load_layout_w_scale
+    offs_ws_n = gl.arange(0, BLOCK_N_PS, layout=gl.SliceLayout(1, LW_S))
+    offs_ws_k = gl.arange(0, BLOCK_K_S_PS_W, layout=gl.SliceLayout(0, LW_S))
+    rows_n_scale = off_n // cfg.PRESHUFFLE_FACTOR + offs_ws_n
+    row_limit_w_s = (N + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
+    k_limit_ws_load = ((D // cfg.SCALE_BLOCK + 7) // 8 * 8) * cfg.PRESHUFFLE_FACTOR
+    w_scale_desc = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_S_PS_W,
+        WScale,
+        rows_n_scale,
+        offs_ws_k,
+        stride_wsn,
+        stride_wsk,
+        (rows_n_scale[:, None] < row_limit_w_s) & (has_any > 0),
+        k_limit_ws_load,
+        base_offset=ws_base_offset,
+    )
+
+    # Shared memory must be allocated unconditionally (static); the pipeline
+    # work and the store are skipped for experts with no routed tokens so the
+    # ~(E - active) empty programs early-exit cheaply (no weight DRAM, no MFMA).
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, 0, w_scale_desc)
+    if has_any <= 0:
+        return
+    acc = pgm.pipeline(D)
+
+    x_scale = gl.load(x_global_scale_ptr).to(gl.float32)
+    acc = acc * x_scale
+
+    if HAS_BIAS:
+        bias_offs = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
+        bias_mask = bias_offs < N
+        bias = gl.load(
+            w13_bias + expert.to(gl.int64) * N + bias_offs,
+            mask=bias_mask,
+            other=0.0,
+        )
+        acc = acc + bias[None, :].to(gl.float32)
+
+    out = _swiglu_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout)
+    out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
+    out = (out * out_inv_scale).to(Y.dtype.element_ty)
+    STORE_LAYOUT: gl.constexpr = out.type.layout
+
+    # ---- scatter: row m -> inter[token_m * TOPK + slot_m] ----
+    offs_y_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
+    y_in_m = offs_y_m < M
+    matched_y = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, STORE_LAYOUT))
+    slot_y = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, STORE_LAYOUT))
+    for s in gl.static_range(TOPK):
+        ids_s = gl.load(
+            TopkIds + offs_y_m * stride_tim + s, mask=y_in_m, other=-1
+        )
+        is_e = ids_s == expert
+        matched_y = gl.where(is_e, 1, matched_y)
+        slot_y = gl.where(is_e, s, slot_y)
+
+    off_n_out = pid_n * OUT_BLOCK_N
+    offs_y_n = off_n_out + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
+    out_row = offs_y_m * TOPK + slot_y
+    y_offs = (
+        out_row[:, None].to(gl.int64) * stride_ym
+        + offs_y_n[None, :].to(gl.int64) * stride_yn
+    )
+    mask_y = (matched_y[:, None] > 0) & y_in_m[:, None] & (offs_y_n[None, :] < I)
+    gl.store(Y + y_offs, out, mask=mask_y)
+
+
+@gluon.jit
+def _warp_decode_stage1_grouped_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    Y,
+    M,
+    E,
+    D,
+    I,
+    stride_xm,
+    stride_xk,
+    stride_tim,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    TOPK: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    GRID_ROUTE_MAJOR: gl.constexpr,
+    W_VIA_VGPR: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+):
+    """Grouped grid: one program per (expert, N-tile).
+
+    Default maps over all experts; ``GRID_ROUTE_MAJOR`` maps over routed
+    token-slot entries and skips duplicate experts so empty experts never enter
+    the schedule while each active expert still streams W13 only once per N-tile.
+    Routing must already be in ``TopkIds`` (run
+    ``_warp_decode_route_only_kernel`` first).
+    """
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(2 * I, BLOCK_N)
+    if GRID_ROUTE_MAJOR:
+        route_idx = pid // num_pid_n
+        pid_n = pid % num_pid_n
+        route_token = route_idx // TOPK
+        route_slot = route_idx - route_token * TOPK
+        expert = gl.load(
+            TopkIds + route_token.to(gl.int64) * stride_tim + route_slot,
+            mask=route_token < M,
+            other=-1,
+        )
+        LR: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+        offs_m = gl.arange(0, BLOCK_M, layout=LR)
+        in_m = offs_m < M
+        seen_prev = gl.zeros([BLOCK_M], gl.int32, layout=LR)
+        for s in gl.static_range(TOPK):
+            ids_s = gl.load(TopkIds + offs_m * stride_tim + s, mask=in_m, other=-1)
+            lin_s = offs_m * TOPK + s
+            seen_prev = gl.where((lin_s < route_idx) & (ids_s == expert), 1, seen_prev)
+        has_prev = gl.max(seen_prev, axis=0)
+        if (expert < 0) | (has_prev > 0):
+            return
+    else:
+        pid_n = pid % num_pid_n
+        expert = pid // num_pid_n
+    # fmt: off
+    _warp_decode_stage1_grouped_compute(
+        expert, pid_n,
+        X, W, WScale, TopkIds, Y,
+        M, E, D, I,
+        stride_xm, stride_xk,
+        stride_tim,
+        stride_we, stride_wk, stride_wn,
+        stride_wse, stride_wsk, stride_wsn,
+        stride_ym, stride_yn,
+        x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
+        TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
+        W_VIA_VGPR, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
     )
     # fmt: on
 

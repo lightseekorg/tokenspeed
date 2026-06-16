@@ -153,9 +153,20 @@ def _extract_features(node: ast.AST) -> Optional[set[str]]:
     return None
 
 
-# A ``CallSite`` tuple: (family, mode, dtype|None, features|None, traits, weight_format, expected_name, location)
+# A ``CallSite`` tuple: (family, mode, dtype|None, features|None, traits, weight_format, expected_name, location, platform|None)
+# ``platform`` tags an entry to a specific platform fixture. When two entries
+# share a location, the one whose ``platform`` matches the platform under test
+# wins; the untagged (``platform=None``) entry is the default everywhere else.
 CallSite = tuple[
-    str, str, Optional[torch.dtype], Optional[set], dict, Optional[str], str, str
+    str,
+    str,
+    Optional[torch.dtype],
+    Optional[set],
+    dict,
+    Optional[str],
+    str,
+    str,
+    Optional[str],
 ]
 
 
@@ -244,6 +255,7 @@ def _collect_call_sites(search_dir: Path) -> list[CallSite]:
                     weight_format,
                     expected,
                     location,
+                    None,
                 )
             )
 
@@ -268,6 +280,7 @@ def _moe_apply_site(
     traits: dict[str, Any],
     location: str,
     dtype: torch.dtype = torch.bfloat16,
+    platform: Optional[str] = None,
 ) -> CallSite:
     return (
         "moe",
@@ -278,6 +291,7 @@ def _moe_apply_site(
         None,
         expected,
         location,
+        platform,
     )
 
 
@@ -359,9 +373,45 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         },
         "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4_fp8",
     ),
+    # gfx950 (mi350) prefers the arch-gated gluon warp-decode kernel
+    _moe_apply_site(
+        "gluon_mxfp4_moe_apply",
+        {
+            "weight_dtype": "mxfp4",
+            "activation": "swiglu",
+            "supports_all_to_all_ep": False,
+            "supports_ep": False,
+            "ispp": 128,
+            "internal_activation_dtype": "fp8",
+            "supports_bias": True,
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4_fp8",
+        platform="mi350_platform",
+    ),
+    # Plain mxfp4 (e.g. stock gpt-oss): no internal_activation_dtype requested.
+    # The fp8-only gluon kernel must NOT win here on any platform (it requires
+    # internal_activation_dtype); triton handles the bf16-activation path.
+    _moe_apply_site(
+        "triton_mxfp4_moe_apply",
+        {
+            "weight_dtype": "mxfp4",
+            "activation": "swiglu",
+            "supports_all_to_all_ep": False,
+            "supports_ep": False,
+            "ispp": 128,
+            "supports_bias": True,
+        },
+        "manual:runtime/layers/moe/expert.py:moe_plan/mxfp4",
+    ),
 ]
 
 _ALL_SITES = _AUTO_SITES + _MANUAL_CALL_SITES
+
+# (location, platform) pairs that have a platform-tagged entry. The untagged
+# default entry for the same location steps aside on those platforms.
+_PLATFORM_TAGGED_SITES = frozenset(
+    (site[7], site[8]) for site in _ALL_SITES if site[8] is not None
+)
 
 
 _DTYPE_PREFERENCE = [
@@ -448,7 +498,24 @@ def _site_id(site: CallSite) -> str:
 )
 def test_kernel_selection(site, platform_name, request):
     platform = request.getfixturevalue(platform_name)
-    family, mode, raw_dtype, features, traits, weight_format, expected, location = site
+    (
+        family,
+        mode,
+        raw_dtype,
+        features,
+        traits,
+        weight_format,
+        expected,
+        location,
+        site_platform,
+    ) = site
+    if site_platform is not None:
+        # Platform-tagged entry: only applies on its own platform.
+        if site_platform != platform_name:
+            pytest.skip(f"Call site {location!r} is tagged to {site_platform!r}")
+    elif (location, platform_name) in _PLATFORM_TAGGED_SITES:
+        # Default entry overridden by a platform-tagged entry here.
+        pytest.skip(f"Call site {location!r} is overridden on {platform_name}")
 
     reg = KernelRegistry.get()
     spec = reg.get_by_name(expected)

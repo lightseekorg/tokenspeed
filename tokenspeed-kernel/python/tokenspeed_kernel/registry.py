@@ -159,6 +159,14 @@ class KernelSpec:
     format_signatures: frozenset[FormatSignature] = frozenset()
     # Op-specific traits, e.g. {"head_dim": frozenset({64, 128, 256}), "persistent": frozenset({True})}
     traits: dict[str, frozenset[Any]] = field(default_factory=dict)
+    # Trait names that MUST be explicitly present in a selection request for
+    # this kernel to be eligible. Normal traits are only checked when the
+    # request specifies them (absent request trait = "don't care"); a required
+    # trait additionally excludes the kernel when the request omits it. Use for
+    # kernels that handle exactly one variant of an otherwise-shared op (e.g. an
+    # fp8-only MoE that must not be picked when no internal activation dtype is
+    # requested).
+    required_traits: frozenset[str] = frozenset()
 
     # Selection metadata
     # Higher = preferred. See :class:`Priority` for the band layout. The default
@@ -362,6 +370,7 @@ def register_kernel(
     capability: CapabilityRequirement | None = None,
     signatures: set[FormatSignature] | frozenset[FormatSignature],
     traits: dict[str, frozenset[Any]] | None = None,
+    required_traits: set[str] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
     tags: set[str] | None = None,
 ) -> Callable:
@@ -371,6 +380,13 @@ def register_kernel(
     in ``[0, 20)``. Within a band, add a small offset for relative preference,
     e.g. ``Priority.SPECIALIZED + 2``. See :class:`Priority` for the meaning of
     each band and how to choose between them.
+
+    ``required_traits`` lists trait names that must be explicitly present in a
+    selection request for this kernel to be eligible. Unlike ``traits`` (which
+    are only checked when the request specifies them), a required trait also
+    excludes the kernel when the request omits it. Use it for kernels that
+    support exactly one variant of a shared op and must not be picked by
+    default, e.g. an fp8-only MoE that requires ``internal_activation_dtype``.
 
     Example::
 
@@ -408,6 +424,7 @@ def register_kernel(
             format_signatures=frozenset(signatures),
             capability=capability or CapabilityRequirement(),
             traits=traits or {},
+            required_traits=frozenset(required_traits or ()),
             priority=priority_int,
             tags=frozenset(tags or set()),
         )
