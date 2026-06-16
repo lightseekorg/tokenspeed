@@ -940,6 +940,8 @@ class DSABackend(AttentionBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
+        # Sparse prefill provides one top-k table row per query token, so TRTLLM
+        # must size the KV span to that sparse width rather than dense context.
         out = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_cache,
@@ -949,7 +951,7 @@ class DSABackend(AttentionBackend):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=int(max_seq_len),
+            max_seq_len=self.index_topk,
             sparse_mla_top_k=self.index_topk,
             bmm1_scale=k_scale * layer.scaling,
             backend="trtllm-gen",

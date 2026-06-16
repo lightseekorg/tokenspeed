@@ -36,6 +36,7 @@ from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
+    GATEWAY_DEFAULT_DISABLE_FLAGS,
     spawn_engine,
     spawn_gateway,
     terminate_then_kill,
@@ -56,12 +57,11 @@ GLM_DSA_REASONING_PARSER = "glm45"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
-# ts serve. These are tokenspeed-internal defaults: not surfaced via
-# the ts CLI, not routed through split_argv.
-_DEFAULT_SMG_DISABLE_FLAGS = (
-    "--disable-circuit-breaker",
-    "--disable-retries",
-)
+# ts serve. Single-engine launches should not let gateway retries, circuit
+# breakers, or queued health probes mask long prefill requests as worker
+# failures. These are tokenspeed-internal defaults: not surfaced via the ts CLI,
+# not routed through split_argv.
+_DEFAULT_SMG_DISABLE_FLAGS = GATEWAY_DEFAULT_DISABLE_FLAGS
 
 
 def _check_serve_extra_installed() -> None:

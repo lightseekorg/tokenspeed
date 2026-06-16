@@ -723,7 +723,7 @@ def test_glm_dsa_sparse_prefill_uses_trtllm_path(monkeypatch) -> None:
     assert seen["kv_cache"].shape == (2, 1, 64, 576)
     assert torch.equal(seen["block_tables"].view(3, 4), expected_block_tables)
     assert torch.equal(seen["seq_lens"], topk_lens)
-    assert seen["max_seq_len"] == 2307
+    assert seen["max_seq_len"] == backend.index_topk
     assert seen["sparse_mla_top_k"] == 4
     assert seen["bmm1_scale"] == 0.625
     assert seen["backend"] == "trtllm-gen"
@@ -793,6 +793,7 @@ def test_glm_dsa_fp8_sparse_prefill_accepts_fp8_query_for_trtllm(
     assert seen["kv_cache"].dtype == torch.float8_e4m3fn
     assert torch.equal(seen["block_tables"].view(2, 4), expected_block_tables)
     assert torch.equal(seen["seq_lens"], topk_lens)
+    assert seen["max_seq_len"] == backend.index_topk
     assert seen["backend"] == "trtllm-gen"
 
 
