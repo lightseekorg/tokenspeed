@@ -24,6 +24,7 @@ bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
+    attn_plan,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
@@ -48,6 +49,7 @@ __all__ = [
     # gemm
     "mm",
     # attention
+    "attn_plan",
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",

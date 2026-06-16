@@ -29,8 +29,10 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
@@ -49,6 +51,7 @@ __all__ = [
     "mla_prefill",
     "mla_decode_with_kvcache",
     "attn_merge_state",
+    "attn_plan",
 ]
 
 LSE_LN = math.log2(math.e)
@@ -686,3 +689,65 @@ def attn_merge_state(
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
         )
+
+
+def attn_plan(
+    dtype: torch.dtype,
+    head_dim: int,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    solution: str | None = None,
+) -> dict:
+    """Build an attention execution plan from registered kernel capabilities.
+
+    Args:
+        dtype: Query/K/V dtype for prefill planning.
+        head_dim: Attention head dimension.
+        window_left: Sliding-window size, or -1 for full-context attention.
+        logit_cap: Logit soft-cap value, or 0.0 when disabled.
+        sinks: Attention sinks tensor when sinks are enabled.
+        return_lse: Whether the selected path must return LSE values.
+        solution: Optional kernel solution to restrict planning.
+
+    Returns:
+        A dict containing:
+        - "extend_mode":
+          "postwrite" means run prefill before writing KV cache;
+          "prewrite" means write KV cache first and run cached extend.
+
+    FP8 currently prefers "prewrite" because the cache write and downcast
+    path is easier to fuse. Other dtypes use "postwrite" only when a
+    matching prefill kernel with at least performant priority exists;
+    otherwise they use "prewrite".
+    """
+    if dtype == torch.float8_e4m3fn:
+        return {"extend_mode": "prewrite"}
+
+    traits = {
+        "head_dim": head_dim,
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": logit_cap != 0.0,
+        "support_sinks": sinks is not None,
+        "return_lse": return_lse,
+    }
+    signature = format_signature(
+        q=dense_tensor_format(dtype),
+        k=dense_tensor_format(dtype),
+        v=dense_tensor_format(dtype),
+    )
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        "mha_prefill",
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    candidates = [spec for spec in candidates if spec_matches_traits(spec, traits)]
+    extend_mode = (
+        "postwrite"
+        if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
+        else "prewrite"
+    )
+    return {"extend_mode": extend_mode}

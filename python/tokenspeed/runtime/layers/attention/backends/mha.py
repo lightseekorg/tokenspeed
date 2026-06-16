@@ -21,11 +21,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
-    NoKernelFoundError,
+    attn_plan,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
@@ -45,6 +46,7 @@ from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
 
 _KERNEL_SOLUTION_BY_BACKEND = {
     "mha": None,
@@ -109,6 +111,13 @@ class MHAAttnBackend(AttentionBackend):
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
         self.is_fp8 = self.kv_cache_dtype == torch.float8_e4m3fn
+        self.plan = partial(
+            attn_plan,
+            dtype=torch.float8_e4m3fn if self.is_fp8 else self.qkv_dtype,
+            head_dim=self.head_dim,
+            return_lse=False,
+            solution=self.kernel_solution,
+        )
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
@@ -335,6 +344,7 @@ class MHAAttnBackend(AttentionBackend):
         if has_kv:
             k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
             v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        sinks = kwargs.get("sinks")
 
         return self._forward_decode(
             q,
@@ -345,7 +355,7 @@ class MHAAttnBackend(AttentionBackend):
             token_to_kv_pool,
             self.forward_decode_metadata,
             save_kv_cache=save_kv_cache,
-            sinks=kwargs.get("sinks"),
+            sinks=sinks,
         )
 
     def forward_extend(
@@ -369,36 +379,38 @@ class MHAAttnBackend(AttentionBackend):
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         metadata = self.forward_extend_metadata
-        # When there is no cached prefix or the input is FP16 which doesn't
-        # need downcast, we will first try the direct prefill kernel. If no
-        # kernel found, then fall back to the extend path.
-        if metadata.max_extend_prefix_len == 0 and not self.is_fp8:
-            try:
-                return self._forward_prefill(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    out_cache_loc,
-                    token_to_kv_pool,
-                    metadata,
-                    save_kv_cache,
-                    kwargs.get("sinks"),
-                )
-            except NoKernelFoundError:
-                pass
-
-        return self._forward_extend(
-            q,
-            k,
-            v,
-            layer,
-            out_cache_loc,
-            token_to_kv_pool,
-            metadata,
-            save_kv_cache,
-            kwargs.get("sinks"),
+        sinks = kwargs.get("sinks")
+        plan = self.plan(
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            sinks=sinks,
         )
+
+        extend_mode = plan.get("extend_mode", "prewrite")
+        if metadata.max_extend_prefix_len == 0 and extend_mode == "postwrite":
+            return self._forward_prefill(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                save_kv_cache,
+                sinks,
+            )
+        else:
+            return self._forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                save_kv_cache,
+                sinks,
+            )
 
     def _forward_prefill(
         self,
@@ -412,6 +424,12 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        # TODO: use a custom kernel to do downcast
+        if self.is_fp8:
+            q = q.to(torch.float8_e4m3fn)
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
+
         result = mha_prefill(
             q=q,
             k=k,
@@ -517,7 +535,7 @@ class MHAAttnBackend(AttentionBackend):
         if k is None:
             return
 
-        if self.is_fp8:
+        if self.is_fp8 and k.dtype != torch.float8_e4m3fn:
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
                 k=k,
