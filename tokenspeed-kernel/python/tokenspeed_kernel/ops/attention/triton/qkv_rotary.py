@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import torch
-
 from tokenspeed_kernel._triton import tl, triton
 
 
