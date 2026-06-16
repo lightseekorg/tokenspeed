@@ -27,11 +27,9 @@ from tokenspeed_kernel.preprocessing import (
     WeightPreprocessorRegistry,
     WeightPreprocessorResolutionError,
     WeightPreprocessorSpec,
-    WeightPreprocessorValidationError,
     register_weight_preprocessor,
     resolve_weight_preprocessor_conflict,
     resolve_weight_preprocessor_ref,
-    validate_weight_preprocessor_links,
 )
 from tokenspeed_kernel.registry import (
     KernelRegistry,
@@ -49,18 +47,17 @@ def _register_apply(
     preprocessor: WeightPreprocessorRef | None = None,
     capability: CapabilityRequirement | None = None,
     weight_dtype: str = "mxfp4",
-) -> None:
-    KernelRegistry.get().register(
-        KernelSpec(
-            name=name,
-            family=family,
-            mode="apply",
-            capability=capability or CapabilityRequirement(),
-            traits={"weight_dtype": frozenset({weight_dtype})},
-            weight_preprocessor=preprocessor,
-        ),
-        lambda **_: None,
+) -> KernelSpec:
+    spec = KernelSpec(
+        name=name,
+        family=family,
+        mode="apply",
+        capability=capability or CapabilityRequirement(),
+        traits={"weight_dtype": frozenset({weight_dtype})},
+        weight_preprocessor=preprocessor,
     )
+    KernelRegistry.get().register(spec, lambda **_: None)
+    return spec
 
 
 def _register_preprocessor(
@@ -114,38 +111,57 @@ def test_preprocessor_spec_validates_local_metadata():
         )
 
 
-def test_validation_allows_kernel_before_preprocessor_registration():
-    _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
+def test_resolution_allows_kernel_before_preprocessor_registration(h100_platform):
+    kernel_spec = _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
     _register_preprocessor(name="layout_a")
 
-    validate_weight_preprocessor_links(family="moe", mode="apply")
+    spec = resolve_weight_preprocessor_ref(
+        kernel_spec.weight_preprocessor,
+        kernel_spec=kernel_spec,
+        platform=h100_platform,
+    )
+
+    assert spec is not None
+    assert spec.name == "layout_a"
 
 
-def test_validation_rejects_missing_preprocessor():
-    _register_apply(preprocessor=WeightPreprocessorRef("missing"))
+def test_resolution_rejects_missing_preprocessor(h100_platform):
+    kernel_spec = _register_apply(preprocessor=WeightPreprocessorRef("missing"))
 
-    with pytest.raises(WeightPreprocessorValidationError, match="missing"):
-        validate_weight_preprocessor_links(family="moe", mode="apply")
+    with pytest.raises(WeightPreprocessorResolutionError, match="missing"):
+        resolve_weight_preprocessor_ref(
+            kernel_spec.weight_preprocessor,
+            kernel_spec=kernel_spec,
+            platform=h100_platform,
+        )
 
 
-def test_validation_rejects_family_mismatch():
-    _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
+def test_resolution_rejects_family_mismatch(h100_platform):
+    kernel_spec = _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
     _register_preprocessor(name="layout_a", family="gemm")
 
-    with pytest.raises(WeightPreprocessorValidationError, match="belongs to family"):
-        validate_weight_preprocessor_links(family="moe", mode="apply")
+    with pytest.raises(WeightPreprocessorResolutionError, match="belongs to family"):
+        resolve_weight_preprocessor_ref(
+            kernel_spec.weight_preprocessor,
+            kernel_spec=kernel_spec,
+            platform=h100_platform,
+        )
 
 
-def test_validation_rejects_trait_mismatch():
-    _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
+def test_resolution_rejects_trait_mismatch(h100_platform):
+    kernel_spec = _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
     _register_preprocessor(name="layout_a", weight_dtype="nvfp4")
 
-    with pytest.raises(WeightPreprocessorValidationError, match="weight_dtype"):
-        validate_weight_preprocessor_links(family="moe", mode="apply")
+    with pytest.raises(WeightPreprocessorResolutionError, match="weight_dtype"):
+        resolve_weight_preprocessor_ref(
+            kernel_spec.weight_preprocessor,
+            kernel_spec=kernel_spec,
+            platform=h100_platform,
+        )
 
 
-def test_validation_rejects_capability_mismatch():
-    _register_apply(
+def test_resolution_ignores_kernel_preprocessor_capability_overlap(mi300_platform):
+    kernel_spec = _register_apply(
         preprocessor=WeightPreprocessorRef("layout_a"),
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     )
@@ -154,8 +170,14 @@ def test_validation_rejects_capability_mismatch():
         capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     )
 
-    with pytest.raises(WeightPreprocessorValidationError, match="capability"):
-        validate_weight_preprocessor_links(family="moe", mode="apply")
+    spec = resolve_weight_preprocessor_ref(
+        kernel_spec.weight_preprocessor,
+        kernel_spec=kernel_spec,
+        platform=mi300_platform,
+    )
+
+    assert spec is not None
+    assert spec.name == "layout_a"
 
 
 def test_required_capability_mismatch_errors_at_resolution(h100_platform):
@@ -167,7 +189,7 @@ def test_required_capability_mismatch_errors_at_resolution(h100_platform):
     with pytest.raises(WeightPreprocessorResolutionError, match="cannot run"):
         resolve_weight_preprocessor_ref(
             WeightPreprocessorRef("amd_layout", required=True),
-            family="moe",
+            kernel_spec=_register_apply(),
             platform=h100_platform,
         )
 
@@ -181,7 +203,7 @@ def test_optional_capability_mismatch_warns_and_skips(h100_platform):
     with pytest.warns(RuntimeWarning, match="skipping optional preprocessing"):
         resolved = resolve_weight_preprocessor_ref(
             WeightPreprocessorRef("amd_layout", required=False),
-            family="moe",
+            kernel_spec=_register_apply(),
             platform=h100_platform,
         )
 
@@ -192,7 +214,7 @@ def test_missing_preprocessor_errors_at_resolution(h100_platform):
     with pytest.raises(WeightPreprocessorResolutionError, match="missing"):
         resolve_weight_preprocessor_ref(
             WeightPreprocessorRef("missing", required=False),
-            family="moe",
+            kernel_spec=_register_apply(),
             platform=h100_platform,
         )
 
@@ -263,7 +285,7 @@ def test_resolution_accepts_matching_capability(mi300_platform):
 
     spec = resolve_weight_preprocessor_ref(
         WeightPreprocessorRef("amd_layout", required=True),
-        family="moe",
+        kernel_spec=_register_apply(),
         platform=mi300_platform,
     )
 

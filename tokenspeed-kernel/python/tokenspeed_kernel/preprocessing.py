@@ -27,7 +27,6 @@ from typing import Any, Callable
 
 from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
 from tokenspeed_kernel.registry import (
-    KernelRegistry,
     KernelSpec,
     WeightPreprocessorRef,
 )
@@ -37,12 +36,10 @@ __all__ = [
     "WeightPreprocessorRegistry",
     "WeightPreprocessorResolutionError",
     "WeightPreprocessorSpec",
-    "WeightPreprocessorValidationError",
     "WeightPreprocessorRef",
     "register_weight_preprocessor",
     "resolve_weight_preprocessor_conflict",
     "resolve_weight_preprocessor_ref",
-    "validate_weight_preprocessor_links",
 ]
 
 
@@ -62,10 +59,6 @@ class WeightPreprocessorSpec:
         _validate_traits(self.traits)
         if not isinstance(self.tags, frozenset):
             raise TypeError("weight preprocessor tags must be a frozenset")
-
-
-class WeightPreprocessorValidationError(RuntimeError):
-    """Raised when registered kernel/preprocessor metadata is inconsistent."""
 
 
 class WeightPreprocessorResolutionError(RuntimeError):
@@ -170,30 +163,6 @@ def _values_overlap(lhs: frozenset[Any], rhs: frozenset[Any]) -> bool:
     return bool(lhs & rhs)
 
 
-def _capabilities_overlap(
-    lhs: CapabilityRequirement,
-    rhs: CapabilityRequirement,
-) -> bool:
-    if (
-        lhs.vendors is not None
-        and rhs.vendors is not None
-        and not (lhs.vendors & rhs.vendors)
-    ):
-        return False
-
-    lhs_min = lhs.min_arch_version
-    lhs_max = lhs.max_arch_version
-    rhs_min = rhs.min_arch_version
-    rhs_max = rhs.max_arch_version
-
-    if lhs_min is not None and rhs_max is not None and lhs_min > rhs_max:
-        return False
-    if rhs_min is not None and lhs_max is not None and rhs_min > lhs_max:
-        return False
-
-    return True
-
-
 def _validate_trait_compatibility(
     *,
     kernel_spec: KernelSpec,
@@ -223,64 +192,10 @@ def _validate_trait_compatibility(
         )
 
 
-def validate_weight_preprocessor_links(
-    *,
-    family: str | None = None,
-    mode: str | None = None,
-    kernel_registry: KernelRegistry | None = None,
-    preprocessor_registry: WeightPreprocessorRegistry | None = None,
-) -> None:
-    """Validate exact kernel-to-preprocessor references after registration."""
-    kernel_registry = kernel_registry or KernelRegistry.get()
-    preprocessor_registry = preprocessor_registry or WeightPreprocessorRegistry.get()
-
-    if family is not None and mode is not None:
-        kernel_specs = kernel_registry.list_kernels(family, mode)
-    else:
-        kernel_specs = kernel_registry.list_kernels(family=family, mode=mode)
-
-    errors: list[str] = []
-    for kernel_spec in kernel_specs:
-        ref = kernel_spec.weight_preprocessor
-        if ref is None:
-            continue
-
-        preprocessor_spec = preprocessor_registry.get_by_name(ref.name)
-        if preprocessor_spec is None:
-            errors.append(
-                f"{kernel_spec.name}: missing weight preprocessor {ref.name!r}"
-            )
-            continue
-
-        if preprocessor_spec.family != kernel_spec.family:
-            errors.append(
-                f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} "
-                f"belongs to family {preprocessor_spec.family!r}, expected "
-                f"{kernel_spec.family!r}"
-            )
-
-        if not _capabilities_overlap(
-            kernel_spec.capability, preprocessor_spec.capability
-        ):
-            errors.append(
-                f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} "
-                "has incompatible platform capability"
-            )
-
-        _validate_trait_compatibility(
-            kernel_spec=kernel_spec,
-            preprocessor_spec=preprocessor_spec,
-            errors=errors,
-        )
-
-    if errors:
-        raise WeightPreprocessorValidationError("\n".join(errors))
-
-
 def resolve_weight_preprocessor_ref(
     ref: WeightPreprocessorRef | None,
     *,
-    family: str,
+    kernel_spec: KernelSpec,
     platform: PlatformInfo,
     registry: WeightPreprocessorRegistry | None = None,
 ) -> WeightPreprocessorSpec | None:
@@ -294,11 +209,19 @@ def resolve_weight_preprocessor_ref(
         raise WeightPreprocessorResolutionError(
             f"Selected kernel references missing weight preprocessor {ref.name!r}"
         )
-    if spec.family != family:
-        raise WeightPreprocessorResolutionError(
-            f"Weight preprocessor {ref.name!r} belongs to family {spec.family!r}, "
-            f"expected {family!r}"
+    errors: list[str] = []
+    if spec.family != kernel_spec.family:
+        errors.append(
+            f"{kernel_spec.name}: preprocessor {spec.name!r} belongs to family "
+            f"{spec.family!r}, expected {kernel_spec.family!r}"
         )
+    _validate_trait_compatibility(
+        kernel_spec=kernel_spec,
+        preprocessor_spec=spec,
+        errors=errors,
+    )
+    if errors:
+        raise WeightPreprocessorResolutionError("\n".join(errors))
     if not spec.capability.satisfied_by(platform):
         message = (
             f"Weight preprocessor {ref.name!r} cannot run on "

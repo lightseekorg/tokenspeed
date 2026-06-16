@@ -163,7 +163,7 @@ def moe_plan(
 
     preprocessor_spec = resolve_weight_preprocessor_ref(
         apply_spec.weight_preprocessor,
-        family="moe",
+        kernel_spec=apply_spec,
         platform=current_platform(),
     )
     weight_preprocessor_name = (

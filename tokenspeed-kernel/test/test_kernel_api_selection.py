@@ -62,9 +62,10 @@ from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.preprocessing import (
+    WeightPreprocessorResolutionError,
     WeightPreprocessorRegistry,
     WeightPreprocessorSpec,
-    validate_weight_preprocessor_links,
+    resolve_weight_preprocessor_ref,
 )
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
@@ -115,8 +116,59 @@ def _kernel_registry(fresh_registry):
         importlib.reload(mod)
 
 
-def test_builtin_moe_preprocessor_links_validate():
-    validate_weight_preprocessor_links(family="moe", mode="apply")
+def _platform_satisfying_preprocessor(
+    spec: WeightPreprocessorSpec | None,
+) -> PlatformInfo:
+    if spec is None:
+        return PlatformInfo(
+            vendor="nvidia",
+            arch_version=ArchVersion(9, 0),
+            device_name="test-h100",
+            device_count=1,
+            total_memory=80 * 1024**3,
+            memory_bandwidth=3000.0,
+            sm_count=132,
+            max_threads_per_sm=2048,
+            max_shared_memory_per_sm=228 * 1024,
+        )
+
+    capability = spec.capability
+    vendor = sorted(capability.vendors)[0] if capability.vendors else "nvidia"
+    arch_version = capability.min_arch_version or ArchVersion(0, 0)
+    return PlatformInfo(
+        vendor=vendor,
+        arch_version=arch_version,
+        device_name=f"test-{vendor}",
+        device_count=1,
+        total_memory=80 * 1024**3,
+        memory_bandwidth=3000.0,
+        sm_count=132,
+        max_threads_per_sm=2048,
+        max_shared_memory_per_sm=228 * 1024,
+        sm_features=capability.required_features,
+    )
+
+
+def test_builtin_moe_preprocessor_links_resolve():
+    kernel_registry = KernelRegistry.get()
+    preprocessor_registry = WeightPreprocessorRegistry.get()
+    errors = []
+    for kernel_spec in kernel_registry.list_kernels("moe", "apply"):
+        ref = kernel_spec.weight_preprocessor
+        if ref is None:
+            continue
+        preprocessor_spec = preprocessor_registry.get_by_name(ref.name)
+        platform = _platform_satisfying_preprocessor(preprocessor_spec)
+        try:
+            resolve_weight_preprocessor_ref(
+                ref,
+                kernel_spec=kernel_spec,
+                platform=platform,
+            )
+        except WeightPreprocessorResolutionError as exc:
+            errors.append(str(exc))
+
+    assert errors == []
 
 
 def test_moe_process_weights_returns_for_no_preprocessing_plan():

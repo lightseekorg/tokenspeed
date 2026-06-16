@@ -35,13 +35,7 @@ from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.language.core import _aggregate as aggregate
 from tokenspeed_triton.language.extra import libdevice
 from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
-
-try:
-    import tokenspeed_triton.profiler as proton
-except ModuleNotFoundError as exc:
-    if exc.name != "tokenspeed_triton.profiler":
-        raise
-    proton = None
+import tokenspeed_triton.profiler as proton
 
 __all__ = [
     "aggregate",
