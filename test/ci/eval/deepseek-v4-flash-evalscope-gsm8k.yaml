@@ -14,6 +14,7 @@ install:
 server:
   command: >-
     ts serve
+    --load-format instanttensor
     --model deepseek-ai/DeepSeek-V4-Flash
     --tensor-parallel-size 4
     --enable-expert-parallel

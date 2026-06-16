@@ -135,8 +135,12 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         )
 
         if aux_hidden_states is not None:
-
-            aux_hidden_states.append(residual.clone())
+            # Under RSAG the residual entering this layer is reduce-scattered
+            # across the attn TP group; aux consumers (e.g. the EAGLE3
+            # drafter) expect full rows, so gather before capturing.
+            aux_hidden_states.append(
+                self.comm_manager.gather_residual(residual, ctx).clone()
+            )
 
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
 

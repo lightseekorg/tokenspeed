@@ -433,7 +433,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
         requires_deferred_finalize=True,
         ep_size=2,
         ispp=128,
-        internal_activation_dtype="fp4",
+        internal_activation_dtype="input",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_moe_apply"
     assert (
@@ -458,7 +458,7 @@ def _moe_apply_nvfp4_cutlass() -> object:
         activation="swiglu",
         ep_size=2,
         ispp=128,
-        internal_activation_dtype="fp4",
+        internal_activation_dtype="input",
         solution="flashinfer_cutlass",
     )
     assert plan["apply_kernel_name"] == "flashinfer_cutlass_nvfp4_moe_apply"
@@ -479,7 +479,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         a2a_backend="deepep",
         ep_size=2,
         ispp=128,
-        internal_activation_dtype="fp4",
+        internal_activation_dtype="input",
         deepep_group=object(),
         solution="flashinfer_cutedsl",
     )
@@ -500,7 +500,7 @@ def _moe_apply_mxfp4_trtllm() -> object:
         activation="swiglu",
         ep_size=2,
         ispp=128,
-        internal_activation_dtype="mxfp8",
+        internal_activation_dtype="input",
         with_bias=True,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_moe_apply"

@@ -146,10 +146,10 @@ class MoELayer(torch.nn.Module):
             prefix=self.prefix,
             ignored_layers=quant_config.ignored_layers,
         ):
-            self._quant_kind = quant_config.get_name()
+            self._quant_kind = quant_config.moe_weight_dtype()
 
         fp8_scale_block_shape = None
-        internal_activation_dtype = None
+        internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
         if self._quant_kind == "mxfp4" and self.quant_config.is_w4a8_fp8:

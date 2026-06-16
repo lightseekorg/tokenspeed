@@ -13,6 +13,9 @@ runner:
       GPT_OSS_EVAL_ATTENTION_BACKEND: trtllm
       GPT_OSS_EVAL_MOE_BACKEND: flashinfer_trtllm
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
+      # InstantTensor is NVIDIA-only and the b200 pool has the memlock raised;
+      # AMD leaves this unset and uses the default loader.
+      GPT_OSS_EVAL_LOAD_FORMAT: instanttensor
     amd-mi35x-2gpu-test:
       GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
       GPT_OSS_EVAL_DISABLE_PREFIX_CACHING: "1"
@@ -25,6 +28,7 @@ server:
   command: >-
     ts serve
     --model ${GPT_OSS_EVAL_MODEL}
+    ${GPT_OSS_EVAL_LOAD_FORMAT:+--load-format ${GPT_OSS_EVAL_LOAD_FORMAT}}
     --attn-tp-size 2
     --moe-tp-size 2
     --max-model-len 80000

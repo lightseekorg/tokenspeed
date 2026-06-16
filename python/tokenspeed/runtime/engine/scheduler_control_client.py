@@ -49,6 +49,8 @@ from tokenspeed.runtime.engine.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
     IsSchedulerPausedReqOutput,
+    IsSleepingReqInput,
+    IsSleepingReqOutput,
     PauseMode,
     PauseSchedulerReqInput,
     PauseSchedulerReqOutput,
@@ -176,6 +178,9 @@ class SchedulerControlClient:
         self.is_scheduler_paused_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
+        self.is_sleeping_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
@@ -239,6 +244,10 @@ class SchedulerControlClient:
                 (
                     IsSchedulerPausedReqOutput,
                     self.is_scheduler_paused_communicator.handle_recv,
+                ),
+                (
+                    IsSleepingReqOutput,
+                    self.is_sleeping_communicator.handle_recv,
                 ),
                 (
                     ProfileReqOutput,
@@ -407,16 +416,21 @@ class SchedulerControlClient:
     async def release_memory_occupation(
         self: AsyncLLM,
         obj: ReleaseMemoryOccupationReqInput,
-    ):
+    ) -> ReleaseMemoryOccupationReqOutput:
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        return (await self.release_memory_occupation_communicator(obj))[0]
 
     async def resume_memory_occupation(
         self: AsyncLLM,
         obj: ResumeMemoryOccupationReqInput,
-    ):
+    ) -> ResumeMemoryOccupationReqOutput:
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        return (await self.resume_memory_occupation_communicator(obj))[0]
+
+    async def is_sleeping(self: AsyncLLM) -> bool:
+        self.auto_create_handle_loop()
+        result = (await self.is_sleeping_communicator(IsSleepingReqInput()))[0]
+        return result.is_sleeping
 
     async def get_internal_state(self: AsyncLLM) -> list[dict[Any, Any]]:
         req = GetInternalStateReq()

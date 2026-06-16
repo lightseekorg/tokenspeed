@@ -8,6 +8,12 @@ runner:
   labels:
     - b200-4gpu
     - b300-4gpu
+  # InstantTensor's io_uring loader needs a raised RLIMIT_MEMLOCK on the node.
+  # The b200 pool is configured for it; the b300 pool is not yet, so b300 falls
+  # back to the default loader (no KIMI_LOAD_FORMAT -> flag omitted below).
+  env:
+    b200-4gpu:
+      KIMI_LOAD_FORMAT: instanttensor
 env:
   CI: "true"
 install:
@@ -15,6 +21,7 @@ install:
 server:
   command: >-
     ts serve
+    ${KIMI_LOAD_FORMAT:+--load-format ${KIMI_LOAD_FORMAT}}
     --model nvidia/Kimi-K2.5-NVFP4
     --tp 4
     --max-model-len 80000

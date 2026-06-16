@@ -1285,8 +1285,15 @@ class DeepseekV3Model(nn.Module):
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):
             if aux_hidden_states is not None and i in self.layers_to_capture:
-                aux_hidden_states.append(
+                # Under RSAG the inter-layer hidden/residual are reduce-
+                # scattered across the attn TP group; aux consumers (e.g. the
+                # EAGLE3 drafter) expect full rows, so gather before capturing.
+                aux = (
                     hidden_states + residual if residual is not None else hidden_states
+                )
+                gathered = self.layers[i].comm_manager.gather_residual(aux, ctx)
+                aux_hidden_states.append(
+                    gathered if gathered is aux else gathered.clone()
                 )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
@@ -1479,11 +1486,13 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                 ):
                     quant_block_size = 1
-                    if (
-                        self.quant_config is not None
-                        and self.quant_config.weight_block_size is not None
-                    ):
-                        quant_block_size = self.quant_config.weight_block_size[0]
+                    # ``weight_block_size`` exists only on block-FP8 configs;
+                    # elsewhere (e.g. compressed-tensors INT4) q/kv_a_proj is unquantized.
+                    weight_block_size = getattr(
+                        self.quant_config, "weight_block_size", None
+                    )
+                    if self.quant_config is not None and weight_block_size is not None:
+                        quant_block_size = weight_block_size[0]
                     begin_size_mp = {
                         "q_a_proj": 0,
                         "kv_a_proj_with_mqa": self.config.q_lora_rank,

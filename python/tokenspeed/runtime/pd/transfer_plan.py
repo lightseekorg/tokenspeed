@@ -61,6 +61,13 @@ class ParallelLayout:
 
 @dataclass(frozen=True)
 class BufferLayout:
+    """Logical layout for one cache/state buffer.
+
+    ``tp_replica_group_size`` describes TP ranks that hold the same logical
+    shard. It is used by GQA/MQA-style KV caches when the prefill TP size is
+    larger than the number of distinct KV heads.
+    """
+
     buffer_index: int
     buffer_kind: BufferKind
     logical_axis: Literal["kv_head", "state_channel", "replicated"]
@@ -68,6 +75,7 @@ class BufferLayout:
     page_size: int
     bytes_per_logical_unit: int
     item_stride_bytes: int
+    tp_replica_group_size: int = 1
 
     def __post_init__(self):
         if self.logical_size <= 0:
@@ -78,6 +86,8 @@ class BufferLayout:
             raise UnsupportedPDLayoutError("bytes_per_logical_unit must be positive")
         if self.item_stride_bytes <= 0:
             raise UnsupportedPDLayoutError("item_stride_bytes must be positive")
+        if self.tp_replica_group_size <= 0:
+            raise UnsupportedPDLayoutError("tp_replica_group_size must be positive")
 
 
 @dataclass(frozen=True)
@@ -216,7 +226,9 @@ class PDTransferPlanner:
         target_dp_group = decode_rank // decode_tp_size
         decode_tp_rank = decode_rank % decode_tp_size
 
-        if self.prefill_layout.tp_size_per_dp == decode_tp_size:
+        if self._can_use_identity_plan() and (
+            self.prefill_layout.tp_size_per_dp == decode_tp_size
+        ):
             prefill_rank = (
                 target_dp_group * self.prefill_layout.tp_size_per_dp + decode_tp_rank
             )
@@ -261,19 +273,25 @@ class PDTransferPlanner:
                 fragments.setdefault(prefill_rank, []).append(fragment)
                 continue
 
-            decode_interval = self._rank_interval(
-                decode_buffer.logical_size, decode_tp_size, decode_tp_rank
+            decode_interval = self._rank_interval_for_buffer(
+                decode_buffer,
+                self.decode_layout,
+                decode_tp_rank,
             )
+            if decode_interval is None:
+                continue
             for prefill_tp_rank in range(self.prefill_layout.tp_size_per_dp):
                 prefill_rank = (
                     target_dp_group * self.prefill_layout.tp_size_per_dp
                     + prefill_tp_rank
                 )
-                prefill_interval = self._rank_interval(
-                    prefill_buffer.logical_size,
-                    self.prefill_layout.tp_size_per_dp,
+                prefill_interval = self._rank_interval_for_buffer(
+                    prefill_buffer,
+                    self.prefill_layout,
                     prefill_tp_rank,
                 )
+                if prefill_interval is None:
+                    continue
                 intersection = prefill_interval.intersect(decode_interval)
                 if intersection is None:
                     continue
@@ -341,11 +359,29 @@ class PDTransferPlanner:
             for buffer in buffers:
                 if buffer.logical_axis == "replicated":
                     continue
-                if buffer.logical_size % layout.tp_size_per_dp != 0:
+                if layout.tp_size_per_dp % buffer.tp_replica_group_size != 0:
+                    raise UnsupportedPDLayoutError(
+                        "tp replica group must divide TP size for "
+                        f"buffer_kind={buffer.buffer_kind.value}: "
+                        f"tp_size_per_dp={layout.tp_size_per_dp}, "
+                        f"tp_replica_group_size={buffer.tp_replica_group_size}"
+                    )
+                effective_tp_size = (
+                    layout.tp_size_per_dp // buffer.tp_replica_group_size
+                )
+                if buffer.logical_size % effective_tp_size != 0:
                     raise UnsupportedPDLayoutError(
                         "non-aligned TP heterogeneous mapping for "
                         f"buffer_kind={buffer.buffer_kind.value}: logical_size="
-                        f"{buffer.logical_size}, tp_size_per_dp={layout.tp_size_per_dp}"
+                        f"{buffer.logical_size}, effective_tp_size={effective_tp_size}"
+                    )
+                item_units = buffer.item_stride_bytes // buffer.bytes_per_logical_unit
+                required_units = buffer.logical_size // effective_tp_size
+                if item_units < required_units:
+                    raise UnsupportedPDLayoutError(
+                        "buffer item is smaller than its logical shard for "
+                        f"buffer_kind={buffer.buffer_kind.value}: item_units="
+                        f"{item_units}, required_units={required_units}"
                     )
 
     def _calc_source_fanout(self) -> dict[int, int]:
@@ -370,17 +406,21 @@ class PDTransferPlanner:
                     intersected_prefill_ranks.add(prefill_rank)
                     continue
 
-                decode_interval = self._rank_interval(
-                    decode_buffer.logical_size,
-                    self.decode_layout.tp_size_per_dp,
+                decode_interval = self._rank_interval_for_buffer(
+                    decode_buffer,
+                    self.decode_layout,
                     decode_tp_rank,
                 )
+                if decode_interval is None:
+                    continue
                 for prefill_tp_rank in range(self.prefill_layout.tp_size_per_dp):
-                    prefill_interval = self._rank_interval(
-                        prefill_buffer.logical_size,
-                        self.prefill_layout.tp_size_per_dp,
+                    prefill_interval = self._rank_interval_for_buffer(
+                        prefill_buffer,
+                        self.prefill_layout,
                         prefill_tp_rank,
                     )
+                    if prefill_interval is None:
+                        continue
                     if prefill_interval.intersect(decode_interval) is None:
                         continue
                     prefill_rank = (
@@ -392,11 +432,33 @@ class PDTransferPlanner:
                 fanout[prefill_rank] += 1
         return fanout
 
+    def _can_use_identity_plan(self) -> bool:
+        return all(
+            prefill_buffer.tp_replica_group_size == 1
+            and decode_buffer.tp_replica_group_size == 1
+            for prefill_buffer, decode_buffer in zip(
+                self.prefill_buffers, self.decode_buffers
+            )
+        )
+
     @staticmethod
     def _rank_interval(logical_size: int, tp_size: int, tp_rank: int) -> _Interval:
         local_size = logical_size // tp_size
         start = tp_rank * local_size
         return _Interval(start, start + local_size)
+
+    @staticmethod
+    def _rank_interval_for_buffer(
+        buffer: BufferLayout, layout: ParallelLayout, tp_rank: int
+    ) -> _Interval | None:
+        replica_group_size = buffer.tp_replica_group_size
+        if tp_rank % replica_group_size != 0:
+            return None
+        effective_tp_size = layout.tp_size_per_dp // replica_group_size
+        effective_tp_rank = tp_rank // replica_group_size
+        return PDTransferPlanner._rank_interval(
+            buffer.logical_size, effective_tp_size, effective_tp_rank
+        )
 
     @staticmethod
     def _replicated_source_tp_rank(

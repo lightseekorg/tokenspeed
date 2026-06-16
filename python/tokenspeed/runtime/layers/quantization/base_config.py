@@ -64,6 +64,16 @@ class QuantizationConfig(ABC):
         """Name of the quantization method."""
         raise NotImplementedError
 
+    def moe_weight_dtype(self) -> str:
+        """Logical MoE weight dtype fed to ``moe_plan`` as the ``weight_dtype`` trait.
+
+        Must name a concrete dtype the kernels register against (``fp8``,
+        ``nvfp4``, ``mxfp4``), not the quant method. Configs whose name already
+        is the dtype need no override; container formats (compressed-tensors)
+        resolve it from the parsed scheme.
+        """
+        return self.get_name()
+
     @abstractmethod
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         """List of supported activation dtypes."""

@@ -716,17 +716,27 @@ class GptOssForCausalLM(BaseCausalLM):
         }
 
     def _load_mxfp4_weights(self, weights, weight_name_mapping: dict):
-
-        mxfp4_weights = []
+        # The MoE expert tensors dominate the checkpoint. Stream them straight
+        # into their (pre-allocated) parameter slots as they arrive instead of
+        # buffering the whole iterator into a list. Buffering is invisible to
+        # CPU-staging loaders, but a GPU-direct loader (e.g.
+        # ``--load-format instanttensor``) yields tensors already on the GPU,
+        # so collecting every expert tensor would keep the entire checkpoint
+        # resident on the device at once and OOM mid-load. The remaining
+        # non-expert weights (attention, embeddings, norms, router) are small
+        # and are collected for the generic ``_load_normal_weights`` pass.
         normal_weights = []
 
-        for name, weight in weights:
-            if ".experts" in name:
-                mxfp4_weights.append((name, weight))
-            else:
-                normal_weights.append((name, weight))
+        def expert_weights():
+            for name, weight in weights:
+                if ".experts" in name:
+                    yield name, weight
+                else:
+                    normal_weights.append((name, weight))
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        # ``_load_mxfp4_experts_weights`` drains this generator fully, so by the
+        # time it returns ``normal_weights`` holds every non-expert tensor.
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(expert_weights())
         self._load_normal_weights(
             normal_weights,
             weight_name_mapping=weight_name_mapping,
@@ -772,27 +782,33 @@ class GptOssForCausalLM(BaseCausalLM):
                 )
                 param.data[slices].copy_(narrow_weight[slices])
 
-        # Detect AMD-Quark per-expert checkpoints (e.g.
-        # ``amd/gpt-oss-120b-w-mxfp4-a-fp8``). These store one set of tensors
-        # per expert (``...experts.{e}.gate_up_proj.{weight,...}``) plus a
-        # scalar ``input_scale`` for static FP8 activation quantization.
-        if any(
-            re.search(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.", n)
-            for n, _ in weights
-        ):
-            return self._load_mxfp4_per_expert_weights(
-                weights,
-                params_dict=params_dict,
-                moe_tp_rank_start=moe_tp_rank_start,
-                moe_tp_rank_end=moe_tp_rank_end,
-                moe_ep_rank_start=moe_ep_rank_start,
-                moe_ep_rank_end=moe_ep_rank_end,
-                moe_tp_rank=moe_tp_rank,
-                copy_into_param=_copy_into_param,
-                mxfp4_block=mxfp4_block,
-            )
+        # The two MXFP4 expert checkpoint layouts are mutually exclusive and
+        # are detected from the first expert tensor (a checkpoint is uniformly
+        # one layout), reproducing the original whole-iterator ``any(...)``
+        # probe for AMD-Quark per-expert checkpoints (e.g.
+        # ``amd/gpt-oss-120b-w-mxfp4-a-fp8``: one tensor set per expert plus a
+        # scalar ``input_scale`` for static FP8 activation quantization)
+        # without buffering the iterator. Each expert tensor is streamed
+        # straight into its slot as it arrives.
+        per_expert_re = re.compile(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.")
+        per_expert_format = None
 
         for name, weight in weights:
+            if per_expert_format is None:
+                per_expert_format = per_expert_re.search(name) is not None
+            if per_expert_format:
+                loaded_params |= self._load_mxfp4_per_expert_weights(
+                    [(name, weight)],
+                    params_dict=params_dict,
+                    moe_tp_rank_start=moe_tp_rank_start,
+                    moe_tp_rank_end=moe_tp_rank_end,
+                    moe_ep_rank_start=moe_ep_rank_start,
+                    moe_ep_rank_end=moe_ep_rank_end,
+                    moe_tp_rank=moe_tp_rank,
+                    copy_into_param=_copy_into_param,
+                    mxfp4_block=mxfp4_block,
+                )
+                continue
             weight = _WeightCreator.maybe_materialize(weight)
 
             if "gate_up_proj_blocks" in name:

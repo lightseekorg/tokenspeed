@@ -42,6 +42,7 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
@@ -478,6 +479,62 @@ def safetensors_weights_iterator(
     ):
         result = safetensors.torch.load_file(st_file, device="cpu")
         yield from result.items()
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files using the
+    InstantTensor library.
+
+    InstantTensor accelerates loading safetensors weights on NVIDIA GPUs
+    through distributed loading, pipelined prefetching, and direct I/O. When
+    the job spans multiple ranks, the world process group is passed to
+    InstantTensor so reads are sharded across ranks.
+
+    Args:
+        hf_weights_files: Local paths to the ``*.safetensors`` shards to load.
+
+    Yields:
+        ``(name, tensor)`` pairs for every tensor in the checkpoint, with the
+        tensors materialized on the current CUDA device.
+    """
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            "Please install instanttensor via `pip install instanttensor`"
+        ) from e
+
+    if not current_platform().is_nvidia:
+        raise ValueError("InstantTensor requires NVIDIA GPUs")
+
+    process_group = None
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        # The default (world) group spans every rank in the job, matching the
+        # semantics InstantTensor expects for distributed loading.
+        process_group = torch.distributed.group.WORLD
+
+    device = torch.cuda.current_device()
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    with instanttensor.safe_open(
+        hf_weights_files, framework="pt", device=device, process_group=process_group
+    ) as f:
+        # Since InstantTensor 0.1.9, tensors are cloned internally by default,
+        # so no extra clone is needed here.
+        yield from tqdm(
+            f.tensors(),
+            desc="Loading safetensors using InstantTensor loader",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+            total=len(f.keys()),
+            mininterval=1.0,
+        )
 
 
 def pt_weights_iterator(

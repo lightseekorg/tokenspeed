@@ -900,43 +900,59 @@ class KimiK25ForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights for the model, separating vision and language weights"""
-        vision_weights = []
-        language_weights = []
+        """Load weights, streaming language weights to the language model.
 
-        for name, loaded_weight in weights:
-            # nvidia/Kimi-K2.5-NVFP4 stores decoder layers under
-            # language_model.layers.*, while TokenSpeed's DeepSeek module
-            # expects model.layers.* after stripping language_model.
-            if name.startswith("language_model.layers."):
-                name = name.replace(
-                    "language_model.layers.", "language_model.model.layers.", 1
-                )
-
-            if "vision_tower" in name or "mm_projector" in name:
-                name = name.replace(r"wqkv.", r"attn.qkv_proj.")
-                name = name.replace(r"wo.", r"attn.proj.")
-                name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
-                name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
-                vision_weights.append((name, loaded_weight))
-            else:
-                name = name.replace("language_model.", "")
-                language_weights.append((name, loaded_weight))
-
-        if self.is_multimodal_active and not getattr(
+        The language weights are forwarded to ``language_model.load_weights``
+        lazily (as a generator) instead of being collected into a list first.
+        Materializing the whole iterator would keep every loaded tensor alive
+        at once; that is harmless for CPU-staged loaders but OOMs GPU-direct
+        loaders (e.g. ``--load-format instanttensor``), which would then hold
+        the entire model on the device during loading. Vision weights are
+        small and are still collected, then loaded after the language model.
+        """
+        vision_weights: list[Tuple[str, torch.Tensor]] = []
+        encoder_only = getattr(self.config, "encoder_only", False)
+        load_vision = self.is_multimodal_active and not getattr(
             self.config, "language_only", False
-        ):
-            vision_state_dict = dict(vision_weights)
+        )
+
+        def language_weights() -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, loaded_weight in weights:
+                # nvidia/Kimi-K2.5-NVFP4 stores decoder layers under
+                # language_model.layers.*, while TokenSpeed's DeepSeek module
+                # expects model.layers.* after stripping language_model.
+                if name.startswith("language_model.layers."):
+                    name = name.replace(
+                        "language_model.layers.", "language_model.model.layers.", 1
+                    )
+
+                if "vision_tower" in name or "mm_projector" in name:
+                    name = name.replace(r"wqkv.", r"attn.qkv_proj.")
+                    name = name.replace(r"wo.", r"attn.proj.")
+                    name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
+                    name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
+                    if load_vision:
+                        vision_weights.append((name, loaded_weight))
+                else:
+                    yield name.replace("language_model.", ""), loaded_weight
+
+        if not encoder_only:
+            # Consumes the iterator lazily; fills vision_weights as a side
+            # effect for the multimodal branch below.
+            self.language_model.load_weights(language_weights())
+        elif load_vision:
+            # Encoder-only: still drain the iterator to collect vision weights.
+            for _ in language_weights():
+                pass
+
+        if load_vision:
             params_dict = dict(self.named_parameters(remove_duplicate=False))
-            for name, loaded_weight in vision_state_dict.items():
+            for name, loaded_weight in vision_weights:
                 if name not in params_dict:
                     raise ValueError(f"Weight {name} not found in params_dict")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        if not getattr(self.config, "encoder_only", False) and language_weights:
-            self.language_model.load_weights(language_weights)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):

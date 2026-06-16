@@ -72,11 +72,7 @@ def test_mha_prefill(
     q = torch.randn(total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
     v = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
-    sinks = (
-        torch.randn(num_q_heads, device=device, dtype=torch.float32)
-        if has_sink
-        else None
-    )
+    sinks = torch.randn(num_q_heads, device=device, dtype=q.dtype) if has_sink else None
     window_left = 127 if is_sliding else -1
 
     out = mha_prefill(
