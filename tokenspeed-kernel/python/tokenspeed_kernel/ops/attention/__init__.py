@@ -280,6 +280,7 @@ def mha_decode_with_kvcache(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
+    max_seqlen_q: int = 1,
     # attention options
     window_left: int = -1,
     logit_cap: float = 0.0,
@@ -292,12 +293,15 @@ def mha_decode_with_kvcache(
     """MHA decode with paged KV cache.
 
     Args:
-        q: Query tensor with shape [batch, num_q_heads, head_dim].
+        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
         cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
         max_seqlen_k: Maximum KV length.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and `spec_num_tokens` for compact
+            speculative decode.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -305,10 +309,15 @@ def mha_decode_with_kvcache(
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
-    if q.shape[0] != cache_seqlens.shape[0]:
+    if max_seqlen_q < 1:
+        raise ValueError(f"max_seqlen_q must be >= 1, got {max_seqlen_q}")
+
+    expected_total_q = cache_seqlens.shape[0] * max_seqlen_q
+    if q.shape[0] != expected_total_q:
         raise ValueError(
-            "mha_decode_with_kvcache assumes query length 1; "
-            f"got q.shape[0]={q.shape[0]} and batch={cache_seqlens.shape[0]}"
+            "mha_decode_with_kvcache expects uniformly packed decode queries; "
+            f"got q.shape[0]={q.shape[0]}, batch={cache_seqlens.shape[0]}, "
+            f"and max_seqlen_q={max_seqlen_q}"
         )
 
     # Select kernel
@@ -340,7 +349,7 @@ def mha_decode_with_kvcache(
         "num_q_heads": q.shape[1],
         "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
-        "max_seqlen_q": 1,
+        "max_seqlen_q": max_seqlen_q,
         "max_seqlen_k": max_seqlen_k,
     }
     ShapeCapture.get().record(
@@ -370,6 +379,7 @@ def mha_decode_with_kvcache(
             sinks=sinks,
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
         )
 
 
