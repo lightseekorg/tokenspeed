@@ -888,7 +888,7 @@ _CASES = [
         "cdna4",
         "moe",
         "apply",
-        "triton_kernels_mxfp4_precomputed_moe_apply",
+        "triton_mxfp4_precomputed_moe_apply",
         _moe_apply_mxfp4_precomputed_tp,
     ),
     _case(
@@ -896,7 +896,7 @@ _CASES = [
         "cdna4",
         "moe",
         "apply",
-        "triton_kernels_mxfp4_ep_precomputed_moe_apply",
+        "triton_mxfp4_ep_precomputed_moe_apply",
         _moe_apply_mxfp4_precomputed_ep,
     ),
 ]

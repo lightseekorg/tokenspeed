@@ -322,7 +322,6 @@ def _local_topk_for_ep(
     "process_weights",
     name="triton_mxfp4_moe_process_weights",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=frozenset({format_signature()}),
     traits={"weight_dtype": frozenset({"mxfp4"})},
     priority=Priority.PORTABLE,
@@ -330,10 +329,14 @@ def _local_topk_for_ep(
 def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     MXFP_BLOCK_SIZE = 32
 
-    w13_weight_bias = w.w13_weight_bias.to(torch.float32)
-    w2_weight_bias = w.w2_weight_bias.to(torch.float32)
-    w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
-    w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+    if hasattr(w, "w13_weight_bias"):
+        w.w13_weight_bias = torch.nn.Parameter(
+            w.w13_weight_bias.to(torch.float32), requires_grad=False
+        )
+    if hasattr(w, "w2_weight_bias"):
+        w.w2_weight_bias = torch.nn.Parameter(
+            w.w2_weight_bias.to(torch.float32), requires_grad=False
+        )
 
     num_warps = 8
     w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
@@ -343,8 +346,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         w.w2_weight, w.w2_weight_scale, num_warps
     )
 
-    if plan.get("internal_activation_dtype", None) == "fp8":
-        assert hasattr(w, "w13_input_scale") and hasattr(w, "w2_input_scale")
+    if hasattr(w, "w13_input_scale") and hasattr(w, "w2_input_scale"):
         # Collapse per-expert input scales to a single per-tensor scale
         # per GEMM. Quark exports a constant value across experts for
         # static ``per_tensor`` quantisation; ``max`` is a safe reduction
@@ -377,7 +379,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     else:
         w13_lhs = InFlexData()
         w2_lhs = InFlexData()
-        out_dtype = None
+        out_dtype = torch.bfloat16 if _uses_dynamic_mxfp4_activations(w) else None
 
     w.w13_precision_config = PrecisionConfig(
         flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
@@ -395,130 +397,19 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
     # Free original weights (replaced by shuffled versions)
-    del w.w13_weight
-    del w.w2_weight
+    _release_parameter(w, "w13_weight")
+    _release_parameter(w, "w2_weight")
+    if current_platform().is_amd:
+        _release_parameter(w, "w13_weight_scale")
+        _release_parameter(w, "w2_weight_scale")
     torch.cuda.empty_cache()
 
 
 @register_kernel(
     "moe",
-    "process_weights",
-    name="triton_kernels_mxfp4_moe_process_weights",
-    solution="triton_kernels",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=frozenset({format_signature()}),
-    traits={"weight_dtype": frozenset({"mxfp4"})},
-    priority=Priority.PERFORMANT,
-)
-def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
-    num_warps = 8
-    if layout is None:
-        raise RuntimeError("triton_kernels backend unavailable")
-
-    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
-    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=-2, num_warps=num_warps
-    )
-    if platform.is_amd:
-        opt_flags.update_opt_flags_constraints({"block_k": 256})
-
-    if hasattr(w, "w13_weight_bias"):
-        w.w13_weight_bias = torch.nn.Parameter(
-            w.w13_weight_bias.to(torch.float32), requires_grad=False
-        )
-    if hasattr(w, "w2_weight_bias"):
-        w.w2_weight_bias = torch.nn.Parameter(
-            w.w2_weight_bias.to(torch.float32), requires_grad=False
-        )
-
-    w13_quant = w.w13_weight.transpose(-2, -1)
-    w13_scale_tensor = w.w13_weight_scale.transpose(-2, -1)
-    w13_weight = convert_layout(wrap_torch_tensor(w13_quant, dtype=FP4), value_layout)
-    w13_flex = InFlexData()
-    w13_scale = convert_layout(wrap_torch_tensor(w13_scale_tensor), scale_layout)
-
-    w2_quant = w.w2_weight.transpose(-2, -1)
-    w2_scale_tensor = w.w2_weight_scale.transpose(-2, -1)
-    w2_weight = convert_layout(wrap_torch_tensor(w2_quant, dtype=FP4), value_layout)
-    w2_flex = InFlexData()
-    w2_scale = convert_layout(wrap_torch_tensor(w2_scale_tensor), scale_layout)
-
-    if hasattr(w, "w13_input_scale") and hasattr(w, "w2_input_scale"):
-        w13_in_scale = (
-            w.w13_input_scale.data.to(torch.float32)
-            .max()
-            .reshape(1)
-            .to(w.w13_input_scale.device)
-            .contiguous()
-        )
-        w2_in_scale = (
-            w.w2_input_scale.data.to(torch.float32)
-            .max()
-            .reshape(1)
-            .to(w.w2_input_scale.device)
-            .contiguous()
-        )
-        w.w13_act_scale = w13_in_scale
-        w.w2_act_scale = w2_in_scale
-        fp8_dtype = current_platform().fp8e4m3fn.dtype
-        w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
-        w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
-        out_dtype = torch.bfloat16
-    else:
-        w13_lhs = InFlexData()
-        w2_lhs = InFlexData()
-        out_dtype = torch.bfloat16 if _uses_dynamic_mxfp4_activations(w) else None
-
-    w.w13_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
-        b_mx_scale=w13_scale,
-        b_microblock_size=MXFP4_BLOCK,
-        out_dtype=out_dtype,
-    )
-    w.w2_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=w2_lhs, rhs_data=w2_flex),
-        b_mx_scale=w2_scale,
-        b_microblock_size=MXFP4_BLOCK,
-        out_dtype=out_dtype,
-    )
-    w.w13_weight_triton_tensor = w13_weight
-    w.w2_weight_triton_tensor = w2_weight
-    _release_parameter(w, "w13_weight")
-    _release_parameter(w, "w13_weight_scale")
-    _release_parameter(w, "w2_weight")
-    _release_parameter(w, "w2_weight_scale")
-    return None
-
-
-@register_kernel(
-    "moe",
     "apply",
-    name="triton_kernels_mxfp4_moe_apply",
-    solution="triton_kernels",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=format_signatures(
-        "x",
-        "dense",
-        {torch.float16, torch.bfloat16},
-    ),
-    traits={
-        "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"kernel_routing"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({False}),
-        "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"input"}),
-        "supports_bias": frozenset({True}),
-    },
-    priority=Priority.PERFORMANT,
-)
-@register_kernel(
-    "moe",
-    "apply",
-    name="triton_kernels_mxfp4_precomputed_moe_apply",
-    solution="triton_kernels",
+    name="triton_mxfp4_precomputed_moe_apply",
+    solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -528,6 +419,7 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"silu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
@@ -540,8 +432,8 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
 @register_kernel(
     "moe",
     "apply",
-    name="triton_kernels_mxfp4_ep_precomputed_moe_apply",
-    solution="triton_kernels",
+    name="triton_mxfp4_ep_precomputed_moe_apply",
+    solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -551,6 +443,7 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"silu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({False}),
@@ -563,139 +456,8 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
 @register_kernel(
     "moe",
     "apply",
-    name="triton_kernels_mxfp4_fp8_activation_moe_apply",
-    solution="triton_kernels",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=format_signatures(
-        "x",
-        "dense",
-        {torch.float16, torch.bfloat16},
-    ),
-    traits={
-        "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"kernel_routing"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({False}),
-        "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"fp8"}),
-        "supports_bias": frozenset({True}),
-    },
-    priority=Priority.PERFORMANT - 1,
-)
-def triton_kernels_mxfp4_moe_apply(
-    plan: dict,
-    x: torch.Tensor,
-    w: torch.nn.Module,
-    router_logits: torch.Tensor,
-    topk_weights: torch.Tensor | None = None,
-    topk_ids: torch.Tensor | None = None,
-    num_tokens_global: int | None = None,
-    max_num_tokens_per_gpu: int | None = None,
-    do_finalize: bool = True,
-    enable_pdl: bool = False,
-):
-    del enable_pdl
-    top_k = getattr(w, "top_k")
-    if topk_weights is not None or topk_ids is not None:
-        if topk_weights is None or topk_ids is None:
-            raise ValueError("topk_weights and topk_ids must be provided together")
-        topk_weights, topk_ids, num_experts = _local_topk_for_ep(
-            topk_weights,
-            topk_ids,
-            w,
-        )
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
-            topk_weights,
-            topk_ids,
-            num_experts=num_experts,
-            dtype=router_logits.dtype,
-        )
-    else:
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
-            router_logits,
-            top_k,
-            sm_first=False,
-            dtype=router_logits.dtype,
-        )
-
-    swiglu_arg = getattr(w, "swiglu_arg", None)
-    activation = None
-    if swiglu_arg is not None:
-        activation = FusedActivation(
-            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-            (swiglu_arg.alpha, swiglu_arg.limit),
-        )
-
-    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
-    w13_precision_config = getattr(w, "w13_precision_config", None)
-    w2_precision_config = getattr(w, "w2_precision_config", None)
-    if hasattr(w, "w13_act_scale"):
-        gemm1_input = tokenspeed_kernel.quantize_fp8(
-            x,
-            scale=w.w13_act_scale,
-            solution="triton",
-        )
-    elif use_dynamic_mxfp4:
-        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(x)
-        w13_precision_config = _with_activation_mx_scale(
-            w13_precision_config,
-            gemm1_scale,
-        )
-    else:
-        gemm1_input = x
-
-    intermediate_cache = _matmul(
-        gemm1_input,
-        w.w13_weight_triton_tensor,
-        getattr(w, "w13_weight_bias", None),
-        a_ragged_metadata=ragged_metadata,
-        gather_indx=gather_indx,
-        precision_config=w13_precision_config,
-        fused_activation=activation,
-    )
-    if activation is None:
-        intermediate_cache = _silu_gate_up(
-            intermediate_cache,
-            output_dtype=x.dtype,
-        )
-
-    if hasattr(w, "w2_act_scale"):
-        gemm2_input = tokenspeed_kernel.quantize_fp8(
-            intermediate_cache,
-            scale=w.w2_act_scale,
-            solution="triton",
-        )
-    elif use_dynamic_mxfp4:
-        gemm2_input, gemm2_scale = _quantize_mxfp4_activation(intermediate_cache)
-        w2_precision_config = _with_activation_mx_scale(
-            w2_precision_config,
-            gemm2_scale,
-        )
-    else:
-        gemm2_input = intermediate_cache
-
-    return _matmul(
-        gemm2_input,
-        w.w2_weight_triton_tensor,
-        getattr(w, "w2_weight_bias", None),
-        a_ragged_metadata=ragged_metadata,
-        precision_config=w2_precision_config,
-        scatter_indx=scatter_indx,
-        betas=None,
-        gammas=gate_scal,
-        n_tokens=router_logits.shape[0],
-        n_expts_act=top_k,
-    )
-
-
-@register_kernel(
-    "moe",
-    "apply",
     name="triton_mxfp4_moe_apply",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=format_signatures(
         "x",
         "dense",
@@ -726,18 +488,33 @@ def triton_mxfp4_moe_apply(
     do_finalize: bool = True,
     enable_pdl: bool = False,
 ):
+    del enable_pdl
     swiglu_arg = getattr(w, "swiglu_arg", None)
 
-    router_logits = router_logits
     top_k = getattr(w, "top_k")
     n_tokens = router_logits.shape[0]
 
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
-        router_logits,
-        top_k,
-        sm_first=False,
-        dtype=router_logits.dtype,
-    )
+    if topk_weights is not None or topk_ids is not None:
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("topk_weights and topk_ids must be provided together")
+        topk_weights, topk_ids, num_experts = _local_topk_for_ep(
+            topk_weights,
+            topk_ids,
+            w,
+        )
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
+            topk_weights,
+            topk_ids,
+            num_experts=num_experts,
+            dtype=router_logits.dtype,
+        )
+    else:
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
+            router_logits,
+            top_k,
+            sm_first=False,
+            dtype=router_logits.dtype,
+        )
 
     w13_weight = w.w13_weight_triton_tensor
     w2_weight = w.w2_weight_triton_tensor
@@ -746,54 +523,59 @@ def triton_mxfp4_moe_apply(
     w13_pc = getattr(w, "w13_precision_config", None)
     w2_pc = getattr(w, "w2_precision_config", None)
 
-    gemm1_alpha = swiglu_arg.alpha if swiglu_arg else 1.702
-    gemm1_clamp = swiglu_arg.limit if swiglu_arg else 7.0
+    act = None
+    if swiglu_arg is not None:
+        act = FusedActivation(
+            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+            (swiglu_arg.alpha, swiglu_arg.limit),
+        )
 
-    act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-        (gemm1_alpha, gemm1_clamp),
-    )
-
-    if plan.get("internal_activation_dtype", None) == "fp8":
-        w13_act_scale = getattr(w, "w13_act_scale", None)
-        gemm1_input = fp8_quantize(
-            x,
-            scale=w13_act_scale,
+    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
+    if hasattr(w, "w13_act_scale"):
+        gemm1_input = fp8_quantize(x, scale=w.w13_act_scale)
+    elif use_dynamic_mxfp4:
+        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(x)
+        w13_pc = _with_activation_mx_scale(
+            w13_pc,
+            gemm1_scale,
         )
     else:
         gemm1_input = x
 
-    # First GEMM: gate_up projection with fused activation
-    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc):
-        intermediate_cache = matmul(
-            gemm1_input,
-            w13_weight,
-            w13_bias,
-            a_ragged_metadata=ragged_metadata,
-            gather_indx=gather_indx,
-            precision_config=w13_pc,
-            fused_activation=act,
+    intermediate_cache = _matmul(
+        gemm1_input,
+        w13_weight,
+        w13_bias,
+        a_ragged_metadata=ragged_metadata,
+        gather_indx=gather_indx,
+        precision_config=w13_pc,
+        fused_activation=act,
+    )
+    if act is None:
+        intermediate_cache = _silu_gate_up(
+            intermediate_cache,
+            output_dtype=x.dtype,
         )
 
-    if plan.get("internal_activation_dtype", None) == "fp8":
-        w2_act_scale = getattr(w, "w2_act_scale", None)
-        gemm2_input = fp8_quantize(
-            intermediate_cache,
-            scale=w2_act_scale,
+    if hasattr(w, "w2_act_scale"):
+        gemm2_input = fp8_quantize(intermediate_cache, scale=w.w2_act_scale)
+    elif use_dynamic_mxfp4:
+        gemm2_input, gemm2_scale = _quantize_mxfp4_activation(intermediate_cache)
+        w2_pc = _with_activation_mx_scale(
+            w2_pc,
+            gemm2_scale,
         )
     else:
         gemm2_input = intermediate_cache
 
-    # Second GEMM: down projection with scatter (combine)
-    # gammas applies the routing weights (expert contribution weights)
-    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc):
-        out = matmul(
-            gemm2_input,
-            w2_weight,
-            w2_bias,
-            a_ragged_metadata=ragged_metadata,
-            scatter_indx=scatter_indx,
-            precision_config=w2_pc,
-            gammas=gate_scal,
-        )
-    return out.view(n_tokens, top_k, out.shape[-1]).sum(dim=1)
+    return _matmul(
+        gemm2_input,
+        w2_weight,
+        w2_bias,
+        a_ragged_metadata=ragged_metadata,
+        precision_config=w2_pc,
+        scatter_indx=scatter_indx,
+        gammas=gate_scal,
+        n_tokens=n_tokens,
+        n_expts_act=top_k,
+    )
