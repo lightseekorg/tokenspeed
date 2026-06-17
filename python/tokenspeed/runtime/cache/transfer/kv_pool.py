@@ -84,25 +84,48 @@ class KVCachePool:
         # Sync BEFORE base writeback to flush any residual async error
         # from previous draft writeback on this stream.
         torch.cuda.synchronize()
+
+        # Compare host vs device pool strides to detect mismatch
+        dev_pool = self.device_pool
+        dev_inner = getattr(dev_pool, 'inner', dev_pool)
+        dev_stride = getattr(dev_inner, 'data_strides', None)
+        dev_stride_val = dev_stride[0].item() if dev_stride is not None and dev_stride.numel() > 0 else '?'
+        host_stride = getattr(self.host_pool, 'token_stride_size', '?')
+        dev_head_num = getattr(dev_inner, 'head_num', '?')
+        dev_head_dim = getattr(dev_inner, 'head_dim', '?')
+        dev_store_dtype = getattr(dev_inner, 'store_dtype', '?')
+        dev_dtype = getattr(dev_inner, 'dtype', '?')
+        # k_buffer[0] shape for device pool
+        dev_k0_shape = '?'
+        dev_k0_stride_bytes = '?'
+        if hasattr(dev_inner, 'k_buffer') and len(dev_inner.k_buffer) > 0:
+            dev_k0_shape = list(dev_inner.k_buffer[0].shape)
+            dev_k0_stride_bytes = dev_inner.k_buffer[0].stride()[0] * dev_inner.k_buffer[0].element_size()
+
         _log.warning(
             "[DEBUG-KVStore] pre-sync OK. Starting base writeback. "
-            "host_pool=%s device_pool=%s "
-            "layer_num=%s token_stride_size=%s "
-            "head_num=%s head_dim=%s dtype=%s "
-            "device_pool.layer_num=%s "
-            "host_pool.size=%s device_pool.size=%s "
-            "src_indices.numel=%d dst_indices.numel=%d",
-            type(self.host_pool).__name__,
-            type(self.device_pool).__name__,
-            getattr(self.host_pool, 'layer_num', '?'),
-            getattr(self.host_pool, 'token_stride_size', '?'),
+            "host_stride=%s dev_stride=%s MATCH=%s "
+            "host(head_num=%s head_dim=%s dtype=%s) "
+            "dev(head_num=%s head_dim=%s dtype=%s store_dtype=%s "
+            "k_buf0_shape=%s k_buf0_stride_bytes=%s) "
+            "layer_num(host=%s dev=%s) "
+            "size(host=%s dev=%s) "
+            "src_indices.numel=%d dst_indices.numel=%d "
+            "src_max=%s dst_max=%s",
+            host_stride, dev_stride_val,
+            host_stride == dev_stride_val if isinstance(dev_stride_val, int) else '?',
             getattr(self.host_pool, 'head_num', '?'),
             getattr(self.host_pool, 'head_dim', '?'),
             getattr(self.host_pool, 'dtype', '?'),
-            getattr(self.device_pool, 'layer_num', '?'),
+            dev_head_num, dev_head_dim, dev_dtype, dev_store_dtype,
+            dev_k0_shape, dev_k0_stride_bytes,
+            getattr(self.host_pool, 'layer_num', '?'),
+            getattr(dev_inner, 'layer_num', '?'),
             getattr(self.host_pool, 'size', '?'),
-            getattr(self.device_pool, 'size', '?'),
+            getattr(dev_inner, 'size', '?'),
             src_indices.numel(), dst_indices.numel(),
+            src_indices.max().item() if src_indices.numel() > 0 else -1,
+            dst_indices.max().item() if dst_indices.numel() > 0 else -1,
         )
 
         self.host_pool.backup_from_device_all_layer(
