@@ -30,20 +30,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.attention.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
+    fused_fp8_set_kv_buffer,
+    gather_page_table_with_padding,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.trtllm_fp8_kv_kernel import (
-    fused_fp8_set_kv_buffer,
-)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -565,37 +564,6 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         self.cuda_graph_prefill_metadata[bs] = metadata
         self.forward_prefill_metadata = metadata
 
-    def _replay_gather_page_table(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
-    ) -> None:
-        """Refresh cuda_graph_page_table[:bs] for the current replay step.
-
-        Replaces torch.index_select(req_to_page, 0, req_pool_indices, out=...).
-        The Triton kernel (1) skips reading padding columns of req_to_page
-        (cache-miss bound under large max_num_pages) and (2) overwrites stale
-        page IDs left in padding columns by previous replays where bs or
-        seq_lens were larger — keeping cuda_graph_page_table consistent.
-        """
-        BLOCK_COLS = 128
-        grid = (bs, triton.cdiv(self.max_num_pages, BLOCK_COLS))
-        _gather_page_table_with_padding_kernel[grid](
-            req_to_page,
-            req_pool_indices,
-            seq_lens,
-            self.cuda_graph_page_table,
-            req_to_page.stride(0),
-            self.cuda_graph_page_table.stride(0),
-            self.max_num_pages,
-            self.page_size,
-            0,  # dummy_slot — must match cuda_graph_page_table init (zeros)
-            BLOCK_COLS=BLOCK_COLS,
-            num_warps=4,
-        )
-
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -612,7 +580,16 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
 
         # cache_seqlens aliases seq_lens_buf; only page_table needs refresh.
         if req_to_page is not None:
-            self._replay_gather_page_table(bs, req_pool_indices, seq_lens, req_to_page)
+            gather_page_table_with_padding(
+                req_to_page=req_to_page,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out=self.cuda_graph_page_table,
+                bs=bs,
+                max_num_pages=self.max_num_pages,
+                page_size=self.page_size,
+                dummy_slot=0,
+            )
 
         if bs in self.cuda_graph_prefill_metadata:
             self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
@@ -621,50 +598,3 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
 
 
 register_backend("trtllm", {AttentionArch.MHA}, TRTLLMMHAAttnBackend)
-
-
-# ---------------------------------------------------------------------------
-# Triton kernel for cuda graph page table gather (replay path)
-# ---------------------------------------------------------------------------
-# Replaces torch.index_select(req_to_page, 0, req_pool_indices, out=...) which
-# launches an ATen indexSelectSmallIndex kernel that (a) reads every column of
-# the source row including padding (max_num_pages can be ~2048 for 128K context)
-# and (b) suffers cache misses on the small-index gather pattern.
-#
-# This kernel only loads the actual valid pages (ceil(seq_len / page_size))
-# and writes dummy_slot to padding columns, which both shrinks total reads
-# (often by 10-100x) and overwrites any stale page IDs left from previous
-# replays where bs or seq_lens were larger.
-
-
-@triton.jit
-def _gather_page_table_with_padding_kernel(
-    req_to_page_ptr,  # [req_pool_size+1, src_stride0] int32
-    req_pool_indices_ptr,  # [bs] int32 or int64
-    seq_lens_ptr,  # [bs] int32 — KV length per req
-    out_ptr,  # [max_bs, max_num_pages] int32
-    src_stride0,  # row stride of req_to_page
-    out_stride0,  # row stride of cuda_graph_page_table
-    max_num_pages: tl.constexpr,
-    page_size: tl.constexpr,
-    dummy_slot: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-):
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    # Per-row valid page count = ceil(seq_len / page_size).
-    sl = tl.load(seq_lens_ptr + pid_row).to(tl.int32)
-    n_pages = (sl + page_size - 1) // page_size
-
-    col_offsets = pid_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-    in_bounds = col_offsets < max_num_pages
-    valid = col_offsets < n_pages
-
-    # Gather source row; out-of-range cols (padding) get dummy_slot via `other`.
-    req_idx = tl.load(req_pool_indices_ptr + pid_row).to(tl.int64)
-    src_addr = req_to_page_ptr + req_idx * src_stride0 + col_offsets
-    gathered = tl.load(src_addr, mask=valid & in_bounds, other=dummy_slot)
-
-    out_addr = out_ptr + pid_row * out_stride0 + col_offsets
-    tl.store(out_addr, gathered, mask=in_bounds)

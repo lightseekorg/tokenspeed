@@ -34,12 +34,19 @@ _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32
 _is_nvidia = current_platform().is_nvidia
 
 __all__ = [
+    "fused_fp8_set_kv_buffer",
+    "gather_page_table_with_padding",
     "store_kv_cache",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Per-Layer KV Cache Scatter
+# -----------------------------------------------------------------------------
 
 
 @triton.jit
@@ -126,6 +133,383 @@ def store_kv_cache(
         n_kv_k,
         BLOCK=block,
     )
+
+
+# -----------------------------------------------------------------------------
+# FP8 KV Cache Write
+# -----------------------------------------------------------------------------
+
+
+# Adapted from meituan-longcat/SGLang-FluentLLM. This code may incorporate
+# material from ModelTC/lightllm, vllm-project/vllm, and sgl-project/sglang.
+@triton.jit
+def _process_fp8_kv_tensor(
+    token_id,
+    head_block_id,
+    page_id,
+    page_offset,
+    input_ptr,
+    cache_ptr,
+    inv_scale,
+    use_provided_scale: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    input_stride_token: tl.constexpr,
+    input_stride_head: tl.constexpr,
+    input_stride_dim: tl.constexpr,
+    cache_stride_page: tl.constexpr,
+    cache_stride_offset: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    head_idx = head_block_id * BLOCK_HEAD
+    num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
+
+    for dim_idx in range(0, head_dim, BLOCK_DIM):
+        num_dims_in_block = min(BLOCK_DIM, head_dim - dim_idx)
+
+        head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
+        dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
+
+        head_mask = head_offsets < (head_idx + num_heads_in_block)
+        dim_mask = dim_offsets < (dim_idx + num_dims_in_block)
+        mask = head_mask[:, None] & dim_mask[None, :]
+
+        input_offsets = (
+            token_id * input_stride_token
+            + head_offsets[:, None] * input_stride_head
+            + dim_offsets[None, :] * input_stride_dim
+        )
+        block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+
+        if use_provided_scale:
+            block_fp8 = (block * inv_scale).to(tl.float8e4nv)
+        else:
+            block_fp8 = block.to(tl.float8e4nv)
+
+        cache_offsets = (
+            page_id * cache_stride_page
+            + page_offset * cache_stride_offset
+            + head_offsets[:, None] * cache_stride_head
+            + dim_offsets[None, :] * cache_stride_dim
+        )
+        tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+
+
+@triton.jit
+def _fused_fp8_set_kv_buffer_kernel(
+    k_ptr,
+    v_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    cache_loc_ptr,
+    inv_k_scale_ptr,
+    inv_v_scale_ptr,
+    use_provided_scale: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    page_size: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    k_cache_stride_page: tl.constexpr,
+    k_cache_stride_offset: tl.constexpr,
+    k_cache_stride_head: tl.constexpr,
+    k_cache_stride_dim: tl.constexpr,
+    v_stride_token: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_dim: tl.constexpr,
+    v_cache_stride_page: tl.constexpr,
+    v_cache_stride_offset: tl.constexpr,
+    v_cache_stride_head: tl.constexpr,
+    v_cache_stride_dim: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_block_id = tl.program_id(1)
+    kv_idx = tl.program_id(2)
+
+    cache_loc = tl.load(cache_loc_ptr + token_id).to(tl.int64)
+    page_id = cache_loc // page_size
+    page_offset = cache_loc % page_size
+
+    if kv_idx == 0:
+        if use_provided_scale:
+            inv_scale = tl.load(inv_k_scale_ptr)
+        else:
+            inv_scale = 1.0
+        _process_fp8_kv_tensor(
+            token_id,
+            head_block_id,
+            page_id,
+            page_offset,
+            k_ptr,
+            k_cache_ptr,
+            inv_scale,
+            use_provided_scale,
+            num_kv_heads,
+            head_dim,
+            k_stride_token,
+            k_stride_head,
+            k_stride_dim,
+            k_cache_stride_page,
+            k_cache_stride_offset,
+            k_cache_stride_head,
+            k_cache_stride_dim,
+            BLOCK_HEAD,
+            BLOCK_DIM,
+        )
+    else:
+        if use_provided_scale:
+            inv_scale = tl.load(inv_v_scale_ptr)
+        else:
+            inv_scale = 1.0
+        _process_fp8_kv_tensor(
+            token_id,
+            head_block_id,
+            page_id,
+            page_offset,
+            v_ptr,
+            v_cache_ptr,
+            inv_scale,
+            use_provided_scale,
+            num_kv_heads,
+            head_dim,
+            v_stride_token,
+            v_stride_head,
+            v_stride_dim,
+            v_cache_stride_page,
+            v_cache_stride_offset,
+            v_cache_stride_head,
+            v_cache_stride_dim,
+            BLOCK_HEAD,
+            BLOCK_DIM,
+        )
+
+
+def fused_fp8_set_kv_buffer(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_loc: torch.Tensor,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
+    page_size: int = 16,
+) -> None:
+    """Quantize K/V tensors to FP8 and scatter them into a paged KV cache.
+
+    Args:
+        k: Key tensor with shape ``[num_tokens, num_kv_heads, head_dim]`` or
+            ``[num_tokens, num_kv_heads * head_dim]``.
+        v: Value tensor with the same shape convention as ``k``.
+        k_cache: Destination K cache, either flattened slots
+            ``[total_slots, num_kv_heads, head_dim]`` or paged layout
+            ``[num_pages, page_size, num_kv_heads, head_dim]``.
+        v_cache: Destination V cache with the same shape convention as
+            ``k_cache``.
+        cache_loc: Cache slot index for each input token.
+        k_scale: Optional scalar K scale. When provided with ``v_scale``, K is
+            divided by this scale before FP8 conversion.
+        v_scale: Optional scalar V scale. When provided with ``k_scale``, V is
+            divided by this scale before FP8 conversion.
+        page_size: Number of tokens per cache page.
+    """
+    num_tokens = k.shape[0]
+    if num_tokens == 0:
+        return
+
+    if k_cache.ndim == 3:
+        total_slots, num_kv_heads, head_dim = k_cache.shape
+        assert (
+            total_slots % page_size == 0
+        ), f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
+    elif k_cache.ndim == 4:
+        _, ps, num_kv_heads, head_dim = k_cache.shape
+        assert (
+            ps == page_size
+        ), f"page_size mismatch: cache has {ps}, expected {page_size}"
+    else:
+        raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}, expected 3 or 4")
+
+    if k.ndim == 3:
+        assert (
+            k.shape[1] == num_kv_heads
+        ), f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
+        assert (
+            k.shape[2] == head_dim
+        ), f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
+        assert v.shape[1] == num_kv_heads and v.shape[2] == head_dim, "v shape mismatch"
+        k_3d = k
+        v_3d = v
+    elif k.ndim == 2:
+        assert (
+            k.shape[1] == num_kv_heads * head_dim
+        ), f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
+        assert (
+            v.shape[1] == num_kv_heads * head_dim
+        ), f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
+        k_3d = k.view(num_tokens, num_kv_heads, head_dim)
+        v_3d = v.view(num_tokens, num_kv_heads, head_dim)
+    else:
+        raise ValueError(f"Unsupported k.ndim={k.ndim}, expected 2 or 3")
+
+    if k_cache.ndim == 3:
+        k_cache_stride_page = k_cache.stride(0) * page_size
+        k_cache_stride_offset = k_cache.stride(0)
+        k_cache_stride_head = k_cache.stride(1)
+        k_cache_stride_dim = k_cache.stride(2)
+
+        v_cache_stride_page = v_cache.stride(0) * page_size
+        v_cache_stride_offset = v_cache.stride(0)
+        v_cache_stride_head = v_cache.stride(1)
+        v_cache_stride_dim = v_cache.stride(2)
+    else:
+        k_cache_stride_page = k_cache.stride(0)
+        k_cache_stride_offset = k_cache.stride(1)
+        k_cache_stride_head = k_cache.stride(2)
+        k_cache_stride_dim = k_cache.stride(3)
+
+        v_cache_stride_page = v_cache.stride(0)
+        v_cache_stride_offset = v_cache.stride(1)
+        v_cache_stride_head = v_cache.stride(2)
+        v_cache_stride_dim = v_cache.stride(3)
+
+    use_provided_scale = k_scale is not None and v_scale is not None
+
+    block_head = min(num_kv_heads, 8)
+    block_dim = min(head_dim, 128)
+    num_head_blocks = (num_kv_heads + block_head - 1) // block_head
+    grid = (num_tokens, num_head_blocks, 2)
+    device = k_3d.device
+
+    def _to_tensor_scale(scale):
+        if isinstance(scale, torch.Tensor):
+            return scale.to(device=device, dtype=torch.float32)
+        return torch.tensor(float(scale), device=device, dtype=torch.float32)
+
+    if use_provided_scale:
+        k_scale_tensor = _to_tensor_scale(k_scale)
+        v_scale_tensor = _to_tensor_scale(v_scale)
+        inv_k_scale_ptr = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
+        inv_v_scale_ptr = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
+    else:
+        inv_k_scale_ptr = k_3d
+        inv_v_scale_ptr = k_3d
+
+    _fused_fp8_set_kv_buffer_kernel[grid](
+        k_3d,
+        v_3d,
+        k_cache,
+        v_cache,
+        cache_loc,
+        inv_k_scale_ptr,
+        inv_v_scale_ptr,
+        use_provided_scale,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        k_3d.stride(0),
+        k_3d.stride(1),
+        k_3d.stride(2),
+        k_cache_stride_page,
+        k_cache_stride_offset,
+        k_cache_stride_head,
+        k_cache_stride_dim,
+        v_3d.stride(0),
+        v_3d.stride(1),
+        v_3d.stride(2),
+        v_cache_stride_page,
+        v_cache_stride_offset,
+        v_cache_stride_head,
+        v_cache_stride_dim,
+        BLOCK_HEAD=block_head,
+        BLOCK_DIM=block_dim,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Page Table Gather
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _gather_page_table_with_padding_kernel(
+    req_to_page_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    src_stride0,
+    out_stride0,
+    max_num_pages: tl.constexpr,
+    page_size: tl.constexpr,
+    dummy_slot: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+
+    sl = tl.load(seq_lens_ptr + pid_row).to(tl.int32)
+    n_pages = (sl + page_size - 1) // page_size
+
+    col_offsets = pid_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    in_bounds = col_offsets < max_num_pages
+    valid = col_offsets < n_pages
+
+    req_idx = tl.load(req_pool_indices_ptr + pid_row).to(tl.int64)
+    src_addr = req_to_page_ptr + req_idx * src_stride0 + col_offsets
+    gathered = tl.load(src_addr, mask=valid & in_bounds, other=dummy_slot)
+
+    out_addr = out_ptr + pid_row * out_stride0 + col_offsets
+    tl.store(out_addr, gathered, mask=in_bounds)
+
+
+def gather_page_table_with_padding(
+    req_to_page: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    bs: int,
+    max_num_pages: int,
+    page_size: int,
+    dummy_slot: int = 0,
+) -> None:
+    """Gather active request page tables and clear padding columns.
+
+    Args:
+        req_to_page: Source page table with request rows.
+        req_pool_indices: Request row indices to gather, shape ``[bs]``.
+        seq_lens: Per-request KV lengths, shape ``[bs]``.
+        out: Destination page table, shape ``[max_bs, max_num_pages]``.
+        bs: Number of active rows to gather.
+        max_num_pages: Number of destination page-table columns.
+        page_size: Number of tokens per page.
+        dummy_slot: Value written into padding columns.
+    """
+    block_cols = 128
+    grid = (bs, triton.cdiv(max_num_pages, block_cols))
+    _gather_page_table_with_padding_kernel[grid](
+        req_to_page,
+        req_pool_indices,
+        seq_lens,
+        out,
+        req_to_page.stride(0),
+        out.stride(0),
+        max_num_pages,
+        page_size,
+        dummy_slot,
+        BLOCK_COLS=block_cols,
+        num_warps=4,
+    )
+
+
+# -----------------------------------------------------------------------------
+# KV Cache Transfer
+# -----------------------------------------------------------------------------
 
 
 @triton.jit

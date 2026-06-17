@@ -315,6 +315,7 @@ def _attention_prefill() -> object:
 def _attention_extend() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
+    cum_seq_lens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
     k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     page_table = torch.empty((2, 4), dtype=torch.int32)
@@ -322,6 +323,7 @@ def _attention_extend() -> object:
     return tokenspeed_kernel.mha_extend_with_kvcache(
         q,
         cu_seqlens_q,
+        cum_seq_lens_kv,
         k_cache,
         v_cache,
         page_table,
@@ -667,8 +669,8 @@ _CASES = [
         _is_hopper,
         "hopper",
         "attention",
-        "mha_merge_state",
-        "cuda_mha_merge_state",
+        "attn_merge_state",
+        "triton_attn_merge_state",
         _attention_merge_state,
     ),
     _case(
@@ -699,17 +701,9 @@ _CASES = [
         _is_blackwell_sm100,
         "blackwell-sm100",
         "attention",
-        "mha_merge_state",
-        "cuda_mha_merge_state",
+        "attn_merge_state",
+        "cuda_attn_merge_state",
         _attention_merge_state,
-    ),
-    _case(
-        _is_blackwell_non_sm100,
-        "blackwell-non-sm100",
-        "attention",
-        "mha_prefill",
-        "flashinfer_mha_prefill",
-        _attention_prefill,
     ),
     _case(
         _is_blackwell_non_sm100,
@@ -731,8 +725,8 @@ _CASES = [
         _is_blackwell_non_sm100,
         "blackwell-non-sm100",
         "attention",
-        "mha_merge_state",
-        "cuda_mha_merge_state",
+        "attn_merge_state",
+        "cuda_attn_merge_state",
         _attention_merge_state,
     ),
     _case(
@@ -763,8 +757,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "mha_merge_state",
-        "triton_mha_merge_state",
+        "attn_merge_state",
+        "triton_attn_merge_state",
         _attention_merge_state,
     ),
     # GEMM API x architecture golden cases.
@@ -918,7 +912,7 @@ def selected_kernel_spy(monkeypatch):
             return torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
 
         if case.family == "attention":
-            if case.mode == "mha_merge_state":
+            if case.mode == "attn_merge_state":
                 return torch.empty_like(kwargs["out_a"]), torch.empty_like(
                     kwargs["lse_a"]
                 )
