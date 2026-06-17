@@ -133,6 +133,9 @@ class DFlash(BaseDrafter):
             dtype=torch.int32,
             pin_memory=True,
         )
+        self.draft_extend_prefix_lens_cpu = torch.zeros(
+            (max_bs,), dtype=torch.int32, pin_memory=True,
+        )
         self.block_offsets = torch.arange(
             self.spec_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -431,15 +434,21 @@ class DFlash(BaseDrafter):
             page_size=self.page_size,
         )
 
+        extend_prefix_lens_cpu = self.draft_extend_prefix_lens_cpu[:bs]
+        extend_prefix_lens_cpu.copy_(prefix_lens.to(dtype=torch.int32))
+
         if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             self.attn_backend.init_forward_metadata(
                 bs=bs,
-                num_extends=0,
+                num_extends=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens_after,
                 req_to_page=self.req_to_page,
-                forward_mode=ForwardMode.DECODE,
+                forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens=self.draft_input_lengths_buf[:bs],
                 extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
+                extend_prefix_lens=prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             )
 
         ctx = ForwardContext(
@@ -447,9 +456,9 @@ class DFlash(BaseDrafter):
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_page=self.req_to_page,
             bs=bs,
-            num_extends=0,
+            num_extends=bs,
             input_num_tokens=bs * self.spec_num_tokens,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
