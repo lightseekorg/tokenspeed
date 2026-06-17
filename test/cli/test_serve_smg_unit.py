@@ -35,13 +35,11 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 
 from tokenspeed.cli._argsplit import OrchestratorOpts
-from tokenspeed.cli._proc import _ENGINE_MODULE_DEFAULT
 from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
     DEFAULT_REASONING_PARSER,
-    GLM_DSA_REASONING_PARSER,
     _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_port,
@@ -49,14 +47,11 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
-    _is_deepseek_v4_model,
-    _is_glm_dsa_model,
     _prewarm_hf_tokenizer,
     _user_host_port_from_gateway_args,
     _user_model_id,
     run_smg,
 )
-from tokenspeed.runtime.entrypoints.smg_grpc_server import _grpc_server_options
 
 
 def _make_proc(returncode: int | None = None) -> MagicMock:
@@ -86,20 +81,6 @@ def test_gateway_args_preserve_user_port():
     assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
 
 
-def test_ts_serve_uses_local_grpc_entrypoint():
-    assert _ENGINE_MODULE_DEFAULT == "tokenspeed.runtime.entrypoints.smg_grpc_server"
-
-
-def test_grpc_server_options_allow_long_idle_streams():
-    options = dict(_grpc_server_options(123))
-    assert options["grpc.max_send_message_length"] == 123
-    assert options["grpc.max_receive_message_length"] == 123
-    assert options["grpc.http2.min_recv_ping_interval_without_data_ms"] == 10000
-    assert options["grpc.http2.max_pings_without_data"] == 0
-    assert options["grpc.http2.max_ping_strikes"] == 0
-    assert options["grpc.keepalive_permit_without_calls"] is True
-
-
 def test_gateway_args_default_reasoning_parser_is_passthrough():
     gateway_args = _gateway_args_with_default_reasoning_parser(["--model", "/tmp/x"])
 
@@ -124,9 +105,8 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "8000",
         "--reasoning-parser",
         "passthrough",
-        "--disable-retries",
         "--disable-circuit-breaker",
-        "--disable-health-check",
+        "--disable-retries",
         "--tokenizer-cache-enable-l0",
         "--tokenizer-cache-enable-l1",
         "--log-level",
@@ -168,9 +148,8 @@ def test_smg_disable_flags_appended_when_absent():
     assert gateway_args == [
         "--model",
         "/tmp/x",
-        "--disable-retries",
         "--disable-circuit-breaker",
-        "--disable-health-check",
+        "--disable-retries",
     ]
 
 
@@ -183,15 +162,13 @@ def test_smg_disable_flags_not_duplicated():
     assert gateway_args == [
         "--disable-circuit-breaker",
         "--disable-retries",
-        "--disable-health-check",
     ]
 
 
-def test_smg_disable_flag_set_covers_single_worker_gateway_defaults():
+def test_smg_disable_flag_set_covers_both():
     assert _DEFAULT_SMG_DISABLE_FLAGS == (
-        "--disable-retries",
         "--disable-circuit-breaker",
-        "--disable-health-check",
+        "--disable-retries",
     )
 
 
@@ -311,34 +288,8 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert DEFAULT_REASONING_PARSER not in gateway_args
 
 
-def test_local_deepseek_v4_config_is_detected(tmp_path):
+def test_local_deepseek_v4_config_gets_default_parsers(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
-
-    assert _is_deepseek_v4_model(str(tmp_path))
-
-
-def test_local_glm_dsa_config_is_detected(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm_moe_dsa",
-                "architectures": ["GlmMoeDsaForCausalLM"],
-            }
-        )
-    )
-
-    assert _is_glm_dsa_model(str(tmp_path))
-
-
-def test_glm_dsa_config_gets_default_reasoning_parser(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm_moe_dsa",
-                "architectures": ["GlmMoeDsaForCausalLM"],
-            }
-        )
-    )
     model = str(tmp_path)
 
     engine_args, gateway_args = _args_with_default_model_parsers(
@@ -350,127 +301,16 @@ def test_glm_dsa_config_gets_default_reasoning_parser(tmp_path):
         "--model",
         model,
         "--reasoning-parser",
-        GLM_DSA_REASONING_PARSER,
+        DEEPSEEK_V4_REASONING_PARSER,
     ]
     assert gateway_args == [
         "--model",
         model,
         "--reasoning-parser",
-        GLM_DSA_REASONING_PARSER,
+        DEEPSEEK_V4_REASONING_PARSER,
+        "--tool-call-parser",
+        DEEPSEEK_V4_TOOL_CALL_PARSER,
     ]
-
-
-def test_glm_dsa_speculative_decoding_disables_prefix_cache_by_default(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm_moe_dsa",
-                "architectures": ["GlmMoeDsaForCausalLM"],
-            }
-        )
-    )
-    model = str(tmp_path)
-
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model, "--speculative-algorithm", "MTP"],
-        ["--model", model],
-    )
-
-    assert engine_args == [
-        "--model",
-        model,
-        "--speculative-algorithm",
-        "MTP",
-        "--reasoning-parser",
-        GLM_DSA_REASONING_PARSER,
-        "--no-enable-prefix-caching",
-        "--disable-kvstore",
-    ]
-    assert gateway_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        GLM_DSA_REASONING_PARSER,
-    ]
-
-
-def test_glm_dsa_speculative_decoding_preserves_explicit_prefix_cache(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm_moe_dsa",
-                "architectures": ["GlmMoeDsaForCausalLM"],
-            }
-        )
-    )
-    model = str(tmp_path)
-
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        [
-            "--model",
-            model,
-            "--speculative-algorithm",
-            "MTP",
-            "--enable-prefix-caching",
-        ],
-        ["--model", model],
-    )
-
-    assert "--no-enable-prefix-caching" not in engine_args
-    assert "--disable-kvstore" not in engine_args
-    assert "--enable-prefix-caching" in engine_args
-    assert gateway_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        GLM_DSA_REASONING_PARSER,
-    ]
-
-
-def test_glm_dsa_speculative_no_prefix_cache_also_disables_kvstore(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm_moe_dsa",
-                "architectures": ["GlmMoeDsaForCausalLM"],
-            }
-        )
-    )
-    model = str(tmp_path)
-
-    engine_args, _ = _args_with_default_model_parsers(
-        [
-            "--model",
-            model,
-            "--speculative-algorithm",
-            "MTP",
-            "--no-enable-prefix-caching",
-        ],
-        ["--model", model],
-    )
-
-    assert "--no-enable-prefix-caching" in engine_args
-    assert "--disable-kvstore" in engine_args
-
-
-def test_glm_dsa_parser_default_preserves_explicit_user_value(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm_moe_dsa",
-                "architectures": ["GlmMoeDsaForCausalLM"],
-            }
-        )
-    )
-    model = str(tmp_path)
-
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model, "--reasoning-parser", "none"],
-        ["--model", model, "--reasoning-parser", "none"],
-    )
-
-    assert engine_args == ["--model", model, "--reasoning-parser", "none"]
-    assert gateway_args == ["--model", model, "--reasoning-parser", "none"]
 
 
 def test_prewarm_skips_local_path(tmp_path):

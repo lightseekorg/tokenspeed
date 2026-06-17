@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
+    # KVStore currently transfers only the base MLA KV rows. GLM DSA also needs
+    # sparse/indexer cache rows to stay coherent with the reused KV pages.
+    supports_hierarchical_kv_cache = False
+
     def __init__(
         self,
         *args,

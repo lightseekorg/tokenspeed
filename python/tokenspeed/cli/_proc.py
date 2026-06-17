@@ -32,12 +32,7 @@ import time
 logger = logging.getLogger(__name__)
 
 _GATEWAY_MODULE = "smg"
-_ENGINE_MODULE_DEFAULT = "tokenspeed.runtime.entrypoints.smg_grpc_server"
-GATEWAY_DEFAULT_DISABLE_FLAGS = (
-    "--disable-retries",
-    "--disable-circuit-breaker",
-    "--disable-health-check",
-)
+_ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
 
 
 async def spawn_engine(
@@ -73,7 +68,6 @@ async def spawn_gateway(
     engine_port: int,
 ) -> asyncio.subprocess.Process:
     """Spawn ``python -m smg launch`` with PIPE stdio."""
-    disable_flags = [flag for flag in GATEWAY_DEFAULT_DISABLE_FLAGS if flag not in args]
     cmd = [
         sys.executable,
         "-m",
@@ -81,7 +75,8 @@ async def spawn_gateway(
         "launch",
         "--worker-urls",
         f"grpc://{engine_host}:{engine_port}",
-        *disable_flags,
+        "--disable-retries",
+        "--disable-circuit-breaker",
         *args,
     ]
     logger.info("spawn gateway: %s", " ".join(cmd))

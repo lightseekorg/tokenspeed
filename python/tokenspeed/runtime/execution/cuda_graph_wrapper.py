@@ -278,16 +278,8 @@ class CudaGraphWrapper:
                     self.max_bs, self.drafter.draft_seq_lens_buf
                 )
 
-            # Drafter (Eagle) is constructed with the target's req_to_page
-            # (ModelExecutor passes the same self.req_to_page to both), and the
-            # replay path hands both backends the same req_pool_indices. The
-            # block-table gather is req_to_page[req_pool_indices] (see
-            # _create_block_kv_indices; it does not depend on seq_lens), so both
-            # backends would compute identical block_kv_indices. When the backing
-            # buffer shapes/dtypes also line up, point the draft backend at the
-            # target's buffer and skip its gather+copy in the replay path: the
-            # target's metadata prep runs first and populates the shared buffer
-            # (see init_forward_metadata_replay_cuda_graph).
+            # Target and draft backends gather the same block table during
+            # replay; alias matching buffers to avoid duplicate copies.
             target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
             draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
             if (
@@ -390,20 +382,11 @@ class CudaGraphWrapper:
         # During capture, use uniform dummy counts across ranks.
         if self.dp_size > 1:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
-            # global_bs must ALSO be set at capture. The draft first-step MoE
-            # all-gather (draft_first_step_reduce) sizes its TritonRSAG collective
-            # from ctx.global_bs; if left None at capture it records a single-rank
-            # layout (fallback branch in comm_manager), but at replay global_bs is
-            # the live per-rank batch list -> multi-rank layout. The mismatch makes
-            # the captured (frozen-offset) gather read uninitialized symm-mem ->
-            # NaN draft logits -> accept_rate 0. Set the matching uniform dummy.
+            # Draft first-step MoE all-gather sizes its collective from
+            # global_bs, so capture needs the same rank layout as replay.
             ctx.global_bs = [bs] * self.world_size
 
-        # Capture with is_all_greedy=False so the graph records the full
-        # top_k_top_p_sampling path (greedy-only requests are served by the
-        # same path with top_k=1 in the buffer, which effectively argmaxes).
-        # is_all_greedy=True at capture would freeze the graph into
-        # argmax and bypass per-request seeding at replay.
+        # Capture the full sampling path; greedy requests replay it with top_k=1.
         ibd = self.input_buffers
         sampling_info = SamplingBatchInfo(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
@@ -753,13 +736,8 @@ class CudaGraphWrapper:
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
             if forward_mode.is_extend_or_mixed():
-                # Non-V4 draft backends follow the legacy contract: a single
-                # EXTEND/MIXED metadata init fills both first-step prefill
-                # metadata and step 1+ decode metadata, with seq_lens aliased
-                # to the drafter-owned mutable buffer. V4 additionally needs
-                # the accepted-prefix view for first-step grouped-cache
-                # metadata, then a separate decode init to prepare the draft
-                # decode metadata from that first-step state.
+                # V4 grouped-cache draft metadata needs the accepted-prefix
+                # view first, then decode metadata with mutable draft lengths.
                 draft_prefill_seq_lens = (
                     seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
                 )

@@ -30,13 +30,13 @@ import logging
 import os
 import signal
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
-    GATEWAY_DEFAULT_DISABLE_FLAGS,
     spawn_engine,
     spawn_gateway,
     terminate_then_kill,
@@ -53,15 +53,46 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
-GLM_DSA_REASONING_PARSER = "glm45"
+GLM_REASONING_PARSER = "glm45"
+GLM_TOOL_CALL_PARSER = "glm47_moe"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
-# ts serve. Single-engine launches should not let gateway retries, circuit
-# breakers, or queued health probes mask long prefill requests as worker
-# failures. These are tokenspeed-internal defaults: not surfaced via the ts CLI,
-# not routed through split_argv.
-_DEFAULT_SMG_DISABLE_FLAGS = GATEWAY_DEFAULT_DISABLE_FLAGS
+# ts serve. These are tokenspeed-internal defaults: not surfaced via
+# the ts CLI, not routed through split_argv.
+_DEFAULT_SMG_DISABLE_FLAGS = (
+    "--disable-circuit-breaker",
+    "--disable-retries",
+)
+
+
+@dataclass(frozen=True)
+class _ServeModelDefaults:
+    name_markers: tuple[str, ...]
+    model_types: tuple[str, ...]
+    architectures: tuple[str, ...]
+    reasoning_parser: str
+    tool_call_parser: str
+    engine_flags: tuple[str, ...] = ()
+
+
+_SERVE_MODEL_DEFAULTS = (
+    _ServeModelDefaults(
+        name_markers=("deepseek-v4",),
+        model_types=("deepseek_v4",),
+        architectures=("DeepseekV4ForCausalLM",),
+        reasoning_parser=DEEPSEEK_V4_REASONING_PARSER,
+        tool_call_parser=DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ),
+    _ServeModelDefaults(
+        name_markers=("glm-5",),
+        model_types=("glm_moe_dsa",),
+        architectures=("GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"),
+        reasoning_parser=GLM_REASONING_PARSER,
+        tool_call_parser=GLM_TOOL_CALL_PARSER,
+        engine_flags=("--disable-kvstore",),
+    ),
+)
 
 
 def _check_serve_extra_installed() -> None:
@@ -191,104 +222,48 @@ def _user_model_id(gateway_args: list[str]) -> str | None:
     return gateway_args[idx + 1]
 
 
-def _is_deepseek_v4_model(model_id: str | None) -> bool:
-    if not model_id:
-        return False
-
+def _model_id_contains(model_id: str, marker: str) -> bool:
     normalized = model_id.lower().replace("_", "-")
     compact = normalized.replace("-", "")
-    if "deepseek-v4" in normalized or "deepseekv4" in compact:
-        return True
+    return marker in normalized or marker.replace("-", "") in compact
 
+
+def _local_model_config(model_id: str | None) -> dict | None:
+    if not model_id:
+        return None
     config_path = Path(model_id) / "config.json"
     if not config_path.is_file():
-        return False
+        return None
     try:
         with config_path.open() as f:
             config = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(config, dict):
-        return False
-    architectures = config.get("architectures") or []
-    return (
-        config.get("model_type") == "deepseek_v4"
-        or "DeepseekV4ForCausalLM" in architectures
-    )
+        return None
+    return config if isinstance(config, dict) else None
 
 
-def _is_glm_dsa_model(model_id: str | None) -> bool:
+def _model_defaults_for(model_id: str | None) -> _ServeModelDefaults | None:
     if not model_id:
-        return False
+        return None
 
-    normalized = model_id.lower().replace("_", "-")
-    compact = normalized.replace("-", "")
-    if "glm-5" in normalized or "glm5" in compact:
-        return True
-
-    config_path = Path(model_id) / "config.json"
-    if not config_path.is_file():
-        return False
-    try:
-        with config_path.open() as f:
-            config = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(config, dict):
-        return False
-    architectures = config.get("architectures") or []
-    return config.get("model_type") == "glm_moe_dsa" or any(
-        arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"}
-        for arch in architectures
-    )
-
-
-_SPECULATIVE_ALGORITHM_FLAGS = ("--speculative-algorithm", "--speculative_algorithm")
-_SPECULATIVE_CONFIG_FLAGS = ("--speculative-config", "--speculative_config")
-_ENABLE_PREFIX_CACHE_FLAGS = (
-    "--enable-prefix-caching",
-    "--enable_prefix_caching",
-)
-_DISABLE_PREFIX_CACHE_FLAGS = (
-    "--no-enable-prefix-caching",
-    "--no_enable_prefix_caching",
-)
-_KVSTORE_DISABLE_FLAGS = ("--disable-kvstore", "--disable_kvstore")
-
-
-def _arg_value(args: list[str], flags: tuple[str, ...]) -> str | None:
-    for idx, token in enumerate(args):
-        if token in flags:
-            return args[idx + 1] if idx + 1 < len(args) else None
-        for flag in flags:
-            prefix = flag + "="
-            if token.startswith(prefix):
-                return token[len(prefix) :]
-    return None
-
-
-def _args_have_flag(args: list[str], flags: tuple[str, ...]) -> bool:
-    return any(token.split("=", 1)[0] in flags for token in args)
-
-
-def _args_request_speculative_decoding(*argvs: list[str]) -> bool:
-    for args in argvs:
-        if _arg_value(args, _SPECULATIVE_ALGORITHM_FLAGS):
-            return True
-        config = _arg_value(args, _SPECULATIVE_CONFIG_FLAGS)
-        if config is None:
-            continue
-        try:
-            parsed = json.loads(config)
-        except json.JSONDecodeError:
-            return True
-        if isinstance(parsed, dict) and (
-            parsed.get("method") is not None
-            or parsed.get("model") is not None
-            or parsed.get("num_speculative_tokens") is not None
+    config = _local_model_config(model_id)
+    model_type = config.get("model_type") if config is not None else None
+    architectures = config.get("architectures", ()) if config is not None else ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    elif not isinstance(architectures, (list, tuple)):
+        architectures = ()
+    for defaults in _SERVE_MODEL_DEFAULTS:
+        if any(
+            _model_id_contains(model_id, marker)
+            for marker in defaults.name_markers
         ):
-            return True
-    return False
+            return defaults
+        if model_type in defaults.model_types:
+            return defaults
+        if any(arch in defaults.architectures for arch in architectures):
+            return defaults
+    return None
 
 
 def _args_with_default_model_parsers(
@@ -301,9 +276,8 @@ def _args_with_default_model_parsers(
     name to defer json_schema grammars past the reasoning channel.
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
-    is_deepseek_v4 = _is_deepseek_v4_model(model_id)
-    is_glm_dsa = _is_glm_dsa_model(model_id)
-    if not is_deepseek_v4 and not is_glm_dsa:
+    defaults = _model_defaults_for(model_id)
+    if defaults is None:
         return engine_args, gateway_args
 
     engine_result = list(engine_args)
@@ -312,32 +286,13 @@ def _args_with_default_model_parsers(
         "--reasoning-parser" not in engine_result
         and "--reasoning-parser" not in gateway_result
     ):
-        parser = (
-            DEEPSEEK_V4_REASONING_PARSER if is_deepseek_v4 else GLM_DSA_REASONING_PARSER
-        )
-        engine_result.extend(["--reasoning-parser", parser])
-        gateway_result.extend(["--reasoning-parser", parser])
-    if is_deepseek_v4 and "--tool-call-parser" not in gateway_result:
-        gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
-    if is_glm_dsa and _args_request_speculative_decoding(
-        engine_result, gateway_result
-    ):
-        prefix_cache_explicitly_enabled = _args_have_flag(
-            engine_result, _ENABLE_PREFIX_CACHE_FLAGS
-        ) or _args_have_flag(gateway_result, _ENABLE_PREFIX_CACHE_FLAGS)
-        prefix_cache_explicitly_disabled = _args_have_flag(
-            engine_result, _DISABLE_PREFIX_CACHE_FLAGS
-        ) or _args_have_flag(gateway_result, _DISABLE_PREFIX_CACHE_FLAGS)
-        if not prefix_cache_explicitly_enabled:
-            if not prefix_cache_explicitly_disabled:
-                logger.warning(
-                    "Disabling prefix caching for GLM DSA speculative decoding; "
-                    "pass --enable-prefix-caching to override after verifying "
-                    "correctness."
-                )
-                engine_result.append("--no-enable-prefix-caching")
-            if not _args_have_flag(engine_result, _KVSTORE_DISABLE_FLAGS):
-                engine_result.append("--disable-kvstore")
+        engine_result.extend(["--reasoning-parser", defaults.reasoning_parser])
+        gateway_result.extend(["--reasoning-parser", defaults.reasoning_parser])
+    if "--tool-call-parser" not in gateway_result:
+        gateway_result.extend(["--tool-call-parser", defaults.tool_call_parser])
+    for flag in defaults.engine_flags:
+        if flag not in engine_result:
+            engine_result.append(flag)
     return engine_result, gateway_result
 
 

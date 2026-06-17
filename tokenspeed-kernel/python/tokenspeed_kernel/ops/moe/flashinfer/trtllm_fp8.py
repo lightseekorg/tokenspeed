@@ -18,21 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek-style FP8 block-scale MoE via the TensorRT-LLM-Gen fused kernel.
-
-FlashInfer's ``cutlass_fused_moe`` gates ``use_deepseek_fp8_block_scale`` to
-SM90, so it cannot serve fp8 block-scale MoE (GLM-5.1 / DeepSeek recipe) on
-Blackwell. The TensorRT-LLM-Gen ``trtllm_fp8_block_scale_moe`` kernel *is* the
-Blackwell (SM100+) path for the same recipe -- it fuses routing + dispatch +
-grouped GEMM + finalize in a single CUDA-graph-safe call. Upstream wired the
-TRT-LLM-Gen solutions for mxfp4 / nvfp4 / unquant but not for fp8; this module
-fills that gap so the generic ``MoELayer`` auto-selects a working fp8 MoE on
-Blackwell.
-
-Registered at the ``SPECIALIZED`` priority band and gated to ``min_arch 10.0``
-so it wins over the ``flashinfer_cutlass`` fp8 apply (``PERFORMANT`` band,
-``min_arch 9.0``) on SM100 while leaving SM90 to cutlass.
-"""
+"""FP8 block-scale MoE via the TensorRT-LLM-Gen fused kernel."""
 
 from __future__ import annotations
 

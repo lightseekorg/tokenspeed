@@ -6,7 +6,6 @@ the live config when ``from_pretrained`` lost it)."""
 import os
 import sys
 import unittest
-from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -14,13 +13,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs import Qwen3_5MoeConfig  # noqa: E402
-from tokenspeed.runtime.configs.model_config import (  # noqa: E402
-    get_hf_text_config,
-    supports_target_verify_forward_mode,
-)
+from tokenspeed.runtime.configs.model_config import get_hf_text_config  # noqa: E402
 from tokenspeed.runtime.utils.hf_transformers_utils import (  # noqa: E402
     _materialize_architectures,
-    _restore_raw_glm_dsa_fields,
     resolve_architecture,
 )
 
@@ -106,62 +101,6 @@ class MaterializeArchitecturesTests(unittest.TestCase):
         self.assertEqual(
             config.architectures, ["Qwen3_5MoeForConditionalGenerationNextN"]
         )
-
-
-class GlmDsaRawConfigTests(unittest.TestCase):
-    def test_glm_dsa_supports_target_verify_forward_mode(self) -> None:
-        self.assertTrue(
-            supports_target_verify_forward_mode(
-                SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
-            )
-        )
-        self.assertTrue(
-            supports_target_verify_forward_mode(
-                SimpleNamespace(architectures=["GlmMoeDsaForCausalLMNextN"])
-            )
-        )
-
-    def test_restores_clobbered_glm_dsa_fields(self) -> None:
-        config = SimpleNamespace(
-            head_dim=64,
-            qk_nope_head_dim=192,
-            qk_rope_head_dim=192,
-            qk_head_dim=384,
-        )
-        _restore_raw_glm_dsa_fields(
-            config,
-            {
-                "architectures": ["GlmMoeDsaForCausalLM"],
-                "head_dim": 192,
-                "qk_nope_head_dim": 192,
-                "qk_rope_head_dim": 64,
-                "index_topk_freq": 2,
-                "index_skip_topk_offset": 3,
-                "index_topk_pattern": ["F", "S"],
-                "indexer_types": ["full", "shared"],
-                "index_share_for_mtp_iteration": True,
-            },
-        )
-
-        self.assertEqual(config.head_dim, 64)
-        self.assertEqual(config.qk_rope_head_dim, 64)
-        self.assertEqual(config.qk_head_dim, 256)
-        self.assertEqual(config.index_topk_freq, 2)
-        self.assertEqual(config.index_skip_topk_offset, 3)
-        self.assertEqual(config.index_topk_pattern, ["F", "S"])
-        self.assertEqual(config.indexer_types, ["full", "shared"])
-        self.assertTrue(config.index_share_for_mtp_iteration)
-
-    def test_ignores_non_glm_dsa_config(self) -> None:
-        config = SimpleNamespace(qk_rope_head_dim=192)
-        _restore_raw_glm_dsa_fields(
-            config,
-            {
-                "architectures": ["Qwen3ForCausalLM"],
-                "qk_rope_head_dim": 64,
-            },
-        )
-        self.assertEqual(config.qk_rope_head_dim, 192)
 
 
 if __name__ == "__main__":

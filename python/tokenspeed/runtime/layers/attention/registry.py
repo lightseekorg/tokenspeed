@@ -27,7 +27,6 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
-    is_deepseek_dsa,
     is_deepseek_v4,
 )
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -355,7 +354,6 @@ def create_attn_components(
     is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
         draft_model_config.hf_config
     )
-    is_deepseek_dsa_model = is_deepseek_dsa(model_config.hf_config)
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
         server_args.attention_backend = "deepseek_v4"
@@ -365,8 +363,6 @@ def create_attn_components(
         # Qwen3.5 GDN hybrid models always need hybrid_linear_attn.
         # Save the user's original choice for the full-attention sub-backend.
         server_args.attention_backend = "hybrid_linear_attn"
-    elif is_deepseek_dsa_model and server_args.attention_backend is None:
-        server_args.attention_backend = "dsa"
     elif server_args.attention_backend == "hybrid_linear_attn":
         logger.warning(
             "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",

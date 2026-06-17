@@ -34,8 +34,8 @@ from tokenspeed.cli._proc import (
 
 
 @pytest.mark.asyncio
-async def test_spawn_gateway_disables_single_worker_reliability_knobs(monkeypatch):
-    """Single-worker mode disables gateway retries, circuit breaker, and probes."""
+async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
+    """Single-worker mode: retries and circuit-breaker are disabled by default."""
 
     captured = {}
 
@@ -53,32 +53,6 @@ async def test_spawn_gateway_disables_single_worker_reliability_knobs(monkeypatc
     cmd = captured["cmd"]
     assert "--disable-retries" in cmd
     assert "--disable-circuit-breaker" in cmd
-    assert "--disable-health-check" in cmd
-
-
-@pytest.mark.asyncio
-async def test_spawn_gateway_does_not_duplicate_default_disable_flags(monkeypatch):
-    captured = {}
-
-    async def fake_exec(*cmd, **kwargs):
-        captured["cmd"] = cmd
-
-        class _P:
-            async def wait(self):
-                return 0
-
-        return _P()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await spawn_gateway(
-        ["--disable-retries", "--disable-circuit-breaker", "--disable-health-check"],
-        engine_host="127.0.0.1",
-        engine_port=12345,
-    )
-    cmd = captured["cmd"]
-    assert cmd.count("--disable-retries") == 1
-    assert cmd.count("--disable-circuit-breaker") == 1
-    assert cmd.count("--disable-health-check") == 1
 
 
 @pytest.mark.asyncio

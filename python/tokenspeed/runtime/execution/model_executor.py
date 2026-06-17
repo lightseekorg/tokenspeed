@@ -176,10 +176,7 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
-            capture_drafter_in_cuda_graph=(
-                model_config.use_target_verify_forward_mode
-                and not envs.TOKENSPEED_DISABLE_DRAFTER_CUDA_GRAPH_CAPTURE.get()
-            ),
+            capture_drafter_in_cuda_graph=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -212,7 +209,6 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._layerwise_mamba_cow_done = None
-        self._debug_spec_tokens_logged = 0
 
         if config.spec_algo is not None:
             max_num_pages_per_req = (
@@ -465,10 +461,8 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
-        # Defensive in-place clamp into the vocab range, mirroring the output
-        # side. Spec-decode writes next-round input ids (drafter output ->
-        # future_input_map -> input_ids_buf); under a captured graph a corrupt
-        # id would otherwise hit the embedding gather unguarded.
+        # Spec-decode feeds drafter outputs back into input_ids_buf; keep the
+        # graph-safe embedding gather inside the vocab range.
         if self.drafter is not None:
             with maybe_inference_mode():
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens].clamp_(
@@ -559,96 +553,6 @@ class ModelExecutor:
             torch.cat([prefill_accept, decode_accept]),
         )
 
-    def _maybe_log_spec_tokens(
-        self,
-        stage: str,
-        ctx: ForwardContext,
-        *,
-        output_tokens: torch.Tensor | None = None,
-        accept_lengths: torch.Tensor | None = None,
-        logits_output: LogitsProcessorOutput | None = None,
-        candidates: torch.Tensor | None = None,
-    ) -> None:
-        if self.config.global_rank != 0 or not envs.TOKENSPEED_DEBUG_SPEC_TOKENS.get():
-            return
-        is_mid_prefill_chunk = (
-            ctx.forward_mode.is_extend()
-            and ctx.input_num_tokens >= self.config.chunked_prefill_size
-        )
-        if is_mid_prefill_chunk:
-            return
-        limit = max(0, envs.TOKENSPEED_DEBUG_SPEC_TOKENS_LIMIT.get())
-        if self._debug_spec_tokens_logged >= limit:
-            return
-        self._debug_spec_tokens_logged += 1
-
-        parts = [
-            f"stage={stage}",
-            f"mode={ctx.forward_mode.name}",
-            f"bs={ctx.bs}",
-            f"num_extends={ctx.num_extends}",
-            f"input_num_tokens={ctx.input_num_tokens}",
-        ]
-        if output_tokens is not None:
-            rows = min(int(output_tokens.shape[0]), 4) if output_tokens.ndim else 1
-            parts.append(
-                f"output={output_tokens[:rows].detach().to('cpu').tolist()}"
-            )
-        if accept_lengths is not None:
-            rows = min(int(accept_lengths.shape[0]), 4) if accept_lengths.ndim else 1
-            parts.append(
-                f"accept={accept_lengths[:rows].detach().to('cpu').tolist()}"
-            )
-        if candidates is not None:
-            rows = min(int(candidates.shape[0]), 4) if candidates.ndim else 1
-            parts.append(
-                f"candidates={candidates[:rows].detach().to('cpu').tolist()}"
-            )
-
-        def _append_finite_stats(name: str, tensor: torch.Tensor | None) -> None:
-            if tensor is None or tensor.numel() == 0:
-                return
-            view = tensor
-            if view.ndim >= 2:
-                rows = min(int(view.shape[0]), 2)
-                view = view[:rows]
-            finite = torch.isfinite(view)
-            finite_count = int(finite.sum().item())
-            total = int(finite.numel())
-            stats = [
-                f"{name}_shape={tuple(tensor.shape)}",
-                f"{name}_finite={finite_count}/{total}",
-            ]
-            if finite_count:
-                finite_values = view[finite].float()
-                stats.extend(
-                    [
-                        f"{name}_min={float(finite_values.min().item())}",
-                        f"{name}_max={float(finite_values.max().item())}",
-                    ]
-                )
-            parts.extend(stats)
-
-        logits = (
-            logits_output.next_token_logits
-            if logits_output is not None and logits_output.next_token_logits is not None
-            else None
-        )
-        _append_finite_stats("logits", logits)
-        hidden_states = (
-            logits_output.hidden_states
-            if logits_output is not None and logits_output.hidden_states is not None
-            else None
-        )
-        _append_finite_stats("hidden", hidden_states)
-        if logits is not None and logits.ndim == 2 and logits.shape[0] > 0:
-            rows = min(int(logits.shape[0]), 2)
-            k = min(5, int(logits.shape[-1]))
-            values, indices = torch.topk(logits[:rows], k=k, dim=-1)
-            parts.append(f"top_ids={indices.detach().to('cpu').tolist()}")
-            parts.append(f"top_vals={values.float().detach().to('cpu').tolist()}")
-        logger.warning("Spec token debug: %s", " ".join(parts))
-
     def _log_dp_sampling_route(self, bs: int, ctx: ForwardContext) -> None:
         runtime = self.dp_sampling_runtime_config
         if (
@@ -721,22 +625,8 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
 
-        self._maybe_log_spec_tokens(
-            "pre_sample",
-            ctx,
-            logits_output=logits_output,
-            candidates=candidates,
-        )
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
-        )
-        self._maybe_log_spec_tokens(
-            "post_sample",
-            ctx,
-            output_tokens=output_tokens,
-            accept_lengths=accept_lengths,
-            logits_output=logits_output,
-            candidates=candidates,
         )
 
         # Single choke point for every (sample/verify) x (greedy/flashinfer)
@@ -756,11 +646,8 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
-        # Legacy speculative models keep the drafter eager on graph replay:
-        # capture only the target verify pass and return hidden states so the
-        # post-replay path can run the drafter. Models using TARGET_VERIFY /
-        # DRAFT_EXTEND have graph-stable draft metadata and can capture the
-        # full target+drafter step.
+        # Only TARGET_VERIFY/DRAFT_EXTEND models capture the drafter; legacy
+        # speculative graphs return hidden states for an eager drafter replay.
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
@@ -771,16 +658,8 @@ class ModelExecutor:
             self._run_drafter_and_store(
                 ctx, logits_output, output_tokens, accept_lengths
             )
-            self._maybe_log_spec_tokens(
-                "post_drafter",
-                ctx,
-                output_tokens=output_tokens,
-                accept_lengths=accept_lengths,
-            )
 
         output_logprobs = logits_output.next_token_logprobs
-        # The draft hidden states ride along so a graph replay (which skips the
-        # in-graph drafter) can hand them to the eager drafter afterwards.
         draft_hidden = (
             logits_output.hidden_states
             if self.drafter is not None and capturing and not capture_drafter
@@ -795,12 +674,7 @@ class ModelExecutor:
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
     ) -> None:
-        """Run the multi-step drafter and stash next-round input ids.
-
-        Runs inline at the tail of ``_forward_step``. Legacy speculative CUDA
-        graphs call this eagerly after replay, while TARGET_VERIFY /
-        DRAFT_EXTEND models can capture this write into the full graph.
-        """
+        """Run the drafter and stash next-round input ids."""
         if (
             ctx.num_extends == ctx.bs
             and self.input_buffers.all_extends_mid_chunk
@@ -813,22 +687,7 @@ class ModelExecutor:
             output_tokens=output_tokens,
             accept_lengths=accept_lengths,
         )
-        self._maybe_log_spec_tokens(
-            "drafter_next",
-            ctx,
-            output_tokens=next_round_input_ids,
-            accept_lengths=accept_lengths,
-        )
-        # _update_runtime_state skips future_input_map when drafter is
-        # active — drafter writes the next-round inputs directly.
-        #
-        # The drafter only produces rows for the DECODE requests (it does not
-        # draft for in-flight prefill/extend reqs), so in a MIXED batch
-        # ``next_round_input_ids`` has ``num_decodes = bs - num_extends`` rows,
-        # not ``bs``. Decodes are the trailing requests of the batch (extends
-        # first, see _update_runtime_state's accept/extend split), so write to
-        # the last ``num_rows`` req-pool slots. For a pure-decode batch
-        # (num_extends == 0) this is exactly ``[: ctx.bs]`` as before.
+        # Mixed batches only draft decode rows; decodes are the trailing rows.
         num_rows = next_round_input_ids.shape[0]
         self.runtime_states.future_input_map[
             self.input_buffers.req_pool_indices_buf[ctx.bs - num_rows : ctx.bs]

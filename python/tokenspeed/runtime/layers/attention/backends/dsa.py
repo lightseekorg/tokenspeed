@@ -900,9 +900,7 @@ class DSABackend(AttentionBackend):
             head_multiple=_flashmla_sparse_prefill_head_multiple(),
         )
 
-        # GLM DSA prefill follows SGLang's FlashMLA sparse contract: invalid
-        # sparse slots are carried as -1-padded indices. Passing topk_length on
-        # this path corrupts long 8k-token chunked prefills on Blackwell.
+        # Invalid sparse slots are encoded as -1; do not pass topk_length here.
         out, _, _ = flash_mla_sparse_fwd(
             q=q_kernel,
             kv=kv_workspace.view(-1, 1, self.kv_cache_dim),
@@ -1112,12 +1110,7 @@ class DSABackend(AttentionBackend):
             softmax_scale=layer.scaling,
             is_fp8_kvcache=True,
             indices=topk_indices.view(num_reqs, q_len_per_req, -1),
-            # No topk_length on purpose: FlashMLA bakes those lengths into
-            # the lazily-built tile schedule and IMAs when a reused
-            # schedule meets different lengths (the CUDA graph replay
-            # case). Without it the schedule depends only on static shapes
-            # and the -1 padded indices carry the per-row length, with
-            # bit-identical outputs.
+            # Lengths are carried by -1 padding; keep FlashMLA scheduling static.
         )
         if out.dim() == 4:
             if out.shape[2] != actual_num_heads:
@@ -1202,10 +1195,7 @@ class DSABackend(AttentionBackend):
                     "GLM DSA TRTLLM sparse decode top-k length mismatch: "
                     f"lens={tuple(topk_lens.shape)}, q_tokens={num_tokens}."
                 )
-            # The TRTLLM sparse MLA kernel interprets seq_lens against the
-            # provided sparse block table, not the original dense KV context.
-            # Passing full context lengths lets rows with -1-padded top-k
-            # entries read past the sparse table under multi-token MTP decode.
+            # seq_lens is relative to the sparse block table, not dense context.
             seq_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
 
         q = q.view(num_tokens, 1, layer.tp_q_head_num, layer.head_dim)
