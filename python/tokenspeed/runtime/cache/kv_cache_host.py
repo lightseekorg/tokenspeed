@@ -305,16 +305,34 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         platform = current_platform()
-        self.k_data_ptrs = torch.tensor(
-            [platform.device_visible_data_ptr(x) for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.v_data_ptrs = torch.tensor(
-            [platform.device_visible_data_ptr(x) for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
+        # self.k_data_ptrs = torch.tensor(
+        #     [platform.device_visible_data_ptr(x) for x in self.k_data_refs],
+        #     dtype=torch.uint64,
+        #     device=self.device_pool.device,
+        # )
+        # self.v_data_ptrs = torch.tensor(
+        #     [platform.device_visible_data_ptr(x) for x in self.v_data_refs],
+        #     dtype=torch.uint64,
+        #     device=self.device_pool.device,
+        # )
+        _PTR_PAD = 64
+
+        def _make_padded_ptrs(values, device):
+            n = len(values)
+            backing = torch.zeros(
+                _PTR_PAD + n + _PTR_PAD, dtype=torch.uint64, device=device
+            )
+            backing[_PTR_PAD:_PTR_PAD + n] = torch.tensor(
+                values, dtype=torch.uint64, device=device
+            )
+            return backing, backing[_PTR_PAD:_PTR_PAD + n]
+
+        dev = self.device_pool.device
+        k_vals = [platform.device_visible_data_ptr(x) for x in self.k_data_refs]
+        v_vals = [platform.device_visible_data_ptr(x) for x in self.v_data_refs]
+
+        self._k_ptrs_backing, self.k_data_ptrs = _make_padded_ptrs(k_vals, dev)
+        self._v_ptrs_backing, self.v_data_ptrs = _make_padded_ptrs(v_vals, dev)
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
