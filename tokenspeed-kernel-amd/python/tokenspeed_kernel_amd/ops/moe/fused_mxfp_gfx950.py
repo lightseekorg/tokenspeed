@@ -20,7 +20,6 @@
 
 
 from __future__ import annotations
-
 from typing import Any, Optional
 
 import torch
@@ -2150,19 +2149,19 @@ class MoESliceNProgram:
     def issue_local_load_x(self, mfma_idx):
         cfg = self.cfg
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
-        if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 128:
+        if not cfg.W_VIA_VGPR and cfg.BLOCK_M == 128:
             x = self.x_desc.issue_local_load_m_swizzle128(
                 mfma_idx,
                 self.x_buffer,
                 cfg.dot_layout_x,
             )
-        elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 64:
+        elif not cfg.W_VIA_VGPR and cfg.BLOCK_M == 64:
             x = self.x_desc.issue_local_load_m_swizzle64(
                 mfma_idx,
                 self.x_buffer,
                 cfg.dot_layout_x,
             )
-        elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and cfg.BLOCK_M == 32:
+        elif not cfg.W_VIA_VGPR and cfg.BLOCK_M == 32:
             x = self.x_desc.issue_local_load_m_swizzle32(
                 mfma_idx,
                 self.x_buffer,
@@ -2817,11 +2816,11 @@ def _pipelined_moe_tile_compute(
         offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
 
     rows_m = off_m + offs_xm
-    if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 128:
+    if not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 128:
         src_offs_xm = (offs_xm % 4) * 32 + (offs_xm // 4)
-    elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 64:
+    elif not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 64:
         src_offs_xm = (offs_xm % 4) * 16 + (offs_xm // 4)
-    elif cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 32:
+    elif not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 32:
         src_offs_xm = (offs_xm % 2) * 16 + (offs_xm // 2)
     else:
         src_offs_xm = offs_xm
@@ -4344,7 +4343,6 @@ def _launch_kernel(
     )
 
     common_kwargs["waves_per_eu"] = num_warps // 4
-
     k = _pipelined_moe_kernel_scaled[grid](
         *common_args,
         block_offs_buf,
@@ -4644,6 +4642,113 @@ def _align_block_n_to_preshuffled_layout(
     return packed_block_n, use_slice_mn, False
 
 
+def _apply_prefill_route_overrides(
+    *,
+    M: int,
+    N: int,
+    slice_size: int | None,
+    block_m: int,
+    block_n: int,
+    requested_block_m: int | None,
+    requested_block_n: int | None,
+    use_slice_n: bool | None,
+    large_slice_size: int,
+    large_m: int,
+) -> tuple[int, int, bool | None, bool, bool, bool]:
+    """Apply the GPT-OSS prefill tile route shared by W layout variants."""
+    use_small_m = (
+        requested_block_m is None
+        and slice_size is not None
+        and slice_size < 16
+        and 1024 <= M < 2048
+    )
+    use_medium_m = (
+        requested_block_m is None
+        and slice_size is not None
+        and slice_size <= 16
+        and 2048 <= M < 4096
+    )
+    use_large_m = (
+        requested_block_m is None
+        and slice_size is not None
+        and slice_size >= large_slice_size
+        and M >= large_m
+    )
+    if use_small_m:
+        block_m = 16
+    elif use_medium_m:
+        block_m = 32
+    elif use_large_m:
+        block_m = 128
+        if use_slice_n is None:
+            use_slice_n = True
+
+    if requested_block_n is None and block_n == 128 and N >= 256:
+        # The tuned prefill route consumes a 256-wide execution tile through the
+        # SliceN pipeline.  Preshuffled W reads two 128-wide packed half-tiles;
+        # non-preshuffled W reads the same two half-tiles from the normal LDS
+        # layout, keeping the compute schedule aligned across both variants.
+        block_n = 256
+
+    if block_n == 256 and block_m > 64 and not use_large_m:
+        block_m = 64
+
+    return block_m, block_n, use_slice_n, use_small_m, use_medium_m, use_large_m
+
+
+def _resolve_prefill_slice_modes(
+    *,
+    use_slice_mn: bool | None,
+    use_slice_n: bool | None,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_buffers: int,
+    scale_load_mode: str,
+    x_format: str,
+    has_x_block_scale: bool,
+    has_w_block_scale: bool,
+) -> tuple[bool, bool]:
+    if use_slice_mn is True:
+        use_slice_mn_resolved = _resolve_use_slice_mn(
+            True,
+            block_m,
+            block_n,
+            num_buffers=num_buffers,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=has_x_block_scale,
+            has_w_block_scale=has_w_block_scale,
+            bk=block_k,
+        )
+        if use_slice_mn_resolved:
+            return True, False
+
+    use_slice_n_resolved = _resolve_use_slice_n(
+        use_slice_n,
+        block_m,
+        block_n,
+        scale_load_mode=scale_load_mode,
+        x_format=x_format,
+        has_x_block_scale=has_x_block_scale,
+        has_w_block_scale=has_w_block_scale,
+        bk=block_k,
+    )
+    use_slice_mn_resolved = _resolve_use_slice_mn(
+        use_slice_mn,
+        block_m,
+        block_n,
+        num_buffers=num_buffers,
+        scale_load_mode=scale_load_mode,
+        x_format=x_format,
+        has_x_block_scale=has_x_block_scale,
+        has_w_block_scale=has_w_block_scale,
+        use_slice_n=use_slice_n_resolved,
+        bk=block_k,
+    )
+    return use_slice_mn_resolved, use_slice_n_resolved
+
+
 def gluon_mxfp_dispatch_swiglu(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -4699,44 +4804,25 @@ def gluon_mxfp_dispatch_swiglu(
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
-    use_small_preshuffled_m = (
-        w_preshuffle
-        and requested_block_m is None
-        and slice_size is not None
-        and slice_size < 16
-        and 1024 <= M < 2048
+    (
+        block_m,
+        block_n,
+        use_slice_n,
+        use_small_prefill_m,
+        _use_medium_prefill_m,
+        use_large_prefill_m,
+    ) = _apply_prefill_route_overrides(
+        M=M,
+        N=N,
+        slice_size=slice_size,
+        block_m=block_m,
+        block_n=block_n,
+        requested_block_m=requested_block_m,
+        requested_block_n=requested_block_n,
+        use_slice_n=use_slice_n,
+        large_slice_size=128,
+        large_m=16384,
     )
-    use_medium_preshuffled_m = (
-        w_preshuffle
-        and requested_block_m is None
-        and slice_size is not None
-        and slice_size <= 16
-        and 2048 <= M < 4096
-    )
-    use_large_preshuffled_m = (
-        w_preshuffle
-        and requested_block_m is None
-        and slice_size is not None
-        and slice_size >= 128
-        and M >= 16384
-    )
-    if use_small_preshuffled_m:
-        block_m = 16
-    elif use_medium_preshuffled_m:
-        block_m = 32
-    elif use_large_preshuffled_m:
-        block_m = 128
-        if use_slice_n is None:
-            use_slice_n = True
-    if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
-        # Preshuffled W is packed as 128-wide tiles. Execute a 256-wide CTA by
-        # consuming two packed tiles through USE_SLICE_N so the same X tile
-        # feeds twice as much MFMA work per wait/barrier region.
-        block_n = 256
-    if w_preshuffle and block_n == 256 and block_m > 64 and not use_large_preshuffled_m:
-        # Preshuffled W supports BN=256 through USE_SLICE_N's two 128-wide
-        # packed half-tiles; pick the BM tier that enables that path.
-        block_m = 64
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
@@ -4771,56 +4857,21 @@ def gluon_mxfp_dispatch_swiglu(
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
-    if w_preshuffle:
-        use_slice_mn = _resolve_use_slice_mn(
-            use_slice_mn,
-            block_m,
-            block_n,
-            num_buffers=num_buffers,
-            scale_load_mode=scale_load_mode,
-            x_format=x_format,
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            bk=block_k,
-        )
-        if use_slice_mn:
-            use_slice_n = False
-        else:
-            use_slice_n = _resolve_use_slice_n(
-                use_slice_n,
-                block_m,
-                block_n,
-                scale_load_mode=scale_load_mode,
-                x_format=x_format,
-                has_x_block_scale=x_format == "e2m1",
-                has_w_block_scale=True,
-                bk=block_k,
-            )
-    else:
-        use_slice_mn = _resolve_use_slice_mn(
-            use_slice_mn,
-            block_m,
-            block_n,
-            num_buffers=num_buffers,
-            scale_load_mode=scale_load_mode,
-            x_format=x_format,
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            bk=block_k,
-        )
-        use_slice_n = _resolve_use_slice_n(
-            use_slice_n,
-            block_m,
-            block_n,
-            scale_load_mode=scale_load_mode,
-            x_format=x_format,
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            bk=block_k,
-        )
-    if persistent is None and use_small_preshuffled_m:
+    use_slice_mn, use_slice_n = _resolve_prefill_slice_modes(
+        use_slice_mn=use_slice_mn,
+        use_slice_n=use_slice_n,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_buffers=num_buffers,
+        scale_load_mode=scale_load_mode,
+        x_format=x_format,
+        has_x_block_scale=x_format == "e2m1",
+        has_w_block_scale=True,
+    )
+    if persistent is None and use_small_prefill_m:
         persistent = False
-    if persistent is None and w_preshuffle and use_slice_n:
+    if persistent is None and use_slice_n:
         grid_n = (N + block_n - 1) // block_n
         if a_ragged_metadata is not None:
             n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
@@ -4834,8 +4885,7 @@ def gluon_mxfp_dispatch_swiglu(
     xcd_swizzle = None
     w_cache_cg = None
     if (
-        w_preshuffle
-        and not persistent
+        not persistent
         and block_m == 16
         and block_n == 256
         and block_k == 256
@@ -4850,8 +4900,7 @@ def gluon_mxfp_dispatch_swiglu(
         group_m = 16
         xcd_swizzle = _CDNA4_NUM_XCDS
     elif (
-        w_preshuffle
-        and persistent
+        persistent
         and num_ctas == _CDNA4_NUM_CUS
         and block_m == 64
         and block_n == 256
@@ -4867,8 +4916,7 @@ def gluon_mxfp_dispatch_swiglu(
         xcd_swizzle = _CDNA4_NUM_XCDS
         w_cache_cg = True
     elif (
-        w_preshuffle
-        and persistent
+        persistent
         and num_ctas == _CDNA4_NUM_CUS
         and block_m == 32
         and block_n == 256
@@ -4971,43 +5019,25 @@ def gluon_mxfp_combine(
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
-    use_small_preshuffled_m = (
-        w_preshuffle
-        and requested_block_m is None
-        and slice_size is not None
-        and slice_size < 16
-        and 1024 <= M < 2048
+    (
+        block_m,
+        block_n,
+        use_slice_n,
+        use_small_prefill_m,
+        _use_medium_prefill_m,
+        _use_large_prefill_m,
+    ) = _apply_prefill_route_overrides(
+        M=M,
+        N=N,
+        slice_size=slice_size,
+        block_m=block_m,
+        block_n=block_n,
+        requested_block_m=requested_block_m,
+        requested_block_n=requested_block_n,
+        use_slice_n=use_slice_n,
+        large_slice_size=256,
+        large_m=32768,
     )
-    use_medium_preshuffled_m = (
-        w_preshuffle
-        and requested_block_m is None
-        and slice_size is not None
-        and slice_size <= 16
-        and 2048 <= M < 4096
-    )
-    use_large_preshuffled_m = (
-        w_preshuffle
-        and requested_block_m is None
-        and slice_size is not None
-        and slice_size >= 256
-        and M >= 32768
-    )
-    if use_small_preshuffled_m:
-        block_m = 16
-    elif use_medium_preshuffled_m:
-        block_m = 32
-    elif use_large_preshuffled_m:
-        block_m = 128
-        if use_slice_n is None:
-            use_slice_n = True
-    if w_preshuffle and requested_block_n is None and block_n == 128 and N >= 256:
-        # Match dispatch's preshuffled layout-aware promotion: the packed W
-        # layout is 128-wide, but the execution tile can consume two adjacent
-        # packed tiles through USE_SLICE_N. That halves the N-tile count for
-        # combine while preserving the same host layout.
-        block_n = 256
-    if w_preshuffle and block_n == 256 and block_m > 64 and not use_large_preshuffled_m:
-        block_m = 64
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
@@ -5042,56 +5072,21 @@ def gluon_mxfp_combine(
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
-    if w_preshuffle:
-        use_slice_mn = _resolve_use_slice_mn(
-            use_slice_mn,
-            block_m,
-            block_n,
-            num_buffers=num_buffers,
-            scale_load_mode=scale_load_mode,
-            x_format=x_format,
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            bk=block_k,
-        )
-        if use_slice_mn:
-            use_slice_n = False
-        else:
-            use_slice_n = _resolve_use_slice_n(
-                use_slice_n,
-                block_m,
-                block_n,
-                scale_load_mode=scale_load_mode,
-                x_format=x_format,
-                has_x_block_scale=x_format == "e2m1",
-                has_w_block_scale=True,
-                bk=block_k,
-            )
-    else:
-        use_slice_mn = _resolve_use_slice_mn(
-            use_slice_mn,
-            block_m,
-            block_n,
-            num_buffers=num_buffers,
-            scale_load_mode=scale_load_mode,
-            x_format=x_format,
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            bk=block_k,
-        )
-        use_slice_n = _resolve_use_slice_n(
-            use_slice_n,
-            block_m,
-            block_n,
-            scale_load_mode=scale_load_mode,
-            x_format=x_format,
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            bk=block_k,
-        )
-    if persistent is None and use_small_preshuffled_m:
+    use_slice_mn, use_slice_n = _resolve_prefill_slice_modes(
+        use_slice_mn=use_slice_mn,
+        use_slice_n=use_slice_n,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_buffers=num_buffers,
+        scale_load_mode=scale_load_mode,
+        x_format=x_format,
+        has_x_block_scale=x_format == "e2m1",
+        has_w_block_scale=True,
+    )
+    if persistent is None and use_small_prefill_m:
         persistent = False
-    if persistent is None and w_preshuffle:
+    if persistent is None:
         grid_n = (N + block_n - 1) // block_n
         if a_ragged_metadata is not None:
             n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
@@ -5106,8 +5101,7 @@ def gluon_mxfp_combine(
     w_cache_cg = None
     store_layout_variant = 0
     if (
-        w_preshuffle
-        and not persistent
+        not persistent
         and block_m == 16
         and block_n == 256
         and block_k == 256
@@ -5122,8 +5116,7 @@ def gluon_mxfp_combine(
         group_m = 16
         xcd_swizzle = _CDNA4_NUM_XCDS
     elif (
-        w_preshuffle
-        and persistent
+        persistent
         and num_ctas == _CDNA4_NUM_CUS
         and block_m == 64
         and block_n == 128
@@ -5137,8 +5130,7 @@ def gluon_mxfp_combine(
         group_m = 8
         xcd_swizzle = _CDNA4_NUM_XCDS
     elif (
-        w_preshuffle
-        and persistent
+        persistent
         and num_ctas == _CDNA4_NUM_CUS
         and block_m == 128
         and block_n == 256
@@ -5150,8 +5142,7 @@ def gluon_mxfp_combine(
         xcd_swizzle = 4
         store_layout_variant = 2
     elif (
-        w_preshuffle
-        and persistent
+        persistent
         and num_ctas == _CDNA4_NUM_CUS
         and block_m == 64
         and block_n == 256
@@ -5176,8 +5167,7 @@ def gluon_mxfp_combine(
             group_m = 4
             xcd_swizzle = 4
     elif (
-        w_preshuffle
-        and persistent
+        persistent
         and num_ctas == _CDNA4_NUM_CUS
         and block_m == 32
         and block_n == 256

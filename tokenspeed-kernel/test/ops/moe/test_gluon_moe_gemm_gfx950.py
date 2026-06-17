@@ -127,6 +127,82 @@ def test_preshuffled_layout_selection_clamps_when_slicen_is_incompatible() -> No
     assert use_slice_n is False
 
 
+def test_prefill_route_overrides_promote_small_dispatch_shape() -> None:
+    block_m, block_n, use_slice_n, small, medium, large = (
+        gluon_moe._apply_prefill_route_overrides(
+            M=1024,
+            N=5760,
+            slice_size=8,
+            block_m=64,
+            block_n=128,
+            requested_block_m=None,
+            requested_block_n=None,
+            use_slice_n=None,
+            large_slice_size=128,
+            large_m=16384,
+        )
+    )
+
+    assert (block_m, block_n, use_slice_n) == (16, 256, None)
+    assert (small, medium, large) == (True, False, False)
+
+
+def test_prefill_route_overrides_force_large_dispatch_slicen() -> None:
+    block_m, block_n, use_slice_n, small, medium, large = (
+        gluon_moe._apply_prefill_route_overrides(
+            M=16384,
+            N=5760,
+            slice_size=128,
+            block_m=128,
+            block_n=256,
+            requested_block_m=None,
+            requested_block_n=None,
+            use_slice_n=None,
+            large_slice_size=128,
+            large_m=16384,
+        )
+    )
+
+    assert (block_m, block_n, use_slice_n) == (128, 256, True)
+    assert (small, medium, large) == (False, False, True)
+
+
+def test_prefill_slice_resolver_prefers_slicen_by_default() -> None:
+    use_slice_mn, use_slice_n = gluon_moe._resolve_prefill_slice_modes(
+        use_slice_mn=None,
+        use_slice_n=True,
+        block_m=128,
+        block_n=256,
+        block_k=256,
+        num_buffers=2,
+        scale_load_mode="swizzle",
+        x_format="e2m1",
+        has_x_block_scale=True,
+        has_w_block_scale=True,
+    )
+
+    assert use_slice_mn is False
+    assert use_slice_n is True
+
+
+def test_prefill_slice_resolver_honors_explicit_slicemn() -> None:
+    use_slice_mn, use_slice_n = gluon_moe._resolve_prefill_slice_modes(
+        use_slice_mn=True,
+        use_slice_n=True,
+        block_m=128,
+        block_n=256,
+        block_k=256,
+        num_buffers=2,
+        scale_load_mode="swizzle",
+        x_format="e2m1",
+        has_x_block_scale=True,
+        has_w_block_scale=True,
+    )
+
+    assert use_slice_mn is True
+    assert use_slice_n is False
+
+
 requires_gfx950 = pytest.mark.skipif(
     not (torch.cuda.is_available() and current_platform().is_cdna4),
     reason="Gluon GPT-OSS MoE GEMM kernels are gfx950 (CDNA4) only",
