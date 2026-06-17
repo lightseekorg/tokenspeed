@@ -102,6 +102,25 @@ class KVCachePool:
             dev_k0_shape = list(dev_inner.k_buffer[0].shape)
             dev_k0_stride_bytes = dev_inner.k_buffer[0].stride()[0] * dev_inner.k_buffer[0].element_size()
 
+        # Collect host & device pointer info for alignment check
+        host_k_ptrs = getattr(self.host_pool, 'k_data_ptrs', None)
+        host_v_ptrs = getattr(self.host_pool, 'v_data_ptrs', None)
+        dev_k_ptrs = getattr(dev_inner, 'k_data_ptrs', None)
+        dev_v_ptrs = getattr(dev_inner, 'v_data_ptrs', None)
+
+        def _ptr_info(ptrs, label):
+            if ptrs is None:
+                return f"{label}=None"
+            vals = ptrs.tolist()
+            aligns = [v % 4 for v in vals]
+            nulls = [i for i, v in enumerate(vals) if v == 0]
+            bad_align = [i for i, a in enumerate(aligns) if a != 0]
+            return (
+                f"{label}: count={len(vals)} "
+                f"first=0x{vals[0]:x} last=0x{vals[-1]:x} "
+                f"null_layers={nulls} bad_align_layers={bad_align}"
+            )
+
         _log.warning(
             "[DEBUG-KVStore] pre-sync OK. Starting base writeback. "
             "host_stride=%s dev_stride=%s MATCH=%s "
@@ -111,7 +130,8 @@ class KVCachePool:
             "layer_num(host=%s dev=%s) "
             "size(host=%s dev=%s) "
             "src_indices.numel=%d dst_indices.numel=%d "
-            "src_max=%s dst_max=%s",
+            "src_max=%s dst_max=%s "
+            "| %s | %s | %s | %s",
             host_stride, dev_stride_val,
             host_stride == dev_stride_val if isinstance(dev_stride_val, int) else '?',
             getattr(self.host_pool, 'head_num', '?'),
@@ -126,6 +146,10 @@ class KVCachePool:
             src_indices.numel(), dst_indices.numel(),
             src_indices.max().item() if src_indices.numel() > 0 else -1,
             dst_indices.max().item() if dst_indices.numel() > 0 else -1,
+            _ptr_info(host_k_ptrs, 'host_k'),
+            _ptr_info(host_v_ptrs, 'host_v'),
+            _ptr_info(dev_k_ptrs, 'dev_k'),
+            _ptr_info(dev_v_ptrs, 'dev_v'),
         )
 
         self.host_pool.backup_from_device_all_layer(
