@@ -94,15 +94,15 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
-    # fmt: off
-    _FLASHINFER_TRTLLM_MXFP4_MOE_TRAITS = {
-        "weight_dtype": frozenset({"mxfp4"}), "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"kernel_routing"}), "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({True}), "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}), "internal_activation_dtype": frozenset({"input"}),
-        "supports_bias": frozenset({True}),
-    }
-    # fmt: on
+    _FLASHINFER_TRTLLM_MXFP4_MOE_TRAITS = (
+        {"weight_dtype": frozenset({"mxfp4"}), "ispp_alignment": frozenset({1})}
+        | {"supports_ep": frozenset({True}), "supports_bias": frozenset({True})}
+        | {"supports_all_to_all_ep": frozenset({False})}
+        | {"activation": frozenset({"silu", "swiglu"})}
+        | {"routing_mode": frozenset({"kernel_routing"})}
+        | {"supports_deferred_finalize": frozenset({False})}
+        | {"internal_activation_dtype": frozenset({"input"})}
+    )
 
     def _get_device_permute_indices(
         x: torch.Tensor,

@@ -497,10 +497,7 @@ class TestDescribeKernel:
             name="moe_apply",
             family="moe",
             mode="apply",
-            weight_preprocessor=WeightPreprocessorRef(
-                "moe_weights",
-                required=False,
-            ),
+            weight_preprocessor=WeightPreprocessorRef("moe_weights", required=False),
         )
         reg.register(spec, dummy_impl("moe_apply"))
 

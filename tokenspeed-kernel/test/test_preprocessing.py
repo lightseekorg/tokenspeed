@@ -251,12 +251,10 @@ def test_missing_preprocessor_errors_at_resolution(h100_platform):
 
 
 def test_same_preprocessor_requests_dedupe_and_preserve_required():
-    ref = resolve_weight_preprocessor_conflict(
-        [
-            WeightPreprocessorRef("layout_a", required=False),
-            WeightPreprocessorRef("layout_a", required=True),
-        ]
-    )
+    optional_ref = WeightPreprocessorRef("layout_a", required=False)
+    required_ref = WeightPreprocessorRef("layout_a", required=True)
+
+    ref = resolve_weight_preprocessor_conflict([optional_ref, required_ref])
 
     assert ref == WeightPreprocessorRef("layout_a", required=True)
 
@@ -266,24 +264,20 @@ def test_optional_conflicting_preprocessors_warn_and_skip():
         RuntimeWarning,
         match="skipping conflicting preprocessors.*hurt performance",
     ):
-        ref = resolve_weight_preprocessor_conflict(
-            [
-                WeightPreprocessorRef("layout_a", required=False),
-                WeightPreprocessorRef("layout_b", required=False),
-            ]
-        )
+        ref_a = WeightPreprocessorRef("layout_a", required=False)
+        ref_b = WeightPreprocessorRef("layout_b", required=False)
+
+        ref = resolve_weight_preprocessor_conflict([ref_a, ref_b])
 
     assert ref is None
 
 
 def test_required_conflicting_preprocessors_error():
     with pytest.raises(WeightPreprocessorConflictError, match="Conflicting"):
-        resolve_weight_preprocessor_conflict(
-            [
-                WeightPreprocessorRef("layout_a", required=True),
-                WeightPreprocessorRef("layout_b", required=False),
-            ]
-        )
+        required_ref = WeightPreprocessorRef("layout_a", required=True)
+        optional_ref = WeightPreprocessorRef("layout_b", required=False)
+
+        resolve_weight_preprocessor_conflict([required_ref, optional_ref])
 
 
 def test_optional_preprocessor_conflicts_with_no_preprocessing_warns_and_skips():
@@ -292,10 +286,7 @@ def test_optional_preprocessor_conflicts_with_no_preprocessing_warns_and_skips()
         match="skipping conflicting preprocessors.*hurt performance",
     ):
         ref = resolve_weight_preprocessor_conflict(
-            [
-                None,
-                WeightPreprocessorRef("layout_a", required=False),
-            ]
+            [None, WeightPreprocessorRef("layout_a", required=False)]
         )
 
     assert ref is None
@@ -304,10 +295,7 @@ def test_optional_preprocessor_conflicts_with_no_preprocessing_warns_and_skips()
 def test_required_preprocessor_conflicts_with_no_preprocessing_errors():
     with pytest.raises(WeightPreprocessorConflictError, match="no-preprocessing"):
         resolve_weight_preprocessor_conflict(
-            [
-                None,
-                WeightPreprocessorRef("layout_a", required=True),
-            ]
+            [None, WeightPreprocessorRef("layout_a", required=True)]
         )
 
 

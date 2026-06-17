@@ -24,12 +24,12 @@ import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.preprocessing import (
     WeightPreprocessorRegistry,
     resolve_weight_preprocessor_ref,
 )
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 

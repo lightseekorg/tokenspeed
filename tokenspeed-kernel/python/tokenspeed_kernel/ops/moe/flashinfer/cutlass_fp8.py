@@ -37,15 +37,16 @@ next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length
 if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
 
-    # fmt: off
-    _FLASHINFER_CUTLASS_FP8_MOE_TRAITS = {
-        "weight_dtype": frozenset({"fp8"}), "activation": frozenset({"silu"}),
-        "routing_mode": frozenset({"precomputed_topk"}), "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({True}), "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}), "internal_activation_dtype": frozenset({"input"}),
-        "fp8_scale_block_shape": frozenset({(128, 128)}), "supports_bias": frozenset({False}),
-    }
-    # fmt: on
+    _FLASHINFER_CUTLASS_FP8_MOE_TRAITS = (
+        {"weight_dtype": frozenset({"fp8"}), "activation": frozenset({"silu"})}
+        | {"ispp_alignment": frozenset({1}), "supports_bias": frozenset({False})}
+        | {"supports_ep": frozenset({True})}
+        | {"supports_all_to_all_ep": frozenset({False})}
+        | {"routing_mode": frozenset({"precomputed_topk"})}
+        | {"supports_deferred_finalize": frozenset({False})}
+        | {"internal_activation_dtype": frozenset({"input"})}
+        | {"fp8_scale_block_shape": frozenset({(128, 128)})}
+    )
 
     @register_weight_preprocessor(
         "moe",

@@ -57,9 +57,9 @@ def _is_scale_swizzled_cdna4(scale: torch.Tensor) -> bool:
 
 
 def _swizzle_scales_cdna4(scale: torch.Tensor) -> torch.Tensor:
-    assert scale.dtype == torch.uint8, (
-        f"_swizzle_scales_cdna4: expected uint8 e8m0 scales, got {scale.dtype}"
-    )
+    assert (
+        scale.dtype == torch.uint8
+    ), f"_swizzle_scales_cdna4: expected uint8 e8m0 scales, got {scale.dtype}"
     if _is_scale_swizzled_cdna4(scale):
         return scale
 
@@ -74,9 +74,7 @@ def _swizzle_scales_cdna4(scale: torch.Tensor) -> torch.Tensor:
         // _ALIGN_K_SCALE_SWIZZLE
         * _ALIGN_K_SCALE_SWIZZLE
     )
-    n_padded = (
-        (n + _ALIGN_N_SWIZZLE - 1) // _ALIGN_N_SWIZZLE * _ALIGN_N_SWIZZLE
-    )
+    n_padded = (n + _ALIGN_N_SWIZZLE - 1) // _ALIGN_N_SWIZZLE * _ALIGN_N_SWIZZLE
 
     scale = scale.mT.contiguous().mT
     scale = torch.nn.functional.pad(

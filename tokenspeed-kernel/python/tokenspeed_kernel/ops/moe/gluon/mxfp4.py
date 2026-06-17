@@ -39,15 +39,15 @@ if platform.is_amd:
         preprocess_gluon_mxfp4_gfx950_moe_weights as _preprocess_impl,
     )
 
-    # fmt: off
-    _GLUON_MXFP4_MOE_TRAITS = {
-        "weight_dtype": frozenset({"mxfp4"}), "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"kernel_routing"}), "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({False}), "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}), "internal_activation_dtype": frozenset({"fp8"}),
-        "supports_bias": frozenset({True}),
-    }
-    # fmt: on
+    _GLUON_MXFP4_MOE_TRAITS = (
+        {"weight_dtype": frozenset({"mxfp4"}), "ispp_alignment": frozenset({1})}
+        | {"supports_ep": frozenset({False}), "supports_bias": frozenset({True})}
+        | {"supports_all_to_all_ep": frozenset({False})}
+        | {"activation": frozenset({"silu", "swiglu"})}
+        | {"routing_mode": frozenset({"kernel_routing"})}
+        | {"supports_deferred_finalize": frozenset({False})}
+        | {"internal_activation_dtype": frozenset({"fp8"})}
+    )
 
     @register_weight_preprocessor(
         "moe",

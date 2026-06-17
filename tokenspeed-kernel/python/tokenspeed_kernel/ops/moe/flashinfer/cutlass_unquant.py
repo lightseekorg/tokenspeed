@@ -38,15 +38,15 @@ if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
     from flashinfer.autotuner import autotune as flashinfer_autotune
 
-    # fmt: off
-    _FLASHINFER_CUTLASS_UNQUANT_MOE_TRAITS = {
-        "weight_dtype": frozenset({"unquant"}), "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"precomputed_topk"}), "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({True}), "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}), "internal_activation_dtype": frozenset({"input"}),
-        "supports_bias": frozenset({False}),
-    }
-    # fmt: on
+    _FLASHINFER_CUTLASS_UNQUANT_MOE_TRAITS = (
+        {"weight_dtype": frozenset({"unquant"}), "ispp_alignment": frozenset({1})}
+        | {"supports_ep": frozenset({True}), "supports_bias": frozenset({False})}
+        | {"supports_all_to_all_ep": frozenset({False})}
+        | {"activation": frozenset({"silu", "swiglu"})}
+        | {"routing_mode": frozenset({"precomputed_topk"})}
+        | {"supports_deferred_finalize": frozenset({False})}
+        | {"internal_activation_dtype": frozenset({"input"})}
+    )
 
     @register_weight_preprocessor(
         "moe",

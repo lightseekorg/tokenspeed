@@ -62,8 +62,8 @@ from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.preprocessing import (
-    WeightPreprocessorResolutionError,
     WeightPreprocessorRegistry,
+    WeightPreprocessorResolutionError,
     WeightPreprocessorSpec,
     resolve_weight_preprocessor_ref,
 )

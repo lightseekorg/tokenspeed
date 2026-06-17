@@ -35,8 +35,8 @@ from tokenspeed_kernel.platform import (
     InterconnectInfo,
     PlatformInfo,
 )
-from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.preprocessing import WeightPreprocessorRegistry
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     _global_overrides,
     _oracles,

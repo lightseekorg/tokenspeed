@@ -186,7 +186,9 @@ def _make_module(raw: RawMxfp4Weights) -> torch.nn.Module:
         raw.w13_scale.clone(), requires_grad=False
     )
     module.w2_weight = torch.nn.Parameter(raw.w2_weight.clone(), requires_grad=False)
-    module.w2_weight_scale = torch.nn.Parameter(raw.w2_scale.clone(), requires_grad=False)
+    module.w2_weight_scale = torch.nn.Parameter(
+        raw.w2_scale.clone(), requires_grad=False
+    )
     module.w13_weight_bias = torch.nn.Parameter(
         torch.zeros((E, 2 * INTERMEDIATE_SIZE), device="cuda", dtype=torch.float32),
         requires_grad=False,

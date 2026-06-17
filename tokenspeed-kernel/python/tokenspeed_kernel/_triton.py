@@ -30,12 +30,12 @@ import sys
 
 import tokenspeed_triton as triton
 import tokenspeed_triton.experimental.gluon.language as gl
+import tokenspeed_triton.profiler as proton
 from tokenspeed_triton import language as tl
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.language.core import _aggregate as aggregate
 from tokenspeed_triton.language.extra import libdevice
 from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
-import tokenspeed_triton.profiler as proton
 
 __all__ = [
     "aggregate",
