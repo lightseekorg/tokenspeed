@@ -130,7 +130,7 @@ if (
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
-            "sliding_window": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
@@ -152,6 +152,7 @@ if (
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
         out, lse = flash_attn_varlen_func(
             q=q,
             k=k_cache,
@@ -163,6 +164,7 @@ if (
             max_seqlen_k=max_seqlen_k,
             softmax_scale=1.0 / math.sqrt(q.shape[-1]),
             causal=is_causal,
+            window_size=window_size,
             return_lse=return_lse,
         )
         if return_lse:
@@ -184,7 +186,7 @@ if (
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
-            "sliding_window": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False}),
             "support_logit_cap": frozenset({False}),
@@ -205,6 +207,7 @@ if (
     ) -> torch.Tensor:
         batch_size = cache_seqlens.shape[0]
         q_reshaped = q.view(batch_size, max_seqlen_q, q.shape[1], q.shape[2])
+        window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
         out, _ = flash_attn_varlen_func(
             q=q_reshaped,
             k=k_cache,
@@ -215,6 +218,7 @@ if (
             max_seqlen_k=max_seqlen_k,
             softmax_scale=1.0 / math.sqrt(q.shape[-1]),
             causal=max_seqlen_q > 1,
+            window_size=window_size,
         )
         return out.view_as(q)
 
