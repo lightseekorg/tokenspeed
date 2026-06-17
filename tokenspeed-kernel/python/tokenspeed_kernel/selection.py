@@ -439,13 +439,6 @@ def spec_matches_traits(
             the spec are ignored. When ``True`` (reference compatibility checks),
             every requested trait must be explicitly present on the spec.
     """
-    # Traits the spec marks as required must be explicitly present in the
-    # request. This lets a single-variant kernel opt out of being matched by
-    # default when the discriminating trait is omitted.
-    for required_name in spec.required_traits:
-        if required_name not in traits:
-            return False
-
     for trait_name, trait_value in traits.items():
         # ispp stands for "intermediate size per partition" and has special
         # alignment requirements that depend on the kernel's declared

@@ -200,10 +200,6 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"fp8"}),
             "supports_bias": frozenset({True}),
         },
-        # fp8-only kernel: require an explicit internal_activation_dtype so it is
-        # never picked for plain mxfp4 (e.g. stock gpt-oss, which omits the
-        # trait) where it would dereference absent fp8 input scales.
-        required_traits={"internal_activation_dtype"},
         # gluon is narrowly gated to gfx950
         priority=Priority.SPECIALIZED,
     )
