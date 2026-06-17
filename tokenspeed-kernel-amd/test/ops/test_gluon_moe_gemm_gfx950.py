@@ -48,8 +48,8 @@ W2_ACT_SCALE = 0.125
 WEIGHT_NIBBLES = (0, 1, 2, 9, 10)
 # E8M0 block scales centered around a useful non-unit exponent.
 WEIGHT_SCALE_EXPONENTS = (123, 124, 125)
-GEMM_ATOL = 2.0
-GEMM_RTOL = 5e-2
+GEMM_ATOL = 0.05
+GEMM_RTOL = 0.01
 
 KEY_NUM_TOKEN_VALUES = (1, 2, 16, 17, 64)
 KEY_NUM_TOKENS = [
