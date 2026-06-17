@@ -387,7 +387,7 @@ def get_mfma_layout(
     # unswizzle view absorbs one 2x2 MFMA block per warp per K-iter).
     # AITER's M=16 W4A8 Triton kernel uses tpw=[1,2]; keep it env-gated
     # because other Gluon scale-preshuffle kernels historically expect [2,2].
-    if scale_preshuffle and block_m <= 16 and _PREFILL_STAGE1_TPW12:
+    if scale_preshuffle and block_m <= 16:
         tiles_per_warp = [1, 2]
     else:
         tiles_per_warp = [2, 2] if scale_preshuffle else [1, 1]
@@ -1457,7 +1457,9 @@ class MoEPipelinedProgram:
         for iter_base in range(0, main_iters, cfg.NUM_BUFFERS):
             for slot in gl.static_range(cfg.NUM_BUFFERS):
                 if iter_base + slot < main_iters:
-                    LOAD_SLOT: gl.constexpr = (slot + cfg.NUM_BUFFERS - 1) % cfg.NUM_BUFFERS
+                    LOAD_SLOT: gl.constexpr = (
+                        slot + cfg.NUM_BUFFERS - 1
+                    ) % cfg.NUM_BUFFERS
                     with gl.amd.warp_pipeline_stage("lds+tdm", priority=1):
                         x, w, scale_x, scale_w = self.issue_local_loads_slot(
                             mfma_idx, slot
@@ -1468,9 +1470,7 @@ class MoEPipelinedProgram:
                     self.async_wait(cfg.NUM_BUFFERS - 2)
 
                     with gl.amd.warp_pipeline_stage("mfma", priority=0):
-                        accumulator = self.mfma(
-                            x, scale_x, w, scale_w, accumulator
-                        )
+                        accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
         self.async_wait(0)
         for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
@@ -3124,7 +3124,6 @@ def _group_m_swizzle(
     return pid_m, pid_n
 
 
-
 @gluon.jit
 def _prefill_m16_stage1_direct_kernel(
     X,
@@ -3161,20 +3160,11 @@ def _prefill_m16_stage1_direct_kernel(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    LOCAL_STAGE: gl.constexpr,
-    UNMASK_FULL: gl.constexpr,
-    USE_CG: gl.constexpr,
-    USE_CG_SCALE: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
 ):
-    """AITER-style direct-load grouped stage1 for M<=16 prefill/general path.
-
-    LOCAL_STAGE=1 attempts Triton-like TTGIR:
-        buffer_load(blocked layout) -> local_alloc/local_load -> dot layout.
-    LOCAL_STAGE=0 keeps the direct-to-dot-layout buffer_load variant.
-    """
+    """AITER-style direct-load grouped stage1 for the M=16 path."""
     pid_raw = gl.program_id(axis=0)
     grid_n: gl.constexpr = GRID_N
     if XCD_SWIZZLE > 1:
@@ -3230,25 +3220,17 @@ def _prefill_m16_stage1_direct_kernel(
     )
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
-    gl.static_assert(BLOCK_K_SCALE == 8, "split-friendly WScale offset assumes BLOCK_K=256")
+    gl.static_assert(BLOCK_K_SCALE == 8, "M=16 direct WScale path assumes BLOCK_K=256")
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
 
     X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
     W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
-    LOAD_X_LAYOUT: gl.constexpr = _load_layout(
-        BLOCK_K, BLOCK_M, 4, [1, 0], X_ELEM_BITS
-    )
+    LOAD_X_LAYOUT: gl.constexpr = _load_layout(BLOCK_K, BLOCK_M, 4, [1, 0], X_ELEM_BITS)
     LOAD_W_LAYOUT: gl.constexpr = _load_layout(
         BLOCK_K_PACKED, BLOCK_N, 4, [0, 1], W_ELEM_BITS
     )
-    # Match Triton/AITER local_alloc layouts for BLOCK_M=16, BLOCK_N=128,
-    # BLOCK_K=256. X load tensor is [M,K], W load tensor is [K_packed,N].
-    DIRECT_SHARED_X: gl.constexpr = gl.SwizzledSharedLayout(
-        16, 1, 16, order=[1, 0]
-    )
-    DIRECT_SHARED_W: gl.constexpr = gl.SwizzledSharedLayout(
-        16, 2, 8, order=[0, 1]
-    )
+    DIRECT_SHARED_X: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 16, order=[1, 0])
+    DIRECT_SHARED_W: gl.constexpr = gl.SwizzledSharedLayout(16, 2, 8, order=[0, 1])
 
     m_base = gl.load(SliceOffs + expert).to(gl.int32)
     m_size = gl.load(SliceSizes + expert).to(gl.int32)
@@ -3256,66 +3238,23 @@ def _prefill_m16_stage1_direct_kernel(
     gl.assume(m_size > 0)
     off_m = m_base + block_in_expert * BLOCK_M
     gl.assume(off_m >= 0)
-    m_limit = m_base + m_size
     off_n = pid_n * BLOCK_N
     gl.assume(off_n >= 0)
 
-    # Dot-layout coordinates for the direct-to-dot path and scale/epilogue.
-    am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))[:, None]
-    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, cfg.dot_layout_x))[None, :]
-    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, cfg.dot_layout_w))[:, None]
-    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.dot_layout_w))[None, :]
-    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, cfg.layout_w_scale))[:, None]
-    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, cfg.layout_w_scale))[None, :]
-
-    # Blocked-load coordinates for the Triton-like local_alloc/local_load path.
-    lm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     lk = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
     lwk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))[:, None]
     lwn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))[None, :]
 
-    sorted_m = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
-    in_sorted = sorted_m < m_limit
-    if UNMASK_FULL:
-        # AITER-style safe padded rows: wrap within this expert's slice for
-        # loads, and rely on the final local-row store mask to discard padded rows.
-        local_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
-        local_m = gl.max_contiguous(gl.multiple_of(local_m % m_size, BLOCK_M), BLOCK_M)
-        token_m = gl.amd.cdna4.buffer_load(
-            ptr=Gather, offsets=(m_base + local_m).to(gl.int32)
-        ).to(gl.int32)
-        valid_m = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, cfg.dot_layout_x))
-        token_m_addr = token_m.to(gl.uint32)
-    else:
-        sorted_safe = gl.where(in_sorted, sorted_m, gl.zeros_like(sorted_m))
-        token_m = gl.amd.cdna4.buffer_load(
-            ptr=Gather, offsets=sorted_safe.to(gl.int32), mask=in_sorted, other=0
-        ).to(gl.int32)
-        valid_m = in_sorted & (token_m < M_X)
-        token_m_addr = token_m.to(gl.uint32)
+    local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+    local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
+    token_m_l = gl.amd.cdna4.buffer_load(
+        ptr=Gather, offsets=(m_base + local_m_l).to(gl.int32)
+    ).to(gl.int32)
+    token_m_l_addr = token_m_l.to(gl.uint32)
 
-    if LOCAL_STAGE:
-        sorted_m_l = off_m + lm
-        in_sorted_l = sorted_m_l < m_limit
-        if UNMASK_FULL:
-            local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-            local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
-            token_m_l = gl.amd.cdna4.buffer_load(
-                ptr=Gather, offsets=(m_base + local_m_l).to(gl.int32)
-            ).to(gl.int32)
-            valid_m_l = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-            token_m_l_addr = token_m_l.to(gl.uint32)
-        else:
-            sorted_safe_l = gl.where(in_sorted_l, sorted_m_l, gl.zeros_like(sorted_m_l))
-            token_m_l = gl.amd.cdna4.buffer_load(
-                ptr=Gather, offsets=sorted_safe_l.to(gl.int32), mask=in_sorted_l, other=0
-            ).to(gl.int32)
-            valid_m_l = in_sorted_l & (token_m_l < M_X)
-            token_m_l_addr = token_m_l.to(gl.uint32)
-
-    n_cols = off_n + bn
-    n_cols_s = off_n + bsn
-    a_scale = gl.full((BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=cfg.layout_x_scale)
+    a_scale = gl.full(
+        (BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=cfg.layout_x_scale
+    )
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
 
     total_kt = gl.cdiv(K, BLOCK_K)
@@ -3325,222 +3264,116 @@ def _prefill_m16_stage1_direct_kernel(
     for kt in range(0, num_full):
         gl.assume(kt >= 0)
         s = _load_w_scale_tile_direct_cdna4(
-            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
+            WScale, expert, kt, off_n, stride_wse, stride_wsk, stride_wsn, cfg
         )
-        if LOCAL_STAGE:
-            k_elem_l = kt * BLOCK_K + lk
-            k_pack_l = kt * BLOCK_K_PACKED + lwk
-            n_cols_l = off_n + lwn
-            x_off_l = (
-                gl.expand_dims(token_m_l_addr, 1).to(gl.int64) * stride_xm
-                + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
-            )
-            w_off_l = (
-                expert.to(gl.int64) * stride_we
-                + k_pack_l.to(gl.int64) * stride_wk
-                + n_cols_l.to(gl.int64) * stride_wn
-            )
-            if UNMASK_FULL:
-                a_l = gl.amd.cdna4.buffer_load(
-                    ptr=X, offsets=x_off_l.to(gl.int32)
-                )
-                if USE_CG:
-                    b_l = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off_l.to(gl.int32), cache=".cg")
-                else:
-                    b_l = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off_l.to(gl.int32))
-            else:
-                a_l = gl.amd.cdna4.buffer_load(
-                    ptr=X,
-                    offsets=x_off_l.to(gl.int32),
-                    mask=gl.expand_dims(valid_m_l, 1),
-                    other=0.0,
-                )
-                if USE_CG:
-                    b_l = gl.amd.cdna4.buffer_load(
-                        ptr=W,
-                        offsets=w_off_l.to(gl.int32),
-                        mask=n_cols_l < N,
-                        other=0,
-                        cache=".cg",
-                    )
-                else:
-                    b_l = gl.amd.cdna4.buffer_load(
-                        ptr=W,
-                        offsets=w_off_l.to(gl.int32),
-                        mask=n_cols_l < N,
-                        other=0,
-                    )
-            a_smem = gl.allocate_shared_memory(
-                X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
-            )
-            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
-            b_smem = gl.allocate_shared_memory(
-                W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
-            )
-            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
-        else:
-            k_elem = kt * BLOCK_K + ak
-            k_pack = kt * BLOCK_K_PACKED + bk
-            x_off = token_m_addr[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
-            w_off = (
-                expert.to(gl.int64) * stride_we
-                + n_cols.to(gl.int64) * stride_wn
-                + k_pack.to(gl.int64) * stride_wk
-            )
-            if UNMASK_FULL:
-                a = gl.amd.cdna4.buffer_load(
-                    ptr=X, offsets=x_off.to(gl.int32)
-                )
-                if USE_CG:
-                    b = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off.to(gl.int32), cache=".cg")
-                else:
-                    b = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off.to(gl.int32))
-            else:
-                a = gl.amd.cdna4.buffer_load(
-                    ptr=X,
-                    offsets=x_off.to(gl.int32),
-                    mask=valid_m[:, None],
-                    other=0.0,
-                )
-                if USE_CG:
-                    b = gl.amd.cdna4.buffer_load(
-                        ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0, cache=".cg"
-                    )
-                else:
-                    b = gl.amd.cdna4.buffer_load(
-                        ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0
-                    )
+        k_elem_l = kt * BLOCK_K + lk
+        k_pack_l = kt * BLOCK_K_PACKED + lwk
+        n_cols_l = off_n + lwn
+        x_off_l = (
+            gl.expand_dims(token_m_l_addr, 1).to(gl.int64) * stride_xm
+            + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+        )
+        w_off_l = (
+            expert.to(gl.int64) * stride_we
+            + k_pack_l.to(gl.int64) * stride_wk
+            + n_cols_l.to(gl.int64) * stride_wn
+        )
+        a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32))
+        b_l = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off_l.to(gl.int32))
+        a_smem = gl.allocate_shared_memory(
+            X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
+        )
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+        b_smem = gl.allocate_shared_memory(
+            W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
+        )
+        b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
         acc = gl.amd.cdna4.mfma_scaled(
-            a=a, a_scale=a_scale, a_format="e4m3",
-            b=b, b_scale=s, b_format="e2m1", acc=acc,
+            a=a,
+            a_scale=a_scale,
+            a_format="e4m3",
+            b=b,
+            b_scale=s,
+            b_format="e2m1",
+            acc=acc,
         )
 
     if total_kt > num_full:
         kt = num_full
         gl.assume(kt >= 0)
         s = _load_w_scale_tile_direct_cdna4(
-            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
+            WScale, expert, kt, off_n, stride_wse, stride_wsk, stride_wsn, cfg
         )
-        if LOCAL_STAGE:
-            k_elem_l = kt * BLOCK_K + lk
-            k_pack_l = kt * BLOCK_K_PACKED + lwk
-            n_cols_l = off_n + lwn
-            x_off_l = (
-                gl.expand_dims(token_m_l_addr, 1).to(gl.int64) * stride_xm
-                + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
-            )
-            w_off_l = (
-                expert.to(gl.int64) * stride_we
-                + k_pack_l.to(gl.int64) * stride_wk
-                + n_cols_l.to(gl.int64) * stride_wn
-            )
-            a_l = gl.amd.cdna4.buffer_load(
-                ptr=X,
-                offsets=x_off_l.to(gl.int32),
-                mask=gl.expand_dims(valid_m_l, 1) & (gl.expand_dims(k_elem_l, 0) < K),
-                other=0.0,
-            )
-            if USE_CG:
-                b_l = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off_l.to(gl.int32),
-                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
-                    other=0,
-                    cache=".cg",
-                )
-            else:
-                b_l = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off_l.to(gl.int32),
-                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
-                    other=0,
-                )
-            a_smem = gl.allocate_shared_memory(
-                X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
-            )
-            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
-            b_smem = gl.allocate_shared_memory(
-                W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
-            )
-            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
-        else:
-            k_elem = kt * BLOCK_K + ak
-            k_pack = kt * BLOCK_K_PACKED + bk
-            x_off = token_m_addr[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
-            w_off = (
-                expert.to(gl.int64) * stride_we
-                + n_cols.to(gl.int64) * stride_wn
-                + k_pack.to(gl.int64) * stride_wk
-            )
-            a = gl.amd.cdna4.buffer_load(
-                ptr=X,
-                offsets=x_off.to(gl.int32),
-                mask=valid_m[:, None] & (k_elem < K),
-                other=0.0,
-            )
-            if USE_CG:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off.to(gl.int32),
-                    mask=(n_cols < N) & (k_pack < (K // 2)),
-                    other=0,
-                    cache=".cg",
-                )
-            else:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off.to(gl.int32),
-                    mask=(n_cols < N) & (k_pack < (K // 2)),
-                    other=0,
-                )
+        k_elem_l = kt * BLOCK_K + lk
+        k_pack_l = kt * BLOCK_K_PACKED + lwk
+        n_cols_l = off_n + lwn
+        x_off_l = (
+            gl.expand_dims(token_m_l_addr, 1).to(gl.int64) * stride_xm
+            + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+        )
+        w_off_l = (
+            expert.to(gl.int64) * stride_we
+            + k_pack_l.to(gl.int64) * stride_wk
+            + n_cols_l.to(gl.int64) * stride_wn
+        )
+        a_l = gl.amd.cdna4.buffer_load(
+            ptr=X,
+            offsets=x_off_l.to(gl.int32),
+            mask=gl.expand_dims(k_elem_l, 0) < K,
+            other=0.0,
+        )
+        b_l = gl.amd.cdna4.buffer_load(
+            ptr=W,
+            offsets=w_off_l.to(gl.int32),
+            mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
+            other=0,
+        )
+        a_smem = gl.allocate_shared_memory(
+            X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
+        )
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+        b_smem = gl.allocate_shared_memory(
+            W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
+        )
+        b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
         acc = gl.amd.cdna4.mfma_scaled(
-            a=a, a_scale=a_scale, a_format="e4m3",
-            b=b, b_scale=s, b_format="e2m1", acc=acc,
+            a=a,
+            a_scale=a_scale,
+            a_format="e4m3",
+            b=b,
+            b_scale=s,
+            b_format="e2m1",
+            acc=acc,
         )
 
     acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
     if HAS_BIAS:
         bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
-        if UNMASK_FULL:
-            bias = gl.load(bias_ptr + expert.to(gl.int64) * N + bias_n).to(gl.float32)
-            bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
-            acc = acc + bias[None, :]
-        else:
-            acc = _add_expert_bias(
-                acc,
-                bias_ptr + expert.to(gl.int64) * N,
-                bias_n,
-                bias_n < N,
-                cfg.acc_layout,
-            )
+        bias = gl.load(bias_ptr + expert.to(gl.int64) * N + bias_n).to(gl.float32)
+        bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
+        acc = acc + bias[None, :]
 
     out = _swiglu_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout)
     out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
     out = (out * out_inv_scale).to(Y.dtype.element_ty)
     STORE_LAYOUT: gl.constexpr = out.type.layout
     sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
-    n_out = pid_n * OUT_BLOCK_N + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
-    if UNMASK_FULL:
-        local_store_m = block_in_expert * BLOCK_M + sm
-        sorted_store = m_base + local_store_m
-        valid_store = local_store_m < m_size
-        y_off = sorted_store[:, None].to(gl.int64) * stride_ym + n_out[None, :].to(gl.int64) * stride_yn
-        gl.amd.cdna4.buffer_store(
-            out,
-            Y,
-            y_off.to(gl.int32),
-            mask=valid_store[:, None],
-        )
-    else:
-        sorted_store = off_m + sm
-        valid_store = sorted_store < m_limit
-        y_off = sorted_store[:, None].to(gl.int64) * stride_ym + n_out[None, :].to(gl.int64) * stride_yn
-        gl.amd.cdna4.buffer_store(
-            out,
-            Y,
-            y_off.to(gl.int32),
-            mask=valid_store[:, None] & (n_out[None, :] < (N // 2)),
-        )
+    n_out = pid_n * OUT_BLOCK_N + gl.arange(
+        0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT)
+    )
+    local_store_m = block_in_expert * BLOCK_M + sm
+    sorted_store = m_base + local_store_m
+    valid_store = local_store_m < m_size
+    y_off = (
+        sorted_store[:, None].to(gl.int64) * stride_ym
+        + n_out[None, :].to(gl.int64) * stride_yn
+    )
+    gl.amd.cdna4.buffer_store(
+        out,
+        Y,
+        y_off.to(gl.int32),
+        mask=valid_store[:, None],
+    )
 
 
 @gluon.jit
@@ -3578,18 +3411,9 @@ def _prefill_m16_stage2_direct_kernel(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    LOCAL_STAGE: gl.constexpr,
-    UNMASK_FULL: gl.constexpr,
-    USE_CG: gl.constexpr,
-    USE_CG_SCALE: gl.constexpr,
-    SORTED_OUT: gl.constexpr,
     HAS_BIAS: gl.constexpr,
 ):
-    """AITER-style direct-load grouped stage2/combine for M<=16 prefill path.
-
-    Computes sorted routed rows for one expert block and scatters weighted bf16
-    partials to Y[scatter_idx[row], n]. Host wrapper then sums TOPK rows.
-    """
+    """AITER-style direct-load grouped stage2/combine for the M=16 path."""
     pid_raw = gl.program_id(axis=0)
     grid_n: gl.constexpr = GRID_N
     if XCD_SWIZZLE > 1:
@@ -3644,22 +3468,16 @@ def _prefill_m16_stage2_direct_kernel(
     )
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
-    gl.static_assert(BLOCK_K_SCALE == 8, "split-friendly WScale offset assumes BLOCK_K=256")
+    gl.static_assert(BLOCK_K_SCALE == 8, "M=16 direct WScale path assumes BLOCK_K=256")
 
     X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
     W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
-    LOAD_X_LAYOUT: gl.constexpr = _load_layout(
-        BLOCK_K, BLOCK_M, 4, [1, 0], X_ELEM_BITS
-    )
+    LOAD_X_LAYOUT: gl.constexpr = _load_layout(BLOCK_K, BLOCK_M, 4, [1, 0], X_ELEM_BITS)
     LOAD_W_LAYOUT: gl.constexpr = _load_layout(
         BLOCK_K_PACKED, BLOCK_N, 4, [0, 1], W_ELEM_BITS
     )
-    DIRECT_SHARED_X: gl.constexpr = gl.SwizzledSharedLayout(
-        16, 1, 16, order=[1, 0]
-    )
-    DIRECT_SHARED_W: gl.constexpr = gl.SwizzledSharedLayout(
-        16, 2, 8, order=[0, 1]
-    )
+    DIRECT_SHARED_X: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 16, order=[1, 0])
+    DIRECT_SHARED_W: gl.constexpr = gl.SwizzledSharedLayout(16, 2, 8, order=[0, 1])
 
     m_base = gl.load(SliceOffs + expert).to(gl.int32)
     m_size = gl.load(SliceSizes + expert).to(gl.int32)
@@ -3668,44 +3486,18 @@ def _prefill_m16_stage2_direct_kernel(
     off_n = pid_n * BLOCK_N
     gl.assume(off_n >= 0)
 
-    am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))[:, None]
-    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, cfg.dot_layout_x))[None, :]
-    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, cfg.dot_layout_w))[:, None]
-    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.dot_layout_w))[None, :]
-    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, cfg.layout_w_scale))[:, None]
-    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, cfg.layout_w_scale))[None, :]
-
     lm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     lk = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
     lwk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))[:, None]
     lwn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))[None, :]
 
-    if UNMASK_FULL:
-        local_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
-        local_m = gl.max_contiguous(gl.multiple_of(local_m % m_size, BLOCK_M), BLOCK_M)
-        row_m = m_base + local_m
-        valid_m = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, cfg.dot_layout_x))
-    else:
-        local_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))
-        row_m = m_base + block_in_expert * BLOCK_M + local_m
-        valid_m = row_m < (m_base + m_size)
-        row_m = gl.where(valid_m, row_m, m_base)
+    local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+    local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
+    row_m_l = m_base + local_m_l
 
-    if LOCAL_STAGE:
-        if UNMASK_FULL:
-            local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-            local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
-            row_m_l = m_base + local_m_l
-            valid_m_l = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-        else:
-            local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-            row_m_l = m_base + block_in_expert * BLOCK_M + local_m_l
-            valid_m_l = row_m_l < (m_base + m_size)
-            row_m_l = gl.where(valid_m_l, row_m_l, m_base)
-
-    n_cols = off_n + bn
-    n_cols_s = off_n + bsn
-    a_scale = gl.full((BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=cfg.layout_x_scale)
+    a_scale = gl.full(
+        (BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=cfg.layout_x_scale
+    )
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
 
     total_kt = gl.cdiv(K, BLOCK_K)
@@ -3715,193 +3507,121 @@ def _prefill_m16_stage2_direct_kernel(
     for kt in range(0, num_full):
         gl.assume(kt >= 0)
         s = _load_w_scale_tile_direct_cdna4(
-            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
+            WScale, expert, kt, off_n, stride_wse, stride_wsk, stride_wsn, cfg
         )
-        if LOCAL_STAGE:
-            k_elem_l = kt * BLOCK_K + lk
-            k_pack_l = kt * BLOCK_K_PACKED + lwk
-            n_cols_l = off_n + lwn
-            x_off_l = (
-                gl.expand_dims(row_m_l, 1).to(gl.int64) * stride_xm
-                + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
-            )
-            w_off_l = (
-                expert.to(gl.int64) * stride_we
-                + k_pack_l.to(gl.int64) * stride_wk
-                + n_cols_l.to(gl.int64) * stride_wn
-            )
-            if UNMASK_FULL:
-                a_l = gl.amd.cdna4.buffer_load(
-                    ptr=X, offsets=x_off_l.to(gl.int32)
-                )
-            else:
-                a_l = gl.amd.cdna4.buffer_load(
-                    ptr=X,
-                    offsets=x_off_l.to(gl.int32),
-                    mask=gl.expand_dims(valid_m_l, 1),
-                    other=0.0,
-                )
-            if USE_CG:
-                b_l = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off_l.to(gl.int32),
-                    mask=n_cols_l < N,
-                    other=0,
-                    cache=".cg",
-                )
-            else:
-                b_l = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off_l.to(gl.int32),
-                    mask=n_cols_l < N,
-                    other=0,
-                )
-            a_smem = gl.allocate_shared_memory(X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l)
-            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
-            b_smem = gl.allocate_shared_memory(W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l)
-            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
-        else:
-            k_elem = kt * BLOCK_K + ak
-            k_pack = kt * BLOCK_K_PACKED + bk
-            x_off = row_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
-            w_off = expert.to(gl.int64) * stride_we + n_cols.to(gl.int64) * stride_wn + k_pack.to(gl.int64) * stride_wk
-            if UNMASK_FULL:
-                a = gl.amd.cdna4.buffer_load(
-                    ptr=X, offsets=x_off.to(gl.int32)
-                )
-            else:
-                a = gl.amd.cdna4.buffer_load(
-                    ptr=X,
-                    offsets=x_off.to(gl.int32),
-                    mask=valid_m[:, None],
-                    other=0.0,
-                )
-            if USE_CG:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0, cache=".cg"
-                )
-            else:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=W, offsets=w_off.to(gl.int32), mask=n_cols < N, other=0
-                )
-        acc = gl.amd.cdna4.mfma_scaled(a=a, a_scale=a_scale, a_format="e4m3", b=b, b_scale=s, b_format="e2m1", acc=acc)
+        k_elem_l = kt * BLOCK_K + lk
+        k_pack_l = kt * BLOCK_K_PACKED + lwk
+        n_cols_l = off_n + lwn
+        x_off_l = (
+            gl.expand_dims(row_m_l, 1).to(gl.int64) * stride_xm
+            + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+        )
+        w_off_l = (
+            expert.to(gl.int64) * stride_we
+            + k_pack_l.to(gl.int64) * stride_wk
+            + n_cols_l.to(gl.int64) * stride_wn
+        )
+        a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32))
+        b_l = gl.amd.cdna4.buffer_load(
+            ptr=W,
+            offsets=w_off_l.to(gl.int32),
+            mask=n_cols_l < N,
+            other=0,
+        )
+        a_smem = gl.allocate_shared_memory(
+            X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
+        )
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+        b_smem = gl.allocate_shared_memory(
+            W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
+        )
+        b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
+        acc = gl.amd.cdna4.mfma_scaled(
+            a=a,
+            a_scale=a_scale,
+            a_format="e4m3",
+            b=b,
+            b_scale=s,
+            b_format="e2m1",
+            acc=acc,
+        )
 
     if total_kt > num_full:
         kt = num_full
         gl.assume(kt >= 0)
         s = _load_w_scale_tile_direct_cdna4(
-            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
+            WScale, expert, kt, off_n, stride_wse, stride_wsk, stride_wsn, cfg
         )
-        if LOCAL_STAGE:
-            k_elem_l = kt * BLOCK_K + lk
-            k_pack_l = kt * BLOCK_K_PACKED + lwk
-            n_cols_l = off_n + lwn
-            x_off_l = gl.expand_dims(row_m_l, 1).to(gl.int64) * stride_xm + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
-            w_off_l = expert.to(gl.int64) * stride_we + k_pack_l.to(gl.int64) * stride_wk + n_cols_l.to(gl.int64) * stride_wn
-            a_l = gl.amd.cdna4.buffer_load(
-                ptr=X,
-                offsets=x_off_l.to(gl.int32),
-                mask=gl.expand_dims(valid_m_l, 1) & (gl.expand_dims(k_elem_l, 0) < K),
-                other=0.0,
-            )
-            if USE_CG:
-                b_l = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off_l.to(gl.int32),
-                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
-                    other=0,
-                    cache=".cg",
-                )
-            else:
-                b_l = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off_l.to(gl.int32),
-                    mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
-                    other=0,
-                )
-            a_smem = gl.allocate_shared_memory(X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l)
-            a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
-            b_smem = gl.allocate_shared_memory(W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l)
-            b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
-        else:
-            k_elem = kt * BLOCK_K + ak
-            k_pack = kt * BLOCK_K_PACKED + bk
-            x_off = row_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
-            w_off = expert.to(gl.int64) * stride_we + n_cols.to(gl.int64) * stride_wn + k_pack.to(gl.int64) * stride_wk
-            a = gl.amd.cdna4.buffer_load(
-                ptr=X,
-                offsets=x_off.to(gl.int32),
-                mask=valid_m[:, None] & (k_elem < K),
-                other=0.0,
-            )
-            if USE_CG:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off.to(gl.int32),
-                    mask=(n_cols < N) & (k_pack < (K // 2)),
-                    other=0,
-                    cache=".cg",
-                )
-            else:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=W,
-                    offsets=w_off.to(gl.int32),
-                    mask=(n_cols < N) & (k_pack < (K // 2)),
-                    other=0,
-                )
-        acc = gl.amd.cdna4.mfma_scaled(a=a, a_scale=a_scale, a_format="e4m3", b=b, b_scale=s, b_format="e2m1", acc=acc)
+        k_elem_l = kt * BLOCK_K + lk
+        k_pack_l = kt * BLOCK_K_PACKED + lwk
+        n_cols_l = off_n + lwn
+        x_off_l = (
+            gl.expand_dims(row_m_l, 1).to(gl.int64) * stride_xm
+            + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+        )
+        w_off_l = (
+            expert.to(gl.int64) * stride_we
+            + k_pack_l.to(gl.int64) * stride_wk
+            + n_cols_l.to(gl.int64) * stride_wn
+        )
+        a_l = gl.amd.cdna4.buffer_load(
+            ptr=X,
+            offsets=x_off_l.to(gl.int32),
+            mask=gl.expand_dims(k_elem_l, 0) < K,
+            other=0.0,
+        )
+        b_l = gl.amd.cdna4.buffer_load(
+            ptr=W,
+            offsets=w_off_l.to(gl.int32),
+            mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
+            other=0,
+        )
+        a_smem = gl.allocate_shared_memory(
+            X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
+        )
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+        b_smem = gl.allocate_shared_memory(
+            W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
+        )
+        b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
+        acc = gl.amd.cdna4.mfma_scaled(
+            a=a,
+            a_scale=a_scale,
+            a_format="e4m3",
+            b=b,
+            b_scale=s,
+            b_format="e2m1",
+            acc=acc,
+        )
 
     acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
     if HAS_BIAS:
         bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
-        if UNMASK_FULL:
-            bias = gl.load(bias_ptr + expert.to(gl.int64) * N + bias_n, mask=bias_n < N, other=0.0).to(gl.float32)
-            bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
-            acc = acc + bias[None, :]
-        else:
-            acc = _add_expert_bias(acc, bias_ptr + expert.to(gl.int64) * N, bias_n, bias_n < N, cfg.acc_layout)
+        bias = gl.load(
+            bias_ptr + expert.to(gl.int64) * N + bias_n, mask=bias_n < N, other=0.0
+        ).to(gl.float32)
+        bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
+        acc = acc + bias[None, :]
 
     out = acc.to(Y.dtype.element_ty)
     STORE_LAYOUT: gl.constexpr = out.type.layout
     sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
     n_out = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
-    if SORTED_OUT:
-        local_store_m = block_in_expert * BLOCK_M + sm
-        sorted_store = m_base + local_store_m
-        valid_store = local_store_m < m_size
-        gate = gl.load(Gate + sorted_store, mask=valid_store, other=0.0).to(Y.dtype.element_ty)
-        out = out * gate[:, None]
-        gl.store(
-            Y
-            + sorted_store[:, None].to(gl.int64) * stride_ym
-            + n_out[None, :].to(gl.int64) * stride_yn,
-            out,
-            mask=valid_store[:, None] & (n_out[None, :] < N),
-        )
-    elif UNMASK_FULL:
-        local_store_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
-        local_store_m = gl.max_contiguous(
-            gl.multiple_of(local_store_m % m_size, BLOCK_M), BLOCK_M
-        )
-        sorted_store = m_base + local_store_m
-        scatter_row = gl.load(Scatter + sorted_store).to(gl.int32)
-        gate = gl.load(Gate + sorted_store).to(Y.dtype.element_ty)
-        out = out * gate[:, None]
-        gl.store(
-            Y
-            + scatter_row[:, None].to(gl.int64) * stride_ym
-            + n_out[None, :].to(gl.int64) * stride_yn,
-            out,
-            mask=n_out[None, :] < N,
-        )
-    else:
-        local_store_m = block_in_expert * BLOCK_M + sm
-        sorted_store = m_base + local_store_m
-        valid_store = local_store_m < m_size
-        scatter_row = gl.load(Scatter + sorted_store, mask=valid_store, other=0).to(gl.int32)
-        gate = gl.load(Gate + sorted_store, mask=valid_store, other=0.0).to(Y.dtype.element_ty)
-        out = out * gate[:, None]
-        gl.store(Y + scatter_row[:, None].to(gl.int64) * stride_ym + n_out[None, :].to(gl.int64) * stride_yn, out, mask=valid_store[:, None] & (n_out[None, :] < N))
+    local_store_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
+    local_store_m = gl.max_contiguous(
+        gl.multiple_of(local_store_m % m_size, BLOCK_M), BLOCK_M
+    )
+    sorted_store = m_base + local_store_m
+    scatter_row = gl.load(Scatter + sorted_store).to(gl.int32)
+    gate = gl.load(Gate + sorted_store).to(Y.dtype.element_ty)
+    out = out * gate[:, None]
+    gl.store(
+        Y
+        + scatter_row[:, None].to(gl.int64) * stride_ym
+        + n_out[None, :].to(gl.int64) * stride_yn,
+        out,
+        mask=n_out[None, :] < N,
+    )
 
 
 @gluon.jit
@@ -3937,39 +3657,6 @@ def _prefill_m16_topk_reduce_kernel(
     gl.store(
         Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
         acc.to(Out.dtype.element_ty),
-        mask=bound,
-    )
-
-
-@gluon.jit
-def _prefill_m16_scatter_sorted_kernel(
-    Sorted,
-    Scatter,
-    Out,
-    G,
-    N,
-    stride_sm,
-    stride_sn,
-    stride_om,
-    stride_on,
-    BLOCK_N: gl.constexpr,
-):
-    pid = gl.program_id(axis=0)
-    num_n = gl.cdiv(N, BLOCK_N)
-    row = pid // num_n
-    pid_n = pid % num_n
-    LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
-    n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
-    bound = (row < G) & (n < N)
-    dst = gl.load(Scatter + row, mask=row < G, other=0).to(gl.int32)
-    vals = gl.load(
-        Sorted + row.to(gl.int64) * stride_sm + n.to(gl.int64) * stride_sn,
-        mask=bound,
-        other=0.0,
-    )
-    gl.store(
-        Out + dst.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
-        vals,
         mask=bound,
     )
 
@@ -4745,9 +4432,8 @@ def _autotune_block(
     del ragged
     is_fp8 = x_format == "e4m3"
     if slice_size is not None and slice_size <= 16:
-        # Tiny ragged decode. Default keeps the prior generic-prefill choice;
-        # TS_PREFILL_BM16=1 enables the AITER-comparison experiment.
-        bm, bn, bk, nw = (16, 128, 256, 4) if _PREFILL_BM16 else (64, 128, 256, 4)
+        # Tiny ragged decode: use the specialized M=16 direct tile.
+        bm, bn, bk, nw = 16, 128, 256, 4
     elif slice_size is not None and slice_size <= 64 and M <= 8192:
         # mid ragged decode
         bm, bn, bk, nw = 64, 128, 256, 4
@@ -5018,8 +4704,7 @@ def gluon_mxfp_dispatch_swiglu(
     y = torch.empty((M, N // 2), device=x.device, dtype=y_dtype)
 
     if (
-        _PREFILL_STAGE1_DIRECT
-        and a_ragged_metadata is not None
+        a_ragged_metadata is not None
         and gather_indx is not None
         and out_quant_scale is not None
         and x_format == "e4m3"
@@ -5035,43 +4720,70 @@ def gluon_mxfp_dispatch_swiglu(
         w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
         w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
         stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, scale_load_mode)
-        gather_buf = gather_indx.src_indx if hasattr(gather_indx, "src_indx") else gather_indx
+        gather_buf = (
+            gather_indx.src_indx if hasattr(gather_indx, "src_indx") else gather_indx
+        )
         block_offs_buf = _as_int32(_ragged_block_offs(a_ragged_metadata, block_m))
-        block_schedule_buf = _as_int32(_ragged_block_schedule(a_ragged_metadata, block_m))
+        block_schedule_buf = _as_int32(
+            _ragged_block_schedule(a_ragged_metadata, block_m)
+        )
         n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
         grid_m_upper = RaggedTensorMetadata.n_blocks(n_slices, M, block_m)
         grid_n = (N + block_n - 1) // block_n
         x_global_scale_buf = (
             x_global_scale.detach().reshape(-1)[:1]
             if isinstance(x_global_scale, torch.Tensor)
-            else torch.tensor([float(x_global_scale)], dtype=torch.float32, device=x.device)
+            else torch.tensor(
+                [float(x_global_scale)], dtype=torch.float32, device=x.device
+            )
         )
         out_quant_scale_buf = (
             out_quant_scale.detach().reshape(-1)[:1]
             if isinstance(out_quant_scale, torch.Tensor)
-            else torch.tensor([float(out_quant_scale)], dtype=torch.float32, device=x.device)
+            else torch.tensor(
+                [float(out_quant_scale)], dtype=torch.float32, device=x.device
+            )
         )
         bias_buf = bias if bias is not None else _make_dummy(x.device, torch.float32)
         num_tiles_total = grid_m_upper * grid_n
         _prefill_m16_stage1_direct_kernel[(num_tiles_total,)](
-            x, w3, w_scale_proc3, gather_buf,
-            _as_int32(a_ragged_metadata.slice_sizes), _as_int32(a_ragged_metadata.slice_offs),
-            block_offs_buf, block_schedule_buf, y,
-            M, int(x.shape[-2]), N, K,
-            x.stride(-2), x.stride(-1),
-            w3.stride(0), w3.stride(-2), w3.stride(-1),
-            w_scale_proc3.stride(0), stride_wsn, stride_wsk,
-            y.stride(0), y.stride(1),
-            x_global_scale_buf, out_quant_scale_buf, bias_buf,
-            N_EXPERTS=n_slices, NUM_TILES=num_tiles_total, GRID_N=grid_n,
-            GROUP_M=1, XCD_SWIZZLE=1,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-            LOCAL_STAGE=_PREFILL_STAGE1_LOCAL_STAGE,
-            UNMASK_FULL=_PREFILL_STAGE1_UNMASK_FULL,
-            USE_CG=_PREFILL_DIRECT_CG_W,
-            USE_CG_SCALE=_PREFILL_DIRECT_CG_SCALE,
+            x,
+            w3,
+            w_scale_proc3,
+            gather_buf,
+            _as_int32(a_ragged_metadata.slice_sizes),
+            _as_int32(a_ragged_metadata.slice_offs),
+            block_offs_buf,
+            block_schedule_buf,
+            y,
+            M,
+            int(x.shape[-2]),
+            N,
+            K,
+            x.stride(-2),
+            x.stride(-1),
+            w3.stride(0),
+            w3.stride(-2),
+            w3.stride(-1),
+            w_scale_proc3.stride(0),
+            stride_wsn,
+            stride_wsk,
+            y.stride(0),
+            y.stride(1),
+            x_global_scale_buf,
+            out_quant_scale_buf,
+            bias_buf,
+            N_EXPERTS=n_slices,
+            NUM_TILES=num_tiles_total,
+            GRID_N=grid_n,
+            GROUP_M=1,
+            XCD_SWIZZLE=1,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
             HAS_BIAS=bias is not None,
-            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+            SWIGLU_ALPHA=float(swiglu_alpha),
+            SWIGLU_LIMIT=float(swiglu_limit),
             num_warps=num_warps,
             num_stages=1,
         )
@@ -5209,8 +4921,7 @@ def gluon_mxfp_combine(
     y = torch.empty((n_rows, N), device=x.device, dtype=out_dtype)
 
     if (
-        _PREFILL_STAGE2_DIRECT
-        and a_ragged_metadata is not None
+        a_ragged_metadata is not None
         and scatter_indx is not None
         and gate_scal is not None
         and n_tokens is not None
@@ -5228,9 +4939,13 @@ def gluon_mxfp_combine(
         w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
         w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
         stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, scale_load_mode)
-        scatter_buf = scatter_indx.dst_indx if hasattr(scatter_indx, "dst_indx") else scatter_indx
+        scatter_buf = (
+            scatter_indx.dst_indx if hasattr(scatter_indx, "dst_indx") else scatter_indx
+        )
         block_offs_buf = _as_int32(_ragged_block_offs(a_ragged_metadata, block_m))
-        block_schedule_buf = _as_int32(_ragged_block_schedule(a_ragged_metadata, block_m))
+        block_schedule_buf = _as_int32(
+            _ragged_block_schedule(a_ragged_metadata, block_m)
+        )
         n_slices = int(a_ragged_metadata.slice_sizes.shape[0])
         grid_m_upper = RaggedTensorMetadata.n_blocks(n_slices, M, block_m)
         grid_n = (N + block_n - 1) // block_n
@@ -5238,51 +4953,51 @@ def gluon_mxfp_combine(
         x_global_scale_buf = (
             x_global_scale.detach().reshape(-1)[:1]
             if isinstance(x_global_scale, torch.Tensor)
-            else torch.tensor([float(x_global_scale)], dtype=torch.float32, device=x.device)
+            else torch.tensor(
+                [float(x_global_scale)], dtype=torch.float32, device=x.device
+            )
         )
         bias_buf = bias if bias is not None else _make_dummy(x.device, torch.float32)
         _prefill_m16_stage2_direct_kernel[(num_tiles_total,)](
-            x, w3, w_scale_proc3, scatter_buf, gate_scal,
-            _as_int32(a_ragged_metadata.slice_sizes), _as_int32(a_ragged_metadata.slice_offs),
-            block_offs_buf, block_schedule_buf, y,
-            M, N, K,
-            x.stride(-2), x.stride(-1),
-            w3.stride(0), w3.stride(-2), w3.stride(-1),
-            w_scale_proc3.stride(0), stride_wsn, stride_wsk,
-            y.stride(0), y.stride(1),
-            x_global_scale_buf, bias_buf,
-            N_EXPERTS=n_slices, NUM_TILES=num_tiles_total, GRID_N=grid_n,
-            GROUP_M=1, XCD_SWIZZLE=1,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-            LOCAL_STAGE=_PREFILL_STAGE2_LOCAL_STAGE,
-            UNMASK_FULL=_PREFILL_STAGE2_UNMASK_FULL,
-            USE_CG=_PREFILL_DIRECT_CG_W,
-            USE_CG_SCALE=_PREFILL_DIRECT_CG_SCALE,
-            SORTED_OUT=_PREFILL_STAGE2_SORTED_OUT,
+            x,
+            w3,
+            w_scale_proc3,
+            scatter_buf,
+            gate_scal,
+            _as_int32(a_ragged_metadata.slice_sizes),
+            _as_int32(a_ragged_metadata.slice_offs),
+            block_offs_buf,
+            block_schedule_buf,
+            y,
+            M,
+            N,
+            K,
+            x.stride(-2),
+            x.stride(-1),
+            w3.stride(0),
+            w3.stride(-2),
+            w3.stride(-1),
+            w_scale_proc3.stride(0),
+            stride_wsn,
+            stride_wsk,
+            y.stride(0),
+            y.stride(1),
+            x_global_scale_buf,
+            bias_buf,
+            N_EXPERTS=n_slices,
+            NUM_TILES=num_tiles_total,
+            GRID_N=grid_n,
+            GROUP_M=1,
+            XCD_SWIZZLE=1,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
             HAS_BIAS=bias is not None,
             num_warps=num_warps,
             num_stages=1,
         )
         if n_act_eff > 1:
             reduce_src = y
-            if _PREFILL_STAGE2_SORTED_OUT:
-                y_scattered = torch.empty_like(y)
-                S_BLOCK_N = 256
-                s_grid = (M * ((N + S_BLOCK_N - 1) // S_BLOCK_N),)
-                _prefill_m16_scatter_sorted_kernel[s_grid](
-                    y,
-                    scatter_buf,
-                    y_scattered,
-                    M,
-                    N,
-                    y.stride(0),
-                    y.stride(1),
-                    y_scattered.stride(0),
-                    y_scattered.stride(1),
-                    BLOCK_N=S_BLOCK_N,
-                    num_warps=1,
-                )
-                reduce_src = y_scattered
             y_reduced = torch.empty((n_tokens_eff, N), device=x.device, dtype=out_dtype)
             R_BLOCK_N = 256
             r_grid = (n_tokens_eff * ((N + R_BLOCK_N - 1) // R_BLOCK_N),)
@@ -5560,7 +5275,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     n_tokens = int(router_logits.shape[0])
     n_experts = int(router_logits.shape[1])
-    if n_tokens > SMALLM_MAX_M:
+    if n_tokens > WARP_DECODE_MAX_M:
         return None
     if not gluon_route_supported(router_logits, top_k, router_logits.dtype):
         return None
@@ -5813,7 +5528,8 @@ def gluon_mxfp_fused_moe(
 
     n_tokens = router_logits.shape[0]
 
-    # Warp-decode small-M MoE is the fastest path for the M<=16 decode regime.
+    # Warp-decode small-M MoE is the fastest path for M<=8 decode only.
+    # M=16 intentionally falls through to the prefill_m16 direct kernels below.
     # It self-guards (returns None) for any shape it does not cover; the
     # tokenspeed-kernel registration wrapper owns the environment/platform gate.
     if enable_warp_decode:
@@ -5917,6 +5633,9 @@ _ROUTE_NB = len(RaggedTensorMetadata.block_sizes())
 # Gluon kernel (decode, where it wins ~6x on routing) and keeps the generic
 # ``triton_kernels_routing`` pipeline for larger M.
 SMALLM_MAX_M = 16
+# Warp-decode is only for the smaller decode regime. M=16 should use the
+# prefill_m16 direct kernels selected by the ragged matmul path below.
+WARP_DECODE_MAX_M = 8
 # Backwards-compatible alias for the small-M bound.
 FUSED_ROUTE_MAX_M = SMALLM_MAX_M
 
@@ -5944,27 +5663,6 @@ _WD_GROUPED_GRID_ROUTE_MAJOR = _WD_GROUPED_GRID_MODE in (
 # weights to attach a pre-shuffled W13 tensor (``TS_WD_STAGE1_W_VGPR=1`` there
 # too); otherwise the wrapper silently keeps the LDS path.
 _WD_STAGE1_W_VGPR = os.environ.get("TS_WD_STAGE1_W_VGPR", "") == "1"
-_PREFILL_BM16 = os.environ.get("TS_PREFILL_BM16", "") == "1"
-_PREFILL_STAGE1_DIRECT = os.environ.get("TS_PREFILL_STAGE1_DIRECT", "") == "1"
-_PREFILL_STAGE1_LOCAL_STAGE = (
-    os.environ.get("TS_PREFILL_STAGE1_LOCAL_STAGE", "") == "1"
-)
-_PREFILL_STAGE1_TPW12 = os.environ.get("TS_PREFILL_STAGE1_TPW12", "") == "1"
-_PREFILL_STAGE1_UNMASK_FULL = (
-    os.environ.get("TS_PREFILL_STAGE1_UNMASK_FULL", "") == "1"
-)
-_PREFILL_STAGE2_DIRECT = os.environ.get("TS_PREFILL_STAGE2_DIRECT", "") == "1"
-_PREFILL_STAGE2_LOCAL_STAGE = (
-    os.environ.get("TS_PREFILL_STAGE2_LOCAL_STAGE", "") == "1"
-)
-_PREFILL_STAGE2_TPW12 = os.environ.get("TS_PREFILL_STAGE2_TPW12", "") == "1"
-_PREFILL_STAGE2_UNMASK_FULL = (
-    os.environ.get("TS_PREFILL_STAGE2_UNMASK_FULL", "") == "1"
-)
-_PREFILL_STAGE2_SORTED_OUT = os.environ.get("TS_PREFILL_STAGE2_SORTED_OUT", "") == "1"
-_PREFILL_DIRECT_CG_MODE = os.environ.get("TS_PREFILL_DIRECT_CG", "")
-_PREFILL_DIRECT_CG_W = _PREFILL_DIRECT_CG_MODE in ("1", "all", "w", "wscale")
-_PREFILL_DIRECT_CG_SCALE = _PREFILL_DIRECT_CG_MODE in ("1", "all", "scale", "wscale")
 # Configs the Gluon routing path supports; everything else falls back to the
 # generic triton_kernels_routing pipeline.
 GLUON_ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -6248,41 +5946,17 @@ def _mxfp4_scale_offset(n_idx, k_scale_idx, stride_wsk, stride_wsn):
 
 
 @gluon.jit
-def _mxfp4_scale_offset_k8_lane(n_idx, k_scale_lane, stride_wsk, stride_wsn):
-    """Split-friendly MXFP4 scale lane offset for BLOCK_K_SCALE == 8.
-
-    The direct M=16 kernels add the uniform ``kt * 256 * stride_wsk`` term
-    separately so the compiler can route it through raw-buffer ``soffset``.
-    """
-    row = n_idx.to(gl.uint32)
-    lin = (
-        (k_scale_lane % 4) * 64
-        + (row % 16) * 4
-        + ((k_scale_lane % 8) // 4) * 2
-        + ((row % 32) // 16)
-    )
-    return (row // 32).to(gl.int64) * stride_wsn + lin.to(gl.int64) * stride_wsk
-
-
-@gluon.jit
 def _load_w_scale_tile_direct_cdna4(
     WScale,
     expert,
     kt,
     off_n,
-    N,
     stride_wse,
     stride_wsk,
     stride_wsn,
     cfg,
-    USE_CG_SCALE: gl.constexpr,
 ):
-    """Load W e8m0 scales in AITER's physical CDNA4-swizzled layout.
-
-    The raw load shape is [BLOCK_N/32, BLOCK_K_SCALE*32], where the K-like
-    axis is physically contiguous.  After the load, reshape/permute reconstructs
-    the logical [BLOCK_N, BLOCK_K_SCALE] scale tile consumed by scaled MFMA.
-    """
+    """Load W e8m0 scales in AITER's physical CDNA4-swizzled layout."""
     BLOCK_N: gl.constexpr = cfg.BLOCK_N
     BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
     BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
@@ -6292,22 +5966,15 @@ def _load_w_scale_tile_direct_cdna4(
     offs_ws_n = gl.arange(0, BLOCK_N_PS, layout=gl.SliceLayout(1, LW_S))[:, None]
     offs_ws_k = gl.arange(0, BLOCK_K_S_PS, layout=gl.SliceLayout(0, LW_S))[None, :]
     rows_n_scale = off_n // cfg.PRESHUFFLE_FACTOR + offs_ws_n
-    row_limit_w_s = (N + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
     scale_k_base = kt * BLOCK_K_S_PS
     raw_off = (
         expert.to(gl.int64) * stride_wse
         + (scale_k_base + offs_ws_k).to(gl.int64) * stride_wsk
         + rows_n_scale.to(gl.int64) * stride_wsn
     )
-    mask = rows_n_scale < row_limit_w_s
-    if USE_CG_SCALE:
-        raw = gl.amd.cdna4.buffer_load(
-            ptr=WScale, offsets=raw_off.to(gl.int32), mask=mask, other=0, cache=".cg"
-        )
-    else:
-        raw = gl.amd.cdna4.buffer_load(
-            ptr=WScale, offsets=raw_off.to(gl.int32), mask=mask, other=0
-        )
+    raw = gl.amd.cdna4.buffer_load(
+        ptr=WScale, offsets=raw_off.to(gl.int32), cache=".cg"
+    )
 
     raw_7d = raw.reshape((BLOCK_N_PS, BLOCK_K_SCALE // 8, 4, 16, 2, 2, 1))
     raw_perm = raw_7d.permute((0, 5, 3, 1, 4, 2, 6))
@@ -6877,9 +6544,7 @@ def _warp_decode_stage1_grouped_compute(
     in_m = offs_xm < M
     matched_x = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     for s in gl.static_range(TOPK):
-        ids_s = gl.load(
-            TopkIds + offs_xm * stride_tim + s, mask=in_m, other=-1
-        )
+        ids_s = gl.load(TopkIds + offs_xm * stride_tim + s, mask=in_m, other=-1)
         matched_x = gl.where(ids_s == expert, 1, matched_x)
     has_any = gl.max(matched_x, axis=0)
 
@@ -6991,9 +6656,7 @@ def _warp_decode_stage1_grouped_compute(
     matched_y = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, STORE_LAYOUT))
     slot_y = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, STORE_LAYOUT))
     for s in gl.static_range(TOPK):
-        ids_s = gl.load(
-            TopkIds + offs_y_m * stride_tim + s, mask=y_in_m, other=-1
-        )
+        ids_s = gl.load(TopkIds + offs_y_m * stride_tim + s, mask=y_in_m, other=-1)
         is_e = ids_s == expert
         matched_y = gl.where(is_e, 1, matched_y)
         slot_y = gl.where(is_e, s, slot_y)
@@ -7138,9 +6801,7 @@ def _warp_decode_stage2_load_tile(
         # Partial / odd final K-tile (K = intermediate dim I): mask out-of-range
         # K lanes to 0 so they contribute nothing and never over-read.
         sk_valid = (kt * BLOCK_K_SCALE + bsk) < (I // 32)
-        a = gl.amd.cdna4.buffer_load(
-            ptr=X, offsets=a_off, mask=k_elem < I, other=0.0
-        )
+        a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off, mask=k_elem < I, other=0.0)
         b = gl.amd.cdna4.buffer_load(
             ptr=W, offsets=b_off, mask=k_pack < I_PACKED, other=0
         )
