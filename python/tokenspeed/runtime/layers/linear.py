@@ -29,12 +29,10 @@ import torch
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
 from tokenspeed.runtime.layers.dense import (
     Fp8LinearMethod,
+    Mxfp4LinearMethod,
     Nvfp4LinearMethod,
     UnquantizedLinearMethod,
     W8A8Fp8LinearMethod,
@@ -182,8 +180,12 @@ class LinearBase(torch.nn.Module):
             else:
                 self.quant_method = Nvfp4LinearMethod(quant_config)
         elif isinstance(quant_config, Mxfp4Config):
-            # mxfp4 only applies to MoE layers, not dense linear layers
-            self.quant_method = UnquantizedLinearMethod()
+            if getattr(quant_config, "use_dynamic_mxfp4_activations", False):
+                self.quant_method = Mxfp4LinearMethod(quant_config)
+            else:
+                # Existing MXFP4 support applies to MoE weights; dense weights
+                # remain unquantized unless the checkpoint stores dense MXFP4.
+                self.quant_method = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:

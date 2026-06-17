@@ -12,10 +12,11 @@ Usage:
     python3 -m unittest models.test_kimi_models.TestKimiK25.test_nvckpt_eagle3 -v
 
 Environment (all optional):
-    KIMI_K25_MODEL            HF model id or path (default: nvidia/Kimi-K2.5-NVFP4)
-    KIMI_K25_WORLD_SIZE       GPU count (default: 4)
-    KIMI_K25_DRAFT_MODEL      EAGLE3 draft repo (default: lightseekorg/kimi-k2.5-eagle3)
-    KIMI_K25_MLA_DRAFT_MODEL  MLA EAGLE3 draft repo (default: nvidia/Kimi-K2.5-Thinking-Eagle3)
+    KIMI_K25_MODEL                HF model id or path (default: nvidia/Kimi-K2.5-NVFP4)
+    KIMI_K25_QUANTIZATION         Quantization mode (default: nvfp4)
+    KIMI_K25_WORLD_SIZE           GPU count (default: 4)
+    KIMI_K25_DRAFT_MODEL          EAGLE3 draft repo (default: lightseekorg/kimi-k2.5-eagle3)
+    KIMI_K25_MLA_DRAFT_MODEL      MLA EAGLE3 draft repo (default: nvidia/Kimi-K2.5-Thinking-Eagle3)
 """
 
 import dataclasses
@@ -30,6 +31,7 @@ import requests
 from tokenspeed.runtime.utils.process import kill_process_tree
 
 MODEL = os.environ.get("KIMI_K25_MODEL", "nvidia/Kimi-K2.5-NVFP4")
+QUANTIZATION = os.environ.get("KIMI_K25_QUANTIZATION", "nvfp4")
 WORLD_SIZE = int(os.environ.get("KIMI_K25_WORLD_SIZE", "4"))
 DRAFT_MODEL = os.environ.get("KIMI_K25_DRAFT_MODEL", "lightseekorg/kimi-k2.5-eagle3")
 MLA_DRAFT_MODEL = os.environ.get(
@@ -68,7 +70,7 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
         "--max-model-len",
         "81920",
         "--quantization",
-        "nvfp4",
+        QUANTIZATION,
         "--gpu-memory-utilization",
         "0.85",
         "--max-num-seqs",
@@ -233,7 +235,7 @@ class TestKimiK25(unittest.TestCase):
             kill_process_tree(proc.pid)
 
     def test_base(self):
-        """Kimi K2.5 with NVFP4 quantization."""
+        """Kimi K2.5 with explicit quantization."""
         self._run_quality_checks(MESH_CASES["base"])
 
     def test_tsckpt_eagle3(self):
