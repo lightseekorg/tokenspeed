@@ -159,37 +159,38 @@ def _validate_traits(traits: dict[str, frozenset[Any]]) -> None:
             )
 
 
-def _values_overlap(lhs: frozenset[Any], rhs: frozenset[Any]) -> bool:
-    return bool(lhs & rhs)
-
-
 def _validate_trait_compatibility(
     *,
     kernel_spec: KernelSpec,
     preprocessor_spec: WeightPreprocessorSpec,
     errors: list[str],
 ) -> None:
-    shared_traits = set(kernel_spec.traits) & set(preprocessor_spec.traits)
-    for trait_name in sorted(shared_traits):
+    kernel_traits = set(kernel_spec.traits)
+    preprocessor_traits = set(preprocessor_spec.traits)
+
+    missing_traits = sorted(kernel_traits - preprocessor_traits)
+    if missing_traits:
+        errors.append(
+            f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} is "
+            f"missing traits {missing_traits!r}"
+        )
+
+    extra_traits = sorted(preprocessor_traits - kernel_traits)
+    if extra_traits:
+        errors.append(
+            f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} has "
+            f"unexpected traits {extra_traits!r}"
+        )
+
+    for trait_name in sorted(kernel_traits & preprocessor_traits):
         kernel_values = kernel_spec.traits[trait_name]
         preprocessor_values = preprocessor_spec.traits[trait_name]
-        if not _values_overlap(kernel_values, preprocessor_values):
+        if kernel_values != preprocessor_values:
             errors.append(
                 f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} "
                 f"trait {trait_name!r} has values {sorted(preprocessor_values)!r} "
-                f"that do not overlap kernel values {sorted(kernel_values)!r}"
+                f"that do not match kernel values {sorted(kernel_values)!r}"
             )
-
-    if (
-        kernel_spec.family == "moe"
-        and kernel_spec.mode == "apply"
-        and "weight_dtype" in kernel_spec.traits
-        and "weight_dtype" not in preprocessor_spec.traits
-    ):
-        errors.append(
-            f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} must "
-            "declare weight_dtype for MoE apply validation"
-        )
 
 
 def resolve_weight_preprocessor_ref(
@@ -230,7 +231,8 @@ def resolve_weight_preprocessor_ref(
         if ref.required:
             raise WeightPreprocessorResolutionError(message)
         warnings.warn(
-            f"{message}; skipping optional preprocessing",
+            "skipping preprocessors due to hardware capabilities: "
+            f"{ref.name!r}; this may hurt performance",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -240,8 +242,6 @@ def resolve_weight_preprocessor_ref(
 
 def resolve_weight_preprocessor_conflict(
     refs: Iterable[WeightPreprocessorRef | None],
-    *,
-    scope: str = "module",
 ) -> WeightPreprocessorRef | None:
     """Resolve module-scoped preprocessing requests.
 
@@ -265,12 +265,13 @@ def resolve_weight_preprocessor_conflict(
         required_named = [name for name, required in named.items() if required]
         if required_named:
             raise WeightPreprocessorConflictError(
-                f"Conflicting {scope} preprocessing requirements: required "
+                "Conflicting module preprocessing requirements: required "
                 f"no-preprocessing and required preprocessors {sorted(required_named)!r}"
             )
         warnings.warn(
-            f"Skipping optional {scope} preprocessors {sorted(named)!r} because "
-            "the module also has a no-preprocessing constraint",
+            "skipping conflicting preprocessors: "
+            f"{sorted(named)!r} conflict with required no preprocessing; "
+            "this may hurt performance",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -280,11 +281,12 @@ def resolve_weight_preprocessor_conflict(
         required_named = [name for name, required in named.items() if required]
         if required_named:
             raise WeightPreprocessorConflictError(
-                f"Conflicting {scope} preprocessors {sorted(named)!r}; "
+                f"Conflicting module preprocessors {sorted(named)!r}; "
                 f"required preprocessors: {sorted(required_named)!r}"
             )
         warnings.warn(
-            f"Skipping optional conflicting {scope} preprocessors {sorted(named)!r}",
+            "skipping conflicting preprocessors: "
+            f"{sorted(named)!r}; this may hurt performance",
             RuntimeWarning,
             stacklevel=2,
         )

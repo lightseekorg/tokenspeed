@@ -37,6 +37,19 @@ next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length
 if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
 
+    _FLASHINFER_CUTLASS_FP8_MOE_TRAITS = {
+        "weight_dtype": frozenset({"fp8"}),
+        "activation": frozenset({"silu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "fp8_scale_block_shape": frozenset({(128, 128)}),
+        "supports_bias": frozenset({False}),
+    }
+
     @register_weight_preprocessor(
         "moe",
         name="flashinfer_cutlass_fp8_moe_weights",
@@ -44,7 +57,7 @@ if platform.is_nvidia:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
         ),
-        traits={"weight_dtype": frozenset({"fp8"})},
+        traits=_FLASHINFER_CUTLASS_FP8_MOE_TRAITS,
     )
     def flashinfer_cutlass_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
@@ -80,18 +93,7 @@ if platform.is_nvidia:
             "dense",
             {torch.float16, torch.bfloat16},
         ),
-        traits={
-            "weight_dtype": frozenset({"fp8"}),
-            "activation": frozenset({"silu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "fp8_scale_block_shape": frozenset({(128, 128)}),
-            "supports_bias": frozenset({False}),
-        },
+        traits=_FLASHINFER_CUTLASS_FP8_MOE_TRAITS,
         priority=Priority.PERFORMANT,
     )
     def flashinfer_cutlass_fp8_moe_apply(

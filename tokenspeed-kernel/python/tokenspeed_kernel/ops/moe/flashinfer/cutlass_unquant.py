@@ -38,6 +38,18 @@ if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
     from flashinfer.autotuner import autotune as flashinfer_autotune
 
+    _FLASHINFER_CUTLASS_UNQUANT_MOE_TRAITS = {
+        "weight_dtype": frozenset({"unquant"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    }
+
     @register_weight_preprocessor(
         "moe",
         name="flashinfer_cutlass_unquant_moe_weights",
@@ -45,7 +57,7 @@ if platform.is_nvidia:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(8, 9),
         ),
-        traits={"weight_dtype": frozenset({"unquant"})},
+        traits=_FLASHINFER_CUTLASS_UNQUANT_MOE_TRAITS,
     )
     def flashinfer_cutlass_unquant_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
@@ -72,17 +84,7 @@ if platform.is_nvidia:
             "dense",
             {torch.float16, torch.bfloat16},
         ),
-        traits={
-            "weight_dtype": frozenset({"unquant"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
-        },
+        traits=_FLASHINFER_CUTLASS_UNQUANT_MOE_TRAITS,
         priority=Priority.PERFORMANT,
     )
     def flashinfer_cutlass_unquant_moe_apply(

@@ -24,7 +24,6 @@ import pytest
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.preprocessing import (
     WeightPreprocessorConflictError,
-    WeightPreprocessorRegistry,
     WeightPreprocessorResolutionError,
     WeightPreprocessorSpec,
     register_weight_preprocessor,
@@ -47,13 +46,14 @@ def _register_apply(
     preprocessor: WeightPreprocessorRef | None = None,
     capability: CapabilityRequirement | None = None,
     weight_dtype: str = "mxfp4",
+    traits: dict[str, frozenset] | None = None,
 ) -> KernelSpec:
     spec = KernelSpec(
         name=name,
         family=family,
         mode="apply",
         capability=capability or CapabilityRequirement(),
-        traits={"weight_dtype": frozenset({weight_dtype})},
+        traits=traits or {"weight_dtype": frozenset({weight_dtype})},
         weight_preprocessor=preprocessor,
     )
     KernelRegistry.get().register(spec, lambda **_: None)
@@ -66,27 +66,16 @@ def _register_preprocessor(
     family: str = "moe",
     capability: CapabilityRequirement | None = None,
     weight_dtype: str = "mxfp4",
+    traits: dict[str, frozenset] | None = None,
 ) -> None:
     @register_weight_preprocessor(
         family,
         name=name,
         capability=capability,
-        traits={"weight_dtype": frozenset({weight_dtype})},
+        traits=traits or {"weight_dtype": frozenset({weight_dtype})},
     )
     def _preprocess(**_):
         return None
-
-
-def test_preprocessor_registry_has_no_solution_field():
-    _register_preprocessor(name="layout_a")
-
-    spec = WeightPreprocessorRegistry.get().get_by_name("layout_a")
-
-    assert spec is not None
-    assert spec.name == "layout_a"
-    assert spec.family == "moe"
-    assert spec.traits["weight_dtype"] == frozenset({"mxfp4"})
-    assert not hasattr(spec, "solution")
 
 
 def test_preprocessor_ref_rejects_empty_name():
@@ -160,7 +149,46 @@ def test_resolution_rejects_trait_mismatch(h100_platform):
         )
 
 
-def test_resolution_ignores_kernel_preprocessor_capability_overlap(mi300_platform):
+def test_resolution_rejects_missing_preprocessor_trait(h100_platform):
+    kernel_spec = _register_apply(
+        preprocessor=WeightPreprocessorRef("layout_a"),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "layout": frozenset({"blocked"}),
+        },
+    )
+    _register_preprocessor(
+        name="layout_a",
+        traits={"weight_dtype": frozenset({"mxfp4"})},
+    )
+
+    with pytest.raises(WeightPreprocessorResolutionError, match="missing traits"):
+        resolve_weight_preprocessor_ref(
+            kernel_spec.weight_preprocessor,
+            kernel_spec=kernel_spec,
+            platform=h100_platform,
+        )
+
+
+def test_resolution_rejects_extra_preprocessor_trait(h100_platform):
+    kernel_spec = _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
+    _register_preprocessor(
+        name="layout_a",
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "layout": frozenset({"blocked"}),
+        },
+    )
+
+    with pytest.raises(WeightPreprocessorResolutionError, match="unexpected traits"):
+        resolve_weight_preprocessor_ref(
+            kernel_spec.weight_preprocessor,
+            kernel_spec=kernel_spec,
+            platform=h100_platform,
+        )
+
+
+def test_resolve_kernel_preprocessor_with_different_capability(mi300_platform):
     kernel_spec = _register_apply(
         preprocessor=WeightPreprocessorRef("layout_a"),
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
@@ -200,7 +228,10 @@ def test_optional_capability_mismatch_warns_and_skips(h100_platform):
         capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     )
 
-    with pytest.warns(RuntimeWarning, match="skipping optional preprocessing"):
+    with pytest.warns(
+        RuntimeWarning,
+        match="skipping preprocessors due to hardware capabilities.*hurt performance",
+    ):
         resolved = resolve_weight_preprocessor_ref(
             WeightPreprocessorRef("amd_layout", required=False),
             kernel_spec=_register_apply(),
@@ -231,7 +262,10 @@ def test_same_preprocessor_requests_dedupe_and_preserve_required():
 
 
 def test_optional_conflicting_preprocessors_warn_and_skip():
-    with pytest.warns(RuntimeWarning, match="Skipping optional conflicting"):
+    with pytest.warns(
+        RuntimeWarning,
+        match="skipping conflicting preprocessors.*hurt performance",
+    ):
         ref = resolve_weight_preprocessor_conflict(
             [
                 WeightPreprocessorRef("layout_a", required=False),
@@ -253,7 +287,10 @@ def test_required_conflicting_preprocessors_error():
 
 
 def test_optional_preprocessor_conflicts_with_no_preprocessing_warns_and_skips():
-    with pytest.warns(RuntimeWarning, match="no-preprocessing constraint"):
+    with pytest.warns(
+        RuntimeWarning,
+        match="skipping conflicting preprocessors.*hurt performance",
+    ):
         ref = resolve_weight_preprocessor_conflict(
             [
                 None,

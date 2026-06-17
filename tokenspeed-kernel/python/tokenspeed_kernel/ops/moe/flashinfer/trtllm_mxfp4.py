@@ -94,6 +94,18 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
+    _FLASHINFER_TRTLLM_MXFP4_MOE_TRAITS = {
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({True}),
+    }
+
     def _get_device_permute_indices(
         x: torch.Tensor,
         epilogue_tile_m: int,
@@ -171,7 +183,7 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        traits={"weight_dtype": frozenset({"mxfp4"})},
+        traits=_FLASHINFER_TRTLLM_MXFP4_MOE_TRAITS,
     )
     def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         sf_block_size = 32
@@ -368,17 +380,7 @@ if platform.is_nvidia:
             "dense",
             {torch.float16, torch.bfloat16},
         ),
-        traits={
-            "weight_dtype": frozenset({"mxfp4"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"kernel_routing"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({True}),
-        },
+        traits=_FLASHINFER_TRTLLM_MXFP4_MOE_TRAITS,
         priority=Priority.SPECIALIZED,
     )
     def flashinfer_trtllm_mxfp4_moe_apply(

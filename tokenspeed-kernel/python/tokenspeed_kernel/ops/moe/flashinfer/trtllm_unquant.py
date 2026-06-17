@@ -44,6 +44,18 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
+    _FLASHINFER_TRTLLM_UNQUANT_MOE_TRAITS = {
+        "weight_dtype": frozenset({"unquant"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({True}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({128}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    }
+
     @register_weight_preprocessor(
         "moe",
         name="flashinfer_trtllm_unquant_moe_weights",
@@ -52,7 +64,7 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        traits={"weight_dtype": frozenset({"unquant"})},
+        traits=_FLASHINFER_TRTLLM_UNQUANT_MOE_TRAITS,
     )
     def flashinfer_trtllm_unquant_moe_weights(plan: dict, w: torch.nn.Module):
         cache_permute_indices = {}
@@ -131,17 +143,7 @@ if platform.is_nvidia:
             "dense",
             {torch.bfloat16},
         ),
-        traits={
-            "weight_dtype": frozenset({"unquant"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"kernel_routing"}),
-            "supports_deferred_finalize": frozenset({True}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({128}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
-        },
+        traits=_FLASHINFER_TRTLLM_UNQUANT_MOE_TRAITS,
         priority=Priority.SPECIALIZED,
     )
     def flashinfer_trtllm_unquant_moe_apply(

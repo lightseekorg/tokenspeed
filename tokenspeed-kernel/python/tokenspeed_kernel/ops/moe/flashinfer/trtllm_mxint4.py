@@ -62,6 +62,17 @@ if platform.is_nvidia:
         trtllm_mxint4_block_scale_moe,
     )
 
+    _FLASHINFER_TRTLLM_MXINT4_MOE_TRAITS = {
+        "weight_dtype": frozenset({"mxint4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({256}),
+        "internal_activation_dtype": frozenset({"input"}),
+    }
+
     def _repack_int4(packed: torch.Tensor) -> torch.Tensor:
         """Convert one expert's ``int32`` ``(w/s)+8`` words to ``uint8`` ``(w/s)``.
 
@@ -161,7 +172,7 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        traits={"weight_dtype": frozenset({"mxint4"})},
+        traits=_FLASHINFER_TRTLLM_MXINT4_MOE_TRAITS,
     )
     def flashinfer_trtllm_mxint4_moe_weights(plan: dict, w: torch.nn.Module):
         num_experts = w.w13_weight_packed.shape[0]
@@ -233,18 +244,7 @@ if platform.is_nvidia:
             "dense",
             {torch.float16, torch.bfloat16},
         ),
-        traits={
-            "weight_dtype": frozenset({"mxint4"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"kernel_routing"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            # w2 stores two INT4 per byte, so its packed K dim is ispp // 2 and
-            # the 128-element block layout needs ispp divisible by 256.
-            "ispp_alignment": frozenset({256}),
-            "internal_activation_dtype": frozenset({"input"}),
-        },
+        traits=_FLASHINFER_TRTLLM_MXINT4_MOE_TRAITS,
         priority=Priority.SPECIALIZED,
     )
     def flashinfer_trtllm_mxint4_moe_apply(

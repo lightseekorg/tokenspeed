@@ -43,6 +43,18 @@ if platform.is_nvidia:
     )
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
+    _FLASHINFER_CUTEDSL_DEEPEP_NVFP4_MOE_TRAITS = {
+        "weight_dtype": frozenset({"nvfp4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({True}),
+        "ispp_alignment": frozenset({64}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    }
+
     @register_weight_preprocessor(
         "moe",
         name="flashinfer_cutedsl_deepep_nvfp4_moe_weights",
@@ -50,7 +62,7 @@ if platform.is_nvidia:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
         ),
-        traits={"weight_dtype": frozenset({"nvfp4"})},
+        traits=_FLASHINFER_CUTEDSL_DEEPEP_NVFP4_MOE_TRAITS,
     )
     def flashinfer_cutedsl_deepep_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         w13_ws2 = w.w13_weight_scale_2[:, 0]
@@ -132,17 +144,7 @@ if platform.is_nvidia:
             "dense",
             {torch.float16, torch.bfloat16},
         ),
-        traits={
-            "weight_dtype": frozenset({"nvfp4"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({True}),
-            "ispp_alignment": frozenset({64}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
-        },
+        traits=_FLASHINFER_CUTEDSL_DEEPEP_NVFP4_MOE_TRAITS,
         priority=Priority.PERFORMANT,
     )
     def flashinfer_cutedsl_deepep_nvfp4_moe_apply(

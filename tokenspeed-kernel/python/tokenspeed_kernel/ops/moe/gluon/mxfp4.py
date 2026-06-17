@@ -39,6 +39,18 @@ if platform.is_amd:
         preprocess_gluon_mxfp4_gfx950_moe_weights as _preprocess_impl,
     )
 
+    _GLUON_MXFP4_MOE_TRAITS = {
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"fp8"}),
+        "supports_bias": frozenset({True}),
+    }
+
     @register_weight_preprocessor(
         "moe",
         name="gluon_mxfp4_gfx950_moe_weights",
@@ -47,7 +59,7 @@ if platform.is_amd:
             min_arch_version=ArchVersion(9, 5),
             max_arch_version=ArchVersion(9, 5),
         ),
-        traits={"weight_dtype": frozenset({"mxfp4"})},
+        traits=_GLUON_MXFP4_MOE_TRAITS,
     )
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
         return _preprocess_impl(plan, w)
@@ -71,17 +83,7 @@ if platform.is_amd:
             "dense",
             {torch.float16, torch.bfloat16},
         ),
-        traits={
-            "weight_dtype": frozenset({"mxfp4"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"kernel_routing"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({False}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"fp8"}),
-            "supports_bias": frozenset({True}),
-        },
+        traits=_GLUON_MXFP4_MOE_TRAITS,
         # gluon is narrowly gated to gfx950
         priority=Priority.SPECIALIZED,
     )
