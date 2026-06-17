@@ -48,6 +48,26 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 
 logger = logging.getLogger(__name__)
 
+_DSA_TRTLLM_WORKSPACE_BYTES = 384 * 1024 * 1024
+_dsa_trtllm_workspace_buffers: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_dsa_trtllm_workspace_buffer(device: torch.device | str) -> torch.Tensor:
+    device = torch.device(device)
+    workspace = _dsa_trtllm_workspace_buffers.get(device)
+    if workspace is None:
+        # SGLang allocates a larger FlashInfer workspace for DSA sparse MLA than
+        # the plain TRTLLM MLA backend. Sparse prefill treats every query token
+        # as a decode row, so the ordinary decode workspace is too small for
+        # long 8k-token chunks.
+        workspace = torch.zeros(
+            _DSA_TRTLLM_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=device,
+        )
+        _dsa_trtllm_workspace_buffers[device] = workspace
+    return workspace
+
 
 def _flashmla_sparse_prefill_head_multiple() -> int:
     platform = current_platform()
@@ -110,9 +130,13 @@ def _pad_flashmla_sparse_decode_query_heads(
     return q_padded, num_heads
 
 
-def _default_dsa_sparse_prefill_impl() -> str:
+def _default_dsa_sparse_prefill_impl(kv_cache_dtype: torch.dtype | None = None) -> str:
     platform = current_platform()
-    if platform.is_nvidia and platform.is_blackwell:
+    if (
+        platform.is_nvidia
+        and platform.is_blackwell
+        and kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    ):
         return "trtllm"
     return "flashmla"
 
@@ -199,6 +223,7 @@ class DSABackend(AttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.trtllm_workspace = _get_dsa_trtllm_workspace_buffer(config.device)
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_dim = 0
@@ -210,8 +235,19 @@ class DSABackend(AttentionBackend):
         # Only graph-captured decode workspaces must survive a regrow. Eager
         # buffers are not referenced by replay and can be released normally.
         self._decode_query_workspace_captured = False
-        self._set_sparse_prefill_impl(_default_dsa_sparse_prefill_impl())
+        self._set_sparse_prefill_impl(_default_dsa_sparse_prefill_impl(self.data_type))
         self._set_sparse_decode_impl("trtllm")
+
+    def _get_trtllm_workspace(self) -> torch.Tensor:
+        workspace = getattr(self, "trtllm_workspace", None)
+        if workspace is not None:
+            return workspace
+        dense_backend = getattr(self, "_dense_backend", None)
+        workspace = getattr(dense_backend, "trtllm_workspace", None)
+        if workspace is not None:
+            self.trtllm_workspace = workspace
+            return workspace
+        raise RuntimeError("GLM DSA TRTLLM sparse path requires a workspace buffer.")
 
     def _resolve_sparse_impl(self, *, family: str, name: str):
         impls = _DSA_SPARSE_IMPLS_BY_FAMILY.get(family)
@@ -244,7 +280,9 @@ class DSABackend(AttentionBackend):
         self._sparse_decode_forward_impl = name
 
     def _get_sparse_prefill_forward(self):
-        name = getattr(self, "_sparse_prefill_impl", _default_dsa_sparse_prefill_impl())
+        name = getattr(self, "_sparse_prefill_impl", None)
+        if name is None:
+            name = _default_dsa_sparse_prefill_impl(getattr(self, "data_type", None))
         if getattr(self, "_sparse_prefill_forward_impl", None) != name:
             self._set_sparse_prefill_impl(name)
         return self._sparse_prefill_forward
@@ -862,13 +900,15 @@ class DSABackend(AttentionBackend):
             head_multiple=_flashmla_sparse_prefill_head_multiple(),
         )
 
+        # GLM DSA prefill follows SGLang's FlashMLA sparse contract: invalid
+        # sparse slots are carried as -1-padded indices. Passing topk_length on
+        # this path corrupts long 8k-token chunked prefills on Blackwell.
         out, _, _ = flash_mla_sparse_fwd(
             q=q_kernel,
             kv=kv_workspace.view(-1, 1, self.kv_cache_dim),
             indices=workspace_indices.unsqueeze(1),
             sm_scale=layer.scaling,
             d_v=layer.v_head_dim,
-            topk_length=topk_lens,
         )
         if out.shape[1] != actual_num_heads:
             out = out[:, :actual_num_heads, :]
@@ -940,18 +980,16 @@ class DSABackend(AttentionBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
-        # Sparse prefill provides one top-k table row per query token, so TRTLLM
-        # must size the KV span to that sparse width rather than dense context.
         out = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_cache,
-            workspace_buffer=self._dense_backend.trtllm_workspace,
+            workspace_buffer=self._get_trtllm_workspace(),
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=self.index_topk,
+            max_seq_len=max_seq_len,
             sparse_mla_top_k=self.index_topk,
             bmm1_scale=k_scale * layer.scaling,
             backend="trtllm-gen",
@@ -1186,7 +1224,7 @@ class DSABackend(AttentionBackend):
         out = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_cache,
-            workspace_buffer=self._dense_backend.trtllm_workspace,
+            workspace_buffer=self._get_trtllm_workspace(),
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,

@@ -35,6 +35,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 
 from tokenspeed.cli._argsplit import OrchestratorOpts
+from tokenspeed.cli._proc import _ENGINE_MODULE_DEFAULT
 from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
@@ -55,6 +56,7 @@ from tokenspeed.cli.serve_smg import (
     _user_model_id,
     run_smg,
 )
+from tokenspeed.runtime.entrypoints.smg_grpc_server import _grpc_server_options
 
 
 def _make_proc(returncode: int | None = None) -> MagicMock:
@@ -82,6 +84,20 @@ def test_gateway_args_preserve_user_port():
 
     assert gateway_args == ["--port", "8413"]
     assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
+
+
+def test_ts_serve_uses_local_grpc_entrypoint():
+    assert _ENGINE_MODULE_DEFAULT == "tokenspeed.runtime.entrypoints.smg_grpc_server"
+
+
+def test_grpc_server_options_allow_long_idle_streams():
+    options = dict(_grpc_server_options(123))
+    assert options["grpc.max_send_message_length"] == 123
+    assert options["grpc.max_receive_message_length"] == 123
+    assert options["grpc.http2.min_recv_ping_interval_without_data_ms"] == 10000
+    assert options["grpc.http2.max_pings_without_data"] == 0
+    assert options["grpc.http2.max_ping_strikes"] == 0
+    assert options["grpc.keepalive_permit_without_calls"] is True
 
 
 def test_gateway_args_default_reasoning_parser_is_passthrough():
@@ -342,6 +358,99 @@ def test_glm_dsa_config_gets_default_reasoning_parser(tmp_path):
         "--reasoning-parser",
         GLM_DSA_REASONING_PARSER,
     ]
+
+
+def test_glm_dsa_speculative_decoding_disables_prefix_cache_by_default(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm_moe_dsa",
+                "architectures": ["GlmMoeDsaForCausalLM"],
+            }
+        )
+    )
+    model = str(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model, "--speculative-algorithm", "MTP"],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--speculative-algorithm",
+        "MTP",
+        "--reasoning-parser",
+        GLM_DSA_REASONING_PARSER,
+        "--no-enable-prefix-caching",
+        "--disable-kvstore",
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        GLM_DSA_REASONING_PARSER,
+    ]
+
+
+def test_glm_dsa_speculative_decoding_preserves_explicit_prefix_cache(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm_moe_dsa",
+                "architectures": ["GlmMoeDsaForCausalLM"],
+            }
+        )
+    )
+    model = str(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        [
+            "--model",
+            model,
+            "--speculative-algorithm",
+            "MTP",
+            "--enable-prefix-caching",
+        ],
+        ["--model", model],
+    )
+
+    assert "--no-enable-prefix-caching" not in engine_args
+    assert "--disable-kvstore" not in engine_args
+    assert "--enable-prefix-caching" in engine_args
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        GLM_DSA_REASONING_PARSER,
+    ]
+
+
+def test_glm_dsa_speculative_no_prefix_cache_also_disables_kvstore(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm_moe_dsa",
+                "architectures": ["GlmMoeDsaForCausalLM"],
+            }
+        )
+    )
+    model = str(tmp_path)
+
+    engine_args, _ = _args_with_default_model_parsers(
+        [
+            "--model",
+            model,
+            "--speculative-algorithm",
+            "MTP",
+            "--no-enable-prefix-caching",
+        ],
+        ["--model", model],
+    )
+
+    assert "--no-enable-prefix-caching" in engine_args
+    assert "--disable-kvstore" in engine_args
 
 
 def test_glm_dsa_parser_default_preserves_explicit_user_value(tmp_path):

@@ -58,6 +58,8 @@ except Exception:
 _DECODE_DEEPGEMM_WARNING_EMITTED = False
 _DECODE_FLASHINFER_TOPK_WARNING_EMITTED = False
 _PREFILL_DEEPGEMM_WARNING_EMITTED = False
+_GLM_DSA_DEBUG_META_LOGGED = 0
+_GLM_DSA_DEBUG_NAN_LOGGED = 0
 logger = logging.getLogger(__name__)
 
 from tokenspeed.runtime.configs.utils import get_rope_theta
@@ -85,7 +87,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     get_layer_id,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 
 @dataclass
@@ -135,6 +137,149 @@ def _glm_dsa_is_pure_decode_token_mode(forward_mode: ForwardMode | None) -> bool
         or forward_mode.is_target_verify()
         or forward_mode.is_draft_extend()
     )
+
+
+def _glm_dsa_debug_enabled() -> bool:
+    return envs.TOKENSPEED_DEBUG_GLM_DSA.get()
+
+
+def _glm_dsa_debug_limit() -> int:
+    return max(0, envs.TOKENSPEED_DEBUG_GLM_DSA_LIMIT.get())
+
+
+def _glm_dsa_debug_context_parts(ctx: ForwardContext) -> list[str]:
+    parts = [
+        f"mode={ctx.forward_mode.name if ctx.forward_mode is not None else None}",
+        f"bs={ctx.bs}",
+        f"num_extends={ctx.num_extends}",
+        f"input_num_tokens={ctx.input_num_tokens}",
+    ]
+    chunk_meta = getattr(ctx.attn_backend, "chunked_prefill_metadata", None)
+    if chunk_meta is not None and int(getattr(ctx, "num_extends", 0) or 0) > 0:
+        num_extends = ctx.num_extends
+        prefix_lens = chunk_meta.extend_prefix_lens[:num_extends]
+        extend_lens = chunk_meta.extend_seq_lens[:num_extends]
+        parts.extend(
+            [
+                f"prefix_lens={prefix_lens.detach().to('cpu').tolist()}",
+                f"extend_lens={extend_lens.detach().to('cpu').tolist()}",
+            ]
+        )
+    return parts
+
+
+def _glm_dsa_debug_tensor_stats(name: str, tensor: torch.Tensor) -> list[str]:
+    parts = [f"{name}_shape={tuple(tensor.shape)}", f"{name}_dtype={tensor.dtype}"]
+    if tensor.numel() == 0:
+        parts.append(f"{name}_empty=1")
+        return parts
+
+    if tensor.is_floating_point() or tensor.is_complex():
+        tensor_for_stats = tensor.float() if tensor.is_floating_point() else tensor
+        finite = torch.isfinite(tensor_for_stats)
+        finite_count = int(finite.sum().item())
+        total = int(finite.numel())
+        parts.append(f"{name}_finite={finite_count}/{total}")
+        if finite_count:
+            finite_values = tensor_for_stats[finite].float()
+            parts.extend(
+                [
+                    f"{name}_min={float(finite_values.min().item())}",
+                    f"{name}_max={float(finite_values.max().item())}",
+                ]
+            )
+    else:
+        parts.extend(
+            [
+                f"{name}_min={int(tensor.min().item())}",
+                f"{name}_max={int(tensor.max().item())}",
+            ]
+        )
+    return parts
+
+
+def _glm_dsa_debug_log_nonfinite(
+    *,
+    layer_id: int | None,
+    stage: str,
+    tensor: torch.Tensor | None,
+    ctx: ForwardContext,
+) -> None:
+    if not _glm_dsa_debug_enabled() or tensor is None or tensor.numel() == 0:
+        return
+    if not (tensor.is_floating_point() or tensor.is_complex()):
+        return
+    tensor_for_check = tensor.float() if tensor.is_floating_point() else tensor
+    finite = torch.isfinite(tensor_for_check)
+    if bool(finite.all().item()):
+        return
+
+    global _GLM_DSA_DEBUG_NAN_LOGGED
+    limit = _glm_dsa_debug_limit()
+    if _GLM_DSA_DEBUG_NAN_LOGGED >= limit:
+        return
+    _GLM_DSA_DEBUG_NAN_LOGGED += 1
+
+    parts = [
+        f"layer={layer_id}",
+        f"stage={stage}",
+        *_glm_dsa_debug_context_parts(ctx),
+        *_glm_dsa_debug_tensor_stats("tensor", tensor),
+    ]
+    logger.warning("GLM DSA non-finite debug: %s", " ".join(parts))
+
+
+def _glm_dsa_debug_log_sparse_prefill(
+    *,
+    layer_id: int | None,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    ctx: ForwardContext,
+    out_cache_loc: torch.Tensor,
+    prefill_topk: GlmDsaPrefillTopK,
+) -> None:
+    if not _glm_dsa_debug_enabled():
+        return
+    if prefill_topk.max_seq_len < 32768 and q.shape[0] < 8192:
+        return
+
+    global _GLM_DSA_DEBUG_META_LOGGED
+    limit = min(8, _glm_dsa_debug_limit())
+    if _GLM_DSA_DEBUG_META_LOGGED >= limit:
+        return
+    _GLM_DSA_DEBUG_META_LOGGED += 1
+
+    parts = [
+        f"layer={layer_id}",
+        *_glm_dsa_debug_context_parts(ctx),
+        f"max_seq_len={prefill_topk.max_seq_len}",
+        *_glm_dsa_debug_tensor_stats("q", q),
+        *_glm_dsa_debug_tensor_stats("positions", positions),
+        *_glm_dsa_debug_tensor_stats("out_cache_loc", out_cache_loc),
+        *_glm_dsa_debug_tensor_stats("topk_lens", prefill_topk.topk_lens),
+        *_glm_dsa_debug_tensor_stats("kv_workspace_slots", prefill_topk.kv_workspace_slots),
+    ]
+
+    workspace_indices = prefill_topk.workspace_indices
+    valid = workspace_indices >= 0
+    valid_count = int(valid.sum().item())
+    total = int(valid.numel())
+    parts.extend(
+        [
+            f"workspace_indices_shape={tuple(workspace_indices.shape)}",
+            f"workspace_indices_valid={valid_count}/{total}",
+        ]
+    )
+    if valid_count:
+        valid_indices = workspace_indices[valid]
+        parts.extend(
+            [
+                f"workspace_indices_min={int(valid_indices.min().item())}",
+                f"workspace_indices_max={int(valid_indices.max().item())}",
+            ]
+        )
+
+    logger.warning("GLM DSA sparse prefill debug: %s", " ".join(parts))
 
 
 def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
@@ -1863,6 +2008,20 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             ctx,
             out_cache_loc,
         )
+        _glm_dsa_debug_log_sparse_prefill(
+            layer_id=self.attn_mqa.layer_id,
+            positions=positions,
+            q=Q,
+            ctx=ctx,
+            out_cache_loc=out_cache_loc,
+            prefill_topk=prefill_topk,
+        )
+        _glm_dsa_debug_log_nonfinite(
+            layer_id=self.attn_mqa.layer_id,
+            stage="sparse_prefill_q",
+            tensor=Q,
+            ctx=ctx,
+        )
         attn_output = ctx.attn_backend.forward_sparse_prefill(
             q=Q,
             layer=self.attn_mqa,
@@ -1874,12 +2033,24 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             kv_workspace_slots=prefill_topk.kv_workspace_slots,
             max_seq_len=prefill_topk.max_seq_len,
         )
+        _glm_dsa_debug_log_nonfinite(
+            layer_id=self.attn_mqa.layer_id,
+            stage="sparse_prefill_attn_output",
+            tensor=attn_output,
+            ctx=ctx,
+        )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
         torch.bmm(
             attn_output.transpose(0, 1),
             self.w_vc,
             out=output_view.transpose(0, 1),
+        )
+        _glm_dsa_debug_log_nonfinite(
+            layer_id=self.attn_mqa.layer_id,
+            stage="sparse_prefill_v_proj_output",
+            tensor=output,
+            ctx=ctx,
         )
         return output
 
@@ -2048,6 +2219,12 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             hidden_states, residual = self.comm_manager.input_reduce_norm(
                 hidden_states, residual
             )
+            _glm_dsa_debug_log_nonfinite(
+                layer_id=self.layer_id,
+                stage="input_reduce_norm_hidden",
+                tensor=hidden_states,
+                ctx=ctx,
+            )
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -2055,10 +2232,22 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
+            _glm_dsa_debug_log_nonfinite(
+                layer_id=self.layer_id,
+                stage="self_attn_output",
+                tensor=hidden_states,
+                ctx=ctx,
+            )
             if ctx.draft_first_step_reduce:
                 residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
+            )
+            _glm_dsa_debug_log_nonfinite(
+                layer_id=self.layer_id,
+                stage="post_attn_reduce_norm_hidden",
+                tensor=hidden_states,
+                ctx=ctx,
             )
             hidden_states = self.forward_mlp(
                 hidden_states,
@@ -2066,6 +2255,12 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 ctx,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
+            )
+            _glm_dsa_debug_log_nonfinite(
+                layer_id=self.layer_id,
+                stage="mlp_output",
+                tensor=hidden_states,
+                ctx=ctx,
             )
         else:
             hidden_states = self.forward_mlp(

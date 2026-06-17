@@ -60,6 +60,10 @@ if platform.is_nvidia:
 
     _FP8_BLOCK = 128
     _DEEPSEEK_V3_ROUTING = int(RoutingMethodType.DeepSeekV3)
+    _MIN_TUNE_MAX_NUM_TOKENS = 8192
+
+    def _tune_max_num_tokens(num_tokens: int) -> int:
+        return max(_MIN_TUNE_MAX_NUM_TOKENS, next_power_of_2(int(num_tokens)))
 
     def _routing_value(w: torch.nn.Module, name: str, default):
         routing_config = getattr(w, "routing_config", {})
@@ -102,6 +106,7 @@ if platform.is_nvidia:
         w.w13_weight_scale_inv.data.clamp_(min=1e-10)
         w.w2_weight_scale_inv.data.clamp_(min=1e-10)
         w._flashinfer_trtllm_fp8_autotuned = False
+        w._flashinfer_trtllm_fp8_autotuned_buckets = set()
         return None
 
     @register_kernel(
@@ -172,13 +177,14 @@ if platform.is_nvidia:
         num_experts = getattr(w, "num_experts", local_experts)
         correction_bias = _routing_value(w, "correction_bias", None)
         routing_bias = (
-            correction_bias.to(torch.float32)
+            correction_bias.to(x.dtype)
             if isinstance(correction_bias, torch.Tensor)
             else None
         )
         n_group = _routing_value(w, "n_group", 0) or None
         topk_group = _routing_value(w, "topk_group", 0) or None
         routed_scaling_factor = _routing_value(w, "routed_scaling_factor", None)
+        tune_max_num_tokens = _tune_max_num_tokens(x_fp8.shape[0])
 
         def _call():
             return trtllm_fp8_block_scale_moe(
@@ -200,15 +206,18 @@ if platform.is_nvidia:
                 routed_scaling_factor=routed_scaling_factor,
                 routing_method_type=_DEEPSEEK_V3_ROUTING,
                 do_finalize=True,
-                tune_max_num_tokens=max(8, next_power_of_2(x_fp8.shape[0])),
+                tune_max_num_tokens=tune_max_num_tokens,
             )
 
-        if autotune is not None and not getattr(
-            w, "_flashinfer_trtllm_fp8_autotuned", False
-        ):
-            with autotune():
-                _call()
-            w._flashinfer_trtllm_fp8_autotuned = True
+        if autotune is not None:
+            tuned_buckets = getattr(w, "_flashinfer_trtllm_fp8_autotuned_buckets", set())
+            if tune_max_num_tokens not in tuned_buckets:
+                with autotune():
+                    _call()
+                tuned_buckets = set(tuned_buckets)
+                tuned_buckets.add(tune_max_num_tokens)
+                w._flashinfer_trtllm_fp8_autotuned_buckets = tuned_buckets
+                w._flashinfer_trtllm_fp8_autotuned = True
 
         result = _call()
         if isinstance(result, (list, tuple)):

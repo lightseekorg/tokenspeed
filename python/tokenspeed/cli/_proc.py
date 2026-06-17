@@ -32,7 +32,7 @@ import time
 logger = logging.getLogger(__name__)
 
 _GATEWAY_MODULE = "smg"
-_ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
+_ENGINE_MODULE_DEFAULT = "tokenspeed.runtime.entrypoints.smg_grpc_server"
 GATEWAY_DEFAULT_DISABLE_FLAGS = (
     "--disable-retries",
     "--disable-circuit-breaker",

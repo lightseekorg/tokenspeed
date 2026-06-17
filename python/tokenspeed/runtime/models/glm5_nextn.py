@@ -75,6 +75,15 @@ from tokenspeed.runtime.models.glm5 import (
 logger = logging.getLogger(__name__)
 
 
+def _mask_glm5_nextn_position_zero_embeddings(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    # The first MTP slot is seeded by target hidden states; its token embedding
+    # must not contribute to the draft input.
+    return torch.where(positions.unsqueeze(-1) == 0, 0, hidden_states)
+
+
 class GlmMoeDsaModelNextN(nn.Module):
     def __init__(
         self,
@@ -126,6 +135,10 @@ class GlmMoeDsaModelNextN(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+        hidden_states = _mask_glm5_nextn_position_zero_embeddings(
+            hidden_states,
+            positions,
+        )
         if captured_hidden_states is None:
             if hidden_states.shape[0] == 0:
                 # DP idle ranks pair the active ranks' collectives with a

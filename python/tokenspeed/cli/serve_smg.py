@@ -243,6 +243,54 @@ def _is_glm_dsa_model(model_id: str | None) -> bool:
     )
 
 
+_SPECULATIVE_ALGORITHM_FLAGS = ("--speculative-algorithm", "--speculative_algorithm")
+_SPECULATIVE_CONFIG_FLAGS = ("--speculative-config", "--speculative_config")
+_ENABLE_PREFIX_CACHE_FLAGS = (
+    "--enable-prefix-caching",
+    "--enable_prefix_caching",
+)
+_DISABLE_PREFIX_CACHE_FLAGS = (
+    "--no-enable-prefix-caching",
+    "--no_enable_prefix_caching",
+)
+_KVSTORE_DISABLE_FLAGS = ("--disable-kvstore", "--disable_kvstore")
+
+
+def _arg_value(args: list[str], flags: tuple[str, ...]) -> str | None:
+    for idx, token in enumerate(args):
+        if token in flags:
+            return args[idx + 1] if idx + 1 < len(args) else None
+        for flag in flags:
+            prefix = flag + "="
+            if token.startswith(prefix):
+                return token[len(prefix) :]
+    return None
+
+
+def _args_have_flag(args: list[str], flags: tuple[str, ...]) -> bool:
+    return any(token.split("=", 1)[0] in flags for token in args)
+
+
+def _args_request_speculative_decoding(*argvs: list[str]) -> bool:
+    for args in argvs:
+        if _arg_value(args, _SPECULATIVE_ALGORITHM_FLAGS):
+            return True
+        config = _arg_value(args, _SPECULATIVE_CONFIG_FLAGS)
+        if config is None:
+            continue
+        try:
+            parsed = json.loads(config)
+        except json.JSONDecodeError:
+            return True
+        if isinstance(parsed, dict) and (
+            parsed.get("method") is not None
+            or parsed.get("model") is not None
+            or parsed.get("num_speculative_tokens") is not None
+        ):
+            return True
+    return False
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -271,6 +319,25 @@ def _args_with_default_model_parsers(
         gateway_result.extend(["--reasoning-parser", parser])
     if is_deepseek_v4 and "--tool-call-parser" not in gateway_result:
         gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
+    if is_glm_dsa and _args_request_speculative_decoding(
+        engine_result, gateway_result
+    ):
+        prefix_cache_explicitly_enabled = _args_have_flag(
+            engine_result, _ENABLE_PREFIX_CACHE_FLAGS
+        ) or _args_have_flag(gateway_result, _ENABLE_PREFIX_CACHE_FLAGS)
+        prefix_cache_explicitly_disabled = _args_have_flag(
+            engine_result, _DISABLE_PREFIX_CACHE_FLAGS
+        ) or _args_have_flag(gateway_result, _DISABLE_PREFIX_CACHE_FLAGS)
+        if not prefix_cache_explicitly_enabled:
+            if not prefix_cache_explicitly_disabled:
+                logger.warning(
+                    "Disabling prefix caching for GLM DSA speculative decoding; "
+                    "pass --enable-prefix-caching to override after verifying "
+                    "correctness."
+                )
+                engine_result.append("--no-enable-prefix-caching")
+            if not _args_have_flag(engine_result, _KVSTORE_DISABLE_FLAGS):
+                engine_result.append("--disable-kvstore")
     return engine_result, gateway_result
 
 

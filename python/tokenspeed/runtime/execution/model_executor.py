@@ -212,6 +212,7 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._layerwise_mamba_cow_done = None
+        self._debug_spec_tokens_logged = 0
 
         if config.spec_algo is not None:
             max_num_pages_per_req = (
@@ -558,6 +559,96 @@ class ModelExecutor:
             torch.cat([prefill_accept, decode_accept]),
         )
 
+    def _maybe_log_spec_tokens(
+        self,
+        stage: str,
+        ctx: ForwardContext,
+        *,
+        output_tokens: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
+        logits_output: LogitsProcessorOutput | None = None,
+        candidates: torch.Tensor | None = None,
+    ) -> None:
+        if self.config.global_rank != 0 or not envs.TOKENSPEED_DEBUG_SPEC_TOKENS.get():
+            return
+        is_mid_prefill_chunk = (
+            ctx.forward_mode.is_extend()
+            and ctx.input_num_tokens >= self.config.chunked_prefill_size
+        )
+        if is_mid_prefill_chunk:
+            return
+        limit = max(0, envs.TOKENSPEED_DEBUG_SPEC_TOKENS_LIMIT.get())
+        if self._debug_spec_tokens_logged >= limit:
+            return
+        self._debug_spec_tokens_logged += 1
+
+        parts = [
+            f"stage={stage}",
+            f"mode={ctx.forward_mode.name}",
+            f"bs={ctx.bs}",
+            f"num_extends={ctx.num_extends}",
+            f"input_num_tokens={ctx.input_num_tokens}",
+        ]
+        if output_tokens is not None:
+            rows = min(int(output_tokens.shape[0]), 4) if output_tokens.ndim else 1
+            parts.append(
+                f"output={output_tokens[:rows].detach().to('cpu').tolist()}"
+            )
+        if accept_lengths is not None:
+            rows = min(int(accept_lengths.shape[0]), 4) if accept_lengths.ndim else 1
+            parts.append(
+                f"accept={accept_lengths[:rows].detach().to('cpu').tolist()}"
+            )
+        if candidates is not None:
+            rows = min(int(candidates.shape[0]), 4) if candidates.ndim else 1
+            parts.append(
+                f"candidates={candidates[:rows].detach().to('cpu').tolist()}"
+            )
+
+        def _append_finite_stats(name: str, tensor: torch.Tensor | None) -> None:
+            if tensor is None or tensor.numel() == 0:
+                return
+            view = tensor
+            if view.ndim >= 2:
+                rows = min(int(view.shape[0]), 2)
+                view = view[:rows]
+            finite = torch.isfinite(view)
+            finite_count = int(finite.sum().item())
+            total = int(finite.numel())
+            stats = [
+                f"{name}_shape={tuple(tensor.shape)}",
+                f"{name}_finite={finite_count}/{total}",
+            ]
+            if finite_count:
+                finite_values = view[finite].float()
+                stats.extend(
+                    [
+                        f"{name}_min={float(finite_values.min().item())}",
+                        f"{name}_max={float(finite_values.max().item())}",
+                    ]
+                )
+            parts.extend(stats)
+
+        logits = (
+            logits_output.next_token_logits
+            if logits_output is not None and logits_output.next_token_logits is not None
+            else None
+        )
+        _append_finite_stats("logits", logits)
+        hidden_states = (
+            logits_output.hidden_states
+            if logits_output is not None and logits_output.hidden_states is not None
+            else None
+        )
+        _append_finite_stats("hidden", hidden_states)
+        if logits is not None and logits.ndim == 2 and logits.shape[0] > 0:
+            rows = min(int(logits.shape[0]), 2)
+            k = min(5, int(logits.shape[-1]))
+            values, indices = torch.topk(logits[:rows], k=k, dim=-1)
+            parts.append(f"top_ids={indices.detach().to('cpu').tolist()}")
+            parts.append(f"top_vals={values.float().detach().to('cpu').tolist()}")
+        logger.warning("Spec token debug: %s", " ".join(parts))
+
     def _log_dp_sampling_route(self, bs: int, ctx: ForwardContext) -> None:
         runtime = self.dp_sampling_runtime_config
         if (
@@ -630,8 +721,22 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
 
+        self._maybe_log_spec_tokens(
+            "pre_sample",
+            ctx,
+            logits_output=logits_output,
+            candidates=candidates,
+        )
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
+        )
+        self._maybe_log_spec_tokens(
+            "post_sample",
+            ctx,
+            output_tokens=output_tokens,
+            accept_lengths=accept_lengths,
+            logits_output=logits_output,
+            candidates=candidates,
         )
 
         # Single choke point for every (sample/verify) x (greedy/flashinfer)
@@ -666,6 +771,12 @@ class ModelExecutor:
             self._run_drafter_and_store(
                 ctx, logits_output, output_tokens, accept_lengths
             )
+            self._maybe_log_spec_tokens(
+                "post_drafter",
+                ctx,
+                output_tokens=output_tokens,
+                accept_lengths=accept_lengths,
+            )
 
         output_logprobs = logits_output.next_token_logprobs
         # The draft hidden states ride along so a graph replay (which skips the
@@ -690,10 +801,22 @@ class ModelExecutor:
         graphs call this eagerly after replay, while TARGET_VERIFY /
         DRAFT_EXTEND models can capture this write into the full graph.
         """
+        if (
+            ctx.num_extends == ctx.bs
+            and self.input_buffers.all_extends_mid_chunk
+            and self.config.data_parallel_size == 1
+        ):
+            return
         next_round_input_ids = self.drafter.run(
             base_ctx=ctx,
             logits_output=logits_output,
             output_tokens=output_tokens,
+            accept_lengths=accept_lengths,
+        )
+        self._maybe_log_spec_tokens(
+            "drafter_next",
+            ctx,
+            output_tokens=next_round_input_ids,
             accept_lengths=accept_lengths,
         )
         # _update_runtime_state skips future_input_map when drafter is

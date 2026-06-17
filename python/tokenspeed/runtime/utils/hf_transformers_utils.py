@@ -462,8 +462,20 @@ def _wrap_deepseek_v4_tokenizer(
                 conversation.insert(0, {"role": "system", "tools": tools})
 
             reasoning_effort = kwargs.get("reasoning_effort")
-            if reasoning_effort not in ("max", "high"):
+            if isinstance(reasoning_effort, str):
+                if reasoning_effort == "none":
+                    thinking = False
+                    reasoning_effort = None
+                elif reasoning_effort in ("max", "xhigh"):
+                    reasoning_effort = "max"
+                elif reasoning_effort in ("minimal", "low", "medium", "high"):
+                    reasoning_effort = "high"
+                else:
+                    reasoning_effort = None
+            else:
                 reasoning_effort = None
+            if thinking and reasoning_effort is None:
+                reasoning_effort = "max"
 
             prompt = encode_messages(
                 conversation,

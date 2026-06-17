@@ -59,14 +59,24 @@ def _model_config() -> SimpleNamespace:
     )
 
 
-def test_blackwell_dsa_prefill_defaults_to_trtllm(monkeypatch) -> None:
+def test_blackwell_fp8_dsa_prefill_defaults_to_trtllm(monkeypatch) -> None:
     monkeypatch.setattr(
         dsa_mod,
         "current_platform",
         lambda: SimpleNamespace(is_nvidia=True, is_blackwell=True),
     )
 
-    assert dsa_mod._default_dsa_sparse_prefill_impl() == "trtllm"
+    assert dsa_mod._default_dsa_sparse_prefill_impl(torch.float8_e4m3fn) == "trtllm"
+
+
+def test_blackwell_bf16_dsa_prefill_defaults_to_flashmla(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dsa_mod,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True, is_blackwell=True),
+    )
+
+    assert dsa_mod._default_dsa_sparse_prefill_impl(torch.bfloat16) == "flashmla"
 
 
 def test_non_blackwell_dsa_prefill_keeps_flashmla(monkeypatch) -> None:
@@ -332,6 +342,99 @@ def test_glm_dsa_mtp_draft_full_context_topk_clamps_to_metadata_rows(
         full_topk.topk_lens,
         torch.tensor([0, 0, 0, 0, 0, 0, 7, 7, 7, 7, 7, 7], dtype=torch.int32),
     )
+
+
+def test_glm_dsa_deepgemm_prefill_passes_chunk_max_seqlen(monkeypatch) -> None:
+    attention = object.__new__(GlmMoeDsaAttention)
+    attention.indexer = SimpleNamespace(
+        index_head_dim=128,
+        index_n_heads=2,
+        softmax_scale=0.5,
+    )
+    attention.attn_mqa = SimpleNamespace(layer_id=3)
+    seen = {}
+
+    def fake_quantize_fp8_with_scale(x, **kwargs):
+        return (
+            x.to(torch.float8_e4m3fn),
+            torch.ones((x.shape[0], 1), dtype=torch.float32),
+        )
+
+    def fake_fp8_mqa_logits(
+        q,
+        kv,
+        weights,
+        row_starts,
+        row_ends,
+        *,
+        clean_logits,
+        max_seqlen_k,
+    ):
+        seen["max_seqlen_k"] = max_seqlen_k
+        seen["row_ends"] = row_ends.clone()
+        return torch.zeros((q.shape[0], 13), dtype=torch.float32)
+
+    def fake_indexer_topk_prefill(logits, row_starts, row_ends, out, topk):
+        out[:, :2] = torch.tensor([0, 1], dtype=torch.int32)
+
+    class _TokenToKVPool:
+        page_size = 64
+
+        def has_index_k_with_scale_buffer(self) -> bool:
+            return True
+
+        def gather_index_k_with_scale(self, layer_id, slots):
+            assert layer_id == 3
+            return (
+                torch.zeros((slots.numel(), 128), dtype=torch.uint8),
+                torch.ones((slots.numel(), 1), dtype=torch.float32),
+            )
+
+    monkeypatch.setattr(glm5_mod, "fast_topk_v2", object())
+    monkeypatch.setattr(
+        glm5_mod,
+        "deep_gemm",
+        SimpleNamespace(fp8_mqa_logits=fake_fp8_mqa_logits),
+    )
+    monkeypatch.setattr(
+        glm5_mod,
+        "quantize_fp8_with_scale",
+        fake_quantize_fp8_with_scale,
+    )
+    monkeypatch.setattr(
+        glm5_mod.torch.ops,
+        "trtllm",
+        SimpleNamespace(indexer_topk_prefill=fake_indexer_topk_prefill),
+        raising=False,
+    )
+    monkeypatch.setitem(
+        glm5_mod.global_server_args_dict,
+        "deepseek_v4_indexer_prefill_max_logits_mb",
+        1,
+    )
+
+    result = attention._compute_prefill_topk_indices_deepgemm(
+        indexer_output=glm5_mod.GlmDsaIndexerOutput(
+            query=torch.zeros((3, 2, 128), dtype=torch.float32),
+            key=torch.empty(0),
+            weights=torch.ones((3, 2), dtype=torch.float32),
+        ),
+        ctx=SimpleNamespace(token_to_kv_pool=_TokenToKVPool()),
+        prefix_lens=torch.tensor([10], dtype=torch.int32),
+        extend_lens=torch.tensor([3], dtype=torch.int32),
+        seq_lens=torch.tensor([13], dtype=torch.int32),
+        block_tables=torch.tensor([[0]], dtype=torch.int32),
+        kv_workspace_slots=torch.arange(13, dtype=torch.int64),
+        kv_workspace_bases=torch.tensor([100], dtype=torch.int32),
+        max_seq_len=13,
+        num_prefill_tokens=3,
+        topk=512,
+    )
+
+    assert result is not None
+    assert seen["max_seqlen_k"] == 13
+    assert torch.equal(seen["row_ends"], torch.tensor([11, 12, 13], dtype=torch.int32))
+    assert torch.equal(result.topk_lens, torch.tensor([11, 12, 13], dtype=torch.int32))
 
 
 def test_glm_dsa_decode_window_uses_metadata_rows_for_mtp_mismatch() -> None:
@@ -661,6 +764,74 @@ def test_glm_dsa_mtp_draft_sparse_decode_clamps_to_metadata_rows(
     assert torch.equal(seen["seq_lens"], topk_lens)
 
 
+def test_glm_dsa_flashmla_sparse_prefill_omits_topk_length(monkeypatch) -> None:
+    backend = object.__new__(DSABackend)
+    backend.data_type = torch.bfloat16
+    backend.page_size = 64
+    backend.kv_cache_dim = 576
+    backend.kv_lora_rank = 512
+    backend.index_topk = 4
+    backend._prefill_workspace_buffer = None
+    backend._prefill_workspace_rows = 0
+    backend._prefill_workspace_dim = 0
+    backend._prefill_query_workspace = None
+    backend._prefill_query_workspace_num_heads = None
+
+    layer = SimpleNamespace(
+        layer_id=3,
+        logit_cap=0.0,
+        tp_q_head_num=2,
+        head_dim=576,
+        v_head_dim=512,
+        scaling=0.5,
+    )
+    q = torch.arange(3 * 2 * 576, dtype=torch.float32).to(torch.bfloat16)
+    q = q.view(3, 2 * 576)
+    key_buffer = torch.zeros(2 * 64, 576, dtype=torch.bfloat16)
+    workspace_indices = torch.tensor(
+        [[0, 2, -1, -1], [3, 4, 5, 6], [1, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    kv_workspace_slots = torch.tensor([10, 11, 12, 70, 71, 72, 73], dtype=torch.int64)
+    topk_lens = torch.tensor([2, 4, 1], dtype=torch.int32)
+    seen = {}
+
+    def fake_flash_mla_sparse_fwd(**kwargs):
+        seen.update(kwargs)
+        return (
+            torch.ones(
+                kwargs["q"].shape[0],
+                kwargs["q"].shape[1],
+                layer.v_head_dim,
+                dtype=torch.bfloat16,
+            ),
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(dsa_mod, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
+
+    out = backend._forward_sparse_prefill_flashmla(
+        q=q,
+        layer=layer,
+        token_to_kv_pool=_TokenToKVPool(key_buffer),
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        seq_lens=torch.tensor([7], dtype=torch.int32),
+        workspace_indices=workspace_indices,
+        topk_lens=topk_lens,
+        kv_workspace_slots=kv_workspace_slots,
+        max_seq_len=7,
+    )
+
+    assert out.shape == (3, 2 * 512)
+    assert "topk_length" not in seen
+    assert seen["q"].shape[0] == 3
+    assert seen["kv"].shape == (7, 1, 576)
+    assert torch.equal(seen["indices"].squeeze(1), workspace_indices)
+    assert seen["sm_scale"] == 0.5
+    assert seen["d_v"] == 512
+
+
 def test_glm_dsa_sparse_prefill_uses_trtllm_path(monkeypatch) -> None:
     backend = object.__new__(DSABackend)
     backend._dense_backend = SimpleNamespace(
@@ -723,7 +894,7 @@ def test_glm_dsa_sparse_prefill_uses_trtllm_path(monkeypatch) -> None:
     assert seen["kv_cache"].shape == (2, 1, 64, 576)
     assert torch.equal(seen["block_tables"].view(3, 4), expected_block_tables)
     assert torch.equal(seen["seq_lens"], topk_lens)
-    assert seen["max_seq_len"] == backend.index_topk
+    assert seen["max_seq_len"] == 2307
     assert seen["sparse_mla_top_k"] == 4
     assert seen["bmm1_scale"] == 0.625
     assert seen["backend"] == "trtllm-gen"
@@ -793,7 +964,7 @@ def test_glm_dsa_fp8_sparse_prefill_accepts_fp8_query_for_trtllm(
     assert seen["kv_cache"].dtype == torch.float8_e4m3fn
     assert torch.equal(seen["block_tables"].view(2, 4), expected_block_tables)
     assert torch.equal(seen["seq_lens"], topk_lens)
-    assert seen["max_seq_len"] == backend.index_topk
+    assert seen["max_seq_len"] == 2307
     assert seen["backend"] == "trtllm-gen"
 
 
