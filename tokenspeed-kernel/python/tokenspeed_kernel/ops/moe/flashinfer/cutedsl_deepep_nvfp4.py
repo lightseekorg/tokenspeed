@@ -43,15 +43,17 @@ if platform.is_nvidia:
     )
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
-    _FLASHINFER_CUTEDSL_DEEPEP_NVFP4_MOE_TRAITS = (
-        {"weight_dtype": frozenset({"nvfp4"}), "ispp_alignment": frozenset({64})}
-        | {"supports_ep": frozenset({True}), "supports_bias": frozenset({False})}
-        | {"supports_all_to_all_ep": frozenset({True})}
-        | {"activation": frozenset({"silu", "swiglu"})}
-        | {"routing_mode": frozenset({"precomputed_topk"})}
-        | {"supports_deferred_finalize": frozenset({False})}
-        | {"internal_activation_dtype": frozenset({"input"})}
-    )
+    _FLASHINFER_CUTEDSL_DEEPEP_NVFP4_MOE_TRAITS = {
+        "weight_dtype": frozenset({"nvfp4"}),
+        "ispp_alignment": frozenset({64}),
+        "supports_ep": frozenset({True}),
+        "supports_bias": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({True}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "internal_activation_dtype": frozenset({"input"}),
+    }
 
     @register_weight_preprocessor(
         "moe",

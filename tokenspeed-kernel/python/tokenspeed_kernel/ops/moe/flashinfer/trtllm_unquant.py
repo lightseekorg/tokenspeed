@@ -44,15 +44,17 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
-    _FLASHINFER_TRTLLM_UNQUANT_MOE_TRAITS = (
-        {"weight_dtype": frozenset({"unquant"}), "ispp_alignment": frozenset({128})}
-        | {"supports_ep": frozenset({True}), "supports_bias": frozenset({False})}
-        | {"supports_all_to_all_ep": frozenset({False})}
-        | {"activation": frozenset({"silu", "swiglu"})}
-        | {"routing_mode": frozenset({"kernel_routing"})}
-        | {"supports_deferred_finalize": frozenset({True})}
-        | {"internal_activation_dtype": frozenset({"input"})}
-    )
+    _FLASHINFER_TRTLLM_UNQUANT_MOE_TRAITS = {
+        "weight_dtype": frozenset({"unquant"}),
+        "ispp_alignment": frozenset({128}),
+        "supports_ep": frozenset({True}),
+        "supports_bias": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({True}),
+        "internal_activation_dtype": frozenset({"input"}),
+    }
 
     @register_weight_preprocessor(
         "moe",

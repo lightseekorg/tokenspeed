@@ -276,15 +276,17 @@ def _local_topk_for_ep(
     return local_weights, local_ids, num_local_experts
 
 
-_TRITON_MXFP4_MOE_TRAITS = (
-    {"weight_dtype": frozenset({"mxfp4"}), "ispp_alignment": frozenset({1})}
-    | {"supports_ep": frozenset({False}), "supports_bias": frozenset({True})}
-    | {"supports_all_to_all_ep": frozenset({False})}
-    | {"activation": frozenset({"silu", "swiglu"})}
-    | {"routing_mode": frozenset({"kernel_routing"})}
-    | {"supports_deferred_finalize": frozenset({False})}
-    | {"internal_activation_dtype": frozenset({"input", "fp8"})}
-)
+_TRITON_MXFP4_MOE_TRAITS = {
+    "weight_dtype": frozenset({"mxfp4"}),
+    "ispp_alignment": frozenset({1}),
+    "supports_ep": frozenset({False}),
+    "supports_bias": frozenset({True}),
+    "supports_all_to_all_ep": frozenset({False}),
+    "activation": frozenset({"silu", "swiglu"}),
+    "routing_mode": frozenset({"kernel_routing"}),
+    "supports_deferred_finalize": frozenset({False}),
+    "internal_activation_dtype": frozenset({"input", "fp8"}),
+}
 
 
 @register_weight_preprocessor(
