@@ -176,6 +176,37 @@ class KVCachePool:
             recomputed_v[1] if isinstance(recomputed_v, list) else 0,
         )
 
+        # WORKAROUND: rebuild k/v_data_ptrs before writeback to recover from
+        # GPU memory corruption (the small 120B tensors get overwritten by
+        # other GPU operations).
+        def _rebuild_ptrs(pool):
+            if pool is None:
+                return
+            k_refs = getattr(pool, 'k_data_refs', None)
+            v_refs = getattr(pool, 'v_data_refs', None)
+            if k_refs is None or v_refs is None:
+                return
+            from tokenspeed_kernel.platform import current_platform
+            _platform = current_platform()
+            dev = pool.k_data_ptrs.device
+            pool.k_data_ptrs = torch.tensor(
+                [_platform.device_visible_data_ptr(x) for x in k_refs],
+                dtype=torch.uint64, device=dev,
+            )
+            pool.v_data_ptrs = torch.tensor(
+                [_platform.device_visible_data_ptr(x) for x in v_refs],
+                dtype=torch.uint64, device=dev,
+            )
+
+        _rebuild_ptrs(self.host_pool)
+        _rebuild_ptrs(self.draft_host_pool)
+        torch.cuda.synchronize()
+        _log.warning(
+            "[DEBUG-KVStore] rebuilt host_v=0x%x..0x%x",
+            self.host_pool.v_data_ptrs[0].item(),
+            self.host_pool.v_data_ptrs[-1].item(),
+        )
+
         self.host_pool.backup_from_device_all_layer(
             self.device_pool,
             dst_indices,
