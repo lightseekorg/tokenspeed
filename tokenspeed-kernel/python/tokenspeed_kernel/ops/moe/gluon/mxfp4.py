@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 from tokenspeed_kernel.platform import (
@@ -93,10 +91,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 
 
 if platform.is_amd:
-    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
-        gluon_mxfp_fused_moe,
-        shuffle_weight_for_gluon_dot_layout,
-    )
+    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import gluon_mxfp_fused_moe
 
     @register_kernel(
         "moe",
@@ -128,15 +123,6 @@ if platform.is_amd:
         w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
             w.w2_weight, w.w2_weight_scale, num_warps
         )
-
-        if os.environ.get("TS_WD_STAGE1_W_VGPR", "") == "1":
-            raw_w13 = getattr(getattr(w13_weight, "storage", None), "data", None)
-            if isinstance(raw_w13, torch.Tensor):
-                raw_w13._wd_stage1_shuffled = shuffle_weight_for_gluon_dot_layout(
-                    raw_w13,
-                    block_k_pk=128,
-                    block_n=128,
-                )
 
         # Collapse per-expert input scales to a single per-tensor scale
         # per GEMM. Quark exports a constant value across experts for

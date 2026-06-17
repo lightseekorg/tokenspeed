@@ -383,10 +383,7 @@ def get_mfma_layout(
         warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
     instr_shape = [16, 16, 128] if use_mfma_scaled else [16, 16, 32]
-    # tpw=[2,2] required when scales preshuffle through LDS (the 5-D
-    # unswizzle view absorbs one 2x2 MFMA block per warp per K-iter).
-    # AITER's M=16 W4A8 Triton kernel uses tpw=[1,2]; keep it env-gated
-    # because other Gluon scale-preshuffle kernels historically expect [2,2].
+    # M=16 direct tiles use [1,2]; larger scale-preshuffle kernels keep [2,2].
     if scale_preshuffle and block_m <= 16:
         tiles_per_warp = [1, 2]
     else:
@@ -5267,8 +5264,6 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     swiglu_limit: float = 7.0,
 ) -> torch.Tensor | None:
     """Small-M direct warp-decode MoE for GPT-OSS FP8 x MXFP4 path."""
-    if _WD_DISABLE:
-        return None
     assert hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
     if hidden_states.ndim != 2 or router_logits.ndim != 2:
@@ -5644,7 +5639,6 @@ FUSED_ROUTE_MAX_M = SMALLM_MAX_M
 # tile ONCE and batches its routed tokens into the MFMA M-dim (weight reuse),
 # producing the exact same ``inter`` as the coop stage1 (drop-in). Default OFF
 # keeps the coop path byte-for-byte unchanged.
-_WD_DISABLE = os.environ.get("TS_WD_DISABLE", "") == "1"
 _WD_GROUPED_S1 = os.environ.get("TS_WD_GROUPED_S1", "") == "1"
 # grouped wins only at M=16; coop is faster for M<=8 (measured). Default gate 16;
 # override via TS_WD_GROUPED_MIN_M (e.g. =1) to force grouped at all M for profiling.
