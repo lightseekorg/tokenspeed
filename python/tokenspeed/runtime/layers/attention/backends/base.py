@@ -128,7 +128,7 @@ class AttentionBackend(ABC):
         self.step_counter = step_counter
 
     @contextmanager
-    def record_cache_step(
+    def record_pd_cache_step(
         self,
         forward_mode: ForwardMode,
         save_kv_cache: bool,
@@ -176,7 +176,7 @@ class AttentionBackend(ABC):
         ``None`` keeps the default (record on the EXTEND-side path), an explicit
         bool forces it so a DECODE-dispatched draft catch-up can still record.
         """
-        with self.record_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+        with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
                 ret = self.forward_decode(
                     q,

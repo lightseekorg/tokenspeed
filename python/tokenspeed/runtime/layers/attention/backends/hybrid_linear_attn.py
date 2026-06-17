@@ -1292,7 +1292,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # See AttentionBackend.forward for the record_kv_cache contract; the step
         # is recorded in this wrapper (not the child backends) to keep one step
         # per model layer across full-attn + mamba. Idle already returned above.
-        with self.record_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+        with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
                 ret = backend.forward_decode(
                     q,
