@@ -203,10 +203,12 @@ def _get_compiled_mla_kernel(
         is_var_split_kv=is_var_split_kv,
         fold_sq_factor=fold_sq_factor,
     )
+    # Causal masking is now supported by both the FP8 and FP16/BF16 kernels.
+    kernel_kwargs["is_causal"] = causal_mask
+    kernel_kwargs["num_heads"] = num_heads
+    kernel_kwargs["seq_len_q"] = seq_len_q
     if is_fp8:
-        kernel_kwargs["is_causal"] = causal_mask
-        kernel_kwargs["num_heads"] = num_heads
-        kernel_kwargs["seq_len_q"] = seq_len_q
+        # DCP (cp_world) strided global-coordinate causal masking is fp8-only.
         kernel_kwargs["cp_world"] = cp_world
     kernel_obj = KernelClass(**kernel_kwargs)
 

@@ -172,6 +172,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         is_var_seq: bool,
         is_var_split_kv: bool,
         fold_sq_factor: int = 1,
+        is_causal: bool = False,
+        num_heads: int = 128,
+        seq_len_q: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -210,6 +213,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
         self.fold_sq_factor = fold_sq_factor
+        self.is_causal = is_causal
+        self.num_heads = num_heads
+        self.seq_len_q = seq_len_q
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -2376,8 +2382,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         correction_factor = self.acc_dtype(1)
         common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
 
-        # no mask applied
-        while k_tile_count > 1:
+        # Number of tiles from the global-K end that may contain causal-masked
+        # positions. For causal, min k_bound = K - (S_q-1), which can span up
+        # to ceil((S_q-1)/tile_N)+1 tiles (tile-boundary-crossing case).
+        # Non-causal only needs the final K-bound tile.
+        tile_n = self.mma_qk_tiler[1]
+        if cutlass.const_expr(self.is_causal):
+            mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
+        else:
+            mask_tile_count = 1
+
+        # first_mask_tile_idx is the global index of the first tile that may
+        # need masking. Runtime because it depends on K (per-batch in
+        # var-seq / split-KV).
+        first_mask_tile_idx = k_tile_total - mask_tile_count
+
+        # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
+        while k_tile_count > 1 and k_index < first_mask_tile_idx:
             (
                 mma_s_consumer_state,
                 p_mma_producer_state,
@@ -2401,7 +2422,33 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             k_index = k_index + 1
             k_tile_count = k_tile_count - 1
 
-        # mask applied
+        # Phase 2: intermediate tiles that overlap the causal/K-bound region
+        # but are not this work-split's final tile.
+        while k_tile_count > 1:
+            (
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+            ) = self.softmax(
+                common_params,
+                softmax_params,
+                k_index,
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+                True,
+                False,
+            )
+            k_index = k_index + 1
+            k_tile_count = k_tile_count - 1
+
+        # Phase 3: this work-split's final tile.
         if cutlass.const_expr(common_params.mAccO is not None):
             (
                 mma_s_consumer_state,
@@ -2420,7 +2467,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 row_max,
                 row_sum,
                 correction_factor,
-                k_index == k_tile_total - 1,
+                k_index >= first_mask_tile_idx,
                 True,
             )
         else:
@@ -2571,7 +2618,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         row_max: cutlass.Float32,
         row_sum: cutlass.Float32,
         correction_factor: cutlass.Float32,
-        is_last_tile: bool,
+        apply_mask: bool,
         is_local_last_tile: cutlass.Boolean,
     ) -> tuple[
         pipeline.PipelineState,
@@ -2601,8 +2648,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type row_sum: cutlass.Float32
         :param correction_factor: The correction factor
         :type correction_factor: cutlass.Float32
-        :param is_last_tile: Whether the last tile
-        :type is_last_tile: bool
+        :param apply_mask: Whether the tile needs K-bound / causal masking
+        :type apply_mask: bool
         :param is_local_last_tile: Whether the last tile is local
         :type is_local_last_tile: cutlass.Boolean
 
@@ -2648,15 +2695,33 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         arch = BaseDSL._get_dsl().get_arch_enum()
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
+            cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                if is_last_tile:
+                if apply_mask:
+                    qk_col = tTR_tS[i][1]
+                    if cutlass.const_expr(self.is_causal):
+                        # Spec-decoding (MTP) causal mask: row r's effective K
+                        # bound is K - (S_q - 1) + q_tok(r). With fold factor F
+                        # the M tile is [F sub_q_tok][num_heads heads].
+                        if cutlass.const_expr(self.fold_sq_factor > 1):
+                            qk_row = tTR_tS[i][0]
+                            q_tok = (
+                                common_params.blk_coord[1] * self.fold_sq_factor
+                                + (qk_row + common_params.blk_coord[0] * cta_m_rows)
+                                // self.num_heads
+                            )
+                        else:
+                            q_tok = common_params.blk_coord[1]
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    else:
+                        k_bound = common_params.K
                     tTR_rAcc[i] = (
                         tTR_rAcc[i]
                         if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                            common_params.K,
+                            qk_col + self.mma_qk_tiler[1] * k_index,
+                            k_bound,
                         )
-                        else -self.acc_dtype.inf
+                        else self.acc_dtype(-1.0e6)
                     )
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
@@ -2683,15 +2748,30 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 (tTR_rAcc_red, tTR_rMax),
             )
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
-            if is_last_tile:
+            if apply_mask:
+                cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                    qk_col = tTR_tS[i][1]
+                    if cutlass.const_expr(self.is_causal):
+                        if cutlass.const_expr(self.fold_sq_factor > 1):
+                            qk_row = tTR_tS[i][0]
+                            q_tok = (
+                                common_params.blk_coord[1] * self.fold_sq_factor
+                                + (qk_row + common_params.blk_coord[0] * cta_m_rows)
+                                // self.num_heads
+                            )
+                        else:
+                            q_tok = common_params.blk_coord[1]
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    else:
+                        k_bound = common_params.K
                     tTR_rAcc[i] = (
                         tTR_rAcc[i]
                         if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                            common_params.K,
+                            qk_col + self.mma_qk_tiler[1] * k_index,
+                            k_bound,
                         )
-                        else -self.acc_dtype.inf
+                        else self.acc_dtype(-1.0e6)
                     )
                 # reduction for row_max
                 row_max_new = tTR_rAcc.load().reduce(
