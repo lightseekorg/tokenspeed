@@ -78,6 +78,33 @@ class KVCachePool:
         dst_indices: torch.Tensor,
         block_quota: int | None = None,
     ) -> None:
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        # Sync BEFORE base writeback to flush any residual async error
+        # from previous draft writeback on this stream.
+        torch.cuda.synchronize()
+        _log.warning(
+            "[DEBUG-KVStore] pre-sync OK. Starting base writeback. "
+            "host_pool=%s device_pool=%s "
+            "layer_num=%s token_stride_size=%s "
+            "head_num=%s head_dim=%s dtype=%s "
+            "device_pool.layer_num=%s "
+            "host_pool.size=%s device_pool.size=%s "
+            "src_indices.numel=%d dst_indices.numel=%d",
+            type(self.host_pool).__name__,
+            type(self.device_pool).__name__,
+            getattr(self.host_pool, 'layer_num', '?'),
+            getattr(self.host_pool, 'token_stride_size', '?'),
+            getattr(self.host_pool, 'head_num', '?'),
+            getattr(self.host_pool, 'head_dim', '?'),
+            getattr(self.host_pool, 'dtype', '?'),
+            getattr(self.device_pool, 'layer_num', '?'),
+            getattr(self.host_pool, 'size', '?'),
+            getattr(self.device_pool, 'size', '?'),
+            src_indices.numel(), dst_indices.numel(),
+        )
+
         self.host_pool.backup_from_device_all_layer(
             self.device_pool,
             dst_indices,
@@ -85,7 +112,28 @@ class KVCachePool:
             self.io_backend,
             block_quota=block_quota,
         )
+        torch.cuda.synchronize()
+        _log.warning("[DEBUG-KVStore] base writeback OK.")
+
         if self.draft_host_pool is not None:
+            _log.warning(
+                "[DEBUG-KVStore] Starting draft writeback. "
+                "draft_host_pool=%s draft_device_pool=%s "
+                "layer_num=%s token_stride_size=%s "
+                "head_num=%s head_dim=%s dtype=%s "
+                "draft_device_pool.layer_num=%s "
+                "draft_host_pool.size=%s draft_device_pool.size=%s",
+                type(self.draft_host_pool).__name__,
+                type(self.draft_device_pool).__name__,
+                getattr(self.draft_host_pool, 'layer_num', '?'),
+                getattr(self.draft_host_pool, 'token_stride_size', '?'),
+                getattr(self.draft_host_pool, 'head_num', '?'),
+                getattr(self.draft_host_pool, 'head_dim', '?'),
+                getattr(self.draft_host_pool, 'dtype', '?'),
+                getattr(self.draft_device_pool, 'layer_num', '?'),
+                getattr(self.draft_host_pool, 'size', '?'),
+                getattr(self.draft_device_pool, 'size', '?'),
+            )
             self.draft_host_pool.backup_from_device_all_layer(
                 self.draft_device_pool,
                 dst_indices,
@@ -93,6 +141,8 @@ class KVCachePool:
                 self.io_backend,
                 block_quota=block_quota,
             )
+            torch.cuda.synchronize()
+            _log.warning("[DEBUG-KVStore] draft writeback OK.")
 
     def loadback(
         self, src_indices: torch.Tensor, dst_indices: torch.Tensor, layer_idx: int
