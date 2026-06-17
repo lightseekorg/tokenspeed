@@ -3191,6 +3191,22 @@ def _prefill_m16_stage1_direct_kernel(
     schedule_raw = gl.load(BlockSchedule + pid_m).to(gl.uint32, bitcast=True)
     expert = (schedule_raw & 0x0000FFFF).to(gl.int32)
     block_in_expert = (schedule_raw >> 16).to(gl.int32)
+    gl.assume(M >= 0)
+    gl.assume(M_X >= 0)
+    gl.assume(N >= 0)
+    gl.assume(K >= 0)
+    gl.assume(expert >= 0)
+    gl.assume(block_in_expert >= 0)
+    gl.assume(stride_xm >= 0)
+    gl.assume(stride_xk >= 0)
+    gl.assume(stride_we >= 0)
+    gl.assume(stride_wn >= 0)
+    gl.assume(stride_wk >= 0)
+    gl.assume(stride_wse >= 0)
+    gl.assume(stride_wsn >= 0)
+    gl.assume(stride_wsk >= 0)
+    gl.assume(stride_ym >= 0)
+    gl.assume(stride_yn >= 0)
 
     cfg = MoEConfig(
         BLOCK_M,
@@ -3214,6 +3230,7 @@ def _prefill_m16_stage1_direct_kernel(
     )
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    gl.static_assert(BLOCK_K_SCALE == 8, "split-friendly WScale offset assumes BLOCK_K=256")
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
 
     X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
@@ -3235,9 +3252,13 @@ def _prefill_m16_stage1_direct_kernel(
 
     m_base = gl.load(SliceOffs + expert).to(gl.int32)
     m_size = gl.load(SliceSizes + expert).to(gl.int32)
+    gl.assume(m_base >= 0)
+    gl.assume(m_size > 0)
     off_m = m_base + block_in_expert * BLOCK_M
+    gl.assume(off_m >= 0)
     m_limit = m_base + m_size
     off_n = pid_n * BLOCK_N
+    gl.assume(off_n >= 0)
 
     # Dot-layout coordinates for the direct-to-dot path and scale/epilogue.
     am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))[:, None]
@@ -3264,12 +3285,14 @@ def _prefill_m16_stage1_direct_kernel(
             ptr=Gather, offsets=(m_base + local_m).to(gl.int32)
         ).to(gl.int32)
         valid_m = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, cfg.dot_layout_x))
+        token_m_addr = token_m.to(gl.uint32)
     else:
         sorted_safe = gl.where(in_sorted, sorted_m, gl.zeros_like(sorted_m))
         token_m = gl.amd.cdna4.buffer_load(
             ptr=Gather, offsets=sorted_safe.to(gl.int32), mask=in_sorted, other=0
         ).to(gl.int32)
         valid_m = in_sorted & (token_m < M_X)
+        token_m_addr = token_m.to(gl.uint32)
 
     if LOCAL_STAGE:
         sorted_m_l = off_m + lm
@@ -3281,12 +3304,14 @@ def _prefill_m16_stage1_direct_kernel(
                 ptr=Gather, offsets=(m_base + local_m_l).to(gl.int32)
             ).to(gl.int32)
             valid_m_l = gl.full([BLOCK_M], True, gl.int1, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+            token_m_l_addr = token_m_l.to(gl.uint32)
         else:
             sorted_safe_l = gl.where(in_sorted_l, sorted_m_l, gl.zeros_like(sorted_m_l))
             token_m_l = gl.amd.cdna4.buffer_load(
                 ptr=Gather, offsets=sorted_safe_l.to(gl.int32), mask=in_sorted_l, other=0
             ).to(gl.int32)
             valid_m_l = in_sorted_l & (token_m_l < M_X)
+            token_m_l_addr = token_m_l.to(gl.uint32)
 
     n_cols = off_n + bn
     n_cols_s = off_n + bsn
@@ -3294,32 +3319,20 @@ def _prefill_m16_stage1_direct_kernel(
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
 
     total_kt = gl.cdiv(K, BLOCK_K)
+    gl.assume(total_kt >= 0)
     num_full = K // BLOCK_K
+    gl.assume(num_full >= 0)
     for kt in range(0, num_full):
-        k_scale_idx = kt * BLOCK_K_SCALE + bsk
-        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(
-            n_cols_s, k_scale_idx, stride_wsk, stride_wsn
+        gl.assume(kt >= 0)
+        s = _load_w_scale_tile_direct_cdna4(
+            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
         )
-        if UNMASK_FULL:
-            if USE_CG_SCALE:
-                s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off.to(gl.int32), cache=".cg")
-            else:
-                s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off.to(gl.int32))
-        else:
-            if USE_CG_SCALE:
-                s = gl.amd.cdna4.buffer_load(
-                    ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0, cache=".cg"
-                )
-            else:
-                s = gl.amd.cdna4.buffer_load(
-                    ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0
-                )
         if LOCAL_STAGE:
             k_elem_l = kt * BLOCK_K + lk
             k_pack_l = kt * BLOCK_K_PACKED + lwk
             n_cols_l = off_n + lwn
             x_off_l = (
-                gl.expand_dims(token_m_l, 1).to(gl.int64) * stride_xm
+                gl.expand_dims(token_m_l_addr, 1).to(gl.int64) * stride_xm
                 + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
             )
             w_off_l = (
@@ -3328,7 +3341,9 @@ def _prefill_m16_stage1_direct_kernel(
                 + n_cols_l.to(gl.int64) * stride_wn
             )
             if UNMASK_FULL:
-                a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32))
+                a_l = gl.amd.cdna4.buffer_load(
+                    ptr=X, offsets=x_off_l.to(gl.int32)
+                )
                 if USE_CG:
                     b_l = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off_l.to(gl.int32), cache=".cg")
                 else:
@@ -3366,21 +3381,26 @@ def _prefill_m16_stage1_direct_kernel(
         else:
             k_elem = kt * BLOCK_K + ak
             k_pack = kt * BLOCK_K_PACKED + bk
-            x_off = token_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
+            x_off = token_m_addr[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
             w_off = (
                 expert.to(gl.int64) * stride_we
                 + n_cols.to(gl.int64) * stride_wn
                 + k_pack.to(gl.int64) * stride_wk
             )
             if UNMASK_FULL:
-                a = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off.to(gl.int32))
+                a = gl.amd.cdna4.buffer_load(
+                    ptr=X, offsets=x_off.to(gl.int32)
+                )
                 if USE_CG:
                     b = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off.to(gl.int32), cache=".cg")
                 else:
                     b = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off.to(gl.int32))
             else:
                 a = gl.amd.cdna4.buffer_load(
-                    ptr=X, offsets=x_off.to(gl.int32), mask=valid_m[:, None], other=0.0
+                    ptr=X,
+                    offsets=x_off.to(gl.int32),
+                    mask=valid_m[:, None],
+                    other=0.0,
                 )
                 if USE_CG:
                     b = gl.amd.cdna4.buffer_load(
@@ -3397,29 +3417,16 @@ def _prefill_m16_stage1_direct_kernel(
 
     if total_kt > num_full:
         kt = num_full
-        k_scale_idx = kt * BLOCK_K_SCALE + bsk
-        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(
-            n_cols_s, k_scale_idx, stride_wsk, stride_wsn
+        gl.assume(kt >= 0)
+        s = _load_w_scale_tile_direct_cdna4(
+            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
         )
-        sk_valid = k_scale_idx < (K // 32)
-        if USE_CG_SCALE:
-            s = gl.amd.cdna4.buffer_load(
-                ptr=WScale,
-                offsets=s_off.to(gl.int32),
-                mask=(n_cols_s < N) & sk_valid,
-                other=0,
-                cache=".cg",
-            )
-        else:
-            s = gl.amd.cdna4.buffer_load(
-                ptr=WScale, offsets=s_off.to(gl.int32), mask=(n_cols_s < N) & sk_valid, other=0
-            )
         if LOCAL_STAGE:
             k_elem_l = kt * BLOCK_K + lk
             k_pack_l = kt * BLOCK_K_PACKED + lwk
             n_cols_l = off_n + lwn
             x_off_l = (
-                gl.expand_dims(token_m_l, 1).to(gl.int64) * stride_xm
+                gl.expand_dims(token_m_l_addr, 1).to(gl.int64) * stride_xm
                 + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
             )
             w_off_l = (
@@ -3459,7 +3466,7 @@ def _prefill_m16_stage1_direct_kernel(
         else:
             k_elem = kt * BLOCK_K + ak
             k_pack = kt * BLOCK_K_PACKED + bk
-            x_off = token_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
+            x_off = token_m_addr[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
             w_off = (
                 expert.to(gl.int64) * stride_we
                 + n_cols.to(gl.int64) * stride_wn
@@ -3599,6 +3606,21 @@ def _prefill_m16_stage2_direct_kernel(
     schedule_raw = gl.load(BlockSchedule + pid_m).to(gl.uint32, bitcast=True)
     expert = (schedule_raw & 0x0000FFFF).to(gl.int32)
     block_in_expert = (schedule_raw >> 16).to(gl.int32)
+    gl.assume(M >= 0)
+    gl.assume(N >= 0)
+    gl.assume(K >= 0)
+    gl.assume(expert >= 0)
+    gl.assume(block_in_expert >= 0)
+    gl.assume(stride_xm >= 0)
+    gl.assume(stride_xk >= 0)
+    gl.assume(stride_we >= 0)
+    gl.assume(stride_wn >= 0)
+    gl.assume(stride_wk >= 0)
+    gl.assume(stride_wse >= 0)
+    gl.assume(stride_wsn >= 0)
+    gl.assume(stride_wsk >= 0)
+    gl.assume(stride_ym >= 0)
+    gl.assume(stride_yn >= 0)
 
     cfg = MoEConfig(
         BLOCK_M,
@@ -3622,6 +3644,7 @@ def _prefill_m16_stage2_direct_kernel(
     )
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    gl.static_assert(BLOCK_K_SCALE == 8, "split-friendly WScale offset assumes BLOCK_K=256")
 
     X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
     W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
@@ -3640,7 +3663,10 @@ def _prefill_m16_stage2_direct_kernel(
 
     m_base = gl.load(SliceOffs + expert).to(gl.int32)
     m_size = gl.load(SliceSizes + expert).to(gl.int32)
+    gl.assume(m_base >= 0)
+    gl.assume(m_size > 0)
     off_n = pid_n * BLOCK_N
+    gl.assume(off_n >= 0)
 
     am = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.dot_layout_x))[:, None]
     ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, cfg.dot_layout_x))[None, :]
@@ -3683,20 +3709,14 @@ def _prefill_m16_stage2_direct_kernel(
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
 
     total_kt = gl.cdiv(K, BLOCK_K)
+    gl.assume(total_kt >= 0)
     num_full = K // BLOCK_K
+    gl.assume(num_full >= 0)
     for kt in range(0, num_full):
-        k_scale_idx = kt * BLOCK_K_SCALE + bsk
-        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(
-            n_cols_s, k_scale_idx, stride_wsk, stride_wsn
+        gl.assume(kt >= 0)
+        s = _load_w_scale_tile_direct_cdna4(
+            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
         )
-        if USE_CG_SCALE:
-            s = gl.amd.cdna4.buffer_load(
-                ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0, cache=".cg"
-            )
-        else:
-            s = gl.amd.cdna4.buffer_load(
-                ptr=WScale, offsets=s_off.to(gl.int32), mask=n_cols_s < N, other=0
-            )
         if LOCAL_STAGE:
             k_elem_l = kt * BLOCK_K + lk
             k_pack_l = kt * BLOCK_K_PACKED + lwk
@@ -3711,7 +3731,9 @@ def _prefill_m16_stage2_direct_kernel(
                 + n_cols_l.to(gl.int64) * stride_wn
             )
             if UNMASK_FULL:
-                a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32))
+                a_l = gl.amd.cdna4.buffer_load(
+                    ptr=X, offsets=x_off_l.to(gl.int32)
+                )
             else:
                 a_l = gl.amd.cdna4.buffer_load(
                     ptr=X,
@@ -3744,10 +3766,15 @@ def _prefill_m16_stage2_direct_kernel(
             x_off = row_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
             w_off = expert.to(gl.int64) * stride_we + n_cols.to(gl.int64) * stride_wn + k_pack.to(gl.int64) * stride_wk
             if UNMASK_FULL:
-                a = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off.to(gl.int32))
+                a = gl.amd.cdna4.buffer_load(
+                    ptr=X, offsets=x_off.to(gl.int32)
+                )
             else:
                 a = gl.amd.cdna4.buffer_load(
-                    ptr=X, offsets=x_off.to(gl.int32), mask=valid_m[:, None], other=0.0
+                    ptr=X,
+                    offsets=x_off.to(gl.int32),
+                    mask=valid_m[:, None],
+                    other=0.0,
                 )
             if USE_CG:
                 b = gl.amd.cdna4.buffer_load(
@@ -3761,28 +3788,22 @@ def _prefill_m16_stage2_direct_kernel(
 
     if total_kt > num_full:
         kt = num_full
-        k_scale_idx = kt * BLOCK_K_SCALE + bsk
-        s_off = expert.to(gl.int64) * stride_wse + _mxfp4_scale_offset(n_cols_s, k_scale_idx, stride_wsk, stride_wsn)
-        sk_valid = k_scale_idx < (K // 32)
-        if USE_CG_SCALE:
-            s = gl.amd.cdna4.buffer_load(
-                ptr=WScale,
-                offsets=s_off.to(gl.int32),
-                mask=(n_cols_s < N) & sk_valid,
-                other=0,
-                cache=".cg",
-            )
-        else:
-            s = gl.amd.cdna4.buffer_load(
-                ptr=WScale, offsets=s_off.to(gl.int32), mask=(n_cols_s < N) & sk_valid, other=0
-            )
+        gl.assume(kt >= 0)
+        s = _load_w_scale_tile_direct_cdna4(
+            WScale, expert, kt, off_n, N, stride_wse, stride_wsk, stride_wsn, cfg, USE_CG_SCALE
+        )
         if LOCAL_STAGE:
             k_elem_l = kt * BLOCK_K + lk
             k_pack_l = kt * BLOCK_K_PACKED + lwk
             n_cols_l = off_n + lwn
             x_off_l = gl.expand_dims(row_m_l, 1).to(gl.int64) * stride_xm + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
             w_off_l = expert.to(gl.int64) * stride_we + k_pack_l.to(gl.int64) * stride_wk + n_cols_l.to(gl.int64) * stride_wn
-            a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32), mask=gl.expand_dims(valid_m_l, 1) & (gl.expand_dims(k_elem_l, 0) < K), other=0.0)
+            a_l = gl.amd.cdna4.buffer_load(
+                ptr=X,
+                offsets=x_off_l.to(gl.int32),
+                mask=gl.expand_dims(valid_m_l, 1) & (gl.expand_dims(k_elem_l, 0) < K),
+                other=0.0,
+            )
             if USE_CG:
                 b_l = gl.amd.cdna4.buffer_load(
                     ptr=W,
@@ -3807,7 +3828,12 @@ def _prefill_m16_stage2_direct_kernel(
             k_pack = kt * BLOCK_K_PACKED + bk
             x_off = row_m[:, None].to(gl.int64) * stride_xm + k_elem.to(gl.int64) * stride_xk
             w_off = expert.to(gl.int64) * stride_we + n_cols.to(gl.int64) * stride_wn + k_pack.to(gl.int64) * stride_wk
-            a = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off.to(gl.int32), mask=valid_m[:, None] & (k_elem < K), other=0.0)
+            a = gl.amd.cdna4.buffer_load(
+                ptr=X,
+                offsets=x_off.to(gl.int32),
+                mask=valid_m[:, None] & (k_elem < K),
+                other=0.0,
+            )
             if USE_CG:
                 b = gl.amd.cdna4.buffer_load(
                     ptr=W,
@@ -6222,6 +6248,74 @@ def _mxfp4_scale_offset(n_idx, k_scale_idx, stride_wsk, stride_wsn):
 
 
 @gluon.jit
+def _mxfp4_scale_offset_k8_lane(n_idx, k_scale_lane, stride_wsk, stride_wsn):
+    """Split-friendly MXFP4 scale lane offset for BLOCK_K_SCALE == 8.
+
+    The direct M=16 kernels add the uniform ``kt * 256 * stride_wsk`` term
+    separately so the compiler can route it through raw-buffer ``soffset``.
+    """
+    row = n_idx.to(gl.uint32)
+    lin = (
+        (k_scale_lane % 4) * 64
+        + (row % 16) * 4
+        + ((k_scale_lane % 8) // 4) * 2
+        + ((row % 32) // 16)
+    )
+    return (row // 32).to(gl.int64) * stride_wsn + lin.to(gl.int64) * stride_wsk
+
+
+@gluon.jit
+def _load_w_scale_tile_direct_cdna4(
+    WScale,
+    expert,
+    kt,
+    off_n,
+    N,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    cfg,
+    USE_CG_SCALE: gl.constexpr,
+):
+    """Load W e8m0 scales in AITER's physical CDNA4-swizzled layout.
+
+    The raw load shape is [BLOCK_N/32, BLOCK_K_SCALE*32], where the K-like
+    axis is physically contiguous.  After the load, reshape/permute reconstructs
+    the logical [BLOCK_N, BLOCK_K_SCALE] scale tile consumed by scaled MFMA.
+    """
+    BLOCK_N: gl.constexpr = cfg.BLOCK_N
+    BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
+    BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
+    BLOCK_K_S_PS: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
+    LW_S: gl.constexpr = cfg.load_layout_w_scale
+
+    offs_ws_n = gl.arange(0, BLOCK_N_PS, layout=gl.SliceLayout(1, LW_S))[:, None]
+    offs_ws_k = gl.arange(0, BLOCK_K_S_PS, layout=gl.SliceLayout(0, LW_S))[None, :]
+    rows_n_scale = off_n // cfg.PRESHUFFLE_FACTOR + offs_ws_n
+    row_limit_w_s = (N + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
+    scale_k_base = kt * BLOCK_K_S_PS
+    raw_off = (
+        expert.to(gl.int64) * stride_wse
+        + (scale_k_base + offs_ws_k).to(gl.int64) * stride_wsk
+        + rows_n_scale.to(gl.int64) * stride_wsn
+    )
+    mask = rows_n_scale < row_limit_w_s
+    if USE_CG_SCALE:
+        raw = gl.amd.cdna4.buffer_load(
+            ptr=WScale, offsets=raw_off.to(gl.int32), mask=mask, other=0, cache=".cg"
+        )
+    else:
+        raw = gl.amd.cdna4.buffer_load(
+            ptr=WScale, offsets=raw_off.to(gl.int32), mask=mask, other=0
+        )
+
+    raw_7d = raw.reshape((BLOCK_N_PS, BLOCK_K_SCALE // 8, 4, 16, 2, 2, 1))
+    raw_perm = raw_7d.permute((0, 5, 3, 1, 4, 2, 6))
+    logical = raw_perm.reshape((BLOCK_N, BLOCK_K_SCALE))
+    return gl.convert_layout(logical, cfg.layout_w_scale)
+
+
+@gluon.jit
 def _swiglu_gate_up(gate, linear, alpha: gl.constexpr, limit: gl.constexpr):
     """SwiGLU on separate gate/up MFMA accumulators (pre-split form)."""
     if limit > 0.0:
@@ -7044,7 +7138,9 @@ def _warp_decode_stage2_load_tile(
         # Partial / odd final K-tile (K = intermediate dim I): mask out-of-range
         # K lanes to 0 so they contribute nothing and never over-read.
         sk_valid = (kt * BLOCK_K_SCALE + bsk) < (I // 32)
-        a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off, mask=k_elem < I, other=0.0)
+        a = gl.amd.cdna4.buffer_load(
+            ptr=X, offsets=a_off, mask=k_elem < I, other=0.0
+        )
         b = gl.amd.cdna4.buffer_load(
             ptr=W, offsets=b_off, mask=k_pack < I_PACKED, other=0
         )
