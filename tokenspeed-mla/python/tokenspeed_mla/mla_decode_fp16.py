@@ -366,6 +366,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.k_dtype = c_latent.element_type
         self.v_dtype = c_latent.element_type
         self.o_dtype = o.element_type
+        self.skip_lse = lse is None
 
         # check type consistency
         if cutlass.const_expr(
@@ -415,12 +416,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
 
         # Reinterpret contiguous [B, S_q, H] as [H, S_q, B]
         # Input stride: (S_q*H, H, 1) → Target: (1, H, S_q*H)
-        lse = cute.make_tensor(
-            lse.iterator,
-            cute.make_layout(
-                (lse.shape[2], lse.shape[1], lse.shape[0]),
-                stride=(lse.stride[2], lse.stride[1], lse.stride[0]),
-            ),
+        lse = (
+            cute.make_tensor(
+                lse.iterator,
+                cute.make_layout(
+                    (lse.shape[2], lse.shape[1], lse.shape[0]),
+                    stride=(lse.stride[2], lse.stride[1], lse.stride[0]),
+                ),
+            )
+            if not self.skip_lse
+            else None
         )
 
         # Fold a query-token group into heads when fold_sq_factor > 1:
@@ -451,18 +456,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             q_rope = _fold_sq_4d(q_rope)
             o = _fold_sq_4d(o)
 
-            fold_groups = lse.shape[1] // self.fold_sq_factor
-            lse = cute.make_tensor(
-                lse.iterator,
-                cute.make_layout(
-                    (lse.shape[0] * self.fold_sq_factor, fold_groups, lse.shape[2]),
-                    stride=(
-                        lse.stride[0],
-                        lse.stride[1] * self.fold_sq_factor,
-                        lse.stride[2],
+            if cutlass.const_expr(not self.skip_lse):
+                fold_groups = lse.shape[1] // self.fold_sq_factor
+                lse = cute.make_tensor(
+                    lse.iterator,
+                    cute.make_layout(
+                        (lse.shape[0] * self.fold_sq_factor, fold_groups, lse.shape[2]),
+                        stride=(
+                            lse.stride[0],
+                            lse.stride[1] * self.fold_sq_factor,
+                            lse.stride[2],
+                        ),
                     ),
-                ),
-            )
+                )
 
         acc_o, acc_lse = self.initialize_workspace(
             q_latent.shape[0],
@@ -729,7 +735,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             tma_tensor_c_latent_transpose,
             page_table,
             o,
-            lse,
+            lse if not self.skip_lse else None,
             acc_o,
             acc_lse,
             split_kv,
@@ -1463,7 +1469,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 else self.lse_dtype.inf
             )
             if tidx == 0:
-                mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
+                if cutlass.const_expr(not self.skip_lse):
+                    mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
             # store the scale to shared memory
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
@@ -3142,31 +3149,40 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 self.mma_pv_tiler[1],
                 self.mma_pv_tiler[2],
             )
-            gLSE = None
-            cLSE = None
             if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                gLSE = cute.local_tile(
-                    epilogue_params.mLSE,
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-
+                if cutlass.const_expr(not self.skip_lse):
+                    lse = (
+                        cute.math.log2(row_sum, fastmath=True)
+                        + epilogue_params.softmax_scale_log2 * row_max
+                    )
+                    gLSE = cute.local_tile(
+                        epilogue_params.mLSE,
+                        (cta_pv_tiler[0], 1, 1),
+                        (
+                            common_params.blk_coord[0],
+                            common_params.blk_coord[1],
+                            common_params.blk_coord[2],
+                        ),
+                        (1, 1, 1),
+                    )
+                    cLSE = cute.local_tile(
+                        cute.make_identity_tensor(epilogue_params.mLSE.shape),
+                        (cta_pv_tiler[0], 1, 1),
+                        (
+                            common_params.blk_coord[0],
+                            common_params.blk_coord[1],
+                            common_params.blk_coord[2],
+                        ),
+                        (1, 1, 1),
+                    )
+                    if cutlass.const_expr(self.warps_in_n == 2):
+                        if cute.elem_less(cLSE[tidx][0], common_params.H):
+                            gLSE[tidx] = lse
             else:
+                lse = (
+                    cute.math.log2(row_sum, fastmath=True)
+                    + epilogue_params.softmax_scale_log2 * row_max
+                )
                 gLSE = cute.local_tile(
                     epilogue_params.mAccLSE[
                         None, common_params.blk_coord[3], None, None
@@ -3193,13 +3209,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     ),
                     (1, 1, 1),
                 )
-            lse = (
-                cute.math.log2(row_sum, fastmath=True)
-                + epilogue_params.softmax_scale_log2 * row_max
-            )
-            if cutlass.const_expr(self.warps_in_n == 2):
-                if cute.elem_less(cLSE[tidx][0], common_params.H):
-                    gLSE[tidx] = lse
+                if cutlass.const_expr(self.warps_in_n == 2):
+                    if cute.elem_less(cLSE[tidx][0], common_params.H):
+                        gLSE[tidx] = lse
 
         cute.arch.fence_view_async_tmem_load()
         common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
