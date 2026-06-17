@@ -175,13 +175,10 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
 
 
 def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
-    raw_archs = raw_config.get("architectures")
-    if raw_archs != ["GlmMoeDsaForCausalLM"]:
+    if raw_config.get("architectures") != ["GlmMoeDsaForCausalLM"]:
         return
 
-    # GlmMoeDsaConfig in current Transformers drops/clobbers raw checkpoint
-    # fields required by DSA top-k sharing. The on-disk config.json is the
-    # source of truth until the fixed upstream config is available everywhere.
+    # Transformers may rewrite these GLM DSA dimensions; config.json is authoritative.
     for key in (
         "qk_head_dim",
         "qk_nope_head_dim",
@@ -201,8 +198,6 @@ def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> N
     ):
         if key in raw_config:
             setattr(config, key, raw_config[key])
-    if hasattr(config, "qk_nope_head_dim") and hasattr(config, "qk_rope_head_dim"):
-        config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
 
 def get_config(

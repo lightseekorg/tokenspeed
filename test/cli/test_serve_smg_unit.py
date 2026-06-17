@@ -47,6 +47,7 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
+    _is_deepseek_v4_model,
     _prewarm_hf_tokenizer,
     _user_host_port_from_gateway_args,
     _user_model_id,
@@ -288,29 +289,10 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert DEFAULT_REASONING_PARSER not in gateway_args
 
 
-def test_local_deepseek_v4_config_gets_default_parsers(tmp_path):
+def test_local_deepseek_v4_config_is_detected(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
-    model = str(tmp_path)
 
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model],
-        ["--model", model],
-    )
-
-    assert engine_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
-    ]
-    assert gateway_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
-        "--tool-call-parser",
-        DEEPSEEK_V4_TOOL_CALL_PARSER,
-    ]
+    assert _is_deepseek_v4_model(str(tmp_path))
 
 
 def test_prewarm_skips_local_path(tmp_path):

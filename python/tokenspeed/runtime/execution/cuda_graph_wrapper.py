@@ -185,14 +185,10 @@ class CudaGraphWrapper:
 
     Callers always use the same interface::
 
-        output_tokens, output_lengths, output_logprobs, draft_hidden = runner(
+        output_tokens, output_lengths, output_logprobs = runner(
             bs, ctx, sampling_info, req_to_page,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
-
-    ``draft_hidden`` is the spec hidden-states buffer captured during a graph
-    replay when the in-graph drafter is disabled; it is None on the eager path,
-    full-graph drafter path, and whenever no drafter is configured.
 
     Internally the wrapper owns both paths and calls init_forward_metadata
     with use_cuda_graph=True/False to select the appropriate backend buffers.
@@ -234,13 +230,7 @@ class CudaGraphWrapper:
         self.vocab_size = config.vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
-        backend_max_graph_bs = getattr(attn_backend, "max_cuda_graph_batch_size", None)
-        if backend_max_graph_bs is not None:
-            backend_max_graph_bs = int(backend_max_graph_bs)
-            self.capture_bs = [
-                bs for bs in self.capture_bs if bs <= backend_max_graph_bs
-            ]
-        self.max_bs = max(self.capture_bs) if self.capture_bs else 0
+        self.max_bs = max(self.capture_bs)
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
@@ -278,8 +268,16 @@ class CudaGraphWrapper:
                     self.max_bs, self.drafter.draft_seq_lens_buf
                 )
 
-            # Target and draft backends gather the same block table during
-            # replay; alias matching buffers to avoid duplicate copies.
+            # Drafter (Eagle) is constructed with the target's req_to_page
+            # (ModelExecutor passes the same self.req_to_page to both), and the
+            # replay path hands both backends the same req_pool_indices. The
+            # block-table gather is req_to_page[req_pool_indices] (see
+            # _create_block_kv_indices; it does not depend on seq_lens), so both
+            # backends would compute identical block_kv_indices. When the backing
+            # buffer shapes/dtypes also line up, point the draft backend at the
+            # target's buffer and skip its gather+copy in the replay path: the
+            # target's metadata prep runs first and populates the shared buffer
+            # (see init_forward_metadata_replay_cuda_graph).
             target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
             draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
             if (
@@ -295,7 +293,7 @@ class CudaGraphWrapper:
         self.output_buffers: dict[int, tuple] = {}
 
         self._forward_func: Callable | None = forward_func
-        self.disable = config.enforce_eager or len(self.capture_bs) == 0
+        self.disable = config.enforce_eager
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         if not self.disable:
             self.capture()
@@ -329,34 +327,9 @@ class CudaGraphWrapper:
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
 
-    def _prepare_capture_inputs(self, bs: int):
-        self.input_buffers.fill_dummy_decode_buffers(
-            batch_size=bs,
-            total_tokens=bs * self.max_tokens_per_req,
-        )
-
-    @staticmethod
-    def _clear_glm_dsa_metadata_caches(*backends) -> None:
-        for backend in backends:
-            if backend is None:
-                continue
-            metadata_objects = []
-            for attr in ("forward_decode_metadata", "forward_prefill_metadata"):
-                metadata = getattr(backend, attr, None)
-                if metadata is not None:
-                    metadata_objects.append(metadata)
-            for attr in ("cuda_graph_decode_metadata", "cuda_graph_prefill_metadata"):
-                metadata_map = getattr(backend, attr, None)
-                if isinstance(metadata_map, dict):
-                    metadata_objects.extend(metadata_map.values())
-            for metadata in metadata_objects:
-                for attr in tuple(vars(metadata)):
-                    if attr.startswith("_glm_dsa_") and attr.endswith("_cache"):
-                        delattr(metadata, attr)
-
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
-        self._prepare_capture_inputs(bs)
+        self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
 
         capture_forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -382,11 +355,20 @@ class CudaGraphWrapper:
         # During capture, use uniform dummy counts across ranks.
         if self.dp_size > 1:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
-            # Draft first-step MoE all-gather sizes its collective from
-            # global_bs, so capture needs the same rank layout as replay.
+            # global_bs must ALSO be set at capture. The draft first-step MoE
+            # all-gather (draft_first_step_reduce) sizes its TritonRSAG collective
+            # from ctx.global_bs; if left None at capture it records a single-rank
+            # layout (fallback branch in comm_manager), but at replay global_bs is
+            # the live per-rank batch list -> multi-rank layout. The mismatch makes
+            # the captured (frozen-offset) gather read uninitialized symm-mem ->
+            # NaN draft logits -> accept_rate 0. Set the matching uniform dummy.
             ctx.global_bs = [bs] * self.world_size
 
-        # Capture the full sampling path; greedy requests replay it with top_k=1.
+        # Capture with is_all_greedy=False so the graph records the full
+        # top_k_top_p_sampling path (greedy-only requests are served by the
+        # same path with top_k=1 in the buffer, which effectively argmaxes).
+        # is_all_greedy=True at capture would freeze the graph into
+        # argmax and bypass per-request seeding at replay.
         ibd = self.input_buffers
         sampling_info = SamplingBatchInfo(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
@@ -442,7 +424,6 @@ class CudaGraphWrapper:
         # so the graph captures reads against a clean baseline.
         if self.sampling_backend is not None:
             self.sampling_backend.reset_capture_state()
-        self._clear_glm_dsa_metadata_caches(self.attn_backend, self.draft_attn_backend)
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -455,7 +436,6 @@ class CudaGraphWrapper:
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
         self._init_capture_metadata(bs)
-        self._clear_glm_dsa_metadata_caches(self.attn_backend, self.draft_attn_backend)
 
         self.deepep_adapter.capture()
 
@@ -736,8 +716,13 @@ class CudaGraphWrapper:
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
             if forward_mode.is_extend_or_mixed():
-                # V4 grouped-cache draft metadata needs the accepted-prefix
-                # view first, then decode metadata with mutable draft lengths.
+                # Non-V4 draft backends follow the legacy contract: a single
+                # EXTEND/MIXED metadata init fills both first-step prefill
+                # metadata and step 1+ decode metadata, with seq_lens aliased
+                # to the drafter-owned mutable buffer. V4 additionally needs
+                # the accepted-prefix view for first-step grouped-cache
+                # metadata, then a separate decode init to prepare the draft
+                # decode metadata from that first-step state.
                 draft_prefill_seq_lens = (
                     seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
                 )
@@ -848,7 +833,6 @@ class CudaGraphWrapper:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
-        original_ctx_bs = ctx.bs
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
@@ -901,105 +885,95 @@ class CudaGraphWrapper:
         if getattr(self.config, "enable_mamba", False):
             mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
-        try:
-            if use_graph:
-                if (
-                    bs == 0
-                    and paged_cache_block_tables is None
-                    and self.attn_backend.uses_paged_cache_groups
-                ):
-                    paged_cache_block_tables = self._capture_paged_cache_block_tables(
-                        padded_bs,
-                        self.token_to_kv_pool,
-                    )
-                self._init_replay_metadata(
-                    padded_bs,
-                    bs,
-                    req_pool_indices,
-                    seq_lens,
-                    req_to_page=req_to_page,
-                    forward_mode=ctx.forward_mode,
-                    num_padding=padded_bs - bs if padded_bs != bs else 0,
-                    paged_cache_block_tables=paged_cache_block_tables,
-                    paged_cache_block_table_base_offsets=(
-                        paged_cache_block_table_base_offsets
-                    ),
-                    **mamba_kwargs,
-                )
-
-                # Runtime prepare() is called by ModelExecutor with per-request rids
-                # BEFORE self.forward_step — we don't refill here to avoid clobbering
-                # the per-request generators with the capture-stub generator.
-                self.deepep_adapter.replay()
-
-                with nvtx_range("graph_replay", color="red"):
-                    self.graphs[padded_bs].replay()
-
-                (
-                    output_tokens,
-                    output_lengths,
-                    output_logprobs,
-                    draft_hidden,
-                ) = self.output_buffers[padded_bs]
-
-                result = (
-                    output_tokens[: bs * self.max_tokens_per_req],
-                    output_lengths[:bs],
-                    (
-                        output_logprobs[: bs * self.max_tokens_per_req]
-                        if output_logprobs is not None
-                        else None
-                    ),
-                    (
-                        draft_hidden[: bs * self.max_tokens_per_req]
-                        if draft_hidden is not None
-                        else None
-                    ),
-                )
-
-            else:
-                self._init_forward_metadata(
-                    padded_bs,
-                    ctx.num_extends,
-                    req_pool_indices,
-                    seq_lens,
-                    req_to_page=req_to_page,
-                    forward_mode=ctx.forward_mode,
-                    extend_with_prefix=extend_with_prefix,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                    extend_seq_lens=extend_seq_lens,
-                    extend_seq_lens_cpu=extend_seq_lens_cpu,
-                    positions=positions,
-                    out_cache_loc=out_cache_loc,
-                    global_num_tokens=ctx.global_num_tokens,
-                    all_decode_or_idle=ctx.all_decode_or_idle,
-                    capture_hidden_mode=ctx.capture_hidden_mode,
-                    spec_info=spec_info,
-                    paged_cache_block_tables=(
-                        paged_cache_block_tables
-                        if self.attn_backend.uses_paged_cache_groups
-                        else None
-                    ),
-                    paged_cache_block_table_base_offsets=(
-                        paged_cache_block_table_base_offsets
-                        if self.attn_backend.uses_paged_cache_groups
-                        else None
-                    ),
-                    **mamba_kwargs,
-                )
-
-                result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
-
-            # Update mamba/GDN state after speculative verify
-            if _should_update_mamba_state_after_mtp_verify(
-                self.drafter, self.attn_backend, ctx.forward_mode
+        if use_graph:
+            if (
+                bs == 0
+                and paged_cache_block_tables is None
+                and self.attn_backend.uses_paged_cache_groups
             ):
-                accept_lengths = result[1]
-                self.attn_backend.update_mamba_state_after_mtp_verify(
-                    accept_lengths, None
+                paged_cache_block_tables = self._capture_paged_cache_block_tables(
+                    padded_bs,
+                    self.token_to_kv_pool,
                 )
+            self._init_replay_metadata(
+                padded_bs,
+                bs,
+                req_pool_indices,
+                seq_lens,
+                req_to_page=req_to_page,
+                forward_mode=ctx.forward_mode,
+                num_padding=padded_bs - bs if padded_bs != bs else 0,
+                paged_cache_block_tables=paged_cache_block_tables,
+                paged_cache_block_table_base_offsets=(
+                    paged_cache_block_table_base_offsets
+                ),
+                **mamba_kwargs,
+            )
 
-            return result
-        finally:
-            ctx.bs = original_ctx_bs
+            # Runtime prepare() is called by ModelExecutor with per-request rids
+            # BEFORE self.forward_step — we don't refill here to avoid clobbering
+            # the per-request generators with the capture-stub generator.
+            self.deepep_adapter.replay()
+
+            with nvtx_range("graph_replay", color="red"):
+                self.graphs[padded_bs].replay()
+
+            output_tokens, output_lengths, output_logprobs = self.output_buffers[
+                padded_bs
+            ]
+
+            result = (
+                output_tokens[: bs * self.max_tokens_per_req],
+                output_lengths[:bs],
+                (
+                    output_logprobs[: bs * self.max_tokens_per_req]
+                    if output_logprobs is not None
+                    else None
+                ),
+            )
+
+        else:
+            self._init_forward_metadata(
+                padded_bs,
+                ctx.num_extends,
+                req_pool_indices,
+                seq_lens,
+                req_to_page=req_to_page,
+                forward_mode=ctx.forward_mode,
+                extend_with_prefix=extend_with_prefix,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens=extend_seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+                global_num_tokens=ctx.global_num_tokens,
+                all_decode_or_idle=ctx.all_decode_or_idle,
+                capture_hidden_mode=ctx.capture_hidden_mode,
+                spec_info=spec_info,
+                paged_cache_block_tables=(
+                    paged_cache_block_tables
+                    if self.attn_backend.uses_paged_cache_groups
+                    else None
+                ),
+                paged_cache_block_table_base_offsets=(
+                    paged_cache_block_table_base_offsets
+                    if self.attn_backend.uses_paged_cache_groups
+                    else None
+                ),
+                **mamba_kwargs,
+            )
+
+            result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+
+        if use_graph and padded_bs != bs:
+            ctx.bs = bs
+
+        # Update mamba/GDN state after speculative verify
+        if _should_update_mamba_state_after_mtp_verify(
+            self.drafter, self.attn_backend, ctx.forward_mode
+        ):
+            accept_lengths = result[1]
+            self.attn_backend.update_mamba_state_after_mtp_verify(accept_lengths, None)
+
+        return result

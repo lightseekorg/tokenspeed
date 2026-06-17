@@ -39,17 +39,8 @@ if platform.is_nvidia:
     from flashinfer.fused_moe import RoutingMethodType, trtllm_fp8_block_scale_moe
     from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
-    try:
-        from flashinfer import autotune
-    except ImportError:  # pragma: no cover - older flashinfer
-        autotune = None
-
     _FP8_BLOCK = 128
     _DEEPSEEK_V3_ROUTING = int(RoutingMethodType.DeepSeekV3)
-    _MIN_TUNE_MAX_NUM_TOKENS = 8192
-
-    def _tune_max_num_tokens(num_tokens: int) -> int:
-        return max(_MIN_TUNE_MAX_NUM_TOKENS, next_power_of_2(int(num_tokens)))
 
     def _routing_value(w: torch.nn.Module, name: str, default):
         routing_config = getattr(w, "routing_config", {})
@@ -91,8 +82,6 @@ if platform.is_nvidia:
 
         w.w13_weight_scale_inv.data.clamp_(min=1e-10)
         w.w2_weight_scale_inv.data.clamp_(min=1e-10)
-        w._flashinfer_trtllm_fp8_autotuned = False
-        w._flashinfer_trtllm_fp8_autotuned_buckets = set()
         return None
 
     @register_kernel(
@@ -170,42 +159,28 @@ if platform.is_nvidia:
         n_group = _routing_value(w, "n_group", 0) or None
         topk_group = _routing_value(w, "topk_group", 0) or None
         routed_scaling_factor = _routing_value(w, "routed_scaling_factor", None)
-        tune_max_num_tokens = _tune_max_num_tokens(x_fp8.shape[0])
 
-        def _call():
-            return trtllm_fp8_block_scale_moe(
-                routing_logits=router_logits.to(torch.float32),
-                routing_bias=routing_bias,
-                hidden_states=x_fp8,
-                hidden_states_scale=x_scale,
-                gemm1_weights=w.w13_weight,
-                gemm1_weights_scale=w.w13_weight_scale_inv,
-                gemm2_weights=w.w2_weight,
-                gemm2_weights_scale=w.w2_weight_scale_inv,
-                num_experts=num_experts,
-                top_k=getattr(w, "top_k"),
-                n_group=n_group,
-                topk_group=topk_group,
-                intermediate_size=getattr(w, "intermediate_size"),
-                local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
-                local_num_experts=local_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                routing_method_type=_DEEPSEEK_V3_ROUTING,
-                do_finalize=True,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
-
-        if autotune is not None:
-            tuned_buckets = getattr(w, "_flashinfer_trtllm_fp8_autotuned_buckets", set())
-            if tune_max_num_tokens not in tuned_buckets:
-                with autotune():
-                    _call()
-                tuned_buckets = set(tuned_buckets)
-                tuned_buckets.add(tune_max_num_tokens)
-                w._flashinfer_trtllm_fp8_autotuned_buckets = tuned_buckets
-                w._flashinfer_trtllm_fp8_autotuned = True
-
-        result = _call()
+        result = trtllm_fp8_block_scale_moe(
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=routing_bias,
+            hidden_states=x_fp8,
+            hidden_states_scale=x_scale,
+            gemm1_weights=w.w13_weight,
+            gemm1_weights_scale=w.w13_weight_scale_inv,
+            gemm2_weights=w.w2_weight,
+            gemm2_weights_scale=w.w2_weight_scale_inv,
+            num_experts=num_experts,
+            top_k=getattr(w, "top_k"),
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=getattr(w, "intermediate_size"),
+            local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
+            local_num_experts=local_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            routing_method_type=_DEEPSEEK_V3_ROUTING,
+            do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(x_fp8.shape[0]),
+        )
         if isinstance(result, (list, tuple)):
             result = result[0]
         return result

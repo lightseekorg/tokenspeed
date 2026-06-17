@@ -30,7 +30,6 @@ import logging
 import os
 import signal
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
@@ -63,35 +62,6 @@ DEFAULT_SMG_PROMETHEUS_PORT = 8413
 _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
-)
-
-
-@dataclass(frozen=True)
-class _ServeModelDefaults:
-    name_markers: tuple[str, ...]
-    model_types: tuple[str, ...]
-    architectures: tuple[str, ...]
-    reasoning_parser: str
-    tool_call_parser: str
-    engine_flags: tuple[str, ...] = ()
-
-
-_SERVE_MODEL_DEFAULTS = (
-    _ServeModelDefaults(
-        name_markers=("deepseek-v4",),
-        model_types=("deepseek_v4",),
-        architectures=("DeepseekV4ForCausalLM",),
-        reasoning_parser=DEEPSEEK_V4_REASONING_PARSER,
-        tool_call_parser=DEEPSEEK_V4_TOOL_CALL_PARSER,
-    ),
-    _ServeModelDefaults(
-        name_markers=("glm-5",),
-        model_types=("glm_moe_dsa",),
-        architectures=("GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"),
-        reasoning_parser=GLM_REASONING_PARSER,
-        tool_call_parser=GLM_TOOL_CALL_PARSER,
-        engine_flags=("--disable-kvstore",),
-    ),
 )
 
 
@@ -222,48 +192,56 @@ def _user_model_id(gateway_args: list[str]) -> str | None:
     return gateway_args[idx + 1]
 
 
-def _model_id_contains(model_id: str, marker: str) -> bool:
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
     normalized = model_id.lower().replace("_", "-")
     compact = normalized.replace("-", "")
-    return marker in normalized or marker.replace("-", "") in compact
+    if "deepseek-v4" in normalized or "deepseekv4" in compact:
+        return True
 
-
-def _local_model_config(model_id: str | None) -> dict | None:
-    if not model_id:
-        return None
     config_path = Path(model_id) / "config.json"
     if not config_path.is_file():
-        return None
+        return False
     try:
         with config_path.open() as f:
             config = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return None
-    return config if isinstance(config, dict) else None
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return (
+        config.get("model_type") == "deepseek_v4"
+        or "DeepseekV4ForCausalLM" in architectures
+    )
 
 
-def _model_defaults_for(model_id: str | None) -> _ServeModelDefaults | None:
+def _is_glm_dsa_model(model_id: str | None) -> bool:
     if not model_id:
-        return None
+        return False
 
-    config = _local_model_config(model_id)
-    model_type = config.get("model_type") if config is not None else None
-    architectures = config.get("architectures", ()) if config is not None else ()
-    if isinstance(architectures, str):
-        architectures = (architectures,)
-    elif not isinstance(architectures, (list, tuple)):
-        architectures = ()
-    for defaults in _SERVE_MODEL_DEFAULTS:
-        if any(
-            _model_id_contains(model_id, marker)
-            for marker in defaults.name_markers
-        ):
-            return defaults
-        if model_type in defaults.model_types:
-            return defaults
-        if any(arch in defaults.architectures for arch in architectures):
-            return defaults
-    return None
+    normalized = model_id.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if "glm-5" in normalized or "glm5" in compact:
+        return True
+
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "glm_moe_dsa" or any(
+        arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"}
+        for arch in architectures
+    )
 
 
 def _args_with_default_model_parsers(
@@ -276,9 +254,23 @@ def _args_with_default_model_parsers(
     name to defer json_schema grammars past the reasoning channel.
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
-    defaults = _model_defaults_for(model_id)
-    if defaults is None:
-        return engine_args, gateway_args
+    if not _is_deepseek_v4_model(model_id):
+        if not _is_glm_dsa_model(model_id):
+            return engine_args, gateway_args
+
+        engine_result = list(engine_args)
+        gateway_result = list(gateway_args)
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
+        if "--disable-kvstore" not in engine_result:
+            engine_result.append("--disable-kvstore")
+        return engine_result, gateway_result
 
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
@@ -286,13 +278,10 @@ def _args_with_default_model_parsers(
         "--reasoning-parser" not in engine_result
         and "--reasoning-parser" not in gateway_result
     ):
-        engine_result.extend(["--reasoning-parser", defaults.reasoning_parser])
-        gateway_result.extend(["--reasoning-parser", defaults.reasoning_parser])
+        engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+        gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
     if "--tool-call-parser" not in gateway_result:
-        gateway_result.extend(["--tool-call-parser", defaults.tool_call_parser])
-    for flag in defaults.engine_flags:
-        if flag not in engine_result:
-            engine_result.append(flag)
+        gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
     return engine_result, gateway_result
 
 

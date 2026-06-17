@@ -34,11 +34,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
 
 platform = current_platform()
 
-top_k = error_fn
+top_k = None
 TopKTieBreak = None
 
 if platform.is_nvidia:
@@ -48,18 +47,12 @@ if platform.is_nvidia:
         pass
 
 
-__all__ = [
-    "glm_dsa_decode_topk_deterministic",
-    "has_deterministic_decode_topk",
-]
-
-
 def has_deterministic_decode_topk() -> bool:
     """Whether the flashinfer deterministic top-k path is importable."""
-    return top_k is not error_fn and TopKTieBreak is not None
+    return top_k is not None and TopKTieBreak is not None
 
 
-def glm_dsa_decode_topk_deterministic(
+def deterministic_decode_topk(
     logits: torch.Tensor,
     out: torch.Tensor,
     topk: int,
@@ -73,11 +66,7 @@ def glm_dsa_decode_topk_deterministic(
     ``dsa_graph_safe`` so eager and CUDA-graph replay agree.
     """
     if not has_deterministic_decode_topk():
-        raise RuntimeError(
-            "flashinfer deterministic top_k is unavailable; set "
-            "TOKENSPEED_GLM5_DECODE_TOPK_IMPL=fast_topk to fall back to the "
-            "trtllm kernel"
-        )
+        raise RuntimeError("flashinfer deterministic top_k is unavailable.")
     _values, indices = top_k(
         logits.contiguous(),
         int(topk),

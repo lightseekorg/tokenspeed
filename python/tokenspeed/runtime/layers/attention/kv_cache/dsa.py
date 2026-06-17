@@ -20,28 +20,24 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch
-from tokenspeed_kernel.ops.attention.triton.dsa import (
-    GLM_DSA_SPARSE_DECODE_ROW_BYTES,
-    glm_dsa_pack_sparse_decode_kv,
+from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
+    pack_sparse_decode_kv,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
-from tokenspeed.runtime.layers.attention.configs.dsa import (
-    glm_dsa_sparse_decode_row_bytes,
-)
+from tokenspeed.runtime.layers.attention.configs.dsa import dsa_sparse_decode_row_bytes
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
     _get_tensor_size_bytes,
 )
 
-logger = logging.getLogger(__name__)
+_INDEX_K_FP8_GROUP_SIZE = 128
+_INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
-    # KVStore currently transfers only the base MLA KV rows. GLM DSA also needs
+    # KVStore currently transfers only the base MLA KV rows. DSA also needs
     # sparse/indexer cache rows to stay coherent with the reused KV pages.
     supports_hierarchical_kv_cache = False
 
@@ -57,26 +53,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
             "qk_rope_head_dim",
             args[5] if len(args) > 5 else None,
         )
-        self.sparse_decode_kv_row_bytes = glm_dsa_sparse_decode_row_bytes(
+        self.sparse_decode_kv_row_bytes = dsa_sparse_decode_row_bytes(
             kv_lora_rank,
             qk_rope_head_dim,
         )
-        if self.index_head_dim % 128 == 0:
+        if self.index_head_dim % _INDEX_K_FP8_GROUP_SIZE == 0:
             self.index_k_with_scale_row_bytes = (
-                self.index_head_dim + self.index_head_dim // 128 * 4
+                self.index_head_dim
+                + self.index_head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
             )
         else:
             self.index_k_with_scale_row_bytes = 0
         self._index_k_with_scale_available = self.index_k_with_scale_row_bytes > 0
-        self._index_k_with_scale_warning_emitted = False
         super().__init__(*args, **kwargs)
-        if self.sparse_decode_kv_row_bytes != GLM_DSA_SPARSE_DECODE_ROW_BYTES:
-            raise ValueError(
-                "GLM DSA sparse decode FlashMLA layout requires "
-                f"kv_lora_rank=512 and qk_rope_head_dim=64, got "
-                f"kv_lora_rank={self.kv_lora_rank}, "
-                f"qk_rope_head_dim={self.qk_rope_head_dim}"
-            )
         with self.memory_saver_adapter.region():
             self.sparse_decode_kv_buffer = [
                 torch.zeros(
@@ -170,7 +159,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if cache_k_nope.dtype != torch.bfloat16:
             cache_k_nope = cache_k_nope.to(torch.bfloat16)
             cache_k_rope = cache_k_rope.to(torch.bfloat16)
-        glm_dsa_pack_sparse_decode_kv(
+        pack_sparse_decode_kv(
             out=self.sparse_decode_kv_buffer[layer.layer_id],
             loc=loc,
             cache_k_nope=cache_k_nope,
@@ -224,7 +213,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         Args:
             buf: Packed FP8 index-K buffer of shape ``[num_slots, row_bytes]``
                 and dtype ``uint8``, where ``row_bytes == head_dim +
-                num_groups * 4`` and ``num_slots`` is a multiple of
+                scale_bytes`` and ``num_slots`` is a multiple of
                 ``page_size``.
 
         Returns:
@@ -235,8 +224,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """
         ps = self.page_size
         hd = self.index_head_dim
-        ng = hd // 128
-        row = hd + ng * 4
+        ng = hd // _INDEX_K_FP8_GROUP_SIZE
+        row = hd + ng * _INDEX_K_SCALE_BYTES
         num_pages = buf.shape[0] // ps
         page_bytes = ps * row
         flat = buf.reshape(-1)
@@ -292,25 +281,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             return
         buf = self.index_k_with_scale_buffer[layer_id]
         if buf is None:
-            self._index_k_with_scale_available = False
-            return
-        try:
-            index_k_fp8, index_k_scale = quantize_fp8_with_scale(
-                index_k,
-                granularity="token_group",
-                group_size=128,
-                scale_encoding="float32",
-            )
-        except Exception as exc:
-            self._index_k_with_scale_available = False
-            if not self._index_k_with_scale_warning_emitted:
-                logger.warning(
-                    "GLM DSA FP8 index K cache is disabled; falling back to "
-                    "BF16 indexer top-k. Reason: %s",
-                    exc,
-                )
-                self._index_k_with_scale_warning_emitted = True
-            return
+            raise RuntimeError("DSA FP8 index K cache is unavailable")
+        index_k_fp8, index_k_scale = quantize_fp8_with_scale(
+            index_k,
+            granularity="token_group",
+            group_size=_INDEX_K_FP8_GROUP_SIZE,
+            scale_encoding="float32",
+        )
 
         fp8_view, scale_view = self._index_k_with_scale_block_views(buf)
         loc = loc.to(torch.long)
@@ -318,7 +295,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         slot_in_page = loc % self.page_size
         fp8_view[page, slot_in_page] = index_k_fp8.view(-1, self.index_head_dim)
         scale_view[page, slot_in_page] = index_k_scale.view(
-            -1, self.index_head_dim // 128
+            -1, self.index_head_dim // _INDEX_K_FP8_GROUP_SIZE
         )
 
     def get_contiguous_buf_infos(self):
@@ -362,63 +339,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        kv_cache_cpu = super().get_cpu_copy(token_indices)
-        torch.cuda.synchronize()
-        for layer_id in range(self.layer_num):
-            for i in range(0, len(token_indices), self.offload_chunk_page_num):
-                chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
-                kv_cache_cpu[layer_id][i // self.offload_chunk_page_num].append(
-                    self.sparse_decode_kv_buffer[layer_id][chunk_indices].to(
-                        "cpu", non_blocking=True
-                    )
-                )
-                kv_cache_cpu[layer_id][i // self.offload_chunk_page_num].append(
-                    self.index_k_buffer[layer_id][chunk_indices].to(
-                        "cpu", non_blocking=True
-                    )
-                )
-                buf = self.index_k_with_scale_buffer[layer_id]
-                if buf is not None:
-                    kv_cache_cpu[layer_id][i // self.offload_chunk_page_num].append(
-                        buf[chunk_indices].to("cpu", non_blocking=True)
-                    )
-        torch.cuda.synchronize()
-        return kv_cache_cpu
+        del token_indices
+        raise NotImplementedError(
+            "DSA KV cache offload is not implemented; sparse/indexer cache "
+            "buffers require page-aware layout handling."
+        )
 
     def load_cpu_copy(
         self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
     ) -> None:
-        super().load_cpu_copy(kv_cache_cpu, token_indices)
-        torch.cuda.synchronize()
-        sparse_offset = 3 if self.quant_method == "per_token_head" else 1
-        index_offset = sparse_offset + 1
-        index_with_scale_offset = index_offset + 1
-        for layer_id in range(self.layer_num):
-            for i in range(0, len(token_indices), self.offload_chunk_page_num):
-                chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
-                chunk = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num]
-                sparse_decode_cpu = kv_cache_cpu[layer_id][
-                    i // self.offload_chunk_page_num
-                ][sparse_offset]
-                assert sparse_decode_cpu.shape[0] == len(chunk_indices)
-                self.sparse_decode_kv_buffer[layer_id][chunk_indices] = (
-                    sparse_decode_cpu.to(
-                        self.sparse_decode_kv_buffer[layer_id].device,
-                        non_blocking=True,
-                    )
-                )
-                index_k_cpu = chunk[index_offset]
-                assert index_k_cpu.shape[0] == len(chunk_indices)
-                self.index_k_buffer[layer_id][chunk_indices] = index_k_cpu.to(
-                    self.index_k_buffer[layer_id].device,
-                    non_blocking=True,
-                )
-                buf = self.index_k_with_scale_buffer[layer_id]
-                if buf is not None and len(chunk) > index_with_scale_offset:
-                    index_k_with_scale_cpu = chunk[index_with_scale_offset]
-                    assert index_k_with_scale_cpu.shape[0] == len(chunk_indices)
-                    buf[chunk_indices] = index_k_with_scale_cpu.to(
-                        buf.device,
-                        non_blocking=True,
-                    )
-        torch.cuda.synchronize()
+        del kv_cache_cpu, token_indices
+        raise NotImplementedError(
+            "DSA KV cache reload is not implemented; sparse/indexer cache "
+            "buffers require page-aware layout handling."
+        )

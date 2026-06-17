@@ -33,16 +33,16 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
 For K2.6, keep the same parameter shape and change the checkpoint and parser
 only if the model card requires a different value.
 
-## GLM5
+## GLM5 / GLM5.2
 
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
-cache, and the TRTLLM MoE backend. TokenSpeed restores the raw GLM config fields
-from `config.json` and defaults the reasoning parser to `glm45`; pass an
-explicit parser flag to override it.
+cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
+`zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
+pass an explicit parser flag to override it.
 
 ```bash
-tokenspeed serve /path/to/glm5-checkpoint \
-  --served-model-name glm5 \
+tokenspeed serve zai-org/GLM-5.2-FP8 \
+  --served-model-name glm-5.2 \
   --trust-remote-code \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \

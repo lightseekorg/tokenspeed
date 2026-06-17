@@ -70,8 +70,6 @@ class ForwardContext:
     # accept_lengths: per-request accepted verify width for cache_seqlens correction.
     accept_lengths: torch.Tensor | None = None
 
-    # --- GLM DSA sparse top-k sharing ---
-    # Context-local carrier for indexer top-k shared by GLM DSA layers and,
-    # when explicitly enabled, by MTP draft iterations.
-    glm_dsa_prefill_topk: Any | None = None
-    glm_dsa_decode_topk: Any | None = None
+    # DSA sparse top-k shared across layers and draft steps.
+    dsa_prefill_topk: Any | None = None
+    dsa_decode_topk: Any | None = None

@@ -235,10 +235,10 @@ def _model_architectures(
     hf_config: PretrainedConfig,
     hf_text_config: PretrainedConfig,
 ) -> list[str]:
-    return [resolve_architecture(hf_config)] + list(
-        getattr(hf_config, "architectures", None) or []
-    ) + list(
-        getattr(hf_text_config, "architectures", []) or []
+    return (
+        [resolve_architecture(hf_config)]
+        + list(getattr(hf_config, "architectures", None) or [])
+        + list(getattr(hf_text_config, "architectures", []) or [])
     )
 
 

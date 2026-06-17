@@ -119,7 +119,6 @@ class ModelExecutorConfig:
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     use_target_verify_forward_mode: bool = False
-    capture_drafter_in_cuda_graph: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -176,7 +175,6 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
-            capture_drafter_in_cuda_graph=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -461,13 +459,6 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
-        # Spec-decode feeds drafter outputs back into input_ids_buf; keep the
-        # graph-safe embedding gather inside the vocab range.
-        if self.drafter is not None:
-            with maybe_inference_mode():
-                self.input_buffers.input_ids_buf[: ctx.input_num_tokens].clamp_(
-                    0, self.runtime_states.vocab_size - 1
-                )
         positions = self._active_positions_override
         if positions is None:
             if self.config.model_is_mrope:
@@ -646,52 +637,21 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
-        # Only TARGET_VERIFY/DRAFT_EXTEND models capture the drafter; legacy
-        # speculative graphs return hidden states for an eager drafter replay.
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
-        capture_drafter = bool(
-            capturing and getattr(self.config, "capture_drafter_in_cuda_graph", False)
-        )
-        if self.drafter is not None and (not capturing or capture_drafter):
-            self._run_drafter_and_store(
-                ctx, logits_output, output_tokens, accept_lengths
+        if self.drafter is not None:
+            next_round_input_ids = self.drafter.run(
+                base_ctx=ctx,
+                logits_output=logits_output,
+                output_tokens=output_tokens,
+                accept_lengths=accept_lengths,
             )
+            # _update_runtime_state skips future_input_map when drafter is
+            # active — drafter writes the next-round inputs directly.
+            self.runtime_states.future_input_map[
+                self.input_buffers.req_pool_indices_buf[: ctx.bs]
+            ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
-        draft_hidden = (
-            logits_output.hidden_states
-            if self.drafter is not None and capturing and not capture_drafter
-            else None
-        )
-        return output_tokens, accept_lengths, output_logprobs, draft_hidden
-
-    def _run_drafter_and_store(
-        self,
-        ctx: ForwardContext,
-        logits_output,
-        output_tokens: torch.Tensor,
-        accept_lengths: torch.Tensor,
-    ) -> None:
-        """Run the drafter and stash next-round input ids."""
-        if (
-            ctx.num_extends == ctx.bs
-            and self.input_buffers.all_extends_mid_chunk
-            and self.config.data_parallel_size == 1
-        ):
-            return
-        next_round_input_ids = self.drafter.run(
-            base_ctx=ctx,
-            logits_output=logits_output,
-            output_tokens=output_tokens,
-            accept_lengths=accept_lengths,
-        )
-        # Mixed batches only draft decode rows; decodes are the trailing rows.
-        num_rows = next_round_input_ids.shape[0]
-        self.runtime_states.future_input_map[
-            self.input_buffers.req_pool_indices_buf[ctx.bs - num_rows : ctx.bs]
-        ] = next_round_input_ids.to(torch.int32)
+        return output_tokens, accept_lengths, output_logprobs
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1525,12 +1485,7 @@ class ModelExecutor:
                         num_reqs=bs,
                     )
                     self._log_dp_sampling_route(bs, ctx)
-                    (
-                        output_tokens,
-                        output_lengths,
-                        output_logprobs,
-                        draft_hidden,
-                    ) = self.forward_step(
+                    output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -1554,24 +1509,6 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
-                    if self.drafter is not None and draft_hidden is not None:
-                        # A graph replay skipped the in-graph drafter; run it
-                        # eagerly on the replay outputs, at the same stream
-                        # position as the eager path (right after sampling).
-                        from tokenspeed.runtime.layers.logits_processor import (
-                            LogitsProcessorOutput,
-                        )
-
-                        with maybe_inference_mode():
-                            self._run_drafter_and_store(
-                                ctx,
-                                LogitsProcessorOutput(
-                                    next_token_logits=None,
-                                    hidden_states=draft_hidden,
-                                ),
-                                output_tokens,
-                                output_lengths,
-                            )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

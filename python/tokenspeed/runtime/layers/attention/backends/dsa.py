@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
@@ -46,9 +44,9 @@ from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABac
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
-logger = logging.getLogger(__name__)
-
 _DSA_TRTLLM_WORKSPACE_BYTES = 384 * 1024 * 1024
+_SPARSE_IMPL_FLASHMLA = "flashmla"
+_SPARSE_IMPL_TRTLLM = "trtllm"
 _dsa_trtllm_workspace_buffers: dict[torch.device, torch.Tensor] = {}
 
 
@@ -56,10 +54,8 @@ def _get_dsa_trtllm_workspace_buffer(device: torch.device | str) -> torch.Tensor
     device = torch.device(device)
     workspace = _dsa_trtllm_workspace_buffers.get(device)
     if workspace is None:
-        # SGLang allocates a larger FlashInfer workspace for DSA sparse MLA than
-        # the plain TRTLLM MLA backend. Sparse prefill treats every query token
-        # as a decode row, so the ordinary decode workspace is too small for
-        # long 8k-token chunks.
+        # Sparse prefill treats every query token as a decode row, so the
+        # plain TRTLLM MLA workspace is too small for long prefill chunks.
         workspace = torch.zeros(
             _DSA_TRTLLM_WORKSPACE_BYTES,
             dtype=torch.uint8,
@@ -80,33 +76,16 @@ def _flashmla_sparse_prefill_padded_heads(
 ) -> int:
     if num_heads <= 0:
         raise RuntimeError(
-            "GLM DSA sparse prefill requires a positive query head count, "
+            "DSA sparse prefill requires a positive query head count, "
             f"got {num_heads}."
         )
     return ((num_heads + head_multiple - 1) // head_multiple) * head_multiple
 
 
-def _pad_flashmla_sparse_prefill_query_heads(
-    q: torch.Tensor,
-    *,
-    num_heads: int,
-    head_dim: int,
-    head_multiple: int,
-) -> tuple[torch.Tensor, int]:
-    q = q.view(-1, num_heads, head_dim)
-    padded_heads = _flashmla_sparse_prefill_padded_heads(num_heads, head_multiple)
-    if padded_heads == num_heads:
-        return q.contiguous(), num_heads
-
-    q_padded = q.new_zeros((q.shape[0], padded_heads, head_dim))
-    q_padded[:, :num_heads, :] = q
-    return q_padded, num_heads
-
-
 def _flashmla_sparse_decode_padded_heads(num_heads: int) -> int:
     if num_heads <= 0:
         raise RuntimeError(
-            "GLM DSA sparse decode requires a positive query head count, "
+            "DSA sparse decode requires a positive query head count, "
             f"got {num_heads}."
         )
     if num_heads <= 64:
@@ -116,20 +95,6 @@ def _flashmla_sparse_decode_padded_heads(num_heads: int) -> int:
     return num_heads
 
 
-def _pad_flashmla_sparse_decode_query_heads(
-    q: torch.Tensor,
-    *,
-    num_heads: int,
-) -> tuple[torch.Tensor, int]:
-    padded_heads = _flashmla_sparse_decode_padded_heads(num_heads)
-    if padded_heads == num_heads:
-        return q.contiguous(), num_heads
-
-    q_padded = q.new_zeros((q.shape[0], q.shape[1], padded_heads, q.shape[3]))
-    q_padded[:, :, :num_heads, :] = q
-    return q_padded, num_heads
-
-
 def _default_dsa_sparse_prefill_impl(kv_cache_dtype: torch.dtype | None = None) -> str:
     platform = current_platform()
     if (
@@ -137,24 +102,8 @@ def _default_dsa_sparse_prefill_impl(kv_cache_dtype: torch.dtype | None = None) 
         and platform.is_blackwell
         and kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     ):
-        return "trtllm"
-    return "flashmla"
-
-
-_DSA_SPARSE_PREFILL_IMPLS = {
-    "flashmla": "_forward_sparse_prefill_flashmla",
-    "trtllm": "_forward_sparse_prefill_trtllm",
-}
-
-_DSA_SPARSE_DECODE_IMPLS = {
-    "flashmla": "_forward_sparse_decode_flashmla",
-    "trtllm": "_forward_sparse_decode_trtllm",
-}
-
-_DSA_SPARSE_IMPLS_BY_FAMILY = {
-    "prefill": _DSA_SPARSE_PREFILL_IMPLS,
-    "decode": _DSA_SPARSE_DECODE_IMPLS,
-}
+        return _SPARSE_IMPL_TRTLLM
+    return _SPARSE_IMPL_FLASHMLA
 
 
 def _workspace_indices_to_kv_slots(
@@ -177,35 +126,10 @@ def _workspace_indices_to_kv_slots(
     return flat_slots.view_as(workspace_indices).to(torch.int32)
 
 
-def _normalize_sparse_decode_topk_lens(
-    *,
-    topk_indices: torch.Tensor,
-    topk_lens: torch.Tensor | None,
-    num_tokens: int,
-) -> torch.Tensor:
-    if topk_lens is None:
-        return (topk_indices >= 0).sum(dim=1, dtype=torch.int32)
-    if topk_lens.dim() != 1:
-        raise RuntimeError(
-            "GLM DSA sparse decode top-k length must be 1-D, "
-            f"got {tuple(topk_lens.shape)}"
-        )
-    if topk_lens.numel() != num_tokens:
-        raise RuntimeError(
-            "GLM DSA sparse decode top-k length mismatch: "
-            f"topk_rows={topk_lens.numel()}, q_tokens={num_tokens}"
-        )
-    if topk_lens.dtype != torch.int32:
-        topk_lens = topk_lens.to(torch.int32)
-    return topk_lens
-
-
 class DSABackend(AttentionBackend):
-    """GLM DSA backend.
+    """DSA backend for sparse MLA attention.
 
-    Dense MLA scheduling and fallback kernels are delegated to TRTLLMMLABackend.
-    The DSA backend itself owns sparse top-k validation and routes sparse DSA
-    kernels to TRTLLM on Blackwell, matching SGLang's B200 default path.
+    Dense MLA metadata and dense attention calls are delegated to TRTLLMMLABackend.
     """
 
     def __init__(self, config: DSAConfig):
@@ -235,8 +159,8 @@ class DSABackend(AttentionBackend):
         # Only graph-captured decode workspaces must survive a regrow. Eager
         # buffers are not referenced by replay and can be released normally.
         self._decode_query_workspace_captured = False
-        self._set_sparse_prefill_impl(_default_dsa_sparse_prefill_impl(self.data_type))
-        self._set_sparse_decode_impl("trtllm")
+        self._sparse_prefill_impl = _default_dsa_sparse_prefill_impl(self.data_type)
+        self._sparse_decode_impl = _SPARSE_IMPL_TRTLLM
 
     def _get_trtllm_workspace(self) -> torch.Tensor:
         workspace = getattr(self, "trtllm_workspace", None)
@@ -247,51 +171,33 @@ class DSABackend(AttentionBackend):
         if workspace is not None:
             self.trtllm_workspace = workspace
             return workspace
-        raise RuntimeError("GLM DSA TRTLLM sparse path requires a workspace buffer.")
-
-    def _resolve_sparse_impl(self, *, family: str, name: str):
-        impls = _DSA_SPARSE_IMPLS_BY_FAMILY.get(family)
-        if impls is None:
-            raise ValueError(f"Unknown GLM DSA sparse implementation family: {family}")
-
-        method_name = impls.get(name)
-        if method_name is None:
-            valid = ", ".join(sorted(impls))
-            raise ValueError(
-                f"Unknown GLM DSA sparse {family} implementation: {name}. "
-                f"Expected one of: {valid}."
-            )
-        return getattr(self, method_name)
-
-    def _set_sparse_prefill_impl(self, name: str) -> None:
-        self._sparse_prefill_impl = name
-        self._sparse_prefill_forward = self._resolve_sparse_impl(
-            family="prefill",
-            name=name,
-        )
-        self._sparse_prefill_forward_impl = name
-
-    def _set_sparse_decode_impl(self, name: str) -> None:
-        self._sparse_decode_impl = name
-        self._sparse_decode_forward = self._resolve_sparse_impl(
-            family="decode",
-            name=name,
-        )
-        self._sparse_decode_forward_impl = name
+        raise RuntimeError("DSA TRTLLM sparse path requires a workspace buffer.")
 
     def _get_sparse_prefill_forward(self):
-        name = getattr(self, "_sparse_prefill_impl", None)
-        if name is None:
-            name = _default_dsa_sparse_prefill_impl(getattr(self, "data_type", None))
-        if getattr(self, "_sparse_prefill_forward_impl", None) != name:
-            self._set_sparse_prefill_impl(name)
-        return self._sparse_prefill_forward
+        name = getattr(
+            self,
+            "_sparse_prefill_impl",
+            _default_dsa_sparse_prefill_impl(getattr(self, "data_type", None)),
+        )
+        if name == _SPARSE_IMPL_TRTLLM:
+            return self._forward_sparse_prefill_trtllm
+        if name == _SPARSE_IMPL_FLASHMLA:
+            return self._forward_sparse_prefill_flashmla
+        raise ValueError(
+            f"Unknown DSA sparse prefill implementation: {name}. "
+            f"Expected one of: {_SPARSE_IMPL_FLASHMLA}, {_SPARSE_IMPL_TRTLLM}."
+        )
 
     def _get_sparse_decode_forward(self):
-        name = getattr(self, "_sparse_decode_impl", "trtllm")
-        if getattr(self, "_sparse_decode_forward_impl", None) != name:
-            self._set_sparse_decode_impl(name)
-        return self._sparse_decode_forward
+        name = getattr(self, "_sparse_decode_impl", _SPARSE_IMPL_TRTLLM)
+        if name == _SPARSE_IMPL_TRTLLM:
+            return self._forward_sparse_decode_trtllm
+        if name == _SPARSE_IMPL_FLASHMLA:
+            return self._forward_sparse_decode_flashmla
+        raise ValueError(
+            f"Unknown DSA sparse decode implementation: {name}. "
+            f"Expected one of: {_SPARSE_IMPL_FLASHMLA}, {_SPARSE_IMPL_TRTLLM}."
+        )
 
     @property
     def forward_decode_metadata(self):
@@ -335,6 +241,21 @@ class DSABackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         return self._dense_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
 
+    def _clear_metadata_caches(self) -> None:
+        metadata_objects = [
+            self.forward_decode_metadata,
+            self.forward_prefill_metadata,
+        ]
+        metadata_objects.extend(self.decode_cuda_graph_metadata.values())
+        seen = set()
+        for metadata in metadata_objects:
+            if metadata is None or id(metadata) in seen:
+                continue
+            seen.add(id(metadata))
+            for attr in tuple(vars(metadata)):
+                if attr.startswith("_dsa_") and attr.endswith("_cache"):
+                    delattr(metadata, attr)
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -342,12 +263,14 @@ class DSABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        return self._dense_backend.init_forward_metadata_capture_cuda_graph(
+        result = self._dense_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=forward_mode,
         )
+        self._clear_metadata_caches()
+        return result
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -377,7 +300,7 @@ class DSABackend(AttentionBackend):
             return
         schedule_metadata = getattr(
             metadata,
-            "_glm_dsa_paged_mqa_schedule_metadata",
+            "_dsa_paged_mqa_schedule_metadata",
             None,
         )
         if schedule_metadata is None:
@@ -386,7 +309,7 @@ class DSABackend(AttentionBackend):
         # Rebuild the per-token visible lengths the capture used: verify
         # graphs schedule [bs, q_len] rows (token j of a request sees
         # seq_len - q_len + j + 1 positions), plain decode [bs, 1].
-        q_len = int(getattr(metadata, "_glm_dsa_paged_mqa_schedule_q_len", 1) or 1)
+        q_len = int(getattr(metadata, "_dsa_paged_mqa_schedule_q_len", 1) or 1)
         base_lens = metadata.seq_lens_k[:bs].to(torch.int32)
         if q_len == 1:
             seq_lens = base_lens.view(-1, 1).contiguous()
@@ -408,7 +331,7 @@ class DSABackend(AttentionBackend):
             or schedule_metadata.dtype != refreshed.dtype
         ):
             raise RuntimeError(
-                "GLM DSA CUDA graph paged-MQA schedule metadata changed shape "
+                "DSA CUDA graph paged-MQA schedule metadata changed shape "
                 "during replay; recapture or use eager for this batch. "
                 f"captured={tuple(schedule_metadata.shape)} {schedule_metadata.dtype} "
                 f"{schedule_metadata.device}, refreshed={tuple(refreshed.shape)} "
@@ -431,12 +354,15 @@ class DSABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
+        dense_forward_mode = (
+            ForwardMode.DECODE if forward_mode.is_target_verify() else forward_mode
+        )
         out = self._dense_backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            forward_mode=forward_mode,
+            forward_mode=dense_forward_mode,
             req_to_page=req_to_page,
             spec_info=spec_info,
             **kwargs,
@@ -456,7 +382,7 @@ class DSABackend(AttentionBackend):
     def _get_sparse_decode_tile_metadata(self, num_reqs: int, q_len: int):
         if get_mla_metadata is error_fn:
             raise RuntimeError(
-                "GLM DSA sparse decode requires FlashMLA. "
+                "DSA sparse decode requires FlashMLA. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
             )
         # FlashMLA lazily generates the tile schedule on the first kernel call
@@ -658,7 +584,7 @@ class DSABackend(AttentionBackend):
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
             raise NotImplementedError(
-                "TokenSpeed GLM DSA fused dense attention does not support "
+                "TokenSpeed DSA fused dense attention does not support "
                 f"logits_soft_cap={logits_soft_cap}. Sparse DSA kernels must "
                 "preserve the capped-score semantics before enabling this model."
             )
@@ -672,7 +598,7 @@ class DSABackend(AttentionBackend):
         max_seq_len = int(active_seq_lens.max().item())
         if max_seq_len > self.index_topk:
             raise NotImplementedError(
-                "TokenSpeed GLM DSA dense attention is exact only when every "
+                "TokenSpeed DSA dense attention is exact only when every "
                 f"request has seq_len <= index_topk ({self.index_topk}); got "
                 f"max seq_len {max_seq_len}. Sparse DSA top-k indices are "
                 "required for longer contexts."
@@ -797,44 +723,44 @@ class DSABackend(AttentionBackend):
     ) -> torch.Tensor:
         if flash_mla_sparse_fwd is error_fn:
             raise RuntimeError(
-                "GLM DSA sparse prefill requires FlashMLA. "
+                "DSA sparse prefill requires FlashMLA. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
             )
         if layer.logit_cap and layer.logit_cap > 0:
             self._validate_logit_cap(layer.logit_cap)
         if self.page_size != 64:
             raise RuntimeError(
-                "GLM DSA sparse prefill currently requires page_size=64 for "
+                "DSA sparse prefill currently requires page_size=64 for "
                 f"FlashMLA sparse KV layout, got {self.page_size}."
             )
         if self.kv_lora_rank != 512:
             raise RuntimeError(
-                "GLM DSA sparse prefill requires kv_lora_rank=512 for FlashMLA, "
+                "DSA sparse prefill requires kv_lora_rank=512 for FlashMLA, "
                 f"got {self.kv_lora_rank}."
             )
         if getattr(token_to_kv_pool, "quant_method", None) == "per_token_head":
             raise RuntimeError(
-                "GLM DSA sparse prefill does not support "
+                "DSA sparse prefill does not support "
                 "kv_cache_quant_method='per_token_head' yet."
             )
         if self.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
             raise RuntimeError(
-                "GLM DSA sparse prefill does not support FP8 MLA KV cache layout yet."
+                "DSA sparse prefill does not support FP8 MLA KV cache layout yet."
             )
         if q.dtype != torch.bfloat16:
             raise RuntimeError(
-                "GLM DSA sparse prefill requires BF16 query tensors, " f"got {q.dtype}."
+                "DSA sparse prefill requires BF16 query tensors, " f"got {q.dtype}."
             )
 
         num_reqs = int(seq_lens.numel())
         if workspace_indices.shape[0] != q.shape[0]:
             raise RuntimeError(
-                "GLM DSA sparse prefill metadata token mismatch: "
+                "DSA sparse prefill metadata token mismatch: "
                 f"indices={workspace_indices.shape[0]}, q_tokens={q.shape[0]}"
             )
         if topk_lens.shape[0] != q.shape[0]:
             raise RuntimeError(
-                "GLM DSA sparse prefill top-k length mismatch: "
+                "DSA sparse prefill top-k length mismatch: "
                 f"lens={topk_lens.shape[0]}, q_tokens={q.shape[0]}"
             )
         if num_reqs == 0 or q.shape[0] == 0:
@@ -843,14 +769,14 @@ class DSABackend(AttentionBackend):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if k_cache.dtype != torch.bfloat16:
             raise RuntimeError(
-                "GLM DSA sparse prefill currently requires BF16 MLA KV cache, "
+                "DSA sparse prefill currently requires BF16 MLA KV cache, "
                 f"got {k_cache.dtype}."
             )
 
         if kv_workspace_slots is not None:
             if kv_workspace_slots.dim() != 1:
                 raise RuntimeError(
-                    "GLM DSA sparse prefill KV slot shape mismatch: "
+                    "DSA sparse prefill KV slot shape mismatch: "
                     f"expected 1-D packed slots, got "
                     f"{tuple(kv_workspace_slots.shape)}"
                 )
@@ -928,7 +854,7 @@ class DSABackend(AttentionBackend):
         del block_tables, seq_lens
         if trtllm_batch_decode_with_kv_cache_mla is error_fn:
             raise RuntimeError(
-                "GLM DSA sparse prefill requires TRTLLM sparse MLA on Blackwell. "
+                "DSA sparse prefill requires TRTLLM sparse MLA on Blackwell. "
                 "Build/install `tokenspeed-kernel/python` with FlashInfer TRTLLM "
                 "decode support."
             )
@@ -937,23 +863,23 @@ class DSABackend(AttentionBackend):
         )
         if q.dtype != torch.bfloat16 and not allow_fp8_query:
             raise RuntimeError(
-                "GLM DSA sparse prefill requires BF16 query tensors, or FP8 query "
+                "DSA sparse prefill requires BF16 query tensors, or FP8 query "
                 f"tensors on the TRTLLM FP8 KV path, got {q.dtype}."
             )
         if topk_lens.shape[0] != q.shape[0]:
             raise RuntimeError(
-                "GLM DSA sparse prefill top-k length mismatch: "
+                "DSA sparse prefill top-k length mismatch: "
                 f"lens={topk_lens.shape[0]}, q_tokens={q.shape[0]}"
             )
         if workspace_indices.shape != (q.shape[0], self.index_topk):
             raise RuntimeError(
-                "GLM DSA sparse prefill top-k shape mismatch: "
+                "DSA sparse prefill top-k shape mismatch: "
                 f"indices={tuple(workspace_indices.shape)}, "
                 f"expected={(q.shape[0], self.index_topk)}"
             )
         if kv_workspace_slots is None:
             raise RuntimeError(
-                "GLM DSA TRTLLM sparse prefill requires kv_workspace_slots to "
+                "DSA TRTLLM sparse prefill requires kv_workspace_slots to "
                 "map workspace-local top-k rows back to KV cache slots."
             )
         if q.shape[0] == 0:
@@ -1011,12 +937,12 @@ class DSABackend(AttentionBackend):
         del v
         if self.page_size != 64:
             raise RuntimeError(
-                "GLM DSA sparse decode currently requires page_size=64 for "
+                "DSA sparse decode currently requires page_size=64 for "
                 f"sparse KV layout, got {self.page_size}."
             )
         if getattr(token_to_kv_pool, "quant_method", None) == "per_token_head":
             raise RuntimeError(
-                "GLM DSA sparse decode does not support "
+                "DSA sparse decode does not support "
                 "kv_cache_quant_method='per_token_head' yet."
             )
         allow_trtllm_fp8_query = (
@@ -1026,7 +952,7 @@ class DSABackend(AttentionBackend):
         )
         if q.dtype != torch.bfloat16 and not allow_trtllm_fp8_query:
             raise RuntimeError(
-                "GLM DSA sparse decode requires BF16 query tensors, or FP8 query "
+                "DSA sparse decode requires BF16 query tensors, or FP8 query "
                 f"tensors on the TRTLLM FP8 KV path, got {q.dtype}."
             )
         if save_kv_cache:
@@ -1042,7 +968,7 @@ class DSABackend(AttentionBackend):
             topk_indices = topk_indices.to(torch.int32)
         if topk_indices.shape[-1] != self.index_topk:
             raise RuntimeError(
-                "GLM DSA sparse decode top-k width mismatch: "
+                "DSA sparse decode top-k width mismatch: "
                 f"indices={topk_indices.shape[-1]}, expected={self.index_topk}"
             )
         num_tokens = q.shape[0]
@@ -1081,12 +1007,12 @@ class DSABackend(AttentionBackend):
         del topk_lens
         if flash_mla_with_kvcache is error_fn:
             raise RuntimeError(
-                "GLM DSA multi-token sparse decode requires FlashMLA. "
+                "DSA multi-token sparse decode requires FlashMLA. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
             )
         if not hasattr(token_to_kv_pool, "get_sparse_decode_kv_buffer"):
             raise RuntimeError(
-                "GLM DSA multi-token sparse decode requires a DSA KV pool with "
+                "DSA multi-token sparse decode requires a DSA KV pool with "
                 "sparse decode cache storage."
             )
         q = q.view(num_reqs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
@@ -1133,7 +1059,7 @@ class DSABackend(AttentionBackend):
     ) -> torch.Tensor:
         if trtllm_batch_decode_with_kv_cache_mla is error_fn:
             raise RuntimeError(
-                "GLM DSA plain sparse decode requires TRTLLM sparse MLA. "
+                "DSA plain sparse decode requires TRTLLM sparse MLA. "
                 "Build/install `tokenspeed-kernel/python` with FlashInfer TRTLLM "
                 "decode support."
             )
@@ -1143,13 +1069,13 @@ class DSABackend(AttentionBackend):
             or metadata.seq_lens_k is None
             or metadata.max_seq_len_k is None
         ):
-            raise RuntimeError("GLM DSA plain sparse decode requires decode metadata.")
+            raise RuntimeError("DSA plain sparse decode requires decode metadata.")
         num_extends = int(metadata.num_extends or 0)
         available_reqs = max(0, int(metadata.seq_lens_k.shape[0]) - num_extends)
         if available_reqs < num_reqs:
             if available_reqs <= 0 or q.shape[0] % available_reqs != 0:
                 raise RuntimeError(
-                    "GLM DSA plain sparse decode metadata batch mismatch: "
+                    "DSA plain sparse decode metadata batch mismatch: "
                     f"seq_lens={available_reqs}, requests={num_reqs}, "
                     f"q_tokens={q.shape[0]}."
                 )
@@ -1158,14 +1084,14 @@ class DSABackend(AttentionBackend):
         seq_lens = metadata.seq_lens_k[num_extends : num_extends + num_reqs]
         if seq_lens.numel() != num_reqs:
             raise RuntimeError(
-                "GLM DSA plain sparse decode metadata batch mismatch: "
+                "DSA plain sparse decode metadata batch mismatch: "
                 f"seq_lens={seq_lens.numel()}, requests={num_reqs}."
             )
         num_tokens = q.shape[0]
         expected_tokens = num_reqs * int(q_len_per_req)
         if num_tokens != expected_tokens:
             raise RuntimeError(
-                "GLM DSA TRTLLM sparse decode token shape mismatch: "
+                "DSA TRTLLM sparse decode token shape mismatch: "
                 f"q_tokens={num_tokens}, requests={num_reqs}, "
                 f"q_len_per_req={q_len_per_req}."
             )
@@ -1192,7 +1118,7 @@ class DSABackend(AttentionBackend):
         if topk_lens is not None:
             if topk_lens.dim() != 1 or topk_lens.numel() != num_tokens:
                 raise RuntimeError(
-                    "GLM DSA TRTLLM sparse decode top-k length mismatch: "
+                    "DSA TRTLLM sparse decode top-k length mismatch: "
                     f"lens={tuple(topk_lens.shape)}, q_tokens={num_tokens}."
                 )
             # seq_lens is relative to the sparse block table, not dense context.

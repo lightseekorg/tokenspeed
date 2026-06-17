@@ -18,32 +18,40 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Sparse DSA row layout and top-k slot kernels."""
+
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-GLM_DSA_FP8_NOPE_DIM = 512
-GLM_DSA_ROPE_DIM = 64
-GLM_DSA_FP8_QUANT_BLOCK = 128
-GLM_DSA_FP8_SCALE_BYTES = 4
-GLM_DSA_FP8_MAX = 448.0
-GLM_DSA_SPARSE_DECODE_ROW_BYTES = (
-    GLM_DSA_FP8_NOPE_DIM
-    + GLM_DSA_FP8_NOPE_DIM // GLM_DSA_FP8_QUANT_BLOCK * GLM_DSA_FP8_SCALE_BYTES
-    + GLM_DSA_ROPE_DIM * 2
-)
+_FP8_QUANT_BLOCK = 128
+_FP8_SCALE_BYTES = 4
+_BF16_BYTES = 2
+_FP8_E4M3_MAX = 448.0
 
-__all__ = [
-    "GLM_DSA_SPARSE_DECODE_ROW_BYTES",
-    "glm_dsa_full_context_topk_to_global_slots",
-    "glm_dsa_local_topk_to_global_slots",
-    "glm_dsa_pack_sparse_decode_kv",
-]
+
+def _sparse_decode_row_bytes(nope_dim: int, rope_dim: int) -> int:
+    nope_dim = int(nope_dim)
+    rope_dim = int(rope_dim)
+    if nope_dim % _FP8_QUANT_BLOCK != 0:
+        raise ValueError(
+            "DSA sparse decode NoPE dim must be divisible by "
+            f"{_FP8_QUANT_BLOCK}, got {nope_dim}"
+        )
+    return (
+        nope_dim
+        + nope_dim // _FP8_QUANT_BLOCK * _FP8_SCALE_BYTES
+        + rope_dim * _BF16_BYTES
+    )
+
+
+def _is_power_of_2(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
 
 
 @triton.jit
-def _glm_dsa_pack_sparse_decode_kv_kernel(
+def _pack_sparse_decode_kv_kernel(
     out_ptr,
     out_stride,
     loc_ptr,
@@ -92,24 +100,17 @@ def _glm_dsa_pack_sparse_decode_kv_kernel(
     tl.store(rope_ptr_out + rope_offsets, rope_values, mask=rope_offsets < rope_dim)
 
 
-def _glm_dsa_prepare_pack_inputs(
+def _prepare_pack_inputs(
     *,
     out: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     if out.dtype != torch.uint8:
         raise TypeError(f"out must be uint8, got {out.dtype}")
-    if out.dim() != 2 or out.shape[1] != GLM_DSA_SPARSE_DECODE_ROW_BYTES:
-        raise ValueError(
-            "out must be [slots, row_bytes] for GLM DSA sparse decode, got "
-            f"{tuple(out.shape)}"
-        )
     if loc.dim() != 1:
         raise ValueError(f"loc must be 1-D, got {tuple(loc.shape)}")
-    if loc.numel() == 0:
-        return cache_k_nope, cache_k_rope
 
     if cache_k_nope.dim() == 3:
         if cache_k_nope.shape[1] != 1:
@@ -125,84 +126,51 @@ def _glm_dsa_prepare_pack_inputs(
                 f"{tuple(cache_k_rope.shape)}"
             )
         cache_k_rope = cache_k_rope.squeeze(1)
-    if cache_k_nope.dim() != 2 or cache_k_nope.shape[1] != GLM_DSA_FP8_NOPE_DIM:
+    if cache_k_nope.dim() != 2:
         raise ValueError(
-            "cache_k_nope must be [tokens, 512], got " f"{tuple(cache_k_nope.shape)}"
+            "cache_k_nope must be [tokens, nope_dim], got "
+            f"{tuple(cache_k_nope.shape)}"
         )
-    if cache_k_rope.dim() != 2 or cache_k_rope.shape[1] != GLM_DSA_ROPE_DIM:
+    if cache_k_rope.dim() != 2:
         raise ValueError(
-            "cache_k_rope must be [tokens, 64], got " f"{tuple(cache_k_rope.shape)}"
+            "cache_k_rope must be [tokens, rope_dim], got "
+            f"{tuple(cache_k_rope.shape)}"
+        )
+    nope_dim = int(cache_k_nope.shape[1])
+    rope_dim = int(cache_k_rope.shape[1])
+    if not _is_power_of_2(nope_dim) or not _is_power_of_2(rope_dim):
+        raise ValueError(
+            "DSA sparse decode pack requires power-of-two NoPE/RoPE dims for "
+            f"Triton arange blocks, got nope_dim={nope_dim}, rope_dim={rope_dim}"
+        )
+    expected_row_bytes = _sparse_decode_row_bytes(nope_dim, rope_dim)
+    if out.dim() != 2 or out.shape[1] != expected_row_bytes:
+        raise ValueError(
+            "out must be [slots, row_bytes] for DSA sparse decode, got "
+            f"{tuple(out.shape)}, expected row_bytes={expected_row_bytes}"
         )
     if cache_k_nope.shape[0] != loc.numel() or cache_k_rope.shape[0] != loc.numel():
         raise ValueError(
-            "GLM DSA sparse decode pack token mismatch: "
+            "DSA sparse decode pack token mismatch: "
             f"loc={loc.numel()}, nope={cache_k_nope.shape[0]}, "
             f"rope={cache_k_rope.shape[0]}"
         )
     if cache_k_nope.dtype != torch.bfloat16 or cache_k_rope.dtype != torch.bfloat16:
         raise TypeError(
-            "GLM DSA sparse decode cache pack requires BF16 source tensors, got "
+            "DSA sparse decode cache pack requires BF16 source tensors, got "
             f"nope={cache_k_nope.dtype}, rope={cache_k_rope.dtype}"
         )
-    return cache_k_nope.contiguous(), cache_k_rope.contiguous()
+    return cache_k_nope.contiguous(), cache_k_rope.contiguous(), nope_dim, rope_dim
 
 
-def _glm_dsa_pack_sparse_decode_kv_cpu(
+def pack_sparse_decode_kv(
     *,
     out: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ) -> None:
-    nope = cache_k_nope.float().view(
-        cache_k_nope.shape[0],
-        GLM_DSA_FP8_NOPE_DIM // GLM_DSA_FP8_QUANT_BLOCK,
-        GLM_DSA_FP8_QUANT_BLOCK,
-    )
-    scale = nope.abs().amax(dim=-1).clamp_min(1.0e-26) / GLM_DSA_FP8_MAX
-    nope_u8 = (
-        torch.clamp(
-            nope / scale.unsqueeze(-1),
-            min=-GLM_DSA_FP8_MAX,
-            max=GLM_DSA_FP8_MAX,
-        )
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8)
-        .view(cache_k_nope.shape[0], GLM_DSA_FP8_NOPE_DIM)
-    )
-    scale_u8 = (
-        scale.contiguous()
-        .view(torch.uint8)
-        .view(
-            cache_k_nope.shape[0],
-            GLM_DSA_FP8_NOPE_DIM // GLM_DSA_FP8_QUANT_BLOCK * GLM_DSA_FP8_SCALE_BYTES,
-        )
-    )
-    rope_u8 = (
-        cache_k_rope.contiguous()
-        .view(torch.uint8)
-        .view(
-            cache_k_rope.shape[0],
-            GLM_DSA_ROPE_DIM * 2,
-        )
-    )
-    rows = out.view(-1, GLM_DSA_SPARSE_DECODE_ROW_BYTES)
-    loc = loc.to(device=out.device, dtype=torch.long)
-    rows[loc, :GLM_DSA_FP8_NOPE_DIM] = nope_u8
-    scale_start = GLM_DSA_FP8_NOPE_DIM
-    rope_start = scale_start + scale_u8.shape[1]
-    rows[loc, scale_start:rope_start] = scale_u8
-    rows[loc, rope_start:] = rope_u8
-
-
-def glm_dsa_pack_sparse_decode_kv(
-    *,
-    out: torch.Tensor,
-    loc: torch.Tensor,
-    cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
-) -> None:
-    cache_k_nope, cache_k_rope = _glm_dsa_prepare_pack_inputs(
+    cache_k_nope, cache_k_rope, nope_dim, rope_dim = _prepare_pack_inputs(
         out=out,
         loc=loc,
         cache_k_nope=cache_k_nope,
@@ -210,16 +178,15 @@ def glm_dsa_pack_sparse_decode_kv(
     )
     if loc.numel() == 0:
         return
-    if not out.is_cuda:
-        _glm_dsa_pack_sparse_decode_kv_cpu(
-            out=out,
-            loc=loc,
-            cache_k_nope=cache_k_nope,
-            cache_k_rope=cache_k_rope,
-        )
-        return
+    if not (
+        out.is_cuda
+        and loc.is_cuda
+        and cache_k_nope.is_cuda
+        and cache_k_rope.is_cuda
+    ):
+        raise RuntimeError("DSA sparse decode KV packing requires CUDA tensors.")
 
-    _glm_dsa_pack_sparse_decode_kv_kernel[(loc.numel(),)](
+    _pack_sparse_decode_kv_kernel[(loc.numel(),)](
         out,
         out.stride(0),
         loc.to(torch.int64),
@@ -227,19 +194,19 @@ def glm_dsa_pack_sparse_decode_kv(
         cache_k_nope.stride(0),
         cache_k_rope,
         cache_k_rope.stride(0),
-        fp8_max=GLM_DSA_FP8_MAX,
-        nope_dim=GLM_DSA_FP8_NOPE_DIM,
-        rope_dim=GLM_DSA_ROPE_DIM,
-        quant_block=GLM_DSA_FP8_QUANT_BLOCK,
-        scale_bytes=GLM_DSA_FP8_SCALE_BYTES,
-        num_nope_blocks=GLM_DSA_FP8_NOPE_DIM // GLM_DSA_FP8_QUANT_BLOCK,
+        fp8_max=_FP8_E4M3_MAX,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        quant_block=_FP8_QUANT_BLOCK,
+        scale_bytes=_FP8_SCALE_BYTES,
+        num_nope_blocks=nope_dim // _FP8_QUANT_BLOCK,
         num_warps=4,
         num_stages=2,
     )
 
 
 @triton.jit
-def _glm_dsa_local_topk_to_global_slots_kernel(
+def _local_topk_to_global_slots_kernel(
     global_topk_slots_ptr,
     global_topk_slots_stride,
     topk_lens_ptr,
@@ -288,7 +255,7 @@ def _glm_dsa_local_topk_to_global_slots_kernel(
     tl.store(topk_lens_ptr + token_idx, count)
 
 
-def glm_dsa_local_topk_to_global_slots(
+def local_topk_to_global_slots(
     *,
     local_topk_offsets: torch.Tensor,
     block_table: torch.Tensor,
@@ -364,38 +331,14 @@ def glm_dsa_local_topk_to_global_slots(
     if num_tokens == 0:
         return global_slots, lens
 
+    if not local_topk_offsets.is_cuda:
+        raise RuntimeError("DSA local top-k slot conversion requires CUDA tensors.")
+
     block_table = block_table.to(device=local_topk_offsets.device, dtype=torch.int32)
     if seq_lens is not None:
         seq_lens = seq_lens.to(device=local_topk_offsets.device, dtype=torch.int32)
-    if not local_topk_offsets.is_cuda:
-        valid = local_topk_offsets >= 0
-        if seq_lens is not None:
-            valid &= local_topk_offsets < seq_lens[:num_tokens].view(num_tokens, 1)
-        safe_local = torch.where(
-            valid,
-            local_topk_offsets,
-            torch.zeros_like(local_topk_offsets),
-        )
-        block_idx = torch.div(safe_local, block_size, rounding_mode="floor")
-        valid &= (block_idx >= 0) & (block_idx < block_table.shape[1])
-        block_offset = safe_local % block_size
-        row_idx = torch.arange(num_tokens, device=local_topk_offsets.device)
-        pages = block_table[
-            row_idx[:, None],
-            block_idx.long().clamp(0, block_table.shape[1] - 1),
-        ]
-        global_slots.copy_(
-            torch.where(
-                valid,
-                pages.to(torch.int32) * int(block_size) + block_offset,
-                torch.full_like(local_topk_offsets, -1),
-            )
-        )
-        lens.copy_(valid.sum(dim=1, dtype=torch.int32))
-        return global_slots, lens
-
     seq_lens_arg = block_table[:, 0] if seq_lens is None else seq_lens
-    _glm_dsa_local_topk_to_global_slots_kernel[(num_tokens,)](
+    _local_topk_to_global_slots_kernel[(num_tokens,)](
         global_slots,
         global_slots.stride(0),
         lens,
@@ -414,7 +357,7 @@ def glm_dsa_local_topk_to_global_slots(
 
 
 @triton.jit
-def _glm_dsa_full_context_topk_to_global_slots_kernel(
+def _full_context_topk_to_global_slots_kernel(
     global_topk_slots_ptr,
     global_topk_slots_stride,
     topk_lens_ptr,
@@ -453,7 +396,7 @@ def _glm_dsa_full_context_topk_to_global_slots_kernel(
     tl.store(topk_lens_ptr + token_idx, topk_len)
 
 
-def glm_dsa_full_context_topk_to_global_slots(
+def full_context_topk_to_global_slots(
     *,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
@@ -515,33 +458,11 @@ def glm_dsa_full_context_topk_to_global_slots(
         return global_slots, lens
 
     if not seq_lens.is_cuda:
-        offsets = torch.arange(int(topk), dtype=torch.int32, device=device)
-        block_idx = torch.div(offsets, block_size, rounding_mode="floor")
-        valid = (offsets.view(1, int(topk)) < seq_lens.view(num_tokens, 1)) & (
-            block_idx.view(1, int(topk)) < block_table.shape[1]
+        raise RuntimeError(
+            "DSA full-context top-k slot conversion requires CUDA tensors."
         )
-        block_offset = offsets % block_size
-        pages = block_table[
-            torch.arange(num_tokens, device=device).view(num_tokens, 1),
-            block_idx.long().view(1, int(topk)).clamp(0, block_table.shape[1] - 1),
-        ]
-        global_slots.copy_(
-            torch.where(
-                valid,
-                pages.to(torch.int32) * int(block_size) + block_offset.view(1, topk),
-                torch.full_like(global_slots, -1),
-            )
-        )
-        max_context_len = int(block_table.shape[1]) * int(block_size)
-        lens.copy_(
-            torch.minimum(
-                torch.minimum(seq_lens, torch.full_like(seq_lens, max_context_len)),
-                torch.full_like(seq_lens, int(topk)),
-            )
-        )
-        return global_slots, lens
 
-    _glm_dsa_full_context_topk_to_global_slots_kernel[(num_tokens,)](
+    _full_context_topk_to_global_slots_kernel[(num_tokens,)](
         global_slots,
         global_slots.stride(0),
         lens,

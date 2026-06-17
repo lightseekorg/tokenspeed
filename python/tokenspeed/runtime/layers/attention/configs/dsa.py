@@ -29,8 +29,9 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
-GLM_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
-GLM_DSA_SPARSE_DECODE_FP8_SCALE_BYTES = 4
+_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
+_SPARSE_DECODE_FP8_SCALE_BYTES = torch._utils._element_size(torch.float32)
+_SPARSE_DECODE_ROPE_BYTES = torch._utils._element_size(torch.bfloat16)
 
 
 def _is_blackwell_device(device: str) -> bool:
@@ -43,23 +44,24 @@ def _is_blackwell_device(device: str) -> bool:
     return major >= 10
 
 
-def glm_dsa_sparse_decode_row_bytes(
+def dsa_sparse_decode_row_bytes(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> int:
+    """Return bytes in one packed DSA sparse-decode KV cache row."""
     kv_lora_rank = int(kv_lora_rank)
     qk_rope_head_dim = int(qk_rope_head_dim)
-    if kv_lora_rank % GLM_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
+    if kv_lora_rank % _SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
         raise ValueError(
-            "GLM DSA sparse decode NoPE dim must be divisible by "
-            f"{GLM_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {kv_lora_rank}"
+            "DSA sparse decode NoPE dim must be divisible by "
+            f"{_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {kv_lora_rank}"
         )
     return (
         kv_lora_rank
         + kv_lora_rank
-        // GLM_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK
-        * GLM_DSA_SPARSE_DECODE_FP8_SCALE_BYTES
-        + qk_rope_head_dim * torch._utils._element_size(torch.bfloat16)
+        // _SPARSE_DECODE_FP8_QUANT_BLOCK
+        * _SPARSE_DECODE_FP8_SCALE_BYTES
+        + qk_rope_head_dim * _SPARSE_DECODE_ROPE_BYTES
     )
 
 
@@ -93,7 +95,7 @@ class DSAConfig(MLAConfig):
 
     def cache_cell_size(self) -> int:
         index_cell_size = self.index_head_dim * torch._utils._element_size(self.dtype)
-        sparse_decode_cell_size = glm_dsa_sparse_decode_row_bytes(
+        sparse_decode_cell_size = dsa_sparse_decode_row_bytes(
             self.kv_lora_rank,
             self.qk_rope_head_dim,
         )
