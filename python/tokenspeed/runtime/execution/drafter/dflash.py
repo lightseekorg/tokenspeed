@@ -240,13 +240,11 @@ class DFlash(BaseDrafter):
         all_gather_into_tensor(
             gathered_max,
             local_max.contiguous(),
-            self.logits_processor.tp_rank,
             self.logits_processor.tp_group,
         )
         all_gather_into_tensor(
             gathered_ids,
             global_ids.contiguous(),
-            self.logits_processor.tp_rank,
             self.logits_processor.tp_group,
         )
 
