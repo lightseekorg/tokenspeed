@@ -196,6 +196,8 @@ class EngineClient(Protocol):
         obj: ResumeMemoryOccupationReqInput,
     ) -> None: ...
 
+    async def is_sleeping(self) -> bool: ...
+
     # ---- Profiling / expert distribution -------------------------
 
     async def start_profile(

@@ -24,7 +24,7 @@ bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
-    mha_decode_scheduler_metadata,
+    attn_plan,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
@@ -41,18 +41,21 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.sampling import argmax
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
+    # exceptions
+    "NoKernelFoundError",
     # gemm
     "mm",
     # attention
+    "attn_plan",
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
     "mla_prefill",
     "mla_decode_with_kvcache",
     "attn_merge_state",
-    "mha_decode_scheduler_metadata",
     # moe
     "moe_apply",
     "moe_plan",

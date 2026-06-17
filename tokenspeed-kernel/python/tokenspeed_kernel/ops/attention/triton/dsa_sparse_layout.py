@@ -179,10 +179,7 @@ def pack_sparse_decode_kv(
     if loc.numel() == 0:
         return
     if not (
-        out.is_cuda
-        and loc.is_cuda
-        and cache_k_nope.is_cuda
-        and cache_k_rope.is_cuda
+        out.is_cuda and loc.is_cuda and cache_k_nope.is_cuda and cache_k_rope.is_cuda
     ):
         raise RuntimeError("DSA sparse decode KV packing requires CUDA tensors.")
 

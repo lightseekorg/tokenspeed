@@ -733,22 +733,36 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    pass
+    # Memory regions to release. None ⇒ all ("weights" and "kv_cache").
+    tags: list[str] | None = None
 
 
 @dataclass
 class ReleaseMemoryOccupationReqOutput:
-    pass
+    success: bool = True
+    message: str = ""
 
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    pass
+    # Memory regions to resume. None ⇒ all previously released tags.
+    tags: list[str] | None = None
 
 
 @dataclass
 class ResumeMemoryOccupationReqOutput:
+    success: bool = True
+    message: str = ""
+
+
+@dataclass
+class IsSleepingReqInput:
     pass
+
+
+@dataclass
+class IsSleepingReqOutput:
+    is_sleeping: bool
 
 
 @dataclass

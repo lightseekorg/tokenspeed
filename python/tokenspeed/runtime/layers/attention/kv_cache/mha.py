@@ -99,7 +99,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region():
+        # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
+        # after wake (paging overwrites; clear_kv_buffers zeros the remapped pages).
+        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             # [size, head_num, head_dim] for each layer.
             # The padded page 0 is used for writing dummy outputs from padded tokens.
             # Zero-init: attention kernels may read block_table entries beyond the

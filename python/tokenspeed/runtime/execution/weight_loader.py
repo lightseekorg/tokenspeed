@@ -82,8 +82,9 @@ class WeightLoader:
             weight_loader_prefetch_num_threads=server_args.weight_loader_prefetch_num_threads,
         )
 
-        # Load model with memory saver context
-        with memory_saver_adapter.region():
+        # Load model with memory saver context. Tag as "weights" with CPU backup
+        # so release_memory_occupation offloads (and restores) them byte-exact.
+        with memory_saver_adapter.region(tag="weights", enable_cpu_backup=True):
             model = get_model(
                 model_config=model_config,
                 load_config=load_config,

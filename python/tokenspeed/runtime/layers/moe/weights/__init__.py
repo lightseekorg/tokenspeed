@@ -25,6 +25,7 @@ from tokenspeed.runtime.layers.moe.weights.mxfp4 import (
     create_mxfp4_fp8_input_scales,
     create_mxfp4_weight_pair,
 )
+from tokenspeed.runtime.layers.moe.weights.mxint4 import create_mxint4_weight_pair
 from tokenspeed.runtime.layers.moe.weights.nvfp4 import create_nvfp4_weight_pair
 from tokenspeed.runtime.layers.moe.weights.unquant import create_dense_weight_pair
 
@@ -74,6 +75,15 @@ def create_layer_weights(
         create_mxfp4_weight_pair(spec, layer, with_bias=with_bias, solution=solution)
         if quant_config.is_w4a8_fp8:
             create_mxfp4_fp8_input_scales(layer, spec.num_local_experts)
+        return
+
+    if quant_kind == "mxint4":
+        weight_quant = quant_config.target_scheme_map["Linear"]["weights"]
+        create_mxint4_weight_pair(
+            spec,
+            layer,
+            group_size=weight_quant.group_size,
+        )
         return
 
     raise RuntimeError(f"Unsupported MoE quant kind: {quant_kind}")
