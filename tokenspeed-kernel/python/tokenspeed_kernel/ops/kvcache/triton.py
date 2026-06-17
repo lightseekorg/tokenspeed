@@ -1038,6 +1038,24 @@ def transfer_kv_all_layer(
     if _ALL_LAYER_GRID_CAP > 0:
         num_programs = min(num_programs, _ALL_LAYER_GRID_CAP)
     grid = (num_programs,)
+
+    import logging as _logging
+    _dbg = _logging.getLogger("tokenspeed_kernel.kvcache.triton")
+    _dbg.warning(
+        "[DEBUG-KVTransfer] item_size=%d total_words=%d num_chunks=%d "
+        "num_layers=%d length=%d use_cs32=%s "
+        "src_k_layers.shape=%s dst_k_layers.shape=%s "
+        "src_indices[:5]=%s dst_indices[:5]=%s "
+        "src_k_ptrs=%s dst_k_ptrs=%s",
+        item_size, total_words, num_chunks,
+        num_layers, length,
+        _is_nvidia and total_words % words_per_chunk == 0,
+        src_k_layers.shape, dst_k_layers.shape,
+        src_indices[:5].tolist() if length > 0 else [],
+        dst_indices[:5].tolist() if length > 0 else [],
+        src_k_layers.tolist(), dst_k_layers.tolist(),
+    )
+
     if _is_nvidia and total_words % words_per_chunk == 0:
         _kv_transfer_all_layer_cs32_kernel[grid](
             dst_k_layers,
