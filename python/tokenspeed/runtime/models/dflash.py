@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Optional
+from collections.abc import Iterable, Sequence
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -112,10 +112,7 @@ class DFlashAttention(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
         )
 
-        # The FA4 MHA extend selector currently has no sliding-window kernel
-        # for this draft shape. Use full attention for draft proposals; target
-        # verification remains authoritative for accepted tokens.
-        sliding_window = -1
+        sliding_window = _get_dflash_layer_attention_params(config, layer_id)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
@@ -123,8 +120,8 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window,
+            causal=False,
         )
-        self.attn.non_causal = True
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -430,6 +427,86 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _get_text_config(config: Any) -> Any:
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        return config.get("text_config", config)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        return text_config
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        try:
+            resolved = get_text_config()
+            if resolved is not None:
+                return resolved
+        except TypeError:
+            pass
+    return config
+
+
+def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+    text_config = _get_text_config(config)
+    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    if layer_types is None:
+        return None
+    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
+        raise ValueError(
+            "DFLASH config.layer_types must be a sequence of attention type strings."
+        )
+    return layer_types
+
+
+def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+
+    text_config = _get_text_config(config)
+    sliding_window = _cfg_get(
+        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    )
+    if sliding_window is None:
+        raise ValueError(
+            "DFLASH sliding_attention layers require config.sliding_window."
+        )
+
+    # HF sliding windows include the current token; TokenSpeed stores window_left.
+    return int(sliding_window) - 1
+
+
+def _get_dflash_layer_attention_params(
+    config, layer_id: int
+) -> int:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return -1
+    if layer_id >= len(layer_types):
+        raise ValueError(
+            "DFLASH config.layer_types must contain one entry per draft layer. "
+            f"Got {len(layer_types)} entries, layer_id={layer_id}."
+        )
+
+    layer_type = layer_types[layer_id]
+    if layer_type == "full_attention":
+        return -1
+    if layer_type == "sliding_attention":
+        sliding_window_size = get_dflash_attention_sliding_window_size(config)
+        assert sliding_window_size is not None
+        return sliding_window_size
+    raise ValueError(
+        "Unsupported DFLASH draft layer type. "
+        f"layer_types[{layer_id}]={layer_type!r}."
+    )
 
 
 EntryClass = [DFlashDraftModel]
