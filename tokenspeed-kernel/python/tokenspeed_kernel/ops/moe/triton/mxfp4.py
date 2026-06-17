@@ -276,17 +276,15 @@ def _local_topk_for_ep(
     return local_weights, local_ids, num_local_experts
 
 
+# fmt: off
 _TRITON_MXFP4_MOE_TRAITS = {
-    "weight_dtype": frozenset({"mxfp4"}),
-    "activation": frozenset({"silu", "swiglu"}),
-    "routing_mode": frozenset({"kernel_routing"}),
-    "supports_deferred_finalize": frozenset({False}),
-    "supports_ep": frozenset({False}),
-    "supports_all_to_all_ep": frozenset({False}),
-    "ispp_alignment": frozenset({1}),
-    "internal_activation_dtype": frozenset({"input", "fp8"}),
+    "weight_dtype": frozenset({"mxfp4"}), "activation": frozenset({"silu", "swiglu"}),
+    "routing_mode": frozenset({"kernel_routing"}), "supports_deferred_finalize": frozenset({False}),
+    "supports_ep": frozenset({False}), "supports_all_to_all_ep": frozenset({False}),
+    "ispp_alignment": frozenset({1}), "internal_activation_dtype": frozenset({"input", "fp8"}),
     "supports_bias": frozenset({True}),
 }
+# fmt: on
 
 
 @register_weight_preprocessor(
@@ -435,8 +433,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     name="triton_mxfp4_moe_apply",
     solution="triton",
     weight_preprocessor=WeightPreprocessorRef(
-        "triton_mxfp4_moe_weights",
-        required=True,
+        "triton_mxfp4_moe_weights", required=True
     ),
     signatures=format_signatures(
         "x",

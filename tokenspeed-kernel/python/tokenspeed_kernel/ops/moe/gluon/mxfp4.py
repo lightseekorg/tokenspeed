@@ -39,17 +39,15 @@ if platform.is_amd:
         preprocess_gluon_mxfp4_gfx950_moe_weights as _preprocess_impl,
     )
 
+    # fmt: off
     _GLUON_MXFP4_MOE_TRAITS = {
-        "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"kernel_routing"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({False}),
-        "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"fp8"}),
+        "weight_dtype": frozenset({"mxfp4"}), "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}), "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}), "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}), "internal_activation_dtype": frozenset({"fp8"}),
         "supports_bias": frozenset({True}),
     }
+    # fmt: on
 
     @register_weight_preprocessor(
         "moe",
@@ -70,8 +68,7 @@ if platform.is_amd:
         name="gluon_mxfp4_moe_apply",
         solution="gluon",
         weight_preprocessor=WeightPreprocessorRef(
-            "gluon_mxfp4_gfx950_moe_weights",
-            required=True,
+            "gluon_mxfp4_gfx950_moe_weights", required=True
         ),
         capability=CapabilityRequirement(
             vendors=frozenset({"amd"}),

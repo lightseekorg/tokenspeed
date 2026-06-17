@@ -43,17 +43,15 @@ if platform.is_nvidia:
     )
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
+    # fmt: off
     _FLASHINFER_CUTEDSL_DEEPEP_NVFP4_MOE_TRAITS = {
-        "weight_dtype": frozenset({"nvfp4"}),
-        "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"precomputed_topk"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({True}),
-        "supports_all_to_all_ep": frozenset({True}),
-        "ispp_alignment": frozenset({64}),
-        "internal_activation_dtype": frozenset({"input"}),
+        "weight_dtype": frozenset({"nvfp4"}), "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}), "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}), "supports_all_to_all_ep": frozenset({True}),
+        "ispp_alignment": frozenset({64}), "internal_activation_dtype": frozenset({"input"}),
         "supports_bias": frozenset({False}),
     }
+    # fmt: on
 
     @register_weight_preprocessor(
         "moe",
@@ -132,8 +130,7 @@ if platform.is_nvidia:
         name="flashinfer_cutedsl_deepep_nvfp4_moe_apply",
         solution="flashinfer_cutedsl",
         weight_preprocessor=WeightPreprocessorRef(
-            "flashinfer_cutedsl_deepep_nvfp4_moe_weights",
-            required=True,
+            "flashinfer_cutedsl_deepep_nvfp4_moe_weights", required=True
         ),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),

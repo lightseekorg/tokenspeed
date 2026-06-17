@@ -152,7 +152,9 @@ def _validate_traits(traits: dict[str, frozenset[Any]]) -> None:
         raise TypeError("weight preprocessor traits must be a dict")
     for trait_name, values in traits.items():
         if not isinstance(trait_name, str) or not trait_name:
-            raise ValueError("weight preprocessor trait names must be non-empty strings")
+            raise ValueError(
+                "weight preprocessor trait names must be non-empty strings"
+            )
         if not isinstance(values, frozenset):
             raise TypeError(
                 f"weight preprocessor trait {trait_name!r} values must be a frozenset"
@@ -225,8 +227,7 @@ def resolve_weight_preprocessor_ref(
         raise WeightPreprocessorResolutionError("\n".join(errors))
     if not spec.capability.satisfied_by(platform):
         message = (
-            f"Weight preprocessor {ref.name!r} cannot run on "
-            f"{platform.device_name}"
+            f"Weight preprocessor {ref.name!r} cannot run on " f"{platform.device_name}"
         )
         if ref.required:
             raise WeightPreprocessorResolutionError(message)

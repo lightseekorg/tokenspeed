@@ -62,16 +62,14 @@ if platform.is_nvidia:
         trtllm_mxint4_block_scale_moe,
     )
 
+    # fmt: off
     _FLASHINFER_TRTLLM_MXINT4_MOE_TRAITS = {
-        "weight_dtype": frozenset({"mxint4"}),
-        "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"kernel_routing"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({True}),
-        "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({256}),
-        "internal_activation_dtype": frozenset({"input"}),
+        "weight_dtype": frozenset({"mxint4"}), "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}), "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}), "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({256}), "internal_activation_dtype": frozenset({"input"}),
     }
+    # fmt: on
 
     def _repack_int4(packed: torch.Tensor) -> torch.Tensor:
         """Convert one expert's ``int32`` ``(w/s)+8`` words to ``uint8`` ``(w/s)``.
@@ -231,8 +229,7 @@ if platform.is_nvidia:
         name="flashinfer_trtllm_mxint4_moe_apply",
         solution="flashinfer_trtllm",
         weight_preprocessor=WeightPreprocessorRef(
-            "flashinfer_trtllm_mxint4_moe_weights",
-            required=True,
+            "flashinfer_trtllm_mxint4_moe_weights", required=True
         ),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
