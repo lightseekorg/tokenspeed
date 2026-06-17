@@ -27,7 +27,6 @@ from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     default_route,
     fp8_quantize,
     gluon_mxfp_ragged_matmul,
-    shuffle_weight_for_gluon_dot_layout,
     swiglu_fn,
 )
 from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (  # noqa: E402
@@ -39,7 +38,6 @@ INTERMEDIATE_SIZE = 256
 E = 8
 TOPK = 2
 MXFP4_BLOCK = 32
-GLUON_COMBINE_BLOCK_N = 128
 SWIGLU_ALPHA = 1.702
 SWIGLU_LIMIT = 7.0
 W13_ACT_SCALE = 0.125
@@ -208,92 +206,22 @@ def _make_module(raw: RawMxfp4Weights) -> torch.nn.Module:
     return module
 
 
-def _pad_w2_to_block_n(module: torch.nn.Module, block_n: int) -> None:
-    original_n = int(module.w2_weight.shape[-2])
-    module._w2_logical_n = original_n
-    if original_n % block_n == 0:
-        return
-
-    n_padded = (original_n + block_n - 1) // block_n * block_n
-    extra_n = n_padded - original_n
-    w2_weight = module.w2_weight.data
-    w2_scale = module.w2_weight_scale.data
-    module.w2_weight = torch.nn.Parameter(
-        torch.cat(
-            [
-                w2_weight,
-                torch.zeros(
-                    *w2_weight.shape[:-2],
-                    extra_n,
-                    w2_weight.shape[-1],
-                    dtype=w2_weight.dtype,
-                    device=w2_weight.device,
-                ),
-            ],
-            dim=-2,
-        ),
-        requires_grad=False,
-    )
-    module.w2_weight_scale = torch.nn.Parameter(
-        torch.cat(
-            [
-                w2_scale,
-                torch.full(
-                    (*w2_scale.shape[:-2], extra_n, w2_scale.shape[-1]),
-                    127,
-                    dtype=w2_scale.dtype,
-                    device=w2_scale.device,
-                ),
-            ],
-            dim=-2,
-        ),
-        requires_grad=False,
-    )
-
-
-def _raw_storage(obj: Any) -> torch.Tensor:
-    storage = getattr(obj, "storage", None)
-    data = getattr(storage, "data", None)
-    if isinstance(data, torch.Tensor):
-        return data
-    assert isinstance(obj, torch.Tensor)
-    return obj
-
-
-def _attach_gluon_bpreshuffle(module: torch.nn.Module) -> None:
-    targets = (
-        ("w13_weight_triton_tensor", None),
-        ("w2_weight_triton_tensor", getattr(module, "_w2_logical_n", None)),
-    )
-    for attr, logical_n in targets:
-        raw = _raw_storage(getattr(module, attr))
-        shuffled = shuffle_weight_for_gluon_dot_layout(raw)
-        if logical_n is not None and logical_n != shuffled.shape[-1]:
-            shuffled.original_n = int(logical_n)
-            raw.original_n = int(logical_n)
-        raw._gluon_shuffled = shuffled
-
-
 def _make_preprocessed_weights(
     raw: RawMxfp4Weights,
     *,
     preshuffle: bool,
 ) -> Mxfp4Weights:
     module = _make_module(raw)
-    if preshuffle:
-        _pad_w2_to_block_n(module, GLUON_COMBINE_BLOCK_N)
-
-    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
-
-    if preshuffle:
-        _attach_gluon_bpreshuffle(module)
+    preprocess_gluon_mxfp4_gfx950_moe_weights(
+        {"gluon_mxfp4_gfx950_preshuffle": preshuffle}, module
+    )
 
     return Mxfp4Weights(
         w13_weight=module.w13_weight_triton_tensor,
         w2_weight=module.w2_weight_triton_tensor,
         w13_bias=module.w13_weight_bias,
-        # Keep combine bias out of this test so padded-preshuffle and unpadded
-        # LDS paths share the same reference.
+        # Keep combine bias out of this test so padded-preshuffle and
+        # unpadded LDS paths share the same reference.
         w2_bias=None,
         w13_precision_config=module.w13_precision_config,
         w2_precision_config=module.w2_precision_config,

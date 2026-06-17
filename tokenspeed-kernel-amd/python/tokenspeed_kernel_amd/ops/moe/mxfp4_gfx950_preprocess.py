@@ -21,14 +21,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from tokenspeed_kernel_amd.ops.moe.utils import FP4, wrap_torch_tensor
 
 _MXFP_BLOCK_SIZE = 32
+_GLUON_COMBINE_BLOCK_N = 128
 _NON_K_PRESHUFFLE_BLOCK_SIZE = 32
 _ALIGN_K_SCALE_SWIZZLE = 8
 _ALIGN_N_SWIZZLE = 32
+_PRESHUFFLE_PLAN_KEY = "gluon_mxfp4_gfx950_preshuffle"
 
 
 @dataclass
@@ -112,10 +115,105 @@ def _swizzle_mxfp4_for_gfx950(
     return quant_tensor, GluonFlexData(), scale
 
 
+def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
+    original_n = int(w.w2_weight.shape[-2])
+    w._w2_logical_n = original_n
+    if original_n % block_n == 0:
+        return
+
+    n_padded = (original_n + block_n - 1) // block_n * block_n
+    extra_n = n_padded - original_n
+    w2_weight = w.w2_weight.data
+    w2_scale = w.w2_weight_scale.data
+    w.w2_weight = torch.nn.Parameter(
+        torch.cat(
+            [
+                w2_weight,
+                torch.zeros(
+                    *w2_weight.shape[:-2],
+                    extra_n,
+                    w2_weight.shape[-1],
+                    dtype=w2_weight.dtype,
+                    device=w2_weight.device,
+                ),
+            ],
+            dim=-2,
+        ),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        torch.cat(
+            [
+                w2_scale,
+                torch.full(
+                    (*w2_scale.shape[:-2], extra_n, w2_scale.shape[-1]),
+                    127,
+                    dtype=w2_scale.dtype,
+                    device=w2_scale.device,
+                ),
+            ],
+            dim=-2,
+        ),
+        requires_grad=False,
+    )
+
+    if hasattr(w, "w2_weight_bias"):
+        w2_bias = w.w2_weight_bias.data
+        w.w2_weight_bias = torch.nn.Parameter(
+            torch.cat(
+                [
+                    w2_bias,
+                    torch.zeros(
+                        *w2_bias.shape[:-1],
+                        extra_n,
+                        dtype=w2_bias.dtype,
+                        device=w2_bias.device,
+                    ),
+                ],
+                dim=-1,
+            ),
+            requires_grad=False,
+        )
+
+
+def _raw_storage(obj: Any) -> torch.Tensor:
+    storage = getattr(obj, "storage", None)
+    data = getattr(storage, "data", None)
+    if isinstance(data, torch.Tensor):
+        return data
+    assert isinstance(obj, torch.Tensor)
+    return obj
+
+
+def _attach_gluon_bpreshuffle(w: torch.nn.Module) -> None:
+    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+        shuffle_weight_for_gluon_dot_layout,
+    )
+
+    targets = (
+        ("w13_weight_triton_tensor", None),
+        ("w2_weight_triton_tensor", getattr(w, "_w2_logical_n", None)),
+    )
+    for attr, logical_n in targets:
+        raw = _raw_storage(getattr(w, attr))
+        try:
+            shuffled = shuffle_weight_for_gluon_dot_layout(raw)
+        except (AssertionError, ValueError):
+            continue
+        if logical_n is not None and logical_n != shuffled.shape[-1]:
+            shuffled.original_n = int(logical_n)
+            raw.original_n = int(logical_n)
+        raw._gluon_shuffled = shuffled
+
+
 def preprocess_gluon_mxfp4_gfx950_moe_weights(
     plan: dict,
     w: torch.nn.Module,
 ) -> None:
+    preshuffle = bool(plan.get(_PRESHUFFLE_PLAN_KEY, True))
+    if preshuffle:
+        _pad_w2_to_block_n(w, _GLUON_COMBINE_BLOCK_N)
+
     w13_weight_bias = w.w13_weight_bias.to(torch.float32)
     w2_weight_bias = w.w2_weight_bias.to(torch.float32)
     w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
@@ -167,5 +265,8 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
     w.w2_weight_triton_tensor = w2_weight
     del w.w13_weight
     del w.w2_weight
+
+    if preshuffle:
+        _attach_gluon_bpreshuffle(w)
 
     torch.cuda.empty_cache()
