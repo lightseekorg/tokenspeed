@@ -1291,44 +1291,33 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         # See AttentionBackend.forward for the record_kv_cache contract; the step
         # is recorded in this wrapper (not the child backends) to keep one step
-        # per model layer across full-attn + mamba.
-        if record_kv_cache is None:
-            record_cache = not forward_mode.is_decode()
-        else:
-            record_cache = record_kv_cache
-        record_cache = record_cache and getattr(self, "step_counter", None) is not None
-        pre_attn_record = record_cache and not save_kv_cache
-        post_attn_record = record_cache and save_kv_cache
-
-        if pre_attn_record:
-            self.step_counter.record_cache()
-        if forward_mode.is_decode():
-            ret = backend.forward_decode(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
-        else:
-            ret = backend.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                forward_mode=forward_mode,
-                **kwargs,
-            )
-        if post_attn_record:
-            self.step_counter.record_cache()
+        # per model layer across full-attn + mamba. Idle already returned above.
+        with self.record_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+            if forward_mode.is_decode():
+                ret = backend.forward_decode(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    bs,
+                    save_kv_cache=save_kv_cache,
+                    **kwargs,
+                )
+            else:
+                ret = backend.forward_extend(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    bs,
+                    save_kv_cache=save_kv_cache,
+                    forward_mode=forward_mode,
+                    **kwargs,
+                )
         return ret
 
     def forward_decode(
