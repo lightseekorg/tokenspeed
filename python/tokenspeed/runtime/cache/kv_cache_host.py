@@ -39,8 +39,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
-_is_nvidia = current_platform().is_nvidia
-if _is_nvidia:
+_platform = current_platform()
+if _platform.is_nvidia:
     from tokenspeed_kernel.ops.kvcache.cuda import (
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
@@ -52,10 +52,17 @@ if _is_nvidia:
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
+
 from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_all_layer,
     transfer_kv_per_layer,
 )
+
+if _platform.is_amd:
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        transfer_kv_all_layer_mla,
+        transfer_kv_per_layer_mla,
+    )
 
 MLA_KVSTORE_LOADBACK_BLOCK_QUOTA = 16
 MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA = 16

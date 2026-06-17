@@ -89,6 +89,35 @@ class BaseTokenToKVPool:
         """Optional hook for model-specific paged-cache diagnostics."""
         return None
 
+    @torch.no_grad()
+    def clear_kv_buffers(self) -> None:
+        """Zero the KV buffers in place.
+
+        Used by sleep/wake: after resume_memory_occupation re-maps the KV region
+        its pages hold garbage, so zero them. Subclasses store buffers under
+        different attributes (``k_buffer``/``v_buffer`` for MHA, ``kv_buffer`` —
+        possibly tuples — for MLA); introspect the known names so every pool is
+        covered without per-class overrides. For non-quantized KV this is
+        belt-and-suspenders (paging overwrites); for FP8 KV it removes garbage.
+        """
+        attrs = (
+            "k_buffer",
+            "v_buffer",
+            "kv_buffer",
+            # DeepSeek V4 pool buffer names.
+            "swa_kv_buffer",
+            "compressed_kv_buffer",
+            "compressor_state_buffer",
+            "indexer_kv_buffer",
+            "indexer_state_buffer",
+        )
+        for attr in attrs:
+            for entry in getattr(self, attr, None) or []:
+                items = entry if isinstance(entry, (tuple, list)) else (entry,)
+                for t in items:
+                    if torch.is_tensor(t):
+                        t.zero_()
+
     def maybe_log_paged_cache_group_pages(self) -> None:
         return None
 
