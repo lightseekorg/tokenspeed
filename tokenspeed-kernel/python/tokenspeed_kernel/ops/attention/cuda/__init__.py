@@ -16,11 +16,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
         "attention",
-        "mha_merge_state",
-        name="cuda_mha_merge_state",
+        "attn_merge_state",
+        name="cuda_attn_merge_state",
         solution="cuda",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
+            min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -30,7 +30,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         traits={},
         tags={"throughput"},
     )
-    def cuda_mha_merge_state(
+    def cuda_attn_merge_state(
         out_a: torch.Tensor,
         lse_a: torch.Tensor,
         out_b: torch.Tensor,

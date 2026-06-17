@@ -193,7 +193,6 @@ class ServerArgs:
     dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
-    mha_extend_mode: Literal["paged", "ragged"] = "paged"
 
     # DeepSeek V4
     deepseek_v4_mega_moe_max_num_tokens: int = 0
@@ -717,7 +716,6 @@ class ServerArgs:
                 "auto",
                 "pt",
                 "safetensors",
-                "instanttensor",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -728,9 +726,6 @@ class ServerArgs:
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
-            '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
-            "via distributed loading, pipelined prefetching, and direct I/O "
-            "(with optional GPUDirect Storage support). "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
@@ -775,6 +770,7 @@ class ServerArgs:
             default=ServerArgs.quantization,
             choices=[
                 "fp8",
+                "mxfp4",
                 "nvfp4",
                 "w8a8_fp8",
                 "compressed-tensors",
@@ -1280,18 +1276,6 @@ class ServerArgs:
             choices=attention_backend_choices,
             help="Attention backend for drafter model in speculative decoding. "
             "If not specified, uses the same backend as the main model (attention_backend).",
-        )
-        parser.add_argument(
-            "--mha-extend-mode",
-            type=str,
-            choices=["paged", "ragged"],
-            default=ServerArgs.mha_extend_mode,
-            help=(
-                "MHA extend strategy for prefix-cache/chunked-prefill batches. "
-                "'paged' uses one paged KV-cache attention kernel over full visible KV; "
-                "'ragged' uses ragged current-chunk prefill plus paged cached-prefix "
-                "attention and merges with merge_state."
-            ),
         )
         parser.add_argument(
             "--sampling-backend",
