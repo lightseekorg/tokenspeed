@@ -23,7 +23,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
 from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
 from tokenspeed_kernel.registry import (
@@ -50,13 +50,11 @@ class WeightPreprocessorSpec:
     name: str
     family: str
     capability: CapabilityRequirement = field(default_factory=CapabilityRequirement)
-    traits: dict[str, frozenset[Any]] = field(default_factory=dict)
     tags: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         _validate_name("weight preprocessor", self.name)
         _validate_name("weight preprocessor family", self.family)
-        _validate_traits(self.traits)
         if not isinstance(self.tags, frozenset):
             raise TypeError("weight preprocessor tags must be a frozenset")
 
@@ -119,21 +117,17 @@ def register_weight_preprocessor(
     *,
     name: str,
     capability: CapabilityRequirement | None = None,
-    traits: dict[str, frozenset[Any]] | None = None,
     tags: set[str] | None = None,
 ) -> Callable:
     """Decorator to register a weight preprocessor function."""
     _validate_name("weight preprocessor", name)
     _validate_name("weight preprocessor family", family)
-    if traits is not None:
-        _validate_traits(traits)
 
     def decorator(fn: Callable) -> Callable:
         spec = WeightPreprocessorSpec(
             name=name,
             family=family,
             capability=capability or CapabilityRequirement(),
-            traits=traits or {},
             tags=frozenset(tags or set()),
         )
         WeightPreprocessorRegistry.get().register(spec, fn)
@@ -145,54 +139,6 @@ def register_weight_preprocessor(
 def _validate_name(kind: str, value: str) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{kind} name must be a non-empty string")
-
-
-def _validate_traits(traits: dict[str, frozenset[Any]]) -> None:
-    if not isinstance(traits, dict):
-        raise TypeError("weight preprocessor traits must be a dict")
-    for trait_name, values in traits.items():
-        if not isinstance(trait_name, str) or not trait_name:
-            raise ValueError(
-                "weight preprocessor trait names must be non-empty strings"
-            )
-        if not isinstance(values, frozenset):
-            raise TypeError(
-                f"weight preprocessor trait {trait_name!r} values must be a frozenset"
-            )
-
-
-def _validate_trait_compatibility(
-    *,
-    kernel_spec: KernelSpec,
-    preprocessor_spec: WeightPreprocessorSpec,
-    errors: list[str],
-) -> None:
-    kernel_traits = set(kernel_spec.traits)
-    preprocessor_traits = set(preprocessor_spec.traits)
-
-    missing_traits = sorted(kernel_traits - preprocessor_traits)
-    if missing_traits:
-        errors.append(
-            f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} is "
-            f"missing traits {missing_traits!r}"
-        )
-
-    extra_traits = sorted(preprocessor_traits - kernel_traits)
-    if extra_traits:
-        errors.append(
-            f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} has "
-            f"unexpected traits {extra_traits!r}"
-        )
-
-    for trait_name in sorted(kernel_traits & preprocessor_traits):
-        kernel_values = kernel_spec.traits[trait_name]
-        preprocessor_values = preprocessor_spec.traits[trait_name]
-        if kernel_values != preprocessor_values:
-            errors.append(
-                f"{kernel_spec.name}: preprocessor {preprocessor_spec.name!r} "
-                f"trait {trait_name!r} has values {sorted(preprocessor_values)!r} "
-                f"that do not match kernel values {sorted(kernel_values)!r}"
-            )
 
 
 def resolve_weight_preprocessor_ref(
@@ -218,11 +164,6 @@ def resolve_weight_preprocessor_ref(
             f"{kernel_spec.name}: preprocessor {spec.name!r} belongs to family "
             f"{spec.family!r}, expected {kernel_spec.family!r}"
         )
-    _validate_trait_compatibility(
-        kernel_spec=kernel_spec,
-        preprocessor_spec=spec,
-        errors=errors,
-    )
     if errors:
         raise WeightPreprocessorResolutionError("\n".join(errors))
     if not spec.capability.satisfied_by(platform):

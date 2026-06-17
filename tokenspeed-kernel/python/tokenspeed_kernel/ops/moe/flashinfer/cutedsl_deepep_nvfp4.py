@@ -62,7 +62,6 @@ if platform.is_nvidia:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
         ),
-        traits=_FLASHINFER_CUTEDSL_DEEPEP_NVFP4_MOE_TRAITS,
     )
     def flashinfer_cutedsl_deepep_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         w13_ws2 = w.w13_weight_scale_2[:, 0]

@@ -183,7 +183,6 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        traits=_FLASHINFER_TRTLLM_MXFP4_MOE_TRAITS,
     )
     def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         sf_block_size = 32

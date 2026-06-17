@@ -292,7 +292,6 @@ _TRITON_MXFP4_MOE_TRAITS = {
 @register_weight_preprocessor(
     "moe",
     name="triton_mxfp4_moe_weights",
-    traits=_TRITON_MXFP4_MOE_TRAITS,
 )
 def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     MXFP_BLOCK_SIZE = 32

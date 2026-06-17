@@ -59,7 +59,6 @@ if platform.is_amd:
             min_arch_version=ArchVersion(9, 5),
             max_arch_version=ArchVersion(9, 5),
         ),
-        traits=_GLUON_MXFP4_MOE_TRAITS,
     )
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
         return _preprocess_impl(plan, w)

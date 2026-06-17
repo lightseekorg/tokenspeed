@@ -65,14 +65,11 @@ def _register_preprocessor(
     name: str = "moe_weights",
     family: str = "moe",
     capability: CapabilityRequirement | None = None,
-    weight_dtype: str = "mxfp4",
-    traits: dict[str, frozenset] | None = None,
 ) -> None:
     @register_weight_preprocessor(
         family,
         name=name,
         capability=capability,
-        traits=traits or {"weight_dtype": frozenset({weight_dtype})},
     )
     def _preprocess(**_):
         return None
@@ -92,11 +89,11 @@ def test_preprocessor_spec_validates_local_metadata():
     with pytest.raises(ValueError, match="family"):
         WeightPreprocessorSpec(name="layout_a", family="")
 
-    with pytest.raises(TypeError, match="frozenset"):
+    with pytest.raises(TypeError, match="tags"):
         WeightPreprocessorSpec(
             name="layout_a",
             family="moe",
-            traits={"weight_dtype": {"mxfp4"}},
+            tags={"layout"},
         )
 
 
@@ -137,19 +134,7 @@ def test_resolution_rejects_family_mismatch(h100_platform):
         )
 
 
-def test_resolution_rejects_trait_mismatch(h100_platform):
-    kernel_spec = _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
-    _register_preprocessor(name="layout_a", weight_dtype="nvfp4")
-
-    with pytest.raises(WeightPreprocessorResolutionError, match="weight_dtype"):
-        resolve_weight_preprocessor_ref(
-            kernel_spec.weight_preprocessor,
-            kernel_spec=kernel_spec,
-            platform=h100_platform,
-        )
-
-
-def test_resolution_rejects_missing_preprocessor_trait(h100_platform):
+def test_resolution_does_not_match_preprocessor_on_kernel_traits(h100_platform):
     kernel_spec = _register_apply(
         preprocessor=WeightPreprocessorRef("layout_a"),
         traits={
@@ -157,35 +142,16 @@ def test_resolution_rejects_missing_preprocessor_trait(h100_platform):
             "layout": frozenset({"blocked"}),
         },
     )
-    _register_preprocessor(
-        name="layout_a",
-        traits={"weight_dtype": frozenset({"mxfp4"})},
+    _register_preprocessor(name="layout_a")
+
+    spec = resolve_weight_preprocessor_ref(
+        kernel_spec.weight_preprocessor,
+        kernel_spec=kernel_spec,
+        platform=h100_platform,
     )
 
-    with pytest.raises(WeightPreprocessorResolutionError, match="missing traits"):
-        resolve_weight_preprocessor_ref(
-            kernel_spec.weight_preprocessor,
-            kernel_spec=kernel_spec,
-            platform=h100_platform,
-        )
-
-
-def test_resolution_rejects_extra_preprocessor_trait(h100_platform):
-    kernel_spec = _register_apply(preprocessor=WeightPreprocessorRef("layout_a"))
-    _register_preprocessor(
-        name="layout_a",
-        traits={
-            "weight_dtype": frozenset({"mxfp4"}),
-            "layout": frozenset({"blocked"}),
-        },
-    )
-
-    with pytest.raises(WeightPreprocessorResolutionError, match="unexpected traits"):
-        resolve_weight_preprocessor_ref(
-            kernel_spec.weight_preprocessor,
-            kernel_spec=kernel_spec,
-            platform=h100_platform,
-        )
+    assert spec is not None
+    assert spec.name == "layout_a"
 
 
 def test_resolve_kernel_preprocessor_with_different_capability(mi300_platform):

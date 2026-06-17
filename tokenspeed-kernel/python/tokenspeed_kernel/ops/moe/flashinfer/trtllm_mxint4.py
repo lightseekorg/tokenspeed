@@ -172,7 +172,6 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        traits=_FLASHINFER_TRTLLM_MXINT4_MOE_TRAITS,
     )
     def flashinfer_trtllm_mxint4_moe_weights(plan: dict, w: torch.nn.Module):
         num_experts = w.w13_weight_packed.shape[0]

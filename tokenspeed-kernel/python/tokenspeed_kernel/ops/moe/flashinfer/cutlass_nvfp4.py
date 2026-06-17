@@ -56,7 +56,6 @@ if platform.is_nvidia:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
         ),
-        traits=_FLASHINFER_CUTLASS_NVFP4_MOE_TRAITS,
     )
     def flashinfer_cutlass_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
