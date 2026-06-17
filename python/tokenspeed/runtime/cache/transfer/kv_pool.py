@@ -108,6 +108,23 @@ class KVCachePool:
         dev_k_ptrs = getattr(dev_inner, 'k_data_ptrs', None)
         dev_v_ptrs = getattr(dev_inner, 'v_data_ptrs', None)
 
+        # Re-compute V pointers from refs to detect corruption
+        host_v_refs = getattr(self.host_pool, 'v_data_refs', None)
+        host_k_refs = getattr(self.host_pool, 'k_data_refs', None)
+        recomputed_v = '?'
+        recomputed_k = '?'
+        if host_v_refs is not None and len(host_v_refs) > 0:
+            recomputed_v = [host_v_refs[0].data_ptr(), host_v_refs[-1].data_ptr()]
+        if host_k_refs is not None and len(host_k_refs) > 0:
+            recomputed_k = [host_k_refs[0].data_ptr(), host_k_refs[-1].data_ptr()]
+        # Also get raw kv_buffer data_ptr
+        host_kv_buffer = getattr(self.host_pool, 'kv_buffer', None)
+        kv_buffer_ptr = '?'
+        kv_buffer_shape = '?'
+        if host_kv_buffer is not None:
+            kv_buffer_ptr = hex(host_kv_buffer.data_ptr())
+            kv_buffer_shape = list(host_kv_buffer.shape)
+
         def _ptr_info(ptrs, label):
             if ptrs is None:
                 return f"{label}=None"
@@ -131,7 +148,9 @@ class KVCachePool:
             "size(host=%s dev=%s) "
             "src_indices.numel=%d dst_indices.numel=%d "
             "src_max=%s dst_max=%s "
-            "| %s | %s | %s | %s",
+            "| %s | %s | %s | %s "
+            "| kv_buffer(ptr=%s shape=%s) "
+            "recomputed_k=[0x%x,0x%x] recomputed_v=[0x%x,0x%x]",
             host_stride, dev_stride_val,
             host_stride == dev_stride_val if isinstance(dev_stride_val, int) else '?',
             getattr(self.host_pool, 'head_num', '?'),
@@ -150,6 +169,11 @@ class KVCachePool:
             _ptr_info(host_v_ptrs, 'host_v'),
             _ptr_info(dev_k_ptrs, 'dev_k'),
             _ptr_info(dev_v_ptrs, 'dev_v'),
+            kv_buffer_ptr, kv_buffer_shape,
+            recomputed_k[0] if isinstance(recomputed_k, list) else 0,
+            recomputed_k[1] if isinstance(recomputed_k, list) else 0,
+            recomputed_v[0] if isinstance(recomputed_v, list) else 0,
+            recomputed_v[1] if isinstance(recomputed_v, list) else 0,
         )
 
         self.host_pool.backup_from_device_all_layer(
