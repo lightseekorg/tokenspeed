@@ -280,7 +280,7 @@ def mha_decode_with_kvcache(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
-    max_seqlen_q: int = 1,
+    max_seqlen_q: int,
     # attention options
     window_left: int = -1,
     logit_cap: float = 0.0,
@@ -309,17 +309,6 @@ def mha_decode_with_kvcache(
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
-    if max_seqlen_q < 1:
-        raise ValueError(f"max_seqlen_q must be >= 1, got {max_seqlen_q}")
-
-    expected_total_q = cache_seqlens.shape[0] * max_seqlen_q
-    if q.shape[0] != expected_total_q:
-        raise ValueError(
-            "mha_decode_with_kvcache expects uniformly packed decode queries; "
-            f"got q.shape[0]={q.shape[0]}, batch={cache_seqlens.shape[0]}, "
-            f"and max_seqlen_q={max_seqlen_q}"
-        )
-
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
