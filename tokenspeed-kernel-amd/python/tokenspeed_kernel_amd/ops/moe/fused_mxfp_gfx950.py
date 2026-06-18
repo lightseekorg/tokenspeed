@@ -2822,68 +2822,6 @@ def _make_nonpreshuffled_w_full_desc(
 
 
 @gluon.jit
-def _run_moe_slice_mn_pipeline(
-    cfg,
-    x_desc_top_mn,
-    x_desc_bot_mn,
-    w_desc_left_mn,
-    w_desc_right_mn,
-    x_scale_desc,
-    w_scale_desc,
-    K,
-):
-    slice_mn_pgm = MoESliceMNProgram.initialize(
-        cfg,
-        x_desc_top_mn,
-        x_desc_bot_mn,
-        w_desc_left_mn,
-        w_desc_right_mn,
-        x_scale_desc,
-        w_scale_desc,
-    )
-    return slice_mn_pgm.pipeline(K)
-
-
-@gluon.jit
-def _run_moe_slice_n_pipeline(
-    cfg,
-    x_desc,
-    w_desc_top,
-    w_desc_bot,
-    x_scale_desc,
-    w_scale_desc,
-    bottom_valid,
-    K,
-):
-    pgm = MoESliceNProgram.initialize(
-        cfg,
-        x_desc,
-        w_desc_top,
-        w_desc_bot,
-        x_scale_desc,
-        w_scale_desc,
-        bottom_valid,
-    )
-    return pgm.pipeline(K)
-
-
-@gluon.jit
-def _run_moe_full_tile_pipeline(
-    cfg,
-    x_desc,
-    w_desc,
-    x_scale_desc,
-    w_scale_desc,
-    K,
-    USE_WARP_PIPELINE: gl.constexpr,
-):
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
-
-
-@gluon.jit
 def _run_moe_tile_preshuffled_w(
     cfg,
     x_ptr,
@@ -3112,7 +3050,7 @@ def _run_moe_tile_preshuffled_w(
                 LOAD_BN=SUB_BN,
                 cache_modifier=W_CACHE_MODIFIER,
             )
-        return _run_moe_slice_n_pipeline(
+        pgm = MoESliceNProgram.initialize(
             cfg,
             x_desc,
             w_desc_top,
@@ -3120,8 +3058,8 @@ def _run_moe_tile_preshuffled_w(
             x_scale_desc,
             w_scale_desc,
             bottom_valid,
-            K,
         )
+        return pgm.pipeline(K)
 
     # Gluon still type-checks the code below when USE_SLICE_N returns above.
     # Keep the original half-tile layout in that specialization so the
@@ -3273,15 +3211,10 @@ def _run_moe_tile_preshuffled_w(
             load_layout=LOAD_W_LAYOUT,
             cache_modifier=W_CACHE_MODIFIER,
         )
-    return _run_moe_full_tile_pipeline(
-        cfg,
-        x_desc,
-        w_desc,
-        x_scale_desc,
-        w_scale_desc,
-        K,
-        USE_WARP_PIPELINE,
-    )
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    if USE_WARP_PIPELINE:
+        return pgm.warp_pipeline(K)
+    return pgm.pipeline(K)
 
 
 @gluon.jit
@@ -3368,7 +3301,7 @@ def _run_moe_tile_transposed_w(
             W_ELEM_BITS,
             W_CACHE_MODIFIER,
         )
-        return _run_moe_slice_mn_pipeline(
+        slice_mn_pgm = MoESliceMNProgram.initialize(
             cfg,
             x_desc_top_mn,
             x_desc_bot_mn,
@@ -3376,8 +3309,8 @@ def _run_moe_tile_transposed_w(
             w_desc_right_mn,
             x_scale_desc,
             w_scale_desc,
-            K,
         )
+        return slice_mn_pgm.pipeline(K)
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
@@ -3398,7 +3331,7 @@ def _run_moe_tile_transposed_w(
             W_ELEM_BITS,
             W_CACHE_MODIFIER,
         )
-        return _run_moe_slice_n_pipeline(
+        pgm = MoESliceNProgram.initialize(
             cfg,
             x_desc,
             w_desc_top,
@@ -3406,8 +3339,8 @@ def _run_moe_tile_transposed_w(
             x_scale_desc,
             w_scale_desc,
             bottom_valid,
-            K,
         )
+        return pgm.pipeline(K)
 
     w_desc = _make_nonpreshuffled_w_full_desc(
         cfg,
@@ -3425,15 +3358,10 @@ def _run_moe_tile_transposed_w(
         W_ELEM_BITS,
         W_CACHE_MODIFIER,
     )
-    return _run_moe_full_tile_pipeline(
-        cfg,
-        x_desc,
-        w_desc,
-        x_scale_desc,
-        w_scale_desc,
-        K,
-        USE_WARP_PIPELINE,
-    )
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    if USE_WARP_PIPELINE:
+        return pgm.warp_pipeline(K)
+    return pgm.pipeline(K)
 
 
 @gluon.jit
@@ -3520,7 +3448,7 @@ def _run_moe_tile_ncontig_w(
             W_ELEM_BITS,
             W_CACHE_MODIFIER,
         )
-        return _run_moe_slice_mn_pipeline(
+        slice_mn_pgm = MoESliceMNProgram.initialize(
             cfg,
             x_desc_top_mn,
             x_desc_bot_mn,
@@ -3528,8 +3456,8 @@ def _run_moe_tile_ncontig_w(
             w_desc_right_mn,
             x_scale_desc,
             w_scale_desc,
-            K,
         )
+        return slice_mn_pgm.pipeline(K)
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
@@ -3550,7 +3478,7 @@ def _run_moe_tile_ncontig_w(
             W_ELEM_BITS,
             W_CACHE_MODIFIER,
         )
-        return _run_moe_slice_n_pipeline(
+        pgm = MoESliceNProgram.initialize(
             cfg,
             x_desc,
             w_desc_top,
@@ -3558,8 +3486,8 @@ def _run_moe_tile_ncontig_w(
             x_scale_desc,
             w_scale_desc,
             bottom_valid,
-            K,
         )
+        return pgm.pipeline(K)
 
     w_desc = _make_nonpreshuffled_w_full_desc(
         cfg,
@@ -3577,15 +3505,10 @@ def _run_moe_tile_ncontig_w(
         W_ELEM_BITS,
         W_CACHE_MODIFIER,
     )
-    return _run_moe_full_tile_pipeline(
-        cfg,
-        x_desc,
-        w_desc,
-        x_scale_desc,
-        w_scale_desc,
-        K,
-        USE_WARP_PIPELINE,
-    )
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    if USE_WARP_PIPELINE:
+        return pgm.warp_pipeline(K)
+    return pgm.pipeline(K)
 
 
 @gluon.jit
