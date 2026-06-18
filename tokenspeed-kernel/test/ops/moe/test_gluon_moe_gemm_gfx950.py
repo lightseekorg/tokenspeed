@@ -164,38 +164,28 @@ def test_autotune_block_forces_large_dispatch_slicen() -> None:
 
 
 @pytest.mark.parametrize(
-    ("op", "persistent", "block_m", "block_n", "use_slice_n", "slice_size", "expected"),
+    ("op", "m", "expected"),
     [
-        ("dispatch", False, 16, 256, True, 8, (16, 8, None, False)),
-        ("dispatch", True, 64, 256, True, 32, (32, 8, True, False)),
-        ("combine", True, 64, 128, False, 32, (8, 8, None, False)),
-        ("combine", True, 128, 256, True, 128, (16, 4, None, True)),
-        ("combine", True, 64, 256, True, 128, (16, 4, None, True)),
-        ("combine", True, 64, 256, True, 32, (4, 8, True, False)),
-        ("combine", True, 64, 256, True, 64, (4, 4, None, False)),
+        ("dispatch", 1024, (1, gluon_moe._CDNA4_NUM_XCDS, None, False)),
+        ("dispatch", 2048, (1, 4, None, False)),
+        ("dispatch", 4096, (1, gluon_moe._CDNA4_NUM_XCDS, True, False)),
+        ("dispatch", 8192, (1, None, None, False)),
+        ("combine", 1024, (1, gluon_moe._CDNA4_NUM_XCDS, None, False)),
+        ("combine", 2048, (1, 4, None, False)),
+        ("combine", 4096, (1, gluon_moe._CDNA4_NUM_XCDS, True, False)),
+        ("combine", 8192, (1, 4, None, False)),
+        ("combine", 16384, (1, 4, None, True)),
     ],
 )
 def test_prefill_launch_tuning_routes(
     op: str,
-    persistent: bool,
-    block_m: int,
-    block_n: int,
-    use_slice_n: bool,
-    slice_size: int,
+    m: int,
     expected: tuple[int | None, int | None, bool | None, bool],
 ) -> None:
-    num_ctas = gluon_moe._CDNA4_NUM_CUS if persistent else None
-
     actual = gluon_moe._prefill_launch_tuning(
         op,
-        persistent=persistent,
-        num_ctas=num_ctas,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=256,
+        m=m,
         use_slice_mn=False,
-        use_slice_n=use_slice_n,
-        slice_size=slice_size,
     )
 
     assert actual == expected
@@ -204,15 +194,9 @@ def test_prefill_launch_tuning_routes(
 def test_prefill_launch_tuning_ignores_slice_mn() -> None:
     assert gluon_moe._prefill_launch_tuning(
         "combine",
-        persistent=True,
-        num_ctas=gluon_moe._CDNA4_NUM_CUS,
-        block_m=64,
-        block_n=256,
-        block_k=256,
+        m=4096,
         use_slice_mn=True,
-        use_slice_n=True,
-        slice_size=128,
-    ) == (None, None, None, False)
+    ) == (1, None, None, False)
 
 
 def test_prefill_slice_resolver_prefers_slicen_by_default() -> None:
