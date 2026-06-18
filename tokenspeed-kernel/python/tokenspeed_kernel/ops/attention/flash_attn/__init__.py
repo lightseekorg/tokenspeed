@@ -54,6 +54,11 @@ if platform.is_blackwell_plus:
         flash_attn_varlen_func,
     )
 
+if (
+    platform.is_nvidia
+    and platform.is_blackwell
+    and platform.arch_version == ArchVersion(10, 0)
+):
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,
     # but the 256-wide MHA path mishandles non-contiguous V split views, so we
     # restrict it to <256 for now until that is resolved.
