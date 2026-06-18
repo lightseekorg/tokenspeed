@@ -80,6 +80,24 @@ def test_preprocessor_ref_rejects_empty_name():
         WeightPreprocessorRef("")
 
 
+def test_preprocessor_ref_rejects_empty_candidate_list():
+    with pytest.raises(ValueError, match="at least one"):
+        WeightPreprocessorRef(())
+
+
+def test_preprocessor_ref_normalizes_ordered_candidates():
+    ref = WeightPreprocessorRef(["layout_fast", "layout_base"], required=False)
+
+    assert ref.names == ("layout_fast", "layout_base")
+    assert ref.name == "layout_fast"
+    assert ref.required is False
+
+
+def test_preprocessor_ref_rejects_duplicate_candidates():
+    with pytest.raises(ValueError, match="unique"):
+        WeightPreprocessorRef(["layout_a", "layout_a"])
+
+
 def test_preprocessor_ref_requires_bool_required():
     with pytest.raises(TypeError, match="required"):
         WeightPreprocessorRef("layout_a", required="yes")
@@ -109,6 +127,26 @@ def test_resolution_allows_kernel_before_preprocessor_registration(h100_platform
 
     assert spec is not None
     assert spec.name == "layout_a"
+
+
+def test_resolution_uses_first_capable_preprocessor_candidate(h100_platform):
+    kernel_spec = _register_apply(
+        preprocessor=WeightPreprocessorRef(("amd_layout", "portable_layout"))
+    )
+    _register_preprocessor(
+        name="amd_layout",
+        capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    )
+    _register_preprocessor(name="portable_layout")
+
+    spec = resolve_weight_preprocessor_ref(
+        kernel_spec.weight_preprocessor,
+        kernel_spec=kernel_spec,
+        platform=h100_platform,
+    )
+
+    assert spec is not None
+    assert spec.name == "portable_layout"
 
 
 def test_resolution_rejects_missing_preprocessor(h100_platform):
@@ -223,6 +261,15 @@ def test_same_preprocessor_requests_dedupe_and_preserve_required():
     ref = resolve_weight_preprocessor_conflict([optional_ref, required_ref])
 
     assert ref == WeightPreprocessorRef("layout_a", required=True)
+
+
+def test_conflicting_refs_choose_highest_common_preprocessor():
+    fast_or_base = WeightPreprocessorRef(("layout_fast", "layout_base"))
+    base_only = WeightPreprocessorRef("layout_base", required=False)
+
+    ref = resolve_weight_preprocessor_conflict([fast_or_base, base_only])
+
+    assert ref == WeightPreprocessorRef("layout_base", required=True)
 
 
 def test_optional_conflicting_preprocessors_warn_and_skip():

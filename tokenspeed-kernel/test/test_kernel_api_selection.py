@@ -67,7 +67,7 @@ from tokenspeed_kernel.preprocessing import (
     WeightPreprocessorSpec,
     resolve_weight_preprocessor_ref,
 )
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, WeightPreprocessorRef
 from tokenspeed_kernel.selection import SelectedKernel
 
 _RELOAD_MODULES = [
@@ -157,16 +157,20 @@ def test_builtin_moe_preprocessor_links_resolve():
         ref = kernel_spec.weight_preprocessor
         if ref is None:
             continue
-        preprocessor_spec = preprocessor_registry.get_by_name(ref.name)
-        platform = _platform_satisfying_preprocessor(preprocessor_spec)
-        try:
-            resolve_weight_preprocessor_ref(
-                ref,
-                kernel_spec=kernel_spec,
-                platform=platform,
-            )
-        except WeightPreprocessorResolutionError as exc:
-            errors.append(str(exc))
+        for name in ref.names:
+            preprocessor_spec = preprocessor_registry.get_by_name(name)
+            if preprocessor_spec is None:
+                errors.append(f"missing weight preprocessor {name!r}")
+                continue
+            platform = _platform_satisfying_preprocessor(preprocessor_spec)
+            try:
+                resolve_weight_preprocessor_ref(
+                    WeightPreprocessorRef(name, required=ref.required),
+                    kernel_spec=kernel_spec,
+                    platform=platform,
+                )
+            except WeightPreprocessorResolutionError as exc:
+                errors.append(str(exc))
 
     assert errors == []
 

@@ -503,7 +503,7 @@ class TestDescribeKernel:
 
         desc = describe_kernel("moe_apply")
 
-        assert "Weight preprocessor: moe_weights (optional)" in desc
+        assert "Weight preprocessors: moe_weights (optional)" in desc
 
     def test_describe_not_found(self):
         desc = describe_kernel("nonexistent_kernel")

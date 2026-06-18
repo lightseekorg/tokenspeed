@@ -142,18 +142,51 @@ def _validate_priority(value: int | Priority) -> int:
     return ivalue
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class WeightPreprocessorRef:
-    """Exact weight-preprocessor association for a registered kernel."""
+    """Ordered weight-preprocessor candidates for a registered kernel."""
 
-    name: str
-    required: bool = True
+    names: tuple[str, ...]
+    required: bool
+
+    def __init__(
+        self,
+        names: str | Iterable[str] | None = None,
+        *,
+        name: str | None = None,
+        required: bool = True,
+    ) -> None:
+        if names is None:
+            names = name
+        if isinstance(names, str):
+            names_tuple = (names,)
+        elif names is None:
+            names_tuple = ()
+        else:
+            names_tuple = tuple(names)
+        object.__setattr__(self, "names", names_tuple)
+        object.__setattr__(self, "required", required)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name:
-            raise ValueError("weight preprocessor ref name must be a non-empty string")
+        if not self.names:
+            raise ValueError(
+                "weight preprocessor ref names must contain at least one name"
+            )
+        for name in self.names:
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "weight preprocessor ref name must be a non-empty string"
+                )
+        if len(set(self.names)) != len(self.names):
+            raise ValueError("weight preprocessor ref names must be unique")
         if not isinstance(self.required, bool):
             raise TypeError("weight preprocessor ref required must be a bool")
+
+    @property
+    def name(self) -> str:
+        """Primary candidate name, for single-name call sites and display."""
+        return self.names[0]
 
 
 @dataclass(frozen=True)
@@ -460,9 +493,8 @@ def describe_kernel(name: str) -> str:
         lines.append("  Weight preprocessor: none")
     else:
         requirement = "required" if spec.weight_preprocessor.required else "optional"
-        lines.append(
-            f"  Weight preprocessor: {spec.weight_preprocessor.name} ({requirement})"
-        )
+        names = ", ".join(spec.weight_preprocessor.names)
+        lines.append(f"  Weight preprocessors: {names} ({requirement})")
     return "\n".join(lines)
 
 

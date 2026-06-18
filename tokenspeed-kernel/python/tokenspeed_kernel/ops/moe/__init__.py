@@ -129,8 +129,9 @@ def moe_plan(
 
     The selected apply kernel owns plan metadata. A plan with support_routing
     false requires precomputed top-k ids and weights when calling moe_apply.
-    Weight preprocessing is pinned to the exact preprocessor named by the
-    selected apply kernel when weights are loaded.
+    Weight preprocessing is selected from the ordered candidates advertised by
+    the selected apply kernel, then pinned by name in the returned plan so load
+    time does not rerun selection or conflict resolution.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)

@@ -148,38 +148,66 @@ def resolve_weight_preprocessor_ref(
     platform: PlatformInfo,
     registry: WeightPreprocessorRegistry | None = None,
 ) -> WeightPreprocessorSpec | None:
-    """Resolve an exact preprocessor reference for a selected kernel path."""
+    """Resolve an ordered preprocessor reference for a selected kernel path."""
     if ref is None:
         return None
 
     registry = registry or WeightPreprocessorRegistry.get()
-    spec = registry.get_by_name(ref.name)
-    if spec is None:
-        raise WeightPreprocessorResolutionError(
-            f"Selected kernel references missing weight preprocessor {ref.name!r}"
-        )
     errors: list[str] = []
-    if spec.family != kernel_spec.family:
-        errors.append(
-            f"{kernel_spec.name}: preprocessor {spec.name!r} belongs to family "
-            f"{spec.family!r}, expected {kernel_spec.family!r}"
-        )
+    candidate_specs: list[WeightPreprocessorSpec] = []
+    for name in ref.names:
+        spec = registry.get_by_name(name)
+        if spec is None:
+            errors.append(
+                f"Selected kernel references missing weight preprocessor {name!r}"
+            )
+            continue
+        if spec.family != kernel_spec.family:
+            errors.append(
+                f"{kernel_spec.name}: preprocessor {spec.name!r} belongs to family "
+                f"{spec.family!r}, expected {kernel_spec.family!r}"
+            )
+            continue
+        candidate_specs.append(spec)
     if errors:
         raise WeightPreprocessorResolutionError("\n".join(errors))
-    if not spec.capability.satisfied_by(platform):
-        message = (
-            f"Weight preprocessor {ref.name!r} cannot run on " f"{platform.device_name}"
-        )
-        if ref.required:
-            raise WeightPreprocessorResolutionError(message)
-        warnings.warn(
-            "skipping preprocessors due to hardware capabilities: "
-            f"{ref.name!r}; this may hurt performance",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return None
-    return spec
+
+    capability_skips = [
+        spec.name
+        for spec in candidate_specs
+        if not spec.capability.satisfied_by(platform)
+    ]
+    for spec in candidate_specs:
+        if spec.capability.satisfied_by(platform):
+            return spec
+
+    skipped = ", ".join(repr(name) for name in capability_skips)
+    message = f"Weight preprocessors [{skipped}] cannot run on {platform.device_name}"
+    if ref.required:
+        raise WeightPreprocessorResolutionError(message)
+    warnings.warn(
+        "skipping preprocessors due to hardware capabilities: "
+        f"[{skipped}]; this may hurt performance",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return None
+
+
+def _ordered_common_preprocessors(
+    refs: list[WeightPreprocessorRef],
+) -> tuple[str, ...]:
+    common = set(refs[0].names)
+    for ref in refs[1:]:
+        common.intersection_update(ref.names)
+    if not common:
+        return ()
+
+    def rank(name: str) -> tuple[int, int, tuple[int, ...], str]:
+        ranks = tuple(ref.names.index(name) for ref in refs)
+        return max(ranks), sum(ranks), ranks, name
+
+    return tuple(sorted(common, key=rank))
 
 
 def resolve_weight_preprocessor_conflict(
@@ -187,52 +215,57 @@ def resolve_weight_preprocessor_conflict(
 ) -> WeightPreprocessorRef | None:
     """Resolve module-scoped preprocessing requests.
 
-    ``None`` is a required no-preprocessing constraint. Same-name preprocessors
-    are compatible and deduped. Distinct named preprocessors conflict because
-    they own the module weight layout as a whole.
+    ``None`` is a required no-preprocessing constraint. Named refs are compatible
+    when they share at least one candidate preprocessor. The resolved ref names
+    the highest-priority shared candidate across the inputs.
     """
     required_no_preprocessing = False
-    named: dict[str, bool] = {}
+    named_refs: list[WeightPreprocessorRef] = []
 
     for ref in refs:
         if ref is None:
             required_no_preprocessing = True
             continue
-        named[ref.name] = named.get(ref.name, False) or ref.required
+        named_refs.append(ref)
 
-    if not named:
+    if not named_refs:
         return None
 
     if required_no_preprocessing:
-        required_named = [name for name, required in named.items() if required]
-        if required_named:
+        if any(ref.required for ref in named_refs):
+            required_names = sorted({name for ref in named_refs for name in ref.names})
             raise WeightPreprocessorConflictError(
                 "Conflicting module preprocessing requirements: required "
-                f"no-preprocessing and required preprocessors {sorted(required_named)!r}"
+                f"no-preprocessing and required preprocessors {required_names!r}"
             )
+        optional_names = sorted({name for ref in named_refs for name in ref.names})
         warnings.warn(
             "skipping conflicting preprocessors: "
-            f"{sorted(named)!r} conflict with required no preprocessing; "
+            f"{optional_names!r} conflict with required no preprocessing; "
             "this may hurt performance",
             RuntimeWarning,
             stacklevel=2,
         )
         return None
 
-    if len(named) > 1:
-        required_named = [name for name, required in named.items() if required]
-        if required_named:
+    common_names = _ordered_common_preprocessors(named_refs)
+    if not common_names:
+        all_names = sorted({name for ref in named_refs for name in ref.names})
+        if any(ref.required for ref in named_refs):
+            required_names = sorted(
+                {name for ref in named_refs if ref.required for name in ref.names}
+            )
             raise WeightPreprocessorConflictError(
-                f"Conflicting module preprocessors {sorted(named)!r}; "
-                f"required preprocessors: {sorted(required_named)!r}"
+                f"Conflicting module preprocessors {all_names!r}; "
+                f"required preprocessors: {required_names!r}"
             )
         warnings.warn(
             "skipping conflicting preprocessors: "
-            f"{sorted(named)!r}; this may hurt performance",
+            f"{all_names!r}; this may hurt performance",
             RuntimeWarning,
             stacklevel=2,
         )
         return None
 
-    name, required = next(iter(named.items()))
-    return WeightPreprocessorRef(name=name, required=required)
+    required = any(ref.required for ref in named_refs)
+    return WeightPreprocessorRef(common_names[0], required=required)
