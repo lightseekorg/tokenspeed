@@ -3017,7 +3017,7 @@ def _make_preshuffled_w_full_offsets(
 
 
 @gluon.jit
-def _run_moe_tile_w_via_vgpr_slice_n(
+def _run_moe_tile_w_via_vgpr(
     cfg,
     x_ptr,
     w_ptr,
@@ -3055,13 +3055,10 @@ def _run_moe_tile_w_via_vgpr_slice_n(
     )
     gl.static_assert(
         BLOCK_K_W == 128
-        and USE_SLICE_N
         and NUM_WARPS == 4
         and not USE_SLICE_MN,
-        "W_VIA_VGPR SliceN layout bases assume BLOCK_K_W=128, "
-        "USE_SLICE_N=True, "
-        "NUM_WARPS=4, and USE_SLICE_MN=False. Re-derive bases for "
-        "other shapes.",
+        "W_VIA_VGPR layout bases assume BLOCK_K_W=128, NUM_WARPS=4, "
+        "and USE_SLICE_MN=False. Re-derive bases for other shapes.",
     )
 
     x_desc = _make_preshuffled_w_x_desc(
@@ -3077,147 +3074,93 @@ def _run_moe_tile_w_via_vgpr_slice_n(
         HAS_GATHER,
     )
 
-    SUB_BN: gl.constexpr = BLOCK_N // 2
-    gl.static_assert(
-        SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
-        "USE_SLICE_N + W_VIA_VGPR requires SUB_BN=BLOCK_K_W=128 "
-        "and NUM_WARPS=4; the half-tile LOAD_W_LAYOUT bases assume "
-        "this shape (re-derive otherwise).",
-    )
-    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-        SUB_BN // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, False
-    )
-    (
-        offsets_h,
-        base_off_top,
-        base_off_bot,
-        w_k_stride,
-        bottom_valid,
-    ) = _make_preshuffled_w_slice_offsets(
-        w_base_offset,
-        pid_n,
-        N,
-        LOAD_W_HALF_COPY_LAYOUT,
-        N_LIMIT,
-        SUB_BN,
-        BLOCK_K_W,
-    )
-    w_desc_top = WVgprDescriptor(
-        cfg,
-        BLOCK_K_W,
-        w_ptr,
-        w_k_stride,
-        offsets_h + base_off_top,
-        pred=gl.to_tensor(True),
-        LOAD_BN=SUB_BN,
-    )
-    w_desc_bot = WVgprDescriptor(
-        cfg,
-        BLOCK_K_W,
-        w_ptr,
-        w_k_stride,
-        offsets_h + base_off_bot,
-        pred=bottom_valid,
-        LOAD_BN=SUB_BN,
-    )
-    pgm = MoESliceNProgram.initialize(
-        cfg,
-        x_desc,
-        w_desc_top,
-        w_desc_bot,
-        x_scale_desc,
-        w_scale_desc,
-        bottom_valid,
-    )
-    return pgm.pipeline(K)
-
-
-@gluon.jit
-def _run_moe_tile_w_via_vgpr_full(
-    cfg,
-    x_ptr,
-    w_ptr,
-    x_scale_desc,
-    w_scale_desc,
-    gather_idx_ptr,
-    stride_xm,
-    stride_xk,
-    M_X,
-    N,
-    K,
-    off_m,
-    m_limit,
-    rows_m_x,
-    offs_xk,
-    k_limit_x,
-    k_limit_w,
-    w_base_offset,
-    pid_n,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K_X: gl.constexpr,
-    BLOCK_K_W: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    HAS_GATHER: gl.constexpr,
-    USE_SLICE_MN: gl.constexpr,
-    USE_SLICE_N: gl.constexpr,
-    USE_WARP_PIPELINE: gl.constexpr,
-    N_LIMIT: gl.constexpr,
-    W_CACHE_MODIFIER: gl.constexpr,
-):
-    gl.static_assert(
-        cfg.W_PRESHUFFLED,
-        "W_VIA_VGPR consumes the preshuffled Gluon-dot W layout.",
-    )
-    gl.static_assert(
-        BLOCK_K_W == 128
-        and BLOCK_N == 128
-        and NUM_WARPS == 4
-        and not USE_SLICE_MN
-        and not USE_SLICE_N,
-        "W_VIA_VGPR full-tile layout bases assume BLOCK_K_W=128, "
-        "BLOCK_N=128, NUM_WARPS=4, USE_SLICE_MN=False, and "
-        "USE_SLICE_N=False. Re-derive bases for other shapes.",
-    )
-
-    x_desc = _make_preshuffled_w_x_desc(
-        cfg,
-        x_ptr,
-        rows_m_x,
-        offs_xk,
-        stride_xm,
-        stride_xk,
-        M_X,
-        k_limit_x,
-        BLOCK_K_X,
-        HAS_GATHER,
-    )
-
-    BLOCK_N_LAYOUT: gl.constexpr = BLOCK_N
-    LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-        BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, False
-    )
-    offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
-        w_base_offset,
-        pid_n,
-        LOAD_W_COPY_LAYOUT,
-        BLOCK_N_LAYOUT,
-        BLOCK_N,
-        BLOCK_K_W,
-    )
-    w_desc = WVgprDescriptor(
-        cfg,
-        BLOCK_K_W,
-        w_ptr,
-        gl.to_tensor(N),  # K-iter advance step: idx * BK_W * N
-        offsets_b_vgpr + base_off_b_vgpr,
-        pred=gl.to_tensor(True),  # full-tile path: always in-bounds
-        LOAD_BN=BLOCK_N_LAYOUT,
-    )
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
+    if USE_SLICE_N:
+        SUB_BN: gl.constexpr = BLOCK_N // 2
+        gl.static_assert(
+            SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
+            "USE_SLICE_N + W_VIA_VGPR requires SUB_BN=BLOCK_K_W=128 "
+            "and NUM_WARPS=4; the half-tile LOAD_W_LAYOUT bases assume "
+            "this shape (re-derive otherwise).",
+        )
+        LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
+            SUB_BN // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, False
+        )
+        (
+            offsets_h,
+            base_off_top,
+            base_off_bot,
+            w_k_stride,
+            bottom_valid,
+        ) = _make_preshuffled_w_slice_offsets(
+            w_base_offset,
+            pid_n,
+            N,
+            LOAD_W_HALF_COPY_LAYOUT,
+            N_LIMIT,
+            SUB_BN,
+            BLOCK_K_W,
+        )
+        w_desc_top = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            w_ptr,
+            w_k_stride,
+            offsets_h + base_off_top,
+            pred=gl.to_tensor(True),
+            LOAD_BN=SUB_BN,
+        )
+        w_desc_bot = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            w_ptr,
+            w_k_stride,
+            offsets_h + base_off_bot,
+            pred=bottom_valid,
+            LOAD_BN=SUB_BN,
+        )
+        pgm = MoESliceNProgram.initialize(
+            cfg,
+            x_desc,
+            w_desc_top,
+            w_desc_bot,
+            x_scale_desc,
+            w_scale_desc,
+            bottom_valid,
+        )
+        return pgm.pipeline(K)
+    else:
+        gl.static_assert(
+            BLOCK_N == 128,
+            "W_VIA_VGPR full-tile layout bases assume BLOCK_N=128. "
+            "Re-derive bases for other shapes.",
+        )
+        BLOCK_N_LAYOUT: gl.constexpr = BLOCK_N
+        LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
+            BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, False
+        )
+        offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
+            w_base_offset,
+            pid_n,
+            LOAD_W_COPY_LAYOUT,
+            BLOCK_N_LAYOUT,
+            BLOCK_N,
+            BLOCK_K_W,
+        )
+        w_desc = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            w_ptr,
+            gl.to_tensor(N),  # K-iter advance step: idx * BK_W * N
+            offsets_b_vgpr + base_off_b_vgpr,
+            pred=gl.to_tensor(True),  # full-tile path: always in-bounds
+            LOAD_BN=BLOCK_N_LAYOUT,
+        )
+        pgm = MoEPipelinedProgram.initialize(
+            cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
+        )
+        if USE_WARP_PIPELINE:
+            return pgm.warp_pipeline(K)
+        return pgm.pipeline(K)
 
 
 @gluon.jit
@@ -3963,72 +3906,38 @@ def _pipelined_moe_tile_compute(
         w_scale_desc: gl.constexpr = 0
 
     if cfg.W_VIA_VGPR:
-        if USE_SLICE_N:
-            acc = _run_moe_tile_w_via_vgpr_slice_n(
-                cfg,
-                x_ptr,
-                w_ptr,
-                x_scale_desc,
-                w_scale_desc,
-                gather_idx_ptr,
-                stride_xm,
-                stride_xk,
-                M_X,
-                N,
-                K,
-                off_m,
-                m_limit,
-                rows_m_x,
-                offs_xk,
-                k_limit_x,
-                k_limit_w,
-                w_base_offset,
-                pid_n,
-                BLOCK_M,
-                BLOCK_N,
-                BLOCK_K_X,
-                BLOCK_K_W,
-                NUM_WARPS,
-                HAS_GATHER,
-                USE_SLICE_MN,
-                USE_SLICE_N,
-                USE_WARP_PIPELINE,
-                N_LIMIT,
-                W_CACHE_MODIFIER,
-            )
-        else:
-            acc = _run_moe_tile_w_via_vgpr_full(
-                cfg,
-                x_ptr,
-                w_ptr,
-                x_scale_desc,
-                w_scale_desc,
-                gather_idx_ptr,
-                stride_xm,
-                stride_xk,
-                M_X,
-                N,
-                K,
-                off_m,
-                m_limit,
-                rows_m_x,
-                offs_xk,
-                k_limit_x,
-                k_limit_w,
-                w_base_offset,
-                pid_n,
-                BLOCK_M,
-                BLOCK_N,
-                BLOCK_K_X,
-                BLOCK_K_W,
-                NUM_WARPS,
-                HAS_GATHER,
-                USE_SLICE_MN,
-                USE_SLICE_N,
-                USE_WARP_PIPELINE,
-                N_LIMIT,
-                W_CACHE_MODIFIER,
-            )
+        acc = _run_moe_tile_w_via_vgpr(
+            cfg,
+            x_ptr,
+            w_ptr,
+            x_scale_desc,
+            w_scale_desc,
+            gather_idx_ptr,
+            stride_xm,
+            stride_xk,
+            M_X,
+            N,
+            K,
+            off_m,
+            m_limit,
+            rows_m_x,
+            offs_xk,
+            k_limit_x,
+            k_limit_w,
+            w_base_offset,
+            pid_n,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K_X,
+            BLOCK_K_W,
+            NUM_WARPS,
+            HAS_GATHER,
+            USE_SLICE_MN,
+            USE_SLICE_N,
+            USE_WARP_PIPELINE,
+            N_LIMIT,
+            W_CACHE_MODIFIER,
+        )
     elif cfg.W_PRESHUFFLED:
         acc = _run_moe_tile_preshuffled_lds_w(
             cfg,
