@@ -2207,10 +2207,6 @@ class MoESliceNProgram:
         gl.amd.cdna4.async_copy.wait_group(waitcnt * 2)
 
     @gluon.jit
-    def async_wait_groups(self, waitcnt):
-        gl.amd.cdna4.async_copy.wait_group(waitcnt)
-
-    @gluon.jit
     def issue_local_load_w_sub(self, mfma_idx, subtile_idx_n: gl.constexpr):
         cfg = self.cfg
         SUBTILE_N: gl.constexpr = cfg.BLOCK_N // cfg.NUM_SUBTILES[1]
@@ -2308,7 +2304,7 @@ class MoESliceNProgram:
         main_iters = K_iters - NB
         gl.assume(main_iters >= 0)
 
-        self.async_wait_groups(2 * NB - 1)
+        gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
         w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
         x0, sx0 = self.issue_local_load_x(mfma_idx)
         mfma_idx += 1
@@ -2320,7 +2316,7 @@ class MoESliceNProgram:
             gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            self.async_wait_groups(2 * NB - 1)
+            gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
@@ -2328,7 +2324,7 @@ class MoESliceNProgram:
             gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
-            self.async_wait_groups(2 * NB - 1)
+            gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
             w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             x0, sx0 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
@@ -2337,24 +2333,24 @@ class MoESliceNProgram:
             gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            self.async_wait_groups(2 * NB - 1)
+            gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
-            self.async_wait_groups(1)
+            gl.amd.cdna4.async_copy.wait_group(1)
             w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             x0, sx0 = self.issue_local_load_x(mfma_idx)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            self.async_wait_groups(0)
+            gl.amd.cdna4.async_copy.wait_group(0)
         else:
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            self.async_wait_groups(1)
+            gl.amd.cdna4.async_copy.wait_group(1)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
-            self.async_wait_groups(0)
+            gl.amd.cdna4.async_copy.wait_group(0)
 
         return self._finish_accumulator(c0, c1)
 
@@ -2385,10 +2381,10 @@ class MoESliceNProgram:
         # Loading X before the bottom MFMA gives the next X tile latency slack.
         # The hot loop delays W-top until after the current bottom MFMA so the
         # pre-bottom wait does not also cover an unused W-top LDS read.
-        self.async_wait_groups(2 * NB - 1)
+        gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
         w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
         x0, sx0 = self.issue_local_load_x(mfma_idx)
-        self.async_wait_groups(2 * NB - 2)
+        gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
         w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
         mfma_idx += 1
 
@@ -2401,24 +2397,24 @@ class MoESliceNProgram:
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
-            self.async_wait_groups(2 * (NB - 1))
+            gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
-            self.async_wait_groups(2 * (NB - 1))
+            gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
 
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
-            self.async_wait_groups(2 * (NB - 1))
+            gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             x0, sx0 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
-            self.async_wait_groups(2 * (NB - 1))
+            gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
 
@@ -2426,33 +2422,33 @@ class MoESliceNProgram:
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
-            self.async_wait_groups(2 * (NB - 1))
+            gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
-            self.async_wait_groups(2 * (NB - 1))
+            gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
 
             # Drain + final NB iters of MFMAs (no more async_copy).
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
-            self.async_wait_groups(1)
+            gl.amd.cdna4.async_copy.wait_group(1)
             w00, sw00 = self.issue_local_load_w_sub(mfma_idx, 0)
             x0, sx0 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
-            self.async_wait_groups(0)
+            gl.amd.cdna4.async_copy.wait_group(0)
             w01, sw01 = self.issue_local_load_w_sub(mfma_idx, 1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
         else:
             # Drain + final NB iters of MFMAs (no more async_copy).
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            self.async_wait_groups(1)
+            gl.amd.cdna4.async_copy.wait_group(1)
             w10, sw10 = self.issue_local_load_w_sub(mfma_idx, 0)
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             c1 = self.mfma(x0, sx0, w01, sw01, c1)
-            self.async_wait_groups(0)
+            gl.amd.cdna4.async_copy.wait_group(0)
             w11, sw11 = self.issue_local_load_w_sub(mfma_idx, 1)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             c1 = self.mfma(x1, sx1, w11, sw11, c1)
