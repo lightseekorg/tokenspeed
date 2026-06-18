@@ -114,49 +114,6 @@ _GLUON_DOT_SUB_TILE_K = _GLUON_DOT_K_QUAD * _GLUON_DOT_K_WIDTH  # = 64
 _TCP_INFLIGHT_CAP_BYTES = 32 * 1024  # gfx9 L1/TCP per-CU in-flight cap
 _CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
 
-_PREFILL_SMALL_SLICE = "lt16"
-
-# Selected-region rocprof tuning for GPT-OSS prefill routes.
-# Key: (op, persistent, route, BLOCK_M, BLOCK_N, BLOCK_K, slice-size bucket)
-# Value: (GROUP_M, XCD_SWIZZLE, W_CACHE_CG, USE_NARROW_N_STORE_LAYOUT)
-_PREFILL_LAUNCH_TUNING = {
-    ("dispatch", False, "slice_n", 16, 256, 256, _PREFILL_SMALL_SLICE): (
-        16,
-        _CDNA4_NUM_XCDS,
-        None,
-        False,
-    ),
-    ("dispatch", True, "slice_n", 64, 256, 256, 32): (
-        32,
-        _CDNA4_NUM_XCDS,
-        True,
-        False,
-    ),
-    ("dispatch", True, "slice_n", 32, 256, 256, 16): (32, 4, None, False),
-    ("combine", False, "slice_n", 16, 256, 256, _PREFILL_SMALL_SLICE): (
-        16,
-        _CDNA4_NUM_XCDS,
-        None,
-        False,
-    ),
-    ("combine", True, "plain", 64, 128, 256, None): (
-        8,
-        _CDNA4_NUM_XCDS,
-        None,
-        False,
-    ),
-    ("combine", True, "slice_n", 128, 256, 256, None): (16, 4, None, True),
-    ("combine", True, "slice_n", 64, 256, 256, 128): (16, 4, None, True),
-    ("combine", True, "slice_n", 64, 256, 256, 32): (
-        4,
-        _CDNA4_NUM_XCDS,
-        True,
-        False,
-    ),
-    ("combine", True, "slice_n", 64, 256, 256, None): (4, 4, None, False),
-    ("combine", True, "slice_n", 32, 256, 256, 16): (4, 4, None, False),
-}
-
 
 def shuffle_weight_for_gluon_dot_layout(
     w: torch.Tensor,
@@ -5081,10 +5038,85 @@ def _autotune_pid_swizzle(
     return group_m, xcd_swizzle
 
 
-def _prefill_slice_size_key(slice_size: int | None):
-    if slice_size is not None and slice_size < 16:
-        return _PREFILL_SMALL_SLICE
-    return slice_size
+_LaunchTuning = tuple[int | None, int | None, bool | None, bool]
+
+
+def _default_prefill_launch_tuning() -> _LaunchTuning:
+    return None, None, None, False
+
+
+def _is_small_prefill_slice(slice_size: int | None) -> bool:
+    return slice_size is not None and slice_size < 16
+
+
+def _is_slice_n_prefill_tile(block_n: int, block_k: int) -> bool:
+    return block_n == 256 and block_k == 256
+
+
+def _nonpersistent_prefill_launch_tuning(
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_slice_n: bool,
+    slice_size: int | None,
+) -> _LaunchTuning:
+    if (
+        use_slice_n
+        and block_m == 16
+        and _is_slice_n_prefill_tile(block_n, block_k)
+        and _is_small_prefill_slice(slice_size)
+    ):
+        return 16, _CDNA4_NUM_XCDS, None, False
+    return _default_prefill_launch_tuning()
+
+
+def _dispatch_prefill_launch_tuning(
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_slice_n: bool,
+    slice_size: int | None,
+) -> _LaunchTuning:
+    if not use_slice_n or not _is_slice_n_prefill_tile(block_n, block_k):
+        return _default_prefill_launch_tuning()
+    if block_m == 64 and slice_size == 32:
+        return 32, _CDNA4_NUM_XCDS, True, False
+    if block_m == 32 and slice_size == 16:
+        return 32, 4, None, False
+    return _default_prefill_launch_tuning()
+
+
+def _combine_prefill_launch_tuning(
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_slice_n: bool,
+    slice_size: int | None,
+) -> _LaunchTuning:
+    if block_k != 256:
+        return _default_prefill_launch_tuning()
+
+    if not use_slice_n:
+        if block_m == 64 and block_n == 128:
+            return 8, _CDNA4_NUM_XCDS, None, False
+        return _default_prefill_launch_tuning()
+
+    if block_n != 256:
+        return _default_prefill_launch_tuning()
+    if block_m == 128:
+        return 16, 4, None, True
+    if block_m == 64:
+        if slice_size == 128:
+            return 16, 4, None, True
+        if slice_size == 32:
+            return 4, _CDNA4_NUM_XCDS, True, False
+        return 4, 4, None, False
+    if block_m == 32 and slice_size == 16:
+        return 4, 4, None, False
+    return _default_prefill_launch_tuning()
 
 
 def _prefill_launch_tuning(
@@ -5098,21 +5130,37 @@ def _prefill_launch_tuning(
     use_slice_mn: bool,
     use_slice_n: bool,
     slice_size: int | None,
-) -> tuple[int | None, int | None, bool | None, bool]:
+) -> _LaunchTuning:
     if use_slice_mn:
-        return None, None, None, False
-    if persistent and num_ctas != _CDNA4_NUM_CUS:
-        return None, None, None, False
+        return _default_prefill_launch_tuning()
+    if not persistent:
+        return _nonpersistent_prefill_launch_tuning(
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            use_slice_n=use_slice_n,
+            slice_size=slice_size,
+        )
+    if num_ctas != _CDNA4_NUM_CUS:
+        return _default_prefill_launch_tuning()
 
-    route = "slice_n" if use_slice_n else "plain"
-    base_key = (op, persistent, route, block_m, block_n, block_k)
-    keyed_slice_size = _prefill_slice_size_key(slice_size)
-    tuning = _PREFILL_LAUNCH_TUNING.get((*base_key, keyed_slice_size))
-    if tuning is None and keyed_slice_size is not None:
-        tuning = _PREFILL_LAUNCH_TUNING.get((*base_key, None))
-    if tuning is None:
-        return None, None, None, False
-    return tuning
+    if op == "dispatch":
+        return _dispatch_prefill_launch_tuning(
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            use_slice_n=use_slice_n,
+            slice_size=slice_size,
+        )
+    if op == "combine":
+        return _combine_prefill_launch_tuning(
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            use_slice_n=use_slice_n,
+            slice_size=slice_size,
+        )
+    return _default_prefill_launch_tuning()
 
 
 def _persistent_grid_size(num_tiles_total: int) -> int:

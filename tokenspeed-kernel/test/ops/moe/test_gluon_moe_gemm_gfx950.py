@@ -169,11 +169,13 @@ def test_autotune_block_forces_large_dispatch_slicen() -> None:
         ("dispatch", False, 16, 256, True, 8, (16, 8, None, False)),
         ("dispatch", True, 64, 256, True, 32, (32, 8, True, False)),
         ("combine", True, 64, 128, False, 32, (8, 8, None, False)),
+        ("combine", True, 128, 256, True, 128, (16, 4, None, True)),
         ("combine", True, 64, 256, True, 128, (16, 4, None, True)),
+        ("combine", True, 64, 256, True, 32, (4, 8, True, False)),
         ("combine", True, 64, 256, True, 64, (4, 4, None, False)),
     ],
 )
-def test_prefill_launch_tuning_table(
+def test_prefill_launch_tuning_routes(
     op: str,
     persistent: bool,
     block_m: int,
