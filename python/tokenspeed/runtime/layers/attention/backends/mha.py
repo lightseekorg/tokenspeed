@@ -157,7 +157,7 @@ class MHAAttnBackend(AttentionBackend):
             assert extend_prefix_lens is not None
             assert extend_prefix_lens_cpu is not None
 
-            # Create cumulative sum versions of the sequence lengths for Q and KV.
+            # Create cumulative sum of the sequence lengths for Q and KV.
             extend_seq_lens = extend_seq_lens[:bs]
             extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
             cu_extend_seq_lens = torch.nn.functional.pad(
