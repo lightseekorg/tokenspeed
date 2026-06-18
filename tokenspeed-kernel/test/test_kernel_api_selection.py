@@ -507,7 +507,7 @@ def _sampling_argmax() -> object:
 def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> None:
     assert plan["apply_kernel_name"] == apply
     assert plan["weight_preprocessor_name"] == preprocessor
-    assert plan["process_weights_kernel_name"] == preprocessor
+    assert "process_weights_kernel_name" not in plan
 
 
 def _moe_apply_unquant_trtllm() -> object:

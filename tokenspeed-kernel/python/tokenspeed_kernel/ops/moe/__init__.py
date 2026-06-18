@@ -180,7 +180,6 @@ def moe_plan(
         "weight_dtype": weight_dtype,
         "apply_kernel_name": apply_spec.name,
         "weight_preprocessor_name": weight_preprocessor_name,
-        "process_weights_kernel_name": weight_preprocessor_name,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
         "support_routing": support_routing,
@@ -198,9 +197,7 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
         w: Module containing loaded MoE weights. This module is mutated in
             place to prepare solution-specific layouts and scales.
     """
-    preprocessor_name = plan.get(
-        "weight_preprocessor_name", plan.get("process_weights_kernel_name")
-    )
+    preprocessor_name = plan.get("weight_preprocessor_name")
     if preprocessor_name is None:
         return None
 
