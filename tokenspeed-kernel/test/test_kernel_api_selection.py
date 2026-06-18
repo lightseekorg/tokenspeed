@@ -219,13 +219,11 @@ def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
     hidden_size = 2048
     output_size = 128
     block_size = [128, 128]
-    a = torch.randn(
-        (1, hidden_size), device="cuda", dtype=torch.bfloat16
-    ).repeat(num_tokens, 1)
+    a = torch.randn((1, hidden_size), device="cuda", dtype=torch.bfloat16).repeat(
+        num_tokens, 1
+    )
     b = (
-        torch.randn(
-            (output_size, hidden_size), device="cuda", dtype=torch.float32
-        )
+        torch.randn((output_size, hidden_size), device="cuda", dtype=torch.float32)
         * 0.1
     ).to(_fp8_dtype())
     b_scales = (
