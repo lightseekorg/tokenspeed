@@ -44,11 +44,11 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -360,13 +360,11 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
             params_dtype=config.torch_dtype,
         )
+
         self.topk = TopK(
             top_k=top_k,
             custom_routing_function=routing_function,
             output_format=self.experts.topk_output_format,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
             topk_indices_dtype=(
                 torch.int64 if get_all2all_backend().is_deepep() else torch.int32
             ),

@@ -56,7 +56,6 @@ class AttentionConfig:
     BATCH_SIZE: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
-    IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
@@ -87,7 +86,6 @@ class AttentionConfig:
         BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
-        IS_SLIDING,
         WINDOW_LEFT,
         q_strides,
         k_strides,
@@ -95,10 +93,6 @@ class AttentionConfig:
     ):
         assert HEAD_DIM == 64
         assert NUM_WARPS == 4
-        if IS_SLIDING:
-            assert WINDOW_LEFT >= 0
-        else:
-            assert WINDOW_LEFT == -1
 
         qk_layout = gl.amd.AMDMFMALayout(
             version=4,
@@ -130,7 +124,6 @@ class AttentionConfig:
         self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
-        self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
@@ -362,28 +355,27 @@ class AttentionProgram:
         return m_i, l_i, acc, sink_log2
 
     @gluon.jit
-    def apply_sliding_mask(self, qk, offs_n):
-        cfg = self.cfg
-        offs_m = self.q_start + gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
-        )
-        kv = gl.convert_layout(offs_n, gl.SliceLayout(0, cfg.qk_layout))
-        valid = offs_m[:, None] < self.seq_len
-        valid &= kv[None, :] < self.seq_len
-        valid &= kv[None, :] <= offs_m[:, None]
-        valid &= offs_m[:, None] <= kv[None, :] + cfg.WINDOW_LEFT
-        qk = gl.where(valid, qk, -float("inf"))
-        return qk
-
-    @gluon.jit
     def softmax(self, qk, m_i, l_i, acc):
         cfg = self.cfg
+        # In sliding window case, some rows can see fully masked tiles before
+        # any valid KV. Guard the online softmax state so `-inf - -inf` does not
+        # produce NaNs. This does not happen when having sink, because m_i
+        # is initialized to sink value instead of -inf.
+        HAS_INVALID: gl.constexpr = cfg.WINDOW_LEFT >= 0 and not cfg.HAS_SINK
+
         row_max = max(qk, 1)
         m_new = maximum(m_i, row_max)
         m_new_scaled = m_new * cfg.SM_SCALE
+        if HAS_INVALID:
+            invalid = m_new == -float("inf")
+            m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
+
         qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
+        if HAS_INVALID:
+            m_diff = gl.where(invalid, 0.0, m_diff)
+
         alpha = gl.exp2(m_diff)
         l_ij = gl.sum(p, axis=1)
         l_i = l_i * alpha + l_ij
@@ -669,7 +661,7 @@ def process_single_attention_tile(
     valid = mask_offs_m[:, None] < program.seq_len
     valid &= mask_offs_n[None, :] < program.seq_len
     valid &= mask_offs_n[None, :] <= mask_offs_m[:, None]
-    if cfg.IS_SLIDING:
+    if cfg.WINDOW_LEFT >= 0:
         valid &= mask_offs_m[:, None] <= mask_offs_n[None, :] + cfg.WINDOW_LEFT
 
     qk = gl.where(valid, qk, -1.0e20)
@@ -708,89 +700,122 @@ def process_attention_tile(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
 
-    if cfg.IS_SLIDING:
-        kv_start = program.q_start - cfg.WINDOW_LEFT
-        kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
-        num_kv_tiles: gl.constexpr = (
-            cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
-        ) // cfg.BLOCK_N
-        for _ in range(0, num_kv_tiles):
-            k_offsets, offs_n = program.make_k_offsets(kv_start)
-            v_offsets = program.make_v_offsets(kv_start)
-            mask = offs_n[:, None] < program.seq_len
-            program.issue_load_k(k_offsets, k_smem, mask=mask)
-            program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+    main_end = program.q_start // cfg.BLOCK_N
+    base_k_offsets, base_offs_n = program.make_k_offsets(0)
+    base_v_offsets = program.make_v_offsets(0)
 
-            async_copy.wait_group(1)
-            k = program.shared_load_k(k_smem)
-            qk = program.compute_qk(q, k)
-            qk = program.apply_sliding_mask(qk, offs_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+    k_offsets = base_k_offsets
+    v_offsets = base_v_offsets
+    offs_n = base_offs_n
 
-            async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem)
-            acc = program.compute_pv(p, v, acc)
-            kv_start = kv_start + cfg.BLOCK_N
-    else:
-        main_end = program.q_start // cfg.BLOCK_N
-        base_k_offsets, base_offs_n = program.make_k_offsets(0)
-        base_v_offsets = program.make_v_offsets(0)
-
-        k_offsets = base_k_offsets
-        v_offsets = base_v_offsets
-        offs_n = base_offs_n
-
-        for _ in range(0, main_end):
-            program.issue_load_k(k_offsets, k_smem)
-            program.issue_load_v(v_offsets, v_smem)
-
-            async_copy.wait_group(1)
-            k = program.shared_load_k(k_smem)
-            qk = program.compute_qk(q, k)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-            async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem)
-            acc = program.compute_pv(p, v, acc)
-
-            k_offsets = program.update_k_offsets(k_offsets)
-            v_offsets = program.update_v_offsets(v_offsets)
-            offs_n = offs_n + cfg.BLOCK_N
-
-        # The main loop handles prefix tiles; the two boundary tiles are causal.
-        boundary_start = main_end * cfg.BLOCK_N
-        k_offsets, offs_n = program.make_k_offsets(boundary_start)
-        v_offsets = program.make_v_offsets(boundary_start)
-        mask = offs_n[:, None] < program.seq_len
-        program.issue_load_k(k_offsets, k_smem, mask=mask, other=0.0)
-        program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+    for _ in range(0, main_end):
+        program.issue_load_k(k_offsets, k_smem)
+        program.issue_load_v(v_offsets, v_smem)
 
         async_copy.wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        qk = gl.where(boundary_mask0, qk, -float("inf"))
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         async_copy.wait_group(0)
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
 
-        boundary_start = boundary_start + cfg.BLOCK_N
-        k_offsets, offs_n = program.make_k_offsets(boundary_start)
-        v_offsets = program.make_v_offsets(boundary_start)
+        k_offsets = program.update_k_offsets(k_offsets)
+        v_offsets = program.update_v_offsets(v_offsets)
+        offs_n = offs_n + cfg.BLOCK_N
+
+    # The main loop handles prefix tiles; the two boundary tiles are causal.
+    boundary_start = main_end * cfg.BLOCK_N
+    k_offsets, offs_n = program.make_k_offsets(boundary_start)
+    v_offsets = program.make_v_offsets(boundary_start)
+    mask = offs_n[:, None] < program.seq_len
+    program.issue_load_k(k_offsets, k_smem, mask=mask, other=0.0)
+    program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+
+    async_copy.wait_group(1)
+    k = program.shared_load_k(k_smem)
+    qk = program.compute_qk(q, k)
+    qk = gl.where(boundary_mask0, qk, -float("inf"))
+    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+    async_copy.wait_group(0)
+    v = program.shared_load_v(v_smem)
+    acc = program.compute_pv(p, v, acc)
+
+    boundary_start = boundary_start + cfg.BLOCK_N
+    k_offsets, offs_n = program.make_k_offsets(boundary_start)
+    v_offsets = program.make_v_offsets(boundary_start)
+    mask = offs_n[:, None] < program.seq_len
+    program.issue_load_k(k_offsets, k_smem, mask=mask, other=0.0)
+    program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+
+    async_copy.wait_group(1)
+    k = program.shared_load_k(k_smem)
+    qk = program.compute_qk(q, k)
+    qk = gl.where(boundary_mask1, qk, -float("inf"))
+    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+    async_copy.wait_group(0)
+    v = program.shared_load_v(v_smem)
+    acc = program.compute_pv(p, v, acc)
+
+    l_i = program.apply_sinks(l_i, m_i, sink_log2)
+    program.store_lse(l_i, m_i)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    recip_denom = 1.0 / denom
+    output = acc * recip_denom[:, None]
+    output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
+def process_sliding_attention_tile(
+    program: AttentionProgram,
+    k_smem: gl.shared_memory_descriptor,
+    v_smem: gl.shared_memory_descriptor,
+):
+    cfg = program.cfg
+    q = program.load_q()
+    m_i, l_i, acc, sink_log2 = program.init_attention_state()
+
+    kv_start = program.q_start - cfg.WINDOW_LEFT
+    kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
+    num_kv_tiles: gl.constexpr = (
+        cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
+    ) // cfg.BLOCK_N
+    offs_m = program.q_start + gl.arange(
+        0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+    )
+    mask_n = kv_start + gl.arange(
+        0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+    )
+    mask_diff = offs_m[:, None] - mask_n[None, :]
+
+    for _ in gl.static_range(num_kv_tiles):
+        k_offsets, offs_n = program.make_k_offsets(kv_start)
+        v_offsets = program.make_v_offsets(kv_start)
         mask = offs_n[:, None] < program.seq_len
-        program.issue_load_k(k_offsets, k_smem, mask=mask, other=0.0)
+        program.issue_load_k(k_offsets, k_smem, mask=mask)
         program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+
+        valid = mask_diff.to(gl.uint32) <= cfg.WINDOW_LEFT
+        if kv_start + cfg.BLOCK_N > program.seq_len:
+            valid &= mask_n[None, :] < program.seq_len
 
         async_copy.wait_group(1)
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
-        qk = gl.where(boundary_mask1, qk, -float("inf"))
+        qk = gl.where(valid, qk, -float("inf"))
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
 
         async_copy.wait_group(0)
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
+        kv_start = kv_start + cfg.BLOCK_N
+
+        mask_n = mask_n + cfg.BLOCK_N
+        mask_diff = mask_diff - cfg.BLOCK_N
 
     l_i = program.apply_sinks(l_i, m_i, sink_log2)
     program.store_lse(l_i, m_i)
@@ -835,7 +860,6 @@ def _mha_prefill_fp16(
     max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
-    IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
 ):
     cfg = AttentionConfig(
@@ -849,8 +873,7 @@ def _mha_prefill_fp16(
         BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
-        IS_SLIDING,
-        WINDOW_LEFT,
+        -1,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -922,7 +945,6 @@ def _mha_prefill_sliding_fp16(
     max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
-    IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
 ):
     cfg = AttentionConfig(
@@ -936,7 +958,6 @@ def _mha_prefill_sliding_fp16(
         BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
-        IS_SLIDING,
         WINDOW_LEFT,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
@@ -969,7 +990,7 @@ def _mha_prefill_sliding_fp16(
                 if program.q_start == 0:
                     process_single_attention_tile(program, k_smem, v_smem)
             else:
-                process_attention_tile(program, k_smem, v_smem)
+                process_sliding_attention_tile(program, k_smem, v_smem)
         scheduler = scheduler.advance()
 
 
@@ -983,7 +1004,6 @@ class LaunchConfig(NamedTuple):
     num_warps: int
     batch_size: int
     max_seqlen: int
-    is_sliding: bool
     window_left: int
     grid: tuple[int, ...]
 
@@ -1003,8 +1023,7 @@ def get_config(
     block_n = 64
     num_warps = 4
     batch_size = cu_seqlens_q.numel() - 1
-    is_sliding = window_left >= 0
-    window_left = window_left if is_sliding else -1
+    window_left = window_left if window_left >= 0 else -1
     sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
     return LaunchConfig(
         n_heads=n_heads,
@@ -1016,7 +1035,6 @@ def get_config(
         num_warps=num_warps,
         batch_size=batch_size,
         max_seqlen=max_seqlen,
-        is_sliding=is_sliding,
         window_left=window_left,
         grid=(512,),
     )
@@ -1053,7 +1071,7 @@ def gluon_mha_prefill_fp16_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    kernel = _mha_prefill_sliding_fp16 if config.is_sliding else _mha_prefill_fp16
+    kernel = _mha_prefill_sliding_fp16 if config.window_left >= 0 else _mha_prefill_fp16
     kernel[config.grid](
         q,
         k,
@@ -1082,7 +1100,6 @@ def gluon_mha_prefill_fp16_gfx950(
         config.max_seqlen,
         has_sink,
         has_lse,
-        config.is_sliding,
         config.window_left,
         num_warps=config.num_warps,
     )

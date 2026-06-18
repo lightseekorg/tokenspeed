@@ -99,6 +99,9 @@ class LlamaAttention(BaseLlamaAttention):
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
                 ).index_select(0, ctx.gather_ids)
+                # record_kv_cache (keyed off the real mode) forces the backend's
+                # PD layerwise cache-step record that the DECODE dispatch would
+                # otherwise skip on an EXTEND/MIXED catch-up.
                 return ctx.attn_backend.forward(
                     q_rope,
                     None,
@@ -109,6 +112,7 @@ class LlamaAttention(BaseLlamaAttention):
                     ForwardMode.DECODE,
                     ctx.bs,
                     save_kv_cache=False,
+                    record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
                 )
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
@@ -126,7 +130,7 @@ class LlamaAttention(BaseLlamaAttention):
         correction = (
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
 
 
 # ---------------------------------------------------------------------------

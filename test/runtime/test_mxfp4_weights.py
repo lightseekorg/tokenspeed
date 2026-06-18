@@ -10,31 +10,41 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-import tokenspeed_kernel  # noqa: E402, F401
 import torch
 from torch import nn
 
-from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import create_mxfp4_weights
-from tokenspeed.runtime.layers.moe.backends.weight_loaders import load_model_weight
+from tokenspeed.runtime.layers.moe.types import MoELayerSpec
+from tokenspeed.runtime.layers.moe.weights.loaders import load_model_weight
+from tokenspeed.runtime.layers.moe.weights.mxfp4 import (
+    create_mxfp4_weight_pair,
+)
 
 
-class _Backend:
-    def _make_weight_loader(self):
-        def _weight_loader(*args, **kwargs):
-            del args, kwargs
-
-        return _weight_loader
+def _mxfp4_spec(num_local_experts: int, hidden_size: int, intermediate_size: int):
+    return MoELayerSpec(
+        top_k=2,
+        num_experts=num_local_experts,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=1,
+    )
 
 
 class TestMxfp4Weights(unittest.TestCase):
     def test_scale_weights_store_checkpoint_bytes(self):
         layer = nn.Module()
-        create_mxfp4_weights(
-            _Backend(),
+        create_mxfp4_weight_pair(
+            _mxfp4_spec(
+                num_local_experts=2,
+                hidden_size=64,
+                intermediate_size=96,
+            ),
             layer,
-            num_local_experts=2,
-            hidden_size_padded=64,
-            ispp_padded=96,
         )
 
         self.assertEqual(layer.w13_weight_scale.dtype, torch.uint8)
@@ -46,12 +56,13 @@ class TestMxfp4Weights(unittest.TestCase):
             self.skipTest("torch.float8_e8m0fnu is unavailable")
 
         layer = nn.Module()
-        create_mxfp4_weights(
-            _Backend(),
+        create_mxfp4_weight_pair(
+            _mxfp4_spec(
+                num_local_experts=1,
+                hidden_size=64,
+                intermediate_size=64,
+            ),
             layer,
-            num_local_experts=1,
-            hidden_size_padded=64,
-            ispp_padded=64,
         )
 
         raw_w1_scale = (

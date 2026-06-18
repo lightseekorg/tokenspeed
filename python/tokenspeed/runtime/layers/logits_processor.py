@@ -138,6 +138,9 @@ def _get_fused_lm_head_gemm():
     global _FUSED_LM_HEAD_GEMM
     if _FUSED_LM_HEAD_GEMM is not None:
         return _FUSED_LM_HEAD_GEMM
+    if not current_platform().is_nvidia:
+        _FUSED_LM_HEAD_GEMM = (None, None)
+        return _FUSED_LM_HEAD_GEMM
     try:
         from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
             lm_head_gemm,
@@ -535,18 +538,20 @@ class LogitsProcessor(nn.Module):
                     safe=False,
                 )
             else:
+                num_rows = logits.size(0)
+                local_vocab_size = logits.size(1)
                 gathered_logits = torch.empty(
-                    self.tp_size * logits.size(0),
-                    logits.size(1),
+                    self.tp_size * num_rows,
+                    local_vocab_size,
                     dtype=logits.dtype,
                     device=logits.device,
                 )
                 all_gather_into_tensor(gathered_logits, logits, self.tp_group)
                 logits = (
-                    gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
+                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
                     .contiguous()
-                    .view(logits.size(0), -1)
+                    .view(num_rows, local_vocab_size * self.tp_size)
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()

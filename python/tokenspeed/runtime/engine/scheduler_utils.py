@@ -194,6 +194,17 @@ def make_finish_event(request_id: str) -> None:
     return fe
 
 
+def make_abort_event(request_id: str) -> None:
+    """Finish without caching: AbortEvent skips the radix-tree insert and
+    never enters Draining, so no host-KV writeback (target or draft) is
+    issued. Used for numerically-corrupted requests whose KV must not be
+    reused.
+    """
+    fe = ForwardEvent.Abort()
+    fe.request_id = request_id
+    return fe
+
+
 def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: int):
     fe = ForwardEvent.UpdateReserveNumTokens()
     fe.request_id = request_id

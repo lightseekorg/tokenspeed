@@ -25,6 +25,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import fused_gate_sigmoid_mul_add
+from tokenspeed_kernel.ops.gemm.cute_dsl import (
+    nvfp4_gemm_swiglu_nvfp4_quant,
+)
+from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
@@ -33,12 +38,13 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
@@ -48,7 +54,10 @@ from tokenspeed.runtime.layers.moe.utils import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.pdl import pdl_enabled
+
+_is_blackwell = current_platform().is_blackwell
 
 
 def _is_moe_layer(layer_id: int, config) -> bool:
@@ -122,8 +131,35 @@ class Qwen3_5MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+        self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
+            envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
+            and _is_blackwell
+            and isinstance(self.gate_up_proj.quant_method, Nvfp4LinearMethod)
+            and isinstance(self.down_proj.quant_method, Nvfp4LinearMethod)
+        )
+        self.gate_up_proj.interleave_linear_and_gate = (
+            self._use_nvfp4_gemm_swiglu_nvfp4_quant
+        )
+
     def forward(self, x):
         if x.shape[0] == 0:
+            return x
+        if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
+            x_fc1_fp4, x_fc1_scale = fp4_quantize(
+                x,
+                self.gate_up_proj.input_scale_inv,
+                enable_pdl=pdl_enabled(),
+            )
+            x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
+                x_fc1_fp4,
+                x_fc1_scale,
+                self.gate_up_proj.weight_swiglu_interleaved,
+                self.gate_up_proj.weight_scale_swiglu_interleaved,
+                self.gate_up_proj.alpha,
+                self.down_proj.input_scale_inv,
+                enable_pdl=pdl_enabled(),
+            )
+            x, _ = self.down_proj((x_fp4, x_scale))
             return x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -193,9 +229,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             use_grouped_topk=False,
             output_format=self.experts.topk_output_format,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
         )
         if getattr(config, "shared_expert_intermediate_size", 0) > 0:
             self.shared_expert = Qwen3_5MoeMLP(

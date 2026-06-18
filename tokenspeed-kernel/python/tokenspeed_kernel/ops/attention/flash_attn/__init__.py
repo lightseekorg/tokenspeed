@@ -57,18 +57,15 @@ if (
     and platform.is_blackwell
     and platform.arch_version == ArchVersion(10, 0)
 ):
-    try:
-        from flash_attn.cute import (
-            flash_attn_func,
-            flash_attn_varlen_func,
-        )
-    except ImportError:
-        pass
+    from flash_attn.cute import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
 
-    # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8
-    # (and (192, 128) for DeepSeek MLA, not applicable here). Cached paths pass
-    # seqused_k and remain limited to <=128 by upstream FA4.
-    _FA4_BLACKWELL_PREFILL_HEAD_DIMS = frozenset(range(8, 257, 8))
+    # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,
+    # but the 256-wide MHA path mishandles non-contiguous V split views, so we
+    # restrict it to <256 for now until that is resolved.
+    _FA4_BLACKWELL_PREFILL_HEAD_DIMS = frozenset(range(8, 256, 8))
     _FA4_BLACKWELL_DECODE_HEAD_DIMS = frozenset(range(8, 129, 8))
 
     @register_kernel(
@@ -83,7 +80,7 @@ if (
         signatures=format_signatures(
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "sliding_window": frozenset({False}),
@@ -91,7 +88,6 @@ if (
             "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa4_mha_prefill(
         q: torch.Tensor,
@@ -133,7 +129,7 @@ if (
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
@@ -142,11 +138,11 @@ if (
             "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa4_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         page_table: torch.Tensor,
@@ -188,7 +184,7 @@ if (
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "sliding_window": frozenset({False}),
@@ -196,7 +192,6 @@ if (
             "return_lse": frozenset({False}),
             "support_logit_cap": frozenset({False}),
         },
-        tags={"latency"},
     )
     def fa4_mha_decode_with_kvcache(
         q: torch.Tensor,
@@ -226,15 +221,12 @@ if (
         return out.view_as(q)
 
 elif platform.is_nvidia and platform.is_hopper:
-    try:
-        from flash_attn_interface import (
-            flash_attn_func,
-            flash_attn_varlen_func,
-            flash_attn_with_kvcache,
-            get_scheduler_metadata,
-        )
-    except ImportError:
-        pass
+    from flash_attn_interface import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+        get_scheduler_metadata,
+    )
 
     @register_kernel(
         "attention",
@@ -248,14 +240,13 @@ elif platform.is_nvidia and platform.is_hopper:
         signatures=format_signatures(
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa3_mha_prefill(
         q: torch.Tensor,
@@ -296,7 +287,7 @@ elif platform.is_nvidia and platform.is_hopper:
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
@@ -304,11 +295,11 @@ elif platform.is_nvidia and platform.is_hopper:
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def fa3_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         page_table: torch.Tensor,
@@ -321,10 +312,6 @@ elif platform.is_nvidia and platform.is_hopper:
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        cu_seqlens_k_new = torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
-            (1, 0),
-        )
         return flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -332,7 +319,7 @@ elif platform.is_nvidia and platform.is_hopper:
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k_new=cu_seqlens_k_new,
+            cu_seqlens_k_new=cum_seq_lens_kv,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=1.0 / math.sqrt(q.shape[-1]),
             causal=is_causal,
@@ -353,14 +340,13 @@ elif platform.is_nvidia and platform.is_hopper:
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
         },
-        tags={"latency"},
     )
     def fa3_mha_decode_with_kvcache(
         q: torch.Tensor,
@@ -373,7 +359,6 @@ elif platform.is_nvidia and platform.is_hopper:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
-        scheduler_metadata: torch.Tensor | None = None,
     ) -> torch.Tensor:
         out = flash_attn_with_kvcache(
             q=q.unsqueeze(1),
@@ -386,46 +371,5 @@ elif platform.is_nvidia and platform.is_hopper:
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
             sinks=sinks,
-            scheduler_metadata=scheduler_metadata,
         )
         return out.view_as(q)
-
-
-# ------------------------------------------------------------------------------
-# Direct export
-# ------------------------------------------------------------------------------
-
-
-def mha_decode_scheduler_metadata(
-    *,
-    batch_size: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    num_heads_q: int,
-    num_heads_kv: int,
-    headdim: int,
-    cache_seqlens: torch.Tensor,
-    qkv_dtype: torch.dtype,
-    page_size: int,
-    causal: bool = True,
-) -> torch.Tensor | None:
-    """Pre-compute decode scheduler metadata once per scheduler step.
-
-    Only the FA3 decode kernel consumes pre-computed scheduler metadata; on
-    every other backend the kernel computes it internally and this helper
-    returns ``None`` so callers can pass through unconditionally.
-    """
-    if get_scheduler_metadata is error_fn:
-        return None
-    return get_scheduler_metadata(
-        batch_size=batch_size,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        num_heads_q=num_heads_q,
-        num_heads_kv=num_heads_kv,
-        headdim=headdim,
-        cache_seqlens=cache_seqlens,
-        qkv_dtype=qkv_dtype,
-        page_size=page_size,
-        causal=causal,
-    )

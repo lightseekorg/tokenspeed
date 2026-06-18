@@ -25,6 +25,7 @@ import torch
 from tokenspeed_kernel import (
     quantize_fp8,
     quantize_fp8_with_scale,
+    quantize_mxfp4,
     quantize_mxfp8,
     quantize_nvfp4,
 )
@@ -36,6 +37,28 @@ FP8_E4M3_FNUZ_MAX = 240.0
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
+    magnitude_bits = nibbles & 0x7
+    exponent = (magnitude_bits >> 1).to(torch.float32)
+    mantissa = (magnitude_bits & 0x1).to(torch.float32)
+    normal = (1.0 + 0.5 * mantissa) * torch.exp2(exponent - 1.0)
+    subnormal = 0.5 * mantissa
+    magnitude = torch.where(exponent == 0, subnormal, normal)
+    sign = 1.0 - 2.0 * ((nibbles >> 3) & 0x1).to(torch.float32)
+    return magnitude * sign
+
+
+def _dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    out = packed.new_empty(
+        (*packed.shape[:-1], packed.shape[-1] * 2),
+        dtype=torch.float32,
+    )
+    out[..., 0::2] = _e2m1_values(packed & 0xF)
+    out[..., 1::2] = _e2m1_values(packed >> 4)
+    scale_values = torch.pow(2.0, scale.to(torch.int32) - 127).to(torch.float32)
+    return out * scale_values.repeat_interleave(32, dim=-1)
 
 
 @pytest.mark.parametrize("solution", ["triton"])
@@ -70,6 +93,56 @@ def test_quantize_fp8_pure_cast_bf16(
     assert out.shape == ref.shape
     assert out.dtype == ref.dtype
     assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.parametrize("solution", ["triton"])
+def test_quantize_mxfp4_dynamic_scales(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "mxfp4", solution, dtype, "x")
+
+    base = torch.tensor(
+        [
+            0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            2.0,
+            -2.0,
+            3.0,
+            -3.0,
+            4.0,
+            -4.0,
+            6.0,
+            -6.0,
+            0.0,
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    row = torch.cat([base, base, base * 0.25, base * 0.25], dim=0)
+    x = torch.stack([row, row], dim=0)
+
+    out, scale = quantize_mxfp4(x, scale_layout="linear", solution=solution)
+    torch.cuda.synchronize()
+
+    assert out.shape == (2, 32)
+    assert out.dtype == torch.uint8
+    assert scale.shape == (2, 2)
+    assert scale.dtype == torch.uint8
+    torch.testing.assert_close(
+        scale.cpu(),
+        torch.tensor([[127, 125], [127, 125]], dtype=torch.uint8),
+    )
+
+    dequant = _dequantize_mxfp4(out.cpu(), scale.cpu())
+    torch.testing.assert_close(dequant, x.cpu().to(torch.float32), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("solution", ["triton"])

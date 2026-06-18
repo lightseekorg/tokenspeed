@@ -4,9 +4,9 @@ set -e
 # ============================================================
 # Platform dispatcher
 #
-# AMD/ROCm runners (e.g. linux-mi355-*) share the same install entry
-# point in CI yaml configs, but need a different toolchain. Hand off
-# to the ROCm-specific script when running on an AMD runner.
+# AMD/ROCm runners (e.g. amd-mi35x-* and amd-mi355-*) share the same
+# install entry point in CI yaml configs, but need a different toolchain.
+# Hand off to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AMD_RUNNER_LABEL_PATTERNS=(*mi350* *mi355* *mi35x*)
