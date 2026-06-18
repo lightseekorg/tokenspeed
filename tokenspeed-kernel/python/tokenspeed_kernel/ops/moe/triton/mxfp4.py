@@ -20,11 +20,14 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 
+import tokenspeed_kernel
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
 
@@ -65,6 +68,56 @@ from triton_kernels.topk import topk
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 
 platform = current_platform()
+
+MXFP4_BLOCK = 32
+MXFP4_ACTIVATION_SCALE_LAYOUT = "linear"
+
+
+def _uses_dynamic_mxfp4_activations(w: torch.nn.Module) -> bool:
+    quant_config = getattr(w, "quant_config", None)
+    return current_platform().is_amd and bool(
+        getattr(quant_config, "use_dynamic_mxfp4_activations", False)
+    )
+
+
+def _quantize_mxfp4_activation(
+    activations: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return tokenspeed_kernel.quantize_mxfp4(
+        activations.contiguous(),
+        scale_size=MXFP4_BLOCK,
+        scale_layout=MXFP4_ACTIVATION_SCALE_LAYOUT,
+        solution="triton",
+        enable_pdl=False,
+    )
+
+
+def _with_activation_mx_scale(
+    precision_config: PrecisionConfig | None,
+    activation_scale: torch.Tensor,
+) -> PrecisionConfig:
+    if precision_config is None:
+        precision_config = PrecisionConfig()
+    precision_config = copy.copy(precision_config)
+    precision_config.a_mx_scale = activation_scale
+    precision_config.a_microblock_size = MXFP4_BLOCK
+    return precision_config
+
+
+def _release_parameter(module: torch.nn.Module, name: str) -> None:
+    if name in module._parameters:
+        module.register_parameter(name, None)
+    elif hasattr(module, name):
+        delattr(module, name)
+
+
+def _silu_gate_up(
+    gate_up: torch.Tensor,
+    *,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    return (F.silu(gate) * up).to(output_dtype)
 
 
 def _is_bf16_mxfp4(x, w, precision_config):
@@ -161,6 +214,67 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     return quant_tensor, InFlexData(), scale
 
 
+def _routing_from_topk(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if topk_ids.ndim != 2:
+        raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "topk_weights and topk_ids must have the same shape, got "
+            f"{tuple(topk_weights.shape)} and {tuple(topk_ids.shape)}"
+        )
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+
+    flat_ids = topk_ids.reshape(-1).to(torch.long)
+    valid = flat_ids >= 0
+    safe_ids = torch.where(valid, flat_ids, flat_ids.new_zeros(()))
+    sort_order = torch.argsort(safe_ids, stable=True)
+
+    top_k = topk_ids.shape[1]
+    gather_indx = (sort_order // top_k).to(torch.int32)
+    scatter_indx = sort_order.to(torch.int32)
+    gate_scal = topk_weights.reshape(-1)[sort_order]
+    gate_scal = torch.where(valid[sort_order], gate_scal, torch.zeros_like(gate_scal))
+    if dtype is not None and gate_scal.dtype != dtype:
+        gate_scal = gate_scal.to(dtype)
+
+    col_sum = torch.zeros((num_experts,), dtype=torch.int32, device=safe_ids.device)
+    col_sum.scatter_add_(
+        0,
+        safe_ids,
+        torch.ones_like(safe_ids, dtype=torch.int32),
+    )
+    n_total_rows = int(sort_order.numel())
+    ragged_metadata = make_ragged_tensor_metadata(col_sum, n_total_rows)
+
+    return ragged_metadata, gather_indx, scatter_indx, gate_scal
+
+
+def _local_topk_for_ep(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    ep_size = int(getattr(w, "ep_size", 1))
+    if ep_size <= 1:
+        return topk_weights, topk_ids, int(getattr(w, "num_experts"))
+
+    num_local_experts = int(getattr(w, "num_local_experts"))
+    expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
+    local_ids = topk_ids - expert_offset
+    local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
+    local_weights = torch.where(
+        local_mask, topk_weights, torch.zeros_like(topk_weights)
+    )
+    local_ids = torch.where(local_mask, local_ids, topk_ids.new_full((), -1))
+    return local_weights, local_ids, num_local_experts
+
+
 @register_kernel(
     "moe",
     "process_weights",
@@ -173,10 +287,14 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     MXFP_BLOCK_SIZE = 32
 
-    w13_weight_bias = w.w13_weight_bias.to(torch.float32)
-    w2_weight_bias = w.w2_weight_bias.to(torch.float32)
-    w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
-    w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+    if hasattr(w, "w13_weight_bias"):
+        w.w13_weight_bias = torch.nn.Parameter(
+            w.w13_weight_bias.to(torch.float32), requires_grad=False
+        )
+    if hasattr(w, "w2_weight_bias"):
+        w.w2_weight_bias = torch.nn.Parameter(
+            w.w2_weight_bias.to(torch.float32), requires_grad=False
+        )
 
     num_warps = 8
     w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
@@ -186,8 +304,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         w.w2_weight, w.w2_weight_scale, num_warps
     )
 
-    if plan.get("internal_activation_dtype", None) == "fp8":
-        assert hasattr(w, "w13_input_scale") and hasattr(w, "w2_input_scale")
+    if hasattr(w, "w13_input_scale") and hasattr(w, "w2_input_scale"):
         # Collapse per-expert input scales to a single per-tensor scale
         # per GEMM. Quark exports a constant value across experts for
         # static ``per_tensor`` quantisation; ``max`` is a safe reduction
@@ -220,7 +337,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     else:
         w13_lhs = InFlexData()
         w2_lhs = InFlexData()
-        out_dtype = None
+        out_dtype = torch.bfloat16 if _uses_dynamic_mxfp4_activations(w) else None
 
     w.w13_precision_config = PrecisionConfig(
         flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
@@ -238,11 +355,62 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
     # Free original weights (replaced by shuffled versions)
-    del w.w13_weight
-    del w.w2_weight
+    _release_parameter(w, "w13_weight")
+    _release_parameter(w, "w2_weight")
+    if current_platform().is_amd:
+        _release_parameter(w, "w13_weight_scale")
+        _release_parameter(w, "w2_weight_scale")
     torch.cuda.empty_cache()
 
 
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_mxfp4_precomputed_moe_apply",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"silu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"fp8", "input"}),
+        "supports_bias": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED + 2,
+)
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_mxfp4_ep_precomputed_moe_apply",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"silu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"fp8", "input"}),
+        "supports_bias": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED + 1,
+)
 @register_kernel(
     "moe",
     "apply",
@@ -278,18 +446,33 @@ def triton_mxfp4_moe_apply(
     do_finalize: bool = True,
     enable_pdl: bool = False,
 ):
+    del enable_pdl
     swiglu_arg = getattr(w, "swiglu_arg", None)
 
-    router_logits = router_logits
     top_k = getattr(w, "top_k")
     n_tokens = router_logits.shape[0]
 
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
-        router_logits,
-        top_k,
-        sm_first=False,
-        dtype=router_logits.dtype,
-    )
+    if topk_weights is not None or topk_ids is not None:
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("topk_weights and topk_ids must be provided together")
+        topk_weights, topk_ids, num_experts = _local_topk_for_ep(
+            topk_weights,
+            topk_ids,
+            w,
+        )
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
+            topk_weights,
+            topk_ids,
+            num_experts=num_experts,
+            dtype=router_logits.dtype,
+        )
+    else:
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
+            router_logits,
+            top_k,
+            sm_first=False,
+            dtype=router_logits.dtype,
+        )
 
     w13_weight = w.w13_weight_triton_tensor
     w2_weight = w.w2_weight_triton_tensor
@@ -298,24 +481,25 @@ def triton_mxfp4_moe_apply(
     w13_pc = getattr(w, "w13_precision_config", None)
     w2_pc = getattr(w, "w2_precision_config", None)
 
-    gemm1_alpha = swiglu_arg.alpha if swiglu_arg else 1.702
-    gemm1_clamp = swiglu_arg.limit if swiglu_arg else 7.0
+    act = None
+    if swiglu_arg is not None:
+        act = FusedActivation(
+            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+            (swiglu_arg.alpha, swiglu_arg.limit),
+        )
 
-    act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-        (gemm1_alpha, gemm1_clamp),
-    )
-
-    if plan.get("internal_activation_dtype", None) == "fp8":
-        w13_act_scale = getattr(w, "w13_act_scale", None)
-        gemm1_input = fp8_quantize(
-            x,
-            scale=w13_act_scale,
+    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
+    if hasattr(w, "w13_act_scale"):
+        gemm1_input = fp8_quantize(x, scale=w.w13_act_scale)
+    elif use_dynamic_mxfp4:
+        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(x)
+        w13_pc = _with_activation_mx_scale(
+            w13_pc,
+            gemm1_scale,
         )
     else:
         gemm1_input = x
 
-    # First GEMM: gate_up projection with fused activation
     with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc):
         intermediate_cache = matmul(
             gemm1_input,
@@ -326,26 +510,33 @@ def triton_mxfp4_moe_apply(
             precision_config=w13_pc,
             fused_activation=act,
         )
-
-    if plan.get("internal_activation_dtype", None) == "fp8":
-        w2_act_scale = getattr(w, "w2_act_scale", None)
-        gemm2_input = fp8_quantize(
+    if act is None:
+        intermediate_cache = _silu_gate_up(
             intermediate_cache,
-            scale=w2_act_scale,
+            output_dtype=x.dtype,
+        )
+
+    if hasattr(w, "w2_act_scale"):
+        gemm2_input = fp8_quantize(intermediate_cache, scale=w.w2_act_scale)
+    elif use_dynamic_mxfp4:
+        gemm2_input, gemm2_scale = _quantize_mxfp4_activation(intermediate_cache)
+        w2_pc = _with_activation_mx_scale(
+            w2_pc,
+            gemm2_scale,
         )
     else:
         gemm2_input = intermediate_cache
 
-    # Second GEMM: down projection with scatter (combine)
-    # gammas applies the routing weights (expert contribution weights)
     with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc):
-        out = matmul(
+        output = matmul(
             gemm2_input,
             w2_weight,
             w2_bias,
             a_ragged_metadata=ragged_metadata,
-            scatter_indx=scatter_indx,
             precision_config=w2_pc,
+            scatter_indx=scatter_indx,
             gammas=gate_scal,
         )
-    return out.view(n_tokens, top_k, out.shape[-1]).sum(dim=1)
+    if top_k > 1:
+        return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
+    return output

@@ -90,7 +90,7 @@ def _mla_decode_kernel(
     e_sum = 0.0
     e_max = -float("inf")
 
-    for start_n in range(0, MAX_SEQLEN_K, BLOCK_N):
+    for start_n in tl.range(0, cache_len, BLOCK_N, num_stages=2):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         token_offsets = start_n + offs_n
         mask_n = token_offsets < cache_len

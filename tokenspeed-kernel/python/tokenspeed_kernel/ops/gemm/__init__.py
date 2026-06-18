@@ -130,6 +130,21 @@ def _gemm_format_signature(
             a=tensor_format("nvfp4", A.dtype, scale=a_scale),
             b=tensor_format("nvfp4", B.dtype, scale=b_scale),
         )
+    if quant == "mxfp4":
+        a_scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(A_scales),
+            granularity="block",
+            block_shape=(32,),
+        )
+        b_scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(B_scales),
+            granularity="block",
+            block_shape=(32,),
+        )
+        return format_signature(
+            a=tensor_format("mxfp4", A.dtype, scale=a_scale),
+            b=tensor_format("mxfp4", B.dtype, scale=b_scale),
+        )
     return format_signature(
         a=dense_tensor_format(A.dtype), b=dense_tensor_format(B.dtype)
     )
@@ -237,7 +252,7 @@ def mm(
         block_size: Block size for block-wise quantization, e.g.
             ``[128, 128]``
         quant: Explicit quant type override.  One of ``"mxfp8"``,
-            ``"fp8"``, ``"nvfp4"``, ``"none"``.
+            ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
             If ``None``, inferred from input dtypes and scales.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
@@ -245,9 +260,13 @@ def mm(
     """
     out_dtype = out_dtype or A.dtype
 
-    K = A.shape[-1]
     M = A.shape[0]
-    N = B.shape[-1] if B.shape[0] == K else B.shape[0]
+    if quant == "mxfp4":
+        K = A.shape[-1] * 2
+        N = B.shape[0]
+    else:
+        K = A.shape[-1]
+        N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
     traits: dict[str, object] = {
         "n_align_16": N % 16 == 0,
