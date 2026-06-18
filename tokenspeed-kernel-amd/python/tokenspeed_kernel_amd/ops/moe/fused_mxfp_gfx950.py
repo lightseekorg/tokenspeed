@@ -3050,6 +3050,10 @@ def _run_moe_tile_w_via_vgpr_slice_n(
     W_CACHE_MODIFIER: gl.constexpr,
 ):
     gl.static_assert(
+        cfg.W_PRESHUFFLED,
+        "W_VIA_VGPR consumes the preshuffled Gluon-dot W layout.",
+    )
+    gl.static_assert(
         BLOCK_K_W == 128
         and USE_SLICE_N
         and NUM_WARPS == 4
@@ -3161,6 +3165,10 @@ def _run_moe_tile_w_via_vgpr_full(
     N_LIMIT: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
 ):
+    gl.static_assert(
+        cfg.W_PRESHUFFLED,
+        "W_VIA_VGPR consumes the preshuffled Gluon-dot W layout.",
+    )
     gl.static_assert(
         BLOCK_K_W == 128
         and BLOCK_N == 128
