@@ -2764,7 +2764,10 @@ def _run_moe_tile_preshuffled_w(
         )
         return pgm.pipeline(K)
 
-    BLOCK_N_LAYOUT: gl.constexpr = BLOCK_N
+    # Gluon still type-checks the code below when USE_SLICE_N returns above.
+    # Keep the original half-tile layout in that specialization so the
+    # preshuffled copy/read layouts remain valid during compilation.
+    BLOCK_N_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
     if cfg.SCALE_VIA_LDS:
         # tpw=[2,2]
         LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
