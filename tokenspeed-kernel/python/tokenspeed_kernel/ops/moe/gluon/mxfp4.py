@@ -36,10 +36,8 @@ platform = current_platform()
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import gluon_mxfp_fused_moe
     from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
-        preprocess_gluon_mxfp4_gfx950_moe_weights as _preprocess_impl,
+        preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
-
-    _PRESHUFFLE_PLAN_KEY = "gluon_mxfp4_gfx950_preshuffle"
 
     @register_weight_preprocessor(
         "moe",
@@ -51,7 +49,7 @@ if platform.is_amd:
         ),
     )
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
-        return _preprocess_impl(plan, w)
+        return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
 
     @register_weight_preprocessor(
         "moe",
@@ -63,7 +61,7 @@ if platform.is_amd:
         ),
     )
     def gluon_mxfp4_gfx950_moe_weights_base(plan: dict, w: torch.nn.Module):
-        return _preprocess_impl({**plan, _PRESHUFFLE_PLAN_KEY: False}, w)
+        return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=False)
 
     @register_kernel(
         "moe",

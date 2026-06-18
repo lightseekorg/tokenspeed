@@ -31,7 +31,6 @@ _GLUON_COMBINE_BLOCK_N = 128
 _NON_K_PRESHUFFLE_BLOCK_SIZE = 32
 _ALIGN_K_SCALE_SWIZZLE = 8
 _ALIGN_N_SWIZZLE = 32
-_PRESHUFFLE_PLAN_KEY = "gluon_mxfp4_gfx950_preshuffle"
 
 
 @dataclass
@@ -209,8 +208,9 @@ def _attach_gluon_bpreshuffle(w: torch.nn.Module) -> None:
 def preprocess_gluon_mxfp4_gfx950_moe_weights(
     plan: dict,
     w: torch.nn.Module,
+    *,
+    preshuffle: bool = True,
 ) -> None:
-    preshuffle = bool(plan.get(_PRESHUFFLE_PLAN_KEY, True))
     if preshuffle:
         _pad_w2_to_block_n(w, _GLUON_COMBINE_BLOCK_N)
 

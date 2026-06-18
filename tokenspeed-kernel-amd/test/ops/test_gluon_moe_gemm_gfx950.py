@@ -212,9 +212,7 @@ def _make_preprocessed_weights(
     preshuffle: bool,
 ) -> Mxfp4Weights:
     module = _make_module(raw)
-    preprocess_gluon_mxfp4_gfx950_moe_weights(
-        {"gluon_mxfp4_gfx950_preshuffle": preshuffle}, module
-    )
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=preshuffle)
 
     return Mxfp4Weights(
         w13_weight=module.w13_weight_triton_tensor,

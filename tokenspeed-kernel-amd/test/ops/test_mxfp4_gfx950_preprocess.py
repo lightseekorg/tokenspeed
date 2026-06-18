@@ -120,7 +120,7 @@ def test_preprocess_gluon_mxfp4_gfx950_can_disable_preshuffle(monkeypatch):
     module = _make_module()
 
     mxfp4_preprocess.preprocess_gluon_mxfp4_gfx950_moe_weights(
-        {"gluon_mxfp4_gfx950_preshuffle": False}, module
+        {}, module, preshuffle=False
     )
 
     w13_storage = module.w13_weight_triton_tensor.storage.data
