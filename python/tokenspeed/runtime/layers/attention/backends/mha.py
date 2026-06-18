@@ -156,12 +156,17 @@ class MHAAttnBackend(AttentionBackend):
             assert extend_seq_lens_cpu is not None
             assert extend_prefix_lens is not None
             assert extend_prefix_lens_cpu is not None
+
+            # Create cumulative sum versions of the sequence lengths for Q and KV.
             extend_seq_lens = extend_seq_lens[:bs]
             extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
-            cu_extend_seq_lens, cu_extend_seq_lens_cpu = self._make_cu_extend_seq_lens(
-                extend_seq_lens,
-                extend_seq_lens_cpu,
+            cu_extend_seq_lens = torch.nn.functional.pad(
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32),
+                (1, 0),
             )
+            cu_extend_seq_lens_cpu = [0]
+            for length in extend_seq_lens_cpu:
+                cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
             cum_seq_lens_kv = torch.nn.functional.pad(
                 torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
                 (1, 0),
@@ -374,7 +379,7 @@ class MHAAttnBackend(AttentionBackend):
             k = k.to(torch.float8_e4m3fn)
             v = v.to(torch.float8_e4m3fn)
 
-        result = mha_prefill(
+        output = mha_prefill(
             q=q,
             k=k,
             v=v,
@@ -386,7 +391,6 @@ class MHAAttnBackend(AttentionBackend):
             sinks=sinks,
             solution=self.kernel_solution,
         )
-        output = self._unwrap_output(result)
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
         if save_kv_cache:
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
@@ -411,7 +415,7 @@ class MHAAttnBackend(AttentionBackend):
             q = q.to(torch.float8_e4m3fn)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        result = mha_extend_with_kvcache(
+        output = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=metadata.cu_extend_seq_lens,
             cum_seq_lens_kv=metadata.cum_seq_lens_kv,
@@ -427,7 +431,6 @@ class MHAAttnBackend(AttentionBackend):
             max_seqlen_k=self.max_context_len,
             solution=self.kernel_solution,
         )
-        output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_decode(
@@ -450,7 +453,7 @@ class MHAAttnBackend(AttentionBackend):
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
-        result = mha_decode_with_kvcache(
+        output = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -463,7 +466,6 @@ class MHAAttnBackend(AttentionBackend):
             max_seqlen_q=max_seqlen_q,
             solution=self.kernel_solution,
         )
-        output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # ------------------------------------------------------------------
@@ -517,25 +519,6 @@ class MHAAttnBackend(AttentionBackend):
             layer.v_head_dim,
         )
         return k_cache, v_cache
-
-    def _make_cu_extend_seq_lens(
-        self,
-        lengths: torch.Tensor,
-        extend_seq_lens_cpu: list[int],
-    ) -> tuple[torch.Tensor, list[int]]:
-        cu_extend_seq_lens = torch.nn.functional.pad(
-            torch.cumsum(lengths, dim=0, dtype=torch.int32),
-            (1, 0),
-        )
-        cu_extend_seq_lens_cpu = [0]
-        for length in extend_seq_lens_cpu:
-            cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
-        return cu_extend_seq_lens, cu_extend_seq_lens_cpu
-
-    def _unwrap_output(self, result):
-        if isinstance(result, tuple):
-            return result[0]
-        return result
 
 
 for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:
