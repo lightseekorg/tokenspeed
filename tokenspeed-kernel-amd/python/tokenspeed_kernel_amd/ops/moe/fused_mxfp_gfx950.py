@@ -5049,7 +5049,7 @@ def _is_small_prefill_slice(slice_size: int | None) -> bool:
     return slice_size is not None and slice_size < 16
 
 
-def _is_slice_n_prefill_tile(block_n: int, block_k: int) -> bool:
+def _is_bn256_bk256_prefill_tile(block_n: int, block_k: int) -> bool:
     return block_n == 256 and block_k == 256
 
 
@@ -5064,7 +5064,7 @@ def _nonpersistent_prefill_launch_tuning(
     if (
         use_slice_n
         and block_m == 16
-        and _is_slice_n_prefill_tile(block_n, block_k)
+        and _is_bn256_bk256_prefill_tile(block_n, block_k)
         and _is_small_prefill_slice(slice_size)
     ):
         return 16, _CDNA4_NUM_XCDS, None, False
@@ -5079,7 +5079,7 @@ def _dispatch_prefill_launch_tuning(
     use_slice_n: bool,
     slice_size: int | None,
 ) -> _LaunchTuning:
-    if not use_slice_n or not _is_slice_n_prefill_tile(block_n, block_k):
+    if not use_slice_n or not _is_bn256_bk256_prefill_tile(block_n, block_k):
         return _default_prefill_launch_tuning()
     if block_m == 64 and slice_size == 32:
         return 32, _CDNA4_NUM_XCDS, True, False
