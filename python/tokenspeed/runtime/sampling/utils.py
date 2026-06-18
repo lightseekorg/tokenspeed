@@ -23,11 +23,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
-from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
-
-logger = get_colorful_logger(__name__)
-
-
 # Smallest positive value per dtype, used as the lower bound for `uniform_`
 # draws that feed rejection-sampling kernels. A coin of exact 0 silently
 # accepts a zero-probability draft in `chain_speculative_sampling_target_only`
@@ -42,24 +37,6 @@ COIN_EPS = {
 def coin_eps(dtype: torch.dtype) -> float:
     """Lower bound for uniform coin draws of the given dtype. See COIN_EPS."""
     return COIN_EPS[dtype]
-
-
-def nan_guard_logits(
-    logits: torch.Tensor,
-    enable_nan_detection: bool,
-) -> torch.Tensor:
-    """Replace NaNs with -1e5 and optionally crash; no-op when detection is disabled."""
-    if not enable_nan_detection:
-        return logits
-
-    if not torch.any(torch.isnan(logits)):
-        return logits
-
-    logger.warning("Detected errors during sampling! NaN in the logits.")
-    logits = torch.where(torch.isnan(logits), torch.full_like(logits, -1e5), logits)
-    if crash_on_warnings():
-        raise ValueError("Detected errors during sampling! NaN in the logits.")
-    return logits
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
