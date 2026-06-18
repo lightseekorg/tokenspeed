@@ -1556,7 +1556,11 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="Enable the NaN detection for debugging purposes.",
+            help="Enable the NaN guard: sanitize non-finite logits before "
+            "sampling, detect requests whose logits contained NaN (or whose "
+            "sampled token id escaped the vocab range), and terminate only "
+            "those requests with a numerical error so corruption cannot "
+            "spread to the rest of the batch.",
         )
         parser.add_argument(
             "--enable-nvtx",
