@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import importlib
 
 import pytest
 import torch
@@ -21,64 +21,35 @@ if not _is_gfx950():
         allow_module_level=True,
     )
 
-
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     _gluon_mxfp4_fp8_warp_decode_moe,
+    fp8_quantize,
+    gluon_mxfp_fused_moe,
 )
 
-try:
-    from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
-        swizzle_mxfp4,
-    )
-except ImportError as exc:
-    pytest.skip(
-        f"tokenspeed runtime MXFP4 swizzle helper is required: {exc}",
-        allow_module_level=True,
-    )
+_gluon_mxfp4 = importlib.import_module("tokenspeed_kernel.ops.moe.gluon.mxfp4")
+_triton_mxfp4 = importlib.import_module("tokenspeed_kernel.ops.moe.triton.mxfp4")
+gluon_mxfp4_moe_process_weights = _gluon_mxfp4.gluon_mxfp4_moe_process_weights
+triton_mxfp4_moe_process_weights = _triton_mxfp4.triton_mxfp4_moe_process_weights
 
-# Standard OCP MXFP4 (E2M1) value table; index is the 4-bit code.
-_E2M1_VALUES = [
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
-
-_FP8_DTYPE = torch.float8_e4m3fn
+WEIGHT_NIBBLES = (0, 1, 2, 9, 10)
+WARP_DECODE_ATOL = 64.0
 
 
-@dataclass
-class PrecisionConfig:
-    b_mx_scale: torch.Tensor
-    b_microblock_size: int = 32
-    out_dtype: torch.dtype | None = None
-
-
-def _mxfp4_dequant(packed: torch.Tensor) -> torch.Tensor:
-    """Decode packed MXFP4 (two e2m1 codes per byte) to float32.
-
-    Replaces aiter.utility.fp4_utils.mxfp4_to_f32 so the test carries no
-    aiter dependency. The low nibble is the even element along the unpacked
-    axis, the high nibble the odd element. Input (..., K // 2) uint8 maps to
-    output (..., K) float32. All weight microscales in these cases are e8m0
-    code 127, i.e. a unit scale, so no scale factor is applied here.
-    """
-    lut = torch.tensor(_E2M1_VALUES, device=packed.device, dtype=torch.float32)
-    lo = lut[(packed & 0x0F).long()]
-    hi = lut[(packed >> 4).long()]
-    return torch.stack((lo, hi), dim=-1).reshape(*packed.shape[:-1], -1)
+def _make_mxfp4_weight_bytes(
+    shape: tuple[int, ...],
+    *,
+    device: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    nibbles = torch.tensor(WEIGHT_NIBBLES, device=device, dtype=torch.uint8)
+    lo = nibbles[
+        torch.randint(0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator)
+    ]
+    hi = nibbles[
+        torch.randint(0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator)
+    ]
+    return lo | (hi << 4)
 
 
 def _build_case(
@@ -89,67 +60,76 @@ def _build_case(
     I: int,
     topk: int,
     use_bias: bool,
+    preshuffle: bool,
     device: str = "cuda",
     seed: int = 123,
 ) -> dict:
     """Construct kernel inputs plus the raw weights kept for the reference."""
-    torch.manual_seed(seed)
-    hidden = torch.randn((M, D), device=device, dtype=torch.bfloat16)
-    router = torch.randn((M, E), device=device, dtype=torch.float32)
-    w13 = torch.randint(0, 256, (E, 2 * I, D // 2), device=device, dtype=torch.uint8)
-    w2 = torch.randint(0, 256, (E, D, I // 2), device=device, dtype=torch.uint8)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    hidden = (
+        torch.randint(-4, 5, (M, D), device=device, generator=generator).to(
+            torch.float32
+        )
+        / 16.0
+    ).to(torch.bfloat16)
+    router = torch.randn(
+        (M, E), device=device, dtype=torch.float32, generator=generator
+    )
+    w13 = _make_mxfp4_weight_bytes(
+        (E, 2 * I, D // 2), device=device, generator=generator
+    )
+    w2 = _make_mxfp4_weight_bytes((E, D, I // 2), device=device, generator=generator)
     s13 = torch.full((E, 2 * I, D // 32), 127, device=device, dtype=torch.uint8)
     s2 = torch.full((E, D, I // 32), 127, device=device, dtype=torch.uint8)
-    w13_bias = (
-        torch.randn((E, 2 * I), device=device, dtype=torch.float32)
-        if use_bias
-        else None
+    w13_bias = torch.randn((E, 2 * I), device=device, dtype=torch.float32)
+    w2_bias = torch.randn((E, D), device=device, dtype=torch.float32)
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
+    layer.w13_weight_bias = torch.nn.Parameter(w13_bias, requires_grad=False)
+    layer.w2_weight_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
+    layer.w13_input_scale = torch.nn.Parameter(
+        torch.ones((E,), device=device, dtype=torch.float32),
+        requires_grad=False,
     )
-    w2_bias = (
-        torch.randn((E, D), device=device, dtype=torch.float32) if use_bias else None
+    layer.w2_input_scale = torch.nn.Parameter(
+        torch.ones((E,), device=device, dtype=torch.float32),
+        requires_grad=False,
     )
 
-    wt13, _w13_flex, st13 = swizzle_mxfp4(w13, s13, 8)
-    wt2, _w2_flex, st2 = swizzle_mxfp4(w2, s2, 8)
-    scale1 = torch.ones((1,), device=device, dtype=torch.float32)
-    scale2 = torch.ones((1,), device=device, dtype=torch.float32)
-    pc1 = PrecisionConfig(b_mx_scale=st13, out_dtype=torch.bfloat16)
-    pc2 = PrecisionConfig(b_mx_scale=st2, out_dtype=torch.bfloat16)
+    plan = {"internal_activation_dtype": "fp8"}
+    if preshuffle:
+        gluon_mxfp4_moe_process_weights(plan, layer)
+    else:
+        triton_mxfp4_moe_process_weights(plan, layer)
+
     return {
         "M": M,
-        "E": E,
-        "D": D,
-        "I": I,
         "topk": topk,
         "use_bias": use_bias,
         "hidden": hidden,
         "router": router,
-        "w13": w13,
-        "w2": w2,
-        "w13_bias": w13_bias,
-        "w2_bias": w2_bias,
-        "wt13": wt13,
-        "wt2": wt2,
-        "pc1": pc1,
-        "pc2": pc2,
-        "scale1": scale1,
-        "scale2": scale2,
+        "w13_weight": layer.w13_weight_triton_tensor,
+        "w2_weight": layer.w2_weight_triton_tensor,
+        "w13_bias": layer.w13_weight_bias if use_bias else None,
+        "w2_bias": layer.w2_weight_bias if use_bias else None,
+        "pc1": layer.w13_precision_config,
+        "pc2": layer.w2_precision_config,
+        "scale1": layer.w13_act_scale,
+        "scale2": layer.w2_act_scale,
     }
 
 
-def _quantize_fp8(
-    x: torch.Tensor, *, scale: torch.Tensor, solution: str | None = None
-) -> torch.Tensor:
-    del scale, solution
-    return x.to(_FP8_DTYPE)
-
-
-def _run_kernel(case: dict) -> torch.Tensor:
+def _run_warp_decode(case: dict) -> torch.Tensor:
+    x_fp8 = fp8_quantize(case["hidden"], case["scale1"])
     return _gluon_mxfp4_fp8_warp_decode_moe(
-        case["hidden"],
+        x_fp8,
         case["router"],
-        case["wt13"],
-        case["wt2"],
+        case["w13_weight"],
+        case["w2_weight"],
         w13_bias=case["w13_bias"],
         w2_bias=case["w2_bias"],
         w13_precision_config=case["pc1"],
@@ -157,65 +137,47 @@ def _run_kernel(case: dict) -> torch.Tensor:
         w13_act_scale=case["scale1"],
         w2_act_scale=case["scale2"],
         top_k=case["topk"],
-        quantize_fp8_fn=_quantize_fp8,
     )
 
 
-def _reference(case: dict) -> torch.Tensor:
-    """Pure-torch decode-MoE matching the warp kernel's swiglu + fp8 rounding."""
-    M, D, I, topk = case["M"], case["D"], case["I"], case["topk"]
-    device = case["hidden"].device
-    use_bias = case["use_bias"]
-    router, w13, w2 = case["router"], case["w13"], case["w2"]
-    w13_bias, w2_bias = case["w13_bias"], case["w2_bias"]
-
-    topk_vals, topk_ids = torch.topk(router, topk, dim=-1)
-    topk_weights = torch.softmax(topk_vals, dim=-1)
-    hidden_fp8 = case["hidden"].to(_FP8_DTYPE).to(torch.float32)
-    seven = torch.tensor(7.0, device=device)
-
-    # Dequant only the experts that are actually routed to, keeping memory
-    # bounded for the larger decode shapes.
-    deq_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-
-    def _expert_weights(expert: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if expert not in deq_cache:
-            deq_cache[expert] = (
-                _mxfp4_dequant(w13[expert]),
-                _mxfp4_dequant(w2[expert]),
-            )
-        return deq_cache[expert]
-
-    ref = torch.zeros((M, D), device=device, dtype=torch.float32)
-    for m in range(M):
-        for slot in range(topk):
-            expert = int(topk_ids[m, slot])
-            w13_f, w2_f = _expert_weights(expert)
-            gate_up = hidden_fp8[m : m + 1] @ w13_f.T
-            if use_bias:
-                gate_up = gate_up + w13_bias[expert][None, :]
-            gate = torch.minimum(gate_up[:, :I], seven)
-            linear = torch.clamp(gate_up[:, I:], -7.0, 7.0)
-            inter = (gate / (1.0 + torch.exp(-1.702 * gate))) * (linear + 1.0)
-            inter_fp8 = inter.to(_FP8_DTYPE).to(torch.float32)
-            second = inter_fp8 @ w2_f.T
-            if use_bias:
-                second = second + w2_bias[expert][None, :]
-            ref[m] += topk_weights[m, slot] * second.squeeze(0)
-    return ref
+def _run_non_warp_reference(case: dict) -> torch.Tensor:
+    return gluon_mxfp_fused_moe(
+        case["hidden"],
+        case["router"],
+        case["w13_weight"],
+        case["w2_weight"],
+        w13_bias=case["w13_bias"],
+        w2_bias=case["w2_bias"],
+        w13_precision_config=case["pc1"],
+        w2_precision_config=case["pc2"],
+        w13_act_scale=case["scale1"],
+        w2_act_scale=case["scale2"],
+        top_k=case["topk"],
+        enable_warp_decode=False,
+    )
 
 
+@pytest.mark.parametrize("preshuffle", [False, True])
 @pytest.mark.parametrize("use_bias", [False, True])
-@pytest.mark.parametrize("M", [1, 2, 4, 8, 16])
-def test_fp8_mxfp4_warp_decode_moe(M: int, use_bias: bool):
-    # I = 256 > BLOCK_K (128) so stage2 split-K partitions the reduction across
-    # real K slices. M sweeps the supported decode range (up to SMALLM_MAX_M=16)
-    # and its tiling transitions (stage2 at M>1, stage1 at M>4).
-    case = _build_case(M=M, E=4, D=256, I=256, topk=2, use_bias=use_bias)
-    out = _run_kernel(case)
+@pytest.mark.parametrize("M", [1, 4, 16])
+def test_fp8_mxfp4_warp_decode_moe(M: int, use_bias: bool, preshuffle: bool):
+    # GPT-OSS-like K/N dimensions exercise the production warp-decode
+    # specializations. M sweeps the supported decode range and its stage2
+    # split-K transitions.
+    case = _build_case(
+        M=M,
+        E=4,
+        D=2880,
+        I=2880,
+        topk=2,
+        use_bias=use_bias,
+        preshuffle=preshuffle,
+    )
+    out = _run_warp_decode(case)
     assert out is not None
     torch.cuda.synchronize()
-    ref = _reference(case)
+    ref = _run_non_warp_reference(case)
+    torch.cuda.synchronize()
     torch.testing.assert_close(
-        out.float(), ref.to(torch.bfloat16).float(), rtol=5e-2, atol=2.0
+        out.float(), ref.float(), rtol=0.0, atol=WARP_DECODE_ATOL
     )

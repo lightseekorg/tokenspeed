@@ -1291,6 +1291,12 @@ class MoEPipelinedProgram:
         return x, w
 
     @gluon.jit
+    def _load_xw_legacy(self, mfma_idx):
+        x = self._load_x(mfma_idx)
+        w = self._load_w(mfma_idx)
+        return x, w
+
+    @gluon.jit
     def _load_x_scales(self, mfma_idx):
         cfg = self.cfg
         x = self.x_desc.issue_local_load(
@@ -1346,7 +1352,7 @@ class MoEPipelinedProgram:
         return x, scale_x, scale_w
 
     @gluon.jit
-    def issue_local_loads(self, mfma_idx):
+    def _load_scales(self, mfma_idx):
         cfg = self.cfg
 
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
@@ -1395,9 +1401,87 @@ class MoEPipelinedProgram:
             scale_x: gl.constexpr = 0
             scale_w: gl.constexpr = 0
 
+        return scale_x, scale_w
+
+    @gluon.jit
+    def issue_local_loads(self, mfma_idx):
+        scale_x, scale_w = self._load_scales(mfma_idx)
         x, w = self._load_xw(mfma_idx)
 
         return x, w, scale_x, scale_w
+
+    @gluon.jit
+    def issue_local_loads_legacy(self, mfma_idx):
+        x, w = self._load_xw_legacy(mfma_idx)
+        scale_x, scale_w = self._load_scales(mfma_idx)
+
+        return x, w, scale_x, scale_w
+
+    @gluon.jit
+    def pipeline_legacy(self, loop_k):
+        cfg = self.cfg
+        EVEN_K: gl.constexpr = cfg.EVEN_K
+        load_idx = 0
+        mfma_idx = 0
+
+        accumulator = gl.zeros(
+            (cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout
+        )
+        K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
+
+        W_PREFETCH: gl.constexpr = cfg.W_VIA_VGPR and cfg.W_PREFETCH
+
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+
+        if W_PREFETCH:
+            w_curr = self._issue_w_vgpr(0)
+
+        # EVEN_K: K_iters - (NUM_BUFFERS-1) all-unmasked main iters.
+        # !EVEN_K: one less unmasked iter; the last is the masked tail below.
+        main_iters = K_iters - (cfg.NUM_BUFFERS - 1 if EVEN_K else cfg.NUM_BUFFERS)
+        gl.assume(main_iters >= 0)
+
+        for _ in range(0, main_iters):
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+            self.async_wait(cfg.NUM_BUFFERS - 1)
+
+            if W_PREFETCH:
+                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                w_curr = self._issue_w_vgpr(mfma_idx + 1)
+            else:
+                x, w, scale_x, scale_w = self.issue_local_loads_legacy(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            mfma_idx += 1
+
+        if not EVEN_K:
+            # Masked tail iter (one more iter still has W to prefetch).
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
+            self.async_wait(cfg.NUM_BUFFERS - 1)
+            if W_PREFETCH:
+                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                w_curr = self._issue_w_vgpr(mfma_idx + 1)
+            else:
+                x, w, scale_x, scale_w = self.issue_local_loads_legacy(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            mfma_idx += 1
+
+        # Epilogue: drain remaining in-flight buffers; no new global loads.
+        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            self.async_wait(cfg.NUM_BUFFERS - 2 - i)
+            if W_PREFETCH:
+                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                if i < cfg.NUM_BUFFERS - 2:
+                    w_curr = self._issue_w_vgpr(mfma_idx + 1)
+            else:
+                x, w, scale_x, scale_w = self.issue_local_loads_legacy(mfma_idx)
+                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            mfma_idx += 1
+
+        return accumulator
 
     @gluon.jit
     def pipeline(self, loop_k):
@@ -6583,7 +6667,10 @@ def _warp_decode_stage1_coop_compute(
     )
 
     pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, 0, w_scale_desc)
-    acc = pgm.pipeline(D)
+    # Preserve the upstream small-M decode schedule: it uses a three-buffer
+    # local-prefetch pipeline and different tail masking from the optimized
+    # prefill GEMM pipeline above.
+    acc = pgm.pipeline_legacy(D)
 
     # Per-tensor activation scale.
     x_scale = gl.load(x_global_scale_ptr).to(gl.float32)
