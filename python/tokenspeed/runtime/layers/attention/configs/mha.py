@@ -46,7 +46,10 @@ class MHAConfig(BaseAttnConfig):
                 speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             )
         kv_cache_dtype = server_args.kv_cache_dtype
-        if is_draft and server_args.speculative_algorithm == "DFLASH":
+        draft_block_decode = bool(
+            is_draft and server_args.speculative_algorithm == "DFLASH"
+        )
+        if draft_block_decode:
             kv_cache_dtype = "bfloat16"
 
         return cls(
@@ -69,6 +72,7 @@ class MHAConfig(BaseAttnConfig):
             max_graph_bs=server_args.max_cudagraph_capture_size,
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             is_draft=is_draft,
+            draft_block_decode=draft_block_decode,
             **kwargs,
         )
 

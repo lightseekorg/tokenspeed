@@ -31,7 +31,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import get_global_server_args
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -71,12 +70,13 @@ class DFlash(BaseDrafter):
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
         )
-        server_args = get_global_server_args()
+        if draft_model_runner is None:
+            raise ValueError("Native DFLASH requires a draft model runner.")
+
+        server_args = draft_model_runner.server_args
         if not server_args.speculative_draft_model_path:
             raise ValueError("DFLASH requires --speculative-draft-model-path.")
 
-        if draft_model_runner is None:
-            raise ValueError("Native DFLASH requires a draft model runner.")
         self.device = torch.device(draft_model_runner.device)
         self.model = draft_model_runner.model
 
@@ -241,13 +241,11 @@ class DFlash(BaseDrafter):
         all_gather_into_tensor(
             gathered_max,
             local_max.contiguous(),
-            self.logits_processor.tp_rank,
             self.logits_processor.tp_group,
         )
         all_gather_into_tensor(
             gathered_ids,
             global_ids.contiguous(),
-            self.logits_processor.tp_rank,
             self.logits_processor.tp_group,
         )
 
@@ -273,7 +271,12 @@ class DFlash(BaseDrafter):
             )
 
         bs = base_ctx.bs
-        lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64)
+        # The target verify forward emits spec_num_tokens hidden states per
+        # decode request (the candidate block); input_lengths_buf only tracks
+        # the committed-token count there, so split decode rows by
+        # spec_num_tokens. Prefill rows keep their real chunk lengths.
+        lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64).clone()
+        lengths[base_ctx.num_extends :] = self.spec_num_tokens
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
         cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
@@ -442,8 +445,19 @@ class DFlash(BaseDrafter):
                 seq_lens=seq_lens_after,
                 req_to_page=self.req_to_page,
                 forward_mode=ForwardMode.DECODE,
+                # Draft block runs in DECODE mode; the extend_* params are
+                # required by the signature but unused on the decode path.
+                extend_seq_lens=None,
                 extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
+                extend_prefix_lens=None,
+                extend_prefix_lens_cpu=None,
             )
+        else:
+            # CUDA-graph capture/replay: the expanded decode metadata
+            # (page table) is prepared out-of-graph by the wrapper; broadcast
+            # the live per-request block-end length into the expanded seq_lens
+            # buffer here so the recorded op re-derives them on every replay.
+            self.attn_backend.fill_block_decode_seq_lens(bs, seq_lens_after)
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -464,7 +478,6 @@ class DFlash(BaseDrafter):
                 input_ids=flat_ids,
                 positions=block_positions.reshape(-1),
                 out_cache_loc=cache_locs,
-                input_lengths=self.draft_input_lengths_buf[:bs],
                 captured_hidden_states=None,
                 input_embeds=input_embeds,
             )
