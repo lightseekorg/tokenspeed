@@ -125,10 +125,9 @@ def _default_num_buffers(
         has_w_block_scale,
         scale_load_mode,
     )
-    # Match the gfx950 Gluon tutorial v5 local-prefetch pipeline: the
-    # three stages are global->LDS, LDS->VGPR, and MFMA, but only two
-    # physical LDS buffers are needed because MFMA consumes values that
-    # were already prefetched into registers.
+    # The kernel uses a three-stage pipeline: global -> LDS,
+    # LDS -> VGPR, and MFMA. It only needs two physical LDS buffers
+    # because MFMA consumes operands already prefetched into registers.
     return 2
 
 
@@ -1439,7 +1438,7 @@ class MoEPipelinedProgram:
         cfg = self.cfg
         gl.static_assert(
             cfg.NUM_BUFFERS == 2,
-            "v5 local-prefetch pipeline requires exactly two LDS buffers",
+            "current local-prefetch pipeline requires exactly two LDS buffers",
         )
         load_idx = 0
         mfma_idx = 0
@@ -2516,7 +2515,7 @@ class MoESliceNProgram:
         )
         gl.static_assert(
             NB == 2,
-            "v5 local-prefetch SliceN pipeline requires exactly two LDS buffers",
+            "current SliceN local-prefetch pipeline requires exactly two LDS buffers",
         )
 
         if self.bottom_valid:
@@ -2888,8 +2887,8 @@ def _pipelined_moe_tile_compute(
     )
     if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
         # Host-preshuffled W uses the dot-tile HBM order. The current
-        # experiment stages that flat tile through LDS unless W_VIA_VGPR
-        # is explicitly enabled.
+        # implementation stages that flat tile through LDS unless
+        # W_VIA_VGPR is explicitly enabled.
         TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
         offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
             BLOCK_K_W * 16
