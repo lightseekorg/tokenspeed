@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as fused_mxfp
+import pytest
+
+fused_mxfp = pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950",
+    reason="tokenspeed-kernel-amd is required for gfx950 MoE launch tuning tests",
+)
 
 
 def test_prefill_launch_tuning_dispatch_m_buckets():

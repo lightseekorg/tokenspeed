@@ -5,13 +5,28 @@ from typing import Any
 
 import pytest
 import torch
+
+
+def _is_gfx950() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    return "gfx950" in arch
+
+
+_IS_GFX950 = _is_gfx950()
+if not _IS_GFX950:
+    pytest.skip(
+        "Gluon GPT-OSS MoE GEMM kernels are gfx950 (CDNA4) only",
+        allow_module_level=True,
+    )
+
 from tokenspeed_kernel.ops.moe.gluon.mxfp4 import gluon_mxfp4_moe_process_weights
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _routing,
     fp8_quantize,
     triton_mxfp4_moe_process_weights,
 )
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe
 from triton_kernels.matmul import FnSpecs, FusedActivation, matmul
 from triton_kernels.swiglu import swiglu_fn
@@ -236,7 +251,7 @@ def test_prefill_slice_resolver_honors_explicit_slicemn() -> None:
 
 
 requires_gfx950 = pytest.mark.skipif(
-    not (torch.cuda.is_available() and current_platform().is_cdna4),
+    not _IS_GFX950,
     reason="Gluon GPT-OSS MoE GEMM kernels are gfx950 (CDNA4) only",
 )
 
