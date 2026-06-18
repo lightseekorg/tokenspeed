@@ -927,35 +927,28 @@ class AsyncCopyDescriptor:
         return gl.amd.cdna4.async_copy.load_shared_relaxed(slot, layout)
 
     @gluon.jit
-    def issue_local_load_m_swizzle64(self, idx, buffer, layout: gl.constexpr):
+    def issue_local_load_m_swizzle(
+        self,
+        idx,
+        buffer,
+        layout: gl.constexpr,
+        BLOCK_M: gl.constexpr,
+    ):
+        if BLOCK_M == 32:
+            GROUPS_M: gl.constexpr = 2
+        else:
+            gl.static_assert(
+                BLOCK_M == 64 or BLOCK_M == 128,
+                "M-swizzled local load supports BLOCK_M in {32, 64, 128}",
+            )
+            GROUPS_M: gl.constexpr = 4
+        ROWS_PER_GROUP: gl.constexpr = BLOCK_M // GROUPS_M
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
         slot = buffer.index(idx % NUM_BUFFERS)
         slot_view = (
-            slot.reshape((16, 4, self.BLOCK_K))
+            slot.reshape((ROWS_PER_GROUP, GROUPS_M, self.BLOCK_K))
             .permute((1, 0, 2))
-            .reshape((64, self.BLOCK_K))
-        )
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_view, layout)
-
-    @gluon.jit
-    def issue_local_load_m_swizzle128(self, idx, buffer, layout: gl.constexpr):
-        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
-        slot = buffer.index(idx % NUM_BUFFERS)
-        slot_view = (
-            slot.reshape((32, 4, self.BLOCK_K))
-            .permute((1, 0, 2))
-            .reshape((128, self.BLOCK_K))
-        )
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_view, layout)
-
-    @gluon.jit
-    def issue_local_load_m_swizzle32(self, idx, buffer, layout: gl.constexpr):
-        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
-        slot = buffer.index(idx % NUM_BUFFERS)
-        slot_view = (
-            slot.reshape((16, 2, self.BLOCK_K))
-            .permute((1, 0, 2))
-            .reshape((32, self.BLOCK_K))
+            .reshape((BLOCK_M, self.BLOCK_K))
         )
         return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_view, layout)
 
@@ -2120,23 +2113,14 @@ class MoESliceNProgram:
     def issue_local_load_x(self, mfma_idx):
         cfg = self.cfg
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
-        if not cfg.W_VIA_VGPR and cfg.BLOCK_M == 128:
-            x = self.x_desc.issue_local_load_m_swizzle128(
+        if not cfg.W_VIA_VGPR and (
+            cfg.BLOCK_M == 32 or cfg.BLOCK_M == 64 or cfg.BLOCK_M == 128
+        ):
+            x = self.x_desc.issue_local_load_m_swizzle(
                 mfma_idx,
                 self.x_buffer,
                 cfg.dot_layout_x,
-            )
-        elif not cfg.W_VIA_VGPR and cfg.BLOCK_M == 64:
-            x = self.x_desc.issue_local_load_m_swizzle64(
-                mfma_idx,
-                self.x_buffer,
-                cfg.dot_layout_x,
-            )
-        elif not cfg.W_VIA_VGPR and cfg.BLOCK_M == 32:
-            x = self.x_desc.issue_local_load_m_swizzle32(
-                mfma_idx,
-                self.x_buffer,
-                cfg.dot_layout_x,
+                cfg.BLOCK_M,
             )
         else:
             x = self.x_desc.issue_local_load(
