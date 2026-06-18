@@ -127,16 +127,14 @@ def test_preshuffled_layout_selection_clamps_when_slicen_is_incompatible() -> No
     assert use_slice_n is False
 
 
-def test_prefill_route_overrides_promote_small_dispatch_shape() -> None:
-    block_m, block_n, use_slice_n, small, medium, large = (
-        gluon_moe._apply_prefill_route_overrides(
-            M=1024,
-            N=5760,
+def test_autotune_block_promotes_small_dispatch_shape() -> None:
+    block_m, block_n, _block_k, _num_warps, use_slice_n, small = (
+        gluon_moe._autotune_block(
+            1024,
+            5760,
+            2880,
+            do_swiglu=True,
             slice_size=8,
-            block_m=64,
-            block_n=128,
-            requested_block_m=None,
-            requested_block_n=None,
             use_slice_n=None,
             large_slice_size=128,
             large_m=16384,
@@ -144,19 +142,17 @@ def test_prefill_route_overrides_promote_small_dispatch_shape() -> None:
     )
 
     assert (block_m, block_n, use_slice_n) == (16, 256, None)
-    assert (small, medium, large) == (True, False, False)
+    assert small is True
 
 
-def test_prefill_route_overrides_force_large_dispatch_slicen() -> None:
-    block_m, block_n, use_slice_n, small, medium, large = (
-        gluon_moe._apply_prefill_route_overrides(
-            M=16384,
-            N=5760,
+def test_autotune_block_forces_large_dispatch_slicen() -> None:
+    block_m, block_n, _block_k, _num_warps, use_slice_n, small = (
+        gluon_moe._autotune_block(
+            16384,
+            5760,
+            2880,
+            do_swiglu=True,
             slice_size=128,
-            block_m=128,
-            block_n=256,
-            requested_block_m=None,
-            requested_block_n=None,
             use_slice_n=None,
             large_slice_size=128,
             large_m=16384,
@@ -164,7 +160,7 @@ def test_prefill_route_overrides_force_large_dispatch_slicen() -> None:
     )
 
     assert (block_m, block_n, use_slice_n) == (128, 256, True)
-    assert (small, medium, large) == (False, False, True)
+    assert small is False
 
 
 def test_prefill_slice_resolver_prefers_slicen_by_default() -> None:

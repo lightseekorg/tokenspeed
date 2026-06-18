@@ -4909,8 +4909,14 @@ def _autotune_block(
     x_format: str = "e2m1",
     scale_load_mode: str = "transpose",
     slice_size: int | None = None,
-) -> tuple[int, int, int, int]:
-    """Pick ``(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS)`` for scaled-MFMA tiles.
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    use_slice_n: bool | None = None,
+    large_slice_size: int | None = None,
+    large_m: int | None = None,
+) -> tuple[int, int, int, int, bool | None, bool]:
+    """Pick the scaled-MFMA tile route.
 
     Sweep-tuned on gpt-oss-120b (H=I=2880, E=128, top_k=4) at MI355.
     Tiers off logical ``M`` and the per-expert ``slice_size`` hint;
@@ -4963,7 +4969,53 @@ def _autotune_block(
     if scale_load_mode == "swizzle":
         bk = max(bk, 256)
         bk = min(bk, _round_up_int(K, _MFMA_SCALED_K))
-    return bm, bn, bk, nw
+
+    requested_block_m = block_m
+    requested_block_n = block_n
+    block_m = block_m or bm
+    block_n = block_n or bn
+    block_k = block_k or bk
+
+    use_small_m = (
+        requested_block_m is None
+        and slice_size is not None
+        and slice_size < 16
+        and 1024 <= M < 2048
+    )
+    use_medium_m = (
+        requested_block_m is None
+        and slice_size is not None
+        and slice_size <= 16
+        and 2048 <= M < 4096
+    )
+    use_large_m = (
+        requested_block_m is None
+        and slice_size is not None
+        and large_slice_size is not None
+        and large_m is not None
+        and slice_size >= large_slice_size
+        and M >= large_m
+    )
+    if use_small_m:
+        block_m = 16
+    elif use_medium_m:
+        block_m = 32
+    elif use_large_m:
+        block_m = 128
+        if use_slice_n is None:
+            use_slice_n = True
+
+    if requested_block_n is None and block_n == 128 and N >= 256:
+        # The tuned prefill route consumes a 256-wide execution tile through the
+        # SliceN pipeline.  Preshuffled W reads two 128-wide packed half-tiles;
+        # non-preshuffled W reads the same two half-tiles from the normal LDS
+        # layout, keeping the compute schedule aligned across both variants.
+        block_n = 256
+
+    if block_n == 256 and block_m > 64 and not use_large_m:
+        block_m = 64
+
+    return block_m, block_n, block_k, nw, use_slice_n, use_small_m
 
 
 def _autotune_pid_swizzle(
@@ -5155,60 +5207,6 @@ def _align_block_n_to_preshuffled_layout(
     return packed_block_n, use_slice_mn, False
 
 
-def _apply_prefill_route_overrides(
-    *,
-    M: int,
-    N: int,
-    slice_size: int | None,
-    block_m: int,
-    block_n: int,
-    requested_block_m: int | None,
-    requested_block_n: int | None,
-    use_slice_n: bool | None,
-    large_slice_size: int,
-    large_m: int,
-) -> tuple[int, int, bool | None, bool, bool, bool]:
-    """Apply the GPT-OSS prefill tile route shared by W layout variants."""
-    use_small_m = (
-        requested_block_m is None
-        and slice_size is not None
-        and slice_size < 16
-        and 1024 <= M < 2048
-    )
-    use_medium_m = (
-        requested_block_m is None
-        and slice_size is not None
-        and slice_size <= 16
-        and 2048 <= M < 4096
-    )
-    use_large_m = (
-        requested_block_m is None
-        and slice_size is not None
-        and slice_size >= large_slice_size
-        and M >= large_m
-    )
-    if use_small_m:
-        block_m = 16
-    elif use_medium_m:
-        block_m = 32
-    elif use_large_m:
-        block_m = 128
-        if use_slice_n is None:
-            use_slice_n = True
-
-    if requested_block_n is None and block_n == 128 and N >= 256:
-        # The tuned prefill route consumes a 256-wide execution tile through the
-        # SliceN pipeline.  Preshuffled W reads two 128-wide packed half-tiles;
-        # non-preshuffled W reads the same two half-tiles from the normal LDS
-        # layout, keeping the compute schedule aligned across both variants.
-        block_n = 256
-
-    if block_n == 256 and block_m > 64 and not use_large_m:
-        block_m = 64
-
-    return block_m, block_n, use_slice_n, use_small_m, use_medium_m, use_large_m
-
-
 def _resolve_prefill_slice_modes(
     *,
     use_slice_mn: bool | None,
@@ -5303,7 +5301,14 @@ def gluon_mxfp_dispatch_swiglu(
     div_x = 2 if x_format == "e2m1" else 1
     K = x.shape[-1] * div_x
     slice_size = _ragged_slice_size(a_ragged_metadata, M)
-    bm, bn, bk, nw = _autotune_block(
+    (
+        block_m,
+        block_n,
+        block_k,
+        nw,
+        use_slice_n,
+        use_small_prefill_m,
+    ) = _autotune_block(
         M,
         N,
         K,
@@ -5311,27 +5316,9 @@ def gluon_mxfp_dispatch_swiglu(
         x_format=x_format,
         scale_load_mode=scale_load_mode,
         slice_size=slice_size,
-    )
-    requested_block_m = block_m
-    requested_block_n = block_n
-    block_m = block_m or bm
-    block_n = block_n or bn
-    block_k = block_k or bk
-    (
-        block_m,
-        block_n,
-        use_slice_n,
-        use_small_prefill_m,
-        _use_medium_prefill_m,
-        use_large_prefill_m,
-    ) = _apply_prefill_route_overrides(
-        M=M,
-        N=N,
-        slice_size=slice_size,
         block_m=block_m,
         block_n=block_n,
-        requested_block_m=requested_block_m,
-        requested_block_n=requested_block_n,
+        block_k=block_k,
         use_slice_n=use_slice_n,
         large_slice_size=128,
         large_m=16384,
@@ -5503,7 +5490,14 @@ def gluon_mxfp_combine(
     div_x = 2 if x_format == "e2m1" else 1
     K = x.shape[-1] * div_x
     slice_size = _ragged_slice_size(a_ragged_metadata, M)
-    bm, bn, bk, nw = _autotune_block(
+    (
+        block_m,
+        block_n,
+        block_k,
+        nw,
+        use_slice_n,
+        use_small_prefill_m,
+    ) = _autotune_block(
         M,
         N,
         K,
@@ -5511,27 +5505,9 @@ def gluon_mxfp_combine(
         x_format=x_format,
         scale_load_mode=scale_load_mode,
         slice_size=slice_size,
-    )
-    requested_block_m = block_m
-    requested_block_n = block_n
-    block_m = block_m or bm
-    block_n = block_n or bn
-    block_k = block_k or bk
-    (
-        block_m,
-        block_n,
-        use_slice_n,
-        use_small_prefill_m,
-        _use_medium_prefill_m,
-        _use_large_prefill_m,
-    ) = _apply_prefill_route_overrides(
-        M=M,
-        N=N,
-        slice_size=slice_size,
         block_m=block_m,
         block_n=block_n,
-        requested_block_m=requested_block_m,
-        requested_block_n=requested_block_n,
+        block_k=block_k,
         use_slice_n=use_slice_n,
         large_slice_size=256,
         large_m=32768,
