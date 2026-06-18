@@ -239,7 +239,7 @@ def test_mha_extend_with_kvcache(
         pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8"),
     ],
 )
-@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
 @pytest.mark.parametrize("seqlen_q", [1, 4], ids=["q1", "q4"])
 def test_mha_decode_with_kvcache(
     device: str,
