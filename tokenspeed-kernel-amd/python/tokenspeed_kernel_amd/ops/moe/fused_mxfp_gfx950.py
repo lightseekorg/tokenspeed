@@ -102,35 +102,6 @@ def _estimate_pipeline_lds_per_buffer(
     return x_bytes + w_bytes + scale_bytes
 
 
-def _default_num_buffers(
-    K: int,
-    block_k: int,
-    *,
-    block_m: int | None = None,
-    block_n: int | None = None,
-    x_format: str = "e2m1",
-    w_format: str = "e2m1",
-    has_x_block_scale: bool | None = None,
-    has_w_block_scale: bool = True,
-    scale_load_mode: str = "transpose",
-) -> int:
-    del (
-        K,
-        block_k,
-        block_m,
-        block_n,
-        x_format,
-        w_format,
-        has_x_block_scale,
-        has_w_block_scale,
-        scale_load_mode,
-    )
-    # The kernel uses a three-stage pipeline: global -> LDS,
-    # LDS -> VGPR, and MFMA. It only needs two physical LDS buffers
-    # because MFMA consumes operands already prefetched into registers.
-    return 2
-
-
 _CDNA4_NUM_CUS = 256
 _PERSISTENT_OVERSUBSCRIBE = 2
 _PERSISTENT_TILES_THRESHOLD = _CDNA4_NUM_CUS * 3
@@ -269,7 +240,7 @@ def _store_layout(
     num_warps: int,
     block_m: int = 0,
     w_via_vgpr: bool = False,
-    variant: int = 0,
+    use_narrow_n_layout: bool = False,
 ):
     # Mirrors the warps_m policy in get_mfma_layout so the MFMA acc
     # and store layouts stay convert-compatible.
@@ -280,9 +251,10 @@ def _store_layout(
     else:
         warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
-    if variant == 1 and w_via_vgpr and block_m >= 64 and num_warps >= 4:
-        return gl.BlockedLayout([1, 16], [4, 16], [warps_m, warps_n], [1, 0])
-    if variant == 2 and w_via_vgpr and block_m >= 64 and num_warps >= 4:
+    # Selected W-via-VGPR combine routes store 16 contiguous N values per
+    # thread instead of 32; profiling found this lower-resource store layout
+    # faster for those shapes.
+    if use_narrow_n_layout and w_via_vgpr and block_m >= 64 and num_warps >= 4:
         return gl.BlockedLayout([1, 16], [8, 8], [warps_m, warps_n], [1, 0])
     if w_via_vgpr and block_m >= 128 and num_warps >= 4:
         return gl.BlockedLayout([1, 16], [4, 16], [warps_m, warps_n], [1, 0])
@@ -3686,7 +3658,7 @@ def _pipelined_moe_tile_compute(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
-    STORE_LAYOUT_VARIANT: gl.constexpr = 0,
+    USE_NARROW_N_STORE_LAYOUT: gl.constexpr = False,
 ):
     expert_id = compact_idx
 
@@ -3714,7 +3686,7 @@ def _pipelined_moe_tile_compute(
         NUM_WARPS,
         block_m=BLOCK_M,
         w_via_vgpr=W_VIA_VGPR or W_PRESHUFFLED,
-        variant=STORE_LAYOUT_VARIANT,
+        use_narrow_n_layout=USE_NARROW_N_STORE_LAYOUT,
     )
 
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
@@ -4254,7 +4226,7 @@ def _pipelined_moe_kernel_scaled(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
-    STORE_LAYOUT_VARIANT: gl.constexpr = 0,
+    USE_NARROW_N_STORE_LAYOUT: gl.constexpr = False,
 ):
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
@@ -4359,7 +4331,7 @@ def _pipelined_moe_kernel_scaled(
             W_VIA_VGPR=W_VIA_VGPR,
             W_PREFETCH=W_PREFETCH,
             W_CACHE_CG=W_CACHE_CG,
-            STORE_LAYOUT_VARIANT=STORE_LAYOUT_VARIANT,
+            USE_NARROW_N_STORE_LAYOUT=USE_NARROW_N_STORE_LAYOUT,
         )
 
 
@@ -4554,7 +4526,7 @@ def _launch_kernel(
     w_preshuffle: bool = False,
     y_n_const: int = 0,
     w_cache_cg: bool | None = None,
-    store_layout_variant: int = 0,
+    use_narrow_n_store_layout: bool = False,
 ):
     assert x_format in _SCALED_FORMATS, f"unknown x_format={x_format!r}"
     assert w_format in _SCALED_FORMATS, f"unknown w_format={w_format!r}"
@@ -4896,7 +4868,7 @@ def _launch_kernel(
         W_VIA_VGPR=False,
         W_PREFETCH=False,
         W_CACHE_CG=bool(w_cache_cg),
-        STORE_LAYOUT_VARIANT=int(store_layout_variant),
+        USE_NARROW_N_STORE_LAYOUT=bool(use_narrow_n_store_layout),
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
@@ -5328,7 +5300,7 @@ def gluon_mxfp_dispatch_swiglu(
     block_n: int | None = None,
     block_k: int | None = None,
     num_warps: int | None = None,
-    num_buffers: int | None = None,
+    num_buffers: int = 2,
     use_warp_pipeline: bool | None = None,
     use_slice_mn: bool | None = None,
     use_slice_n: bool | None = None,
@@ -5400,21 +5372,6 @@ def gluon_mxfp_dispatch_swiglu(
     num_warps = num_warps or nw
     if w_preshuffle:
         num_warps = 4
-    num_buffers = (
-        num_buffers
-        if num_buffers is not None
-        else _default_num_buffers(
-            K,
-            block_k,
-            block_m=block_m,
-            block_n=block_n,
-            x_format=x_format,
-            w_format="e2m1",
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            scale_load_mode=scale_load_mode,
-        )
-    )
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
@@ -5550,7 +5507,7 @@ def gluon_mxfp_combine(
     block_n: int | None = None,
     block_k: int | None = None,
     num_warps: int | None = None,
-    num_buffers: int | None = None,
+    num_buffers: int = 2,
     use_warp_pipeline: bool | None = None,
     use_slice_mn: bool | None = None,
     use_slice_n: bool | None = None,
@@ -5615,21 +5572,6 @@ def gluon_mxfp_combine(
     num_warps = num_warps or nw
     if w_preshuffle:
         num_warps = 4
-    num_buffers = (
-        num_buffers
-        if num_buffers is not None
-        else _default_num_buffers(
-            K,
-            block_k,
-            block_m=block_m,
-            block_n=block_n,
-            x_format=x_format,
-            w_format="e2m1",
-            has_x_block_scale=x_format == "e2m1",
-            has_w_block_scale=True,
-            scale_load_mode=scale_load_mode,
-        )
-    )
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
@@ -5660,7 +5602,7 @@ def gluon_mxfp_combine(
     group_m = None
     xcd_swizzle = None
     w_cache_cg = None
-    store_layout_variant = 0
+    use_narrow_n_store_layout = False
     if (
         not persistent
         and block_m == 16
@@ -5701,7 +5643,7 @@ def gluon_mxfp_combine(
     ):
         group_m = 16
         xcd_swizzle = 4
-        store_layout_variant = 2
+        use_narrow_n_store_layout = True
     elif (
         persistent
         and num_ctas == _CDNA4_NUM_CUS
@@ -5719,7 +5661,7 @@ def gluon_mxfp_combine(
         if slice_size == 128:
             group_m = 16
             xcd_swizzle = 4
-            store_layout_variant = 2
+            use_narrow_n_store_layout = True
         elif slice_size == 32:
             group_m = 4
             xcd_swizzle = _CDNA4_NUM_XCDS
@@ -5787,7 +5729,7 @@ def gluon_mxfp_combine(
         w_preshuffle=w_preshuffle,
         y_n_const=y_n if y_n != N else 0,
         w_cache_cg=w_cache_cg,
-        store_layout_variant=store_layout_variant,
+        use_narrow_n_store_layout=use_narrow_n_store_layout,
     )
     if n_act_eff > 1:
         y = y.view(n_tokens_eff, n_act_eff, y_n).sum(dim=1)
