@@ -202,20 +202,17 @@ def test_prefill_launch_tuning_routes(
 
 
 def test_prefill_launch_tuning_ignores_slice_mn() -> None:
-    assert (
-        gluon_moe._prefill_launch_tuning(
-            "combine",
-            persistent=True,
-            num_ctas=gluon_moe._CDNA4_NUM_CUS,
-            block_m=64,
-            block_n=256,
-            block_k=256,
-            use_slice_mn=True,
-            use_slice_n=True,
-            slice_size=128,
-        )
-        == (None, None, None, False)
-    )
+    assert gluon_moe._prefill_launch_tuning(
+        "combine",
+        persistent=True,
+        num_ctas=gluon_moe._CDNA4_NUM_CUS,
+        block_m=64,
+        block_n=256,
+        block_k=256,
+        use_slice_mn=True,
+        use_slice_n=True,
+        slice_size=128,
+    ) == (None, None, None, False)
 
 
 def test_prefill_slice_resolver_prefers_slicen_by_default() -> None:
@@ -364,7 +361,9 @@ def _make_weight_module(raw: RawMxfp4Weights) -> torch.nn.Module:
         raw.w13_scale.clone(), requires_grad=False
     )
     layer.w2_weight = torch.nn.Parameter(raw.w2_weight.clone(), requires_grad=False)
-    layer.w2_weight_scale = torch.nn.Parameter(raw.w2_scale.clone(), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(
+        raw.w2_scale.clone(), requires_grad=False
+    )
     layer.w13_weight_bias = torch.nn.Parameter(
         torch.zeros(E, 2 * INTERMEDIATE_SIZE, device=raw.w13_weight.device),
         requires_grad=False,

@@ -20,6 +20,7 @@
 
 
 from __future__ import annotations
+
 from typing import Any, Optional
 
 import torch
@@ -2923,9 +2924,7 @@ def _make_preshuffled_w_slice_offsets(
     SUB_BN: gl.constexpr,
     BLOCK_K_W: gl.constexpr,
 ):
-    offs_wn_h = gl.arange(
-        0, SUB_BN // 16, layout=gl.SliceLayout(1, LOAD_W_COPY_LAYOUT)
-    )
+    offs_wn_h = gl.arange(0, SUB_BN // 16, layout=gl.SliceLayout(1, LOAD_W_COPY_LAYOUT))
     offs_wk_h = gl.arange(
         0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_COPY_LAYOUT)
     )
@@ -2957,9 +2956,7 @@ def _make_preshuffled_w_full_offsets(
     offs_wn = gl.arange(
         0, BLOCK_N_LAYOUT // 16, layout=gl.SliceLayout(1, LOAD_W_COPY_LAYOUT)
     )
-    offs_wk = gl.arange(
-        0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_COPY_LAYOUT)
-    )
+    offs_wk = gl.arange(0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_COPY_LAYOUT))
     offsets_b = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
         BLOCK_K_W * 16
     )
@@ -3006,9 +3003,7 @@ def _run_moe_tile_w_via_vgpr(
         "W_VIA_VGPR consumes the preshuffled Gluon-dot W layout.",
     )
     gl.static_assert(
-        BLOCK_K_W == 128
-        and NUM_WARPS == 4
-        and not USE_SLICE_MN,
+        BLOCK_K_W == 128 and NUM_WARPS == 4 and not USE_SLICE_MN,
         "W_VIA_VGPR layout bases assume BLOCK_K_W=128, NUM_WARPS=4, "
         "and USE_SLICE_MN=False. Re-derive bases for other shapes.",
     )
@@ -3265,7 +3260,9 @@ def _run_moe_tile_preshuffled_lds_w(
         load_layout=LOAD_W_LAYOUT,
         cache_modifier=W_CACHE_MODIFIER,
     )
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    pgm = MoEPipelinedProgram.initialize(
+        cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
+    )
     if USE_WARP_PIPELINE:
         return pgm.warp_pipeline(K)
     return pgm.pipeline(K)
@@ -3412,7 +3409,9 @@ def _run_moe_tile_transposed_w(
         W_ELEM_BITS,
         W_CACHE_MODIFIER,
     )
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    pgm = MoEPipelinedProgram.initialize(
+        cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
+    )
     if USE_WARP_PIPELINE:
         return pgm.warp_pipeline(K)
     return pgm.pipeline(K)
@@ -3559,7 +3558,9 @@ def _run_moe_tile_ncontig_w(
         W_ELEM_BITS,
         W_CACHE_MODIFIER,
     )
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    pgm = MoEPipelinedProgram.initialize(
+        cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
+    )
     if USE_WARP_PIPELINE:
         return pgm.warp_pipeline(K)
     return pgm.pipeline(K)
@@ -3724,9 +3725,7 @@ def _pipelined_moe_tile_compute(
         rows_m = gl.load(
             gather_idx_ptr + rows_m_safe, mask=pre_gather_mask, other=0
         ).to(gl.int32)
-        rows_m_x_safe = gl.where(
-            pre_gather_mask_x, rows_m_x, gl.zeros_like(rows_m_x)
-        )
+        rows_m_x_safe = gl.where(pre_gather_mask_x, rows_m_x, gl.zeros_like(rows_m_x))
         rows_m_x = gl.load(
             gather_idx_ptr + rows_m_x_safe, mask=pre_gather_mask_x, other=0
         ).to(gl.int32)
@@ -3999,7 +3998,10 @@ def _pipelined_moe_tile_compute(
         )
 
     FUSE_X_GLOBAL_WITH_GATE: gl.constexpr = (
-        APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE and APPLY_GATE_SCAL and not DO_SWIGLU
+        APPLY_X_GLOBAL_SCALE
+        and not HAS_X_BLOCK_SCALE
+        and APPLY_GATE_SCAL
+        and not DO_SWIGLU
     )
 
     if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE and not FUSE_X_GLOBAL_WITH_GATE:
