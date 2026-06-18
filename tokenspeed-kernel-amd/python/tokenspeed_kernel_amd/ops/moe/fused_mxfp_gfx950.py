@@ -2524,6 +2524,898 @@ class MoESliceNProgram:
 
 
 @gluon.jit
+def _run_moe_tile_preshuffled_w(
+    cfg,
+    x_ptr,
+    w_ptr,
+    x_scale_desc,
+    w_scale_desc,
+    gather_idx_ptr,
+    stride_xm,
+    stride_xk,
+    M_X,
+    N,
+    K,
+    off_m,
+    m_limit,
+    rows_m_x,
+    offs_xk,
+    k_limit_x,
+    k_limit_w,
+    w_base_offset,
+    pid_n,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K_X: gl.constexpr,
+    BLOCK_K_W: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    HAS_GATHER: gl.constexpr,
+    USE_SLICE_MN: gl.constexpr,
+    USE_SLICE_N: gl.constexpr,
+    USE_WARP_PIPELINE: gl.constexpr,
+    N_LIMIT: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+):
+    gl.static_assert(
+        BLOCK_K_W == 128
+        and (BLOCK_N == 128 or USE_SLICE_N)
+        and NUM_WARPS == 4
+        and not USE_SLICE_MN,
+        "preshuffled W layout bases assume BLOCK_K_W=128, "
+        "BLOCK_N=128 (or USE_SLICE_N=True for half-tile path), "
+        "NUM_WARPS=4, and USE_SLICE_MN=False. Re-derive bases for "
+        "other shapes.",
+    )
+
+    if HAS_GATHER:
+        # Invalid expert-tail rows were already clamped to gather row 0.
+        # Keep the global token bound check, but avoid carrying the
+        # per-expert tail predicate through every X async-copy element.
+        x_mask_nonk = (rows_m_x < M_X)[:, None]
+    else:
+        x_mask_nonk = gl.to_tensor(True)
+    x_desc = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_X,
+        x_ptr,
+        rows_m_x,
+        offs_xk,
+        stride_xm,
+        stride_xk,
+        x_mask_nonk,
+        k_limit_x,
+    )
+
+    if USE_SLICE_N:
+        SUB_BN: gl.constexpr = BLOCK_N // 2
+        bottom_valid = gl.to_tensor(True)
+        gl.static_assert(
+            SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
+            "USE_SLICE_N + preshuffled W requires SUB_BN=BLOCK_K_W=128 "
+            "and NUM_WARPS=4; the half-tile LOAD_W_LAYOUT bases assume "
+            "this shape (re-derive otherwise).",
+        )
+        if cfg.SCALE_VIA_LDS:
+            LOAD_W_HALF_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=[
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 8],
+                    [0, 1024],
+                    [1, 0],
+                    [4, 0],
+                ],
+                lane_bases=[
+                    [0, 16],
+                    [0, 32],
+                    [0, 64],
+                    [0, 128],
+                    [0, 256],
+                    [0, 512],
+                ],
+                warp_bases=[[2, 0], [0, 0]],
+                block_bases=[],
+                shape=[SUB_BN // 16, BLOCK_K_W * 16],
+            )
+            if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+                LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [0, 1],
+                        [0, 2],
+                        [0, 4],
+                        [0, 8],
+                        [0, 1024],
+                        [1, 0],
+                    ],
+                    lane_bases=[
+                        [0, 16],
+                        [0, 32],
+                        [0, 64],
+                        [0, 128],
+                        [0, 256],
+                        [0, 512],
+                    ],
+                    warp_bases=[[2, 0], [4, 0]],
+                    block_bases=[],
+                    shape=[SUB_BN // 16, BLOCK_K_W * 16],
+                )
+            else:
+                LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = LOAD_W_HALF_LAYOUT
+        else:
+            LOAD_W_HALF_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=[
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 8],
+                    [0, 1024],
+                    [2, 0],
+                    [4, 0],
+                ],
+                lane_bases=[
+                    [0, 16],
+                    [0, 32],
+                    [0, 64],
+                    [0, 128],
+                    [0, 256],
+                    [0, 512],
+                ],
+                warp_bases=[[1, 0], [0, 0]],
+                block_bases=[],
+                shape=[SUB_BN // 16, BLOCK_K_W * 16],
+            )
+            if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+                LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [0, 1],
+                        [0, 2],
+                        [0, 4],
+                        [0, 8],
+                        [0, 1024],
+                        [2, 0],
+                    ],
+                    lane_bases=[
+                        [0, 16],
+                        [0, 32],
+                        [0, 64],
+                        [0, 128],
+                        [0, 256],
+                        [0, 512],
+                    ],
+                    warp_bases=[[1, 0], [4, 0]],
+                    block_bases=[],
+                    shape=[SUB_BN // 16, BLOCK_K_W * 16],
+                )
+            else:
+                LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = LOAD_W_HALF_LAYOUT
+        offs_wn_h = gl.arange(
+            0, SUB_BN // 16, layout=gl.SliceLayout(1, LOAD_W_HALF_COPY_LAYOUT)
+        )
+        offs_wk_h = gl.arange(
+            0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_HALF_COPY_LAYOUT)
+        )
+        offsets_h = gl.expand_dims(offs_wk_h, 0) + gl.expand_dims(offs_wn_h, 1) * (
+            BLOCK_K_W * 16
+        )
+        TILE_BYTES_HALF: gl.constexpr = 128 * 128
+        if N_LIMIT:
+            n_block_count: gl.constexpr = (N_LIMIT + 127) // 128
+            w_k_stride = gl.to_tensor(N_LIMIT)
+        else:
+            n_block_count = (N + 127) // 128
+            w_k_stride = gl.to_tensor(N)
+        bottom_valid = (2 * pid_n + 1) < n_block_count
+        base_off_top = w_base_offset + 2 * pid_n * TILE_BYTES_HALF
+        base_off_bot = base_off_top + TILE_BYTES_HALF
+        if cfg.W_VIA_VGPR:
+            w_desc_top = WVgprDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                w_k_stride,
+                offsets_h + base_off_top,
+                pred=gl.to_tensor(True),
+                LOAD_BN=SUB_BN,
+            )
+            w_desc_bot = WVgprDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                w_k_stride,
+                offsets_h + base_off_bot,
+                pred=bottom_valid,
+                LOAD_BN=SUB_BN,
+            )
+        else:
+            w_desc_top = WPreshuffledLdsDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                w_ptr.dtype.element_ty,
+                w_k_stride,
+                offsets_h + base_off_top,
+                pred=gl.to_tensor(True),
+                load_layout=LOAD_W_HALF_LAYOUT,
+                LOAD_BN=SUB_BN,
+                cache_modifier=W_CACHE_MODIFIER,
+            )
+            w_desc_bot = WPreshuffledLdsDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                w_ptr.dtype.element_ty,
+                w_k_stride,
+                offsets_h + base_off_bot,
+                pred=bottom_valid,
+                load_layout=LOAD_W_HALF_LAYOUT,
+                LOAD_BN=SUB_BN,
+                cache_modifier=W_CACHE_MODIFIER,
+            )
+        pgm = MoESliceNProgram.initialize(
+            cfg,
+            x_desc,
+            w_desc_top,
+            w_desc_bot,
+            x_scale_desc,
+            w_scale_desc,
+            bottom_valid,
+        )
+        return pgm.pipeline(K)
+
+    BLOCK_N_LAYOUT: gl.constexpr = BLOCK_N
+    if cfg.SCALE_VIA_LDS:
+        # tpw=[2,2]
+        LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=[
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 1024],
+                [1, 0],
+                [4, 0],
+            ],
+            lane_bases=[
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [0, 128],
+                [0, 256],
+                [0, 512],
+            ],
+            warp_bases=[
+                [2, 0],
+                [0, 0],
+            ],
+            block_bases=[],
+            shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
+        )
+        if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+            # Use all four waves as unique async-copy producers. The local
+            # LDS load still uses LOAD_W_LAYOUT because it is matched to the
+            # W dot operand layout.
+            LOAD_W_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=[
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 8],
+                    [0, 1024],
+                    [1, 0],
+                ],
+                lane_bases=[
+                    [0, 16],
+                    [0, 32],
+                    [0, 64],
+                    [0, 128],
+                    [0, 256],
+                    [0, 512],
+                ],
+                warp_bases=[
+                    [2, 0],
+                    [4, 0],
+                ],
+                block_bases=[],
+                shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
+            )
+        else:
+            LOAD_W_COPY_LAYOUT: gl.constexpr = LOAD_W_LAYOUT
+    else:
+        # tpw=[1,1]
+        LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=[
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 1024],
+                [2, 0],
+                [4, 0],
+            ],
+            lane_bases=[
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [0, 128],
+                [0, 256],
+                [0, 512],
+            ],
+            warp_bases=[
+                [1, 0],
+                [0, 0],
+            ],
+            block_bases=[],
+            shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
+        )
+        if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+            # See the SCALE_VIA_LDS branch: copy with unique producer waves,
+            # then read from LDS with the dot-compatible layout.
+            LOAD_W_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=[
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 8],
+                    [0, 1024],
+                    [2, 0],
+                ],
+                lane_bases=[
+                    [0, 16],
+                    [0, 32],
+                    [0, 64],
+                    [0, 128],
+                    [0, 256],
+                    [0, 512],
+                ],
+                warp_bases=[
+                    [1, 0],
+                    [4, 0],
+                ],
+                block_bases=[],
+                shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
+            )
+        else:
+            LOAD_W_COPY_LAYOUT: gl.constexpr = LOAD_W_LAYOUT
+
+    offs_wn = gl.arange(
+        0, BLOCK_N_LAYOUT // 16, layout=gl.SliceLayout(1, LOAD_W_COPY_LAYOUT)
+    )
+    offs_wk = gl.arange(
+        0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_COPY_LAYOUT)
+    )
+    TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
+    offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
+        BLOCK_K_W * 16
+    )
+    base_off_b_vgpr = w_base_offset + pid_n * TILE_BYTES
+    if cfg.W_VIA_VGPR:
+        w_desc = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            w_ptr,
+            gl.to_tensor(N),  # K-iter advance step: idx * BK_W * N
+            offsets_b_vgpr + base_off_b_vgpr,
+            pred=gl.to_tensor(True),  # full-tile path: always in-bounds
+        )
+    else:
+        w_desc = WPreshuffledLdsDescriptor(
+            cfg,
+            BLOCK_K_W,
+            w_ptr,
+            w_ptr.dtype.element_ty,
+            gl.to_tensor(N),
+            offsets_b_vgpr + base_off_b_vgpr,
+            pred=gl.to_tensor(True),
+            load_layout=LOAD_W_LAYOUT,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    if USE_WARP_PIPELINE:
+        return pgm.warp_pipeline(K)
+    return pgm.pipeline(K)
+
+
+@gluon.jit
+def _run_moe_tile_transposed_w(
+    cfg,
+    x_ptr,
+    w_ptr,
+    x_scale_desc,
+    w_scale_desc,
+    gather_idx_ptr,
+    stride_xm,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    M_X,
+    N,
+    K,
+    off_m,
+    off_n,
+    m_limit,
+    rows_m_x,
+    mask_m_x,
+    offs_xk,
+    k_limit_x,
+    k_limit_w,
+    w_base_offset,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K_X: gl.constexpr,
+    BLOCK_K_W: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    HAS_GATHER: gl.constexpr,
+    USE_SLICE_MN: gl.constexpr,
+    USE_SLICE_N: gl.constexpr,
+    USE_WARP_PIPELINE: gl.constexpr,
+    X_ELEM_BITS: gl.constexpr,
+    W_ELEM_BITS: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+):
+    x_desc = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_X,
+        x_ptr,
+        rows_m_x,
+        offs_xk,
+        stride_xm,
+        stride_xk,
+        mask_m_x[:, None],
+        k_limit_x,
+    )
+
+    if USE_SLICE_MN:
+        SUB_BM_MN: gl.constexpr = BLOCK_M // 2
+        SUB_BN_MN: gl.constexpr = BLOCK_N // 2
+
+        LOAD_X_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
+            BLOCK_K_X, SUB_BM_MN, NUM_WARPS, [1, 0], X_ELEM_BITS
+        )
+        offs_xm_sub_mn = gl.arange(
+            0, SUB_BM_MN, layout=gl.SliceLayout(1, LOAD_X_SUB_LAYOUT_MN)
+        )
+        offs_xk_sub_mn = gl.arange(
+            0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_SUB_LAYOUT_MN)
+        )
+        rows_m_top = off_m + offs_xm_sub_mn
+        rows_m_bot = off_m + SUB_BM_MN + offs_xm_sub_mn
+        pre_gather_mask_top = rows_m_top < m_limit
+        pre_gather_mask_bot = rows_m_bot < m_limit
+        if HAS_GATHER:
+            rows_m_top_safe = gl.where(
+                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
+            )
+            rows_m_bot_safe = gl.where(
+                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
+            )
+            rows_m_top = gl.load(
+                gather_idx_ptr + rows_m_top_safe,
+                mask=pre_gather_mask_top,
+                other=0,
+            ).to(gl.int32)
+            rows_m_bot = gl.load(
+                gather_idx_ptr + rows_m_bot_safe,
+                mask=pre_gather_mask_bot,
+                other=0,
+            ).to(gl.int32)
+            mask_m_top = pre_gather_mask_top & (rows_m_top < M_X)
+            mask_m_bot = pre_gather_mask_bot & (rows_m_bot < M_X)
+        else:
+            rows_m_top = gl.where(
+                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
+            )
+            rows_m_bot = gl.where(
+                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
+            )
+            mask_m_top = pre_gather_mask_top
+            mask_m_bot = pre_gather_mask_bot
+        x_desc_top_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_X,
+            x_ptr,
+            rows_m_top,
+            offs_xk_sub_mn,
+            stride_xm,
+            stride_xk,
+            mask_m_top[:, None],
+            k_limit_x,
+        )
+        x_desc_bot_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_X,
+            x_ptr,
+            rows_m_bot,
+            offs_xk_sub_mn,
+            stride_xm,
+            stride_xk,
+            mask_m_bot[:, None],
+            k_limit_x,
+        )
+
+        LOAD_W_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
+            BLOCK_K_W, SUB_BN_MN, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn_sub_mn = gl.arange(
+            0, SUB_BN_MN, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT_MN)
+        )
+        offs_wk_sub_mn = gl.arange(
+            0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT_MN)
+        )
+        mask_n_left_mn = (off_n + offs_wn_sub_mn) < N
+        mask_n_right_mn = (off_n + SUB_BN_MN + offs_wn_sub_mn) < N
+        w_desc_left_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + offs_wn_sub_mn,
+            offs_wk_sub_mn,
+            stride_wn,
+            stride_wk,
+            mask_n_left_mn[:, None],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        w_desc_right_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + SUB_BN_MN + offs_wn_sub_mn,
+            offs_wk_sub_mn,
+            stride_wn,
+            stride_wk,
+            mask_n_right_mn[:, None],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        slice_mn_pgm = MoESliceMNProgram.initialize(
+            cfg,
+            x_desc_top_mn,
+            x_desc_bot_mn,
+            w_desc_left_mn,
+            w_desc_right_mn,
+            x_scale_desc,
+            w_scale_desc,
+        )
+        return slice_mn_pgm.pipeline(K)
+
+    if USE_SLICE_N:
+        SUB_BN: gl.constexpr = BLOCK_N // 2
+        bottom_valid = gl.to_tensor(True)
+        LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_K_W, SUB_BN, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn_sub = gl.arange(
+            0, SUB_BN, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT)
+        )
+        offs_wk_sub = gl.arange(
+            0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT)
+        )
+        mask_n_top = (off_n + offs_wn_sub) < N
+        mask_n_bot = (off_n + SUB_BN + offs_wn_sub) < N
+        w_desc_top = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + offs_wn_sub,
+            offs_wk_sub,
+            stride_wn,
+            stride_wk,
+            mask_n_top[:, None],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        w_desc_bot = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + SUB_BN + offs_wn_sub,
+            offs_wk_sub,
+            stride_wn,
+            stride_wk,
+            mask_n_bot[:, None],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        pgm = MoESliceNProgram.initialize(
+            cfg,
+            x_desc,
+            w_desc_top,
+            w_desc_bot,
+            x_scale_desc,
+            w_scale_desc,
+            bottom_valid,
+        )
+        return pgm.pipeline(K)
+
+    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
+    )
+    offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+    offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+    mask_n = (off_n + offs_wn) < N
+    w_desc = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_W,
+        w_ptr,
+        off_n + offs_wn,
+        offs_wk,
+        stride_wn,
+        stride_wk,
+        mask_n[:, None],
+        k_limit_w,
+        base_offset=w_base_offset,
+        cache_modifier=W_CACHE_MODIFIER,
+    )
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    if USE_WARP_PIPELINE:
+        return pgm.warp_pipeline(K)
+    return pgm.pipeline(K)
+
+
+@gluon.jit
+def _run_moe_tile_ncontig_w(
+    cfg,
+    x_ptr,
+    w_ptr,
+    x_scale_desc,
+    w_scale_desc,
+    gather_idx_ptr,
+    stride_xm,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    M_X,
+    N,
+    K,
+    off_m,
+    off_n,
+    m_limit,
+    rows_m_x,
+    mask_m_x,
+    offs_xk,
+    k_limit_x,
+    k_limit_w,
+    w_base_offset,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K_X: gl.constexpr,
+    BLOCK_K_W: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    HAS_GATHER: gl.constexpr,
+    USE_SLICE_MN: gl.constexpr,
+    USE_SLICE_N: gl.constexpr,
+    USE_WARP_PIPELINE: gl.constexpr,
+    X_ELEM_BITS: gl.constexpr,
+    W_ELEM_BITS: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+):
+    x_desc = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_X,
+        x_ptr,
+        rows_m_x,
+        offs_xk,
+        stride_xm,
+        stride_xk,
+        mask_m_x[:, None],
+        k_limit_x,
+    )
+
+    if USE_SLICE_MN:
+        SUB_BM_MN: gl.constexpr = BLOCK_M // 2
+        SUB_BN_MN: gl.constexpr = BLOCK_N // 2
+
+        LOAD_X_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
+            BLOCK_K_X, SUB_BM_MN, NUM_WARPS, [1, 0], X_ELEM_BITS
+        )
+        offs_xm_sub_mn = gl.arange(
+            0, SUB_BM_MN, layout=gl.SliceLayout(1, LOAD_X_SUB_LAYOUT_MN)
+        )
+        offs_xk_sub_mn = gl.arange(
+            0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_SUB_LAYOUT_MN)
+        )
+        rows_m_top = off_m + offs_xm_sub_mn
+        rows_m_bot = off_m + SUB_BM_MN + offs_xm_sub_mn
+        pre_gather_mask_top = rows_m_top < m_limit
+        pre_gather_mask_bot = rows_m_bot < m_limit
+        if HAS_GATHER:
+            rows_m_top_safe = gl.where(
+                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
+            )
+            rows_m_bot_safe = gl.where(
+                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
+            )
+            rows_m_top = gl.load(
+                gather_idx_ptr + rows_m_top_safe,
+                mask=pre_gather_mask_top,
+                other=0,
+            ).to(gl.int32)
+            rows_m_bot = gl.load(
+                gather_idx_ptr + rows_m_bot_safe,
+                mask=pre_gather_mask_bot,
+                other=0,
+            ).to(gl.int32)
+            mask_m_top = pre_gather_mask_top & (rows_m_top < M_X)
+            mask_m_bot = pre_gather_mask_bot & (rows_m_bot < M_X)
+        else:
+            rows_m_top = gl.where(
+                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
+            )
+            rows_m_bot = gl.where(
+                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
+            )
+            mask_m_top = pre_gather_mask_top
+            mask_m_bot = pre_gather_mask_bot
+        x_desc_top_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_X,
+            x_ptr,
+            rows_m_top,
+            offs_xk_sub_mn,
+            stride_xm,
+            stride_xk,
+            mask_m_top[:, None],
+            k_limit_x,
+        )
+        x_desc_bot_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_X,
+            x_ptr,
+            rows_m_bot,
+            offs_xk_sub_mn,
+            stride_xm,
+            stride_xk,
+            mask_m_bot[:, None],
+            k_limit_x,
+        )
+
+        LOAD_W_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
+            SUB_BN_MN, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn_sub_mn = gl.arange(
+            0, SUB_BN_MN, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT_MN)
+        )
+        offs_wk_sub_mn = gl.arange(
+            0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT_MN)
+        )
+        mask_n_left_mn = (off_n + offs_wn_sub_mn) < N
+        mask_n_right_mn = (off_n + SUB_BN_MN + offs_wn_sub_mn) < N
+        w_desc_left_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            1,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + offs_wn_sub_mn,
+            offs_wk_sub_mn,
+            stride_wn,
+            stride_wk,
+            mask_n_left_mn[None, :],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        w_desc_right_mn = AsyncCopyDescriptor.initialize(
+            cfg,
+            1,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + SUB_BN_MN + offs_wn_sub_mn,
+            offs_wk_sub_mn,
+            stride_wn,
+            stride_wk,
+            mask_n_right_mn[None, :],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        slice_mn_pgm = MoESliceMNProgram.initialize(
+            cfg,
+            x_desc_top_mn,
+            x_desc_bot_mn,
+            w_desc_left_mn,
+            w_desc_right_mn,
+            x_scale_desc,
+            w_scale_desc,
+        )
+        return slice_mn_pgm.pipeline(K)
+
+    if USE_SLICE_N:
+        SUB_BN: gl.constexpr = BLOCK_N // 2
+        bottom_valid = gl.to_tensor(True)
+        LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
+            SUB_BN, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn_sub = gl.arange(
+            0, SUB_BN, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT)
+        )
+        offs_wk_sub = gl.arange(
+            0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT)
+        )
+        mask_n_top = (off_n + offs_wn_sub) < N
+        mask_n_bot = (off_n + SUB_BN + offs_wn_sub) < N
+        w_desc_top = AsyncCopyDescriptor.initialize(
+            cfg,
+            1,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + offs_wn_sub,
+            offs_wk_sub,
+            stride_wn,
+            stride_wk,
+            mask_n_top[None, :],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        w_desc_bot = AsyncCopyDescriptor.initialize(
+            cfg,
+            1,
+            BLOCK_K_W,
+            w_ptr,
+            off_n + SUB_BN + offs_wn_sub,
+            offs_wk_sub,
+            stride_wn,
+            stride_wk,
+            mask_n_bot[None, :],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        pgm = MoESliceNProgram.initialize(
+            cfg,
+            x_desc,
+            w_desc_top,
+            w_desc_bot,
+            x_scale_desc,
+            w_scale_desc,
+            bottom_valid,
+        )
+        return pgm.pipeline(K)
+
+    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_N, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
+    )
+    offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+    offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+    mask_n = (off_n + offs_wn) < N
+    w_desc = AsyncCopyDescriptor.initialize(
+        cfg,
+        1,
+        BLOCK_K_W,
+        w_ptr,
+        off_n + offs_wn,
+        offs_wk,
+        stride_wn,
+        stride_wk,
+        mask_n[None, :],
+        k_limit_w,
+        base_offset=w_base_offset,
+        cache_modifier=W_CACHE_MODIFIER,
+    )
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    if USE_WARP_PIPELINE:
+        return pgm.warp_pipeline(K)
+    return pgm.pipeline(K)
+
+
+@gluon.jit
 def _pipelined_moe_tile_compute(
     # Tensors --------------------------------------------------------
     x_ptr,
@@ -2660,159 +3552,9 @@ def _pipelined_moe_tile_compute(
     LOAD_X_LAYOUT: gl.constexpr = _load_layout(
         BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS
     )
-    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
-        gl.static_assert(
-            BLOCK_K_W == 128
-            and (BLOCK_N == 128 or USE_SLICE_N)
-            and NUM_WARPS == 4
-            and not USE_SLICE_MN,
-            "preshuffled W layout bases assume BLOCK_K_W=128, "
-            "BLOCK_N=128 (or USE_SLICE_N=True for half-tile path), "
-            "NUM_WARPS=4, and USE_SLICE_MN=False. Re-derive bases for "
-            "other shapes.",
-        )
-        BLOCK_N_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
-        if cfg.SCALE_VIA_LDS:
-            # tpw=[2,2]
-            LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                reg_bases=[
-                    [0, 1],
-                    [0, 2],
-                    [0, 4],
-                    [0, 8],
-                    [0, 1024],
-                    [1, 0],
-                    [4, 0],
-                ],
-                lane_bases=[
-                    [0, 16],
-                    [0, 32],
-                    [0, 64],
-                    [0, 128],
-                    [0, 256],
-                    [0, 512],
-                ],
-                warp_bases=[
-                    [2, 0],
-                    [0, 0],
-                ],
-                block_bases=[],
-                shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
-            )
-            if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
-                # Use all four waves as unique async-copy producers.  The
-                # local LDS load still uses LOAD_W_LAYOUT above because it is
-                # matched to the W dot operand layout.
-                LOAD_W_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                    reg_bases=[
-                        [0, 1],
-                        [0, 2],
-                        [0, 4],
-                        [0, 8],
-                        [0, 1024],
-                        [1, 0],
-                    ],
-                    lane_bases=[
-                        [0, 16],
-                        [0, 32],
-                        [0, 64],
-                        [0, 128],
-                        [0, 256],
-                        [0, 512],
-                    ],
-                    warp_bases=[
-                        [2, 0],
-                        [4, 0],
-                    ],
-                    block_bases=[],
-                    shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
-                )
-            else:
-                LOAD_W_COPY_LAYOUT: gl.constexpr = LOAD_W_LAYOUT
-        else:
-            # tpw=[1,1]
-            LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                reg_bases=[
-                    [0, 1],
-                    [0, 2],
-                    [0, 4],
-                    [0, 8],
-                    [0, 1024],
-                    [2, 0],
-                    [4, 0],
-                ],
-                lane_bases=[
-                    [0, 16],
-                    [0, 32],
-                    [0, 64],
-                    [0, 128],
-                    [0, 256],
-                    [0, 512],
-                ],
-                warp_bases=[
-                    [1, 0],
-                    [0, 0],
-                ],
-                block_bases=[],
-                shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
-            )
-            if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
-                # See the SCALE_VIA_LDS branch: copy with unique producer
-                # waves, then read from LDS with the dot-compatible layout.
-                LOAD_W_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                    reg_bases=[
-                        [0, 1],
-                        [0, 2],
-                        [0, 4],
-                        [0, 8],
-                        [0, 1024],
-                        [2, 0],
-                    ],
-                    lane_bases=[
-                        [0, 16],
-                        [0, 32],
-                        [0, 64],
-                        [0, 128],
-                        [0, 256],
-                        [0, 512],
-                    ],
-                    warp_bases=[
-                        [1, 0],
-                        [4, 0],
-                    ],
-                    block_bases=[],
-                    shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
-                )
-            else:
-                LOAD_W_COPY_LAYOUT: gl.constexpr = LOAD_W_LAYOUT
-    elif W_TRANSPOSE:
-        # LDS path, K-contig: offsets shape (BLOCK_NONK, BLOCK_K).
-        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
-            BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
-        )
-    else:
-        # LDS path, N-contig: W is [K_packed, N]; vectorise contig axis.
-        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
-            BLOCK_N, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
-        )
 
     offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
-    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
-        # Virtual (n_block, k_flat); half-tile (BLOCK_N//2//16) under sliceN.
-        _BN_W_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
-        offs_wn = gl.arange(
-            0, _BN_W_LAYOUT // 16, layout=gl.SliceLayout(1, LOAD_W_COPY_LAYOUT)
-        )
-        offs_wk = gl.arange(
-            0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_COPY_LAYOUT)
-        )
-    elif W_TRANSPOSE:
-        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
-        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
-    else:
-        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
-        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
 
     rows_m = off_m + offs_xm
     if not cfg.W_VIA_VGPR and USE_SLICE_N and BLOCK_M == 128:
@@ -2850,101 +3592,10 @@ def _pipelined_moe_tile_compute(
         rows_m_x = gl.where(pre_gather_mask_x, rows_m_x, gl.zeros_like(rows_m_x))
         mask_m = pre_gather_mask
         mask_m_x = pre_gather_mask_x
-    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
-        # Preshuffled W skips the per-element n-mask; the launcher enforces
-        # 128-wide alignment and SliceN uses a scalar bottom-half predicate.
-        # Half-tile width under sliceN so the dummy mask matches the
-        # actual offs_wn extent.
-        _BN_MASK: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
-        mask_n = offs_wn < (_BN_MASK // 16)
-    else:
-        mask_n = (off_n + offs_wn) < N
 
     k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
-    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
-        if HAS_GATHER:
-            # Invalid expert-tail rows were already clamped to gather row 0.
-            # Keep the global token bound check, but avoid carrying the
-            # per-expert tail predicate through every X async-copy element.
-            x_mask_nonk = (rows_m_x < M_X)[:, None]
-        else:
-            x_mask_nonk = gl.to_tensor(True)
-    else:
-        x_mask_nonk = mask_m_x[:, None]
 
-    x_desc = AsyncCopyDescriptor.initialize(
-        cfg,
-        0,
-        BLOCK_K_X,
-        x_ptr,
-        rows_m_x,
-        offs_xk,
-        stride_xm,
-        stride_xk,
-        x_mask_nonk,
-        k_limit_x,
-    )
-    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
-        # Host-preshuffled W uses the dot-tile HBM order. The current
-        # implementation stages that flat tile through LDS unless
-        # W_VIA_VGPR is explicitly enabled.
-        TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
-        offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
-            BLOCK_K_W * 16
-        )
-        base_off_b_vgpr = w_base_offset + pid_n * TILE_BYTES
-        if cfg.W_VIA_VGPR:
-            w_desc = WVgprDescriptor(
-                cfg,
-                BLOCK_K_W,
-                w_ptr,
-                gl.to_tensor(N),  # K-iter advance step: idx * BK_W * N
-                offsets_b_vgpr + base_off_b_vgpr,
-                pred=gl.to_tensor(True),  # full-tile path: always in-bounds
-            )
-        else:
-            w_desc = WPreshuffledLdsDescriptor(
-                cfg,
-                BLOCK_K_W,
-                w_ptr,
-                w_ptr.dtype.element_ty,
-                gl.to_tensor(N),
-                offsets_b_vgpr + base_off_b_vgpr,
-                pred=gl.to_tensor(True),
-                load_layout=LOAD_W_LAYOUT,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-    elif W_TRANSPOSE:
-        w_desc = AsyncCopyDescriptor.initialize(
-            cfg,
-            0,
-            BLOCK_K_W,
-            w_ptr,
-            off_n + offs_wn,
-            offs_wk,
-            stride_wn,
-            stride_wk,
-            mask_n[:, None],
-            k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
-        )
-    else:
-        w_desc = AsyncCopyDescriptor.initialize(
-            cfg,
-            1,
-            BLOCK_K_W,
-            w_ptr,
-            off_n + offs_wn,
-            offs_wk,
-            stride_wn,
-            stride_wk,
-            mask_n[None, :],
-            k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
-        )
     # SCALE_VIA_LDS uses post-swizzle HBM shape via buffer_load_to_shared;
     # other modes load scales G->VGPR via gl.load.
     if HAS_X_BLOCK_SCALE:
@@ -3056,433 +3707,113 @@ def _pipelined_moe_tile_compute(
     else:
         w_scale_desc: gl.constexpr = 0
 
-    if USE_SLICE_MN:
-        SUB_BM_MN: gl.constexpr = BLOCK_M // 2
-        SUB_BN_MN: gl.constexpr = BLOCK_N // 2
-
-        LOAD_X_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
-            BLOCK_K_X, SUB_BM_MN, NUM_WARPS, [1, 0], X_ELEM_BITS
-        )
-        offs_xm_sub_mn = gl.arange(
-            0, SUB_BM_MN, layout=gl.SliceLayout(1, LOAD_X_SUB_LAYOUT_MN)
-        )
-        offs_xk_sub_mn = gl.arange(
-            0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_SUB_LAYOUT_MN)
-        )
-        rows_m_top = off_m + offs_xm_sub_mn
-        rows_m_bot = off_m + SUB_BM_MN + offs_xm_sub_mn
-        pre_gather_mask_top = rows_m_top < m_limit
-        pre_gather_mask_bot = rows_m_bot < m_limit
-        if HAS_GATHER:
-            rows_m_top_safe = gl.where(
-                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
-            )
-            rows_m_bot_safe = gl.where(
-                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
-            )
-            rows_m_top = gl.load(
-                gather_idx_ptr + rows_m_top_safe,
-                mask=pre_gather_mask_top,
-                other=0,
-            ).to(gl.int32)
-            rows_m_bot = gl.load(
-                gather_idx_ptr + rows_m_bot_safe,
-                mask=pre_gather_mask_bot,
-                other=0,
-            ).to(gl.int32)
-            mask_m_top = pre_gather_mask_top & (rows_m_top < M_X)
-            mask_m_bot = pre_gather_mask_bot & (rows_m_bot < M_X)
-        else:
-            rows_m_top = gl.where(
-                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
-            )
-            rows_m_bot = gl.where(
-                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
-            )
-            mask_m_top = pre_gather_mask_top
-            mask_m_bot = pre_gather_mask_bot
-        x_desc_top_mn = AsyncCopyDescriptor.initialize(
+    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
+        acc = _run_moe_tile_preshuffled_w(
             cfg,
-            0,
-            BLOCK_K_X,
             x_ptr,
-            rows_m_top,
-            offs_xk_sub_mn,
-            stride_xm,
-            stride_xk,
-            mask_m_top[:, None],
-            k_limit_x,
-        )
-        x_desc_bot_mn = AsyncCopyDescriptor.initialize(
-            cfg,
-            0,
-            BLOCK_K_X,
-            x_ptr,
-            rows_m_bot,
-            offs_xk_sub_mn,
-            stride_xm,
-            stride_xk,
-            mask_m_bot[:, None],
-            k_limit_x,
-        )
-
-        if W_TRANSPOSE:
-            LOAD_W_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
-                BLOCK_K_W, SUB_BN_MN, NUM_WARPS, [1, 0], W_ELEM_BITS
-            )
-            offs_wn_sub_mn = gl.arange(
-                0, SUB_BN_MN, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT_MN)
-            )
-            offs_wk_sub_mn = gl.arange(
-                0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT_MN)
-            )
-            mask_n_left_mn = (off_n + offs_wn_sub_mn) < N
-            mask_n_right_mn = (off_n + SUB_BN_MN + offs_wn_sub_mn) < N
-            w_desc_left_mn = AsyncCopyDescriptor.initialize(
-                cfg,
-                0,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + offs_wn_sub_mn,
-                offs_wk_sub_mn,
-                stride_wn,
-                stride_wk,
-                mask_n_left_mn[:, None],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-            w_desc_right_mn = AsyncCopyDescriptor.initialize(
-                cfg,
-                0,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + SUB_BN_MN + offs_wn_sub_mn,
-                offs_wk_sub_mn,
-                stride_wn,
-                stride_wk,
-                mask_n_right_mn[:, None],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-        else:
-            LOAD_W_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
-                SUB_BN_MN, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
-            )
-            offs_wn_sub_mn = gl.arange(
-                0, SUB_BN_MN, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT_MN)
-            )
-            offs_wk_sub_mn = gl.arange(
-                0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT_MN)
-            )
-            mask_n_left_mn = (off_n + offs_wn_sub_mn) < N
-            mask_n_right_mn = (off_n + SUB_BN_MN + offs_wn_sub_mn) < N
-            w_desc_left_mn = AsyncCopyDescriptor.initialize(
-                cfg,
-                1,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + offs_wn_sub_mn,
-                offs_wk_sub_mn,
-                stride_wn,
-                stride_wk,
-                mask_n_left_mn[None, :],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-            w_desc_right_mn = AsyncCopyDescriptor.initialize(
-                cfg,
-                1,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + SUB_BN_MN + offs_wn_sub_mn,
-                offs_wk_sub_mn,
-                stride_wn,
-                stride_wk,
-                mask_n_right_mn[None, :],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-        slice_mn_pgm = MoESliceMNProgram.initialize(
-            cfg,
-            x_desc_top_mn,
-            x_desc_bot_mn,
-            w_desc_left_mn,
-            w_desc_right_mn,
+            w_ptr,
             x_scale_desc,
             w_scale_desc,
+            gather_idx_ptr,
+            stride_xm,
+            stride_xk,
+            M_X,
+            N,
+            K,
+            off_m,
+            m_limit,
+            rows_m_x,
+            offs_xk,
+            k_limit_x,
+            k_limit_w,
+            w_base_offset,
+            pid_n,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K_X,
+            BLOCK_K_W,
+            NUM_WARPS,
+            HAS_GATHER,
+            USE_SLICE_MN,
+            USE_SLICE_N,
+            USE_WARP_PIPELINE,
+            N_LIMIT,
+            W_CACHE_MODIFIER,
         )
-        acc = slice_mn_pgm.pipeline(K)
-    elif USE_SLICE_N:
-        SUB_BN: gl.constexpr = BLOCK_N // 2
-        bottom_valid = gl.to_tensor(True)
-        if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
-            gl.static_assert(
-                SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
-                "USE_SLICE_N + preshuffled W requires SUB_BN=BLOCK_K_W=128 "
-                "and NUM_WARPS=4; the half-tile LOAD_W_LAYOUT bases assume "
-                "this shape (re-derive otherwise).",
-            )
-            if cfg.SCALE_VIA_LDS:
-                LOAD_W_HALF_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                    reg_bases=[
-                        [0, 1],
-                        [0, 2],
-                        [0, 4],
-                        [0, 8],
-                        [0, 1024],
-                        [1, 0],
-                        [4, 0],
-                    ],
-                    lane_bases=[
-                        [0, 16],
-                        [0, 32],
-                        [0, 64],
-                        [0, 128],
-                        [0, 256],
-                        [0, 512],
-                    ],
-                    warp_bases=[[2, 0], [0, 0]],
-                    block_bases=[],
-                    shape=[SUB_BN // 16, BLOCK_K_W * 16],
-                )
-                if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
-                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                        reg_bases=[
-                            [0, 1],
-                            [0, 2],
-                            [0, 4],
-                            [0, 8],
-                            [0, 1024],
-                            [1, 0],
-                        ],
-                        lane_bases=[
-                            [0, 16],
-                            [0, 32],
-                            [0, 64],
-                            [0, 128],
-                            [0, 256],
-                            [0, 512],
-                        ],
-                        warp_bases=[[2, 0], [4, 0]],
-                        block_bases=[],
-                        shape=[SUB_BN // 16, BLOCK_K_W * 16],
-                    )
-                else:
-                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = LOAD_W_HALF_LAYOUT
-            else:
-                LOAD_W_HALF_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                    reg_bases=[
-                        [0, 1],
-                        [0, 2],
-                        [0, 4],
-                        [0, 8],
-                        [0, 1024],
-                        [2, 0],
-                        [4, 0],
-                    ],
-                    lane_bases=[
-                        [0, 16],
-                        [0, 32],
-                        [0, 64],
-                        [0, 128],
-                        [0, 256],
-                        [0, 512],
-                    ],
-                    warp_bases=[[1, 0], [0, 0]],
-                    block_bases=[],
-                    shape=[SUB_BN // 16, BLOCK_K_W * 16],
-                )
-                if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
-                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-                        reg_bases=[
-                            [0, 1],
-                            [0, 2],
-                            [0, 4],
-                            [0, 8],
-                            [0, 1024],
-                            [2, 0],
-                        ],
-                        lane_bases=[
-                            [0, 16],
-                            [0, 32],
-                            [0, 64],
-                            [0, 128],
-                            [0, 256],
-                            [0, 512],
-                        ],
-                        warp_bases=[[1, 0], [4, 0]],
-                        block_bases=[],
-                        shape=[SUB_BN // 16, BLOCK_K_W * 16],
-                    )
-                else:
-                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = LOAD_W_HALF_LAYOUT
-            offs_wn_h = gl.arange(
-                0, SUB_BN // 16, layout=gl.SliceLayout(1, LOAD_W_HALF_COPY_LAYOUT)
-            )
-            offs_wk_h = gl.arange(
-                0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_HALF_COPY_LAYOUT)
-            )
-            offsets_h = gl.expand_dims(offs_wk_h, 0) + gl.expand_dims(offs_wn_h, 1) * (
-                BLOCK_K_W * 16
-            )
-            TILE_BYTES_HALF: gl.constexpr = 128 * 128
-            if N_LIMIT:
-                n_block_count: gl.constexpr = (N_LIMIT + 127) // 128
-                w_k_stride = gl.to_tensor(N_LIMIT)
-            else:
-                n_block_count = (N + 127) // 128
-                w_k_stride = gl.to_tensor(N)
-            bottom_valid = (2 * pid_n + 1) < n_block_count
-            base_off_top = w_base_offset + 2 * pid_n * TILE_BYTES_HALF
-            base_off_bot = base_off_top + TILE_BYTES_HALF
-            if cfg.W_VIA_VGPR:
-                w_desc_top = WVgprDescriptor(
-                    cfg,
-                    BLOCK_K_W,
-                    w_ptr,
-                    w_k_stride,
-                    offsets_h + base_off_top,
-                    pred=gl.to_tensor(True),
-                    LOAD_BN=SUB_BN,
-                )
-                w_desc_bot = WVgprDescriptor(
-                    cfg,
-                    BLOCK_K_W,
-                    w_ptr,
-                    w_k_stride,
-                    offsets_h + base_off_bot,
-                    pred=bottom_valid,
-                    LOAD_BN=SUB_BN,
-                )
-            else:
-                w_desc_top = WPreshuffledLdsDescriptor(
-                    cfg,
-                    BLOCK_K_W,
-                    w_ptr,
-                    w_ptr.dtype.element_ty,
-                    w_k_stride,
-                    offsets_h + base_off_top,
-                    pred=gl.to_tensor(True),
-                    load_layout=LOAD_W_HALF_LAYOUT,
-                    LOAD_BN=SUB_BN,
-                    cache_modifier=W_CACHE_MODIFIER,
-                )
-                w_desc_bot = WPreshuffledLdsDescriptor(
-                    cfg,
-                    BLOCK_K_W,
-                    w_ptr,
-                    w_ptr.dtype.element_ty,
-                    w_k_stride,
-                    offsets_h + base_off_bot,
-                    pred=bottom_valid,
-                    load_layout=LOAD_W_HALF_LAYOUT,
-                    LOAD_BN=SUB_BN,
-                    cache_modifier=W_CACHE_MODIFIER,
-                )
-        elif W_TRANSPOSE:
-            # LDS path, K-contig W tiles.
-            LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
-                BLOCK_K_W, SUB_BN, NUM_WARPS, [1, 0], W_ELEM_BITS
-            )
-            offs_wn_sub = gl.arange(
-                0, SUB_BN, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT)
-            )
-            offs_wk_sub = gl.arange(
-                0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT)
-            )
-            mask_n_top = (off_n + offs_wn_sub) < N
-            mask_n_bot = (off_n + SUB_BN + offs_wn_sub) < N
-            w_desc_top = AsyncCopyDescriptor.initialize(
-                cfg,
-                0,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + offs_wn_sub,
-                offs_wk_sub,
-                stride_wn,
-                stride_wk,
-                mask_n_top[:, None],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-            w_desc_bot = AsyncCopyDescriptor.initialize(
-                cfg,
-                0,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + SUB_BN + offs_wn_sub,
-                offs_wk_sub,
-                stride_wn,
-                stride_wk,
-                mask_n_bot[:, None],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-        else:
-            # LDS path, N-contig W tiles.
-            LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
-                SUB_BN, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
-            )
-            offs_wn_sub = gl.arange(
-                0, SUB_BN, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT)
-            )
-            offs_wk_sub = gl.arange(
-                0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT)
-            )
-            mask_n_top = (off_n + offs_wn_sub) < N
-            mask_n_bot = (off_n + SUB_BN + offs_wn_sub) < N
-            w_desc_top = AsyncCopyDescriptor.initialize(
-                cfg,
-                1,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + offs_wn_sub,
-                offs_wk_sub,
-                stride_wn,
-                stride_wk,
-                mask_n_top[None, :],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-            w_desc_bot = AsyncCopyDescriptor.initialize(
-                cfg,
-                1,
-                BLOCK_K_W,
-                w_ptr,
-                off_n + SUB_BN + offs_wn_sub,
-                offs_wk_sub,
-                stride_wn,
-                stride_wk,
-                mask_n_bot[None, :],
-                k_limit_w,
-                base_offset=w_base_offset,
-                cache_modifier=W_CACHE_MODIFIER,
-            )
-        pgm = MoESliceNProgram.initialize(
+    elif W_TRANSPOSE:
+        acc = _run_moe_tile_transposed_w(
             cfg,
-            x_desc,
-            w_desc_top,
-            w_desc_bot,
+            x_ptr,
+            w_ptr,
             x_scale_desc,
             w_scale_desc,
-            bottom_valid,
+            gather_idx_ptr,
+            stride_xm,
+            stride_xk,
+            stride_wn,
+            stride_wk,
+            M_X,
+            N,
+            K,
+            off_m,
+            off_n,
+            m_limit,
+            rows_m_x,
+            mask_m_x,
+            offs_xk,
+            k_limit_x,
+            k_limit_w,
+            w_base_offset,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K_X,
+            BLOCK_K_W,
+            NUM_WARPS,
+            HAS_GATHER,
+            USE_SLICE_MN,
+            USE_SLICE_N,
+            USE_WARP_PIPELINE,
+            X_ELEM_BITS,
+            W_ELEM_BITS,
+            W_CACHE_MODIFIER,
         )
-        acc = pgm.pipeline(K)
     else:
-        pgm = MoEPipelinedProgram.initialize(
-            cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
+        acc = _run_moe_tile_ncontig_w(
+            cfg,
+            x_ptr,
+            w_ptr,
+            x_scale_desc,
+            w_scale_desc,
+            gather_idx_ptr,
+            stride_xm,
+            stride_xk,
+            stride_wn,
+            stride_wk,
+            M_X,
+            N,
+            K,
+            off_m,
+            off_n,
+            m_limit,
+            rows_m_x,
+            mask_m_x,
+            offs_xk,
+            k_limit_x,
+            k_limit_w,
+            w_base_offset,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K_X,
+            BLOCK_K_W,
+            NUM_WARPS,
+            HAS_GATHER,
+            USE_SLICE_MN,
+            USE_SLICE_N,
+            USE_WARP_PIPELINE,
+            X_ELEM_BITS,
+            W_ELEM_BITS,
+            W_CACHE_MODIFIER,
         )
-        if USE_WARP_PIPELINE:
-            acc = pgm.warp_pipeline(K)
-        else:
-            acc = pgm.pipeline(K)
 
     FUSE_X_GLOBAL_WITH_GATE: gl.constexpr = (
         APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE and APPLY_GATE_SCAL and not DO_SWIGLU
