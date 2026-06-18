@@ -2524,6 +2524,366 @@ class MoESliceNProgram:
 
 
 @gluon.jit
+def _make_moe_x_desc(
+    cfg,
+    x_ptr,
+    rows_m_x,
+    offs_xk,
+    stride_xm,
+    stride_xk,
+    x_mask_nonk,
+    k_limit_x,
+    BLOCK_K_X: gl.constexpr,
+):
+    return AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_X,
+        x_ptr,
+        rows_m_x,
+        offs_xk,
+        stride_xm,
+        stride_xk,
+        x_mask_nonk,
+        k_limit_x,
+    )
+
+
+@gluon.jit
+def _make_slice_mn_x_descs(
+    cfg,
+    x_ptr,
+    gather_idx_ptr,
+    stride_xm,
+    stride_xk,
+    M_X,
+    off_m,
+    m_limit,
+    k_limit_x,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K_X: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    HAS_GATHER: gl.constexpr,
+    X_ELEM_BITS: gl.constexpr,
+):
+    SUB_BM_MN: gl.constexpr = BLOCK_M // 2
+
+    LOAD_X_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
+        BLOCK_K_X, SUB_BM_MN, NUM_WARPS, [1, 0], X_ELEM_BITS
+    )
+    offs_xm_sub_mn = gl.arange(
+        0, SUB_BM_MN, layout=gl.SliceLayout(1, LOAD_X_SUB_LAYOUT_MN)
+    )
+    offs_xk_sub_mn = gl.arange(
+        0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_SUB_LAYOUT_MN)
+    )
+    rows_m_top = off_m + offs_xm_sub_mn
+    rows_m_bot = off_m + SUB_BM_MN + offs_xm_sub_mn
+    pre_gather_mask_top = rows_m_top < m_limit
+    pre_gather_mask_bot = rows_m_bot < m_limit
+    if HAS_GATHER:
+        rows_m_top_safe = gl.where(
+            pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
+        )
+        rows_m_bot_safe = gl.where(
+            pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
+        )
+        rows_m_top = gl.load(
+            gather_idx_ptr + rows_m_top_safe,
+            mask=pre_gather_mask_top,
+            other=0,
+        ).to(gl.int32)
+        rows_m_bot = gl.load(
+            gather_idx_ptr + rows_m_bot_safe,
+            mask=pre_gather_mask_bot,
+            other=0,
+        ).to(gl.int32)
+        mask_m_top = pre_gather_mask_top & (rows_m_top < M_X)
+        mask_m_bot = pre_gather_mask_bot & (rows_m_bot < M_X)
+    else:
+        rows_m_top = gl.where(
+            pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
+        )
+        rows_m_bot = gl.where(
+            pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
+        )
+        mask_m_top = pre_gather_mask_top
+        mask_m_bot = pre_gather_mask_bot
+    x_desc_top_mn = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_X,
+        x_ptr,
+        rows_m_top,
+        offs_xk_sub_mn,
+        stride_xm,
+        stride_xk,
+        mask_m_top[:, None],
+        k_limit_x,
+    )
+    x_desc_bot_mn = AsyncCopyDescriptor.initialize(
+        cfg,
+        0,
+        BLOCK_K_X,
+        x_ptr,
+        rows_m_bot,
+        offs_xk_sub_mn,
+        stride_xm,
+        stride_xk,
+        mask_m_bot[:, None],
+        k_limit_x,
+    )
+    return x_desc_top_mn, x_desc_bot_mn
+
+
+@gluon.jit
+def _make_nonpreshuffled_w_desc(
+    cfg,
+    w_ptr,
+    rows_n,
+    offs_wk,
+    stride_wn,
+    stride_wk,
+    mask_n,
+    k_limit_w,
+    w_base_offset,
+    OP_IDX: gl.constexpr,
+    BLOCK_K_W: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+):
+    return AsyncCopyDescriptor.initialize(
+        cfg,
+        OP_IDX,
+        BLOCK_K_W,
+        w_ptr,
+        rows_n,
+        offs_wk,
+        stride_wn,
+        stride_wk,
+        mask_n,
+        k_limit_w,
+        base_offset=w_base_offset,
+        cache_modifier=W_CACHE_MODIFIER,
+    )
+
+
+@gluon.jit
+def _make_nonpreshuffled_w_half_descs(
+    cfg,
+    w_ptr,
+    stride_wn,
+    stride_wk,
+    N,
+    off_n,
+    k_limit_w,
+    w_base_offset,
+    SUB_BN: gl.constexpr,
+    BLOCK_K_W: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_TRANSPOSE: gl.constexpr,
+    W_ELEM_BITS: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+):
+    if W_TRANSPOSE:
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_K_W, SUB_BN, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn = gl.arange(0, SUB_BN, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+        mask_n_first = (off_n + offs_wn) < N
+        mask_n_second = (off_n + SUB_BN + offs_wn) < N
+        w_desc_first = _make_nonpreshuffled_w_desc(
+            cfg,
+            w_ptr,
+            off_n + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n_first[:, None],
+            k_limit_w,
+            w_base_offset,
+            0,
+            BLOCK_K_W,
+            W_CACHE_MODIFIER,
+        )
+        w_desc_second = _make_nonpreshuffled_w_desc(
+            cfg,
+            w_ptr,
+            off_n + SUB_BN + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n_second[:, None],
+            k_limit_w,
+            w_base_offset,
+            0,
+            BLOCK_K_W,
+            W_CACHE_MODIFIER,
+        )
+    else:
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            SUB_BN, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn = gl.arange(0, SUB_BN, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        mask_n_first = (off_n + offs_wn) < N
+        mask_n_second = (off_n + SUB_BN + offs_wn) < N
+        w_desc_first = _make_nonpreshuffled_w_desc(
+            cfg,
+            w_ptr,
+            off_n + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n_first[None, :],
+            k_limit_w,
+            w_base_offset,
+            1,
+            BLOCK_K_W,
+            W_CACHE_MODIFIER,
+        )
+        w_desc_second = _make_nonpreshuffled_w_desc(
+            cfg,
+            w_ptr,
+            off_n + SUB_BN + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n_second[None, :],
+            k_limit_w,
+            w_base_offset,
+            1,
+            BLOCK_K_W,
+            W_CACHE_MODIFIER,
+        )
+    return w_desc_first, w_desc_second
+
+
+@gluon.jit
+def _make_nonpreshuffled_w_full_desc(
+    cfg,
+    w_ptr,
+    stride_wn,
+    stride_wk,
+    N,
+    off_n,
+    k_limit_w,
+    w_base_offset,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K_W: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_TRANSPOSE: gl.constexpr,
+    W_ELEM_BITS: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+):
+    if W_TRANSPOSE:
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+        mask_n = (off_n + offs_wn) < N
+        w_desc = _make_nonpreshuffled_w_desc(
+            cfg,
+            w_ptr,
+            off_n + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n[:, None],
+            k_limit_w,
+            w_base_offset,
+            0,
+            BLOCK_K_W,
+            W_CACHE_MODIFIER,
+        )
+    else:
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_N, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        mask_n = (off_n + offs_wn) < N
+        w_desc = _make_nonpreshuffled_w_desc(
+            cfg,
+            w_ptr,
+            off_n + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n[None, :],
+            k_limit_w,
+            w_base_offset,
+            1,
+            BLOCK_K_W,
+            W_CACHE_MODIFIER,
+        )
+    return w_desc
+
+
+@gluon.jit
+def _run_moe_slice_mn_pipeline(
+    cfg,
+    x_desc_top_mn,
+    x_desc_bot_mn,
+    w_desc_left_mn,
+    w_desc_right_mn,
+    x_scale_desc,
+    w_scale_desc,
+    K,
+):
+    slice_mn_pgm = MoESliceMNProgram.initialize(
+        cfg,
+        x_desc_top_mn,
+        x_desc_bot_mn,
+        w_desc_left_mn,
+        w_desc_right_mn,
+        x_scale_desc,
+        w_scale_desc,
+    )
+    return slice_mn_pgm.pipeline(K)
+
+
+@gluon.jit
+def _run_moe_slice_n_pipeline(
+    cfg,
+    x_desc,
+    w_desc_top,
+    w_desc_bot,
+    x_scale_desc,
+    w_scale_desc,
+    bottom_valid,
+    K,
+):
+    pgm = MoESliceNProgram.initialize(
+        cfg,
+        x_desc,
+        w_desc_top,
+        w_desc_bot,
+        x_scale_desc,
+        w_scale_desc,
+        bottom_valid,
+    )
+    return pgm.pipeline(K)
+
+
+@gluon.jit
+def _run_moe_full_tile_pipeline(
+    cfg,
+    x_desc,
+    w_desc,
+    x_scale_desc,
+    w_scale_desc,
+    K,
+    USE_WARP_PIPELINE: gl.constexpr,
+):
+    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
+    if USE_WARP_PIPELINE:
+        return pgm.warp_pipeline(K)
+    return pgm.pipeline(K)
+
+
+@gluon.jit
 def _run_moe_tile_preshuffled_w(
     cfg,
     x_ptr,
@@ -2574,10 +2934,8 @@ def _run_moe_tile_preshuffled_w(
         x_mask_nonk = (rows_m_x < M_X)[:, None]
     else:
         x_mask_nonk = gl.to_tensor(True)
-    x_desc = AsyncCopyDescriptor.initialize(
+    x_desc = _make_moe_x_desc(
         cfg,
-        0,
-        BLOCK_K_X,
         x_ptr,
         rows_m_x,
         offs_xk,
@@ -2585,6 +2943,7 @@ def _run_moe_tile_preshuffled_w(
         stride_xk,
         x_mask_nonk,
         k_limit_x,
+        BLOCK_K_X,
     )
 
     if USE_SLICE_N:
@@ -2753,7 +3112,7 @@ def _run_moe_tile_preshuffled_w(
                 LOAD_BN=SUB_BN,
                 cache_modifier=W_CACHE_MODIFIER,
             )
-        pgm = MoESliceNProgram.initialize(
+        return _run_moe_slice_n_pipeline(
             cfg,
             x_desc,
             w_desc_top,
@@ -2761,8 +3120,8 @@ def _run_moe_tile_preshuffled_w(
             x_scale_desc,
             w_scale_desc,
             bottom_valid,
+            K,
         )
-        return pgm.pipeline(K)
 
     # Gluon still type-checks the code below when USE_SLICE_N returns above.
     # Keep the original half-tile layout in that specialization so the
@@ -2914,10 +3273,15 @@ def _run_moe_tile_preshuffled_w(
             load_layout=LOAD_W_LAYOUT,
             cache_modifier=W_CACHE_MODIFIER,
         )
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
+    return _run_moe_full_tile_pipeline(
+        cfg,
+        x_desc,
+        w_desc,
+        x_scale_desc,
+        w_scale_desc,
+        K,
+        USE_WARP_PIPELINE,
+    )
 
 
 @gluon.jit
@@ -2957,10 +3321,8 @@ def _run_moe_tile_transposed_w(
     W_ELEM_BITS: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
 ):
-    x_desc = AsyncCopyDescriptor.initialize(
+    x_desc = _make_moe_x_desc(
         cfg,
-        0,
-        BLOCK_K_X,
         x_ptr,
         rows_m_x,
         offs_xk,
@@ -2968,118 +3330,45 @@ def _run_moe_tile_transposed_w(
         stride_xk,
         mask_m_x[:, None],
         k_limit_x,
+        BLOCK_K_X,
     )
 
     if USE_SLICE_MN:
-        SUB_BM_MN: gl.constexpr = BLOCK_M // 2
         SUB_BN_MN: gl.constexpr = BLOCK_N // 2
-
-        LOAD_X_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
-            BLOCK_K_X, SUB_BM_MN, NUM_WARPS, [1, 0], X_ELEM_BITS
-        )
-        offs_xm_sub_mn = gl.arange(
-            0, SUB_BM_MN, layout=gl.SliceLayout(1, LOAD_X_SUB_LAYOUT_MN)
-        )
-        offs_xk_sub_mn = gl.arange(
-            0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_SUB_LAYOUT_MN)
-        )
-        rows_m_top = off_m + offs_xm_sub_mn
-        rows_m_bot = off_m + SUB_BM_MN + offs_xm_sub_mn
-        pre_gather_mask_top = rows_m_top < m_limit
-        pre_gather_mask_bot = rows_m_bot < m_limit
-        if HAS_GATHER:
-            rows_m_top_safe = gl.where(
-                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
-            )
-            rows_m_bot_safe = gl.where(
-                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
-            )
-            rows_m_top = gl.load(
-                gather_idx_ptr + rows_m_top_safe,
-                mask=pre_gather_mask_top,
-                other=0,
-            ).to(gl.int32)
-            rows_m_bot = gl.load(
-                gather_idx_ptr + rows_m_bot_safe,
-                mask=pre_gather_mask_bot,
-                other=0,
-            ).to(gl.int32)
-            mask_m_top = pre_gather_mask_top & (rows_m_top < M_X)
-            mask_m_bot = pre_gather_mask_bot & (rows_m_bot < M_X)
-        else:
-            rows_m_top = gl.where(
-                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
-            )
-            rows_m_bot = gl.where(
-                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
-            )
-            mask_m_top = pre_gather_mask_top
-            mask_m_bot = pre_gather_mask_bot
-        x_desc_top_mn = AsyncCopyDescriptor.initialize(
+        x_desc_top_mn, x_desc_bot_mn = _make_slice_mn_x_descs(
             cfg,
-            0,
-            BLOCK_K_X,
             x_ptr,
-            rows_m_top,
-            offs_xk_sub_mn,
+            gather_idx_ptr,
             stride_xm,
             stride_xk,
-            mask_m_top[:, None],
+            M_X,
+            off_m,
+            m_limit,
             k_limit_x,
-        )
-        x_desc_bot_mn = AsyncCopyDescriptor.initialize(
-            cfg,
-            0,
+            BLOCK_M,
             BLOCK_K_X,
-            x_ptr,
-            rows_m_bot,
-            offs_xk_sub_mn,
-            stride_xm,
-            stride_xk,
-            mask_m_bot[:, None],
-            k_limit_x,
+            NUM_WARPS,
+            HAS_GATHER,
+            X_ELEM_BITS,
         )
 
-        LOAD_W_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
-            BLOCK_K_W, SUB_BN_MN, NUM_WARPS, [1, 0], W_ELEM_BITS
-        )
-        offs_wn_sub_mn = gl.arange(
-            0, SUB_BN_MN, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT_MN)
-        )
-        offs_wk_sub_mn = gl.arange(
-            0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT_MN)
-        )
-        mask_n_left_mn = (off_n + offs_wn_sub_mn) < N
-        mask_n_right_mn = (off_n + SUB_BN_MN + offs_wn_sub_mn) < N
-        w_desc_left_mn = AsyncCopyDescriptor.initialize(
+        w_desc_left_mn, w_desc_right_mn = _make_nonpreshuffled_w_half_descs(
             cfg,
-            0,
-            BLOCK_K_W,
             w_ptr,
-            off_n + offs_wn_sub_mn,
-            offs_wk_sub_mn,
             stride_wn,
             stride_wk,
-            mask_n_left_mn[:, None],
+            N,
+            off_n,
             k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
-        )
-        w_desc_right_mn = AsyncCopyDescriptor.initialize(
-            cfg,
-            0,
+            w_base_offset,
+            SUB_BN_MN,
             BLOCK_K_W,
-            w_ptr,
-            off_n + SUB_BN_MN + offs_wn_sub_mn,
-            offs_wk_sub_mn,
-            stride_wn,
-            stride_wk,
-            mask_n_right_mn[:, None],
-            k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
+            NUM_WARPS,
+            True,
+            W_ELEM_BITS,
+            W_CACHE_MODIFIER,
         )
-        slice_mn_pgm = MoESliceMNProgram.initialize(
+        return _run_moe_slice_mn_pipeline(
             cfg,
             x_desc_top_mn,
             x_desc_bot_mn,
@@ -3087,52 +3376,29 @@ def _run_moe_tile_transposed_w(
             w_desc_right_mn,
             x_scale_desc,
             w_scale_desc,
+            K,
         )
-        return slice_mn_pgm.pipeline(K)
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
         bottom_valid = gl.to_tensor(True)
-        LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
-            BLOCK_K_W, SUB_BN, NUM_WARPS, [1, 0], W_ELEM_BITS
-        )
-        offs_wn_sub = gl.arange(
-            0, SUB_BN, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT)
-        )
-        offs_wk_sub = gl.arange(
-            0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT)
-        )
-        mask_n_top = (off_n + offs_wn_sub) < N
-        mask_n_bot = (off_n + SUB_BN + offs_wn_sub) < N
-        w_desc_top = AsyncCopyDescriptor.initialize(
+        w_desc_top, w_desc_bot = _make_nonpreshuffled_w_half_descs(
             cfg,
-            0,
-            BLOCK_K_W,
             w_ptr,
-            off_n + offs_wn_sub,
-            offs_wk_sub,
             stride_wn,
             stride_wk,
-            mask_n_top[:, None],
+            N,
+            off_n,
             k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
-        )
-        w_desc_bot = AsyncCopyDescriptor.initialize(
-            cfg,
-            0,
+            w_base_offset,
+            SUB_BN,
             BLOCK_K_W,
-            w_ptr,
-            off_n + SUB_BN + offs_wn_sub,
-            offs_wk_sub,
-            stride_wn,
-            stride_wk,
-            mask_n_bot[:, None],
-            k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
+            NUM_WARPS,
+            True,
+            W_ELEM_BITS,
+            W_CACHE_MODIFIER,
         )
-        pgm = MoESliceNProgram.initialize(
+        return _run_moe_slice_n_pipeline(
             cfg,
             x_desc,
             w_desc_top,
@@ -3140,33 +3406,34 @@ def _run_moe_tile_transposed_w(
             x_scale_desc,
             w_scale_desc,
             bottom_valid,
+            K,
         )
-        return pgm.pipeline(K)
 
-    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
-        BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
-    )
-    offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
-    offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
-    mask_n = (off_n + offs_wn) < N
-    w_desc = AsyncCopyDescriptor.initialize(
+    w_desc = _make_nonpreshuffled_w_full_desc(
         cfg,
-        0,
-        BLOCK_K_W,
         w_ptr,
-        off_n + offs_wn,
-        offs_wk,
         stride_wn,
         stride_wk,
-        mask_n[:, None],
+        N,
+        off_n,
         k_limit_w,
-        base_offset=w_base_offset,
-        cache_modifier=W_CACHE_MODIFIER,
+        w_base_offset,
+        BLOCK_N,
+        BLOCK_K_W,
+        NUM_WARPS,
+        True,
+        W_ELEM_BITS,
+        W_CACHE_MODIFIER,
     )
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
+    return _run_moe_full_tile_pipeline(
+        cfg,
+        x_desc,
+        w_desc,
+        x_scale_desc,
+        w_scale_desc,
+        K,
+        USE_WARP_PIPELINE,
+    )
 
 
 @gluon.jit
@@ -3206,10 +3473,8 @@ def _run_moe_tile_ncontig_w(
     W_ELEM_BITS: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
 ):
-    x_desc = AsyncCopyDescriptor.initialize(
+    x_desc = _make_moe_x_desc(
         cfg,
-        0,
-        BLOCK_K_X,
         x_ptr,
         rows_m_x,
         offs_xk,
@@ -3217,118 +3482,45 @@ def _run_moe_tile_ncontig_w(
         stride_xk,
         mask_m_x[:, None],
         k_limit_x,
+        BLOCK_K_X,
     )
 
     if USE_SLICE_MN:
-        SUB_BM_MN: gl.constexpr = BLOCK_M // 2
         SUB_BN_MN: gl.constexpr = BLOCK_N // 2
-
-        LOAD_X_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
-            BLOCK_K_X, SUB_BM_MN, NUM_WARPS, [1, 0], X_ELEM_BITS
-        )
-        offs_xm_sub_mn = gl.arange(
-            0, SUB_BM_MN, layout=gl.SliceLayout(1, LOAD_X_SUB_LAYOUT_MN)
-        )
-        offs_xk_sub_mn = gl.arange(
-            0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_SUB_LAYOUT_MN)
-        )
-        rows_m_top = off_m + offs_xm_sub_mn
-        rows_m_bot = off_m + SUB_BM_MN + offs_xm_sub_mn
-        pre_gather_mask_top = rows_m_top < m_limit
-        pre_gather_mask_bot = rows_m_bot < m_limit
-        if HAS_GATHER:
-            rows_m_top_safe = gl.where(
-                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
-            )
-            rows_m_bot_safe = gl.where(
-                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
-            )
-            rows_m_top = gl.load(
-                gather_idx_ptr + rows_m_top_safe,
-                mask=pre_gather_mask_top,
-                other=0,
-            ).to(gl.int32)
-            rows_m_bot = gl.load(
-                gather_idx_ptr + rows_m_bot_safe,
-                mask=pre_gather_mask_bot,
-                other=0,
-            ).to(gl.int32)
-            mask_m_top = pre_gather_mask_top & (rows_m_top < M_X)
-            mask_m_bot = pre_gather_mask_bot & (rows_m_bot < M_X)
-        else:
-            rows_m_top = gl.where(
-                pre_gather_mask_top, rows_m_top, gl.zeros_like(rows_m_top)
-            )
-            rows_m_bot = gl.where(
-                pre_gather_mask_bot, rows_m_bot, gl.zeros_like(rows_m_bot)
-            )
-            mask_m_top = pre_gather_mask_top
-            mask_m_bot = pre_gather_mask_bot
-        x_desc_top_mn = AsyncCopyDescriptor.initialize(
+        x_desc_top_mn, x_desc_bot_mn = _make_slice_mn_x_descs(
             cfg,
-            0,
-            BLOCK_K_X,
             x_ptr,
-            rows_m_top,
-            offs_xk_sub_mn,
+            gather_idx_ptr,
             stride_xm,
             stride_xk,
-            mask_m_top[:, None],
+            M_X,
+            off_m,
+            m_limit,
             k_limit_x,
-        )
-        x_desc_bot_mn = AsyncCopyDescriptor.initialize(
-            cfg,
-            0,
+            BLOCK_M,
             BLOCK_K_X,
-            x_ptr,
-            rows_m_bot,
-            offs_xk_sub_mn,
-            stride_xm,
-            stride_xk,
-            mask_m_bot[:, None],
-            k_limit_x,
+            NUM_WARPS,
+            HAS_GATHER,
+            X_ELEM_BITS,
         )
 
-        LOAD_W_SUB_LAYOUT_MN: gl.constexpr = _load_layout(
-            SUB_BN_MN, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
-        )
-        offs_wn_sub_mn = gl.arange(
-            0, SUB_BN_MN, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT_MN)
-        )
-        offs_wk_sub_mn = gl.arange(
-            0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT_MN)
-        )
-        mask_n_left_mn = (off_n + offs_wn_sub_mn) < N
-        mask_n_right_mn = (off_n + SUB_BN_MN + offs_wn_sub_mn) < N
-        w_desc_left_mn = AsyncCopyDescriptor.initialize(
+        w_desc_left_mn, w_desc_right_mn = _make_nonpreshuffled_w_half_descs(
             cfg,
-            1,
-            BLOCK_K_W,
             w_ptr,
-            off_n + offs_wn_sub_mn,
-            offs_wk_sub_mn,
             stride_wn,
             stride_wk,
-            mask_n_left_mn[None, :],
+            N,
+            off_n,
             k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
-        )
-        w_desc_right_mn = AsyncCopyDescriptor.initialize(
-            cfg,
-            1,
+            w_base_offset,
+            SUB_BN_MN,
             BLOCK_K_W,
-            w_ptr,
-            off_n + SUB_BN_MN + offs_wn_sub_mn,
-            offs_wk_sub_mn,
-            stride_wn,
-            stride_wk,
-            mask_n_right_mn[None, :],
-            k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
+            NUM_WARPS,
+            False,
+            W_ELEM_BITS,
+            W_CACHE_MODIFIER,
         )
-        slice_mn_pgm = MoESliceMNProgram.initialize(
+        return _run_moe_slice_mn_pipeline(
             cfg,
             x_desc_top_mn,
             x_desc_bot_mn,
@@ -3336,52 +3528,29 @@ def _run_moe_tile_ncontig_w(
             w_desc_right_mn,
             x_scale_desc,
             w_scale_desc,
+            K,
         )
-        return slice_mn_pgm.pipeline(K)
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
         bottom_valid = gl.to_tensor(True)
-        LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
-            SUB_BN, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
-        )
-        offs_wn_sub = gl.arange(
-            0, SUB_BN, layout=gl.SliceLayout(0, LOAD_W_SUB_LAYOUT)
-        )
-        offs_wk_sub = gl.arange(
-            0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_SUB_LAYOUT)
-        )
-        mask_n_top = (off_n + offs_wn_sub) < N
-        mask_n_bot = (off_n + SUB_BN + offs_wn_sub) < N
-        w_desc_top = AsyncCopyDescriptor.initialize(
+        w_desc_top, w_desc_bot = _make_nonpreshuffled_w_half_descs(
             cfg,
-            1,
-            BLOCK_K_W,
             w_ptr,
-            off_n + offs_wn_sub,
-            offs_wk_sub,
             stride_wn,
             stride_wk,
-            mask_n_top[None, :],
+            N,
+            off_n,
             k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
-        )
-        w_desc_bot = AsyncCopyDescriptor.initialize(
-            cfg,
-            1,
+            w_base_offset,
+            SUB_BN,
             BLOCK_K_W,
-            w_ptr,
-            off_n + SUB_BN + offs_wn_sub,
-            offs_wk_sub,
-            stride_wn,
-            stride_wk,
-            mask_n_bot[None, :],
-            k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
+            NUM_WARPS,
+            False,
+            W_ELEM_BITS,
+            W_CACHE_MODIFIER,
         )
-        pgm = MoESliceNProgram.initialize(
+        return _run_moe_slice_n_pipeline(
             cfg,
             x_desc,
             w_desc_top,
@@ -3389,33 +3558,34 @@ def _run_moe_tile_ncontig_w(
             x_scale_desc,
             w_scale_desc,
             bottom_valid,
+            K,
         )
-        return pgm.pipeline(K)
 
-    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
-        BLOCK_N, BLOCK_K_W, NUM_WARPS, [1, 0], W_ELEM_BITS
-    )
-    offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
-    offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
-    mask_n = (off_n + offs_wn) < N
-    w_desc = AsyncCopyDescriptor.initialize(
+    w_desc = _make_nonpreshuffled_w_full_desc(
         cfg,
-        1,
-        BLOCK_K_W,
         w_ptr,
-        off_n + offs_wn,
-        offs_wk,
         stride_wn,
         stride_wk,
-        mask_n[None, :],
+        N,
+        off_n,
         k_limit_w,
-        base_offset=w_base_offset,
-        cache_modifier=W_CACHE_MODIFIER,
+        w_base_offset,
+        BLOCK_N,
+        BLOCK_K_W,
+        NUM_WARPS,
+        False,
+        W_ELEM_BITS,
+        W_CACHE_MODIFIER,
     )
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, x_scale_desc, w_scale_desc)
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
+    return _run_moe_full_tile_pipeline(
+        cfg,
+        x_desc,
+        w_desc,
+        x_scale_desc,
+        w_scale_desc,
+        K,
+        USE_WARP_PIPELINE,
+    )
 
 
 @gluon.jit
