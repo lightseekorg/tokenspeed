@@ -114,6 +114,49 @@ _GLUON_DOT_SUB_TILE_K = _GLUON_DOT_K_QUAD * _GLUON_DOT_K_WIDTH  # = 64
 _TCP_INFLIGHT_CAP_BYTES = 32 * 1024  # gfx9 L1/TCP per-CU in-flight cap
 _CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
 
+_PREFILL_SMALL_SLICE = "lt16"
+
+# Selected-region rocprof tuning for GPT-OSS prefill routes.
+# Key: (op, persistent, route, BLOCK_M, BLOCK_N, BLOCK_K, slice-size bucket)
+# Value: (GROUP_M, XCD_SWIZZLE, W_CACHE_CG, USE_NARROW_N_STORE_LAYOUT)
+_PREFILL_LAUNCH_TUNING = {
+    ("dispatch", False, "slice_n", 16, 256, 256, _PREFILL_SMALL_SLICE): (
+        16,
+        _CDNA4_NUM_XCDS,
+        None,
+        False,
+    ),
+    ("dispatch", True, "slice_n", 64, 256, 256, 32): (
+        32,
+        _CDNA4_NUM_XCDS,
+        True,
+        False,
+    ),
+    ("dispatch", True, "slice_n", 32, 256, 256, 16): (32, 4, None, False),
+    ("combine", False, "slice_n", 16, 256, 256, _PREFILL_SMALL_SLICE): (
+        16,
+        _CDNA4_NUM_XCDS,
+        None,
+        False,
+    ),
+    ("combine", True, "plain", 64, 128, 256, None): (
+        8,
+        _CDNA4_NUM_XCDS,
+        None,
+        False,
+    ),
+    ("combine", True, "slice_n", 128, 256, 256, None): (16, 4, None, True),
+    ("combine", True, "slice_n", 64, 256, 256, 128): (16, 4, None, True),
+    ("combine", True, "slice_n", 64, 256, 256, 32): (
+        4,
+        _CDNA4_NUM_XCDS,
+        True,
+        False,
+    ),
+    ("combine", True, "slice_n", 64, 256, 256, None): (4, 4, None, False),
+    ("combine", True, "slice_n", 32, 256, 256, 16): (4, 4, None, False),
+}
+
 
 def shuffle_weight_for_gluon_dot_layout(
     w: torch.Tensor,
@@ -5038,6 +5081,40 @@ def _autotune_pid_swizzle(
     return group_m, xcd_swizzle
 
 
+def _prefill_slice_size_key(slice_size: int | None):
+    if slice_size is not None and slice_size < 16:
+        return _PREFILL_SMALL_SLICE
+    return slice_size
+
+
+def _prefill_launch_tuning(
+    op: str,
+    *,
+    persistent: bool,
+    num_ctas: int | None,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_slice_mn: bool,
+    use_slice_n: bool,
+    slice_size: int | None,
+) -> tuple[int | None, int | None, bool | None, bool]:
+    if use_slice_mn:
+        return None, None, None, False
+    if persistent and num_ctas != _CDNA4_NUM_CUS:
+        return None, None, None, False
+
+    route = "slice_n" if use_slice_n else "plain"
+    base_key = (op, persistent, route, block_m, block_n, block_k)
+    keyed_slice_size = _prefill_slice_size_key(slice_size)
+    tuning = _PREFILL_LAUNCH_TUNING.get((*base_key, keyed_slice_size))
+    if tuning is None and keyed_slice_size is not None:
+        tuning = _PREFILL_LAUNCH_TUNING.get((*base_key, None))
+    if tuning is None:
+        return None, None, None, False
+    return tuning
+
+
 def _persistent_grid_size(num_tiles_total: int) -> int:
     if num_tiles_total <= 0:
         return 1
@@ -5366,55 +5443,17 @@ def gluon_mxfp_dispatch_swiglu(
         persistent = (grid_m_upper * grid_n) >= _PERSISTENT_TILES_THRESHOLD
         if persistent and num_ctas is None:
             num_ctas = _CDNA4_NUM_CUS
-    group_m = None
-    xcd_swizzle = None
-    w_cache_cg = None
-    if (
-        not persistent
-        and block_m == 16
-        and block_n == 256
-        and block_k == 256
-        and not use_slice_mn
-        and use_slice_n
-        and slice_size is not None
-        and slice_size < 16
-    ):
-        # The 256-token GPT-OSS prefill dispatch shape uses BM16
-        # nonpersistent SliceN. Rocprof verification favored explicit XCD
-        # spreading over the BM16 default of no launch swizzle.
-        group_m = 16
-        xcd_swizzle = _CDNA4_NUM_XCDS
-    elif (
-        persistent
-        and num_ctas == _CDNA4_NUM_CUS
-        and block_m == 64
-        and block_n == 256
-        and block_k == 256
-        and not use_slice_mn
-        and use_slice_n
-        and slice_size == 32
-    ):
-        # The 1024-token GPT-OSS prefill dispatch shape uses BM64 SliceN.
-        # Selected-region rocprof verification favored larger M grouping
-        # with all-XCD spreading.
-        group_m = 32
-        xcd_swizzle = _CDNA4_NUM_XCDS
-        w_cache_cg = True
-    elif (
-        persistent
-        and num_ctas == _CDNA4_NUM_CUS
-        and block_m == 32
-        and block_n == 256
-        and block_k == 256
-        and not use_slice_mn
-        and use_slice_n
-        and slice_size == 16
-    ):
-        # The 512-token GPT-OSS prefill dispatch shape uses BM32 SliceN.
-        # Selected-region rocprof verification favored larger M grouping
-        # with moderate XCD swizzling.
-        group_m = 32
-        xcd_swizzle = 4
+    group_m, xcd_swizzle, w_cache_cg, _ = _prefill_launch_tuning(
+        "dispatch",
+        persistent=bool(persistent),
+        num_ctas=num_ctas,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        use_slice_mn=use_slice_mn,
+        use_slice_n=use_slice_n,
+        slice_size=slice_size,
+    )
     out_block_n = block_n // 2
     y_dtype = torch.float8_e4m3fn if out_quant_scale is not None else out_dtype
     y = torch.empty((M, N // 2), device=x.device, dtype=y_dtype)
@@ -5555,91 +5594,19 @@ def gluon_mxfp_combine(
         persistent = (grid_m_upper * grid_n) >= _PERSISTENT_TILES_THRESHOLD
         if persistent and num_ctas is None:
             num_ctas = _CDNA4_NUM_CUS
-    group_m = None
-    xcd_swizzle = None
-    w_cache_cg = None
-    use_narrow_n_store_layout = False
-    if (
-        not persistent
-        and block_m == 16
-        and block_n == 256
-        and block_k == 256
-        and not use_slice_mn
-        and use_slice_n
-        and slice_size is not None
-        and slice_size < 16
-    ):
-        # The 256-token GPT-OSS prefill combine shape uses BM16
-        # nonpersistent SliceN. g16/xcd8 was the best selected-region rocprof
-        # candidate and keeps the same resource profile as the default route.
-        group_m = 16
-        xcd_swizzle = _CDNA4_NUM_XCDS
-    elif (
-        persistent
-        and num_ctas == _CDNA4_NUM_CUS
-        and block_m == 64
-        and block_n == 128
-        and block_k == 256
-        and not use_slice_mn
-        and not use_slice_n
-    ):
-        # Combine's persistent BN128 path has more M tiles per N tile than
-        # dispatch's SliceN path; grouping eight M tiles improves locality
-        # without changing the global swizzle heuristic used elsewhere.
-        group_m = 8
-        xcd_swizzle = _CDNA4_NUM_XCDS
-    elif (
-        persistent
-        and num_ctas == _CDNA4_NUM_CUS
-        and block_m == 128
-        and block_n == 256
-        and block_k == 256
-        and not use_slice_mn
-        and use_slice_n
-    ):
-        group_m = 16
-        xcd_swizzle = 4
-        use_narrow_n_store_layout = True
-    elif (
-        persistent
-        and num_ctas == _CDNA4_NUM_CUS
-        and block_m == 64
-        and block_n == 256
-        and block_k == 256
-        and not use_slice_mn
-        and use_slice_n
-    ):
-        # The 4096-token GPT-OSS prefill combine shape has slice_size=128.
-        # Rocprof verification showed a clear win from a larger M grouping
-        # there. The 1024-token shape has slice_size=32 and benefits from
-        # spreading work across all XCDs. 2048 keeps the established g4/xcd4
-        # checkpoint route.
-        if slice_size == 128:
-            group_m = 16
-            xcd_swizzle = 4
-            use_narrow_n_store_layout = True
-        elif slice_size == 32:
-            group_m = 4
-            xcd_swizzle = _CDNA4_NUM_XCDS
-            w_cache_cg = True
-        else:
-            group_m = 4
-            xcd_swizzle = 4
-    elif (
-        persistent
-        and num_ctas == _CDNA4_NUM_CUS
-        and block_m == 32
-        and block_n == 256
-        and block_k == 256
-        and not use_slice_mn
-        and use_slice_n
-        and slice_size == 16
-    ):
-        # The 512-token GPT-OSS prefill combine shape uses BM32 SliceN.
-        # Selected-region rocprof verification favored the same M grouping as
-        # the default route, but with less aggressive XCD swizzling.
-        group_m = 4
-        xcd_swizzle = 4
+    group_m, xcd_swizzle, w_cache_cg, use_narrow_n_store_layout = (
+        _prefill_launch_tuning(
+            "combine",
+            persistent=bool(persistent),
+            num_ctas=num_ctas,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            use_slice_mn=use_slice_mn,
+            use_slice_n=use_slice_n,
+            slice_size=slice_size,
+        )
+    )
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
     if n_tokens is None:
         n_rows = M
