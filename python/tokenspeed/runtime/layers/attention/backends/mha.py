@@ -63,13 +63,14 @@ class MHAExtendMetadata:
     # - seq_lens: total length after this step
     # - extend_seq_lens: length of new tokens
     #   cu_extend_seq_lens: the cumsum version of extend_seq_lens
+    #   cu_seqlens_kv: the cumsum version of seq_lens
     # - extend_prefix_lens: length of the cached prefix tokens
     # seq_lens[i] = extend_prefix_lens[i] + extend_seq_lens[i]
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cu_extend_seq_lens: torch.Tensor
-    cum_seq_lens_kv: torch.Tensor
+    cu_seqlens_kv: torch.Tensor
     extend_prefix_lens: torch.Tensor
     # Host-side metadata:
     extend_seq_lens_cpu: list[int]
@@ -167,7 +168,7 @@ class MHAAttnBackend(AttentionBackend):
             cu_extend_seq_lens_cpu = [0]
             for length in extend_seq_lens_cpu:
                 cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
-            cum_seq_lens_kv = torch.nn.functional.pad(
+            cu_seqlens_kv = torch.nn.functional.pad(
                 torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
                 (1, 0),
             )
@@ -180,7 +181,7 @@ class MHAAttnBackend(AttentionBackend):
                 seq_lens=seq_lens,
                 extend_seq_lens=extend_seq_lens,
                 cu_extend_seq_lens=cu_extend_seq_lens,
-                cum_seq_lens_kv=cum_seq_lens_kv,
+                cu_seqlens_kv=cu_seqlens_kv,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
@@ -418,17 +419,17 @@ class MHAAttnBackend(AttentionBackend):
         output = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=metadata.cu_extend_seq_lens,
-            cum_seq_lens_kv=metadata.cum_seq_lens_kv,
+            cu_seqlens_kv=metadata.cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
+            max_seqlen_q=metadata.max_extend_seq_len,
+            max_seqlen_k=self.max_context_len,
             is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
-            max_seqlen_q=metadata.max_extend_seq_len,
-            max_seqlen_k=self.max_context_len,
             solution=self.kernel_solution,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)

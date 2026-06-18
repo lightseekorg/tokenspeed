@@ -164,7 +164,7 @@ def mha_extend_with_kvcache(
     # attention inputs
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cum_seq_lens_kv: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -186,7 +186,7 @@ def mha_extend_with_kvcache(
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
         cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cum_seq_lens_kv: KV cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
@@ -257,7 +257,7 @@ def mha_extend_with_kvcache(
         return kernel(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cum_seq_lens_kv,
+            cu_seqlens_kv=cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
