@@ -455,9 +455,10 @@ def get_hf_text_config(config: PretrainedConfig):
     if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
         # We support non-hf version of llava models, so we do not want to
         # read the wrong values from the unused default text_config.
-        #  We set `torch_dtype` of config to `torch.float16` for the weights, as
-        # `torch.float16` is default used for image features in `python/tokenspeed/runtime/models/llava.py`.
-        setattr(config, "torch_dtype", torch.float16)
+        # We set `dtype` of config to `torch.float16` for the weights, as
+        # `torch.float16` is default used for image features in
+        # `python/tokenspeed/runtime/models/llava.py`.
+        config.dtype = torch.float16
         return config
 
     if hasattr(config, "text_config"):
@@ -483,9 +484,8 @@ def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: str | torch.dtype,
 ) -> torch.dtype:
-    #  getattr(config, "torch_dtype", torch.float32) is not correct
-    # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "torch_dtype", None)
+    # config.dtype can be missing or None.
+    config_dtype = getattr(config, "dtype", None)
     if config_dtype is None:
         config_dtype = torch.bfloat16
 

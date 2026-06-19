@@ -3,9 +3,14 @@
 ``_materialize_architectures`` (pin the raw config.json value back onto
 the live config when ``from_pretrained`` lost it)."""
 
+# ruff: noqa: E402
+
 import os
 import sys
 import unittest
+
+import torch
+from transformers import PretrainedConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -14,8 +19,13 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs import Qwen3_5MoeConfig  # noqa: E402
 from tokenspeed.runtime.configs.model_config import get_hf_text_config  # noqa: E402
-from tokenspeed.runtime.utils.hf_transformers_utils import (  # noqa: E402
+from tokenspeed.runtime.utils.hf_transformers_utils import (
     _materialize_architectures,
+)
+from tokenspeed.runtime.utils.hf_transformers_utils import (  # noqa: E402
+    get_hf_text_config as get_runtime_hf_text_config,
+)
+from tokenspeed.runtime.utils.hf_transformers_utils import (
     resolve_architecture,
 )
 
@@ -56,6 +66,17 @@ class Qwen3_5ConfigTests(unittest.TestCase):
             config.num_attention_heads,
             config.text_config.num_attention_heads,
         )
+
+
+class ConfigDtypeTests(unittest.TestCase):
+    def test_llava_dtype_override_does_not_use_deprecated_field(self) -> None:
+        helpers = (get_hf_text_config, get_runtime_hf_text_config)
+
+        with self.assertNoLogs("transformers", level="WARNING"):
+            for helper in helpers:
+                config = PretrainedConfig(architectures=["LlavaForCausalLM"])
+                self.assertIs(helper(config), config)
+                self.assertIs(config.dtype, torch.float16)
 
 
 class MaterializeArchitecturesTests(unittest.TestCase):
