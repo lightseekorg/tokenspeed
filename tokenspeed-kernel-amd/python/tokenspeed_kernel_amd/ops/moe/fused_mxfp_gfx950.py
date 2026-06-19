@@ -1291,7 +1291,7 @@ class MoEPipelinedProgram:
         return x, w
 
     @gluon.jit
-    def _load_xw_legacy(self, mfma_idx):
+    def _load_xw_decode(self, mfma_idx):
         x = self._load_x(mfma_idx)
         w = self._load_w(mfma_idx)
         return x, w
@@ -1411,14 +1411,14 @@ class MoEPipelinedProgram:
         return x, w, scale_x, scale_w
 
     @gluon.jit
-    def issue_local_loads_legacy(self, mfma_idx):
-        x, w = self._load_xw_legacy(mfma_idx)
+    def issue_decode_local_loads(self, mfma_idx):
+        x, w = self._load_xw_decode(mfma_idx)
         scale_x, scale_w = self._load_scales(mfma_idx)
 
         return x, w, scale_x, scale_w
 
     @gluon.jit
-    def pipeline_legacy(self, loop_k):
+    def decode_pipeline(self, loop_k):
         cfg = self.cfg
         EVEN_K: gl.constexpr = cfg.EVEN_K
         load_idx = 0
@@ -1451,7 +1451,7 @@ class MoEPipelinedProgram:
                 accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
                 w_curr = self._issue_w_vgpr(mfma_idx + 1)
             else:
-                x, w, scale_x, scale_w = self.issue_local_loads_legacy(mfma_idx)
+                x, w, scale_x, scale_w = self.issue_decode_local_loads(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
             mfma_idx += 1
 
@@ -1464,7 +1464,7 @@ class MoEPipelinedProgram:
                 accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
                 w_curr = self._issue_w_vgpr(mfma_idx + 1)
             else:
-                x, w, scale_x, scale_w = self.issue_local_loads_legacy(mfma_idx)
+                x, w, scale_x, scale_w = self.issue_decode_local_loads(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
             mfma_idx += 1
 
@@ -1477,7 +1477,7 @@ class MoEPipelinedProgram:
                 if i < cfg.NUM_BUFFERS - 2:
                     w_curr = self._issue_w_vgpr(mfma_idx + 1)
             else:
-                x, w, scale_x, scale_w = self.issue_local_loads_legacy(mfma_idx)
+                x, w, scale_x, scale_w = self.issue_decode_local_loads(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
             mfma_idx += 1
 
@@ -6017,9 +6017,9 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     )
     # Cooperative-LDS, num_warps=4, software-pipelined stage1 -- the small-M
     # decode path (this wrapper is only entered for n_tokens <= SMALLM_MAX_M).
-    # BLOCK_N=64 maximizes CTAs/CU for legacy W.  Preshuffled W13 is laid out
-    # as 128-wide CTA tiles, so the first decode preshuffle path consumes full
-    # 128-wide tiles and lets SwiGLU reduce them to 64 output columns.
+    # BLOCK_N=64 maximizes CTAs/CU for non-preshuffled W. Preshuffled W13 is
+    # laid out as 128-wide CTA tiles, so the first decode preshuffle path
+    # consumes full 128-wide tiles and lets SwiGLU reduce them to 64 columns.
     COOP_NUM_WARPS = 4
     COOP_BLOCK_N = 128 if w13_preshuffled else 64
     COOP_BLOCK_K = 256
@@ -6595,7 +6595,7 @@ def _warp_decode_stage1_coop_compute(
         "e2m1",  # W format (mxfp4 weights)
         32,  # SCALE_BLOCK
         NUM_BUFFERS,
-        not W_PRESHUFFLED,  # W_TRANSPOSE for legacy K-packed-contiguous W
+        not W_PRESHUFFLED,  # W_TRANSPOSE for non-preshuffled K-packed-contiguous W
         False,  # WITH_X_MX_SCALE (per-tensor x scale only)
         True,  # WITH_W_MX_SCALE (e8m0 block scales)
         "swizzle",  # SCALE_LOAD_MODE -> SCALE_VIA_LDS unswizzle
@@ -6728,7 +6728,7 @@ def _warp_decode_stage1_coop_compute(
     # Preserve the upstream small-M decode schedule: it uses a three-buffer
     # local-prefetch pipeline and different tail masking from the optimized
     # prefill GEMM pipeline above.
-    acc = pgm.pipeline_legacy(D)
+    acc = pgm.decode_pipeline(D)
 
     # Per-tensor activation scale.
     x_scale = gl.load(x_global_scale_ptr).to(gl.float32)
