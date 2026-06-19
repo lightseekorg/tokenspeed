@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import torch
-
 from tokenspeed_kernel._triton import tl, triton
 
 
@@ -66,9 +65,7 @@ def _packed_qkv_complex_rotary_kernel(
     k_odd = tl.load(k_base + odd_d[None, :], mask=mask, other=0.0).to(tl.float32)
 
     freq_base = (
-        FREQS
-        + offs_t[:, None] * freqs_stride_t
-        + offs_p[None, :] * freqs_stride_pair
+        FREQS + offs_t[:, None] * freqs_stride_t + offs_p[None, :] * freqs_stride_pair
     )
     real = tl.load(freq_base, mask=mask, other=0.0).to(tl.float32)
     imag = tl.load(freq_base + freqs_stride_ri, mask=mask, other=0.0).to(tl.float32)
