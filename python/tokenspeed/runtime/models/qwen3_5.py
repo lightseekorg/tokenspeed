@@ -61,7 +61,7 @@ from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -105,7 +105,6 @@ from tokenspeed.runtime.utils import (
     make_layers,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +224,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             group_size=None,
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
+            dtype=config.dtype,
         )
 
         # Output projection
