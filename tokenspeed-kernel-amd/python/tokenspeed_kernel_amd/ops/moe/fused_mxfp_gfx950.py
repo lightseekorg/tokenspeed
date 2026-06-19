@@ -5630,7 +5630,7 @@ _ROUTE_NB = len(RaggedTensorMetadata.block_sizes())
 SMALLM_MAX_M = 16
 # Warp-decode is only for the smaller decode regime. M=16 should use the
 # prefill_m16 direct kernels selected by the ragged matmul path below.
-WARP_DECODE_MAX_M = 8
+WARP_DECODE_MAX_M = 4
 # Backwards-compatible alias for the small-M bound.
 FUSED_ROUTE_MAX_M = SMALLM_MAX_M
 
