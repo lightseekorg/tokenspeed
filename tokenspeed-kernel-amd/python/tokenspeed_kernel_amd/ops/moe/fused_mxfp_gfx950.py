@@ -5925,9 +5925,24 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     if w13_precision_config is None or w2_precision_config is None:
         return None
 
-    # Both weights and scales unwrap to their raw uint8 storage the same way.
-    w13_raw = _extract_gluon_raw_s(w13_weight)
-    w2_raw = _extract_gluon_raw_s(w2_weight)
+    # Use the optional Gluon dot-layout preshuffled attachments when they match
+    # the layout this warp-decode path knows how to consume.
+    w13_raw_candidate = _extract_gluon_raw_w(w13_weight)
+    w13_preshuffled = (
+        isinstance(w13_raw_candidate, torch.Tensor)
+        and bool(getattr(w13_raw_candidate, "is_shuffled_for_gluon_dot", False))
+        and int(getattr(w13_raw_candidate, "gluon_dot_block_k_pk", 0)) == 128
+        and int(getattr(w13_raw_candidate, "gluon_dot_block_n", 0)) == 128
+    )
+    w13_raw = w13_raw_candidate if w13_preshuffled else _extract_gluon_raw_s(w13_weight)
+    w2_raw_candidate = _extract_gluon_raw_w(w2_weight)
+    w2_preshuffled = (
+        isinstance(w2_raw_candidate, torch.Tensor)
+        and bool(getattr(w2_raw_candidate, "is_shuffled_for_gluon_dot", False))
+        and int(getattr(w2_raw_candidate, "gluon_dot_block_k_pk", 0)) == 128
+        and int(getattr(w2_raw_candidate, "gluon_dot_block_n", 0)) == 128
+    )
+    w2_raw = w2_raw_candidate if w2_preshuffled else _extract_gluon_raw_s(w2_weight)
     w13_scale = _extract_gluon_raw_s(getattr(w13_precision_config, "b_mx_scale", None))
     w2_scale = _extract_gluon_raw_s(getattr(w2_precision_config, "b_mx_scale", None))
     if not all(
@@ -5942,15 +5957,22 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
 
     D = int(hidden_states.shape[1])
-    if int(w13_raw.shape[1]) * 2 != D:
+    w13_k_pk = int(getattr(w13_raw, "original_k_pk", int(w13_raw.shape[1])))
+    if w13_k_pk * 2 != D:
         return None
     two_i = int(w13_raw.shape[2])
     if two_i % 2 != 0:
         return None
-    I = two_i // 2
-    if int(w2_raw.shape[1]) * 2 != I:
+    if w13_preshuffled and two_i % 128 != 0:
         return None
-    N = int(w2_raw.shape[2])
+    I = two_i // 2
+    w2_k_pk = int(getattr(w2_raw, "original_k_pk", int(w2_raw.shape[1])))
+    if w2_k_pk * 2 != I:
+        return None
+    w2_n_phys = int(w2_raw.shape[2])
+    N = int(getattr(w2_raw, "original_n", w2_n_phys)) if w2_preshuffled else w2_n_phys
+    if w2_preshuffled and (N > w2_n_phys or w2_n_phys % 128 != 0):
+        return None
 
     # Stage1 computes the dense top-k inside the kernel; allocate its outputs.
     router_logits_c = router_logits.contiguous()
@@ -5995,10 +6017,11 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     )
     # Cooperative-LDS, num_warps=4, software-pipelined stage1 -- the small-M
     # decode path (this wrapper is only entered for n_tokens <= SMALLM_MAX_M).
-    # BLOCK_N=64 maximizes CTAs/CU (the kernel is occupancy-bound); BLOCK_K=256
-    # is the MX-scale-swizzle minimum; NUM_BUFFERS=3 is the LDS pipeline depth.
+    # BLOCK_N=64 maximizes CTAs/CU for legacy W.  Preshuffled W13 is laid out
+    # as 128-wide CTA tiles, so the first decode preshuffle path consumes full
+    # 128-wide tiles and lets SwiGLU reduce them to 64 output columns.
     COOP_NUM_WARPS = 4
-    COOP_BLOCK_N = 64
+    COOP_BLOCK_N = 128 if w13_preshuffled else 64
     COOP_BLOCK_K = 256
     COOP_NUM_BUFFERS = 3
     coop_grid = (n_tokens * ((2 * I + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
@@ -6022,6 +6045,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
         BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
         NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
+        W_PRESHUFFLED=w13_preshuffled,
         HAS_BIAS=w13_bias is not None,
         SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
         num_warps=COOP_NUM_WARPS,
@@ -6047,7 +6071,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # fmt: off
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
         inter, w2_raw, w2_scale, topk_ids, topk_weights, s2_dst,
-        n_tokens, N, I,
+        n_tokens, N, w2_n_phys, I,
         inter.stride(0), inter.stride(1),
         w2_raw.stride(0), w2_raw.stride(-2), w2_raw.stride(-1),
         w2_scale.stride(0), w2_scale.stride(-2), w2_scale.stride(-1),
@@ -6055,6 +6079,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         w2_act_scale, b2,
         I_PACKED=I // 2, TOPK=top_k,
         BLOCK_K=BLOCK_K, BLOCK_N=S2_BLOCK_N, M_DUP=S2_M_DUP,
+        W_PRESHUFFLED=w2_preshuffled,
         HAS_BIAS=w2_bias is not None, SPLIT_K=s2_split_k,
         num_warps=1,
     )
@@ -6543,6 +6568,7 @@ def _warp_decode_stage1_coop_compute(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -6569,7 +6595,7 @@ def _warp_decode_stage1_coop_compute(
         "e2m1",  # W format (mxfp4 weights)
         32,  # SCALE_BLOCK
         NUM_BUFFERS,
-        True,  # W_TRANSPOSE (W is K-packed-contiguous: stride_wk==1)
+        not W_PRESHUFFLED,  # W_TRANSPOSE for legacy K-packed-contiguous W
         False,  # WITH_X_MX_SCALE (per-tensor x scale only)
         True,  # WITH_W_MX_SCALE (e8m0 block scales)
         "swizzle",  # SCALE_LOAD_MODE -> SCALE_VIA_LDS unswizzle
@@ -6578,6 +6604,7 @@ def _warp_decode_stage1_coop_compute(
         False,  # EVEN_K (D=2880 not a multiple of BLOCK_K)
         False,  # USE_GATHER
         NUM_WARPS,
+        W_PRESHUFFLED=W_PRESHUFFLED,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
     )
@@ -6592,23 +6619,14 @@ def _warp_decode_stage1_coop_compute(
     LOAD_X_LAYOUT: gl.constexpr = _load_layout(
         BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS
     )
-    # K-contig W (W_TRANSPOSE=True): vectorise the contiguous K_packed axis
-    # (mirrors the W_TRANSPOSE branch of _pipelined_moe_tile_compute).
-    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
-        BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
-    )
-
     offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
-    offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
-    offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
 
     valid = (token < M) & (expert >= 0)
     # One decode token per CTA: row 0 of the BLOCK_M tile carries the token,
     # the remaining rows are clamped/masked (buffer OOB -> 0 in LDS).
     rows_m = gl.where(offs_xm == 0, token, gl.zeros_like(offs_xm))
     mask_m = (offs_xm == 0) & valid
-    mask_n = (off_n + offs_wn) < N
 
     k_limit_x = gl.multiple_of(D // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(D // cfg.DIV_FACTOR_W, 16)
@@ -6625,20 +6643,60 @@ def _warp_decode_stage1_coop_compute(
         mask_m[:, None],
         k_limit_x,
     )
-    w_desc = AsyncCopyDescriptor.initialize(
-        cfg,
-        0,
-        BLOCK_K_W,
-        W,
-        off_n + offs_wn,
-        offs_wk,
-        stride_wn,
-        stride_wk,
-        mask_n[:, None],
-        k_limit_w,
-        base_offset=w_base_offset,
-        cache_modifier=W_CACHE_MODIFIER,
-    )
+    if W_PRESHUFFLED:
+        gl.static_assert(
+            BLOCK_N == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
+            "warp_decode preshuffled W13 path assumes 128x128 W tiles "
+            "and NUM_WARPS=4; re-derive the copy/read layouts for other shapes.",
+        )
+        LOAD_W_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
+            BLOCK_N // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS
+        )
+        LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
+            BLOCK_N // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, True
+        )
+        offsets_w, base_off_w = _make_preshuffled_w_full_offsets(
+            w_base_offset,
+            pid_n,
+            LOAD_W_COPY_LAYOUT,
+            BLOCK_N,
+            BLOCK_N,
+            BLOCK_K_W,
+        )
+        w_desc = WPreshuffledLdsDescriptor(
+            cfg,
+            BLOCK_K_W,
+            W,
+            W.dtype.element_ty,
+            gl.to_tensor(N),
+            offsets_w + base_off_w,
+            pred=gl.to_tensor(True),
+            load_layout=LOAD_W_LAYOUT,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+    else:
+        # K-contig W (W_TRANSPOSE=True): vectorise the contiguous K_packed axis
+        # (mirrors the W_TRANSPOSE branch of _pipelined_moe_tile_compute).
+        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+            BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
+        )
+        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+        mask_n = (off_n + offs_wn) < N
+        w_desc = AsyncCopyDescriptor.initialize(
+            cfg,
+            0,
+            BLOCK_K_W,
+            W,
+            off_n + offs_wn,
+            offs_wk,
+            stride_wn,
+            stride_wk,
+            mask_n[:, None],
+            k_limit_w,
+            base_offset=w_base_offset,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
 
     # W e8m0 scales -> LDS in the post-swizzle HBM shape; issue_local_load_unswizzle
     # reconstructs [BLOCK_N, BLOCK_K_SCALE] (the 7-D reshape/permute).
@@ -6747,6 +6805,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     BLOCK_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -6818,9 +6877,37 @@ def _warp_decode_topk_stage1_coop_kernel(
         stride_ym, stride_yn,
         x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
         TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
-        HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
+        W_PRESHUFFLED, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
     )
     # fmt: on
+
+
+@gluon.jit
+def _warp_decode_stage2_preshuffled_w_offset(
+    w_expert_off,
+    k_pack,
+    n_col,
+    N_PHYS,
+):
+    k_in_block = k_pack % 128
+    n_in_block = n_col % 128
+
+    k_within = k_in_block % 16
+    k_quad = (k_in_block // 16) % 4
+    k_block = k_in_block // 64
+    n_in_sub = n_in_block % 16
+    n_block = n_in_block // 16
+
+    in_tile = (
+        n_block.to(gl.int64) * 2048
+        + k_block.to(gl.int64) * 1024
+        + k_quad.to(gl.int64) * 256
+        + n_in_sub.to(gl.int64) * 16
+        + k_within.to(gl.int64)
+    )
+    n_tiles = N_PHYS // 128
+    tile_id = (k_pack // 128).to(gl.int64) * n_tiles + (n_col // 128).to(gl.int64)
+    return (w_expert_off + tile_id * (128 * 128) + in_tile).to(gl.int32)
 
 
 @gluon.jit
@@ -6834,17 +6921,21 @@ def _warp_decode_stage2_load_tile(
     W,
     WScale,
     x_row_off,
+    w_expert_off,
     w_n_off,
     ws_expert_off,
     scale_row_off,
+    n_cols,
     stride_xk,
     stride_wk,
     stride_wsk,
+    N_PHYS,
     I,
     BLOCK_K: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
     I_PACKED: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
     MASK_TAIL: gl.constexpr = False,
 ):
     k_elem = kt * BLOCK_K + ak
@@ -6852,7 +6943,12 @@ def _warp_decode_stage2_load_tile(
     a_off = (x_row_off + k_elem.to(gl.int64) * stride_xk + am.to(gl.int64) * 0).to(
         gl.int32
     )
-    b_off = (w_n_off + k_pack.to(gl.int64) * stride_wk).to(gl.int32)
+    if W_PRESHUFFLED:
+        b_off = _warp_decode_stage2_preshuffled_w_offset(
+            w_expert_off, k_pack, n_cols, N_PHYS
+        )
+    else:
+        b_off = (w_n_off + k_pack.to(gl.int64) * stride_wk).to(gl.int32)
     if BLOCK_K_SCALE == 4:
         scale_k_lin = (kt // 2) * 256 + (kt % 2) * 2 + bsk * 64
     else:
@@ -6865,9 +6961,8 @@ def _warp_decode_stage2_load_tile(
         # K lanes to 0 so they contribute nothing and never over-read.
         sk_valid = (kt * BLOCK_K_SCALE + bsk) < (I // 32)
         a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off, mask=k_elem < I, other=0.0)
-        b = gl.amd.cdna4.buffer_load(
-            ptr=W, offsets=b_off, mask=k_pack < I_PACKED, other=0
-        )
+        b_mask = k_pack < I_PACKED
+        b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off, mask=b_mask, other=0)
         s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off, mask=sk_valid, other=0)
     else:
         a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off)
@@ -6887,31 +6982,35 @@ def _warp_decode_stage2_load_pair(
     W,
     WScale,
     x_row_off,
+    w_expert_off,
     w_n_off,
     ws_expert_off,
     scale_row_off,
+    n_cols,
     stride_xk,
     stride_wk,
     stride_wsk,
+    N_PHYS,
     I,
     BLOCK_K: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
     I_PACKED: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
 ):
     """Load the even (kt) and odd (kt+1) K-tiles of one pipeline step."""
     # fmt: off
     a_even, b_even, s_even = _warp_decode_stage2_load_tile(
         kt, ak, bk, bsk, am, X, W, WScale,
-        x_row_off, w_n_off, ws_expert_off, scale_row_off,
-        stride_xk, stride_wk, stride_wsk, I,
-        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
+        x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
+        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
     )
     a_odd, b_odd, s_odd = _warp_decode_stage2_load_tile(
         kt + 1, ak, bk, bsk, am, X, W, WScale,
-        x_row_off, w_n_off, ws_expert_off, scale_row_off,
-        stride_xk, stride_wk, stride_wsk, I,
-        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
+        x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
+        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
     )
     # fmt: on
     return a_even, b_even, s_even, a_odd, b_odd, s_odd
@@ -6945,6 +7044,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     Out,
     M,
     N,
+    N_PHYS,
     I,
     stride_xm,
     stride_xk,
@@ -6964,6 +7064,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     BLOCK_K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     M_DUP: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SPLIT_K: gl.constexpr,
 ):
@@ -6976,6 +7077,13 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     """
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    if W_PRESHUFFLED:
+        gl.static_assert(
+            128 % BLOCK_N == 0 and BLOCK_K_PACKED == 64,
+            "warp_decode preshuffled W2 expects BLOCK_N to divide the "
+            "128-wide shuffled tile and BLOCK_K_PACKED=64 so two stage2 "
+            "iterations cover one 128-packed-byte K tile.",
+        )
     pid = gl.program_id(axis=0)
     num_n = gl.cdiv(N, BLOCK_N)
     if SPLIT_K == 1:
@@ -7045,17 +7153,17 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                     (a_even, b_even, s_even,
                      a_odd, b_odd, s_odd) = _warp_decode_stage2_load_pair(
                         kt_start, ak, bk, bsk, am, X, W, WScale,
-                        x_row_off, w_n_off, ws_expert_off, scale_row_off,
-                        stride_xk, stride_wk, stride_wsk, I,
-                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
+                        x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
+                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                     )
                     for kt in range(kt_start, main_end - 2, 2):
                         (nxt_a_even, nxt_b_even, nxt_s_even,
                          nxt_a_odd, nxt_b_odd, nxt_s_odd) = _warp_decode_stage2_load_pair(
                             kt + 2, ak, bk, bsk, am, X, W, WScale,
-                            x_row_off, w_n_off, ws_expert_off, scale_row_off,
-                            stride_xk, stride_wk, stride_wsk, I,
-                            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
+                            x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
+                            n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                         )
                         acc = _warp_decode_stage2_mfma_pair(
                             acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
@@ -7072,9 +7180,9 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                 for kt in range(main_end, kt_stop):
                     a_t, b_t, s_t = _warp_decode_stage2_load_tile(
                         kt, ak, bk, bsk, am, X, W, WScale,
-                        x_row_off, w_n_off, ws_expert_off, scale_row_off,
-                        stride_xk, stride_wk, stride_wsk, I,
-                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED,
+                        x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
+                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                         MASK_TAIL=True,
                     )
                     acc = gl.amd.cdna4.mfma_scaled(
