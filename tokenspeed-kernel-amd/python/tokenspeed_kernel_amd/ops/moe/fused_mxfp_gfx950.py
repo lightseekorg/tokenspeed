@@ -800,15 +800,6 @@ def _scale_async_blocked_layout(
     )
 
 
-@gluon.constexpr_function
-def _direct_shared_layout(H: gl.constexpr, W: gl.constexpr):
-    H_i = int(H)
-    W_i = int(W)
-    inner = [[0, 1 << i] for i in range(W_i.bit_length() - 1)]
-    outer = [[1 << i, 0] for i in range(H_i.bit_length() - 1)]
-    return gl.PaddedSharedLayout([[1024, 32]], inner + outer, [], [H_i, W_i])
-
-
 @gluon.aggregate
 class AsyncCopyDescriptor:
     cfg: MoEConfig
@@ -5366,78 +5357,31 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # uint8 view (an fp8 LDS buffer fails to lower).
     x_uint8 = x_fp8.view(torch.uint8)
 
-    if _WD_GROUPED_S1 and n_tokens >= _WD_GROUPED_MIN_M:
-        # EXPERT-MAJOR grouped stage1: route once, then one program per
-        # (expert, N-tile) loads w13[expert] ONCE and batches its routed
-        # tokens into the MFMA M-dim. Produces the same ``inter`` as coop.
-        GROUP_NUM_WARPS = COOP_NUM_WARPS
-        # BLOCK_N=128 (vs coop's 64) halves the per-expert N-tile program count
-        # and the pipeline ramp-ups; ~3us faster on the weight-bandwidth-bound
-        # grouped stage1 at M=16 (BLOCK_N=256 regresses on register pressure).
-        GROUP_BLOCK_N = 128
-        GROUP_BLOCK_K = COOP_BLOCK_K
-        GROUP_NUM_BUFFERS = COOP_NUM_BUFFERS
-        # fmt: off
-        _warp_decode_route_only_kernel[(n_tokens,)](
-            router_logits_c, topk_ids, topk_weights,
-            n_tokens, n_experts,
-            router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
-            TOPK=top_k,
-            EP=max(_route_next_pow2(n_experts), 64 * GROUP_NUM_WARPS),
-            TKP=64 * GROUP_NUM_WARPS,
-            NUM_WARPS=GROUP_NUM_WARPS,
-            num_warps=GROUP_NUM_WARPS,
-        )
-        g_num_pid_n = (2 * I + GROUP_BLOCK_N - 1) // GROUP_BLOCK_N
-        if _WD_GROUPED_GRID_ROUTE_MAJOR:
-            group_grid = (n_tokens * top_k * g_num_pid_n,)
-        else:
-            group_grid = (n_experts * g_num_pid_n,)
-        _warp_decode_stage1_grouped_kernel[group_grid](
-            x_uint8, w13_raw, w13_scale, topk_ids, inter,
-            n_tokens, n_experts, D, I,
-            x_uint8.stride(0), x_uint8.stride(1),
-            topk_ids.stride(0),
-            w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
-            w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
-            inter.stride(0), inter.stride(1),
-            w13_act_scale, w2_act_scale, b13,
-            TOPK=top_k,
-            BLOCK_M=16, BLOCK_N=GROUP_BLOCK_N, BLOCK_K=GROUP_BLOCK_K,
-            NUM_BUFFERS=GROUP_NUM_BUFFERS, NUM_WARPS=GROUP_NUM_WARPS,
-            GRID_ROUTE_MAJOR=_WD_GROUPED_GRID_ROUTE_MAJOR,
-            W_VIA_VGPR=stage1_w_vgpr,
-            HAS_BIAS=w13_bias is not None,
-            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
-            num_warps=GROUP_NUM_WARPS,
-        )
-        # fmt: on
-    else:
-        coop_grid = (n_tokens * ((2 * I + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
-        # fmt: off
-        _warp_decode_topk_stage1_coop_kernel[coop_grid](
-            x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
-            n_tokens, n_experts, D, I,
-            x_uint8.stride(0), x_uint8.stride(1),
-            router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
-            w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
-            w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
-            inter.stride(0), inter.stride(1),
-            w13_act_scale, w2_act_scale, b13,
-            D_PACKED=D // 2, TOPK=top_k,
-            # EP/TKP: padded widths of the [tokens, experts] logits tile and the
-            # top-k selection tile; >= 64*num_warps keeps the blocked layout valid.
-            EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS),
-            TKP=64 * COOP_NUM_WARPS,
-            X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
-            BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
-            NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
-            W_VIA_VGPR=stage1_w_vgpr,
-            HAS_BIAS=w13_bias is not None,
-            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
-            num_warps=COOP_NUM_WARPS,
-        )
-        # fmt: on
+    coop_grid = (n_tokens * ((2 * I + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
+    # fmt: off
+    _warp_decode_topk_stage1_coop_kernel[coop_grid](
+        x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
+        n_tokens, n_experts, D, I,
+        x_uint8.stride(0), x_uint8.stride(1),
+        router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
+        w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
+        w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
+        inter.stride(0), inter.stride(1),
+        w13_act_scale, w2_act_scale, b13,
+        D_PACKED=D // 2, TOPK=top_k,
+        # EP/TKP: padded widths of the [tokens, experts] logits tile and the
+        # top-k selection tile; >= 64*num_warps keeps the blocked layout valid.
+        EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS),
+        TKP=64 * COOP_NUM_WARPS,
+        X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
+        BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
+        NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
+        W_VIA_VGPR=stage1_w_vgpr,
+        HAS_BIAS=w13_bias is not None,
+        SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+        num_warps=COOP_NUM_WARPS,
+    )
+    # fmt: on
 
     n_tiles2 = (N + S2_BLOCK_N - 1) // S2_BLOCK_N
     if s2_split_k > 1:
@@ -5628,31 +5572,12 @@ _ROUTE_NB = len(RaggedTensorMetadata.block_sizes())
 # Gluon kernel (decode, where it wins ~6x on routing) and keeps the generic
 # ``triton_kernels_routing`` pipeline for larger M.
 SMALLM_MAX_M = 16
-# Warp-decode is only for the smaller decode regime. M=16 should use the
+# Warp-decode is only for the smallest decode regime. M>=8 should use the
 # prefill_m16 direct kernels selected by the ragged matmul path below.
 WARP_DECODE_MAX_M = 4
 # Backwards-compatible alias for the small-M bound.
 FUSED_ROUTE_MAX_M = SMALLM_MAX_M
 
-# Experimental EXPERT-MAJOR (grouped) warp-decode stage1. Read once at import.
-# When set AND n_tokens >= _WD_GROUPED_MIN_M, stage1 loads each expert's w13
-# tile ONCE and batches its routed tokens into the MFMA M-dim (weight reuse),
-# producing the exact same ``inter`` as the coop stage1 (drop-in). Default OFF
-# keeps the coop path byte-for-byte unchanged.
-_WD_GROUPED_S1 = os.environ.get("TS_WD_GROUPED_S1", "") == "1"
-# grouped wins only at M=16; coop is faster for M<=8 (measured). Default gate 16;
-# override via TS_WD_GROUPED_MIN_M (e.g. =1) to force grouped at all M for profiling.
-_WD_GROUPED_MIN_M = int(os.environ.get("TS_WD_GROUPED_MIN_M", "16"))
-# Experimental grouped stage1 CTA scheduling. Default preserves the measured
-# expert-major launch order. ``route_major`` launches from the M*TOPK routed
-# slots and skips duplicate experts, cutting empty-expert CTAs while preserving
-# one W13 stream per active expert.
-_WD_GROUPED_GRID_MODE = os.environ.get("TS_WD_GROUPED_GRID", "expert")
-_WD_GROUPED_GRID_ROUTE_MAJOR = _WD_GROUPED_GRID_MODE in (
-    "route",
-    "route_major",
-    "route-major",
-)
 # Experimental W13 direct-to-VGPR path for warp-decode stage1. Requires process
 # weights to attach a pre-shuffled W13 tensor (``TS_WD_STAGE1_W_VGPR=1`` there
 # too); otherwise the wrapper silently keeps the LDS path.
@@ -6339,411 +6264,6 @@ def _warp_decode_topk_stage1_coop_kernel(
         X, W, WScale, Y,
         M, D, I,
         stride_xm, stride_xk,
-        stride_we, stride_wk, stride_wn,
-        stride_wse, stride_wsk, stride_wsn,
-        stride_ym, stride_yn,
-        x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
-        TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
-        W_VIA_VGPR, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
-    )
-    # fmt: on
-
-
-@gluon.jit
-def _warp_decode_route_only_kernel(
-    Logits,
-    TopkIdsOut,
-    TopkWeightsOut,
-    M,
-    E,
-    stride_lm,
-    stride_tim,
-    stride_twm,
-    TOPK: gl.constexpr,
-    EP: gl.constexpr,
-    TKP: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-):
-    """Standalone dense top-k routing pre-pass for the grouped stage1.
-
-    Byte-identical to the inline top-k folded into
-    ``_warp_decode_topk_stage1_coop_kernel`` (argmax + min-index tie-break +
-    softmax over the selected experts).  One program per token; writes
-    ``topk_ids`` / ``topk_weights`` consumed by the grouped GEMM and stage2.
-    """
-    token = gl.program_id(axis=0)
-    LE: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
-    e = gl.arange(0, EP, layout=LE)
-    emask = e < E
-    cur = gl.load(
-        Logits + token.to(gl.int64) * stride_lm + e,
-        mask=(token < M) & emask,
-        other=float("-inf"),
-    ).to(gl.float32)
-    t = gl.arange(0, TKP, layout=LE)
-    val_t = gl.full([TKP], -1e30, gl.float32, layout=LE)
-    idx_t = gl.zeros([TKP], gl.int32, layout=LE)
-    big = gl.full([EP], E, gl.int32, layout=LE)
-    for r in gl.static_range(TOPK):
-        vmax = gl.max(cur, axis=0)
-        ismax = (cur == vmax) & emask
-        amax = gl.min(gl.where(ismax, e, big), axis=0)
-        sel = t == r
-        val_t = gl.where(sel, vmax, val_t)
-        idx_t = gl.where(sel, amax, idx_t)
-        cur = gl.where(e == amax, float("-inf"), cur)
-    rmax = gl.max(val_t, axis=0)
-    num = gl.exp(val_t - rmax)
-    den = gl.sum(num, axis=0)
-    gate_t = gl.fdiv(num, den)
-    gl.store(
-        TopkIdsOut + token.to(gl.int64) * stride_tim + t,
-        idx_t,
-        mask=(token < M) & (t < TOPK),
-    )
-    gl.store(
-        TopkWeightsOut + token.to(gl.int64) * stride_twm + t,
-        gate_t.to(TopkWeightsOut.dtype.element_ty),
-        mask=(token < M) & (t < TOPK),
-    )
-
-
-@gluon.jit
-def _warp_decode_stage1_grouped_compute(
-    expert,
-    pid_n,
-    X,
-    W,
-    WScale,
-    TopkIds,
-    Y,
-    M,
-    E,
-    D,
-    I,
-    stride_xm,
-    stride_xk,
-    stride_tim,
-    stride_we,
-    stride_wk,
-    stride_wn,
-    stride_wse,
-    stride_wsk,
-    stride_wsn,
-    stride_ym,
-    stride_yn,
-    x_global_scale_ptr,
-    out_quant_scale_ptr,
-    w13_bias,
-    TOPK: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    NUM_BUFFERS: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    W_VIA_VGPR: gl.constexpr,
-    HAS_BIAS: gl.constexpr,
-    SWIGLU_ALPHA: gl.constexpr,
-    SWIGLU_LIMIT: gl.constexpr,
-):
-    """EXPERT-MAJOR gate_up GEMM for one (expert, N-tile).
-
-    Loads ``w13[expert]`` once and gathers every token routed to this expert
-    into the BLOCK_M MFMA tile (row m == token m; matched rows active, others
-    masked).  Result row m is SCATTERed to ``inter[m*TOPK + slot_m]`` so the
-    output is identical to the coop stage1.  Empty experts gate all global
-    traffic off via ``has_any`` (no weight DRAM, no stores).
-
-    Mirrors ``_warp_decode_stage1_coop_compute`` (same MoEConfig / scaled-MFMA
-    pipeline); only the M-dim gather and the output scatter differ.
-    """
-    N = 2 * I
-    off_n = pid_n * BLOCK_N
-    w_base_offset = expert * stride_we
-    ws_base_offset = expert * stride_wse
-
-    cfg = MoEConfig(
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
-        "e4m3",
-        "e2m1",
-        32,
-        NUM_BUFFERS,
-        True,  # W_TRANSPOSE
-        False,  # WITH_X_MX_SCALE
-        True,  # WITH_W_MX_SCALE
-        "swizzle",
-        gl.int32,
-        (1, 1, 1),
-        False,  # EVEN_K
-        False,  # USE_GATHER
-        NUM_WARPS,
-        W_VIA_VGPR=W_VIA_VGPR,
-        W_PREFETCH=True,
-    )
-
-    BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
-    BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
-    OUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
-    W_CACHE_MODIFIER: gl.constexpr = ".cg" if BLOCK_M <= 32 else ""
-
-    X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
-    W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
-    LOAD_X_LAYOUT: gl.constexpr = _load_layout(
-        BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS
-    )
-    if cfg.W_VIA_VGPR:
-        gl.static_assert(
-            BLOCK_K_W == 128 and BLOCK_N == 128 and NUM_WARPS == 4,
-            "stage1 W_VIA_VGPR assumes BLOCK_K_W=128, BLOCK_N=128, NUM_WARPS=4",
-        )
-        LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=[
-                [0, 1],
-                [0, 2],
-                [0, 4],
-                [0, 8],
-                [0, 1024],
-                [1, 0],
-                [4, 0],
-            ],
-            lane_bases=[
-                [0, 16],
-                [0, 32],
-                [0, 64],
-                [0, 128],
-                [0, 256],
-                [0, 512],
-            ],
-            warp_bases=[[2, 0], [0, 0]],
-            block_bases=[],
-            shape=[BLOCK_N // 16, BLOCK_K_W * 16],
-        )
-    else:
-        LOAD_W_LAYOUT: gl.constexpr = _load_layout(
-            BLOCK_K_W, BLOCK_N, NUM_WARPS, [1, 0], W_ELEM_BITS
-        )
-
-    offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-    offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
-    if cfg.W_VIA_VGPR:
-        offs_wn = gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
-        offs_wk = gl.arange(0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
-    else:
-        offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
-        offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
-
-    # ---- gather: which tokens routed to this expert (row m == token m) ----
-    in_m = offs_xm < M
-    matched_x = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-    for s in gl.static_range(TOPK):
-        ids_s = gl.load(TopkIds + offs_xm * stride_tim + s, mask=in_m, other=-1)
-        matched_x = gl.where(ids_s == expert, 1, matched_x)
-    has_any = gl.max(matched_x, axis=0)
-
-    rows_m = gl.where(in_m, offs_xm, gl.zeros_like(offs_xm))
-    mask_m = (matched_x > 0) & in_m
-    if cfg.W_VIA_VGPR:
-        # W_VIA_VGPR requires N to be BLOCK_N-aligned and skips per-column masking.
-        mask_n = (offs_wn < (BLOCK_N // 16)) & (has_any > 0)
-    else:
-        mask_n = ((off_n + offs_wn) < N) & (has_any > 0)
-
-    k_limit_x = gl.multiple_of(D // cfg.DIV_FACTOR_X, 16)
-    k_limit_w = gl.multiple_of(D // cfg.DIV_FACTOR_W, 16)
-
-    x_desc = AsyncCopyDescriptor.initialize(
-        cfg,
-        0,
-        BLOCK_K_X,
-        X,
-        rows_m,
-        offs_xk,
-        stride_xm,
-        stride_xk,
-        mask_m[:, None],
-        k_limit_x,
-    )
-    if cfg.W_VIA_VGPR:
-        # Host-preshuffled W -> VGPR direct; bypasses LDS staging for W13.
-        TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
-        offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
-            BLOCK_K_W * 16
-        )
-        base_off_b_vgpr = w_base_offset + pid_n * TILE_BYTES
-        w_desc = WVgprDescriptor(
-            cfg,
-            BLOCK_K_W,
-            W,
-            gl.to_tensor(N),
-            offsets_b_vgpr + base_off_b_vgpr,
-            pred=has_any > 0,
-        )
-    else:
-        w_desc = AsyncCopyDescriptor.initialize(
-            cfg,
-            0,
-            BLOCK_K_W,
-            W,
-            off_n + offs_wn,
-            offs_wk,
-            stride_wn,
-            stride_wk,
-            mask_n[:, None],
-            k_limit_w,
-            base_offset=w_base_offset,
-            cache_modifier=W_CACHE_MODIFIER,
-        )
-
-    BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
-    BLOCK_K_S_PS_W: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
-    LW_S: gl.constexpr = cfg.load_layout_w_scale
-    offs_ws_n = gl.arange(0, BLOCK_N_PS, layout=gl.SliceLayout(1, LW_S))
-    offs_ws_k = gl.arange(0, BLOCK_K_S_PS_W, layout=gl.SliceLayout(0, LW_S))
-    rows_n_scale = off_n // cfg.PRESHUFFLE_FACTOR + offs_ws_n
-    row_limit_w_s = (N + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
-    k_limit_ws_load = ((D // cfg.SCALE_BLOCK + 7) // 8 * 8) * cfg.PRESHUFFLE_FACTOR
-    w_scale_desc = AsyncCopyDescriptor.initialize(
-        cfg,
-        0,
-        BLOCK_K_S_PS_W,
-        WScale,
-        rows_n_scale,
-        offs_ws_k,
-        stride_wsn,
-        stride_wsk,
-        (rows_n_scale[:, None] < row_limit_w_s) & (has_any > 0),
-        k_limit_ws_load,
-        base_offset=ws_base_offset,
-    )
-
-    # Shared memory must be allocated unconditionally (static); the pipeline
-    # work and the store are skipped for experts with no routed tokens so the
-    # ~(E - active) empty programs early-exit cheaply (no weight DRAM, no MFMA).
-    pgm = MoEPipelinedProgram.initialize(cfg, x_desc, w_desc, 0, w_scale_desc)
-    if has_any <= 0:
-        return
-    acc = pgm.pipeline(D)
-
-    x_scale = gl.load(x_global_scale_ptr).to(gl.float32)
-    acc = acc * x_scale
-
-    if HAS_BIAS:
-        bias_offs = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
-        bias_mask = bias_offs < N
-        bias = gl.load(
-            w13_bias + expert.to(gl.int64) * N + bias_offs,
-            mask=bias_mask,
-            other=0.0,
-        )
-        acc = acc + bias[None, :].to(gl.float32)
-
-    out = _swiglu_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout)
-    out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
-    out = (out * out_inv_scale).to(Y.dtype.element_ty)
-    STORE_LAYOUT: gl.constexpr = out.type.layout
-
-    # ---- scatter: row m -> inter[token_m * TOPK + slot_m] ----
-    offs_y_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
-    y_in_m = offs_y_m < M
-    matched_y = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, STORE_LAYOUT))
-    slot_y = gl.zeros([BLOCK_M], gl.int32, layout=gl.SliceLayout(1, STORE_LAYOUT))
-    for s in gl.static_range(TOPK):
-        ids_s = gl.load(TopkIds + offs_y_m * stride_tim + s, mask=y_in_m, other=-1)
-        is_e = ids_s == expert
-        matched_y = gl.where(is_e, 1, matched_y)
-        slot_y = gl.where(is_e, s, slot_y)
-
-    off_n_out = pid_n * OUT_BLOCK_N
-    offs_y_n = off_n_out + gl.arange(0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
-    out_row = offs_y_m * TOPK + slot_y
-    y_offs = (
-        out_row[:, None].to(gl.int64) * stride_ym
-        + offs_y_n[None, :].to(gl.int64) * stride_yn
-    )
-    mask_y = (matched_y[:, None] > 0) & y_in_m[:, None] & (offs_y_n[None, :] < I)
-    gl.store(Y + y_offs, out, mask=mask_y)
-
-
-@gluon.jit
-def _warp_decode_stage1_grouped_kernel(
-    X,
-    W,
-    WScale,
-    TopkIds,
-    Y,
-    M,
-    E,
-    D,
-    I,
-    stride_xm,
-    stride_xk,
-    stride_tim,
-    stride_we,
-    stride_wk,
-    stride_wn,
-    stride_wse,
-    stride_wsk,
-    stride_wsn,
-    stride_ym,
-    stride_yn,
-    x_global_scale_ptr,
-    out_quant_scale_ptr,
-    w13_bias,
-    TOPK: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    NUM_BUFFERS: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    GRID_ROUTE_MAJOR: gl.constexpr,
-    W_VIA_VGPR: gl.constexpr,
-    HAS_BIAS: gl.constexpr,
-    SWIGLU_ALPHA: gl.constexpr,
-    SWIGLU_LIMIT: gl.constexpr,
-):
-    """Grouped grid: one program per (expert, N-tile).
-
-    Default maps over all experts; ``GRID_ROUTE_MAJOR`` maps over routed
-    token-slot entries and skips duplicate experts so empty experts never enter
-    the schedule while each active expert still streams W13 only once per N-tile.
-    Routing must already be in ``TopkIds`` (run
-    ``_warp_decode_route_only_kernel`` first).
-    """
-    pid = gl.program_id(axis=0)
-    num_pid_n = gl.cdiv(2 * I, BLOCK_N)
-    if GRID_ROUTE_MAJOR:
-        route_idx = pid // num_pid_n
-        pid_n = pid % num_pid_n
-        route_token = route_idx // TOPK
-        route_slot = route_idx - route_token * TOPK
-        expert = gl.load(
-            TopkIds + route_token.to(gl.int64) * stride_tim + route_slot,
-            mask=route_token < M,
-            other=-1,
-        )
-        LR: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
-        offs_m = gl.arange(0, BLOCK_M, layout=LR)
-        in_m = offs_m < M
-        seen_prev = gl.zeros([BLOCK_M], gl.int32, layout=LR)
-        for s in gl.static_range(TOPK):
-            ids_s = gl.load(TopkIds + offs_m * stride_tim + s, mask=in_m, other=-1)
-            lin_s = offs_m * TOPK + s
-            seen_prev = gl.where((lin_s < route_idx) & (ids_s == expert), 1, seen_prev)
-        has_prev = gl.max(seen_prev, axis=0)
-        if (expert < 0) | (has_prev > 0):
-            return
-    else:
-        pid_n = pid % num_pid_n
-        expert = pid // num_pid_n
-    # fmt: off
-    _warp_decode_stage1_grouped_compute(
-        expert, pid_n,
-        X, W, WScale, TopkIds, Y,
-        M, E, D, I,
-        stride_xm, stride_xk,
-        stride_tim,
         stride_we, stride_wk, stride_wn,
         stride_wse, stride_wsk, stride_wsn,
         stride_ym, stride_yn,

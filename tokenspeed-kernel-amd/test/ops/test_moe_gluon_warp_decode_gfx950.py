@@ -206,11 +206,11 @@ def _reference(case: dict) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("use_bias", [False, True])
-@pytest.mark.parametrize("M", [1, 2, 4, 8])
+@pytest.mark.parametrize("M", [1, 2, 4])
 def test_fp8_mxfp4_warp_decode_moe(M: int, use_bias: bool):
     # I = 256 > BLOCK_K (128) so stage2 split-K partitions the reduction across
-    # real K slices. M sweeps the supported warp-decode range (M<=8)
-    # and its tiling transitions (stage2 at M>1, stage1 at M>4).
+    # real K slices. M sweeps the supported warp-decode range (M<=4)
+    # and its tiling transitions (stage2 at M>1).
     case = _build_case(M=M, E=4, D=256, I=256, topk=2, use_bias=use_bias)
     out = _run_kernel(case)
     assert out is not None
@@ -222,8 +222,9 @@ def test_fp8_mxfp4_warp_decode_moe(M: int, use_bias: bool):
 
 
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_fp8_mxfp4_warp_decode_rejects_m16(use_bias: bool):
-    # M=16 is deliberately handled by the prefill_m16 direct kernels in the
+@pytest.mark.parametrize("M", [8, 16])
+def test_fp8_mxfp4_warp_decode_rejects_larger_m(M: int, use_bias: bool):
+    # M>=8 is deliberately handled by the prefill_m16 direct kernels in the
     # generic fused-MoE path, not by the warp-decode path.
-    case = _build_case(M=16, E=4, D=256, I=256, topk=2, use_bias=use_bias)
+    case = _build_case(M=M, E=4, D=256, I=256, topk=2, use_bias=use_bias)
     assert _run_kernel(case) is None
