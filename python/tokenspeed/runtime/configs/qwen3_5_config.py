@@ -25,6 +25,18 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
 from tokenspeed.runtime.configs.qwen3_vision_config import Qwen3VLVisionConfig
 
+_MROPE_EXTENSION_KEYS = frozenset({"mrope_section", "mrope_interleaved"})
+
+
+def _to_transformers_rope_parameters(rope_config):
+    if not isinstance(rope_config, dict):
+        return rope_config
+    return {
+        key: value
+        for key, value in rope_config.items()
+        if key not in _MROPE_EXTENSION_KEYS
+    }
+
 
 class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
@@ -41,16 +53,14 @@ class Qwen3_5TextConfig(Qwen3_5BaseTextConfig):
     ):
         # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
         # Normalize it before parent init so downstream code sees the expected values.
-        rope_parameters = kwargs.pop("rope_parameters", None)
-        if kwargs.get("rope_scaling") is None and rope_parameters is not None:
-            kwargs["rope_scaling"] = rope_parameters
+        full_rope_parameters = kwargs.get("rope_parameters")
+        if full_rope_parameters is not None:
+            kwargs["rope_parameters"] = _to_transformers_rope_parameters(
+                full_rope_parameters
+            )
 
         super().__init__(**kwargs)
-        if self.rope_scaling is None:
-            self.rope_scaling = rope_parameters or {}
-
-        # Keep both names for compatibility with model code paths that read either.
-        self.rope_parameters = rope_parameters or self.rope_scaling
+        self._tokenspeed_rope_parameters = full_rope_parameters or self.rope_parameters
 
 
 class Qwen3_5Config(PretrainedConfig):
