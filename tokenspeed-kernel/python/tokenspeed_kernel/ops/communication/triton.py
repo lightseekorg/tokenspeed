@@ -914,8 +914,7 @@ def nvidia_rsag_reduce_scatter_num_blocks(
     needed_blocks = max(
         _RSAG_MIN_BLOCKS, triton.cdiv(max_local_numel, numel_per_program)
     )
-    # `1 << (n - 1).bit_length()` is the smallest power of two >= n.
-    return min(_RSAG_MAX_BLOCKS, 1 << (needed_blocks - 1).bit_length())
+    return min(_RSAG_MAX_BLOCKS, triton.next_power_of_2(needed_blocks))
 
 
 @triton.jit
