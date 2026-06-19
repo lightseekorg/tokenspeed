@@ -164,7 +164,7 @@ def mha_extend_with_kvcache(
     # attention inputs
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cum_seq_lens_kv: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -186,7 +186,7 @@ def mha_extend_with_kvcache(
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
         cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cum_seq_lens_kv: KV cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
@@ -257,7 +257,7 @@ def mha_extend_with_kvcache(
         return kernel(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cum_seq_lens_kv,
+            cu_seqlens_kv=cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
@@ -280,6 +280,7 @@ def mha_decode_with_kvcache(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
+    max_seqlen_q: int,
     # attention options
     window_left: int = -1,
     logit_cap: float = 0.0,
@@ -292,12 +293,15 @@ def mha_decode_with_kvcache(
     """MHA decode with paged KV cache.
 
     Args:
-        q: Query tensor with shape [batch, num_q_heads, head_dim].
+        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
         cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
         max_seqlen_k: Maximum KV length.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and `spec_num_tokens` for compact
+            speculative decode.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -305,12 +309,6 @@ def mha_decode_with_kvcache(
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
-    if q.shape[0] != cache_seqlens.shape[0]:
-        raise ValueError(
-            "mha_decode_with_kvcache assumes query length 1; "
-            f"got q.shape[0]={q.shape[0]} and batch={cache_seqlens.shape[0]}"
-        )
-
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
@@ -340,7 +338,7 @@ def mha_decode_with_kvcache(
         "num_q_heads": q.shape[1],
         "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
-        "max_seqlen_q": 1,
+        "max_seqlen_q": max_seqlen_q,
         "max_seqlen_k": max_seqlen_k,
     }
     ShapeCapture.get().record(
@@ -370,6 +368,7 @@ def mha_decode_with_kvcache(
             sinks=sinks,
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
         )
 
 
