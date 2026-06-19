@@ -4081,14 +4081,7 @@ def _pipelined_moe_tile_compute(
             W_CACHE_MODIFIER,
         )
 
-    FUSE_X_GLOBAL_WITH_GATE: gl.constexpr = (
-        APPLY_X_GLOBAL_SCALE
-        and not HAS_X_BLOCK_SCALE
-        and APPLY_GATE_SCAL
-        and not DO_SWIGLU
-    )
-
-    if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE and not FUSE_X_GLOBAL_WITH_GATE:
+    if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE:
         x_global_scale = gl.load(x_global_scale_ptr)
         acc = acc * x_global_scale
 
@@ -4101,22 +4094,6 @@ def _pipelined_moe_tile_compute(
             other=0.0,
         )
         acc = acc + bias[None, :].to(gl.float32)
-
-    if APPLY_GATE_SCAL and not DO_SWIGLU:
-        offs_acc_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, cfg.acc_layout))
-        acc_m_in_bounds = offs_acc_m < m_limit
-        offs_acc_m_safe = gl.where(
-            acc_m_in_bounds, offs_acc_m, gl.zeros_like(offs_acc_m)
-        )
-        scal = gl.load(
-            gate_scal_ptr + offs_acc_m_safe,
-            mask=acc_m_in_bounds,
-            other=1.0,
-        )
-        if FUSE_X_GLOBAL_WITH_GATE:
-            x_global_scale = gl.load(x_global_scale_ptr)
-            scal = scal * x_global_scale
-        acc = acc * scal[:, None].to(acc.dtype)
 
     if DO_SWIGLU:
         out = _swiglu_reduce(
@@ -4143,7 +4120,7 @@ def _pipelined_moe_tile_compute(
     y_m_in_bounds = offs_y_m < m_limit
     offs_y_m_safe = gl.where(y_m_in_bounds, offs_y_m, gl.zeros_like(offs_y_m))
 
-    if APPLY_GATE_SCAL and DO_SWIGLU:
+    if APPLY_GATE_SCAL:
         scal = gl.load(
             gate_scal_ptr + offs_y_m_safe,
             mask=y_m_in_bounds,
