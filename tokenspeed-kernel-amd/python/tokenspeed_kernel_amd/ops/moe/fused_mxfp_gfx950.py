@@ -5970,7 +5970,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     if w2_k_pk * 2 != I:
         return None
     w2_n_phys = int(w2_raw.shape[2])
-    N = int(getattr(w2_raw, "original_n", w2_n_phys)) if w2_preshuffled else w2_n_phys
+    N = int(getattr(w2_raw, "original_n", w2_n_phys))
     if w2_preshuffled and (N > w2_n_phys or w2_n_phys % 128 != 0):
         return None
 
