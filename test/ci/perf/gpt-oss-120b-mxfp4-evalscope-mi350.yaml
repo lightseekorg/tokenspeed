@@ -1,0 +1,75 @@
+api_version: ci.tokenspeed.io/v1
+name: perf-gpt-oss-120b-mxfp4-mi350
+type: perf
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi350-1gpu-bench
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    tokenspeed serve
+    --model amd/gpt-oss-120b-w-mxfp4-a-fp8
+    --host 127.0.0.1
+    --port 21000
+    --world-size 1
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --no-enable-prefix-caching
+    --sampling-backend greedy
+  ready:
+    url: http://127.0.0.1:21000/readiness
+    timeout: 1800
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    REPO_ROOT=$PWD &&
+    MODEL=amd/gpt-oss-120b-w-mxfp4-a-fp8 &&
+    URL=http://127.0.0.1:21000/v1/completions &&
+    OUTPUTS_DIR=/tmp/tokenspeed-gpt-oss-mi350-perf &&
+    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" &&
+    set +e &&
+    PERF_STATUS=0 &&
+    for input_len in 1024 4096 8192; do
+    label=$((input_len / 1024))k;
+    echo "==================================================";
+    echo ">>> input=${label} output=1k bs=1,2,4,8,16";
+    echo "==================================================";
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model "$MODEL"
+    --url "$URL"
+    --api openai
+    --dataset random
+    --tokenizer-path "$MODEL"
+    --min-prompt-length "$input_len"
+    --max-prompt-length "$input_len"
+    --prefix-length 0
+    --min-tokens 1024
+    --max-tokens 1024
+    --parallel 1 2 4 8 16
+    --number 5 10 20 40 80
+    --warmup-num 16
+    --rate -1
+    --seed 1
+    --temperature 0
+    --stream
+    --outputs-dir "$OUTPUTS_DIR/input_${label}"
+    --no-timestamp
+    --extra-args '{"ignore_eos": true}';
+    rc=$?;
+    if [ $rc -ne 0 ] && [ $PERF_STATUS -eq 0 ]; then PERF_STATUS=$rc; fi;
+    done;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 1;
+    PARSE_STATUS=$?;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true
