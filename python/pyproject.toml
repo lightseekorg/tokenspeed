@@ -65,9 +65,9 @@ dependencies = [
     "setproctitle",
     "tiktoken",
     "tokenspeed-mooncake>=0.3.11.post20260527",
-    "tokenspeed-smg==1.5.0.post20260618",
-    "tokenspeed-smg-grpc-proto==0.4.10.post20260618",
-    "tokenspeed-smg-grpc-servicer==0.5.6.post20260618",
+    "tokenspeed-smg==1.5.0.post20260620",
+    "tokenspeed-smg-grpc-proto==0.4.10.post20260620",
+    "tokenspeed-smg-grpc-servicer==0.5.6.post20260620",
     "torch==2.11.0",
     # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
     # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
