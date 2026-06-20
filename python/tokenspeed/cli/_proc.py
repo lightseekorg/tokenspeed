@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 _GATEWAY_MODULE = "smg"
 _ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
+_PIPE_LINE_LIMIT = 64 * 1024 * 1024
 
 
 async def spawn_engine(
@@ -58,6 +59,7 @@ async def spawn_engine(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=_PIPE_LINE_LIMIT,
     )
 
 
@@ -84,6 +86,7 @@ async def spawn_gateway(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=_PIPE_LINE_LIMIT,
     )
 
 
