@@ -100,7 +100,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
     def flashinfer_trtllm_mha_extend_with_kvcache(
         q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cum_seq_lens_kv: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         page_table: torch.Tensor,
@@ -139,7 +139,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             bmm2_scale=1.0,
             batch_size=cache_seqlens.shape[0],
             cum_seq_lens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cum_seq_lens_kv,
+            cum_seq_lens_kv=cu_seqlens_kv,
             window_left=window_left,
             sinks=sinks,
             out_dtype=q.dtype,
@@ -175,6 +175,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         max_seqlen_k: int,
+        max_seqlen_q: int = 1,
         window_left: int = -1,
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
@@ -207,6 +208,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             window_left=window_left,
             sinks=sinks,
             out_dtype=q.dtype,
+            q_len_per_req=max_seqlen_q,
         )
 
 

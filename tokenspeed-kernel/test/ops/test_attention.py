@@ -104,8 +104,8 @@ def test_mha_prefill(
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [
-        pytest.param(torch.bfloat16, 128, 8, 2, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8"),
+        pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer"])
@@ -141,8 +141,8 @@ def test_mha_extend_with_kvcache(
     q = _randn((total_q, num_q_heads, head_dim), device=device, dtype=dtype)
     cu_seqlens_q = torch.cumsum(query_seqlens, dim=0, dtype=torch.int32)
     cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0))
-    cum_seq_lens_kv = torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
-    cum_seq_lens_kv = torch.nn.functional.pad(cum_seq_lens_kv, (1, 0))
+    cu_seqlens_kv = torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+    cu_seqlens_kv = torch.nn.functional.pad(cu_seqlens_kv, (1, 0))
 
     page_table = torch.zeros(
         batch_size,
@@ -201,7 +201,7 @@ def test_mha_extend_with_kvcache(
     out = mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
-        cum_seq_lens_kv=cum_seq_lens_kv,
+        cu_seqlens_kv=cu_seqlens_kv,
         k_cache=k_cache,
         v_cache=v_cache,
         page_table=page_table,
@@ -217,7 +217,7 @@ def test_mha_extend_with_kvcache(
         triton_out, triton_lse = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cum_seq_lens_kv,
+            cu_seqlens_kv=cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
@@ -235,14 +235,16 @@ def test_mha_extend_with_kvcache(
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [
-        pytest.param(torch.bfloat16, 128, 8, 2, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8"),
+        pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
     ],
 )
-@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
+@pytest.mark.parametrize("seqlen_q", [1, 4], ids=["q1", "q4"])
 def test_mha_decode_with_kvcache(
     device: str,
     solution: str,
+    seqlen_q: int,
     dtype: torch.dtype,
     head_dim: int,
     num_q_heads: int,
@@ -255,12 +257,16 @@ def test_mha_decode_with_kvcache(
     page_size = 64
     max_cache_seqlen = 256
     prefix_seqlens = torch.tensor([63, 129, 17, 191], device=device, dtype=torch.int32)
-    cache_seqlens = prefix_seqlens + 1
+    cache_seqlens = prefix_seqlens + seqlen_q
     num_blocks_per_seq = (cache_seqlens + page_size - 1) // page_size
     max_num_blocks_per_seq = (max_cache_seqlen + page_size - 1) // page_size
     total_num_blocks = int(num_blocks_per_seq.sum().item())
 
-    q = _randn((batch_size, num_q_heads, head_dim), device=device, dtype=dtype)
+    q = _randn(
+        (batch_size * seqlen_q, num_q_heads, head_dim),
+        device=device,
+        dtype=dtype,
+    )
 
     page_table = torch.zeros(
         batch_size,
@@ -323,10 +329,12 @@ def test_mha_decode_with_kvcache(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max_cache_seqlen,
+        max_seqlen_q=seqlen_q,
         solution=solution,
     )
 
     assert out.shape == q.shape
+    assert not torch.isnan(out).any()
 
 
 @pytest.mark.parametrize(

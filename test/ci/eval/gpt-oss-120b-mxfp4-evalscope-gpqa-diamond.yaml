@@ -10,8 +10,6 @@ runner:
     - amd-mi35x-2gpu-test
   env:
     b200-2gpu:
-      GPT_OSS_EVAL_ATTENTION_BACKEND: trtllm
-      GPT_OSS_EVAL_MOE_BACKEND: flashinfer_trtllm
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     amd-mi35x-2gpu-test:
       GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
@@ -30,8 +28,6 @@ server:
     --max-model-len 80000
     --trust-remote-code
     --reasoning-parser base
-    ${GPT_OSS_EVAL_ATTENTION_BACKEND:+--attention-backend ${GPT_OSS_EVAL_ATTENTION_BACKEND}}
-    ${GPT_OSS_EVAL_MOE_BACKEND:+--moe-backend ${GPT_OSS_EVAL_MOE_BACKEND}}
     ${GPT_OSS_EVAL_DISABLE_KVSTORE:+--disable-kvstore}
     ${GPT_OSS_EVAL_DISABLE_PREFIX_CACHING:+--no-enable-prefix-caching}
     --enable-cache-report

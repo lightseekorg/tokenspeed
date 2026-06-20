@@ -63,13 +63,14 @@ class MHAExtendMetadata:
     # - seq_lens: total length after this step
     # - extend_seq_lens: length of new tokens
     #   cu_extend_seq_lens: the cumsum version of extend_seq_lens
+    #   cu_seqlens_kv: the cumsum version of seq_lens
     # - extend_prefix_lens: length of the cached prefix tokens
     # seq_lens[i] = extend_prefix_lens[i] + extend_seq_lens[i]
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cu_extend_seq_lens: torch.Tensor
-    cum_seq_lens_kv: torch.Tensor
+    cu_seqlens_kv: torch.Tensor
     extend_prefix_lens: torch.Tensor
     # Host-side metadata:
     extend_seq_lens_cpu: list[int]
@@ -156,13 +157,18 @@ class MHAAttnBackend(AttentionBackend):
             assert extend_seq_lens_cpu is not None
             assert extend_prefix_lens is not None
             assert extend_prefix_lens_cpu is not None
+
+            # Create cumulative sum of the sequence lengths for Q and KV.
             extend_seq_lens = extend_seq_lens[:bs]
             extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
-            cu_extend_seq_lens, cu_extend_seq_lens_cpu = self._make_cu_extend_seq_lens(
-                extend_seq_lens,
-                extend_seq_lens_cpu,
+            cu_extend_seq_lens = torch.nn.functional.pad(
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32),
+                (1, 0),
             )
-            cum_seq_lens_kv = torch.nn.functional.pad(
+            cu_extend_seq_lens_cpu = [0]
+            for length in extend_seq_lens_cpu:
+                cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
+            cu_seqlens_kv = torch.nn.functional.pad(
                 torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
                 (1, 0),
             )
@@ -175,7 +181,7 @@ class MHAAttnBackend(AttentionBackend):
                 seq_lens=seq_lens,
                 extend_seq_lens=extend_seq_lens,
                 cu_extend_seq_lens=cu_extend_seq_lens,
-                cum_seq_lens_kv=cum_seq_lens_kv,
+                cu_seqlens_kv=cu_seqlens_kv,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
@@ -192,34 +198,10 @@ class MHAAttnBackend(AttentionBackend):
                     seq_lens=seq_lens,
                 )
         else:
-            if self.spec_num_tokens > 1:
-                if self.is_draft:
-                    self.forward_decode_metadata = MHADecodeMetadata(
-                        page_table=page_table,
-                        seq_lens=seq_lens,
-                    )
-                else:
-                    expanded_page_table, expanded_seq_lens = (
-                        self._make_spec_metadata_buffers(
-                            bs,
-                            page_table.device,
-                        )
-                    )
-                    self._fill_spec_metadata(
-                        expanded_page_table,
-                        expanded_seq_lens,
-                        page_table,
-                        seq_lens,
-                    )
-                    self.forward_decode_metadata = MHADecodeMetadata(
-                        page_table=expanded_page_table,
-                        seq_lens=expanded_seq_lens,
-                    )
-            else:
-                self.forward_decode_metadata = MHADecodeMetadata(
-                    page_table=page_table,
-                    seq_lens=seq_lens,
-                )
+            self.forward_decode_metadata = MHADecodeMetadata(
+                page_table=page_table,
+                seq_lens=seq_lens,
+            )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         assert (
@@ -232,22 +214,15 @@ class MHAAttnBackend(AttentionBackend):
         )
 
         self.cuda_graph_decode_metadata = {}
+        self.cuda_graph_page_table = torch.zeros(
+            (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
+        )
         if self.spec_num_tokens > 1 and not self.is_draft:
-            page_table, seq_lens = self._make_spec_metadata_buffers(
-                max_bs,
-                self.device,
+            self.cuda_graph_seq_lens = torch.empty(
+                (max_bs,), dtype=torch.int32, device=self.device
             )
-            self.cuda_graph_page_table = page_table
-            self.cuda_graph_seq_lens = seq_lens
-            self.cuda_graph_base_page_table = torch.zeros(
-                (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
-            )
-            self.cuda_graph_page_table.zero_()
         else:
             # Alias controller's seq_lens_buf — backend never mutates it.
-            self.cuda_graph_page_table = torch.zeros(
-                (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
-            )
             self.cuda_graph_seq_lens = seq_lens_buf
 
     def init_forward_metadata_capture_cuda_graph(
@@ -259,26 +234,14 @@ class MHAAttnBackend(AttentionBackend):
     ):
         assert not forward_mode.is_extend_or_mixed()
 
+        metadata = MHADecodeMetadata(
+            page_table=self.cuda_graph_page_table[:bs, :],
+            seq_lens=self.cuda_graph_seq_lens[:bs],
+        )
         if self.spec_num_tokens > 1 and not self.is_draft:
-            expanded_bs = bs * self.spec_num_tokens
-            metadata = MHADecodeMetadata(
-                page_table=self.cuda_graph_page_table[:expanded_bs, :],
-                seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
-            )
-            self._fill_spec_seq_lens(
-                metadata.seq_lens,
-                seq_lens[:bs].clamp_min(self.spec_num_tokens),
-            )
-            self.cuda_graph_decode_metadata[bs] = metadata
-            self.forward_decode_metadata = metadata
-        else:
-            seq_lens = self.cuda_graph_seq_lens[:bs]
-            metadata = MHADecodeMetadata(
-                page_table=self.cuda_graph_page_table[:bs, :],
-                seq_lens=seq_lens,
-            )
-            self.cuda_graph_decode_metadata[bs] = metadata
-            self.forward_decode_metadata = metadata
+            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
+        self.cuda_graph_decode_metadata[bs] = metadata
+        self.forward_decode_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -291,35 +254,18 @@ class MHAAttnBackend(AttentionBackend):
     ):
         assert not forward_mode.is_extend_or_mixed()
 
+        gather_page_table_with_padding(
+            req_to_page=req_to_page,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out=self.cuda_graph_page_table,
+            bs=bs,
+            max_num_pages=self.max_num_pages,
+            page_size=self.page_size,
+            dummy_slot=0,
+        )
         if self.spec_num_tokens > 1 and not self.is_draft:
-            base_page_table = self.cuda_graph_base_page_table
-            gather_page_table_with_padding(
-                req_to_page=req_to_page,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out=base_page_table,
-                bs=bs,
-                max_num_pages=self.max_num_pages,
-                page_size=self.page_size,
-                dummy_slot=0,
-            )
-            self._fill_spec_metadata(
-                self.cuda_graph_page_table[: bs * self.spec_num_tokens, :],
-                self.cuda_graph_seq_lens[: bs * self.spec_num_tokens],
-                base_page_table[:bs, :],
-                seq_lens[:bs],
-            )
-        else:
-            gather_page_table_with_padding(
-                req_to_page=req_to_page,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out=self.cuda_graph_page_table,
-                bs=bs,
-                max_num_pages=self.max_num_pages,
-                page_size=self.page_size,
-                dummy_slot=0,
-            )
+            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
@@ -434,7 +380,7 @@ class MHAAttnBackend(AttentionBackend):
             k = k.to(torch.float8_e4m3fn)
             v = v.to(torch.float8_e4m3fn)
 
-        result = mha_prefill(
+        output = mha_prefill(
             q=q,
             k=k,
             v=v,
@@ -446,7 +392,6 @@ class MHAAttnBackend(AttentionBackend):
             sinks=sinks,
             solution=self.kernel_solution,
         )
-        output = self._unwrap_output(result)
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
         if save_kv_cache:
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
@@ -471,23 +416,22 @@ class MHAAttnBackend(AttentionBackend):
             q = q.to(torch.float8_e4m3fn)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        result = mha_extend_with_kvcache(
+        output = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=metadata.cu_extend_seq_lens,
-            cum_seq_lens_kv=metadata.cum_seq_lens_kv,
+            cu_seqlens_kv=metadata.cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
+            max_seqlen_q=metadata.max_extend_seq_len,
+            max_seqlen_k=self.max_context_len,
             is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
-            max_seqlen_q=metadata.max_extend_seq_len,
-            max_seqlen_k=self.max_context_len,
             solution=self.kernel_solution,
         )
-        output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_decode(
@@ -509,7 +453,8 @@ class MHAAttnBackend(AttentionBackend):
             q = q.to(torch.float8_e4m3fn)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        result = mha_decode_with_kvcache(
+        max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
+        output = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -519,9 +464,9 @@ class MHAAttnBackend(AttentionBackend):
             logit_cap=layer.logit_cap,
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
+            max_seqlen_q=max_seqlen_q,
             solution=self.kernel_solution,
         )
-        output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # ------------------------------------------------------------------
@@ -575,78 +520,6 @@ class MHAAttnBackend(AttentionBackend):
             layer.v_head_dim,
         )
         return k_cache, v_cache
-
-    def _make_spec_metadata_buffers(
-        self,
-        bs: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        expanded_bs = bs * self.spec_num_tokens
-        cuda_graph_page_table = torch.empty(
-            (expanded_bs, self.max_num_pages),
-            dtype=torch.int32,
-            device=device,
-        )
-        cuda_graph_seq_lens = torch.empty(
-            (expanded_bs,),
-            dtype=torch.int32,
-            device=device,
-        )
-        return (cuda_graph_page_table, cuda_graph_seq_lens)
-
-    def _fill_spec_metadata(
-        self,
-        expanded_page_table: torch.Tensor,
-        expanded_seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        bs = seq_lens.shape[0]
-        spec_num_tokens = self.spec_num_tokens
-        expanded_page_table = expanded_page_table.view(
-            bs, spec_num_tokens, self.max_num_pages
-        )
-        expanded_page_table.copy_(page_table[:, None, :])
-        self._fill_spec_seq_lens(expanded_seq_lens, seq_lens)
-
-    def _fill_spec_seq_lens(
-        self,
-        expanded_seq_lens: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        bs = seq_lens.shape[0]
-        spec_num_tokens = self.spec_num_tokens
-        spec_decode_offsets = torch.arange(
-            spec_num_tokens - 1,
-            -1,
-            -1,
-            dtype=torch.int32,
-            device=seq_lens.device,
-        )
-        torch.sub(
-            seq_lens[:, None],
-            spec_decode_offsets,
-            out=expanded_seq_lens.view(bs, spec_num_tokens),
-        )
-
-    def _make_cu_extend_seq_lens(
-        self,
-        lengths: torch.Tensor,
-        extend_seq_lens_cpu: list[int],
-    ) -> tuple[torch.Tensor, list[int]]:
-        cu_extend_seq_lens = torch.nn.functional.pad(
-            torch.cumsum(lengths, dim=0, dtype=torch.int32),
-            (1, 0),
-        )
-        cu_extend_seq_lens_cpu = [0]
-        for length in extend_seq_lens_cpu:
-            cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
-        return cu_extend_seq_lens, cu_extend_seq_lens_cpu
-
-    def _unwrap_output(self, result):
-        if isinstance(result, tuple):
-            return result[0]
-        return result
 
 
 for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:

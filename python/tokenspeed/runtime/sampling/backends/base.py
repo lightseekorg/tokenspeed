@@ -43,8 +43,6 @@ SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 @dataclass
 class SamplingBackendConfig:
 
-    enable_nan_detection: bool = False
-
     # Optional logprob features — OFF by default. These are checked at server
     # start / graph capture time so the fast path has zero extra compute.
     # Enabling any of these enlarges the captured graph footprint.
@@ -83,7 +81,6 @@ class SamplingBackendConfig:
     ) -> SamplingBackendConfig:
 
         return cls(
-            enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),

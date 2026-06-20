@@ -850,20 +850,71 @@ def rsag_restore_hidden(
 # NVIDIA Triton RS/AG
 # ------------------------------------------------------------------------------
 
+# multimem reduce-scatter / all-gather launch geometry. A CTA runs
+# _RSAG_BLOCK_THREADS threads; each thread moves _RSAG_NUMEL_PER_THREAD bf16
+# elements with one 128-bit multimem op (16 bytes / 2 bytes per bf16). So a CTA
+# sweeps _RSAG_BLOCK_THREADS * _RSAG_NUMEL_PER_THREAD elements per grid-stride
+# step. get_launch_config and the reduce-scatter block-count heuristic share
+# these constants so the two can never drift apart.
+_RSAG_BLOCK_THREADS = 1024
+_RSAG_NUMEL_PER_THREAD = 8
+# The multimem kernels grid-stride, so the CTA count is a free tuning knob, not
+# fixed by the data. Reduce-scatter scales it with the payload between these
+# bounds: _RSAG_MIN_BLOCKS is the smallest grid we ever launch (and the
+# all-gather fallback); _RSAG_MAX_BLOCKS caps it at a count that still saturates
+# NVLink while bounding the signal-pad slots nvidia_create_rsag_state reserves.
+_RSAG_MIN_BLOCKS = 4
+_RSAG_MAX_BLOCKS = 32
 
-def nvidia_rsag_get_launch_config(local_numel: int) -> Tuple[int, int, int, int]:
+
+def nvidia_rsag_get_launch_config(
+    local_numel: int, num_blocks: int | None = None
+) -> Tuple[int, int, int, int]:
     warp_size = 32
-    max_num_blocks = 4
-    max_block_size = 1024
+    max_block_size = _RSAG_BLOCK_THREADS
     bytes_per_thread = 16
-    numel_per_thread = 8
+    numel_per_thread = _RSAG_NUMEL_PER_THREAD
     assert (
         local_numel % numel_per_thread == 0
     ), f"The number of elements must be {bytes_per_thread} bytes aligned"
     block_size = max_block_size
     num_warps = max_block_size // warp_size
-    num_blocks = max_num_blocks
+    # Reduce-scatter passes a payload-scaled count; the all-gather paths leave it
+    # None and fall back to the minimum grid.
+    num_blocks = _RSAG_MIN_BLOCKS if num_blocks is None else num_blocks
     return num_blocks, block_size, num_warps, numel_per_thread
+
+
+def nvidia_rsag_reduce_scatter_num_blocks(
+    token_list_in_group: list[int], hidden_size: int
+) -> int:
+    """Choose how many CTAs (grid blocks) the reduce-scatter kernel launches.
+
+    The multimem kernel is a grid-stride loop, so the block count is a free
+    tuning knob rather than dictated by the data: more CTAs expose more
+    parallelism on a large payload, fewer avoid cross-CTA barrier cost on a small
+    one. The count is sized from the busiest rank in the group
+    (``max(token_list_in_group)``) because a collective must launch an identical
+    grid on every rank for the kernel's per-CTA cross-rank barrier to pair up.
+
+    Args:
+        token_list_in_group: Per-rank token counts participating in this
+            collective (identical on every rank).
+        hidden_size: Hidden dimension, i.e. elements per token.
+
+    Returns:
+        A power of two in ``[_RSAG_MIN_BLOCKS, _RSAG_MAX_BLOCKS]``: enough CTAs
+        for roughly one grid-stride pass over the busiest rank's payload, floored
+        and capped, then rounded up to a power of two. The cap is exactly what
+        ``nvidia_create_rsag_state`` reserves signal-pad slots for.
+    """
+    # Elements one CTA sweeps per grid-stride step (threads * elems-per-thread).
+    numel_per_program = _RSAG_BLOCK_THREADS * _RSAG_NUMEL_PER_THREAD
+    max_local_numel = max(token_list_in_group) * hidden_size
+    needed_blocks = max(
+        _RSAG_MIN_BLOCKS, triton.cdiv(max_local_numel, numel_per_program)
+    )
+    return min(_RSAG_MAX_BLOCKS, triton.next_power_of_2(needed_blocks))
 
 
 @triton.jit
@@ -955,6 +1006,16 @@ def nvidia_create_rsag_state(
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+    # Reserve the symmetric-memory signal pad for the largest grid the
+    # reduce-scatter launcher can pick. blockwise_barrier indexes the pad at
+    # block_id * world_size + rank, so an _RSAG_MAX_BLOCKS-CTA grid needs
+    # _RSAG_MAX_BLOCKS * world_size uint32 (4-byte) slots. Otherwise this path
+    # silently relies on PyTorch's default pad size, which a smaller-payload
+    # module could have set below what 32 CTAs need. max() only grows the pad, so
+    # we never shrink one another module enlarged. Must precede symm_mem.empty()
+    # below, which bakes the pad size into the allocation.
+    pad_bytes = _RSAG_MAX_BLOCKS * group.size() * 4
+    symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
     free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
     # Allocate outside inference_mode so the persistent comm buffer is not
     # an inference tensor; this class is often lazily constructed during
@@ -982,11 +1043,14 @@ def nvidia_create_rsag_state(
 
 
 def nvidia_rsag_multimem_reduce_scatter(
-    state: TritonCommState, local_num_tokens: int, local_token_offset: int
+    state: TritonCommState,
+    local_num_tokens: int,
+    local_token_offset: int,
+    num_blocks: int | None = None,
 ) -> None:
     num_elts = local_num_tokens * state.hidden_dim
     num_blocks, block_size, num_warps, numel_per_thread = nvidia_rsag_get_launch_config(
-        num_elts
+        num_elts, num_blocks=num_blocks
     )
     symm_mem_hdl = symm_mem.rendezvous(state.comm_buff, group=state.group)
     assert state.rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
@@ -1049,7 +1113,12 @@ def nvidia_rsag_reduce_scatter(
         hidden_states.shape[-1] == state.hidden_dim
     ), f"Mismatched shape, {hidden_states.shape[0]=} != {total_num_tokens=} or {hidden_states.shape[-1]=} != {state.hidden_dim=} {hidden_states.shape=}"
     state.comm_buff[:total_num_tokens, :].copy_(hidden_states)
-    nvidia_rsag_multimem_reduce_scatter(state, local_num_tokens, local_token_offset)
+    num_blocks = nvidia_rsag_reduce_scatter_num_blocks(
+        token_list_in_group, state.hidden_dim
+    )
+    nvidia_rsag_multimem_reduce_scatter(
+        state, local_num_tokens, local_token_offset, num_blocks=num_blocks
+    )
     output = state.comm_buff[
         local_token_offset : (local_token_offset + local_num_tokens), :
     ]
