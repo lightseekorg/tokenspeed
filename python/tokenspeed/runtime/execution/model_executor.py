@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.engine.scheduler_utils import (
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
@@ -147,10 +148,8 @@ class ModelExecutorConfig:
             if server_args.speculative_algorithm
             else 1
         )
-        rope_scaling = getattr(
-            model_config.hf_text_config, "rope_parameters", None
-        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
-        model_is_mrope = bool(rope_scaling and "mrope_section" in rope_scaling)
+        rope_parameters = get_rope_parameters(model_config.hf_text_config)
+        model_is_mrope = bool(rope_parameters and "mrope_section" in rope_parameters)
 
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
