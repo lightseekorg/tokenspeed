@@ -5,6 +5,7 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     sigmoid_mul,
+    silu_and_mul,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -111,6 +112,45 @@ def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:
     gate = torch.randn(4, 2, 4, 4, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="gate must be 2D or 3D"):
         sigmoid_mul(x, gate)
+
+
+# --- silu_and_mul tests ---
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("shape", [(1, 7168 * 2), (17, 1024), (128, 9216 * 2)])
+def test_silu_and_mul_matches_eager(
+    dtype: torch.dtype, shape: tuple[int, int], device: str
+) -> None:
+    x = torch.randn(shape, device=device, dtype=dtype)
+    d = shape[-1] // 2
+    ref = torch.nn.functional.silu(x[..., :d].float()) * x[..., d:].float()
+    ref = ref.to(dtype)
+
+    out = silu_and_mul(x)
+
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_silu_and_mul_writes_provided_output(device: str) -> None:
+    x = torch.randn(8, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(8, 256, device=device, dtype=torch.bfloat16)
+    same = silu_and_mul(x, out)
+    assert same.data_ptr() == out.data_ptr()
+
+
+def test_silu_and_mul_empty(device: str) -> None:
+    x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
+    out = silu_and_mul(x)
+    assert out.shape == (0, 256)
+
+
+def test_silu_and_mul_rejects_bad_output_shape(device: str) -> None:
+    x = torch.randn(4, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(4, 128, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="out shape"):
+        silu_and_mul(x, out)
 
 
 # --- fused_gate_sigmoid_mul_add tests ---

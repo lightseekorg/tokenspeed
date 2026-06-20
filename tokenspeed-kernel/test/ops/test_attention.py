@@ -39,27 +39,37 @@ torch.manual_seed(42)
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
 
-pytestmark = pytest.mark.skipif(
-    not (platform.is_nvidia or platform.is_amd),
-    reason="Unified attention tests require an NVIDIA or AMD GPU.",
-)
+
+def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.Tensor:
+    init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
+    tensor = torch.randn(shape, device=device, dtype=init_dtype)
+    if dtype != init_dtype:
+        tensor = tensor.to(dtype)
+    return tensor
 
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [(torch.bfloat16, 64, 8, 2)],
 )
+@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "gluon"])
 @pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
 @pytest.mark.parametrize("is_sliding", [False, True], ids=["full", "sliding"])
 def test_mha_prefill(
     device: str,
+    solution: str,
     dtype: torch.dtype,
     head_dim: int,
     num_q_heads: int,
     num_kv_heads: int,
     has_sink: bool,
     is_sliding: bool,
+    require,
 ) -> None:
+    require("attention", "mha_prefill", solution, dtype, "q")
+    if solution == "fa4" and (has_sink or is_sliding):
+        pytest.skip("FA4 MHA prefill does not support sinks or sliding window")
+
     seqlens_list = [851, 914, 1053]
     max_seqlen = max(seqlens_list)
     cu_seqlens_cpu = [0]
@@ -69,10 +79,10 @@ def test_mha_prefill(
     cu_seqlens = torch.tensor(cu_seqlens_cpu, device=device, dtype=torch.int32)
     total_tokens = int(seqlens.sum().item())
 
-    q = torch.randn(total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
-    k = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
-    v = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
-    sinks = torch.randn(num_q_heads, device=device, dtype=q.dtype) if has_sink else None
+    q = _randn((total_tokens, num_q_heads, head_dim), device=device, dtype=dtype)
+    k = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
+    v = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
+    sinks = _randn((num_q_heads,), device=device, dtype=q.dtype) if has_sink else None
     window_left = 127 if is_sliding else -1
 
     out = mha_prefill(
@@ -84,6 +94,7 @@ def test_mha_prefill(
         max_seqlen=max_seqlen,
         window_left=window_left,
         sinks=sinks,
+        solution=solution,
     )
 
     assert out.shape == q.shape
@@ -92,15 +103,23 @@ def test_mha_prefill(
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 128, 8, 2)],
+    [
+        pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
+    ],
 )
+@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer"])
 def test_mha_extend_with_kvcache(
     device: str,
+    solution: str,
     dtype: torch.dtype,
     head_dim: int,
     num_q_heads: int,
     num_kv_heads: int,
+    require,
 ) -> None:
+    require("attention", "mha_extend_with_kvcache", solution, dtype, "q")
+
     batch_size = 4
     page_size = 64
     max_cache_seqlen = 256
@@ -119,9 +138,11 @@ def test_mha_extend_with_kvcache(
     total_num_blocks = int(num_blocks_per_seq.sum().item())
     total_q = int(query_seqlens.sum().item())
 
-    q = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=dtype)
+    q = _randn((total_q, num_q_heads, head_dim), device=device, dtype=dtype)
     cu_seqlens_q = torch.cumsum(query_seqlens, dim=0, dtype=torch.int32)
     cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0))
+    cu_seqlens_kv = torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+    cu_seqlens_kv = torch.nn.functional.pad(cu_seqlens_kv, (1, 0))
 
     page_table = torch.zeros(
         batch_size,
@@ -167,67 +188,85 @@ def test_mha_extend_with_kvcache(
                     num_kv_heads,
                     head_dim,
                     device=device,
-                    dtype=dtype,
-                )
+                    dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
+                ).to(dtype)
                 v_cache[physical_block, :tokens_in_block] = torch.randn(
                     tokens_in_block,
                     num_kv_heads,
                     head_dim,
                     device=device,
-                    dtype=dtype,
-                )
+                    dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
+                ).to(dtype)
 
     out = mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
         k_cache=k_cache,
         v_cache=v_cache,
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         max_seqlen_q=max_query_seqlen,
         max_seqlen_k=max_cache_seqlen_used,
+        solution=solution,
     )
 
     assert out.shape == q.shape
 
-    triton_out, triton_lse = mha_extend_with_kvcache(
-        q=q,
-        cu_seqlens_q=cu_seqlens_q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=prefix_seqlens,
-        max_seqlen_q=max_query_seqlen,
-        max_seqlen_k=int(prefix_seqlens.max().item()),
-        return_lse=True,
-        solution="triton",
-    )
+    if solution == "triton":
+        triton_out, triton_lse = mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=prefix_seqlens,
+            max_seqlen_q=max_query_seqlen,
+            max_seqlen_k=int(prefix_seqlens.max().item()),
+            return_lse=True,
+            solution=solution,
+        )
 
-    assert triton_out.shape == q.shape
-    assert triton_lse.shape == (q.shape[0], q.shape[1])
+        assert triton_out.shape == q.shape
+        assert triton_lse.shape == (q.shape[0], q.shape[1])
 
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 128, 8, 2)],
+    [
+        pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
+    ],
 )
+@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
+@pytest.mark.parametrize("seqlen_q", [1, 4], ids=["q1", "q4"])
 def test_mha_decode_with_kvcache(
     device: str,
+    solution: str,
+    seqlen_q: int,
     dtype: torch.dtype,
     head_dim: int,
     num_q_heads: int,
     num_kv_heads: int,
+    require,
 ) -> None:
+    require("attention", "mha_decode_with_kvcache", solution, dtype, "q")
+
     batch_size = 4
     page_size = 64
     max_cache_seqlen = 256
     prefix_seqlens = torch.tensor([63, 129, 17, 191], device=device, dtype=torch.int32)
-    cache_seqlens = prefix_seqlens + 1
+    cache_seqlens = prefix_seqlens + seqlen_q
     num_blocks_per_seq = (cache_seqlens + page_size - 1) // page_size
     max_num_blocks_per_seq = (max_cache_seqlen + page_size - 1) // page_size
     total_num_blocks = int(num_blocks_per_seq.sum().item())
 
-    q = torch.randn(batch_size, num_q_heads, head_dim, device=device, dtype=dtype)
+    q = _randn(
+        (batch_size * seqlen_q, num_q_heads, head_dim),
+        device=device,
+        dtype=dtype,
+    )
 
     page_table = torch.zeros(
         batch_size,
@@ -273,15 +312,15 @@ def test_mha_decode_with_kvcache(
                     num_kv_heads,
                     head_dim,
                     device=device,
-                    dtype=dtype,
-                )
+                    dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
+                ).to(dtype)
                 v_cache[physical_block, :tokens_in_block] = torch.randn(
                     tokens_in_block,
                     num_kv_heads,
                     head_dim,
                     device=device,
-                    dtype=dtype,
-                )
+                    dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
+                ).to(dtype)
 
     out = mha_decode_with_kvcache(
         q=q,
@@ -290,9 +329,12 @@ def test_mha_decode_with_kvcache(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max_cache_seqlen,
+        max_seqlen_q=seqlen_q,
+        solution=solution,
     )
 
     assert out.shape == q.shape
+    assert not torch.isnan(out).any()
 
 
 @pytest.mark.parametrize(
@@ -312,7 +354,10 @@ def test_mla_prefill(
     num_heads: int,
     qk_head_dim: int,
     v_head_dim: int,
+    require,
 ) -> None:
+    require("attention", "mla_prefill", solution, dtype, "q")
+
     q_lens = [853, 1045]
     kv_lens = q_lens
     cu_seqlens_q = torch.tensor([0, 853, 1898], device=device, dtype=torch.int32)
@@ -391,7 +436,10 @@ def test_mla_decode_with_kvcache(
     num_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    require,
 ) -> None:
+    require("attention", "mla_decode_with_kvcache", solution, dtype, "q")
+
     batch_size = 2
     q_len = 1
     page_size = 4
@@ -466,18 +514,17 @@ def test_mla_decode_with_kvcache(
 )
 @pytest.mark.parametrize(
     "solution",
-    [None, "triton", "cuda"],
-    ids=["auto", "triton", "cuda"],
+    ["triton", "cuda"],
 )
 def test_attn_merge_state(
     device: str,
-    solution: str | None,
+    solution: str,
     dtype: torch.dtype,
     head_dim: int,
     num_heads: int,
+    require,
 ) -> None:
-    if solution == "cuda" and not (platform.is_nvidia and platform.is_hopper_plus):
-        pytest.skip("CUDA merge-state kernel is NVIDIA Hopper+-only")
+    require("attention", "attn_merge_state", solution, dtype, "out_a")
 
     total_q = 31
     out_a = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)

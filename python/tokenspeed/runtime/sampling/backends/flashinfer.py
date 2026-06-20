@@ -61,9 +61,7 @@ from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs_torch,
-    nan_guard_logits,
 )
-from tokenspeed.runtime.utils import crash_on_warnings
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -310,9 +308,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
+        logits = logits_output.next_token_logits
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
@@ -337,7 +333,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 enable_pdl=pdl_enabled(),
             )
 
-            check_nan = self.config.enable_nan_detection and crash_on_warnings()
             probs = softmax(
                 logits,
                 temperature=temperatures.view(-1, 1),
@@ -348,7 +343,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 top_ks,
                 top_ps,
                 filter_apply_order="joint",
-                check_nan=check_nan,
                 seed=seeds,
                 offset=offsets,
                 deterministic=True,
@@ -455,9 +449,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
             accept_length = self._accept_length_buf[:bs]
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
+        logits = logits_output.next_token_logits
         if dp_sampling:
             expected_rows = bs * num_tokens_per_req
             if logits.shape[0] != expected_rows:

@@ -234,6 +234,7 @@ class MoonViTEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             customized_position_embedding_applier=apply_rope,
+            position_embedding_mode="complex_rope",
             mapping=mapping,
             mm_attention_backend=mm_attention_backend,
         )

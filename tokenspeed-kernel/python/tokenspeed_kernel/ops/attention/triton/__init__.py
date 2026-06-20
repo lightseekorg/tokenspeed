@@ -38,7 +38,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
-def mha_merge_state_kernel(
+def attn_merge_state_kernel(
     OutA,
     LseA,
     OutB,
@@ -158,6 +158,7 @@ def triton_mha_prefill(
 def triton_mha_extend_with_kvcache(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -239,6 +240,7 @@ def triton_mha_decode_with_kvcache(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
+    max_seqlen_q: int = 1,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -275,6 +277,7 @@ def triton_mha_decode_with_kvcache(
         attn_lse,
         num_kv_splits,
         max_kv_splits,
+        max_seqlen_q,
         page_table.stride(0),
         k_cache.shape[1],
         window_left,
@@ -287,8 +290,8 @@ def triton_mha_decode_with_kvcache(
 
 @register_kernel(
     "attention",
-    "mha_merge_state",
-    name="triton_mha_merge_state",
+    "attn_merge_state",
+    name="triton_attn_merge_state",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=format_signatures(
@@ -298,7 +301,7 @@ def triton_mha_decode_with_kvcache(
     traits={},
     tags={"portability"},
 )
-def triton_mha_merge_state(
+def triton_attn_merge_state(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,
     out_b: torch.Tensor,
@@ -310,7 +313,7 @@ def triton_mha_merge_state(
     total_rows = out_a.shape[0] * out_a.shape[1]
     head_dim = out_a.shape[2]
     block_d = triton.next_power_of_2(head_dim)
-    mha_merge_state_kernel[(total_rows,)](
+    attn_merge_state_kernel[(total_rows,)](
         out_a,
         lse_a,
         out_b,

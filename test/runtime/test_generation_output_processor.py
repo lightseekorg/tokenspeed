@@ -48,6 +48,12 @@ class _Tokenizer:
 class _Metrics:
     enabled = False
 
+    def __init__(self):
+        self.nan_aborts = 0
+
+    def record_nan_abort(self):
+        self.nan_aborts += 1
+
 
 class _ForwardOp:
     request_ids = ["prefill", "decode"]
@@ -63,6 +69,7 @@ class _ExecutionResult:
     output_tokens = torch.tensor([11, 22], dtype=torch.int32)
     output_lengths = torch.tensor([1, 1], dtype=torch.int32)
     output_logprobs = None
+    output_nan_flags = None
     grammar_completion = None
 
     def sync(self):
@@ -118,3 +125,109 @@ def test_mark_abort_notify_client_flag():
     processor.mark_abort("client")  # default: client tore down its own state
     assert client_state.to_abort
     assert not client_state.abort_notify_client
+
+
+def test_nan_flag_finishes_request_with_numerical_error():
+    """A request flagged by the NaN guard is finished with
+    ABORT_CODE.NumericalError while the rest of the batch continues."""
+    from tokenspeed.runtime.engine.request_types import ABORT_CODE, FINISH_ABORT
+
+    sender = _Sender()
+    metrics = _Metrics()
+    processor = OutputProcesser(sender, global_rank=0, metrics=metrics)
+    prefill_state = _state([1, 2, 3, 4])
+    decode_state = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["prefill"] = prefill_state
+    processor.rid_to_state["decode"] = decode_state
+
+    result = _ExecutionResult()
+    # Flag only the decode slot.
+    result.output_nan_flags = torch.tensor([0, 1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(_ForwardOp(), result)
+
+    # Flagged request: aborted with NumericalError, removed from tracking.
+    # The scheduler gets an Abort (NOT Finish) event — AbortEvent skips the
+    # radix-tree insert and host-KV writeback, so corrupted KV is not reused.
+    assert isinstance(decode_state.finished_reason, FINISH_ABORT)
+    assert decode_state.finished_reason.err_type == ABORT_CODE.NumericalError
+    assert "decode" not in processor.rid_to_state
+    abort_events = [e for e in events if type(e).__name__ == "Abort"]
+    assert [e.request_id for e in abort_events] == ["decode"]
+    assert not [e for e in events if type(e).__name__ == "Finish"]
+    assert metrics.nan_aborts == 1
+
+    # Unflagged request keeps running untouched.
+    assert not prefill_state.finished
+    assert "prefill" in processor.rid_to_state
+    assert prefill_state.output_ids == [11]
+
+    # The abort finish reason is streamed to the client.
+    assert len(sender.items) == 1
+    out = sender.items[0]
+    idx = out.rids.index("decode")
+    assert out.finished_reasons[idx]["type"] == "abort"
+    assert out.finished_reasons[idx]["err_type"] == ABORT_CODE.NumericalError.value
+
+
+def test_nan_flag_keeps_single_sanitized_token():
+    """A NaN-flagged spec-decode slot keeps exactly one (sanitized) token so
+    extend-result accounting matches a normal mid-step finish."""
+    sender = _Sender()
+    metrics = _Metrics()
+    processor = OutputProcesser(
+        sender,
+        global_rank=0,
+        spec_algorithm="eagle",
+        spec_num_tokens=4,
+        metrics=metrics,
+    )
+    decode_state = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["decode"] = decode_state
+
+    class _SpecForwardOp:
+        request_ids = ["decode"]
+        request_pool_indices = [0]
+        input_lengths = [1]
+        extend_prefix_lens = []
+
+        def num_extends(self):
+            return 0
+
+    result = _ExecutionResult()
+    result.output_tokens = torch.tensor([11, 22, 33, 44], dtype=torch.int32)
+    result.output_lengths = torch.tensor([3], dtype=torch.int32)
+    result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(_SpecForwardOp(), result)
+
+    assert decode_state.finished
+    # Only the first of the 3 accepted tokens is kept.
+    assert decode_state.output_ids == [11]
+    extend_events = [e for e in events if type(e).__name__ == "ExtendResult"]
+    assert len(extend_events) == 1
+    assert list(extend_events[0].tokens) == [11]
+    assert metrics.nan_aborts == 1
+
+
+def test_nan_flag_skips_first_token_pd_handoff():
+    """NaN-terminated requests must not hand their bootstrap token to the PD
+    transfer layer — their KV is suspect."""
+    sender = _Sender()
+    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+
+    result = _ExecutionResult()
+    result.next_input_ids = None
+    result.output_nan_flags = torch.tensor([1, 0], dtype=torch.int32)
+
+    handoffs = []
+    processor.post_process_forward_op(
+        _ForwardOp(),
+        result,
+        on_first_token=lambda rid, *a: handoffs.append(rid),
+    )
+
+    # Flagged prefill slot is skipped; the healthy decode slot still hands off.
+    assert handoffs == ["decode"]

@@ -29,9 +29,10 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.attention.flash_attn import mha_decode_scheduler_metadata
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
@@ -50,7 +51,7 @@ __all__ = [
     "mla_prefill",
     "mla_decode_with_kvcache",
     "attn_merge_state",
-    "mha_decode_scheduler_metadata",
+    "attn_plan",
 ]
 
 LSE_LN = math.log2(math.e)
@@ -163,6 +164,7 @@ def mha_extend_with_kvcache(
     # attention inputs
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -184,6 +186,7 @@ def mha_extend_with_kvcache(
     Args:
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
         cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
@@ -254,6 +257,7 @@ def mha_extend_with_kvcache(
         return kernel(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
@@ -276,12 +280,12 @@ def mha_decode_with_kvcache(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
+    max_seqlen_q: int,
     # attention options
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
-    scheduler_metadata: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -289,12 +293,15 @@ def mha_decode_with_kvcache(
     """MHA decode with paged KV cache.
 
     Args:
-        q: Query tensor with shape [batch, num_q_heads, head_dim].
+        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
         k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
         page_table: Page table with shape [batch, max_pages_per_seq].
         cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
         max_seqlen_k: Maximum KV length.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and `spec_num_tokens` for compact
+            speculative decode.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
@@ -302,12 +309,6 @@ def mha_decode_with_kvcache(
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
-    if q.shape[0] != cache_seqlens.shape[0]:
-        raise ValueError(
-            "mha_decode_with_kvcache assumes query length 1; "
-            f"got q.shape[0]={q.shape[0]} and batch={cache_seqlens.shape[0]}"
-        )
-
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
@@ -337,7 +338,7 @@ def mha_decode_with_kvcache(
         "num_q_heads": q.shape[1],
         "num_kv_heads": k_cache.shape[2],
         "head_dim": q.shape[-1],
-        "max_seqlen_q": 1,
+        "max_seqlen_q": max_seqlen_q,
         "max_seqlen_k": max_seqlen_k,
     }
     ShapeCapture.get().record(
@@ -356,7 +357,7 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        kernel_kwargs = dict(
+        return kernel(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -367,12 +368,8 @@ def mha_decode_with_kvcache(
             sinks=sinks,
             return_lse=return_lse,
             max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
         )
-        # Only the FA3 path accepts pre-computed scheduler metadata; other
-        # backends would reject the unknown kwarg.
-        if scheduler_metadata is not None:
-            kernel_kwargs["scheduler_metadata"] = scheduler_metadata
-        return kernel(**kernel_kwargs)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -656,7 +653,7 @@ def attn_merge_state(
     signature = _attention_format_signature(out_a=out_a, out_b=out_b)
     kernel = select_kernel(
         "attention",
-        "mha_merge_state",
+        "attn_merge_state",
         signature,
         traits=traits,
         solution=solution,
@@ -670,7 +667,7 @@ def attn_merge_state(
     }
     ShapeCapture.get().record(
         "attention",
-        "mha_merge_state",
+        "attn_merge_state",
         kernel.name,
         out_a.dtype,
         shape_params,
@@ -678,7 +675,7 @@ def attn_merge_state(
 
     with kernel_scope(
         "attention",
-        "mha_merge_state",
+        "attn_merge_state",
         out_a.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -690,3 +687,65 @@ def attn_merge_state(
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
         )
+
+
+def attn_plan(
+    dtype: torch.dtype,
+    head_dim: int,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    solution: str | None = None,
+) -> dict:
+    """Build an attention execution plan from registered kernel capabilities.
+
+    Args:
+        dtype: Query/K/V dtype for prefill planning.
+        head_dim: Attention head dimension.
+        window_left: Sliding-window size, or -1 for full-context attention.
+        logit_cap: Logit soft-cap value, or 0.0 when disabled.
+        sinks: Attention sinks tensor when sinks are enabled.
+        return_lse: Whether the selected path must return LSE values.
+        solution: Optional kernel solution to restrict planning.
+
+    Returns:
+        A dict containing:
+        - "extend_mode":
+          "postwrite" means run prefill before writing KV cache;
+          "prewrite" means write KV cache first and run cached extend.
+
+    FP8 currently prefers "prewrite" because the cache write and downcast
+    path is easier to fuse. Other dtypes use "postwrite" only when a
+    matching prefill kernel with at least performant priority exists;
+    otherwise they use "prewrite".
+    """
+    if dtype == torch.float8_e4m3fn:
+        return {"extend_mode": "prewrite"}
+
+    traits = {
+        "head_dim": head_dim,
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": logit_cap != 0.0,
+        "support_sinks": sinks is not None,
+        "return_lse": return_lse,
+    }
+    signature = format_signature(
+        q=dense_tensor_format(dtype),
+        k=dense_tensor_format(dtype),
+        v=dense_tensor_format(dtype),
+    )
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        "mha_prefill",
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    candidates = [spec for spec in candidates if spec_matches_traits(spec, traits)]
+    extend_mode = (
+        "postwrite"
+        if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
+        else "prewrite"
+    )
+    return {"extend_mode": extend_mode}

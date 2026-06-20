@@ -333,6 +333,10 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_speculative_decoding()
         self.assertIsNone(sa.speculative_draft_model_quantization)
 
+    def test_mxfp4_quantization_arg(self):
+        args = self._parse_args(["--model", "test/model", "--quantization", "mxfp4"])
+        self.assertEqual(args.quantization, "mxfp4")
+
     def test_dotted_attention_config_args(self):
         args = self._parse_args(
             [
