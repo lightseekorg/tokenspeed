@@ -136,7 +136,6 @@ def _run_rt_generate(
                     "max_new_tokens": max_new_tokens,
                     "temperature": 0,
                 },
-                return_logprob=False,
                 stream=False,
             )
             text = response["text"]

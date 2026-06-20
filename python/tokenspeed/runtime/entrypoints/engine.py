@@ -149,16 +149,13 @@ class Engine(EngineBase):
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
-        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-        # Can be formatted as:
-        # - Single image for a single request
-        # - List of images (one per request in a batch)
-        # - List of lists of images (multiple images per request)
-        # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        return_logprob: list[bool] | bool | None = False,
+        # SGLang-dialect output logprobs (vLLM dialect: sampling_params["logprobs"]).
+        return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,
+        return_text_in_logprobs: bool = False,
+        logprob_format: list[str | None] | str | None = None,
         custom_logit_processor: list[str] | str | None = None,
         return_hidden_states: bool = False,
         stream: bool = False,
@@ -182,12 +179,6 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be less than dp_size: {self.server_args.mapping.attn.dp_size}"
                 )
 
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
-            return_logprob = False
-            logprob_start_len = None
-            top_logprobs_num = None
-            token_ids_logprob = None
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -196,6 +187,8 @@ class Engine(EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            return_text_in_logprobs=return_text_in_logprobs,
+            logprob_format=logprob_format,
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             stream=stream,
@@ -218,16 +211,13 @@ class Engine(EngineBase):
         input_embeds: torch.Tensor = None,
         input_multi_ids: list[list[int]] = None,
         input_extra_infos: list[dict] = None,
-        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-        # Can be formatted as:
-        # - Single image for a single request
-        # - List of images (one per request in a batch)
-        # - List of lists of images (multiple images per request)
-        # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        return_logprob: list[bool] | bool | None = False,
+        # SGLang-dialect output logprobs (vLLM dialect: sampling_params["logprobs"]).
+        return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,
+        return_text_in_logprobs: bool = False,
+        logprob_format: list[str | None] | str | None = None,
         custom_logit_processor: list[str] | str | None = None,
         return_hidden_states: bool = False,
         stream: bool = False,
@@ -242,12 +232,6 @@ class Engine(EngineBase):
         Please refer to ``GenerateReqInput`` for the documentation.
         """
 
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
-            return_logprob = False
-            logprob_start_len = None
-            top_logprobs_num = None
-            token_ids_logprob = None
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -259,6 +243,8 @@ class Engine(EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            return_text_in_logprobs=return_text_in_logprobs,
+            logprob_format=logprob_format,
             return_hidden_states=return_hidden_states,
             stream=stream,
             custom_logit_processor=custom_logit_processor,

@@ -25,13 +25,36 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+# Streaming merge policy for the logprob meta_info fields. These are the UNION
+# of both dialects' per-position list keys; only one dialect is present per
+# request (the renderer emits one), so the union is harmless.
+#
+# Each value is a per-position list that GROWS as frames arrive, so it must be
+# appended rather than overwritten -- hence merged by ``_extend_sequence``. That
+# helper is dict-safe: its prefix check (``_is_prefix``) compares elements only
+# with ``==``, which both ``dict`` and the ``Logprob`` dataclass support, so the
+# entries never need to be hashed or ordered.
+#
+# ``cumulative_logprob`` is a scalar handled separately (see _SUM_META_KEYS):
+# under streaming each frame recomputes it from a fresh dict, so each frame's
+# value is the sum of only that frame's positions (a delta). Since the
+# per-position ``logprobs`` are appended across frames, the scalar must be
+# *summed* (not overwritten) to stay consistent with the appended list.
 _APPEND_META_KEYS = {
+    # vLLM dialect
+    "logprobs",
+    # SGLang dialect
     "input_token_logprobs",
     "output_token_logprobs",
     "input_top_logprobs",
     "output_top_logprobs",
     "input_token_ids_logprobs",
     "output_token_ids_logprobs",
+}
+
+# Scalar logprob metadata accumulated by addition across coalesced frames.
+_SUM_META_KEYS = {
+    "cumulative_logprob",
 }
 
 
@@ -114,6 +137,10 @@ class RequestOutputCollector:
                 continue
             if key in _APPEND_META_KEYS:
                 self._extend_sequence(pending, key, value)
+                continue
+            if key in _SUM_META_KEYS:
+                if value is not None:
+                    pending[key] = (pending.get(key) or 0.0) + value
                 continue
             pending[key] = value
 

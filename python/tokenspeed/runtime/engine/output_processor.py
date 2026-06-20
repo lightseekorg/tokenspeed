@@ -128,13 +128,23 @@ class OutputProcessor:
             }
             logprobs_info = state.logprobs_info if not state.obj.stream else {}
 
-            if getattr(state.obj, "return_logprob", False):
+            obj = state.obj
+            sp = getattr(obj, "sampling_params", None) or {}
+            vllm_req = sp.get("logprobs") is not None
+            sglang_req = bool(getattr(obj, "return_logprob", False))
+            if vllm_req or sglang_req:
+                # Render the dialect the request asked for; default = match the
+                # request (vLLM via sampling_params.logprobs, else SGLang).
+                fmt = getattr(obj, "logprob_format", None) or (
+                    "vllm" if vllm_req else "sglang"
+                )
                 try:
                     self.logprobs_processor.convert_logprob_style(
                         logprobs_info,
-                        state.obj.top_logprobs_num,
-                        state.obj.token_ids_logprob,
-                        state.obj.return_text_in_logprobs,
+                        fmt,
+                        getattr(obj, "top_logprobs_num", 0) or 0,
+                        getattr(obj, "token_ids_logprob", None),
+                        bool(getattr(obj, "return_text_in_logprobs", False)),
                         recv_obj,
                         i,
                     )
