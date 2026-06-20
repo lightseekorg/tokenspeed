@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 _GATEWAY_MODULE = "smg"
 _ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
 
+# Log-pipe StreamReader buffer limit. Load-bearing: at the 64KB default the
+# reader pauses the pipe (asyncio flow control) when it briefly falls behind
+# under a log flood, the kernel pipe fills, and the engine's next hot-path log
+# write() blocks in anon_pipe_write -> TP deadlock (idle GPUs). A large limit
+# keeps the pipe draining into memory instead of pausing it.
+_PIPE_LINE_LIMIT = 64 * 1024 * 1024
+
 
 async def spawn_engine(
     args: list[str],
@@ -58,6 +65,7 @@ async def spawn_engine(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=_PIPE_LINE_LIMIT,
     )
 
 
@@ -84,6 +92,7 @@ async def spawn_gateway(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=_PIPE_LINE_LIMIT,
     )
 
 
