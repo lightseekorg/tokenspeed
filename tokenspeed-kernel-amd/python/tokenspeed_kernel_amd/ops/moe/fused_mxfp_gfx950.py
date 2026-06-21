@@ -4112,9 +4112,14 @@ def _pipelined_moe_tile_compute(
 
     if HAS_BIAS:
         bias_offs = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
-        bias_mask = bias_offs < N
+        if Y_N_CONST and not DO_SWIGLU:
+            BIAS_N: gl.constexpr = Y_N_CONST
+            bias_mask = bias_offs < BIAS_N
+        else:
+            bias_mask = bias_offs < N
+        bias_offs_safe = gl.where(bias_mask, bias_offs, gl.zeros_like(bias_offs))
         bias = gl.load(
-            bias_ptr + expert_id * stride_be + bias_offs,
+            bias_ptr + expert_id * stride_be + bias_offs_safe,
             mask=bias_mask,
             other=0.0,
         )
@@ -4159,21 +4164,21 @@ def _pipelined_moe_tile_compute(
         ACTUAL_N: gl.constexpr = (N_LIMIT // 2) if DO_SWIGLU else N_LIMIT
     else:
         actual_n = (N // 2) if DO_SWIGLU else N
+    if Y_N_CONST or N_LIMIT:
+        n_in_bounds = offs_y_n < ACTUAL_N
+    else:
+        n_in_bounds = offs_y_n < actual_n
+    offs_y_n_safe = gl.where(n_in_bounds, offs_y_n, gl.zeros_like(offs_y_n))
     if HAS_SCATTER:
         rows_y = gl.load(scatter_idx_ptr + offs_y_m_safe, mask=y_m_in_bounds, other=M)
-        if Y_N_CONST or N_LIMIT:
-            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < ACTUAL_N)
-        else:
-            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
-        rows_y_safe = gl.where(y_m_in_bounds, rows_y, gl.zeros_like(rows_y))
-        y_offs = rows_y_safe[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
+        rows_y_in_bounds = rows_y < M
+        mask_y = rows_y_in_bounds[:, None] & n_in_bounds[None, :]
+        rows_y_safe = gl.where(rows_y_in_bounds, rows_y, gl.zeros_like(rows_y))
+        y_offs = rows_y_safe[:, None] * stride_ym + offs_y_n_safe[None, :] * stride_yn
     else:
-        if Y_N_CONST or N_LIMIT:
-            mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < ACTUAL_N)
-        else:
-            mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < actual_n)
+        mask_y = y_m_in_bounds[:, None] & n_in_bounds[None, :]
         offs_y_m_2d_safe = offs_y_m_safe[:, None]
-        y_offs = offs_y_m_2d_safe * stride_ym + offs_y_n[None, :] * stride_yn
+        y_offs = offs_y_m_2d_safe * stride_ym + offs_y_n_safe[None, :] * stride_yn
 
     gl.store(y_ptr + y_offs, out, mask=mask_y)
 
@@ -4599,8 +4604,12 @@ def _medium_decode_body(
     if MEDIUM_COMBINE:
         if HAS_BIAS:
             bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
+            bias_mask = bias_n < N
+            bias_n_safe = gl.where(bias_mask, bias_n, gl.zeros_like(bias_n))
             bias = gl.load(
-                bias_ptr + expert.to(gl.int64) * N + bias_n, mask=bias_n < N, other=0.0
+                bias_ptr + expert.to(gl.int64) * N + bias_n_safe,
+                mask=bias_mask,
+                other=0.0,
             ).to(gl.float32)
             bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
             acc = acc + bias[None, :]
@@ -4617,15 +4626,23 @@ def _medium_decode_body(
         scatter_row = gl.load(Scatter + sorted_store).to(gl.int32)
         gate = gl.load(Gate + sorted_store).to(Y.dtype.element_ty)
         out = out * gate[:, None]
+        n_in_bounds = n_out < N
+        n_out_safe = gl.where(n_in_bounds, n_out, gl.zeros_like(n_out))
         y_offs = (
             scatter_row[:, None].to(gl.int64) * stride_ym
-            + n_out[None, :].to(gl.int64) * stride_yn
+            + n_out_safe[None, :].to(gl.int64) * stride_yn
         )
-        _moe_masked_store(out, Y, y_offs, n_out[None, :] < N, USE_BUFFER_STORE=False)
+        _moe_masked_store(out, Y, y_offs, n_in_bounds[None, :], USE_BUFFER_STORE=False)
     else:
         if HAS_BIAS:
             bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
-            bias = gl.load(bias_ptr + expert.to(gl.int64) * N + bias_n).to(gl.float32)
+            bias_mask = bias_n < N
+            bias_n_safe = gl.where(bias_mask, bias_n, gl.zeros_like(bias_n))
+            bias = gl.load(
+                bias_ptr + expert.to(gl.int64) * N + bias_n_safe,
+                mask=bias_mask,
+                other=0.0,
+            ).to(gl.float32)
             bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
             acc = acc + bias[None, :]
 
@@ -4642,11 +4659,19 @@ def _medium_decode_body(
         local_store_m = block_in_expert * BLOCK_M + sm
         sorted_store = m_base + local_store_m
         valid_store = local_store_m < m_size
+        n_in_bounds = n_out < (N // 2)
+        n_out_safe = gl.where(n_in_bounds, n_out, gl.zeros_like(n_out))
         y_off = (
             sorted_store[:, None].to(gl.int64) * stride_ym
-            + n_out[None, :].to(gl.int64) * stride_yn
+            + n_out_safe[None, :].to(gl.int64) * stride_yn
         )
-        _moe_masked_store(out, Y, y_off, valid_store[:, None], USE_BUFFER_STORE=True)
+        _moe_masked_store(
+            out,
+            Y,
+            y_off,
+            valid_store[:, None] & n_in_bounds[None, :],
+            USE_BUFFER_STORE=True,
+        )
 
 
 def _pipelined_moe_kernel_repr(specialization) -> str:
@@ -7844,19 +7869,21 @@ def _moe_partial_reduce(
     pid_n = pid % num_n
     LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
     n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
-    bound = (pid_m < M) & (n < N)
+    n_in_bounds = n < N
+    n_safe = gl.where(n_in_bounds, n, gl.zeros_like(n))
+    bound = (pid_m < M) & n_in_bounds
     acc = gl.zeros([BLOCK_N], gl.float32, layout=LAYOUT)
     for k in gl.static_range(SPLIT_K):
         acc += gl.load(
             Partial
             + k * stride_pk
             + pid_m.to(gl.int64) * stride_pm
-            + n.to(gl.int64) * stride_pn,
+            + n_safe.to(gl.int64) * stride_pn,
             mask=bound,
             other=0.0,
         ).to(gl.float32)
     gl.store(
-        Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
+        Out + pid_m.to(gl.int64) * stride_om + n_safe.to(gl.int64) * stride_on,
         acc.to(Out.dtype.element_ty),
         mask=bound,
     )

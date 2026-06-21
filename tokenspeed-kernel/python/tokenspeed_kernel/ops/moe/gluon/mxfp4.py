@@ -69,6 +69,7 @@ def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
 
     w2_weight = w.w2_weight.data
     w2_scale = w.w2_weight_scale.data
+    w2_bias = getattr(w, "w2_weight_bias", None)
     w.w2_weight = torch.nn.Parameter(
         torch.cat(
             [
@@ -100,6 +101,23 @@ def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
         ),
         requires_grad=False,
     )
+    if w2_bias is not None:
+        w2_bias_data = w2_bias.data
+        w.w2_weight_bias = torch.nn.Parameter(
+            torch.cat(
+                [
+                    w2_bias_data,
+                    torch.zeros(
+                        *w2_bias_data.shape[:-1],
+                        extra_n,
+                        dtype=w2_bias_data.dtype,
+                        device=w2_bias_data.device,
+                    ),
+                ],
+                dim=-1,
+            ),
+            requires_grad=False,
+        )
 
 
 def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
