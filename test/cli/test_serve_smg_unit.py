@@ -39,9 +39,9 @@ from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
-    DEFAULT_REASONING_PARSER,
     _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
+    _gateway_args_with_default_policy,
     _gateway_args_with_default_port,
     _gateway_args_with_default_prometheus_port,
     _gateway_args_with_default_reasoning_parser,
@@ -96,6 +96,18 @@ def test_gateway_args_preserve_user_reasoning_parser():
     assert gateway_args == ["--reasoning-parser", "qwen3"]
 
 
+def test_gateway_args_default_policy_is_passthrough():
+    gateway_args = _gateway_args_with_default_policy(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--policy", "passthrough"]
+
+
+def test_gateway_args_preserve_user_policy():
+    gateway_args = _gateway_args_with_default_policy(["--policy", "round_robin"])
+
+    assert gateway_args == ["--policy", "round_robin"]
+
+
 def test_gateway_args_defaults_include_port_and_reasoning_parser():
     gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
 
@@ -108,6 +120,8 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "passthrough",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--policy",
+        "passthrough",
         "--tokenizer-cache-enable-l0",
         "--tokenizer-cache-enable-l1",
         "--log-level",
@@ -115,6 +129,28 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--prometheus-port",
         "8413",
     ]
+
+
+def test_gateway_args_defaults_inject_passthrough_policy():
+    """``ts serve`` fronts a single backend, so the default routing policy is
+    ``passthrough`` (no load balancing / monitoring / KV-event subscription)."""
+    gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
+
+    assert "--policy" in gateway_args
+    idx = gateway_args.index("--policy")
+    assert gateway_args[idx + 1] == "passthrough"
+
+
+def test_gateway_args_defaults_preserve_user_policy():
+    """An explicit operator ``--policy`` is never overridden by the default."""
+    gateway_args = _gateway_args_with_defaults(
+        ["--model", "/tmp/x", "--policy", "round_robin"]
+    )
+
+    # Exactly one --policy (default not appended on top of the explicit value).
+    assert gateway_args.count("--policy") == 1
+    idx = gateway_args.index("--policy")
+    assert gateway_args[idx + 1] == "round_robin"
 
 
 def test_gateway_args_default_log_level_is_warn():
@@ -284,9 +320,14 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     )
     gateway_args = _gateway_args_with_defaults(gateway_args)
 
+    # Exactly one reasoning parser, and it is the deepseek-v4 default — the
+    # generic passthrough reasoning-parser default must not be layered on top.
+    # Check the parser slot rather than bare membership: the value "passthrough"
+    # (== DEFAULT_REASONING_PARSER) now also appears as the --policy value, which
+    # is an unrelated flag.
+    assert gateway_args.count("--reasoning-parser") == 1
     idx = gateway_args.index("--reasoning-parser")
     assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
-    assert DEFAULT_REASONING_PARSER not in gateway_args
 
 
 def test_local_deepseek_v4_config_is_detected(tmp_path):
