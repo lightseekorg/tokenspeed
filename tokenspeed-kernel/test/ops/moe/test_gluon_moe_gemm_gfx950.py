@@ -435,13 +435,18 @@ def _make_hidden_and_router(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor
     return hidden_states, router_logits
 
 
-def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
+def _make_gemm2_input(
+    num_tokens: int,
+    scale: torch.Tensor,
+    *,
+    topk: int = TOPK,
+) -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(19000 + num_tokens)
     exact_values = (
         torch.randint(
             -4,
             5,
-            (num_tokens * TOPK, INTERMEDIATE_SIZE),
+            (num_tokens * topk, INTERMEDIATE_SIZE),
             device="cuda",
             generator=generator,
         ).to(torch.float32)
@@ -463,23 +468,25 @@ def _swiglu_activation() -> FusedActivation:
 def _compute_triton_reference(
     num_tokens: int,
     weights: Mxfp4Weights,
+    *,
+    topk: int = TOPK,
 ) -> TritonReference:
     hidden_states, router_logits = _make_hidden_and_router(num_tokens)
 
     ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
         router_logits,
-        TOPK,
+        topk,
         sm_first=False,
         dtype=router_logits.dtype,
     )
 
-    assert int(ragged_metadata.slice_sizes.sum()) == num_tokens * TOPK
+    assert int(ragged_metadata.slice_sizes.sum()) == num_tokens * topk
 
     gemm1_input = fp8_quantize(
         hidden_states,
         scale=weights.w13_act_scale,
     )
-    gemm2_input = _make_gemm2_input(num_tokens, weights.w2_act_scale)
+    gemm2_input = _make_gemm2_input(num_tokens, weights.w2_act_scale, topk=topk)
 
     with torch.no_grad():
         gemm1_output = matmul(
@@ -501,7 +508,7 @@ def _compute_triton_reference(
             precision_config=weights.w2_precision_config,
             gammas=gate_scal,
         )
-        gemm2_output = gemm2_routed.view(num_tokens, TOPK, gemm2_routed.shape[-1]).sum(
+        gemm2_output = gemm2_routed.view(num_tokens, topk, gemm2_routed.shape[-1]).sum(
             dim=1
         )
 
@@ -529,9 +536,19 @@ def triton_references(
     }
 
 
+def _assert_last_kernel_name(expected: str) -> None:
+    profile = gluon_moe.last_kernel_profile()
+    assert profile is not None
+    kernel_name = str(profile.get("kernel_name", ""))
+    assert expected in kernel_name, profile
+
+
 def _run_gluon_gemms(
     reference: TritonReference,
     weights: Mxfp4Weights,
+    *,
+    topk: int = TOPK,
+    expected_kernel_name: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         gemm1_output = gluon_moe.gluon_mxfp_ragged_matmul(
@@ -544,6 +561,9 @@ def _run_gluon_gemms(
             fused_activation=_swiglu_activation(),
         )
 
+        if expected_kernel_name is not None:
+            _assert_last_kernel_name(expected_kernel_name)
+
         gemm2_output = gluon_moe.gluon_mxfp_ragged_matmul(
             reference.gemm2_input,
             weights.w2_weight,
@@ -552,9 +572,12 @@ def _run_gluon_gemms(
             scatter_indx=reference.scatter_indx,
             precision_config=weights.w2_precision_config,
             gammas=reference.gate_scal,
-            n_tokens=reference.gate_scal.shape[0] // TOPK,
-            n_expts_act=TOPK,
+            n_tokens=reference.gate_scal.shape[0] // topk,
+            n_expts_act=topk,
         )
+
+        if expected_kernel_name is not None:
+            _assert_last_kernel_name(expected_kernel_name)
 
     torch.cuda.synchronize()
     return gemm1_output, gemm2_output
@@ -594,6 +617,37 @@ def test_gluon_moe_gemms_without_preshuffle_match_triton_gfx950(
         num_tokens,
         weights=mxfp4_weights.nonpreshuffled,
         triton_references=triton_references,
+    )
+
+
+@requires_gfx950
+def test_gluon_moe_topk4_preshuffle_uses_block_schedule_gfx950(
+    mxfp4_weights: Mxfp4WeightVariants,
+) -> None:
+    topk = 4
+    reference = _compute_triton_reference(
+        8,
+        mxfp4_weights.nonpreshuffled,
+        topk=topk,
+    )
+    gluon_gemm1, gluon_gemm2 = _run_gluon_gemms(
+        reference,
+        mxfp4_weights.preshuffled,
+        topk=topk,
+        expected_kernel_name="_pipelined_moe_kernel_scaled_block_schedule",
+    )
+
+    torch.testing.assert_close(
+        gluon_gemm1.float(),
+        reference.gemm1_output.float(),
+        atol=GEMM_ATOL,
+        rtol=RTOL,
+    )
+    torch.testing.assert_close(
+        gluon_gemm2.float(),
+        reference.gemm2_output.float(),
+        atol=GEMM_ATOL,
+        rtol=RTOL,
     )
 
 

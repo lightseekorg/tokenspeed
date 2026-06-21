@@ -342,37 +342,48 @@ def _swiglu_reduce(
 # ---------------------------------------------------------------------------
 
 
+_SCALE_TILES_PER_WARP_UNIT = (1, 1)
+_SCALE_TILES_PER_WARP_MX_SWIZZLED_2X2 = (2, 2)
+_SCALE_TILES_PER_WARP_MEDIUM_DECODE_1X2 = (1, 2)
+_SCALE_TILES_PER_WARP_VALUES = (
+    _SCALE_TILES_PER_WARP_UNIT,
+    _SCALE_TILES_PER_WARP_MX_SWIZZLED_2X2,
+    _SCALE_TILES_PER_WARP_MEDIUM_DECODE_1X2,
+)
+
+
 @gluon.constexpr_function
 def get_mfma_layout(
     num_warps: int,
-    use_mfma_scaled: bool,
-    scale_preshuffle: bool = False,
+    use_scaled_mfma: bool,
+    scale_tiles_per_warp: tuple[int, int] = _SCALE_TILES_PER_WARP_UNIT,
     block_m: int = 0,
-    w_via_vgpr: bool = False,
+    w_operand_forces_warps_m_2: bool = False,
 ) -> gl.constexpr:
     # CDNA4 (gfx950): scaled MFMA = 16x16x128 (mxfp/fp8); regular = 16x16x32.
     # ``[2, 2]`` warps_per_cta split keeps W DotOperand per warp at
     # half the ``[num_warps, 1]`` footprint -- the latter spills VGPRs
-    # at BN=256. ``w_via_vgpr`` forces ``warps_m=2`` because the host-
-    # preshuffled ``LOAD_W_LAYOUT`` assumes that split for the
-    # ``assert_trivial=True`` convert; BM<=32 small-tile decode prefers
-    # ``warps_m=1`` to keep the fundamental block from over-filling M.
+    # at BN=256. Some W operand layouts force ``warps_m=2`` because their
+    # layout bases assume that split for ``assert_trivial=True`` converts.
     assert num_warps in (4, 8), "MI355 MoE kernel currently supports 4 or 8 warps."
-    if w_via_vgpr and num_warps >= 4:
+    if w_operand_forces_warps_m_2 and num_warps >= 4:
         warps_m = 2
     elif block_m and block_m <= 32 and num_warps >= 4:
         warps_m = 1
     else:
         warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
-    instr_shape = [16, 16, 128] if use_mfma_scaled else [16, 16, 32]
-    # tpw=[2,2] required when scales preshuffle through LDS (the 5-D
-    # unswizzle view absorbs one 2x2 MFMA block per warp per K-iter).
-    # M<=16 direct (medium-decode) tiles use [1,2]; larger keep [2,2].
-    if scale_preshuffle and block_m and block_m <= 16:
-        tiles_per_warp = [1, 2]
-    else:
-        tiles_per_warp = [2, 2] if scale_preshuffle else [1, 1]
+    instr_shape = [16, 16, 128] if use_scaled_mfma else [16, 16, 32]
+    if scale_tiles_per_warp == _SCALE_TILES_PER_WARP_MEDIUM_DECODE_1X2:
+        assert (
+            block_m and block_m <= 16
+        ), "medium-decode scale layout requires BLOCK_M <= 16"
+    elif scale_tiles_per_warp not in _SCALE_TILES_PER_WARP_VALUES:
+        raise ValueError(
+            f"scale_tiles_per_warp must be one of "
+            f"{_SCALE_TILES_PER_WARP_VALUES}, got {scale_tiles_per_warp!r}"
+        )
+    tiles_per_warp = [scale_tiles_per_warp[0], scale_tiles_per_warp[1]]
     return gl.amd.cdna4.AMDMFMALayout(
         version=4,
         instr_shape=instr_shape,
@@ -514,6 +525,7 @@ class MoEConfig:
         W_PRESHUFFLED=False,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
+        SCALE_TILES_PER_WARP=None,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -571,12 +583,21 @@ class MoEConfig:
         BLOCK_K_SCALE = BLOCK_K // SCALE_BLOCK
         self.index_type = gl.constexpr(index_type)
 
+        if SCALE_TILES_PER_WARP is None:
+            scale_tiles_per_warp = (
+                _SCALE_TILES_PER_WARP_MX_SWIZZLED_2X2
+                if _scale_via_lds
+                else _SCALE_TILES_PER_WARP_UNIT
+            )
+        else:
+            scale_tiles_per_warp = SCALE_TILES_PER_WARP
+
         MFMA_LAYOUT: gl.constexpr = get_mfma_layout(
             NUM_WARPS,
             self.USE_MFMA_SCALED,
-            scale_preshuffle=_scale_via_lds,
+            scale_tiles_per_warp=scale_tiles_per_warp,
             block_m=BLOCK_M,
-            w_via_vgpr=W_VIA_VGPR or W_PRESHUFFLED,
+            w_operand_forces_warps_m_2=W_VIA_VGPR or W_PRESHUFFLED,
         )
 
         DOT_K_WIDTH_X: gl.constexpr = 16 if self.USE_MFMA_SCALED else 8
@@ -4233,6 +4254,7 @@ def _medium_decode_moe_config(BLOCK_M, BLOCK_N, BLOCK_K):
         NUM_WARPS=4,
         W_VIA_VGPR=False,
         W_PREFETCH=False,
+        SCALE_TILES_PER_WARP=_SCALE_TILES_PER_WARP_MEDIUM_DECODE_1X2,
     )
 
 
