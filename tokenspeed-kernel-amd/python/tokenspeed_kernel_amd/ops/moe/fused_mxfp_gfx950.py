@@ -3651,6 +3651,21 @@ def _run_moe_tile_ncontig_w(
 
 
 @gluon.jit
+def _moe_masked_store(out, y_ptr, y_offs, mask, USE_BUFFER_STORE: gl.constexpr):
+    """Shared masked store for the prefill and medium-decode epilogues.
+
+    ``USE_BUFFER_STORE`` selects the AMD ``buffer_store`` intrinsic (the medium
+    dispatch path's fast store) vs generic ``gl.store`` (prefill + medium
+    combine). The caller owns all address/mask computation so each path keeps
+    its own addressing; only the final emit is shared.
+    """
+    if USE_BUFFER_STORE:
+        gl.amd.cdna4.buffer_store(out, y_ptr, y_offs.to(gl.int32), mask=mask)
+    else:
+        gl.store(y_ptr + y_offs, out, mask=mask)
+
+
+@gluon.jit
 def _pipelined_moe_tile_compute(
     # Tensors --------------------------------------------------------
     x_ptr,
@@ -4184,8 +4199,427 @@ def _group_m_swizzle(
     return pid_m, pid_n
 
 
+@gluon.jit
+def _decode_block_schedule(block_schedule_ptr, pid_m):
+    """Unpack the packed ``block_in_expert << 16 | expert`` schedule word."""
+    schedule_raw = gl.load(block_schedule_ptr + pid_m).to(gl.uint32, bitcast=True)
+    expert = (schedule_raw & 0x0000FFFF).to(gl.int32)
+    block_in_expert = (schedule_raw >> 16).to(gl.int32)
+    return expert, block_in_expert
+
+
+@gluon.constexpr_function
+def _medium_decode_moe_config(BLOCK_M, BLOCK_N, BLOCK_K):
+    """Frozen single-buffer direct-load profile shared by the medium-decode stages."""
+    return MoEConfig(
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        "e4m3",
+        "e2m1",
+        32,
+        1,
+        True,
+        False,
+        True,
+        "swizzle",
+        gl.int32,
+        (1, 1, 1),
+        False,
+        True,
+        4,
+        W_VIA_VGPR=False,
+        W_PREFETCH=False,
+    )
+
+
+@gluon.jit
+def _medium_decode_mfma_tile(
+    X,
+    W,
+    WScale,
+    token_m_l_addr,
+    expert,
+    kt,
+    off_n,
+    lk,
+    lwk,
+    lwn,
+    acc,
+    a_scale,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    stride_wse,
+    stride_wsn,
+    stride_wsk,
+    K,
+    N,
+    cfg: gl.constexpr,
+    DIRECT_SHARED_X: gl.constexpr,
+    DIRECT_SHARED_W: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_K_PACKED: gl.constexpr,
+    MASK_K: gl.constexpr,
+    MASK_N: gl.constexpr,
+):
+    s = _load_w_scale_tile_direct_cdna4(
+        WScale, expert, kt, off_n, stride_wse, stride_wsk, stride_wsn, cfg
+    )
+    k_elem_l = kt * BLOCK_K + lk
+    k_pack_l = kt * BLOCK_K_PACKED + lwk
+    n_cols_l = off_n + lwn
+    x_off_l = (
+        gl.expand_dims(token_m_l_addr, 1).to(gl.int64) * stride_xm
+        + gl.expand_dims(k_elem_l, 0).to(gl.int64) * stride_xk
+    )
+    w_off_l = (
+        expert.to(gl.int64) * stride_we
+        + k_pack_l.to(gl.int64) * stride_wk
+        + n_cols_l.to(gl.int64) * stride_wn
+    )
+    # MASK_K guards the ragged K tail; MASK_N guards N tiles that do not divide
+    # BLOCK_N. The full-K stage1 tile (N a multiple of BLOCK_N) takes neither,
+    # which keeps its loads bit-identical to the unmasked baseline.
+    if MASK_K:
+        a_l = gl.amd.cdna4.buffer_load(
+            ptr=X,
+            offsets=x_off_l.to(gl.int32),
+            mask=gl.expand_dims(k_elem_l, 0) < K,
+            other=0.0,
+        )
+    else:
+        a_l = gl.amd.cdna4.buffer_load(ptr=X, offsets=x_off_l.to(gl.int32))
+    if MASK_N and MASK_K:
+        b_l = gl.amd.cdna4.buffer_load(
+            ptr=W,
+            offsets=w_off_l.to(gl.int32),
+            mask=(n_cols_l < N) & (k_pack_l < (K // 2)),
+            other=0,
+        )
+    elif MASK_N:
+        b_l = gl.amd.cdna4.buffer_load(
+            ptr=W,
+            offsets=w_off_l.to(gl.int32),
+            mask=n_cols_l < N,
+            other=0,
+        )
+    else:
+        b_l = gl.amd.cdna4.buffer_load(ptr=W, offsets=w_off_l.to(gl.int32))
+    a_smem = gl.allocate_shared_memory(
+        X.dtype.element_ty, [BLOCK_M, BLOCK_K], DIRECT_SHARED_X, a_l
+    )
+    a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_smem, cfg.dot_layout_x)
+    b_smem = gl.allocate_shared_memory(
+        W.dtype.element_ty, [BLOCK_K_PACKED, BLOCK_N], DIRECT_SHARED_W, b_l
+    )
+    b = gl.amd.cdna4.async_copy.load_shared_relaxed(b_smem, cfg.dot_layout_w)
+    return gl.amd.cdna4.mfma_scaled(
+        a=a,
+        a_scale=a_scale,
+        a_format="e4m3",
+        b=b,
+        b_scale=s,
+        b_format="e2m1",
+        acc=acc,
+    )
+
+
+@gluon.jit
+def _medium_decode_body(
+    X,
+    W,
+    WScale,
+    Gather,
+    Scatter,
+    Gate,
+    SliceSizes,
+    SliceOffs,
+    BlockOffs,
+    BlockSchedule,
+    Y,
+    M,
+    M_X,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    stride_wse,
+    stride_wsn,
+    stride_wsk,
+    stride_ym,
+    stride_yn,
+    stride_be,
+    stride_bn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    bias_ptr,
+    N_EXPERTS: gl.constexpr,
+    NUM_TILES: gl.constexpr,
+    GRID_N: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+    Y_N_CONST: gl.constexpr,
+    MEDIUM_COMBINE: gl.constexpr,
+):
+    """Shared AITER-style direct-load grouped body for M=8/16 decode.
+
+    ``MEDIUM_COMBINE=False`` is stage1 (gather X rows, SwiGLU + fp8-quant store);
+    ``MEDIUM_COMBINE=True`` is stage2/combine (contiguous X rows, gate + scatter
+    store). This is selected only for the additive medium-decode path; the
+    existing prefill/default pipeline remains the fallback for all other shapes.
+    """
+    pid_raw = gl.program_id(axis=0)
+    grid_n: gl.constexpr = GRID_N
+    if XCD_SWIZZLE > 1:
+        pid = _xcd_chiplet_swizzle(pid_raw, NUM_TILES, XCD_SWIZZLE)
+    else:
+        pid = pid_raw
+    grid_m_padded: gl.constexpr = NUM_TILES // GRID_N
+    pid_m, pid_n = _group_m_swizzle(pid, grid_m_padded, grid_n, GROUP_M)
+
+    unpadded_m = gl.load(BlockOffs + N_EXPERTS).to(gl.int32)
+    if pid_m >= unpadded_m:
+        return
+
+    expert, block_in_expert = _decode_block_schedule(BlockSchedule, pid_m)
+    gl.assume(M >= 0)
+    if not MEDIUM_COMBINE:
+        gl.assume(M_X >= 0)
+    gl.assume(N >= 0)
+    gl.assume(K >= 0)
+    gl.assume(expert >= 0)
+    gl.assume(block_in_expert >= 0)
+    gl.assume(stride_xm >= 0)
+    gl.assume(stride_xk >= 0)
+    gl.assume(stride_we >= 0)
+    gl.assume(stride_wn >= 0)
+    gl.assume(stride_wk >= 0)
+    gl.assume(stride_wse >= 0)
+    gl.assume(stride_wsn >= 0)
+    gl.assume(stride_wsk >= 0)
+    gl.assume(stride_ym >= 0)
+    gl.assume(stride_yn >= 0)
+    gl.assume(stride_be >= 0)
+    gl.assume(stride_bn >= 0)
+
+    cfg = _medium_decode_moe_config(BLOCK_M, BLOCK_N, BLOCK_K)
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    gl.static_assert(BLOCK_K_SCALE == 8, "M=8/16 direct WScale path assumes BLOCK_K=256")
+    OUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
+
+    X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
+    W_ELEM_BITS: gl.constexpr = W.dtype.element_ty.primitive_bitwidth
+    LOAD_X_LAYOUT: gl.constexpr = _load_layout(BLOCK_K, BLOCK_M, 4, [1, 0], X_ELEM_BITS)
+    LOAD_W_LAYOUT: gl.constexpr = _load_layout(
+        BLOCK_K_PACKED, BLOCK_N, 4, [0, 1], W_ELEM_BITS
+    )
+    DIRECT_SHARED_X: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 16, order=[1, 0])
+    DIRECT_SHARED_W: gl.constexpr = gl.SwizzledSharedLayout(16, 2, 8, order=[0, 1])
+
+    m_base = gl.load(SliceOffs + expert).to(gl.int32)
+    m_size = gl.load(SliceSizes + expert).to(gl.int32)
+    gl.assume(m_base >= 0)
+    gl.assume(m_size > 0)
+    if not MEDIUM_COMBINE:
+        off_m = m_base + block_in_expert * BLOCK_M
+        gl.assume(off_m >= 0)
+    off_n = pid_n * BLOCK_N
+    gl.assume(off_n >= 0)
+
+    lk = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
+    lwk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))[:, None]
+    lwn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))[None, :]
+
+    local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
+    local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
+    if MEDIUM_COMBINE:
+        # Combine reads the sorted (contiguous) X rows directly.
+        row_addr = m_base + local_m_l
+    else:
+        # Dispatch gathers the routed token rows for this expert block.
+        token_m_l = gl.amd.cdna4.buffer_load(
+            ptr=Gather, offsets=(m_base + local_m_l).to(gl.int32)
+        ).to(gl.int32)
+        row_addr = token_m_l.to(gl.uint32)
+
+    a_scale = gl.full(
+        (BLOCK_M, BLOCK_K_SCALE), 127, gl.uint8, layout=cfg.layout_x_scale
+    )
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+
+    total_kt = gl.cdiv(K, BLOCK_K)
+    gl.assume(total_kt >= 0)
+    num_full = K // BLOCK_K
+    gl.assume(num_full >= 0)
+    for kt in range(0, num_full):
+        gl.assume(kt >= 0)
+        acc = _medium_decode_mfma_tile(
+            X,
+            W,
+            WScale,
+            row_addr,
+            expert,
+            kt,
+            off_n,
+            lk,
+            lwk,
+            lwn,
+            acc,
+            a_scale,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wn,
+            stride_wk,
+            stride_wse,
+            stride_wsn,
+            stride_wsk,
+            K,
+            N,
+            cfg,
+            DIRECT_SHARED_X,
+            DIRECT_SHARED_W,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            BLOCK_K_PACKED,
+            MASK_K=False,
+            MASK_N=MEDIUM_COMBINE,
+        )
+
+    if total_kt > num_full:
+        kt = num_full
+        gl.assume(kt >= 0)
+        acc = _medium_decode_mfma_tile(
+            X,
+            W,
+            WScale,
+            row_addr,
+            expert,
+            kt,
+            off_n,
+            lk,
+            lwk,
+            lwn,
+            acc,
+            a_scale,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wn,
+            stride_wk,
+            stride_wse,
+            stride_wsn,
+            stride_wsk,
+            K,
+            N,
+            cfg,
+            DIRECT_SHARED_X,
+            DIRECT_SHARED_W,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            BLOCK_K_PACKED,
+            MASK_K=True,
+            MASK_N=True,
+        )
+
+    acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
+    if MEDIUM_COMBINE:
+        if HAS_BIAS:
+            bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
+            if Y_N_CONST:
+                bias_bound = bias_n < Y_N_CONST
+            else:
+                bias_bound = bias_n < N
+            bias = gl.load(
+                bias_ptr + expert.to(gl.int64) * stride_be + bias_n.to(gl.int64) * stride_bn,
+                mask=bias_bound,
+                other=0.0,
+            ).to(gl.float32)
+            bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
+            acc = acc + bias[None, :]
+
+        out = acc.to(Y.dtype.element_ty)
+        STORE_LAYOUT: gl.constexpr = out.type.layout
+        n_out = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
+        local_store_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
+        local_store_m = gl.max_contiguous(
+            gl.multiple_of(local_store_m % m_size, BLOCK_M), BLOCK_M
+        )
+        sorted_store = m_base + local_store_m
+        scatter_row = gl.load(Scatter + sorted_store).to(gl.int32)
+        gate = gl.load(Gate + sorted_store).to(Y.dtype.element_ty)
+        out = out * gate[:, None]
+        y_offs = (
+            scatter_row[:, None].to(gl.int64) * stride_ym
+            + n_out[None, :].to(gl.int64) * stride_yn
+        )
+        if Y_N_CONST:
+            store_mask = n_out[None, :] < Y_N_CONST
+        else:
+            store_mask = n_out[None, :] < N
+        _moe_masked_store(out, Y, y_offs, store_mask, USE_BUFFER_STORE=False)
+    else:
+        if HAS_BIAS:
+            bias_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
+            if Y_N_CONST:
+                bias_bound = bias_n < Y_N_CONST
+            else:
+                bias_bound = bias_n < N
+            bias = gl.load(
+                bias_ptr + expert.to(gl.int64) * stride_be + bias_n.to(gl.int64) * stride_bn,
+                mask=bias_bound,
+                other=0.0,
+            ).to(gl.float32)
+            bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
+            acc = acc + bias[None, :]
+
+        out = _swiglu_reduce(
+            acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout
+        )
+        out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
+        out = (out * out_inv_scale).to(Y.dtype.element_ty)
+        STORE_LAYOUT: gl.constexpr = out.type.layout
+        sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
+        n_out = pid_n * OUT_BLOCK_N + gl.arange(
+            0, OUT_BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT)
+        )
+        local_store_m = block_in_expert * BLOCK_M + sm
+        sorted_store = m_base + local_store_m
+        valid_store = local_store_m < m_size
+        y_off = (
+            sorted_store[:, None].to(gl.int64) * stride_ym
+            + n_out[None, :].to(gl.int64) * stride_yn
+        )
+        if Y_N_CONST:
+            store_mask = valid_store[:, None] & (n_out[None, :] < (Y_N_CONST // 2))
+        else:
+            store_mask = valid_store[:, None] & (n_out[None, :] < (N // 2))
+        _moe_masked_store(out, Y, y_off, store_mask, USE_BUFFER_STORE=True)
+
+
 def _pipelined_moe_kernel_repr(specialization) -> str:
     """Distinct rocprof names for schedule vs no-schedule specialization."""
+    if bool(specialization.constants.get("IS_MEDIUM_DECODE", False)):
+        if bool(specialization.constants.get("MEDIUM_COMBINE", False)):
+            return "_moe_medium_decode_combine"
+        return "_moe_medium_decode_dispatch"
     use_block_schedule = bool(specialization.constants.get("USE_BLOCK_SCHEDULE", False))
     if use_block_schedule:
         return "_pipelined_moe_kernel_scaled_block_schedule"
@@ -4270,7 +4704,60 @@ def _pipelined_moe_kernel_scaled(
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
     USE_NARROW_N_STORE_LAYOUT: gl.constexpr = False,
+    IS_MEDIUM_DECODE: gl.constexpr = False,
+    MEDIUM_COMBINE: gl.constexpr = False,
 ):
+    if IS_MEDIUM_DECODE:
+        # Medium-decode (M=8/16) reuses this kernel's signature but runs the
+        # single-buffer direct-load body instead of the pipelined prefill loop.
+        # The constexpr guard DCEs this branch for the existing/default path.
+        _medium_decode_body(
+            x_ptr,
+            w_ptr,
+            w_scale_ptr,
+            gather_idx_ptr,
+            scatter_idx_ptr,
+            gate_scal_ptr,
+            slice_sizes_ptr,
+            slice_offs_ptr,
+            block_offs_ptr,
+            block_schedule_ptr,
+            y_ptr,
+            M,
+            M_X,
+            N,
+            K,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wn,
+            stride_wk,
+            stride_wse,
+            stride_wsn,
+            stride_wsk,
+            stride_ym,
+            stride_yn,
+            stride_be,
+            stride_bn,
+            x_global_scale_ptr,
+            out_quant_scale_ptr,
+            bias_ptr,
+            N_EXPERTS=N_EXPTS_TOT,
+            NUM_TILES=NUM_TILES,
+            GRID_N=GRID_N,
+            GROUP_M=GROUP_M,
+            XCD_SWIZZLE=XCD_SWIZZLE,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            HAS_BIAS=HAS_BIAS,
+            SWIGLU_ALPHA=SWIGLU_ALPHA,
+            SWIGLU_LIMIT=SWIGLU_LIMIT,
+            Y_N_CONST=Y_N_CONST,
+            MEDIUM_COMBINE=MEDIUM_COMBINE,
+        )
+        return
+
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
         tiles_per_expert: gl.constexpr = BLOCKS_PER_EXPERT * GRID_N
@@ -4570,6 +5057,8 @@ def _launch_kernel(
     y_n_const: int = 0,
     w_cache_cg: bool | None = None,
     use_narrow_n_store_layout: bool = False,
+    medium_decode_dispatch: bool = False,
+    medium_decode_combine: bool = False,
 ):
     assert x_format in _SCALED_FORMATS, f"unknown x_format={x_format!r}"
     assert w_format in _SCALED_FORMATS, f"unknown w_format={w_format!r}"
@@ -4919,6 +5408,32 @@ def _launch_kernel(
     )
 
     common_kwargs["waves_per_eu"] = num_warps // 4
+
+    if medium_decode_dispatch or medium_decode_combine:
+        # M=8/16 decode reuses the regular launcher preprocessing, but selects
+        # the single-buffer direct-load body under a constexpr. Keep the
+        # identity swizzles/grid shape the direct kernels were tuned for and
+        # avoid the occupancy hint that bloats the medium body's VGPR footprint.
+        medium_kwargs = dict(common_kwargs)
+        medium_kwargs["GROUP_M"] = 1
+        medium_kwargs["XCD_SWIZZLE"] = 1
+        medium_kwargs["num_stages"] = 1
+        medium_kwargs.pop("waves_per_eu", None)
+        k = _pipelined_moe_kernel_scaled[(num_tiles_total,)](
+            *common_args,
+            block_offs_buf,
+            block_schedule_buf,
+            *common_strides,
+            *common_dims,
+            USE_BLOCK_SCHEDULE=use_block_schedule,
+            N_EXPTS_TOT=n_slices,
+            IS_MEDIUM_DECODE=True,
+            MEDIUM_COMBINE=medium_decode_combine,
+            **medium_kwargs,
+        )
+        _capture_launch_profile(k)
+        return
+
     k = _pipelined_moe_kernel_scaled[grid](
         *common_args,
         block_offs_buf,
@@ -5398,6 +5913,7 @@ def gluon_mxfp_dispatch_swiglu(
     w_preshuffle: bool = False,
 ) -> torch.Tensor:
     assert w.ndim == 3 and w.shape[-1] % 2 == 0
+    M_X = int(x.shape[-2])
     if gather_indx is not None:
         gather_t = (
             gather_indx.src_indx if hasattr(gather_indx, "src_indx") else gather_indx
@@ -5408,6 +5924,9 @@ def gluon_mxfp_dispatch_swiglu(
     N = w.shape[-1]
     div_x = 2 if x_format == "e2m1" else 1
     K = x.shape[-1] * div_x
+    requested_block_m = block_m
+    requested_block_n = block_n
+    requested_block_k = block_k
     slice_size = _ragged_slice_size(a_ragged_metadata, M)
     (
         block_m,
@@ -5431,6 +5950,26 @@ def gluon_mxfp_dispatch_swiglu(
         large_slice_size=128,
         large_m=16384,
     )
+    medium_decode_dispatch_shape = (
+        8 <= M_X <= 16
+        and a_ragged_metadata is not None
+        and gather_indx is not None
+        and out_quant_scale is not None
+        and x_format == "e4m3"
+        and x_scale is None
+        and scale_load_mode == "swizzle"
+        and w_transpose
+        and requested_block_m is None
+        and requested_block_n is None
+        and requested_block_k is None
+        and not w_preshuffle
+        and N % 128 == 0
+    )
+    if medium_decode_dispatch_shape:
+        block_m, block_n, block_k, nw = 16, 128, 256, 4
+        use_slice_n = False
+        use_slice_mn = False
+        use_small_prefill_m = False
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
@@ -5461,6 +6000,15 @@ def gluon_mxfp_dispatch_swiglu(
         x_format=x_format,
         has_x_block_scale=x_format == "e2m1",
         has_w_block_scale=True,
+    )
+    medium_decode_dispatch_eligible = (
+        medium_decode_dispatch_shape
+        and block_m == 16
+        and block_n == 128
+        and block_k == 256
+        and not use_slice_mn
+        and not use_slice_n
+        and not w_preshuffle
     )
     if persistent is None and use_small_prefill_m:
         persistent = False
@@ -5515,6 +6063,7 @@ def gluon_mxfp_dispatch_swiglu(
         out_quant_scale=out_quant_scale,
         w_preshuffle=w_preshuffle,
         w_cache_cg=w_cache_cg,
+        medium_decode_dispatch=medium_decode_dispatch_eligible,
     )
     return y
 
@@ -5553,6 +6102,9 @@ def gluon_mxfp_combine(
     N = w.shape[-1]
     div_x = 2 if x_format == "e2m1" else 1
     K = x.shape[-1] * div_x
+    requested_block_m = block_m
+    requested_block_n = block_n
+    requested_block_k = block_k
     slice_size = _ragged_slice_size(a_ragged_metadata, M)
     (
         block_m,
@@ -5576,6 +6128,27 @@ def gluon_mxfp_combine(
         large_slice_size=256,
         large_m=32768,
     )
+    medium_decode_combine_shape = (
+        a_ragged_metadata is not None
+        and scatter_indx is not None
+        and gate_scal is not None
+        and n_tokens in (8, 16)
+        and n_expts_act is not None
+        and x_format == "e4m3"
+        and x_scale is None
+        and scale_load_mode == "swizzle"
+        and w_transpose
+        and requested_block_m is None
+        and requested_block_n is None
+        and requested_block_k is None
+        and not w_preshuffle
+        and N % 128 == 0
+    )
+    if medium_decode_combine_shape:
+        block_m, block_n, block_k, nw = 16, 128, 256, 4
+        use_slice_n = False
+        use_slice_mn = False
+        use_small_prefill_m = False
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
@@ -5607,6 +6180,15 @@ def gluon_mxfp_combine(
         has_x_block_scale=x_format == "e2m1",
         has_w_block_scale=True,
     )
+    medium_decode_combine_eligible = (
+        medium_decode_combine_shape
+        and block_m == 16
+        and block_n == 128
+        and block_k == 256
+        and not use_slice_mn
+        and not use_slice_n
+        and not w_preshuffle
+    )
     if persistent is None and use_small_prefill_m:
         persistent = False
     if persistent is None:
@@ -5633,10 +6215,15 @@ def gluon_mxfp_combine(
     else:
         n_tokens_eff = int(n_tokens)
         n_rows = n_tokens_eff * n_act_eff
-    # Preshuffled W may be padded in N to satisfy the packed layout. Keep the
-    # padded N for tiling/W strides, but store only the caller-visible width.
+    # Preshuffled/medium-decode W may be padded in N to satisfy the packed
+    # layout. Keep padded N for tiling/W-scale reads, but store only the
+    # caller-visible width.
     logical_n = int(getattr(w, "original_n", N))
-    y_n = logical_n if w_preshuffle and logical_n < N else N
+    y_n = (
+        logical_n
+        if (w_preshuffle or medium_decode_combine_eligible) and logical_n < N
+        else N
+    )
     y = torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
     _launch_kernel(
         x,
@@ -5672,9 +6259,34 @@ def gluon_mxfp_combine(
         y_n_const=y_n if y_n != N else 0,
         w_cache_cg=w_cache_cg,
         use_narrow_n_store_layout=use_narrow_n_store_layout,
+        medium_decode_combine=medium_decode_combine_eligible,
     )
     if n_act_eff > 1:
-        y = y.view(n_tokens_eff, n_act_eff, y_n).sum(dim=1)
+        if medium_decode_combine_eligible:
+            # Fused top-k reduction over the scatter rows (graph-capturable).
+            # The TOPK partials for a token are consecutive rows of y.
+            y_reduced = torch.empty(
+                (n_tokens_eff, y_n), device=x.device, dtype=out_dtype
+            )
+            R_BLOCK_N = 256
+            r_grid = (n_tokens_eff * ((y_n + R_BLOCK_N - 1) // R_BLOCK_N),)
+            _moe_partial_reduce[r_grid](
+                y,
+                y_reduced,
+                n_tokens_eff,
+                y_n,
+                y.stride(0),
+                n_act_eff * y.stride(0),
+                y.stride(1),
+                y_reduced.stride(0),
+                y_reduced.stride(1),
+                SPLIT_K=n_act_eff,
+                BLOCK_N=R_BLOCK_N,
+                num_warps=1,
+            )
+            y = y_reduced
+        else:
+            y = y.view(n_tokens_eff, n_act_eff, y_n).sum(dim=1)
     # Unpad N if the caller padded W for w_preshuffle. Padded W bytes
     # are 0 and padded scales are 127 so acc[:, N:N_padded] == 0.
     if logical_n != y.shape[-1]:
@@ -5711,6 +6323,19 @@ def _extract_gluon_raw_w(w):
     if shuffled is not None:
         return shuffled
     return raw
+
+
+def _extract_gluon_raw_w_unshuffled(w):
+    """Return the canonical K-contiguous W storage, ignoring preshuffle attrs.
+
+    M=8/16 medium-decode uses the direct-load body and must not be routed to the
+    default preshuffled-W path. This helper preserves the main path's
+    ``_extract_gluon_raw_w`` behavior by being opt-in at the call site.
+    """
+    if isinstance(w, torch.Tensor):
+        return w
+    raw = _wrapped_tensor_data(w)
+    return w if raw is None else raw
 
 
 def _extract_gluon_raw_s(s):
@@ -5795,7 +6420,12 @@ def gluon_mxfp_ragged_matmul(
     else:
         out_dtype = torch.bfloat16
 
-    w_raw = _extract_gluon_raw_w(w)
+    prefer_unshuffled_w = bool(extra_kwargs.get("prefer_unshuffled_w", False))
+    w_raw = (
+        _extract_gluon_raw_w_unshuffled(w)
+        if prefer_unshuffled_w
+        else _extract_gluon_raw_w(w)
+    )
     s_raw = _extract_gluon_raw_s(w_mx_scale)
 
     assert isinstance(w_raw, torch.Tensor) and isinstance(s_raw, torch.Tensor)
@@ -5895,7 +6525,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     n_tokens = int(router_logits.shape[0])
     n_experts = int(router_logits.shape[1])
-    if n_tokens > SMALLM_MAX_M:
+    if n_tokens > WARP_DECODE_MAX_M:
         return None
     if not gluon_route_supported(router_logits, top_k, router_logits.dtype):
         return None
@@ -5992,8 +6622,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     inter = torch.empty(
         (n_tokens * top_k, I), dtype=x_fp8.dtype, device=hidden_states.device
     )
-    # Cooperative-LDS, num_warps=4, software-pipelined stage1 -- the small-M
-    # decode path (this wrapper is only entered for n_tokens <= SMALLM_MAX_M).
+    # Cooperative-LDS, num_warps=4, software-pipelined stage1 -- the smallest-M
+    # decode path (this wrapper is only entered for n_tokens <= WARP_DECODE_MAX_M).
     # BLOCK_N=64 maximizes CTAs/CU for non-preshuffled W. Preshuffled W13 is
     # laid out as 128-wide CTA tiles, so the first decode preshuffle path
     # consumes full 128-wide tiles and lets SwiGLU reduce them to 64 columns.
@@ -6065,7 +6695,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         R_BLOCK_N = 256
         r_grid = (n_tokens * ((N + R_BLOCK_N - 1) // R_BLOCK_N),)
         # fmt: off
-        _warp_decode_stage2_reduce[r_grid](
+        _moe_partial_reduce[r_grid](
             out_partial, out, n_tokens, N,
             out_partial.stride(0), out_partial.stride(1), out_partial.stride(2),
             out.stride(0), out.stride(1),
@@ -6113,8 +6743,10 @@ def gluon_mxfp_fused_moe(
     x_fp8 = fp8_quantize(hidden_states, w13_act_scale)
 
     n_tokens = router_logits.shape[0]
+    use_medium_decode = int(n_tokens) in (8, 16)
 
-    # Warp-decode small-M MoE is the fastest path for the M<=16 decode regime.
+    # Warp-decode small-M MoE is only the fastest path for M<=4. M=8/16
+    # intentionally falls through to the medium-decode direct path below.
     # It self-guards (returns None) for any shape it does not cover; the
     # tokenspeed-kernel registration wrapper owns the environment/platform gate.
     if enable_warp_decode:
@@ -6170,6 +6802,7 @@ def gluon_mxfp_fused_moe(
         precision_config=w13_precision_config,
         fused_activation=act,
         out_quant_scale=w2_act_scale,
+        prefer_unshuffled_w=use_medium_decode,
     )
 
     gemm2_input = intermediate_cache
@@ -6184,6 +6817,7 @@ def gluon_mxfp_fused_moe(
         gammas=gate_scal,
         n_tokens=n_tokens,
         n_expts_act=top_k,
+        prefer_unshuffled_w=use_medium_decode,
     )
 
 
@@ -6218,6 +6852,9 @@ _ROUTE_NB = len(RaggedTensorMetadata.block_sizes())
 # Gluon kernel (decode, where it wins ~6x on routing) and keeps the generic
 # ``triton_kernels_routing`` pipeline for larger M.
 SMALLM_MAX_M = 16
+# Warp-decode is only for the smallest decode regime. M>=8 should use the
+# medium-decode direct path selected by the ragged matmul path below.
+WARP_DECODE_MAX_M = 4
 # Backwards-compatible alias for the small-M bound.
 FUSED_ROUTE_MAX_M = SMALLM_MAX_M
 
@@ -6501,6 +7138,43 @@ def _mxfp4_scale_offset(n_idx, k_scale_idx, stride_wsk, stride_wsn):
         + ((row % 32) // 16)
     )
     return (row // 32).to(gl.int64) * stride_wsn + lin.to(gl.int64) * stride_wsk
+
+
+@gluon.jit
+def _load_w_scale_tile_direct_cdna4(
+    WScale,
+    expert,
+    kt,
+    off_n,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    cfg,
+):
+    """Load W e8m0 scales in AITER's physical CDNA4-swizzled layout."""
+    BLOCK_N: gl.constexpr = cfg.BLOCK_N
+    BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
+    BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
+    BLOCK_K_S_PS: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
+    LW_S: gl.constexpr = cfg.load_layout_w_scale
+
+    offs_ws_n = gl.arange(0, BLOCK_N_PS, layout=gl.SliceLayout(1, LW_S))[:, None]
+    offs_ws_k = gl.arange(0, BLOCK_K_S_PS, layout=gl.SliceLayout(0, LW_S))[None, :]
+    rows_n_scale = off_n // cfg.PRESHUFFLE_FACTOR + offs_ws_n
+    scale_k_base = kt * BLOCK_K_S_PS
+    raw_off = (
+        expert.to(gl.int64) * stride_wse
+        + (scale_k_base + offs_ws_k).to(gl.int64) * stride_wsk
+        + rows_n_scale.to(gl.int64) * stride_wsn
+    )
+    raw = gl.amd.cdna4.buffer_load(
+        ptr=WScale, offsets=raw_off.to(gl.int32), cache=".cg"
+    )
+
+    raw_7d = raw.reshape((BLOCK_N_PS, BLOCK_K_SCALE // 8, 4, 16, 2, 2, 1))
+    raw_perm = raw_7d.permute((0, 5, 3, 1, 4, 2, 6))
+    logical = raw_perm.reshape((BLOCK_N, BLOCK_K_SCALE))
+    return gl.convert_layout(logical, cfg.layout_w_scale)
 
 
 @gluon.jit
@@ -7049,7 +7723,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
 
     With SPLIT_K > 1 the K (intermediate) reduction is partitioned across
     SPLIT_K CTAs per output tile; each writes an fp32 partial into slice
-    ``pid_k`` of the destination, reduced by ``_warp_decode_stage2_reduce``.
+    ``pid_k`` of the destination, reduced by ``_moe_partial_reduce``.
     Bias is added only by the first slice so it is not counted SPLIT_K times.
     """
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
@@ -7200,7 +7874,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
 
 
 @gluon.jit
-def _warp_decode_stage2_reduce(
+def _moe_partial_reduce(
     Partial,
     Out,
     M,
@@ -7213,7 +7887,13 @@ def _warp_decode_stage2_reduce(
     SPLIT_K: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    """Sum the SPLIT_K stage2 partials into the bf16 output in one launch."""
+    """Sum SPLIT_K partials per (m, n) into Out in one launch.
+
+    Shared by the warp-decode split-K stage2 ([SPLIT_K, M, N] partials) and the
+    medium-decode top-k combine (consecutive-row partials, mapped by passing
+    stride_pk = row stride and stride_pm = TOPK * row stride). The float32 cast
+    is a no-op for f32 partials and upcasts bf16 combine partials.
+    """
     pid = gl.program_id(axis=0)
     num_n = gl.cdiv(N, BLOCK_N)
     pid_m = pid // num_n
@@ -7230,7 +7910,7 @@ def _warp_decode_stage2_reduce(
             + n.to(gl.int64) * stride_pn,
             mask=bound,
             other=0.0,
-        )
+        ).to(gl.float32)
     gl.store(
         Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
         acc.to(Out.dtype.element_ty),
