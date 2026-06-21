@@ -40,6 +40,7 @@ from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
 )
+from tokenspeed.runtime.configs.utils import get_rope_parameters
 
 # Distributed
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -591,10 +592,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        if hasattr(config, "rope_parameters"):
-            self.rope_scaling = getattr(config, "rope_parameters", None)
-        else:
-            self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.rope_scaling = get_rope_parameters(config)
 
         self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
         self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
@@ -1160,9 +1158,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             prefix=prefix,
         )
 
-        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
-            self.config, "rope_scaling", {}
-        )
+        rope_config = get_rope_parameters(self.config)
         self.is_mrope_enabled = "mrope_section" in rope_config
         self.is_multimodal_active = is_multimodal_active
         if not self.is_multimodal_active:

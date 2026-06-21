@@ -124,7 +124,7 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
-    capture_bs = [bs for bs in capture_bs if bs <= effective_max]
+    capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
     return capture_bs
 
 
