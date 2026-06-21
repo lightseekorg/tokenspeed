@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: perf-gpt-oss-120b-mxfp4-mi350
+name: perf-gpt-oss-120b-mxfp4-mi35x
 type: perf
 triggers:
   - per-commit
@@ -7,6 +7,7 @@ triggers:
 runner:
   labels:
     - amd-mi350-1gpu-bench
+    - amd-mi355-1gpu-bench
 env:
   CI: "true"
 install:
@@ -33,7 +34,9 @@ perf:
     REPO_ROOT=$PWD &&
     MODEL=amd/gpt-oss-120b-w-mxfp4-a-fp8 &&
     URL=http://127.0.0.1:21000/v1/completions &&
-    OUTPUTS_DIR=/tmp/tokenspeed-gpt-oss-mi350-perf &&
+    GPU_LABEL=${CI_RUNNER_LABEL#amd-} &&
+    GPU_LABEL=${GPU_LABEL%-1gpu-bench} &&
+    OUTPUTS_DIR=/tmp/tokenspeed-gpt-oss-${GPU_LABEL}-perf &&
     trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
     rm -rf "$OUTPUTS_DIR" &&
     set +e &&
