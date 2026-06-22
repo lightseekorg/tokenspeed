@@ -56,22 +56,12 @@ def _normalize_roles(roles: str | Iterable[str]) -> tuple[str, ...]:
     return role_names
 
 
-def _normalize_weight_preprocessors(
-    weight_preprocessors: Callable | Iterable[Callable] | None,
-) -> tuple[Callable, ...]:
-    if weight_preprocessors is None:
-        preprocessors: tuple[Callable, ...] = ()
-    elif callable(weight_preprocessors):
-        preprocessors = (weight_preprocessors,)
-    else:
-        preprocessors = tuple(weight_preprocessors)
-
-    for preprocessor in preprocessors:
-        if not callable(preprocessor):
-            raise TypeError("weight preprocessors must be callable")
-    if len(set(preprocessors)) != len(preprocessors):
-        raise ValueError("weight preprocessors must be unique")
-    return preprocessors
+def _normalize_weight_preprocessor(
+    weight_preprocessor: Callable | None,
+) -> Callable | None:
+    if weight_preprocessor is not None and not callable(weight_preprocessor):
+        raise TypeError("weight preprocessor must be callable")
+    return weight_preprocessor
 
 
 def _callable_name(fn: Callable) -> str:
@@ -190,17 +180,14 @@ class KernelSpec:
     tags: frozenset[str] = (
         frozenset()
     )  # Standard tags: "throughput", "latency", "determinism", "portability"
-    weight_preprocessors: tuple[Callable, ...] = field(default_factory=tuple)
-    weight_preprocessing_required: bool = True
+    weight_preprocessor: Callable | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
-            "weight_preprocessors",
-            _normalize_weight_preprocessors(self.weight_preprocessors),
+            "weight_preprocessor",
+            _normalize_weight_preprocessor(self.weight_preprocessor),
         )
-        if not isinstance(self.weight_preprocessing_required, bool):
-            raise TypeError("weight preprocessing required must be a bool")
 
     def supports_format_signature(self, format_signature: FormatSignature) -> bool:
         return format_signature in self.format_signatures
@@ -397,8 +384,7 @@ def register_kernel(
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
     tags: set[str] | None = None,
-    weight_preprocessors: Callable | Iterable[Callable] | None = None,
-    weight_preprocessing_required: bool = True,
+    weight_preprocessor: Callable | None = None,
 ) -> Callable:
     """Decorator to register a kernel function.
 
@@ -430,11 +416,7 @@ def register_kernel(
             ...
     """
     priority_int = _validate_priority(priority)
-    normalized_weight_preprocessors = _normalize_weight_preprocessors(
-        weight_preprocessors
-    )
-    if not isinstance(weight_preprocessing_required, bool):
-        raise TypeError("weight preprocessing required must be a bool")
+    normalized_weight_preprocessor = _normalize_weight_preprocessor(weight_preprocessor)
 
     def decorator(fn: Callable) -> Callable:
         kernel_name = name or f"{solution}_{family}_{mode}"
@@ -450,8 +432,7 @@ def register_kernel(
             traits=traits or {},
             priority=priority_int,
             tags=frozenset(tags or set()),
-            weight_preprocessors=normalized_weight_preprocessors,
-            weight_preprocessing_required=weight_preprocessing_required,
+            weight_preprocessor=normalized_weight_preprocessor,
         )
 
         KernelRegistry.get().register(spec, fn)
@@ -480,12 +461,12 @@ def describe_kernel(name: str) -> str:
         f"  Platform: {spec.capability}",
         f"  Tags: {', '.join(spec.tags) or 'none'}",
     ]
-    if not spec.weight_preprocessors:
+    if spec.weight_preprocessor is None:
         lines.append("  Weight preprocessor: none")
     else:
-        requirement = "required" if spec.weight_preprocessing_required else "optional"
-        names = ", ".join(_callable_name(fn) for fn in spec.weight_preprocessors)
-        lines.append(f"  Weight preprocessors: {names} ({requirement})")
+        lines.append(
+            f"  Weight preprocessor: {_callable_name(spec.weight_preprocessor)}"
+        )
     return "\n".join(lines)
 
 

@@ -50,7 +50,7 @@ if platform.is_nvidia:
             return routing_config[name]
         return getattr(w, name, default)
 
-    def flashinfer_trtllm_fp8_moe_weights(plan: dict, w: torch.nn.Module):
+    def flashinfer_trtllm_fp8_moe_process_weights(plan: dict, w: torch.nn.Module):
         # The shared MoE checkpoint loader stores w13 as a concatenated
         # ``[w1(gate) | w3(up)]`` block; the TRT-LLM-Gen gated kernel consumes
         # ``[w3 | w1]`` ordering (same swap flashinfer_cutlass applies). Swap the
@@ -76,7 +76,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_fp8_moe_apply",
         solution="flashinfer_trtllm",
-        weight_preprocessors=(flashinfer_trtllm_fp8_moe_weights,),
+        weight_preprocessor=flashinfer_trtllm_fp8_moe_process_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

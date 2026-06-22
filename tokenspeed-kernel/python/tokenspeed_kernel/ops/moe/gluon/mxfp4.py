@@ -41,18 +41,12 @@ if platform.is_amd:
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
 
-    def gluon_mxfp4_gfx950_moe_weights_base(plan: dict, w: torch.nn.Module):
-        return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=False)
-
     @register_kernel(
         "moe",
         "apply",
         name="gluon_mxfp4_moe_apply",
         solution="gluon",
-        weight_preprocessors=(
-            gluon_mxfp4_gfx950_moe_weights,
-            gluon_mxfp4_gfx950_moe_weights_base,
-        ),
+        weight_preprocessor=gluon_mxfp4_gfx950_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"amd"}),
             min_arch_version=ArchVersion(9, 5),

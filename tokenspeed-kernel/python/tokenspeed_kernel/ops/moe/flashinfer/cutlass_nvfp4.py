@@ -113,7 +113,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_cutlass_nvfp4_moe_apply",
         solution="flashinfer_cutlass",
-        weight_preprocessors=(flashinfer_cutlass_nvfp4_moe_weights,),
+        weight_preprocessor=flashinfer_cutlass_nvfp4_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

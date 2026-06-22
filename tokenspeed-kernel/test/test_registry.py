@@ -499,14 +499,13 @@ class TestDescribeKernel:
             name="moe_apply",
             family="moe",
             mode="apply",
-            weight_preprocessors=(moe_weights,),
-            weight_preprocessing_required=False,
+            weight_preprocessor=moe_weights,
         )
         reg.register(spec, dummy_impl("moe_apply"))
 
         desc = describe_kernel("moe_apply")
 
-        assert "Weight preprocessors: moe_weights (optional)" in desc
+        assert "Weight preprocessor: moe_weights" in desc
 
     def test_describe_not_found(self):
         desc = describe_kernel("nonexistent_kernel")

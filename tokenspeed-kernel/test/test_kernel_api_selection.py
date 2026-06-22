@@ -116,12 +116,9 @@ def test_builtin_moe_preprocessor_links_are_callables():
     kernel_registry = KernelRegistry.get()
     errors = []
     for kernel_spec in kernel_registry.list_kernels("moe", "apply"):
-        preprocessors = kernel_spec.weight_preprocessors
-        if len(set(preprocessors)) != len(preprocessors):
-            errors.append(f"{kernel_spec.name}: duplicate weight preprocessors")
-        for preprocessor in preprocessors:
-            if not callable(preprocessor):
-                errors.append(f"{kernel_spec.name}: non-callable preprocessor")
+        preprocessor = kernel_spec.weight_preprocessor
+        if preprocessor is not None and not callable(preprocessor):
+            errors.append(f"{kernel_spec.name}: non-callable preprocessor")
 
     process_weight_kernels = kernel_registry.list_kernels("moe", "process_weights")
     assert process_weight_kernels == []
@@ -462,8 +459,6 @@ def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> Non
         else getattr(actual_preprocessor, "__name__", repr(actual_preprocessor))
     )
     assert actual_name == preprocessor
-    assert "weight_preprocessor_name" not in plan
-    assert "process_weights_kernel_name" not in plan
 
 
 def _moe_apply_unquant_trtllm() -> object:

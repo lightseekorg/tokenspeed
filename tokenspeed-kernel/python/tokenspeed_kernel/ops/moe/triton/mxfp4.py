@@ -359,7 +359,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_precomputed_moe_apply",
     solution="triton",
-    weight_preprocessors=(triton_mxfp4_moe_weights,),
+    weight_preprocessor=triton_mxfp4_moe_weights,
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -384,7 +384,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_ep_precomputed_moe_apply",
     solution="triton",
-    weight_preprocessors=(triton_mxfp4_moe_weights,),
+    weight_preprocessor=triton_mxfp4_moe_weights,
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -409,7 +409,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_moe_apply",
     solution="triton",
-    weight_preprocessors=(triton_mxfp4_moe_weights,),
+    weight_preprocessor=triton_mxfp4_moe_weights,
     signatures=format_signatures(
         "x",
         "dense",

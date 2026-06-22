@@ -157,10 +157,6 @@ def moe_plan(
     if apply_spec is None:
         raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
 
-    weight_preprocessor = (
-        apply_spec.weight_preprocessors[0] if apply_spec.weight_preprocessors else None
-    )
-
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes
     supports_deferred_finalize = True in apply_spec.traits.get(
@@ -169,7 +165,7 @@ def moe_plan(
     return {
         "weight_dtype": weight_dtype,
         "apply_kernel_name": apply_spec.name,
-        "weight_preprocessor": weight_preprocessor,
+        "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
         "support_routing": support_routing,
