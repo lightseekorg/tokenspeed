@@ -19,6 +19,7 @@ server:
     --max-model-len 80000
     --trust-remote-code
     --attention-backend tokenspeed_mla
+    --mm-attention-backend fa4
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
     --kv-cache-dtype fp8

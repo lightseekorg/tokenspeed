@@ -47,6 +47,7 @@ def _try_import_optional_backend(name: str, dependency: str) -> None:
 
 
 if platform.is_nvidia:
+    from tokenspeed.runtime.layers.attention.backends import dsa  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import deepseek_v4  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import flashmla  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import (

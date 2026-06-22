@@ -839,137 +839,81 @@ class TestSeedHandling(unittest.TestCase):
 
 
 class _LogprobReqObj(_StubReqObj):
-    """Request object that asks for logprobs so
-    ``_handle_batch_output`` invokes ``convert_logprob_style`` on the
-    recv_obj. Matches ``GenerateReqInput``'s ``return_logprob=True`` shape.
+    """Request object that asks for output logprobs in a given dialect so
+    ``_handle_batch_output`` invokes ``convert_logprob_style`` on the recv_obj.
 
-    ``token_ids_logprob`` must stay ``None`` (not ``[]``) when the test
-    does not populate ``recv_obj.input_token_ids_logprobs_val`` /
-    ``output_token_ids_logprobs_val``. ``convert_logprob_style`` uses
-    ``if token_ids_logprob is not None:`` to decide whether to index
-    into those arrays, and an empty list ``[]`` satisfies
-    ``is not None`` just as well as a populated list — so coercing
-    ``None`` to ``[]`` here would trigger ``IndexError`` on the empty
-    recv_obj logprob arrays. This is the fix for the bug Gemini review
-    flagged on the initial 12a push (commit ``3380394802``).
+    ``fmt="vllm"`` sets ``sampling_params["logprobs"]=0`` (the output processor
+    renders the vLLM ``logprobs`` dict). ``fmt="sglang"`` leaves sampling_params
+    without ``logprobs`` so the SGLang ``return_logprob`` flag drives the
+    tuple-list rendering.
     """
 
     def __init__(
         self,
         *,
         rid: str = "r1",
-        top_logprobs_num: int = 0,
-        token_ids_logprob: Optional[List[int]] = None,
+        fmt: str = "vllm",
     ) -> None:
         super().__init__(stream=True, return_logprob=True, rid=rid)
-        self.top_logprobs_num = top_logprobs_num
-        # Keep None as None — do NOT coerce to []. See class docstring.
-        self.token_ids_logprob = token_ids_logprob
-        self.return_text_in_logprobs = False
+        self.sampling_params = {"logprobs": 0} if fmt == "vllm" else {}
+        self.logprob_format = None  # auto: match the request dialect
 
 
-def _mk_logprob_state(*, rid: str = "r1", top_logprobs_num: int = 0) -> ReqState:
+def _mk_logprob_state(*, rid: str = "r1", fmt: str = "vllm") -> ReqState:
     return ReqState(
         RequestOutputCollector(),
         False,
         __import__("asyncio").Event(),
-        _LogprobReqObj(rid=rid, top_logprobs_num=top_logprobs_num),
+        _LogprobReqObj(rid=rid, fmt=fmt),
         created_time=0.0,
     )
 
 
 class TestInlineLogprobPassThrough(unittest.TestCase):
-    """Verify every logprob array set on a ``BatchTokenIDOut`` flows
-    through the inline branch of ``_handle_batch_output`` into the
-    ``meta_info`` dict that reaches the collector. This is the
-    inline-branch equivalent of the existing BatchStrOut logprob
-    pass-through coverage.
-
-    ``LogprobsProcessor.convert_logprob_style`` is the one function in
-    ``_handle_batch_output`` that reads ``recv_obj.input_token_logprobs_*``
-    / ``recv_obj.output_token_logprobs_*`` / ``recv_obj.input_top_logprobs_*``
-    / ``recv_obj.output_top_logprobs_*`` / ``recv_obj.input_token_ids_logprobs_*``
-    / ``recv_obj.output_token_ids_logprobs_*`` and copies them into
-    ``meta_info``. It runs for any ``recv_obj`` including
-    ``BatchTokenIDOut``, so the inline branch does NOT have to do the
-    copy itself — but if the inline branch somehow masked the logprob
-    fields (for example by consuming ``recv_obj`` before the top-level
-    call in ``_handle_batch_output``) those logprobs would be lost.
-    Lock that contract.
+    """Verify the sampled-token output logprob arrays on a ``BatchTokenIDOut``
+    flow through the inline branch of ``_handle_batch_output`` into ``meta_info``
+    — in BOTH dialects, selected per request, from the same wire arrays.
     """
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
-    def test_flat_output_token_logprobs_flow_through_inline_branch(self):
+    def _run(self, fmt):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
-        state = _mk_logprob_state(rid="r1", top_logprobs_num=0)
+        state = _mk_logprob_state(rid="r1", fmt=fmt)
         _register(mgr, state)
-
-        ids = self.tok.encode("Hello")
         recv = _batch_token_id_out(
             ["r1"],
-            decode_ids=[ids],
+            decode_ids=[self.tok.encode("Hello")],
             finished_reasons=[{"type": "stop", "matched": None}],
-            input_token_logprobs_val=[[-0.1, -0.2, -0.3]],
-            input_token_logprobs_idx=[[10, 20, 30]],
+            input_token_logprobs_val=[[]],
+            input_token_logprobs_idx=[[]],
             output_token_logprobs_val=[[-0.5, -0.6]],
             output_token_logprobs_idx=[[1, 2]],
         )
         mgr.output_processor.handle_batch_output(recv)
-        out = state.collector.take()
+        return state.collector.take()["meta_info"]
 
-        meta = out["meta_info"]
-        self.assertIn("input_token_logprobs", meta)
+    def test_vllm_format(self):
+        meta = self._run("vllm")
+        # vLLM shape: "logprobs" is a list[dict[int, Logprob]], one per token.
+        self.assertIn("logprobs", meta)
+        self.assertNotIn("output_token_logprobs", meta)
+        self.assertEqual(len(meta["logprobs"]), 2)
+        self.assertEqual(meta["logprobs"][0][1].logprob, -0.5)
+        self.assertEqual(meta["logprobs"][0][1].rank, 0)
+        self.assertEqual(meta["logprobs"][1][2].logprob, -0.6)
+        self.assertAlmostEqual(meta["cumulative_logprob"], -1.1)
+
+    def test_sglang_format(self):
+        meta = self._run("sglang")
+        # SGLang shape: "output_token_logprobs" is a list of (val, idx, text)
+        # tuples (text None when not decoding); no vLLM "logprobs" key.
         self.assertIn("output_token_logprobs", meta)
-        # ``detokenize_logprob_tokens`` is stubbed out by ``processor=None``
-        # on ``_StubTokenizerManager``, so the detokenized entries are
-        # ``(val, idx, None)`` tuples. What matters for this gap-fill is
-        # that the recv_obj arrays reach ``meta_info`` at all.
-        self.assertEqual(len(meta["output_token_logprobs"]), 2)
-        self.assertEqual(
-            [entry[0] for entry in meta["output_token_logprobs"]], [-0.5, -0.6]
-        )
-        self.assertEqual([entry[1] for entry in meta["output_token_logprobs"]], [1, 2])
-
-    def test_top_logprobs_flow_through_inline_branch_when_requested(self):
-        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
-        state = _mk_logprob_state(rid="r1", top_logprobs_num=2)
-        _register(mgr, state)
-
-        ids = self.tok.encode("Hello")
-        recv = _batch_token_id_out(
-            ["r1"],
-            decode_ids=[ids],
-            finished_reasons=[{"type": "stop", "matched": None}],
-            input_token_logprobs_val=[[]],
-            input_token_logprobs_idx=[[]],
-            output_token_logprobs_val=[[]],
-            output_token_logprobs_idx=[[]],
-            input_top_logprobs_val=[[[-0.1, -0.2]]],
-            input_top_logprobs_idx=[[[10, 20]]],
-            output_top_logprobs_val=[[[-0.3, -0.4]]],
-            output_top_logprobs_idx=[[[1, 2]]],
-        )
-        mgr.output_processor.handle_batch_output(recv)
-        out = state.collector.take()
-
-        meta = out["meta_info"]
-        self.assertIn("input_top_logprobs", meta)
-        self.assertIn("output_top_logprobs", meta)
-        self.assertEqual(len(meta["output_top_logprobs"]), 1)
-        # First top-k bucket corresponds to one generation step; its
-        # entries are (val, idx, None) tuples in the same shape the
-        # string branch would produce.
-        self.assertEqual(
-            [entry[0] for entry in meta["output_top_logprobs"][0]],
-            [-0.3, -0.4],
-        )
-        self.assertEqual(
-            [entry[1] for entry in meta["output_top_logprobs"][0]],
-            [1, 2],
-        )
+        self.assertNotIn("logprobs", meta)
+        self.assertEqual([e[0] for e in meta["output_token_logprobs"]], [-0.5, -0.6])
+        self.assertEqual([e[1] for e in meta["output_token_logprobs"]], [1, 2])
 
 
 if __name__ == "__main__":

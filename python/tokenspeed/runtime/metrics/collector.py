@@ -230,6 +230,15 @@ class EngineMetrics:
             labelnames=labelnames,
             **kw,
         )
+        self.num_nan_aborted_requests = Counter(
+            name="tokenspeed:num_nan_aborted_requests",
+            documentation=(
+                "Requests terminated by the NaN guard (NaN in logits or an "
+                "out-of-vocab sampled token id)."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
 
     def set_scheduler_snapshot(
         self, *, running: int, waiting: int, kv_cache_usage_ratio: float
@@ -280,6 +289,11 @@ class EngineMetrics:
         self.spec_decode_num_accepted_tokens.labels(**self.labels).inc(
             max(0, accepted_draft_tokens)
         )
+
+    def record_nan_abort(self) -> None:
+        if not self.enabled:
+            return
+        self.num_nan_aborted_requests.labels(**self.labels).inc()
 
 
 class RequestMetrics:

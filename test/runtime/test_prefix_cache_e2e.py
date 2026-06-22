@@ -168,7 +168,6 @@ class TestPrefixCacheDisabled(unittest.TestCase):
                             case, "What is 1+1? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
 
@@ -178,7 +177,6 @@ class TestPrefixCacheDisabled(unittest.TestCase):
                             case, "What is 2+2? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
                     cached = resp["meta_info"].get("cached_tokens", 0)
@@ -208,7 +206,6 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                             case, "What is 1+1? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
 
@@ -218,7 +215,6 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                             case, "What is 2+2? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
                     cached = resp["meta_info"].get("cached_tokens", 0)
@@ -245,7 +241,6 @@ class TestPrefixCacheDisabledOutputQuality(unittest.TestCase):
                             case, "What is 2+2? Reply with just the number."
                         ),
                         sampling_params={"max_new_tokens": 32, "temperature": 0},
-                        return_logprob=False,
                         stream=False,
                     )
                     text = resp["text"].strip()

@@ -208,6 +208,49 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     assert b_format.scale.block_shape == (128, 128)
 
 
+def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for online mxfp8 GEMM verification")
+    if not Platform.get().is_nvidia:
+        pytest.skip("NVIDIA GPU is required for TRTLLM mxfp8 scale layout")
+
+    torch.manual_seed(0)
+    num_tokens = 16
+    hidden_size = 2048
+    output_size = 128
+    block_size = [128, 128]
+    a = torch.randn((1, hidden_size), device="cuda", dtype=torch.bfloat16).repeat(
+        num_tokens, 1
+    )
+    b = (
+        torch.randn((output_size, hidden_size), device="cuda", dtype=torch.float32)
+        * 0.1
+    ).to(_fp8_dtype())
+    b_scales = (
+        torch.rand(
+            (
+                (output_size + block_size[0] - 1) // block_size[0],
+                (hidden_size + block_size[1] - 1) // block_size[1],
+            ),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        + 0.01
+    )
+
+    out = tokenspeed_kernel.mm(
+        a,
+        b,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        quant="mxfp8",
+        block_size=block_size,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out[1:], out[:1].expand_as(out[1:]), rtol=0, atol=0)
+
+
 def test_gemm_fp8_scaled_signature_uses_fp8_format_with_scale() -> None:
     a = torch.empty((4, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
@@ -315,7 +358,7 @@ def _attention_prefill() -> object:
 def _attention_extend() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
-    cum_seq_lens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
+    cu_seqlens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
     k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     page_table = torch.empty((2, 4), dtype=torch.int32)
@@ -323,7 +366,7 @@ def _attention_extend() -> object:
     return tokenspeed_kernel.mha_extend_with_kvcache(
         q,
         cu_seqlens_q,
-        cum_seq_lens_kv,
+        cu_seqlens_kv,
         k_cache,
         v_cache,
         page_table,
@@ -346,6 +389,7 @@ def _attention_decode() -> object:
         page_table,
         cache_seqlens,
         max_seqlen_k=128,
+        max_seqlen_q=1,
     )
 
 

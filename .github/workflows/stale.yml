@@ -16,20 +16,20 @@ jobs:
     steps:
       - uses: actions/stale@v10
         with:
-          days-before-stale: 30
-          days-before-close: 7
+          days-before-stale: 14
+          days-before-close: 3
           stale-issue-label: inactive
           stale-issue-message: >
-            This issue has been inactive for 30 days and is marked as stale.
-            It will be closed in 7 days if there is no further activity.
+            This issue has been inactive for 14 days and is marked as stale.
+            It will be closed in 3 days if there is no further activity.
           close-issue-message: >
             This issue has been automatically closed due to inactivity.
             Feel free to reopen it if it is still relevant.
           exempt-issue-labels: 'good first issue'
           stale-pr-label: inactive
           stale-pr-message: >
-            This PR has been inactive for 30 days and is marked as stale.
-            It will be closed in 7 days if there is no further activity.
+            This PR has been inactive for 14 days and is marked as stale.
+            It will be closed in 3 days if there is no further activity.
           close-pr-message: >
             This PR has been automatically closed due to inactivity.
             Feel free to reopen it if it is still relevant.

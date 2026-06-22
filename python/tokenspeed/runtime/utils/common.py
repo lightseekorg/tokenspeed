@@ -719,6 +719,13 @@ def dataclass_to_string_truncated(
 ):
     if skip_names is None:
         skip_names = set()
+    # Summarize tensors/ndarrays by shape — never str() the values (the bare
+    # str() fallthrough below would dump a whole multimodal feature tensor,
+    # bloating the request log).
+    if torch.is_tensor(data):
+        return f"Tensor(shape={tuple(data.shape)}, dtype={data.dtype})"
+    if isinstance(data, np.ndarray):
+        return f"ndarray(shape={tuple(data.shape)}, dtype={data.dtype})"
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -726,16 +733,27 @@ def dataclass_to_string_truncated(
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
+        # Recurse element-wise (was ``str(data)``, which would dump nested
+        # tensors in full) and propagate skip_names.
         if len(data) > max_length:
             half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+            shown = list(data[:half_length]) + ["..."] + list(data[-half_length:])
         else:
-            return str(data)
+            shown = data
+        inner = ", ".join(
+            (
+                "..."
+                if x == "..."
+                else dataclass_to_string_truncated(x, max_length, skip_names)
+            )
+            for x in shown
+        )
+        return "[" + inner + "]"
     elif isinstance(data, dict):
         return (
             "{"
             + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {dataclass_to_string_truncated(v, max_length, skip_names)}"
                 for k, v in data.items()
                 if k not in skip_names
             )
@@ -746,7 +764,7 @@ def dataclass_to_string_truncated(
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length, skip_names)}"
                 for f in fields
                 if f.name not in skip_names
             )

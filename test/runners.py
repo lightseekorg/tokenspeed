@@ -271,13 +271,9 @@ class HFRunner:
         max_model_len: Optional[int] = None,
     ) -> ModelOutput:
         output_strs = []
-        top_input_logprobs = []
-        top_output_logprobs = []
-        if token_ids_logprob is not None:
-            token_ids_input_logprobs = []
-            token_ids_output_logprobs = []
-        else:
-            token_ids_input_logprobs = token_ids_output_logprobs = None
+        # Per-prompt list of (logprob, token_id) for each greedily generated
+        # token — the reference for the engine's vLLM-style output logprobs.
+        output_token_logprobs_lst = []
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
@@ -339,33 +335,17 @@ class HFRunner:
             output_strs.append(text)
 
             if not output_str_only:
-                # outputs.scores: (num_token, 1, vocab_size)
-                top_output_logprobs.append(
-                    [
-                        get_top_logprobs(logits[0], NUM_TOP_LOGPROBS).tolist()
-                        for logits in outputs.scores
-                    ]
-                )
-                if token_ids_logprob is not None:
-                    token_ids_output_logprobs.append(
-                        [
-                            get_token_ids_logprobs(
-                                logits[0], token_ids_logprob
-                            ).tolist()
-                            for logits in outputs.scores
-                        ]
-                    )
+                # outputs.scores: (num_token, 1, vocab_size). For each generated
+                # token t, the reference logprob is log_softmax(scores[t])[gen_id]
+                # where gen_id is the greedily generated token at position t.
+                gen_ids = outputs.sequences[0][len(input_ids[0]) :]
+                per_token = []
+                for t, logits in enumerate(outputs.scores):
+                    lp = torch.log_softmax(logits[0].float(), dim=-1)
+                    tid = int(gen_ids[t])
+                    per_token.append((float(lp[tid]), tid))
+                output_token_logprobs_lst.append(per_token)
                 del outputs
-
-                input_logits = model.forward(input_ids).logits[0]
-                top_input_logprobs.append(
-                    get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist()
-                )
-                if token_ids_logprob is not None:
-                    token_ids_input_logprobs.append(
-                        get_token_ids_logprobs(input_logits, token_ids_logprob).tolist()
-                    )
-                del input_logits
 
             if lora_paths is not None and lora_paths[i] is not None:
                 # Unload the LoRA adapter if it is used
@@ -373,10 +353,7 @@ class HFRunner:
 
         return ModelOutput(
             output_strs=output_strs,
-            top_input_logprobs=top_input_logprobs,
-            top_output_logprobs=top_output_logprobs,
-            token_ids_input_logprobs=token_ids_input_logprobs,
-            token_ids_output_logprobs=token_ids_output_logprobs,
+            output_token_logprobs_lst=output_token_logprobs_lst,
         )
 
 
@@ -442,6 +419,10 @@ class RTRunner:
             trust_remote_code=trust_remote_code,
             attention_backend=attention_backend,
             enforce_eager=enforce_eager,
+            # Output (decode-token) logprobs are gated by this static server arg
+            # (the sampler only gathers them when on). The runner compares them
+            # against the HF reference, so enable it for all RT runs.
+            enable_output_logprobs=True,
             enable_prefix_caching=enable_prefix_caching,
             chunked_prefill_size=chunked_prefill_size,
             max_model_len=max_model_len,
@@ -530,23 +511,20 @@ class RTRunner:
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
     ):
-        # the return value contains logprobs from prefill
+        # vLLM-style output logprobs only: request the sampled token's logprob
+        # at each output position via SamplingParams.logprobs=0. Prompt/top-k/
+        # token-id logprobs are not supported, so their ModelOutput fields stay
+        # None. (logprob_start_len / token_ids_logprob are accepted for call-site
+        # compatibility but ignored.)
         output_strs = []
         output_ids = []
-        # Input logprobs. Note that the last item in input logprob is equivalent to
-        # the first item in the output logprob.
-        top_input_logprobs = []
-        input_token_logprobs_lst = []
-        top_output_logprobs = []
         output_token_logprobs_lst = []
-        top_output_logprob_idx = []
-        if token_ids_logprob is not None:
-            token_ids_input_logprobs = []
-            token_ids_output_logprobs = []
-        else:
-            token_ids_input_logprobs = token_ids_output_logprobs = None
 
-        sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+        sampling_params = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": 0,
+            "logprobs": 0,
+        }
         if top_k:
             sampling_params["top_k"] = top_k
 
@@ -554,10 +532,6 @@ class RTRunner:
             response = engine.generate(
                 prompt,
                 sampling_params=sampling_params,
-                return_logprob=True,
-                logprob_start_len=logprob_start_len,
-                top_logprobs_num=NUM_TOP_LOGPROBS,
-                token_ids_logprob=token_ids_logprob,
             )
             text = response["text"]
 
@@ -569,84 +543,19 @@ class RTRunner:
             output_strs.append(text)
             output_ids.append(response["output_ids"])
 
-            input_token_logprobs = response["meta_info"]["input_token_logprobs"]
-            output_token_logprobs = response["meta_info"]["output_token_logprobs"]
-            # print(i, input_token_logprobs)
-            # print(i, output_token_logprobs)
-            logprobs = response["meta_info"]["input_top_logprobs"]
-            if token_ids_logprob is not None:
-                input_token_ids_logprobs = response["meta_info"][
-                    "input_token_ids_logprobs"
-                ][1:]
-            else:
-                input_token_ids_logprobs = None
-
-            num_prompt_tokens = response["meta_info"]["prompt_tokens"]
-            # assert len(input_token_logprobs) == num_prompt_tokens - logprob_start_len
-            assert len(logprobs) == num_prompt_tokens - logprob_start_len
-
-            # The first token logprob has no meaning in tokenspeed.
-            input_token_logprobs = input_token_logprobs[1:]
-            logprobs = logprobs[1:]
-            assert len(input_token_logprobs) == len(logprobs)
-
-            input_token_logprobs_lst.append(
-                input_token_logprobs + [output_token_logprobs[0]]
-            )
-            output_token_logprobs_lst.append(output_token_logprobs)
-
-            top_input_logprobs.append(
-                [[tup[0] for tup in x[:NUM_TOP_LOGPROBS]] for x in logprobs]
-                + [
-                    [
-                        tup[0]
-                        for tup in response["meta_info"]["output_top_logprobs"][0][
-                            :NUM_TOP_LOGPROBS
-                        ]
-                    ]
-                ]
-            )
-            top_output_logprobs.append(
-                [
-                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["output_top_logprobs"]
-                ]
-            )
-            top_output_logprob_idx.append(
-                [
-                    [tup[1] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["output_top_logprobs"]
-                ]
-            )
-            if token_ids_logprob is not None:
-                token_ids_input_logprobs.append(
-                    [[tup[0] for tup in x] for x in input_token_ids_logprobs]
-                    + [
-                        [
-                            tup[0]
-                            for tup in response["meta_info"][
-                                "output_token_ids_logprobs"
-                            ][0]
-                        ]
-                    ]
-                )
-                token_ids_output_logprobs.append(
-                    [
-                        [tup[0] for tup in x]
-                        for x in response["meta_info"]["output_token_ids_logprobs"]
-                    ]
-                )
+            # meta_info["logprobs"] is a list[dict[token_id, Logprob]] (one dict
+            # per generated token, holding the sampled token at rank 0). Flatten
+            # to (logprob, token_id) tuples per position.
+            per_token = []
+            for pos in response["meta_info"].get("logprobs", []):
+                tid, lp = next(iter(pos.items()))
+                per_token.append((lp.logprob, tid))
+            output_token_logprobs_lst.append(per_token)
 
         return ModelOutput(
             output_strs=output_strs,
             output_ids=output_ids,
-            top_input_logprobs=top_input_logprobs,
-            top_output_logprobs=top_output_logprobs,
-            input_token_logprobs_lst=input_token_logprobs_lst,
             output_token_logprobs_lst=output_token_logprobs_lst,
-            top_output_logprob_idx=top_output_logprob_idx,
-            token_ids_input_logprobs=token_ids_input_logprobs,
-            token_ids_output_logprobs=token_ids_output_logprobs,
         )
 
     @staticmethod
@@ -718,30 +627,22 @@ def check_close_model_outputs(
 
     if check_logprobs:
         for i in range(len(hf_outputs.output_strs)):
-            # Compare input logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
-            srt_logprobs = torch.Tensor(rt_outputs.top_input_logprobs[i])
-            input_len = hf_logprobs.shape[0]
-            print(
-                "prefill logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
+            # Compare the vLLM-style output (sampled-token) logprobs against the
+            # HF reference. Both runners decode greedily; compare the prefix of
+            # positions where the generated token ids agree (greedy can diverge
+            # late due to numerics, which the ROUGE-L check above already bounds).
+            hf_lp = hf_outputs.output_token_logprobs_lst[i]
+            rt_lp = rt_outputs.output_token_logprobs_lst[i]
+            n = 0
+            while n < min(len(hf_lp), len(rt_lp)) and hf_lp[n][1] == rt_lp[n][1]:
+                n += 1
+            if n == 0:
+                continue
+            hf_vals = torch.Tensor([x[0] for x in hf_lp[:n]])
+            rt_vals = torch.Tensor([x[0] for x in rt_lp[:n]])
+            print("output logprobs max_diff", torch.max(abs(hf_vals - rt_vals)))
+            assert torch.all(abs(hf_vals - rt_vals) < decode_tolerance), (
+                f"output logprobs are not all close with {debug_text} "
+                f"decode_tolerance={decode_tolerance}."
+                f"{hf_vals=}, {rt_vals=}"
             )
-            if input_len <= 100:
-                assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
-                    f"prefill logprobs are not all close with {debug_text} "
-                    f"prefill_tolerance={prefill_tolerance}."
-                    f"{hf_logprobs=}, {srt_logprobs=}"
-                )
-
-            # Compare output logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
-            srt_logprobs = torch.Tensor(rt_outputs.top_output_logprobs[i])
-
-            print(
-                "decode logprobs max_diff", torch.max(abs(hf_logprobs - srt_logprobs))
-            )
-            if input_len <= 100:
-                assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
-                    f"decode logprobs are not all close with {debug_text} "
-                    f"decode_tolerance={decode_tolerance}."
-                    f"{hf_logprobs=}, {srt_logprobs=}"
-                )
