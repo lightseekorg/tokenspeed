@@ -132,8 +132,6 @@ class DSABackend(AttentionBackend):
     Dense MLA metadata and dense attention calls are delegated to TRTLLMMLABackend.
     """
 
-    uses_dummy_request_padding = True
-
     def __init__(self, config: DSAConfig):
         super().__init__(config)
         self._dense_backend = TRTLLMMLABackend(config)

@@ -237,11 +237,6 @@ class CudaGraphWrapper:
         self.use_target_verify_forward_mode = config.use_target_verify_forward_mode
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
-        self.uses_dummy_request_padding = any(
-            getattr(backend, "uses_dummy_request_padding", False)
-            for backend in (attn_backend, draft_attn_backend)
-            if backend is not None
-        )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         paged_cache_group_specs = tuple(token_to_kv_pool.paged_cache_group_specs)
@@ -810,10 +805,28 @@ class CudaGraphWrapper:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
-    def _padding_req_pool_index(self) -> int:
-        if self.uses_dummy_request_padding:
-            return int(self.config.max_req_pool_size)
-        return 0
+    @staticmethod
+    def _pad_graph_req_pool_indices(
+        active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> torch.Tensor:
+        pad = padded_bs - active_req_pool_indices.shape[0]
+        if pad <= 0:
+            return active_req_pool_indices
+        return torch.cat(
+            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+        )
+
+    def _set_graph_state_write_indices(
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> None:
+        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
+        active_bs = active_req_pool_indices.shape[0]
+        if active_bs > 0:
+            state_indices[:active_bs].copy_(active_req_pool_indices)
+        if active_bs < padded_bs:
+            state_indices[active_bs:padded_bs].fill_(
+                int(self.config.max_req_pool_size)
+            )
 
     def __call__(
         self,
@@ -845,6 +858,7 @@ class CudaGraphWrapper:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
@@ -852,15 +866,8 @@ class CudaGraphWrapper:
             seq_lens = torch.nn.functional.pad(
                 self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
             )
-            active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-            dummy_req_pool_indices = torch.full(
-                (pad,),
-                self._padding_req_pool_index(),
-                dtype=active_req_pool_indices.dtype,
-                device=active_req_pool_indices.device,
-            )
-            req_pool_indices = torch.cat(
-                [active_req_pool_indices, dummy_req_pool_indices]
+            req_pool_indices = self._pad_graph_req_pool_indices(
+                active_req_pool_indices, padded_bs
             )
             self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
             self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
@@ -883,6 +890,9 @@ class CudaGraphWrapper:
         else:
             seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
+
+        if use_graph:
+            self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
 
         mamba_kwargs = {}
         if mamba_pool_indices is not None:

@@ -39,7 +39,6 @@ class AttentionBackend(ABC):
 
     uses_paged_cache_groups: bool = False
     uses_padded_decode_token_mask: bool = False
-    uses_dummy_request_padding: bool = False
 
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device
