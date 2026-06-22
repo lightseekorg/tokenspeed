@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.engine.scheduler_utils import (
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
@@ -42,10 +43,13 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
+from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -105,6 +109,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    enable_nan_detection: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -143,10 +148,8 @@ class ModelExecutorConfig:
             if server_args.speculative_algorithm
             else 1
         )
-        rope_scaling = getattr(
-            model_config.hf_text_config, "rope_parameters", None
-        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
-        model_is_mrope = bool(rope_scaling and "mrope_section" in rope_scaling)
+        rope_parameters = get_rope_parameters(model_config.hf_text_config)
+        model_is_mrope = bool(rope_parameters and "mrope_section" in rope_parameters)
 
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
@@ -174,6 +177,7 @@ class ModelExecutorConfig:
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
+            enable_nan_detection=server_args.enable_nan_detection,
             use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
@@ -230,6 +234,7 @@ class ModelExecutor:
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
+            state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
             has_mamba=(mamba_pool is not None),
         )
@@ -240,6 +245,12 @@ class ModelExecutor:
             device=self.device,
             output_length=config.output_length,
             mamba_pool=mamba_pool,
+        )
+        # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
+        self.nan_guard = NanGuard.create(
+            config.enable_nan_detection,
+            config.max_num_seqs // max(config.data_parallel_size, 1),
+            self.device,
         )
         if self.config.spec_algo is not None:
             DrafterImpl = _DRAFTER_MAPPING[config.spec_algo]
@@ -607,6 +618,10 @@ class ModelExecutor:
             self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
+
+        # Flag NaN per request and sanitize in place, before any sampling kernel.
+        self.nan_guard.audit_logits(logits_output, ctx)
+
         candidates = (
             self.drafter.get_candidates(ctx)
             if self.config.spec_algo is not None
@@ -630,6 +645,8 @@ class ModelExecutor:
         # access). Clamp in place (this runs inside the CUDA graph) so grammar,
         # drafter, and the return value all observe clean ids. Mirror of the
         # draft-side draft_ids.clamp_(min=0) guard.
+        # Record which requests produced bad ids before the clamp erases them.
+        self.nan_guard.merge_oov(output_tokens, ctx, self.runtime_states.vocab_size)
         output_tokens.clamp_(min=0)
 
         # Fork sampler-output D2H onto the grammar side stream so the
@@ -647,7 +664,7 @@ class ModelExecutor:
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly.
             self.runtime_states.future_input_map[
-                self.input_buffers.req_pool_indices_buf[: ctx.bs]
+                self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
@@ -1078,7 +1095,22 @@ class ModelExecutor:
                     global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
-                    draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
+                    # Mirror the active-rank broaden in eagle.py: Llama Eagle3
+                    # and Qwen3.5 NextN narrow for any non-idle catch-up, so the
+                    # idle peer must size collectives the same way.
+                    draft_first_step_reduce=(
+                        step_idx == 0
+                        and (
+                            all_decode_or_idle
+                            or isinstance(
+                                self.drafter.draft_model_runner.model,
+                                (
+                                    LlamaForCausalLMEagle3,
+                                    Qwen3_5ForConditionalGenerationNextN,
+                                ),
+                            )
+                        )
+                    ),
                 )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
@@ -1296,6 +1328,8 @@ class ModelExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
+            # Outside the graph: in-graph sites only OR into the flag buffer.
+            self.nan_guard.reset(bs)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1565,6 +1599,8 @@ class ModelExecutor:
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
 
+                output_nan_flags = self.nan_guard.flags_cpu
+
                 copy_event = torch.cuda.Event()
                 copy_event.record()
 
@@ -1575,6 +1611,7 @@ class ModelExecutor:
             copy_event=copy_event,
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
+            output_nan_flags=output_nan_flags,
         )
 
     def write_remote_spec_candidate_ids(

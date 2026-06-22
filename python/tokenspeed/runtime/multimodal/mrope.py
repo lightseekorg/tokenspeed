@@ -56,13 +56,18 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     if not any(arch in _MROPE_ARCHITECTURES for arch in architectures):
         return None, None
 
-    image_grid_thw = None
-    video_grid_thw = None
-    for item in mm_items:
-        if "image_grid_thw" in item.model_specific_data:
-            image_grid_thw = item.model_specific_data["image_grid_thw"]
-        if "video_grid_thw" in item.model_specific_data:
-            video_grid_thw = item.model_specific_data["video_grid_thw"]
+    image_grids = [
+        item.model_specific_data["image_grid_thw"]
+        for item in mm_items
+        if "image_grid_thw" in item.model_specific_data
+    ]
+    video_grids = [
+        item.model_specific_data["video_grid_thw"]
+        for item in mm_items
+        if "video_grid_thw" in item.model_specific_data
+    ]
+    image_grid_thw = torch.cat(image_grids, dim=0) if image_grids else None
+    video_grid_thw = torch.cat(video_grids, dim=0) if video_grids else None
 
     input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
     mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(

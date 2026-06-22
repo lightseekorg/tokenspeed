@@ -79,17 +79,23 @@ class GenerateReqInput:
     user_rid: list[str] | str | None = None
     # Routing id; always server-assigned during normalize, never caller-settable.
     rid: list[str] | str | None = field(default=None, init=False)
-    # Whether to return logprobs.
+    # --- Logprob request (two dialects, one compute path) ---
+    # vLLM dialect: request output logprobs via ``sampling_params["logprobs"]``.
+    # SGLang dialect: the fields below. A request uses one dialect; the response
+    # is rendered to match (override with ``logprob_format``).
     return_logprob: list[bool] | bool | None = None
-    # If return logprobs, the start location in the prompt for returning logprobs.
-    # By default, this value is "-1", which means it will only return logprobs for output tokens.
+    # SGLang: start location in the prompt for prompt logprobs. -1 (default) =
+    # output tokens only.
     logprob_start_len: list[int] | int | None = None
-    # If return logprobs, the number of top logprobs to return at each position.
+    # SGLang: number of top logprobs per position.
     top_logprobs_num: list[int] | int | None = None
-    # If return logprobs, the token ids to return logprob for.
+    # SGLang: specific token ids to score per position.
     token_ids_logprob: list[list[int]] | list[int] | None = None
-    # Whether to detokenize tokens in text in the returned logprobs.
+    # SGLang: detokenize tokens in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Output rendering dialect: "vllm" | "sglang" | "both". None = auto (match
+    # the request dialect: vllm if sampling_params.logprobs is set, else sglang).
+    logprob_format: list[str | None] | str | None = None
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -260,6 +266,9 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
+            if self.logprob_format is None or isinstance(self.logprob_format, str):
+                self.logprob_format = [self.logprob_format] * num
+
             if self.custom_logit_processor is None:
                 self.custom_logit_processor = [None] * num
             elif not isinstance(self.custom_logit_processor, list):
@@ -325,6 +334,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            logprob_format=self.logprob_format[i],
             stream=self.stream,
             log_metrics=self.log_metrics,
             custom_logit_processor=(
@@ -358,13 +368,15 @@ class TokenizedGenerateReqInput:
     input_ids: list[int]
     # The sampling parameters
     sampling_params: SamplingParams
-    # Whether to return the logprobs
+    # Whether to return the sampled token's logprob for this request.
     return_logprob: bool
-    # If return logprobs, the start location in the prompt for returning logprobs.
+    # Internal carry-over fields kept for pipeline/PD compatibility. The vLLM
+    # output-logprob API only drives ``return_logprob``; InputProcessor sets
+    # these to neutral values (logprob_start_len=-1, top_logprobs_num=0,
+    # token_ids_logprob=None) since prompt logprobs, output top-k, and token-id
+    # logprobs are not supported.
     logprob_start_len: int
-    # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: int
-    # If return logprobs, the token id to return logprob for
     token_ids_logprob: list[int]
     # Whether to stream output
     stream: bool

@@ -173,10 +173,6 @@ class InputProcessor:
                 input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
 
         if self.engine.is_generation:
-            return_logprob = obj.return_logprob
-            logprob_start_len = obj.logprob_start_len
-            top_logprobs_num = obj.top_logprobs_num
-            token_ids_logprob = obj.token_ids_logprob
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -211,6 +207,41 @@ class InputProcessor:
         sampling_params.resolve_seed(obj.rid)
         sampling_params.normalize(self.engine.tokenizer)
         sampling_params.verify(self.engine.model_config.vocab_size)
+
+        # Output logprobs: two request dialects, one compute path. vLLM uses
+        # sampling_params.logprobs; SGLang uses GenerateReqInput.return_logprob
+        # (+ top_logprobs_num / logprob_start_len / token_ids_logprob). Either way
+        # the scheduler computes only the sampled token's logprob; the response
+        # dialect is chosen at render time. Gate unsupported CAPABILITIES loudly
+        # here rather than silently clamping the request shape.
+        sglang_req = bool(getattr(obj, "return_logprob", False))
+        return_logprob = sampling_params.logprobs is not None or sglang_req
+        # Output logprobs are gated by the static server arg enable_output_logprobs
+        # (the sampler only gathers them when on). Reject loudly instead of
+        # silently returning empty logprobs when the server cannot honor it.
+        if return_logprob and not self.engine.server_args.enable_output_logprobs:
+            raise ValueError(
+                "logprobs were requested but the server was started without "
+                "enable_output_logprobs; restart with enable_output_logprobs=True "
+                "to return output logprobs."
+            )
+        if sglang_req:
+            # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
+            # the SGLang capability knobs here for parity.
+            if getattr(obj, "top_logprobs_num", 0):
+                raise ValueError(
+                    "top_logprobs_num > 0 (output top-k logprobs) is not supported "
+                    "yet; use top_logprobs_num=0 (the sampled token's logprob)."
+                )
+            if (getattr(obj, "logprob_start_len", -1) or -1) >= 0:
+                raise ValueError(
+                    "logprob_start_len >= 0 (prompt logprobs) is not supported yet."
+                )
+            if getattr(obj, "token_ids_logprob", None):
+                raise ValueError("token_ids_logprob is not supported yet.")
+        logprob_start_len = -1
+        top_logprobs_num = 0
+        token_ids_logprob = None
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(

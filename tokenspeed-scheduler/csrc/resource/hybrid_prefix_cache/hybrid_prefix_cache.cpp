@@ -1501,7 +1501,47 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
         last_committed = target;
     }
 
-    (void)commitTerminalContinuationSnapshot(tables, terminal, chunk_depth);
+    const bool terminal_state_committed = commitTerminalContinuationSnapshot(tables, terminal, chunk_depth);
+
+    // Release superseded interior continuation-state snapshots.
+    //
+    // A continuation-state restore resumes from the deepest matching terminal
+    // (Match). Each turn's terminal becomes an interior ancestor on the next
+    // turn, but nothing released its now-superseded trailing-window state
+    // snapshot, so these pinned pages accumulate one window per turn and
+    // exhaust the small State pools (e.g. v4.c128a.compressor_state). Release an
+    // ancestor's State portion (keeping its History chain) only when it is
+    // provably unreferenced, which requires BOTH:
+    //   (1) the owning request's sliding window has advanced past the ancestor
+    //       (node_depth + window <= chunk_depth), so ReleaseSkipped has already
+    //       dropped those pages from this request's own borrowed set; and
+    //   (2) no OTHER request references the ancestor. Each request holds exactly
+    //       one DeviceNodeRef that Locks its whole path to root (NodeRef::Lock),
+    //       so Device().RefCount() == 1 means this committing request is the
+    //       sole referencer and no other request can be borrowing the node's
+    //       continuation-state window. When shared (RefCount > 1, e.g. a second
+    //       request whose prefix runs through this node), keep the snapshot so
+    //       the sharer's continuation-state resume stays valid; it is released
+    //       on a later commit once the sharer's ref drops.
+    // Gate on a complete terminal snapshot so a resume anchor always remains.
+    if (terminal_state_committed) {
+        std::int32_t max_state_window = 0;
+        for (const auto& gid : paged_cache_continuation_state_groups_) {
+            auto alloc_it = paged_cache_allocators_.find(gid);
+            if (alloc_it != paged_cache_allocators_.end() && alloc_it->second != nullptr) {
+                max_state_window =
+                    std::max(max_state_window, alloc_it->second->Config().sliding_window_tokens.value_or(0));
+            }
+        }
+        for (TreeNode* cur = terminal->Parent(); cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
+            if (!cur->HasPagedCacheSnapshot()) continue;
+            if (static_cast<std::int32_t>(cur->DepthInTokens()) + max_state_window > chunk_depth) {
+                continue;
+            }
+            if (!cur->OnDevice() || cur->Device().RefCount() != 1) continue;
+            DetachStateSnapshotFromNode(cur);
+        }
+    }
 }
 
 }  // namespace tokenspeed

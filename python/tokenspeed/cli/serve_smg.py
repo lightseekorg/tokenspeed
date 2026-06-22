@@ -52,8 +52,14 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+GLM_REASONING_PARSER = "glm45"
+GLM_TOOL_CALL_PARSER = "glm47_moe"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
+# smg routing policy for ``ts serve``. Distinct from DEFAULT_REASONING_PARSER,
+# which happens to share the "passthrough" string but configures an unrelated
+# flag (--reasoning-parser).
+DEFAULT_SMG_POLICY = "passthrough"
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -123,6 +129,30 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
         if flag not in result:
             result.append(flag)
     return result
+
+
+def _gateway_args_with_default_policy(gateway_args: list[str]) -> list[str]:
+    """Front smg's single backend with the ``passthrough`` routing policy.
+
+    ``ts serve`` always orchestrates exactly one engine endpoint, so smg's binary
+    default (``cache_aware``) is pure overhead here: it runs the load-aware worker
+    monitor and subscribes to the engine's KV events (``SubscribeKvEvents``).
+    Against engines that predate that RPC the subscription surfaced as
+    ``NotImplementedError: Method not implemented`` (smg#1794). The ``passthrough``
+    policy (smg#1797) forwards every request to the single healthy worker with no
+    load balancing, load monitoring, or KV-event subscription.
+
+    Default-when-unset: an explicit operator ``--policy`` is preserved.
+
+    NOTE: ``--policy`` is whitelisted by smg's clap ``value_parser`` — a gateway
+    that predates smg#1797 rejects ``passthrough`` and fails to start. This
+    injection therefore requires a bundled ``tokenspeed-smg`` that ships smg#1797;
+    the pin in ``python/pyproject.toml`` must be bumped to such a release in
+    lockstep with this default.
+    """
+    if "--policy" in gateway_args:
+        return gateway_args
+    return [*gateway_args, "--policy", DEFAULT_SMG_POLICY]
 
 
 _TOKENIZER_CACHE_FLAGS = (
@@ -216,6 +246,32 @@ def _is_deepseek_v4_model(model_id: str | None) -> bool:
     )
 
 
+def _is_glm_dsa_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
+    normalized = model_id.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if "glm-5" in normalized or "glm5" in compact:
+        return True
+
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "glm_moe_dsa" or any(
+        arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"}
+        for arch in architectures
+    )
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -227,7 +283,22 @@ def _args_with_default_model_parsers(
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
     if not _is_deepseek_v4_model(model_id):
-        return engine_args, gateway_args
+        if not _is_glm_dsa_model(model_id):
+            return engine_args, gateway_args
+
+        engine_result = list(engine_args)
+        gateway_result = list(gateway_args)
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
+        if "--disable-kvstore" not in engine_result:
+            engine_result.append("--disable-kvstore")
+        return engine_result, gateway_result
 
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
@@ -276,6 +347,7 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
     gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
+    gateway_args = _gateway_args_with_default_policy(gateway_args)
     gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
     gateway_args = _gateway_args_with_default_log_level(gateway_args)
     return _gateway_args_with_default_prometheus_port(gateway_args)

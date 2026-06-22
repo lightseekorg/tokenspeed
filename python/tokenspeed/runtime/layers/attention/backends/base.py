@@ -127,6 +127,35 @@ class AttentionBackend(ABC):
     def register_step_counter(self, step_counter: StepCounter):
         self.step_counter = step_counter
 
+    @contextmanager
+    def record_pd_cache_step(
+        self,
+        forward_mode: ForwardMode,
+        save_kv_cache: bool,
+        record_kv_cache: bool | None,
+    ):
+        """Anchor the PD layerwise cache-step record to the wrapped KV write.
+
+        Records the ``StepCounter`` step before the attention call when the KV
+        was pre-written (``save_kv_cache=False``) and after it otherwise, so a
+        layerwise cache transfer always observes a fully written layer. See
+        ``forward`` for the ``record_kv_cache`` override contract. No-op when no
+        step counter is registered. Backends that own the record (e.g. the
+        hybrid wrapper, which counts once per model layer across full-attn +
+        mamba children) reuse this to avoid duplicating the gate logic.
+        """
+        if record_kv_cache is None:
+            record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
+        else:
+            record_cache = record_kv_cache
+        record_cache = record_cache and getattr(self, "step_counter", None) is not None
+
+        if record_cache and not save_kv_cache:
+            self.step_counter.record_cache()
+        yield
+        if record_cache and save_kv_cache:
+            self.step_counter.record_cache()
+
     def forward(
         self,
         q: torch.Tensor,
@@ -138,49 +167,42 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode,
         bs: int,
         save_kv_cache: bool = True,
+        record_kv_cache: bool | None = None,
         **kwargs,
     ):
-        """Run forward on an attention layer with explicit scheduler metadata."""
-        if forward_mode.is_decode():
-            return self.forward_decode(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
-        else:
-            if (
-                not forward_mode.is_idle()
-                and getattr(self, "step_counter", None)
-                and not save_kv_cache
-            ):
-                self.step_counter.record_cache()
+        """Run forward on an attention layer with explicit scheduler metadata.
 
-            ret = self.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                forward_mode=forward_mode,
-                **kwargs,
-            )
-
-            if (
-                not forward_mode.is_idle()
-                and getattr(self, "step_counter", None)
-                and save_kv_cache
-            ):
-                self.step_counter.record_cache()
-            return ret
+        ``record_kv_cache`` overrides the PD layerwise cache-step recording:
+        ``None`` keeps the default (record on the EXTEND-side path), an explicit
+        bool forces it so a DECODE-dispatched draft catch-up can still record.
+        """
+        with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+            if forward_mode.is_decode():
+                ret = self.forward_decode(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    bs,
+                    save_kv_cache=save_kv_cache,
+                    **kwargs,
+                )
+            else:
+                ret = self.forward_extend(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    bs,
+                    save_kv_cache=save_kv_cache,
+                    forward_mode=forward_mode,
+                    **kwargs,
+                )
+        return ret
 
     def forward_decode(
         self,
