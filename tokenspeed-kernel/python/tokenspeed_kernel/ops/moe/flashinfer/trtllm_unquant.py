@@ -26,8 +26,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.preprocessing import register_weight_preprocessor
-from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -44,15 +43,6 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
-    @register_weight_preprocessor(
-        "moe",
-        name="flashinfer_trtllm_unquant_moe_weights",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
-        ),
-    )
     def flashinfer_trtllm_unquant_moe_weights(plan: dict, w: torch.nn.Module):
         cache_permute_indices = {}
         num_experts = w.w13_weight.shape[0]
@@ -116,9 +106,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_unquant_moe_apply",
         solution="flashinfer_trtllm",
-        weight_preprocessor=WeightPreprocessorRef(
-            "flashinfer_trtllm_unquant_moe_weights", required=True
-        ),
+        weight_preprocessors=(flashinfer_trtllm_unquant_moe_weights,),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

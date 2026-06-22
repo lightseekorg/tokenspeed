@@ -26,7 +26,6 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import (
     KernelRegistry,
     KernelSpec,
-    WeightPreprocessorRef,
     describe_kernel,
     register_kernel,
 )
@@ -492,12 +491,16 @@ class TestDescribeKernel:
         assert "flashinfer" in desc
 
     def test_describe_includes_weight_preprocessor_link(self):
+        def moe_weights(**_):
+            return None
+
         reg = KernelRegistry.get()
         spec = KernelSpec(
             name="moe_apply",
             family="moe",
             mode="apply",
-            weight_preprocessor=WeightPreprocessorRef("moe_weights", required=False),
+            weight_preprocessors=(moe_weights,),
+            weight_preprocessing_required=False,
         )
         reg.register(spec, dummy_impl("moe_apply"))
 

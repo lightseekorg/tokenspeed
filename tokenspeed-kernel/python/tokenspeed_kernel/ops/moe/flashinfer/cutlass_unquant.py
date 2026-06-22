@@ -26,8 +26,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.preprocessing import register_weight_preprocessor
-from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -38,14 +37,6 @@ if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
     from flashinfer.autotuner import autotune as flashinfer_autotune
 
-    @register_weight_preprocessor(
-        "moe",
-        name="flashinfer_cutlass_unquant_moe_weights",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(8, 9),
-        ),
-    )
     def flashinfer_cutlass_unquant_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
         first_half = w.w13_weight.data[:, :half_w, :].clone()
@@ -58,9 +49,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_cutlass_unquant_moe_apply",
         solution="flashinfer_cutlass",
-        weight_preprocessor=WeightPreprocessorRef(
-            "flashinfer_cutlass_unquant_moe_weights", required=True
-        ),
+        weight_preprocessors=(flashinfer_cutlass_unquant_moe_weights,),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(8, 9),

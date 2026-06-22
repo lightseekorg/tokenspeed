@@ -28,7 +28,7 @@ Kimi-K2.5 / K2.6 / K2.7). Blackwell-only, weight-only (activations stay
 The checkpoint stores ``weight_packed`` as ``int32`` (eight INT4 per word,
 ``+8`` zero-point) with per-group ``bfloat16`` scales; the kernel wants signed
 ``uint8`` weights (two INT4 per byte) in ``BlockMajorK`` layout with
-permuted/interleaved scales. process_weights repacks them once.
+permuted/interleaved scales. Weight preprocessing repacks them once.
 """
 
 from __future__ import annotations
@@ -39,8 +39,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.preprocessing import register_weight_preprocessor
-from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -153,15 +152,6 @@ if platform.is_nvidia:
         w2_scales = torch.stack(w2_scales_shuffled)
         return w13_weights, w13_scales, w2_weights, w2_scales
 
-    @register_weight_preprocessor(
-        "moe",
-        name="flashinfer_trtllm_mxint4_moe_weights",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
-        ),
-    )
     def flashinfer_trtllm_mxint4_moe_weights(plan: dict, w: torch.nn.Module):
         num_experts = w.w13_weight_packed.shape[0]
 
@@ -218,9 +208,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_mxint4_moe_apply",
         solution="flashinfer_trtllm",
-        weight_preprocessor=WeightPreprocessorRef(
-            "flashinfer_trtllm_mxint4_moe_weights", required=True
-        ),
+        weight_preprocessors=(flashinfer_trtllm_mxint4_moe_weights,),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

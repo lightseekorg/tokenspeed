@@ -21,251 +21,159 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable
-from dataclasses import dataclass, field
-from typing import Callable
-
-from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
-from tokenspeed_kernel.registry import (
-    KernelSpec,
-    WeightPreprocessorRef,
-)
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 __all__ = [
     "WeightPreprocessorConflictError",
-    "WeightPreprocessorRegistry",
-    "WeightPreprocessorResolutionError",
-    "WeightPreprocessorSpec",
-    "WeightPreprocessorRef",
-    "register_weight_preprocessor",
+    "WeightPreprocessorRequest",
     "resolve_weight_preprocessor_conflict",
-    "resolve_weight_preprocessor_ref",
 ]
-
-
-@dataclass(frozen=True)
-class WeightPreprocessorSpec:
-    """Complete specification of a registered weight preprocessor."""
-
-    name: str
-    family: str
-    capability: CapabilityRequirement = field(default_factory=CapabilityRequirement)
-    tags: frozenset[str] = frozenset()
-
-    def __post_init__(self) -> None:
-        _validate_name("weight preprocessor", self.name)
-        _validate_name("weight preprocessor family", self.family)
-        if not isinstance(self.tags, frozenset):
-            raise TypeError("weight preprocessor tags must be a frozenset")
-
-
-class WeightPreprocessorResolutionError(RuntimeError):
-    """Raised when a selected preprocessor cannot be resolved or applied."""
 
 
 class WeightPreprocessorConflictError(RuntimeError):
     """Raised when selected kernels require incompatible module weight layouts."""
 
 
-class WeightPreprocessorRegistry:
-    """Central registry for weight preprocessing implementations."""
+def _normalize_weight_preprocessors(
+    preprocessors: Callable | Iterable[Callable],
+) -> tuple[Callable, ...]:
+    if callable(preprocessors):
+        normalized = (preprocessors,)
+    else:
+        normalized = tuple(preprocessors)
+    if not normalized:
+        raise ValueError("weight preprocessor request must contain at least one item")
+    for preprocessor in normalized:
+        if not callable(preprocessor):
+            raise TypeError("weight preprocessors must be callable")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("weight preprocessors must be unique")
+    return normalized
 
-    _instance: WeightPreprocessorRegistry | None = None
 
-    def __init__(self) -> None:
-        self._by_name: dict[str, WeightPreprocessorSpec] = {}
-        self._impls: dict[str, Callable] = {}
+def _preprocessor_name(preprocessor: Callable) -> str:
+    return getattr(preprocessor, "__name__", repr(preprocessor))
 
-    @classmethod
-    def get(cls) -> WeightPreprocessorRegistry:
-        """Get singleton registry instance."""
-        if cls._instance is None:
-            cls._instance = WeightPreprocessorRegistry()
-        return cls._instance
 
-    @classmethod
-    def reset(cls) -> None:
-        """Reset singleton registry. Intended for tests."""
-        cls._instance = None
+@dataclass(frozen=True, init=False)
+class WeightPreprocessorRequest:
+    """Ordered weight-preprocessor candidates requested by one kernel path."""
 
-    def register(self, spec: WeightPreprocessorSpec, impl: Callable) -> None:
-        """Register a weight preprocessor specification and implementation."""
-        self._by_name[spec.name] = spec
-        self._impls[spec.name] = impl
+    preprocessors: tuple[Callable, ...]
+    required: bool
 
-    def get_by_name(self, name: str) -> WeightPreprocessorSpec | None:
-        """Get a specific preprocessor spec by name."""
-        return self._by_name.get(name)
-
-    def get_impl(self, name: str) -> Callable | None:
-        """Get a preprocessor callable by name."""
-        return self._impls.get(name)
-
-    def list_preprocessors(
+    def __init__(
         self,
-        family: str | None = None,
-    ) -> list[WeightPreprocessorSpec]:
-        """List registered preprocessor specs, optionally filtered by family."""
-        specs = list(self._by_name.values())
-        if family is not None:
-            specs = [spec for spec in specs if spec.family == family]
-        return specs
-
-
-def register_weight_preprocessor(
-    family: str,
-    *,
-    name: str,
-    capability: CapabilityRequirement | None = None,
-    tags: set[str] | None = None,
-) -> Callable:
-    """Decorator to register a weight preprocessor function."""
-    _validate_name("weight preprocessor", name)
-    _validate_name("weight preprocessor family", family)
-
-    def decorator(fn: Callable) -> Callable:
-        spec = WeightPreprocessorSpec(
-            name=name,
-            family=family,
-            capability=capability or CapabilityRequirement(),
-            tags=frozenset(tags or set()),
+        preprocessors: Callable | Iterable[Callable],
+        *,
+        required: bool = True,
+    ) -> None:
+        object.__setattr__(
+            self,
+            "preprocessors",
+            _normalize_weight_preprocessors(preprocessors),
         )
-        WeightPreprocessorRegistry.get().register(spec, fn)
-        return fn
+        object.__setattr__(self, "required", required)
+        if not isinstance(self.required, bool):
+            raise TypeError("weight preprocessor request required must be a bool")
 
-    return decorator
-
-
-def _validate_name(kind: str, value: str) -> None:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{kind} name must be a non-empty string")
-
-
-def resolve_weight_preprocessor_ref(
-    ref: WeightPreprocessorRef | None,
-    *,
-    kernel_spec: KernelSpec,
-    platform: PlatformInfo,
-    registry: WeightPreprocessorRegistry | None = None,
-) -> WeightPreprocessorSpec | None:
-    """Resolve an ordered preprocessor reference for a selected kernel path."""
-    if ref is None:
-        return None
-
-    registry = registry or WeightPreprocessorRegistry.get()
-    errors: list[str] = []
-    candidate_specs: list[WeightPreprocessorSpec] = []
-    for name in ref.names:
-        spec = registry.get_by_name(name)
-        if spec is None:
-            errors.append(
-                f"Selected kernel references missing weight preprocessor {name!r}"
-            )
-            continue
-        if spec.family != kernel_spec.family:
-            errors.append(
-                f"{kernel_spec.name}: preprocessor {spec.name!r} belongs to family "
-                f"{spec.family!r}, expected {kernel_spec.family!r}"
-            )
-            continue
-        candidate_specs.append(spec)
-    if errors:
-        raise WeightPreprocessorResolutionError("\n".join(errors))
-
-    capability_skips = [
-        spec.name
-        for spec in candidate_specs
-        if not spec.capability.satisfied_by(platform)
-    ]
-    for spec in candidate_specs:
-        if spec.capability.satisfied_by(platform):
-            return spec
-
-    skipped = ", ".join(repr(name) for name in capability_skips)
-    message = f"Weight preprocessors [{skipped}] cannot run on {platform.device_name}"
-    if ref.required:
-        raise WeightPreprocessorResolutionError(message)
-    warnings.warn(
-        "skipping preprocessors due to hardware capabilities: "
-        f"[{skipped}]; this may hurt performance",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    return None
+    @property
+    def preprocessor(self) -> Callable:
+        """Primary candidate, for single-preprocessor callers and display."""
+        return self.preprocessors[0]
 
 
 def _ordered_common_preprocessors(
-    refs: list[WeightPreprocessorRef],
-) -> tuple[str, ...]:
-    common = set(refs[0].names)
-    for ref in refs[1:]:
-        common.intersection_update(ref.names)
+    requests: list[WeightPreprocessorRequest],
+) -> tuple[Callable, ...]:
+    common = set(requests[0].preprocessors)
+    for request in requests[1:]:
+        common.intersection_update(request.preprocessors)
     if not common:
         return ()
 
-    def rank(name: str) -> tuple[int, int, tuple[int, ...], str]:
-        ranks = tuple(ref.names.index(name) for ref in refs)
-        return max(ranks), sum(ranks), ranks, name
+    def rank(preprocessor: Callable) -> tuple[int, int, tuple[int, ...], str]:
+        ranks = tuple(request.preprocessors.index(preprocessor) for request in requests)
+        return max(ranks), sum(ranks), ranks, _preprocessor_name(preprocessor)
 
     return tuple(sorted(common, key=rank))
 
 
 def resolve_weight_preprocessor_conflict(
-    refs: Iterable[WeightPreprocessorRef | None],
-) -> WeightPreprocessorRef | None:
+    requests: Iterable[WeightPreprocessorRequest | None],
+) -> WeightPreprocessorRequest | None:
     """Resolve module-scoped preprocessing requests.
 
-    ``None`` is a required no-preprocessing constraint. Named refs are compatible
-    when they share at least one candidate preprocessor. The resolved ref names
-    the highest-priority shared candidate across the inputs.
+    ``None`` is a required no-preprocessing constraint. Callable requests are
+    compatible when they share at least one candidate preprocessor. The resolved
+    request names the highest-priority shared callable across the inputs.
     """
     required_no_preprocessing = False
-    named_refs: list[WeightPreprocessorRef] = []
+    preprocessor_requests: list[WeightPreprocessorRequest] = []
 
-    for ref in refs:
-        if ref is None:
+    for request in requests:
+        if request is None:
             required_no_preprocessing = True
             continue
-        named_refs.append(ref)
+        preprocessor_requests.append(request)
 
-    if not named_refs:
+    if not preprocessor_requests:
         return None
 
     if required_no_preprocessing:
-        if any(ref.required for ref in named_refs):
-            required_names = sorted({name for ref in named_refs for name in ref.names})
+        names = sorted(
+            {
+                _preprocessor_name(preprocessor)
+                for request in preprocessor_requests
+                for preprocessor in request.preprocessors
+            }
+        )
+        if any(request.required for request in preprocessor_requests):
             raise WeightPreprocessorConflictError(
                 "Conflicting module preprocessing requirements: required "
-                f"no-preprocessing and required preprocessors {required_names!r}"
+                f"no-preprocessing and required preprocessors {names!r}"
             )
-        optional_names = sorted({name for ref in named_refs for name in ref.names})
         warnings.warn(
             "skipping conflicting preprocessors: "
-            f"{optional_names!r} conflict with required no preprocessing; "
+            f"{names!r} conflict with required no preprocessing; "
             "this may hurt performance",
             RuntimeWarning,
             stacklevel=2,
         )
         return None
 
-    common_names = _ordered_common_preprocessors(named_refs)
-    if not common_names:
-        all_names = sorted({name for ref in named_refs for name in ref.names})
-        if any(ref.required for ref in named_refs):
+    common_preprocessors = _ordered_common_preprocessors(preprocessor_requests)
+    if not common_preprocessors:
+        names = sorted(
+            {
+                _preprocessor_name(preprocessor)
+                for request in preprocessor_requests
+                for preprocessor in request.preprocessors
+            }
+        )
+        if any(request.required for request in preprocessor_requests):
             required_names = sorted(
-                {name for ref in named_refs if ref.required for name in ref.names}
+                {
+                    _preprocessor_name(preprocessor)
+                    for request in preprocessor_requests
+                    if request.required
+                    for preprocessor in request.preprocessors
+                }
             )
             raise WeightPreprocessorConflictError(
-                f"Conflicting module preprocessors {all_names!r}; "
+                f"Conflicting module preprocessors {names!r}; "
                 f"required preprocessors: {required_names!r}"
             )
         warnings.warn(
-            "skipping conflicting preprocessors: "
-            f"{all_names!r}; this may hurt performance",
+            f"skipping conflicting preprocessors: {names!r}; "
+            "this may hurt performance",
             RuntimeWarning,
             stacklevel=2,
         )
         return None
 
-    required = any(ref.required for ref in named_refs)
-    return WeightPreprocessorRef(common_names[0], required=required)
+    return WeightPreprocessorRequest(
+        common_preprocessors[0],
+        required=any(request.required for request in preprocessor_requests),
+    )

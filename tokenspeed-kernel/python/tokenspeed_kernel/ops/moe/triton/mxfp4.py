@@ -28,8 +28,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.preprocessing import register_weight_preprocessor
-from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 with redirect_triton_to_tokenspeed_triton():
@@ -276,10 +275,6 @@ def _local_topk_for_ep(
     return local_weights, local_ids, num_local_experts
 
 
-@register_weight_preprocessor(
-    "moe",
-    name="triton_mxfp4_moe_weights",
-)
 def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     MXFP_BLOCK_SIZE = 32
 
@@ -364,10 +359,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_precomputed_moe_apply",
     solution="triton",
-    weight_preprocessor=WeightPreprocessorRef(
-        "triton_mxfp4_moe_weights",
-        required=True,
-    ),
+    weight_preprocessors=(triton_mxfp4_moe_weights,),
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -392,10 +384,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_ep_precomputed_moe_apply",
     solution="triton",
-    weight_preprocessor=WeightPreprocessorRef(
-        "triton_mxfp4_moe_weights",
-        required=True,
-    ),
+    weight_preprocessors=(triton_mxfp4_moe_weights,),
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -420,9 +409,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_moe_apply",
     solution="triton",
-    weight_preprocessor=WeightPreprocessorRef(
-        "triton_mxfp4_moe_weights", required=True
-    ),
+    weight_preprocessors=(triton_mxfp4_moe_weights,),
     signatures=format_signatures(
         "x",
         "dense",

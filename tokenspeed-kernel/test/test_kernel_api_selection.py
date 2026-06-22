@@ -54,6 +54,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mxint4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
@@ -61,13 +62,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_u
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.preprocessing import (
-    WeightPreprocessorRegistry,
-    WeightPreprocessorResolutionError,
-    WeightPreprocessorSpec,
-    resolve_weight_preprocessor_ref,
-)
-from tokenspeed_kernel.registry import KernelRegistry, WeightPreprocessorRef
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
 
 _RELOAD_MODULES = [
@@ -90,6 +85,7 @@ _RELOAD_MODULES = [
     _moe_cutlass_fp8,
     _moe_cutlass_nvfp4,
     _moe_cutlass_unquant,
+    _moe_trtllm_fp8,
     _moe_trtllm_mxfp4,
     _moe_trtllm_mxint4,
     _moe_trtllm_nvfp4,
@@ -116,61 +112,19 @@ def _kernel_registry(fresh_registry):
         importlib.reload(mod)
 
 
-def _platform_satisfying_preprocessor(
-    spec: WeightPreprocessorSpec | None,
-) -> PlatformInfo:
-    if spec is None:
-        return PlatformInfo(
-            vendor="nvidia",
-            arch_version=ArchVersion(9, 0),
-            device_name="test-h100",
-            device_count=1,
-            total_memory=80 * 1024**3,
-            memory_bandwidth=3000.0,
-            sm_count=132,
-            max_threads_per_sm=2048,
-            max_shared_memory_per_sm=228 * 1024,
-        )
-
-    capability = spec.capability
-    vendor = sorted(capability.vendors)[0] if capability.vendors else "nvidia"
-    arch_version = capability.min_arch_version or ArchVersion(0, 0)
-    return PlatformInfo(
-        vendor=vendor,
-        arch_version=arch_version,
-        device_name=f"test-{vendor}",
-        device_count=1,
-        total_memory=80 * 1024**3,
-        memory_bandwidth=3000.0,
-        sm_count=132,
-        max_threads_per_sm=2048,
-        max_shared_memory_per_sm=228 * 1024,
-        sm_features=capability.required_features,
-    )
-
-
-def test_builtin_moe_preprocessor_links_resolve():
+def test_builtin_moe_preprocessor_links_are_callables():
     kernel_registry = KernelRegistry.get()
-    preprocessor_registry = WeightPreprocessorRegistry.get()
     errors = []
     for kernel_spec in kernel_registry.list_kernels("moe", "apply"):
-        ref = kernel_spec.weight_preprocessor
-        if ref is None:
-            continue
-        for name in ref.names:
-            preprocessor_spec = preprocessor_registry.get_by_name(name)
-            if preprocessor_spec is None:
-                errors.append(f"missing weight preprocessor {name!r}")
-                continue
-            platform = _platform_satisfying_preprocessor(preprocessor_spec)
-            try:
-                resolve_weight_preprocessor_ref(
-                    WeightPreprocessorRef(name, required=ref.required),
-                    kernel_spec=kernel_spec,
-                    platform=platform,
-                )
-            except WeightPreprocessorResolutionError as exc:
-                errors.append(str(exc))
+        preprocessors = kernel_spec.weight_preprocessors
+        if len(set(preprocessors)) != len(preprocessors):
+            errors.append(f"{kernel_spec.name}: duplicate weight preprocessors")
+        for preprocessor in preprocessors:
+            if not callable(preprocessor):
+                errors.append(f"{kernel_spec.name}: non-callable preprocessor")
+
+    process_weight_kernels = kernel_registry.list_kernels("moe", "process_weights")
+    assert process_weight_kernels == []
 
     assert errors == []
 
@@ -179,26 +133,21 @@ def test_moe_process_weights_returns_for_no_preprocessing_plan():
     module = torch.nn.Module()
 
     result = tokenspeed_kernel.moe_process_weights(
-        {"weight_preprocessor_name": None},
+        {"weight_preprocessor": None},
         module,
     )
 
     assert result is None
 
 
-def test_moe_process_weights_dispatches_registered_preprocessor_by_name():
+def test_moe_process_weights_dispatches_plan_preprocessor_callable():
     calls = []
 
     def preprocess(plan, w):
         calls.append((plan, w))
 
-    registry = WeightPreprocessorRegistry.get()
-    registry.register(
-        WeightPreprocessorSpec(name="test_moe_weights", family="moe"),
-        preprocess,
-    )
     module = torch.nn.Module()
-    plan = {"weight_preprocessor_name": "test_moe_weights"}
+    plan = {"weight_preprocessor": preprocess}
 
     result = tokenspeed_kernel.moe_process_weights(plan, module)
 
@@ -506,7 +455,14 @@ def _sampling_argmax() -> object:
 
 def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> None:
     assert plan["apply_kernel_name"] == apply
-    assert plan["weight_preprocessor_name"] == preprocessor
+    actual_preprocessor = plan["weight_preprocessor"]
+    actual_name = (
+        None
+        if actual_preprocessor is None
+        else getattr(actual_preprocessor, "__name__", repr(actual_preprocessor))
+    )
+    assert actual_name == preprocessor
+    assert "weight_preprocessor_name" not in plan
     assert "process_weights_kernel_name" not in plan
 
 

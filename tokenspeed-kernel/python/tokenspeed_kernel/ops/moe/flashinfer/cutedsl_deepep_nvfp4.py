@@ -29,8 +29,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.preprocessing import register_weight_preprocessor
-from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -43,14 +42,6 @@ if platform.is_nvidia:
     )
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
-    @register_weight_preprocessor(
-        "moe",
-        name="flashinfer_cutedsl_deepep_nvfp4_moe_weights",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-        ),
-    )
     def flashinfer_cutedsl_deepep_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         w13_ws2 = w.w13_weight_scale_2[:, 0]
         w13_input_scale = w.w13_input_scale.max().to(torch.float32)
@@ -118,9 +109,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_cutedsl_deepep_nvfp4_moe_apply",
         solution="flashinfer_cutedsl",
-        weight_preprocessor=WeightPreprocessorRef(
-            "flashinfer_cutedsl_deepep_nvfp4_moe_weights", required=True
-        ),
+        weight_preprocessors=(flashinfer_cutedsl_deepep_nvfp4_moe_weights,),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

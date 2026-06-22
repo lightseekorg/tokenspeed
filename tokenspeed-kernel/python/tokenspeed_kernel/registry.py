@@ -40,7 +40,6 @@ __all__ = [
     "KernelSpec",
     "KernelRegistry",
     "Priority",
-    "WeightPreprocessorRef",
     "load_builtin_kernels",
     "register_kernel",
     "describe_kernel",
@@ -55,6 +54,28 @@ def _normalize_roles(roles: str | Iterable[str]) -> tuple[str, ...]:
     if not role_names:
         raise ValueError("at least one dtype filter role is required")
     return role_names
+
+
+def _normalize_weight_preprocessors(
+    weight_preprocessors: Callable | Iterable[Callable] | None,
+) -> tuple[Callable, ...]:
+    if weight_preprocessors is None:
+        preprocessors: tuple[Callable, ...] = ()
+    elif callable(weight_preprocessors):
+        preprocessors = (weight_preprocessors,)
+    else:
+        preprocessors = tuple(weight_preprocessors)
+
+    for preprocessor in preprocessors:
+        if not callable(preprocessor):
+            raise TypeError("weight preprocessors must be callable")
+    if len(set(preprocessors)) != len(preprocessors):
+        raise ValueError("weight preprocessors must be unique")
+    return preprocessors
+
+
+def _callable_name(fn: Callable) -> str:
+    return getattr(fn, "__name__", repr(fn))
 
 
 # Hard upper bound on priority values; selection scoring clamps to this range.
@@ -142,53 +163,6 @@ def _validate_priority(value: int | Priority) -> int:
     return ivalue
 
 
-@dataclass(frozen=True, init=False)
-class WeightPreprocessorRef:
-    """Ordered weight-preprocessor candidates for a registered kernel."""
-
-    names: tuple[str, ...]
-    required: bool
-
-    def __init__(
-        self,
-        names: str | Iterable[str] | None = None,
-        *,
-        name: str | None = None,
-        required: bool = True,
-    ) -> None:
-        if names is None:
-            names = name
-        if isinstance(names, str):
-            names_tuple = (names,)
-        elif names is None:
-            names_tuple = ()
-        else:
-            names_tuple = tuple(names)
-        object.__setattr__(self, "names", names_tuple)
-        object.__setattr__(self, "required", required)
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if not self.names:
-            raise ValueError(
-                "weight preprocessor ref names must contain at least one name"
-            )
-        for name in self.names:
-            if not isinstance(name, str) or not name:
-                raise ValueError(
-                    "weight preprocessor ref name must be a non-empty string"
-                )
-        if len(set(self.names)) != len(self.names):
-            raise ValueError("weight preprocessor ref names must be unique")
-        if not isinstance(self.required, bool):
-            raise TypeError("weight preprocessor ref required must be a bool")
-
-    @property
-    def name(self) -> str:
-        """Primary candidate name, for single-name call sites and display."""
-        return self.names[0]
-
-
 @dataclass(frozen=True)
 class KernelSpec:
     """Complete specification of a registered kernel."""
@@ -216,7 +190,17 @@ class KernelSpec:
     tags: frozenset[str] = (
         frozenset()
     )  # Standard tags: "throughput", "latency", "determinism", "portability"
-    weight_preprocessor: WeightPreprocessorRef | None = None
+    weight_preprocessors: tuple[Callable, ...] = field(default_factory=tuple)
+    weight_preprocessing_required: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "weight_preprocessors",
+            _normalize_weight_preprocessors(self.weight_preprocessors),
+        )
+        if not isinstance(self.weight_preprocessing_required, bool):
+            raise TypeError("weight preprocessing required must be a bool")
 
     def supports_format_signature(self, format_signature: FormatSignature) -> bool:
         return format_signature in self.format_signatures
@@ -413,7 +397,8 @@ def register_kernel(
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
     tags: set[str] | None = None,
-    weight_preprocessor: WeightPreprocessorRef | None = None,
+    weight_preprocessors: Callable | Iterable[Callable] | None = None,
+    weight_preprocessing_required: bool = True,
 ) -> Callable:
     """Decorator to register a kernel function.
 
@@ -445,6 +430,11 @@ def register_kernel(
             ...
     """
     priority_int = _validate_priority(priority)
+    normalized_weight_preprocessors = _normalize_weight_preprocessors(
+        weight_preprocessors
+    )
+    if not isinstance(weight_preprocessing_required, bool):
+        raise TypeError("weight preprocessing required must be a bool")
 
     def decorator(fn: Callable) -> Callable:
         kernel_name = name or f"{solution}_{family}_{mode}"
@@ -460,7 +450,8 @@ def register_kernel(
             traits=traits or {},
             priority=priority_int,
             tags=frozenset(tags or set()),
-            weight_preprocessor=weight_preprocessor,
+            weight_preprocessors=normalized_weight_preprocessors,
+            weight_preprocessing_required=weight_preprocessing_required,
         )
 
         KernelRegistry.get().register(spec, fn)
@@ -489,11 +480,11 @@ def describe_kernel(name: str) -> str:
         f"  Platform: {spec.capability}",
         f"  Tags: {', '.join(spec.tags) or 'none'}",
     ]
-    if spec.weight_preprocessor is None:
+    if not spec.weight_preprocessors:
         lines.append("  Weight preprocessor: none")
     else:
-        requirement = "required" if spec.weight_preprocessor.required else "optional"
-        names = ", ".join(spec.weight_preprocessor.names)
+        requirement = "required" if spec.weight_preprocessing_required else "optional"
+        names = ", ".join(_callable_name(fn) for fn in spec.weight_preprocessors)
         lines.append(f"  Weight preprocessors: {names} ({requirement})")
     return "\n".join(lines)
 
@@ -501,12 +492,7 @@ def describe_kernel(name: str) -> str:
 def load_builtin_kernels() -> None:
     import sys
 
-    from tokenspeed_kernel.preprocessing import WeightPreprocessorRegistry
-
-    if (
-        not KernelRegistry.get().list_kernels()
-        or not WeightPreprocessorRegistry.get().list_preprocessors()
-    ):
+    if not KernelRegistry.get().list_kernels():
         # Registry was reset; clear cached ops modules so decorators re-run.
         for key in list(sys.modules.keys()):
             if key.startswith("tokenspeed_kernel.ops.") or key.startswith(

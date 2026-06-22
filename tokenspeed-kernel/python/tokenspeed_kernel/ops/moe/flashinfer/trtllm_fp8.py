@@ -29,7 +29,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signature, format_signatures
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
@@ -50,20 +50,7 @@ if platform.is_nvidia:
             return routing_config[name]
         return getattr(w, name, default)
 
-    @register_kernel(
-        "moe",
-        "process_weights",
-        name="flashinfer_trtllm_fp8_moe_process_weights",
-        solution="flashinfer_trtllm",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-        ),
-        signatures=frozenset({format_signature()}),
-        traits={"weight_dtype": frozenset({"fp8"})},
-        priority=Priority.SPECIALIZED,
-    )
-    def flashinfer_trtllm_fp8_moe_process_weights(plan: dict, w: torch.nn.Module):
+    def flashinfer_trtllm_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         # The shared MoE checkpoint loader stores w13 as a concatenated
         # ``[w1(gate) | w3(up)]`` block; the TRT-LLM-Gen gated kernel consumes
         # ``[w3 | w1]`` ordering (same swap flashinfer_cutlass applies). Swap the
@@ -89,6 +76,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_fp8_moe_apply",
         solution="flashinfer_trtllm",
+        weight_preprocessors=(flashinfer_trtllm_fp8_moe_weights,),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

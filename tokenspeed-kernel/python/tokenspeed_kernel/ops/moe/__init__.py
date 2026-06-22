@@ -24,11 +24,6 @@ import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.preprocessing import (
-    WeightPreprocessorRegistry,
-    resolve_weight_preprocessor_ref,
-)
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -130,7 +125,7 @@ def moe_plan(
     The selected apply kernel owns plan metadata. A plan with support_routing
     false requires precomputed top-k ids and weights when calling moe_apply.
     Weight preprocessing is selected from the ordered candidates advertised by
-    the selected apply kernel, then pinned by name in the returned plan so load
+    the selected apply kernel, then pinned by callable in the returned plan so load
     time does not rerun selection or conflict resolution.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
@@ -162,13 +157,8 @@ def moe_plan(
     if apply_spec is None:
         raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
 
-    preprocessor_spec = resolve_weight_preprocessor_ref(
-        apply_spec.weight_preprocessor,
-        kernel_spec=apply_spec,
-        platform=current_platform(),
-    )
-    weight_preprocessor_name = (
-        preprocessor_spec.name if preprocessor_spec is not None else None
+    weight_preprocessor = (
+        apply_spec.weight_preprocessors[0] if apply_spec.weight_preprocessors else None
     )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
@@ -179,7 +169,7 @@ def moe_plan(
     return {
         "weight_dtype": weight_dtype,
         "apply_kernel_name": apply_spec.name,
-        "weight_preprocessor_name": weight_preprocessor_name,
+        "weight_preprocessor": weight_preprocessor,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
         "support_routing": support_routing,
@@ -197,16 +187,11 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
         w: Module containing loaded MoE weights. This module is mutated in
             place to prepare solution-specific layouts and scales.
     """
-    preprocessor_name = plan.get("weight_preprocessor_name")
-    if preprocessor_name is None:
-        return None
-
-    registry = WeightPreprocessorRegistry.get()
-    preprocessor = registry.get_impl(preprocessor_name)
+    preprocessor = plan.get("weight_preprocessor")
     if preprocessor is None:
-        raise RuntimeError(
-            f"Weight preprocessor implementation not found: {preprocessor_name!r}"
-        )
+        return None
+    if not callable(preprocessor):
+        raise RuntimeError(f"Weight preprocessor is not callable: {preprocessor!r}")
     return preprocessor(plan=plan, w=w)
 
 

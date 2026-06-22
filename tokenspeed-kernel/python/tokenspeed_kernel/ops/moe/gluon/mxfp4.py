@@ -26,8 +26,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.preprocessing import register_weight_preprocessor
-from tokenspeed_kernel.registry import Priority, WeightPreprocessorRef, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -39,27 +38,9 @@ if platform.is_amd:
         preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
 
-    @register_weight_preprocessor(
-        "moe",
-        name="gluon_mxfp4_gfx950_moe_weights",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"amd"}),
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-        ),
-    )
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
 
-    @register_weight_preprocessor(
-        "moe",
-        name="gluon_mxfp4_gfx950_moe_weights_base",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"amd"}),
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-        ),
-    )
     def gluon_mxfp4_gfx950_moe_weights_base(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=False)
 
@@ -68,12 +49,9 @@ if platform.is_amd:
         "apply",
         name="gluon_mxfp4_moe_apply",
         solution="gluon",
-        weight_preprocessor=WeightPreprocessorRef(
-            (
-                "gluon_mxfp4_gfx950_moe_weights",
-                "gluon_mxfp4_gfx950_moe_weights_base",
-            ),
-            required=True,
+        weight_preprocessors=(
+            gluon_mxfp4_gfx950_moe_weights,
+            gluon_mxfp4_gfx950_moe_weights_base,
         ),
         capability=CapabilityRequirement(
             vendors=frozenset({"amd"}),

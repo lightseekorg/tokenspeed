@@ -35,7 +35,6 @@ from tokenspeed_kernel.platform import (
     InterconnectInfo,
     PlatformInfo,
 )
-from tokenspeed_kernel.preprocessing import WeightPreprocessorRegistry
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     _global_overrides,
@@ -201,13 +200,11 @@ def b200_platform() -> PlatformInfo:
 @pytest.fixture
 def fresh_registry():
     KernelRegistry.reset()
-    WeightPreprocessorRegistry.reset()
     clear_config_overrides()
     _oracles.clear()
     _global_overrides.clear()
     yield
     KernelRegistry.reset()
-    WeightPreprocessorRegistry.reset()
     clear_config_overrides()
     _oracles.clear()
     _global_overrides.clear()

@@ -21,11 +21,11 @@ if not _IS_GFX950:
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.moe.gluon.mxfp4 import gluon_mxfp4_moe_process_weights
+from tokenspeed_kernel.ops.moe.gluon.mxfp4 import gluon_mxfp4_gfx950_moe_weights
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _routing,
     fp8_quantize,
-    triton_mxfp4_moe_process_weights,
+    triton_mxfp4_moe_weights,
 )
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe
 from triton_kernels.matmul import FnSpecs, FusedActivation, matmul
@@ -390,9 +390,9 @@ def _make_preprocessed_weights(
     layer = _make_weight_module(raw)
     plan = {"internal_activation_dtype": "fp8"}
     if preshuffle:
-        gluon_mxfp4_moe_process_weights(plan, layer)
+        gluon_mxfp4_gfx950_moe_weights(plan, layer)
     else:
-        triton_mxfp4_moe_process_weights(plan, layer)
+        triton_mxfp4_moe_weights(plan, layer)
 
     return Mxfp4Weights(
         w13_weight=layer.w13_weight_triton_tensor,
