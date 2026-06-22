@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -69,3 +69,7 @@ class ForwardContext:
     draft_seq_lens_buf: torch.Tensor | None = None
     # accept_lengths: per-request accepted verify width for cache_seqlens correction.
     accept_lengths: torch.Tensor | None = None
+
+    # DSA sparse top-k shared across layers and draft steps.
+    dsa_prefill_topk: Any | None = None
+    dsa_decode_topk: Any | None = None

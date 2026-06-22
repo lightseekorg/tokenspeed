@@ -165,11 +165,22 @@ def _online_quantize_mxfp8(
     def ensure_row_major_scales(
         qA: torch.Tensor,
         A_scales: torch.Tensor,
+        *,
+        group_major_scales: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # On NVIDIA, the TRT-LLM helper used by per_token_group_quant_fp8
         # returns [num_groups, num_tokens] scales. FlashInfer and Triton GEMMs
         # consume [num_tokens, num_groups].
         expected_groups = (qA.shape[-1] + block_k - 1) // block_k
+        if group_major_scales:
+            if A_scales.dim() != 2 or A_scales.shape[0] != expected_groups:
+                raise ValueError(
+                    "TRTLLM per-token-group quantization returned unexpected "
+                    f"scale shape {tuple(A_scales.shape)} for "
+                    f"tokens={qA.shape[0]}, groups={expected_groups}."
+                )
+            A_scales = A_scales.transpose(0, 1).contiguous()
+            return qA, A_scales
         if (
             A_scales.shape[-1] != expected_groups
             and A_scales.shape[0] == expected_groups
@@ -199,13 +210,15 @@ def _online_quantize_mxfp8(
                 A,
                 block_k,
                 column_major_scales=False,
-            )
+            ),
+            group_major_scales=_platform.is_nvidia,
         )
     elif kernel_name == "triton_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
         return ensure_row_major_scales(
-            *per_token_group_quant_fp8(A, block_k, column_major_scales=False)
+            *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
+            group_major_scales=_platform.is_nvidia,
         )
     else:
         raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")

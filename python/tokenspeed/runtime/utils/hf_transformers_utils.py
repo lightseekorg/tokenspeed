@@ -171,6 +171,32 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     config.__dict__["architectures"] = list(raw_archs)
 
 
+def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
+    if raw_config.get("architectures") != ["GlmMoeDsaForCausalLM"]:
+        return
+
+    # Transformers may rewrite these GLM DSA dimensions; config.json is authoritative.
+    for key in (
+        "qk_head_dim",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "kv_lora_rank",
+        "q_lora_rank",
+        "index_topk",
+        "index_head_dim",
+        "index_n_heads",
+        "index_topk_freq",
+        "index_skip_topk_offset",
+        "index_topk_pattern",
+        "indexer_types",
+        "indexer_rope_interleave",
+        "index_share_for_mtp_iteration",
+    ):
+        if key in raw_config:
+            setattr(config, key, raw_config[key])
+
+
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -209,6 +235,7 @@ def get_config(
             raise e
 
     _materialize_architectures(config, raw_config)
+    _restore_raw_glm_dsa_fields(config, raw_config)
 
     # extract 'text_config'
     text_config = get_hf_text_config(config)

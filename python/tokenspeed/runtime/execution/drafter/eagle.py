@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
@@ -43,6 +43,8 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 logger = get_colorful_logger(__name__)
+
+DsaTopKState = tuple[Any | None, Any | None]
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -139,6 +141,10 @@ class Eagle(BaseDrafter):
 
         # VLM placeholder id plumbed by ModelExecutor; None for text-only targets.
         self.mm_pad_substitute_id: int | None = None
+        hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
+        self._dsa_reuse_mtp_topk = bool(
+            getattr(hf_config, "index_share_for_mtp_iteration", False)
+        )
 
     def set_mm_pad_substitute_id(self, token_id: int) -> None:
         self.mm_pad_substitute_id = token_id
@@ -146,6 +152,24 @@ class Eagle(BaseDrafter):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _attach_dsa_topk(
+        self,
+        ctx: ForwardContext,
+        dsa_topk: DsaTopKState,
+    ) -> None:
+        if not self._dsa_reuse_mtp_topk:
+            return
+        ctx.dsa_prefill_topk, ctx.dsa_decode_topk = dsa_topk
+
+    def _extract_dsa_topk(
+        self,
+        ctx: ForwardContext,
+        dsa_topk: DsaTopKState,
+    ) -> DsaTopKState:
+        if not self._dsa_reuse_mtp_topk:
+            return dsa_topk
+        return ctx.dsa_prefill_topk, ctx.dsa_decode_topk
 
     def _map_hot(self, ids: torch.Tensor) -> torch.Tensor:
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
@@ -210,7 +234,7 @@ class Eagle(BaseDrafter):
         self,
         bs: int,
         draft_input: EagleDraftInput,
-    ) -> LogitsProcessorOutput:
+    ) -> tuple[LogitsProcessorOutput, DsaTopKState]:
 
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
@@ -253,7 +277,7 @@ class Eagle(BaseDrafter):
             accept_lengths=draft_input.accept_lengths,
         )
 
-        return self.draft_model_runner.forward(
+        logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
             positions=buffers.positions_buf[: draft_input.input_num_tokens],
@@ -261,6 +285,8 @@ class Eagle(BaseDrafter):
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
+        dsa_topk = self._extract_dsa_topk(ctx, (None, None))
+        return logits_output, dsa_topk
 
     @nvtx_range("draft_multi_step", color="purple")
     def _run_multi_step_decode(
@@ -270,6 +296,7 @@ class Eagle(BaseDrafter):
         next_tokens: torch.Tensor,
         logits_output: LogitsProcessorOutput,
         draft_input: EagleDraftInput,
+        dsa_topk: DsaTopKState,
     ) -> None:
         num_extends = draft_input.num_extends
         num_decodes = bs - num_extends
@@ -329,6 +356,7 @@ class Eagle(BaseDrafter):
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
             )
+            self._attach_dsa_topk(ctx, dsa_topk)
 
             out_cache_loc = cache_locs[:, i - 1].contiguous()
             # Keep attention metadata on the accepted prefix; rejected verify
@@ -346,6 +374,7 @@ class Eagle(BaseDrafter):
                     captured_hidden_states=logits_output.hidden_states,
                     spec_step_idx=i,
                 )
+                dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
 
             with nvtx_range("draft_sample", color="yellow"):
                 draft_ids = sampling_argmax(logits_output.next_token_logits)
@@ -410,13 +439,15 @@ class Eagle(BaseDrafter):
                 indices,
                 out=next_tokens[num_extends:, 0],
             )
+        if self.spec_num_steps > 0:
+            next_tokens[:, 1:] = next_tokens[:, :1]
 
         # Seed the draft attn backend's aliased seq_lens for the first step.
         self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
 
         # First draft step. LogitsProcessor prunes `[num_prefill_tokens + num_decodes * spec_num_tokens, ...]`
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
-        logits_output = self._run_first_step(bs, draft_input)
+        logits_output, dsa_topk = self._run_first_step(bs, draft_input)
 
         draft_ids = sampling_argmax(logits_output.next_token_logits)
         draft_ids.clamp_(min=0)
@@ -442,7 +473,12 @@ class Eagle(BaseDrafter):
         # time.
         with self.attn_backend.override_num_extends(0):
             self._run_multi_step_decode(
-                bs, draft_ids, next_tokens, logits_output, draft_input
+                bs,
+                draft_ids,
+                next_tokens,
+                logits_output,
+                draft_input,
+                dsa_topk,
             )
         return next_tokens
 

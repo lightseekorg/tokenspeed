@@ -143,6 +143,32 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
+def test_cuda_graph_req_pool_padding_keeps_attention_default_row():
+    active_indices = torch.tensor([7, 8], dtype=torch.int64)
+
+    padded_indices = CudaGraphWrapper._pad_graph_req_pool_indices(active_indices, 4)
+
+    assert padded_indices.tolist() == [7, 8, 0, 0]
+
+
+def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.config = SimpleNamespace(max_req_pool_size=99)
+    wrapper.input_buffers = SimpleNamespace(
+        state_write_req_pool_indices_buf=torch.full((4,), -1, dtype=torch.int64)
+    )
+    active_indices = torch.tensor([7, 8], dtype=torch.int64)
+
+    wrapper._set_graph_state_write_indices(active_indices, 4)
+
+    assert wrapper.input_buffers.state_write_req_pool_indices_buf.tolist() == [
+        7,
+        8,
+        99,
+        99,
+    ]
+
+
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
     ctx = ForwardContext(
         attn_backend=None,

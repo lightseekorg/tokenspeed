@@ -805,6 +805,29 @@ class CudaGraphWrapper:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
+    @staticmethod
+    def _pad_graph_req_pool_indices(
+        active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> torch.Tensor:
+        pad = padded_bs - active_req_pool_indices.shape[0]
+        if pad <= 0:
+            return active_req_pool_indices
+        return torch.cat(
+            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+        )
+
+    def _set_graph_state_write_indices(
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> None:
+        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
+        active_bs = active_req_pool_indices.shape[0]
+        if active_bs > 0:
+            state_indices[:active_bs].copy_(active_req_pool_indices)
+        if active_bs < padded_bs:
+            state_indices[active_bs:padded_bs].fill_(
+                int(self.config.max_req_pool_size)
+            )
+
     def __call__(
         self,
         bs: int,
@@ -835,6 +858,7 @@ class CudaGraphWrapper:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
@@ -842,9 +866,11 @@ class CudaGraphWrapper:
             seq_lens = torch.nn.functional.pad(
                 self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
             )
-            req_pool_indices = torch.nn.functional.pad(
-                self.input_buffers.req_pool_indices_buf[:bs], (0, pad), value=0
+            req_pool_indices = self._pad_graph_req_pool_indices(
+                active_req_pool_indices, padded_bs
             )
+            self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
+            self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
             if mamba_pool_indices is not None:
                 mamba_pool_indices = torch.nn.functional.pad(
                     mamba_pool_indices, (0, pad), value=0
@@ -864,6 +890,9 @@ class CudaGraphWrapper:
         else:
             seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
+
+        if use_graph:
+            self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
 
         mamba_kwargs = {}
         if mamba_pool_indices is not None:
@@ -957,6 +986,9 @@ class CudaGraphWrapper:
             )
 
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+
+        if use_graph and padded_bs != bs:
+            ctx.bs = bs
 
         # Update mamba/GDN state after speculative verify
         if _should_update_mamba_state_after_mtp_verify(

@@ -234,6 +234,7 @@ class ModelExecutor:
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
+            state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
             has_mamba=(mamba_pool is not None),
         )
@@ -663,7 +664,7 @@ class ModelExecutor:
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly.
             self.runtime_states.future_input_map[
-                self.input_buffers.req_pool_indices_buf[: ctx.bs]
+                self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
