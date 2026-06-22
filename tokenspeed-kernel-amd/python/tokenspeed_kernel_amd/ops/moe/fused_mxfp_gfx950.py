@@ -4419,7 +4419,9 @@ def _medium_decode_body(
     cfg = _medium_decode_moe_config(BLOCK_M, BLOCK_N, BLOCK_K)
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
-    gl.static_assert(BLOCK_K_SCALE == 8, "M=8/16 direct WScale path assumes BLOCK_K=256")
+    gl.static_assert(
+        BLOCK_K_SCALE == 8, "M=8/16 direct WScale path assumes BLOCK_K=256"
+    )
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
 
     X_ELEM_BITS: gl.constexpr = X.dtype.element_ty.primitive_bitwidth
@@ -4548,7 +4550,9 @@ def _medium_decode_body(
             else:
                 bias_bound = bias_n < N
             bias = gl.load(
-                bias_ptr + expert.to(gl.int64) * stride_be + bias_n.to(gl.int64) * stride_bn,
+                bias_ptr
+                + expert.to(gl.int64) * stride_be
+                + bias_n.to(gl.int64) * stride_bn,
                 mask=bias_bound,
                 other=0.0,
             ).to(gl.float32)
@@ -4583,7 +4587,9 @@ def _medium_decode_body(
             else:
                 bias_bound = bias_n < N
             bias = gl.load(
-                bias_ptr + expert.to(gl.int64) * stride_be + bias_n.to(gl.int64) * stride_bn,
+                bias_ptr
+                + expert.to(gl.int64) * stride_be
+                + bias_n.to(gl.int64) * stride_bn,
                 mask=bias_bound,
                 other=0.0,
             ).to(gl.float32)
