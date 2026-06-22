@@ -4150,7 +4150,7 @@ def _pipelined_moe_tile_compute(
     offs_y_n_safe = gl.where(n_in_bounds, offs_y_n, gl.zeros_like(offs_y_n))
     if HAS_SCATTER:
         rows_y = gl.load(scatter_idx_ptr + offs_y_m_safe, mask=y_m_in_bounds, other=M)
-        rows_y_in_bounds = rows_y < M
+        rows_y_in_bounds = y_m_in_bounds & (rows_y < M)
         mask_y = rows_y_in_bounds[:, None] & n_in_bounds[None, :]
         rows_y_safe = gl.where(rows_y_in_bounds, rows_y, gl.zeros_like(rows_y))
         y_offs = rows_y_safe[:, None] * stride_ym + offs_y_n_safe[None, :] * stride_yn
@@ -7229,22 +7229,19 @@ def _warp_decode_stage2_reduce(
     pid_n = pid % num_n
     LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
     n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
-    n_in_bounds = n < N
-    # Tail lanes are masked, but keep their addresses in-bounds for AMD/HIP.
-    n_safe = gl.where(n_in_bounds, n, gl.zeros_like(n))
-    bound = (pid_m < M) & n_in_bounds
+    bound = (pid_m < M) & (n < N)
     acc = gl.zeros([BLOCK_N], gl.float32, layout=LAYOUT)
     for k in gl.static_range(SPLIT_K):
         acc += gl.load(
             Partial
             + k * stride_pk
             + pid_m.to(gl.int64) * stride_pm
-            + n_safe.to(gl.int64) * stride_pn,
+            + n.to(gl.int64) * stride_pn,
             mask=bound,
             other=0.0,
         )
     gl.store(
-        Out + pid_m.to(gl.int64) * stride_om + n_safe.to(gl.int64) * stride_on,
+        Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
         acc.to(Out.dtype.element_ty),
         mask=bound,
     )
