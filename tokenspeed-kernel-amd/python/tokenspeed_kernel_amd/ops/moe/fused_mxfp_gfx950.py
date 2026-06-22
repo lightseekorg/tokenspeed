@@ -4087,9 +4087,16 @@ def _pipelined_moe_tile_compute(
 
     if HAS_BIAS:
         bias_offs = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
-        bias_mask = bias_offs < N
+        if Y_N_CONST and not DO_SWIGLU:
+            BIAS_N: gl.constexpr = Y_N_CONST
+            bias_mask = bias_offs < BIAS_N
+        else:
+            bias_mask = bias_offs < N
+        # Masked lanes still need in-bounds addresses; W2 preshuffle can
+        # tile over padded physical N while bias remains logical N.
+        bias_offs_safe = gl.where(bias_mask, bias_offs, gl.zeros_like(bias_offs))
         bias = gl.load(
-            bias_ptr + expert_id * stride_be + bias_offs,
+            bias_ptr + expert_id * stride_be + bias_offs_safe,
             mask=bias_mask,
             other=0.0,
         )
@@ -4134,21 +4141,23 @@ def _pipelined_moe_tile_compute(
         ACTUAL_N: gl.constexpr = (N_LIMIT // 2) if DO_SWIGLU else N_LIMIT
     else:
         actual_n = (N // 2) if DO_SWIGLU else N
+    if Y_N_CONST or N_LIMIT:
+        n_in_bounds = offs_y_n < ACTUAL_N
+    else:
+        n_in_bounds = offs_y_n < actual_n
+    # Clamp masked-off N lanes before pointer arithmetic; masked GPU
+    # memory ops may still fault on OOB addresses.
+    offs_y_n_safe = gl.where(n_in_bounds, offs_y_n, gl.zeros_like(offs_y_n))
     if HAS_SCATTER:
         rows_y = gl.load(scatter_idx_ptr + offs_y_m_safe, mask=y_m_in_bounds, other=M)
-        if Y_N_CONST or N_LIMIT:
-            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < ACTUAL_N)
-        else:
-            mask_y = (rows_y[:, None] < M) & (offs_y_n[None, :] < actual_n)
-        rows_y_safe = gl.where(y_m_in_bounds, rows_y, gl.zeros_like(rows_y))
-        y_offs = rows_y_safe[:, None] * stride_ym + offs_y_n[None, :] * stride_yn
+        rows_y_in_bounds = y_m_in_bounds & (rows_y < M)
+        mask_y = rows_y_in_bounds[:, None] & n_in_bounds[None, :]
+        rows_y_safe = gl.where(rows_y_in_bounds, rows_y, gl.zeros_like(rows_y))
+        y_offs = rows_y_safe[:, None] * stride_ym + offs_y_n_safe[None, :] * stride_yn
     else:
-        if Y_N_CONST or N_LIMIT:
-            mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < ACTUAL_N)
-        else:
-            mask_y = (offs_y_m[:, None] < m_limit) & (offs_y_n[None, :] < actual_n)
+        mask_y = y_m_in_bounds[:, None] & n_in_bounds[None, :]
         offs_y_m_2d_safe = offs_y_m_safe[:, None]
-        y_offs = offs_y_m_2d_safe * stride_ym + offs_y_n[None, :] * stride_yn
+        y_offs = offs_y_m_2d_safe * stride_ym + offs_y_n_safe[None, :] * stride_yn
 
     gl.store(y_ptr + y_offs, out, mask=mask_y)
 

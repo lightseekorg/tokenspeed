@@ -398,10 +398,7 @@ def _make_preprocessed_weights(
         w13_weight=layer.w13_weight_triton_tensor,
         w2_weight=layer.w2_weight_triton_tensor,
         w13_bias=layer.w13_weight_bias,
-        # W2 preshuffle pads output N before the Gluon-specific shuffle.
-        # Keep combine bias out of this test so the same Triton reference is
-        # valid for both padded-preshuffle and unpadded LDS paths.
-        w2_bias=None,
+        w2_bias=layer.w2_weight_bias,
         w13_precision_config=layer.w13_precision_config,
         w2_precision_config=layer.w2_precision_config,
         w13_act_scale=layer.w13_act_scale,
@@ -416,6 +413,16 @@ def mxfp4_weights() -> Mxfp4WeightVariants:
         nonpreshuffled=_make_preprocessed_weights(raw_weights, preshuffle=False),
         preshuffled=_make_preprocessed_weights(raw_weights, preshuffle=True),
     )
+
+
+def test_gluon_preshuffle_keeps_w2_bias_logical_n(
+    mxfp4_weights: Mxfp4WeightVariants,
+) -> None:
+    w2_raw = gluon_moe._extract_gluon_raw_w(mxfp4_weights.preshuffled.w2_weight)
+    assert mxfp4_weights.preshuffled.w2_bias is not None
+    assert getattr(w2_raw, "original_n") == HIDDEN_SIZE
+    assert w2_raw.shape[-1] > HIDDEN_SIZE
+    assert mxfp4_weights.preshuffled.w2_bias.shape[-1] == HIDDEN_SIZE
 
 
 def _make_hidden_and_router(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:

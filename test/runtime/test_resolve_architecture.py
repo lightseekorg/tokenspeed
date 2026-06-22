@@ -19,6 +19,8 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs import Qwen3_5MoeConfig  # noqa: E402
 from tokenspeed.runtime.configs.model_config import get_hf_text_config  # noqa: E402
+from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5MoeTextConfig  # noqa: E402
+from tokenspeed.runtime.configs.utils import get_rope_parameters  # noqa: E402
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     _materialize_architectures,
 )
@@ -66,6 +68,23 @@ class Qwen3_5ConfigTests(unittest.TestCase):
             config.num_attention_heads,
             config.text_config.num_attention_heads,
         )
+
+    def test_mrope_extensions_do_not_leak_to_transformers_rope_validation(
+        self,
+    ) -> None:
+        rope_parameters = {
+            "rope_type": "default",
+            "mrope_section": [16, 24, 24],
+            "mrope_interleaved": True,
+        }
+
+        with self.assertNoLogs("transformers", level="WARNING"):
+            config = Qwen3_5MoeTextConfig(rope_parameters=rope_parameters)
+
+        self.assertEqual(config.rope_parameters["rope_type"], "default")
+        self.assertNotIn("mrope_section", config.rope_parameters)
+        self.assertNotIn("mrope_interleaved", config.rope_parameters)
+        self.assertEqual(get_rope_parameters(config), rope_parameters)
 
 
 class ConfigDtypeTests(unittest.TestCase):

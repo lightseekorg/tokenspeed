@@ -577,6 +577,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                         "input_embeds",
                         "image_data",
                         "audio_data",
+                        "precomputed_multimodal_inputs",
+                        "input_multi_ids",
                     ]
                 )
                 out_skip_names = set(
