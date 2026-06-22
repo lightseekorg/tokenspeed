@@ -56,7 +56,7 @@ def _normalize_roles(roles: str | Iterable[str]) -> tuple[str, ...]:
     return role_names
 
 
-def _normalize_weight_preprocessor(
+def _validate_weight_preprocessor(
     weight_preprocessor: Callable | None,
 ) -> Callable | None:
     if weight_preprocessor is not None and not callable(weight_preprocessor):
@@ -186,7 +186,7 @@ class KernelSpec:
         object.__setattr__(
             self,
             "weight_preprocessor",
-            _normalize_weight_preprocessor(self.weight_preprocessor),
+            _validate_weight_preprocessor(self.weight_preprocessor),
         )
 
     def supports_format_signature(self, format_signature: FormatSignature) -> bool:
@@ -416,7 +416,7 @@ def register_kernel(
             ...
     """
     priority_int = _validate_priority(priority)
-    normalized_weight_preprocessor = _normalize_weight_preprocessor(weight_preprocessor)
+    normalized_weight_preprocessor = _validate_weight_preprocessor(weight_preprocessor)
 
     def decorator(fn: Callable) -> Callable:
         kernel_name = name or f"{solution}_{family}_{mode}"
