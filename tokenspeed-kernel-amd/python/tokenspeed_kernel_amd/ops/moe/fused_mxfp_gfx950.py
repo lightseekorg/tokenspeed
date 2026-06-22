@@ -6230,15 +6230,10 @@ def gluon_mxfp_combine(
     else:
         n_tokens_eff = int(n_tokens)
         n_rows = n_tokens_eff * n_act_eff
-    # Preshuffled/medium-decode W may be padded in N to satisfy the packed
-    # layout. Keep padded N for tiling/W-scale reads, but store only the
-    # caller-visible width.
+    # W may be padded in N to satisfy the packed layout. Keep padded N for
+    # tiling/W-scale reads, but store only the caller-visible width.
     logical_n = int(getattr(w, "original_n", N))
-    y_n = (
-        logical_n
-        if (w_preshuffle or medium_decode_combine_eligible) and logical_n < N
-        else N
-    )
+    y_n = logical_n if logical_n < N else N
     y = torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
     _launch_kernel(
         x,

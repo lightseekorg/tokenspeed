@@ -91,18 +91,21 @@ def test_preprocess_gluon_mxfp4_gfx950_mutates_module_state(monkeypatch):
     assert module.w13_weight_triton_tensor.shape == [2, 64, 256]
     assert module.w2_weight_triton_tensor.shape == [2, 128, 128]
     assert module._w2_logical_n == 64
-    assert module.w2_weight_bias.shape == (2, 128)
-    assert torch.count_nonzero(module.w2_weight_bias[:, 64:]) == 0
+    assert module.w2_weight_bias.shape == (2, 64)
 
     assert hasattr(w13_storage, "_gluon_shuffled")
     assert hasattr(w2_storage, "_gluon_shuffled")
+    assert hasattr(module.w13_weight_triton_tensor, "_gluon_shuffled")
+    assert hasattr(module.w2_weight_triton_tensor, "_gluon_shuffled")
     assert w2_storage.original_n == 64
+    assert module.w2_weight_triton_tensor.original_n == 64
     assert w2_storage._gluon_shuffled.original_n == 64
+    assert module.w2_weight_triton_tensor._gluon_shuffled.original_n == 64
 
     w13_config = module.w13_precision_config
     w2_config = module.w2_precision_config
-    assert isinstance(w13_config, mxfp4_preprocess.GluonPrecisionConfig)
-    assert isinstance(w2_config, mxfp4_preprocess.GluonPrecisionConfig)
+    assert isinstance(w13_config, mxfp4_preprocess.PrecisionConfig)
+    assert isinstance(w2_config, mxfp4_preprocess.PrecisionConfig)
     assert w13_config.flex_ctx.lhs_data.dtype == torch.float8_e4m3fn
     assert w2_config.flex_ctx.lhs_data.dtype == torch.float8_e4m3fn
     assert w13_config.flex_ctx.lhs_data.scale is module.w13_act_scale
@@ -111,8 +114,8 @@ def test_preprocess_gluon_mxfp4_gfx950_mutates_module_state(monkeypatch):
     assert w2_config.b_microblock_size == 32
     assert w13_config.out_dtype == torch.bfloat16
     assert w2_config.out_dtype == torch.bfloat16
-    assert mxfp4_preprocess._is_scale_swizzled_cdna4(w13_config.b_mx_scale)
-    assert mxfp4_preprocess._is_scale_swizzled_cdna4(w2_config.b_mx_scale)
+    assert w13_config.b_mx_scale.storage.data.dtype == torch.uint8
+    assert w2_config.b_mx_scale.storage.data.dtype == torch.uint8
 
 
 def test_preprocess_gluon_mxfp4_gfx950_can_disable_preshuffle(monkeypatch):
@@ -126,8 +129,12 @@ def test_preprocess_gluon_mxfp4_gfx950_can_disable_preshuffle(monkeypatch):
     w13_storage = module.w13_weight_triton_tensor.storage.data
     w2_storage = module.w2_weight_triton_tensor.storage.data
     assert module.w13_weight_triton_tensor.shape == [2, 64, 256]
-    assert module.w2_weight_triton_tensor.shape == [2, 128, 64]
-    assert not hasattr(module, "_w2_logical_n")
+    assert module.w2_weight_triton_tensor.shape == [2, 128, 128]
+    assert module._w2_logical_n == 64
+    assert module.w2_weight_triton_tensor.original_n == 64
+    assert w2_storage.original_n == 64
     assert module.w2_weight_bias.shape == (2, 64)
     assert not hasattr(w13_storage, "_gluon_shuffled")
     assert not hasattr(w2_storage, "_gluon_shuffled")
+    assert not hasattr(module.w13_weight_triton_tensor, "_gluon_shuffled")
+    assert not hasattr(module.w2_weight_triton_tensor, "_gluon_shuffled")
