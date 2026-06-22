@@ -143,6 +143,22 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
+def test_cuda_graph_padding_req_pool_index_defaults_to_zero():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.config = SimpleNamespace(max_req_pool_size=99)
+    wrapper.uses_dummy_request_padding = False
+
+    assert wrapper._padding_req_pool_index() == 0
+
+
+def test_cuda_graph_padding_req_pool_index_uses_reserved_row_when_requested():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.config = SimpleNamespace(max_req_pool_size=99)
+    wrapper.uses_dummy_request_padding = True
+
+    assert wrapper._padding_req_pool_index() == 99
+
+
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
     ctx = ForwardContext(
         attn_backend=None,

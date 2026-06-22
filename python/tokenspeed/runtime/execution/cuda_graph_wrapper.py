@@ -237,6 +237,11 @@ class CudaGraphWrapper:
         self.use_target_verify_forward_mode = config.use_target_verify_forward_mode
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
+        self.uses_dummy_request_padding = any(
+            getattr(backend, "uses_dummy_request_padding", False)
+            for backend in (attn_backend, draft_attn_backend)
+            if backend is not None
+        )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         paged_cache_group_specs = tuple(token_to_kv_pool.paged_cache_group_specs)
@@ -329,7 +334,6 @@ class CudaGraphWrapper:
 
     def _capture_one(self, bs: int):
         graph = torch.cuda.CUDAGraph()
-        self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
 
         capture_forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -806,6 +810,11 @@ class CudaGraphWrapper:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
+    def _padding_req_pool_index(self) -> int:
+        if self.uses_dummy_request_padding:
+            return int(self.config.max_req_pool_size)
+        return 0
+
     def __call__(
         self,
         bs: int,
@@ -844,10 +853,9 @@ class CudaGraphWrapper:
                 self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
             )
             active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-            dummy_req_pool_index = int(self.config.max_req_pool_size)
             dummy_req_pool_indices = torch.full(
                 (pad,),
-                dummy_req_pool_index,
+                self._padding_req_pool_index(),
                 dtype=active_req_pool_indices.dtype,
                 device=active_req_pool_indices.device,
             )
