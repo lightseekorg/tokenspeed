@@ -87,10 +87,7 @@ from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
-from tokenspeed.runtime.layers.quantization.utils import (
-    block_dequant,
-    should_ignore_quant_layer,
-)
+from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -797,7 +794,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         elif self.rotary_emb is not None and q_nope.size(0) > 0:
             # Apply RoPE directly on Q and K slices
-            q_pe, k_pe = self.rotary_emb(
+            self.rotary_emb(
                 positions,
                 q_pe,
                 K[..., self.kv_lora_rank :],
@@ -811,9 +808,10 @@ class DeepseekV3AttentionMLA(nn.Module):
                     if self.use_fused_set_kv_buffer
                     else None
                 ),
+                output_q_rope=Q[..., self.kv_lora_rank :],
+                output_k_rope=K[..., self.kv_lora_rank :],
+                enable_pdl=pdl_enabled(),
             )
-            Q[..., self.kv_lora_rank :].copy_(q_pe)
-            K[..., self.kv_lora_rank :].copy_(k_pe)
         else:
             Q[..., self.kv_lora_rank :] = q_pe
 

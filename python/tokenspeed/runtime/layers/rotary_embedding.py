@@ -28,10 +28,7 @@ from typing import Any, Tuple
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
-
-_is_nvidia = current_platform().is_nvidia
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -238,7 +235,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
     ) -> None:
         if isinstance(scaling_factors, float):
             scaling_factors = [scaling_factors]
-        self.scaling_factors: List[float] = scaling_factors
+        self.scaling_factors: list[float] = scaling_factors
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -670,54 +667,23 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
         output_q_rope=None,
+        output_k_rope=None,
         offsets: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if _is_nvidia:
-            return super().forward(
-                positions=positions,
-                query=query,
-                key=key,
-                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-                output_q_rope=output_q_rope,
-                offsets=offsets,
-            )
-
-        dtype = query.dtype
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
-
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
-        cos_sin = self.cos_sin_cache[
-            torch.add(positions, offsets) if offsets is not None else positions
-        ]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            #  Here we assume that the positions tensor has the
-            # shape [batch_size, seq_len].
-            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
-            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
-        else:
-            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-
-        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
-
-        if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
-        else:
-            query = query_rot
-            key = key_rot
-        return query.to(dtype), key.to(dtype)
+        return super().forward(
+            positions=positions,
+            query=query,
+            key=key,
+            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            output_q_rope=output_q_rope,
+            output_k_rope=output_k_rope,
+            offsets=offsets,
+            enable_pdl=enable_pdl,
+        )
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -870,9 +836,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "save kv cache is not supported for MRotaryEmbedding."
+        assert fused_set_kv_buffer_arg is None, (
+            "save kv cache is not supported for MRotaryEmbedding."
+        )
         assert positions.ndim == 1 or positions.ndim == 2
 
         num_tokens = positions.shape[-1]
