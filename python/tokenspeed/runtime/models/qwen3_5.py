@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from functools import partial
 
 import torch
 import torch.nn as nn
@@ -1208,14 +1207,14 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         """Eager image encode via the ``pre_encode`` / ``forward_blocks`` /
         ``post_encode`` decomposition the cudagraph wrapper uses, so eager
         and captured paths share a single source of truth."""
-        tokens, grid = self.pre_encode(items, grid_attr="image_grid_thw")
+        tokens, grid = self.pre_encode(items)
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
 
     def get_video_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
         """Eager video encode; the cudagraph path uses the same pre/post hooks."""
-        tokens, grid = self.pre_encode(items, grid_attr="video_grid_thw")
+        tokens, grid = self.pre_encode(items)
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
@@ -1223,17 +1222,30 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
     def pre_encode(
         self,
         items: list[MultimodalDataItem],
-        grid_attr: str = "image_grid_thw",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Eager patch-embed before the captured region; returns ``(tokens, grid)``.
 
-        ``grid_attr`` selects which grid field on each item to read --
-        ``image_grid_thw`` (default, used by the wrapper) or ``video_grid_thw``.
+        The grid field is selected per item by modality (``video_grid_thw`` for
+        video, ``image_grid_thw`` otherwise) so a single shared encoder cudagraph
+        wrapper can serve both image and video batches.
         """
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        grid = torch.concat([getattr(item, grid_attr) for item in items], dim=0)
+        grid = torch.concat(
+            [
+                getattr(
+                    item,
+                    (
+                        "video_grid_thw"
+                        if item.modality == Modality.VIDEO
+                        else "image_grid_thw"
+                    ),
+                )
+                for item in items
+            ],
+            dim=0,
+        )
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert grid.dim() == 2, grid.dim()
         x = self.visual.prepare_patch_embed(pixel_values, grid)
@@ -1249,8 +1261,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         self,
         mapping,
         *,
-        modality_name: str,
-        grid_attr: str,
         max_metadata_sequences_per_batch: int | None = None,
         metadata_sequence_budget_from_encoder_output_budget: bool = False,
     ):
@@ -1261,12 +1271,12 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         # ``spatial_merge_size ** 2 * budget`` patches.
         adapter = VisionEncoderCudaGraphAdapter(
             tower=self.visual,
-            pre_encode=partial(self.pre_encode, grid_attr=grid_attr),
+            pre_encode=self.pre_encode,
             post_encode=self.post_encode,
             out_div=self.visual.spatial_merge_size**2,
             merge=self.visual.spatial_merge_size,
             input_feature_shape=(1, self.visual.hidden_size),
-            modality_name=modality_name,
+            modality_name="vision",
             capture_tp_size=mapping.vision.tp_size,
             capture_tp_group=mapping.vision.tp_group,
         )
@@ -1285,22 +1295,22 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         )
         if max_video_metadata_sequences is not None:
             max_video_metadata_sequences = max(1, max_video_metadata_sequences)
-        return {
-            "image_encoder": self._build_encoder_cudagraph_wrapper(
-                mapping,
-                modality_name="image",
-                grid_attr="image_grid_thw",
+        # Image and video encode through the identical captured region
+        # (``visual.forward_blocks`` over the same post-merge token buckets), so
+        # one wrapper serves both -- ``pre_encode`` selects the grid field per
+        # item by modality. Sharing a single set of budget graphs (rather than
+        # one set per modality) halves the captured-graph GPU memory. The video
+        # metadata-sequence policy is the superset (a video batch packs more
+        # sequences per item than an image batch at a given token budget), so it
+        # also covers image batches.
+        shared = self._build_encoder_cudagraph_wrapper(
+            mapping,
+            max_metadata_sequences_per_batch=max_video_metadata_sequences,
+            metadata_sequence_budget_from_encoder_output_budget=(
+                max_video_metadata_sequences is None
             ),
-            "video_encoder": self._build_encoder_cudagraph_wrapper(
-                mapping,
-                modality_name="video",
-                grid_attr="video_grid_thw",
-                max_metadata_sequences_per_batch=max_video_metadata_sequences,
-                metadata_sequence_budget_from_encoder_output_budget=(
-                    max_video_metadata_sequences is None
-                ),
-            ),
-        }
+        )
+        return {"image_encoder": shared, "video_encoder": shared}
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
