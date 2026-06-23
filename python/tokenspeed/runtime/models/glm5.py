@@ -1253,9 +1253,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk = self.index_topk
         page_size = ctx.token_to_kv_pool.page_size
         if prefix_lens_cpu is not None and extend_lens_cpu is not None:
-            max_seq_len = int((prefix_lens_cpu + extend_lens_cpu).max().item())
+            seq_lens_cpu = prefix_lens_cpu + extend_lens_cpu
+            max_seq_len = int(seq_lens_cpu.max().item())
+            seq_len_sum = int(seq_lens_cpu.sum().item())
         else:
             max_seq_len = int(seq_lens.max().item())
+            seq_len_sum = int(seq_lens.sum().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
         block_tables_snapshot = getattr(ctx.attn_backend, "_prefill_block_tables", None)
         if block_tables_snapshot is None:
@@ -1282,6 +1285,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             kv_workspace_slots=kv_workspace_slots,
             kv_workspace_bases=kv_workspace_bases,
             max_seq_len=max_seq_len,
+            seq_len_sum=seq_len_sum,
             num_prefill_tokens=num_prefill_tokens,
             topk=topk,
         )
@@ -1298,6 +1302,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         kv_workspace_slots: torch.Tensor,
         kv_workspace_bases: torch.Tensor,
         max_seq_len: int,
+        seq_len_sum: int,
         num_prefill_tokens: int,
         topk: int,
     ) -> GlmDsaPrefillTopK:
@@ -1321,7 +1326,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if num_prefill_tokens <= 0 or seq_lens.numel() == 0:
             raise RuntimeError("GLM DSA prefill top-k requires at least one token.")
 
-        seq_len_sum = int(seq_lens.sum().item())
         max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
         q = indexer_output.query[:num_prefill_tokens].contiguous()
         q_2d = q.view(-1, self.indexer.index_head_dim)

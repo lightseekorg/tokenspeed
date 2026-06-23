@@ -699,6 +699,7 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
 
     def fake_compute_prefill_topk_indices_deepgemm(self, **kwargs):
         captured["deepgemm_max_seq_len"] = kwargs["max_seq_len"]
+        captured["deepgemm_seq_len_sum"] = kwargs["seq_len_sum"]
         captured["deepgemm_num_prefill_tokens"] = kwargs["num_prefill_tokens"]
         return "prefill-topk"
 
@@ -714,8 +715,8 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
     )
 
     # The live tensors deliberately disagree with the CPU mirror. The scalar
-    # token-count and max-len decisions should use the CPU mirror to avoid GPU
-    # syncs in the GLM DSA prefill top-k path.
+    # token-count, max-len, and chunk-budget decisions should use the CPU mirror
+    # to avoid GPU syncs in the GLM DSA prefill top-k path.
     chunk_meta = SimpleNamespace(
         extend_prefix_lens=torch.tensor([100], dtype=torch.int32),
         extend_seq_lens=torch.tensor([100], dtype=torch.int32),
@@ -751,6 +752,7 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
     assert captured["workspace_max_seq_len"] == 12
     assert captured["workspace_block_tables_shape"] == (1, 1)
     assert captured["deepgemm_max_seq_len"] == 12
+    assert captured["deepgemm_seq_len_sum"] == 12
     assert captured["deepgemm_num_prefill_tokens"] == 5
 
 

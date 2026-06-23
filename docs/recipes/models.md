@@ -49,7 +49,7 @@ importing the DSA backend into generic drafter startup. The draft MoE path is
 also excluded from expert-distribution recording. The GLM DSA decode top-k
 schedule cache is refreshed against the current MTP query width and visible
 lengths, and DSA prefill top-k uses scheduler CPU length mirrors for scalar
-planning to avoid extra GPU synchronizations.
+planning, including chunk budgets, to avoid extra GPU synchronizations.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \
