@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 from tokenspeed_kernel_amd._triton import redirect_triton_to_tokenspeed_triton
 
@@ -34,13 +37,33 @@ with redirect_triton_to_tokenspeed_triton():
     import triton_kernels.tensor_details.layout  # noqa: F401
 
 import triton_kernels.matmul_details.opt_flags as opt_flags
-from triton_kernels.matmul import FlexCtx, PrecisionConfig
-from triton_kernels.numerics import InFlexData
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 
 _MXFP_BLOCK_SIZE = 32
 _GLUON_COMBINE_BLOCK_N = 128
+
+
+@dataclass
+class InFlexData:
+    dtype: torch.dtype | None = None
+    scale: torch.Tensor | None = None
+
+
+@dataclass
+class FlexCtx:
+    lhs_data: InFlexData | None = None
+    rhs_data: InFlexData | None = None
+
+
+@dataclass
+class PrecisionConfig:
+    flex_ctx: FlexCtx | None = None
+    b_mx_scale: Any | None = None
+    b_microblock_size: int | None = None
+    out_dtype: torch.dtype | None = None
+    a_mx_scale: Any | None = None
+    a_microblock_size: int | None = None
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):

@@ -25,6 +25,11 @@ from typing import Any, Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
+    FlexCtx,
+    InFlexData,
+    PrecisionConfig,
+)
 from tokenspeed_kernel_amd.ops.moe.utils import (
     FnSpecs,
     FusedActivation,
@@ -5301,7 +5306,7 @@ def _launch_kernel(
     if not needs_scale_load:
         x_global_scale_buf = _make_dummy(x.device, torch.float32)
     elif isinstance(x_global_scale, torch.Tensor):
-        # Production: zero-copy passthrough of upstream FlexCtx scale.
+        # Production: zero-copy passthrough of the precision config scale.
         scale_view = x_global_scale.detach().reshape(-1)[:1]
         if scale_view.device == x.device and scale_view.dtype == torch.float32:
             x_global_scale_buf = scale_view
@@ -6392,22 +6397,24 @@ def gluon_mxfp_ragged_matmul(
     a_ragged_metadata=None,
     gather_indx=None,
     scatter_indx=None,
-    precision_config=None,
+    precision_config: PrecisionConfig | None = None,
     fused_activation=None,
     n_tokens=None,
     n_expts_act=None,
     **extra_kwargs,
 ) -> torch.Tensor | None:
-    assert precision_config is not None
-    w_mx_scale = getattr(precision_config, "b_mx_scale", None)
+    assert isinstance(precision_config, PrecisionConfig)
+    w_mx_scale = precision_config.b_mx_scale
     assert w_mx_scale is not None
 
-    flex = getattr(precision_config, "flex_ctx", None)
-    lhs = getattr(flex, "lhs_data", None) if flex is not None else None
-    fp8_dtype = getattr(lhs, "dtype", None) if lhs is not None else None
-    fp8_scale = getattr(lhs, "scale", None) if lhs is not None else None
+    flex = precision_config.flex_ctx
+    assert flex is None or isinstance(flex, FlexCtx)
+    lhs = flex.lhs_data if flex is not None else None
+    assert lhs is None or isinstance(lhs, InFlexData)
+    fp8_dtype = lhs.dtype if lhs is not None else None
+    fp8_scale = lhs.scale if lhs is not None else None
 
-    x_mx_scale = getattr(precision_config, "a_mx_scale", None)
+    x_mx_scale = precision_config.a_mx_scale
 
     if fp8_dtype is not None:
         x_format = "e4m3"
@@ -6520,8 +6527,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     *,
     w13_bias=None,
     w2_bias=None,
-    w13_precision_config=None,
-    w2_precision_config=None,
+    w13_precision_config: PrecisionConfig | None = None,
+    w2_precision_config: PrecisionConfig | None = None,
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
     top_k: int,
@@ -6540,6 +6547,10 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     if not gluon_route_supported(router_logits, top_k, router_logits.dtype):
         return None
     if w13_precision_config is None or w2_precision_config is None:
+        return None
+    if not isinstance(w13_precision_config, PrecisionConfig) or not isinstance(
+        w2_precision_config, PrecisionConfig
+    ):
         return None
 
     # Use the optional Gluon dot-layout preshuffled attachments when they match
@@ -6560,8 +6571,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         and int(getattr(w2_raw_candidate, "gluon_dot_block_n", 0)) == 128
     )
     w2_raw = w2_raw_candidate if w2_preshuffled else _extract_gluon_raw_s(w2_weight)
-    w13_scale = _extract_gluon_raw_s(getattr(w13_precision_config, "b_mx_scale", None))
-    w2_scale = _extract_gluon_raw_s(getattr(w2_precision_config, "b_mx_scale", None))
+    w13_scale = _extract_gluon_raw_s(w13_precision_config.b_mx_scale)
+    w2_scale = _extract_gluon_raw_s(w2_precision_config.b_mx_scale)
     if not all(
         isinstance(t, torch.Tensor) for t in (w13_raw, w2_raw, w13_scale, w2_scale)
     ):
@@ -6605,7 +6616,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # Pass the FP8 tensor straight to Gluon.  ``view(torch.uint8)`` materializes a
     # copy for float8 tensors on this stack and dominates small-M latency.
 
-    out_dtype = getattr(w2_precision_config, "out_dtype", None) or torch.bfloat16
+    out_dtype = w2_precision_config.out_dtype or torch.bfloat16
     out = torch.empty((n_tokens, N), dtype=out_dtype, device=hidden_states.device)
 
     # The kernels only read the bias pointer when HAS_BIAS; allocate the
@@ -6723,8 +6734,8 @@ def gluon_mxfp_fused_moe(
     *,
     w13_bias=None,
     w2_bias=None,
-    w13_precision_config=None,
-    w2_precision_config=None,
+    w13_precision_config: PrecisionConfig | None = None,
+    w2_precision_config: PrecisionConfig | None = None,
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
     top_k: int,
