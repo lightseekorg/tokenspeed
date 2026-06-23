@@ -18,4 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _is_triton_kernels_import_error(exc: ImportError) -> bool:
+    name = getattr(exc, "name", None)
+    if name is None:
+        return "triton_kernels" in str(exc)
+    return name == "triton_kernels" or name.startswith("triton_kernels.")
+
+
+try:
+    import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
+except ImportError as exc:
+    if not _is_triton_kernels_import_error(exc):
+        raise
+    logger.warning("Skipping optional Triton MXFP4 MoE backend: %s", exc)

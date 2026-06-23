@@ -509,10 +509,21 @@ class Eagle(BaseDrafter):
         if self.spec_num_steps <= 1:
             return next_tokens
 
-        if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
+        capturing_cuda_graph = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if (
+            self.input_buffers.all_extends_mid_chunk
+            and self.dp_size == 1
+            and not capturing_cuda_graph
+        ):
             # Skip multi-step when the whole batch is mid-chunk EXTEND: no
             # request transitions to target_verify after this forward, so
             # any speculative tokens we draft would be discarded.
+            #
+            # During CUDA graph capture, record the full multi-step loop so a
+            # stale mid-chunk flag cannot bake a shortened candidate chain into
+            # every replay.
             #
             # In DP we still run, because peer ranks may have completing
             # extends or decodes; diverging here would desync the drafter's

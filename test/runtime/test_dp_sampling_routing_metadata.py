@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -96,6 +97,12 @@ def test_extensible_lm_exposes_base_sampling_setup_handles():
 
     assert ext.logits_processor is base.logits_processor
     assert ext.lm_head is base.lm_head
+
+
+def test_tokenspeed_kernel_moe_import_tolerates_optional_mxfp4_backends():
+    import tokenspeed_kernel.ops.moe as moe
+
+    assert callable(moe.moe_plan)
 
 
 def test_logits_processor_dp_layout_threshold_and_modes():
@@ -628,6 +635,68 @@ def test_eagle_multi_step_starts_from_accepted_prefix(monkeypatch):
     assert calls[0]["input_ids"].tolist() == [8, 9]
     assert calls[1]["input_ids"].tolist() == [1, 1]
     assert next_tokens[:, 2:].tolist() == [[1, 1], [1, 1]]
+
+
+def test_eagle_mid_chunk_skip_is_disabled_during_cuda_graph_capture(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        eagle_module,
+        "sampling_argmax",
+        lambda logits: torch.argmax(logits, dim=-1),
+    )
+
+    eagle = Eagle.__new__(Eagle)
+    eagle.spec_num_steps = 3
+    eagle.spec_num_tokens = 4
+    eagle.hot_token_ids = None
+    eagle.device = "cpu"
+    eagle.dp_size = 1
+    eagle._dsa_reuse_mtp_topk = False
+    eagle.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
+    eagle.padded_gather_ids_offsets_buf = torch.arange(1, dtype=torch.int64) * 4 - 1
+    eagle.input_buffers = SimpleNamespace(
+        all_extends_mid_chunk=True,
+        seq_lens_buf=torch.tensor([10], dtype=torch.int32),
+    )
+
+    called = {}
+
+    def fake_run_first_step(bs, draft_input):
+        assert bs == 1
+        return (
+            SimpleNamespace(
+                hidden_states=torch.zeros((1, 3)),
+                next_token_logits=torch.tensor([[0.0, 1.0, 0.0]]),
+            ),
+            (None, None),
+        )
+
+    def fake_run_multi_step_decode(
+        bs,
+        draft_ids,
+        next_tokens,
+        logits_output,
+        draft_input,
+        dsa_topk,
+    ):
+        called["yes"] = True
+        assert draft_ids.tolist() == [1]
+        next_tokens[:, 2:] = torch.tensor([[2, 3]], dtype=torch.int32)
+
+    eagle._run_first_step = fake_run_first_step
+    eagle._run_multi_step_decode = fake_run_multi_step_decode
+    eagle.attn_backend = SimpleNamespace(override_num_extends=lambda _: nullcontext())
+    draft_input = SimpleNamespace(
+        accept_lengths=torch.ones(1, dtype=torch.int32),
+        num_extends=1,
+        base_model_output=torch.tensor([7], dtype=torch.int32),
+    )
+
+    next_tokens = eagle.draft(draft_input)
+
+    assert called == {"yes": True}
+    assert next_tokens.tolist() == [[7, 1, 2, 3]]
 
 
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
