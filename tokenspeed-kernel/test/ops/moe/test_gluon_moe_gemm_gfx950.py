@@ -1,6 +1,8 @@
+# ruff: noqa: E402
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +23,7 @@ if not _IS_GFX950:
         allow_module_level=True,
     )
 
+import tokenspeed_kernel
 from tokenspeed_kernel.ops.moe.gluon.mxfp4 import gluon_mxfp4_moe_process_weights
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _quantize_mxfp4_activation,
@@ -55,6 +58,7 @@ WEIGHT_NIBBLES = (0, 1, 2, 9, 10)
 # e8m0 block scales centered around the previous uniform exponent 124.
 WEIGHT_SCALE_EXPONENTS = (123, 124, 125)
 GEMM_ATOL = 0.05
+APPLY_ATOL = 0.075
 RTOL = 0.01
 
 KEY_NUM_TOKEN_VALUES = (1, 2, 16, 17, 64, 4096, 8192)
@@ -304,6 +308,10 @@ class TritonReference:
     gemm2_output: torch.Tensor
 
 
+class _DynamicMxfp4Config:
+    use_dynamic_mxfp4_activations = True
+
+
 def _make_mxfp4_weight_bytes(
     shape: tuple[int, ...],
     *,
@@ -391,6 +399,28 @@ def _make_weight_module(raw: RawMxfp4Weights) -> torch.nn.Module:
     return layer
 
 
+def _make_dynamic_weight_module(raw: RawMxfp4Weights) -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.activation = "swiglu"
+    layer.top_k = TOPK
+    layer.num_experts = E
+    layer.num_local_experts = E
+    layer.ep_size = 1
+    layer.ep_rank = 0
+    layer.quant_config = _DynamicMxfp4Config()
+    layer.swiglu_arg = SimpleNamespace(alpha=SWIGLU_ALPHA, limit=SWIGLU_LIMIT)
+    layer.swiglu_beta = SWIGLU_BETA
+    layer.w13_weight = torch.nn.Parameter(raw.w13_weight.clone(), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        raw.w13_scale.clone(), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(raw.w2_weight.clone(), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(
+        raw.w2_scale.clone(), requires_grad=False
+    )
+    return layer
+
+
 def _make_preprocessed_weights(
     raw: RawMxfp4Weights,
     *,
@@ -467,6 +497,15 @@ def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
         exact_values,
         scale=scale,
     )
+
+
+def _make_precomputed_topk(
+    router_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.softmax(router_logits.float(), dim=-1)
+    topk_weights, topk_ids = torch.topk(scores, TOPK, dim=-1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights.contiguous(), topk_ids.to(torch.int32).contiguous()
 
 
 def _swiglu_activation() -> FusedActivation:
@@ -681,6 +720,70 @@ def test_gluon_dynamic_stage1_a4w4_beta_matches_triton_gfx950(
         actual.float(),
         expected.float(),
         atol=GEMM_ATOL,
+        rtol=RTOL,
+    )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("num_tokens", [4, 64])
+def test_gluon_dynamic_mxfp4_moe_apply_matches_triton_gfx950(
+    num_tokens: int,
+) -> None:
+    raw = _make_raw_mxfp4_weights()
+    triton_weights = _make_dynamic_weight_module(raw)
+    gluon_weights = _make_dynamic_weight_module(raw)
+    triton_plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=1,
+        ispp=INTERMEDIATE_SIZE,
+        internal_activation_dtype="input",
+        with_bias=False,
+        solution="triton",
+    )
+    gluon_plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=1,
+        ispp=INTERMEDIATE_SIZE,
+        internal_activation_dtype="input",
+        with_bias=False,
+        solution="gluon",
+    )
+    tokenspeed_kernel.moe_process_weights(triton_plan, triton_weights)
+    tokenspeed_kernel.moe_process_weights(gluon_plan, gluon_weights)
+
+    hidden_states, router_logits = _make_hidden_and_router(num_tokens)
+    topk_weights, topk_ids = _make_precomputed_topk(router_logits)
+    with torch.no_grad():
+        expected = tokenspeed_kernel.moe_apply(
+            triton_plan,
+            hidden_states,
+            triton_weights,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            num_tokens_global=num_tokens,
+            max_num_tokens_per_gpu=num_tokens,
+        )
+        actual = tokenspeed_kernel.moe_apply(
+            gluon_plan,
+            hidden_states,
+            gluon_weights,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            num_tokens_global=num_tokens,
+            max_num_tokens_per_gpu=num_tokens,
+        )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
+        atol=APPLY_ATOL,
         rtol=RTOL,
     )
 

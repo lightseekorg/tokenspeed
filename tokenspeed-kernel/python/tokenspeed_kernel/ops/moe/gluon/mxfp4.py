@@ -161,7 +161,22 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 
 
 if platform.is_amd:
-    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import gluon_mxfp_fused_moe
+    from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
+        _deepseek_v4_topk_from_logits,
+        _local_topk_for_ep,
+        _maybe_interleave_w13_for_swiglu,
+        _quantize_mxfp4_activation,
+        _release_parameter,
+        _routing,
+        _routing_from_local_topk,
+        _swiglu_activation_for_weights,
+        _uses_dynamic_mxfp4_activations,
+        _with_activation_mx_scale,
+    )
+    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+        gluon_mxfp_fused_moe,
+        gluon_mxfp_ragged_matmul,
+    )
 
     @register_kernel(
         "moe",
@@ -181,11 +196,15 @@ if platform.is_amd:
     def gluon_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         MXFP_BLOCK_SIZE = 32
 
-        w13_weight_bias = w.w13_weight_bias.to(torch.float32)
-        w2_weight_bias = w.w2_weight_bias.to(torch.float32)
-        w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
-        w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+        if hasattr(w, "w13_weight_bias"):
+            w13_weight_bias = w.w13_weight_bias.to(torch.float32)
+            w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
+        if hasattr(w, "w2_weight_bias"):
+            w2_weight_bias = w.w2_weight_bias.to(torch.float32)
+            w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+        _maybe_interleave_w13_for_swiglu(w)
         _pad_w2_to_block_n(w, _GLUON_COMBINE_BLOCK_N)
+        use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
 
         num_warps = 8
         w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
@@ -195,35 +214,41 @@ if platform.is_amd:
             w.w2_weight, w.w2_weight_scale, num_warps
         )
 
-        # Collapse per-expert input scales to a single per-tensor scale
-        # per GEMM. Quark exports a constant value across experts for
-        # static ``per_tensor`` quantisation; ``max`` is a safe reduction
-        # in case individual experts reach slightly different values.
-        w13_in_scale = (
-            w.w13_input_scale.data.to(torch.float32)
-            .max()
-            .reshape(1)
-            .to(w.w13_input_scale.device)
-            .contiguous()
-        )
-        w2_in_scale = (
-            w.w2_input_scale.data.to(torch.float32)
-            .max()
-            .reshape(1)
-            .to(w.w2_input_scale.device)
-            .contiguous()
-        )
-        w.w13_act_scale = w13_in_scale
-        w.w2_act_scale = w2_in_scale
+        if hasattr(w, "w13_input_scale") and hasattr(w, "w2_input_scale"):
+            # Collapse per-expert input scales to a single per-tensor scale
+            # per GEMM. Quark exports a constant value across experts for
+            # static ``per_tensor`` quantisation; ``max`` is a safe reduction
+            # in case individual experts reach slightly different values.
+            w13_in_scale = (
+                w.w13_input_scale.data.to(torch.float32)
+                .max()
+                .reshape(1)
+                .to(w.w13_input_scale.device)
+                .contiguous()
+            )
+            w2_in_scale = (
+                w.w2_input_scale.data.to(torch.float32)
+                .max()
+                .reshape(1)
+                .to(w.w2_input_scale.device)
+                .contiguous()
+            )
+            w.w13_act_scale = w13_in_scale
+            w.w2_act_scale = w2_in_scale
 
-        fp8_dtype = current_platform().fp8e4m3fn.dtype
-        w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
-        w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
-        # Force bf16 output so the swiglu / down-proj results stay in a
-        # standard floating dtype; without this, ``triton_kernels.matmul``
-        # defaults ``out_dtype`` to the input dtype (fp8) which would
-        # make the subsequent reductions / re-quantisation blow up.
-        out_dtype = torch.bfloat16
+            fp8_dtype = current_platform().fp8e4m3fn.dtype
+            w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
+            w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
+            # Force bf16 output so the swiglu / down-proj results stay in a
+            # standard floating dtype; without this, ``triton_kernels.matmul``
+            # defaults ``out_dtype`` to the input dtype (fp8) which would
+            # make the subsequent reductions / re-quantisation blow up.
+            out_dtype = torch.bfloat16
+        else:
+            w13_lhs = InFlexData()
+            w2_lhs = InFlexData()
+            out_dtype = torch.bfloat16 if use_dynamic_mxfp4 else None
+        w._mxfp4_intermediate_size = int(w.w2_weight.shape[-1]) * 2
 
         w.w13_precision_config = PrecisionConfig(
             flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
@@ -241,10 +266,183 @@ if platform.is_amd:
         w.w13_weight_triton_tensor = w13_weight
         w.w2_weight_triton_tensor = w2_weight
         _attach_gluon_preshuffle(w)
-        del w.w13_weight
-        del w.w2_weight
+        _release_parameter(w, "w13_weight")
+        _release_parameter(w, "w2_weight")
+        if use_dynamic_mxfp4:
+            _release_parameter(w, "w13_weight_scale")
+            _release_parameter(w, "w2_weight_scale")
 
         torch.cuda.empty_cache()
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_dynamic_precomputed_moe_apply",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 1,
+    )
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_dynamic_deepseek_v4_moe_apply",
+        features={"backend_routing:deepseek_v4"},
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"swiglu"}),
+            "routing_mode": frozenset({"kernel_routing"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 1,
+    )
+    def gluon_mxfp4_dynamic_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+        routing_config: dict | None = None,
+        num_token_non_padded: torch.Tensor | None = None,
+        expert_location_dispatch_info: object | None = None,
+    ):
+        del (
+            plan,
+            num_tokens_global,
+            max_num_tokens_per_gpu,
+            do_finalize,
+            enable_pdl,
+            num_token_non_padded,
+            expert_location_dispatch_info,
+        )
+        if not _uses_dynamic_mxfp4_activations(w):
+            raise RuntimeError("dynamic Gluon MXFP4 MoE requires dynamic activations")
+
+        top_k = getattr(w, "top_k")
+        n_tokens = int(router_logits.shape[0])
+        if routing_config is not None:
+            topk_weights, topk_ids = _deepseek_v4_topk_from_logits(
+                router_logits,
+                routing_config,
+            )
+            topk_weights, topk_ids, num_experts = _local_topk_for_ep(
+                topk_weights,
+                topk_ids,
+                w,
+            )
+            ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+                _routing_from_local_topk(
+                    topk_weights,
+                    topk_ids,
+                    num_experts=num_experts,
+                    dtype=router_logits.dtype,
+                    ep_size=int(getattr(w, "ep_size", 1)),
+                    schedule_block16_only=True,
+                )
+            )
+        elif topk_weights is not None or topk_ids is not None:
+            if topk_weights is None or topk_ids is None:
+                raise ValueError("topk_weights and topk_ids must be provided together")
+            topk_weights, topk_ids, num_experts = _local_topk_for_ep(
+                topk_weights,
+                topk_ids,
+                w,
+            )
+            ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+                _routing_from_local_topk(
+                    topk_weights,
+                    topk_ids,
+                    num_experts=num_experts,
+                    dtype=router_logits.dtype,
+                    ep_size=int(getattr(w, "ep_size", 1)),
+                    schedule_block16_only=True,
+                )
+            )
+        else:
+            ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
+                router_logits,
+                top_k,
+                sm_first=False,
+                dtype=router_logits.dtype,
+            )
+
+        swiglu_arg = getattr(w, "swiglu_arg", None)
+        if swiglu_arg is None:
+            raise RuntimeError("dynamic Gluon MXFP4 MoE currently requires SwiGLU")
+        act = _swiglu_activation_for_weights(w, swiglu_arg)
+
+        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(x)
+        w13_pc = _with_activation_mx_scale(
+            getattr(w, "w13_precision_config", None),
+            gemm1_scale,
+        )
+        intermediate_cache = gluon_mxfp_ragged_matmul(
+            gemm1_input,
+            w.w13_weight_triton_tensor,
+            getattr(w, "w13_weight_bias", None),
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            precision_config=w13_pc,
+            fused_activation=act,
+        )
+
+        gemm2_input, gemm2_scale = _quantize_mxfp4_activation(intermediate_cache)
+        w2_pc = _with_activation_mx_scale(
+            getattr(w, "w2_precision_config", None),
+            gemm2_scale,
+        )
+        output = gluon_mxfp_ragged_matmul(
+            gemm2_input,
+            w.w2_weight_triton_tensor,
+            getattr(w, "w2_weight_bias", None),
+            a_ragged_metadata=ragged_metadata,
+            precision_config=w2_pc,
+            scatter_indx=scatter_indx,
+            gammas=gate_scal,
+            n_tokens=n_tokens,
+            n_expts_act=top_k,
+        )
+        return output
 
     @register_kernel(
         "moe",
