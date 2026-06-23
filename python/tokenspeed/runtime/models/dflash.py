@@ -274,7 +274,7 @@ class DFlashDecoderLayer(nn.Module):
             ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
         ):
             hidden_states = all_reduce(
-                hidden_states, self.mapping.dense.tp_rank, self.mapping.dense.tp_group
+                hidden_states, self.mapping.dense.tp_group
             )
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
@@ -296,7 +296,7 @@ class DFlashDecoderLayer(nn.Module):
 
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
             hidden_states = all_reduce(
-                hidden_states, self.mapping.attn.tp_rank, self.mapping.attn.tp_group
+                hidden_states, self.mapping.attn.tp_group
             )
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
