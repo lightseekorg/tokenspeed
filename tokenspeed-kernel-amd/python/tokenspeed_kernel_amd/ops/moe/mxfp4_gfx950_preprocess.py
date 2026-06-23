@@ -24,24 +24,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from tokenspeed_kernel_amd._triton import redirect_triton_to_tokenspeed_triton
-
-with redirect_triton_to_tokenspeed_triton():
-    import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
-    import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-    import triton_kernels.tensor_details  # noqa: F401
-    import triton_kernels.tensor_details.layout  # noqa: F401
-
-import triton_kernels.matmul_details.opt_flags as opt_flags
-from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-from triton_kernels.tensor_details import layout
 
 _MXFP_BLOCK_SIZE = 32
 _GLUON_COMBINE_BLOCK_N = 128
+_CDNA4_SCALE_N_BLOCK = 32
+_CDNA4_SCALE_K_BLOCK = 8
 
 
 @dataclass
@@ -66,22 +53,57 @@ class PrecisionConfig:
     a_microblock_size: int | None = None
 
 
-def _swizzle_mxfp4(quant_tensor, scale, num_warps):
-    """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
+def _make_k_packed_mxfp4_weight(quant_tensor: torch.Tensor) -> torch.Tensor:
+    """Return W storage in the gfx950 apply kernel's canonical K-packed layout."""
+    if quant_tensor.ndim < 2:
+        raise ValueError("MXFP4 weight tensor must have at least 2 dimensions")
+    *leading_shape, n, k_packed = quant_tensor.shape
+    out_shape = [*leading_shape, k_packed, n]
+    out_strides = [0] * len(out_shape)
+    out_strides[-2] = 1
+    out_strides[-1] = k_packed
+    running_stride = n * k_packed
+    for dim in range(len(leading_shape) - 1, -1, -1):
+        out_strides[dim] = running_stride
+        running_stride *= out_shape[dim]
+    out = torch.empty_strided(
+        out_shape, out_strides, dtype=quant_tensor.dtype, device=quant_tensor.device
+    )
+    out.copy_(quant_tensor.transpose(-2, -1))
+    return out
 
-    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
-    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=-2, num_warps=num_warps
-    )
-    # This backend preprocessor is gfx950-specific. Fix block_k=256 to support
-    # scale swizzling, matching the upstream Gluon MXFP4 path on AMD.
-    opt_flags.update_opt_flags_constraints({"block_k": 256})
-    quant_tensor = quant_tensor.transpose(-2, -1)
-    scale = scale.transpose(-2, -1)
-    quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout
-    )
-    scale = convert_layout(wrap_torch_tensor(scale), scale_layout)
+
+def _swizzle_cdna4_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Match triton_kernels' CDNA4MXScaleLayout byte swizzle using PyTorch ops."""
+    if scale.ndim < 2:
+        raise ValueError("MXFP4 scale tensor must have at least 2 dimensions")
+    scale = scale.transpose(-2, -1).contiguous()
+    *leading_shape, k_scale, n = scale.shape
+    leading = 1
+    for dim in leading_shape:
+        leading *= dim
+    k_scale_pad = (k_scale + _CDNA4_SCALE_K_BLOCK - 1) // _CDNA4_SCALE_K_BLOCK
+    k_scale_pad *= _CDNA4_SCALE_K_BLOCK
+    n_pad = (n + _CDNA4_SCALE_N_BLOCK - 1) // _CDNA4_SCALE_N_BLOCK
+    n_pad *= _CDNA4_SCALE_N_BLOCK
+
+    scale = scale.mT.contiguous().mT
+    scale = torch.nn.functional.pad(scale, (0, n_pad - n, 0, k_scale_pad - k_scale))
+    scale = scale.transpose(-1, -2)
+    scale = scale.reshape(leading, n_pad, k_scale_pad)
+    scale = scale.view(leading, n_pad // 32, 2, 16, k_scale_pad // 8, 2, 4, 1)
+    scale = scale.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
+    scale = scale.reshape(leading, n_pad // 32, k_scale_pad * 32)
+    scale = scale.transpose(-1, -2)
+    assert scale.stride(-2) == 1
+    return scale
+
+
+def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: int):
+    """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
+    del num_warps
+    quant_tensor = _make_k_packed_mxfp4_weight(quant_tensor)
+    scale = _swizzle_cdna4_mxfp4_scale(scale)
     return quant_tensor, InFlexData(), scale
 
 

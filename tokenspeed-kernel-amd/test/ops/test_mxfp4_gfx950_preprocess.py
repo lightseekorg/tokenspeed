@@ -84,12 +84,14 @@ def test_preprocess_gluon_mxfp4_gfx950_mutates_module_state(monkeypatch):
     assert module.w13_act_scale.item() == pytest.approx(0.75)
     assert module.w2_act_scale.item() == pytest.approx(0.625)
 
-    w13_storage = module.w13_weight_triton_tensor.storage.data
-    w2_storage = module.w2_weight_triton_tensor.storage.data
+    w13_storage = module.w13_weight_triton_tensor
+    w2_storage = module.w2_weight_triton_tensor
     assert w13_storage.dtype == torch.uint8
     assert w2_storage.dtype == torch.uint8
-    assert module.w13_weight_triton_tensor.shape == [2, 64, 256]
-    assert module.w2_weight_triton_tensor.shape == [2, 128, 128]
+    assert module.w13_weight_triton_tensor.shape == (2, 32, 256)
+    assert module.w2_weight_triton_tensor.shape == (2, 64, 128)
+    assert module.w13_weight_triton_tensor.stride(-2) == 1
+    assert module.w2_weight_triton_tensor.stride(-2) == 1
     assert module._w2_logical_n == 64
     assert module.w2_weight_bias.shape == (2, 64)
 
@@ -114,8 +116,12 @@ def test_preprocess_gluon_mxfp4_gfx950_mutates_module_state(monkeypatch):
     assert w2_config.b_microblock_size == 32
     assert w13_config.out_dtype == torch.bfloat16
     assert w2_config.out_dtype == torch.bfloat16
-    assert w13_config.b_mx_scale.storage.data.dtype == torch.uint8
-    assert w2_config.b_mx_scale.storage.data.dtype == torch.uint8
+    assert w13_config.b_mx_scale.dtype == torch.uint8
+    assert w2_config.b_mx_scale.dtype == torch.uint8
+    assert w13_config.b_mx_scale.shape == (2, 256, 8)
+    assert w2_config.b_mx_scale.shape == (2, 256, 4)
+    assert w13_config.b_mx_scale.stride(-2) == 1
+    assert w2_config.b_mx_scale.stride(-2) == 1
 
 
 def test_preprocess_gluon_mxfp4_gfx950_can_disable_preshuffle(monkeypatch):
@@ -126,10 +132,12 @@ def test_preprocess_gluon_mxfp4_gfx950_can_disable_preshuffle(monkeypatch):
         {}, module, preshuffle=False
     )
 
-    w13_storage = module.w13_weight_triton_tensor.storage.data
-    w2_storage = module.w2_weight_triton_tensor.storage.data
-    assert module.w13_weight_triton_tensor.shape == [2, 64, 256]
-    assert module.w2_weight_triton_tensor.shape == [2, 128, 128]
+    w13_storage = module.w13_weight_triton_tensor
+    w2_storage = module.w2_weight_triton_tensor
+    assert module.w13_weight_triton_tensor.shape == (2, 32, 256)
+    assert module.w2_weight_triton_tensor.shape == (2, 64, 128)
+    assert module.w13_weight_triton_tensor.stride(-2) == 1
+    assert module.w2_weight_triton_tensor.stride(-2) == 1
     assert module._w2_logical_n == 64
     assert module.w2_weight_triton_tensor.original_n == 64
     assert w2_storage.original_n == 64

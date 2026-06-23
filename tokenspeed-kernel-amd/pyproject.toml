@@ -12,7 +12,6 @@ license = { file = "LICENSE" }
 dependencies = [
     "torch",
     "tokenspeed-triton>=3.7.10.post20260531",
-    "tokenspeed-triton-kernels==1.0.0.post20260510",
 ]
 
 [project.urls]

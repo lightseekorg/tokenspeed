@@ -30,5 +30,9 @@ def _find_imports(module_root: str):
     return violations
 
 
+def test_no_triton_kernels_imports_in_amd_package():
+    assert _find_imports("triton_kernels") == []
+
+
 def test_no_tokenspeed_kernel_imports_in_amd_package():
     assert _find_imports("tokenspeed_kernel") == []
