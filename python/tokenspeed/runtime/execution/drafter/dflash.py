@@ -435,21 +435,21 @@ class DFlash(BaseDrafter):
         )
 
         extend_prefix_lens_cpu = self.draft_extend_prefix_lens_cpu[:bs]
-        extend_prefix_lens_cpu.copy_(prefix_lens.to(dtype=torch.int32))
-
         if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
-            self.attn_backend.init_forward_metadata(
-                bs=bs,
-                num_extends=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens_after,
-                req_to_page=self.req_to_page,
-                forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=self.draft_input_lengths_buf[:bs],
-                extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
-                extend_prefix_lens=prefix_lens,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            )
+            extend_prefix_lens_cpu.copy_(prefix_lens.to(dtype=torch.int32))
+
+        self.attn_backend.init_forward_metadata(
+            bs=bs,
+            num_extends=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens_after,
+            req_to_page=self.req_to_page,
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=self.draft_input_lengths_buf[:bs],
+            extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
+            extend_prefix_lens=prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        )
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,

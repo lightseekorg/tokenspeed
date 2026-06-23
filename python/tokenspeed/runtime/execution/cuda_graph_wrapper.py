@@ -440,6 +440,22 @@ class CudaGraphWrapper:
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
+        from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+        is_dflash = isinstance(self.drafter, DFlash) if self.drafter is not None else False
+        # Choose a large prefix bound for DFlash warmup so that FA4 max_seqlen_k
+        # recorded during capture covers the longest possible runtime prefix.
+        saved_valid_cache_lengths = None
+        if is_dflash and self.runtime_states is not None:
+            graph_prefix_bound = max(
+                int(self.context_len) if self.context_len > 0 else 0,
+                int(self.max_tokens_per_req),
+            )
+            saved_valid_cache_lengths = (
+                self.runtime_states.valid_cache_lengths.clone()
+            )
+            self.runtime_states.valid_cache_lengths.fill_(graph_prefix_bound)
+
         # Warm up before capture.
         for _ in range(4):
             torch.cuda.synchronize()
@@ -501,6 +517,10 @@ class CudaGraphWrapper:
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
+
+        if saved_valid_cache_lengths is not None:
+            self.runtime_states.valid_cache_lengths.copy_(saved_valid_cache_lengths)
+
         return graph, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
@@ -783,6 +803,10 @@ class CudaGraphWrapper:
                         **draft_kwargs,
                     )
             else:
+                from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+                if isinstance(self.drafter, DFlash):
+                    return
                 draft_metadata_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
