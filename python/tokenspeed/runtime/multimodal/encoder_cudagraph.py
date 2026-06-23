@@ -629,9 +629,7 @@ class EncoderCudaGraphWrapper:
                     outputs_by_orig_idx,
                 )
             else:
-                output = self._run_budget_graph(
-                    sub_batch, encoder_output_token_budget
-                )
+                output = self._run_budget_graph(sub_batch, encoder_output_token_budget)
                 # clone: output is the shared, reused output_buffer.
                 self._scatter_output_slices(
                     output,

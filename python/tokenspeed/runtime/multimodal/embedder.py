@@ -492,9 +492,7 @@ class VisionEmbedder:
             it
             for it in items
             if isinstance(it.feature, (torch.Tensor, ShmTensorHandle))
-            and (
-                isinstance(it.feature, ShmTensorHandle) or it.feature.device != device
-            )
+            and (isinstance(it.feature, ShmTensorHandle) or it.feature.device != device)
         ]
         if not pending:
             return

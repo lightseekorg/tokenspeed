@@ -1669,9 +1669,7 @@ class ModelExecutor:
                 copy_event = torch.cuda.Event()
                 copy_event.record()
                 if timing_enabled:
-                    output_d2h_ms = (
-                        time.perf_counter() - output_d2h_start
-                    ) * 1000.0
+                    output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
 
             if timing_enabled and (
                 num_extends > 0 or self.log_step < 64 or self.log_step % 100 == 0

@@ -73,9 +73,9 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     # The vision encoder still consumes the original grid [T, H, W], but the
     # text prompt contains T separate <|video_pad|> runs. Split only the RoPE
     # grid to match HuggingFace's Qwen3.5 get_rope_index behavior.
-    if (
-        video_grid_thw is not None
-        and getattr(hf_config, "model_type", None) in ("qwen3_5", "qwen3_5_moe")
+    if video_grid_thw is not None and getattr(hf_config, "model_type", None) in (
+        "qwen3_5",
+        "qwen3_5_moe",
     ):
         video_grid_thw = torch.repeat_interleave(
             video_grid_thw, video_grid_thw[:, 0].to(torch.long), dim=0
