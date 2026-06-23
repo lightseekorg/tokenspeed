@@ -146,10 +146,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             self.bootstrap_token_cond.notify_all()
 
     def discard_expired_metadata_room(self, room: int) -> None:
-        """Best-effort cleanup of an expired-room marker; safe to call
-        when the room may or may not have ever been added."""
+        """Best-effort cleanup of per-room metadata and expiry markers."""
         with self.bootstrap_token_cond:
             self.expired_prefill_metadata_rooms.discard(room)
+            self.prefill_metadata.pop(room, None)
 
     def _wait_prefill_metadata(
         self,
@@ -181,7 +181,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     )
                     next_log_time = now + wait_log_interval
                 self.bootstrap_token_cond.wait(timeout=0.01)
-            return self.prefill_metadata.pop(room)
+            return self.prefill_metadata[room]
 
     def _is_session_failed(self, mooncake_session_id: str) -> bool:
         if self.failed_session_ttl <= 0:
@@ -711,9 +711,13 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             req.mooncake_session_id,
                         )
                         tm_start = time.monotonic()
+                        prefill_metadata = None
                         dst_kv_ptrs = self.decode_kv_args_table[
                             req.mooncake_session_id
                         ].dst_kv_ptrs
+                        dst_state_data_ptrs = self.decode_kv_args_table[
+                            req.mooncake_session_id
+                        ].dst_state_data_ptrs
                         if kv_chunk.begin_cache_step is None:
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
@@ -731,39 +735,29 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 resolved.dst_indices,
                                 kv_chunk.begin_cache_step,
                                 kv_chunk.layerwise_interval,
-                                self.decode_kv_args_table[
-                                    req.mooncake_session_id
-                                ].dst_state_data_ptrs,
+                                dst_state_data_ptrs,
                                 kv_chunk.prefill_mamba_indices,
                                 req.dst_mamba_indices,
                                 req.transfer_fragments,
                             )
-                        if (
-                            ret == 0
-                            and kv_chunk.is_last
-                            and kv_chunk.begin_cache_step is None
-                        ):
+                        if ret == 0 and kv_chunk.is_last:
                             if kv_chunk.wait_for_bootstrap_token:
-                                # Block until prefill metadata is published, then
-                                # discard the returned tuple — the bootstrap token
-                                # itself is delivered via the status message that
-                                # follows this Mamba send (line ~711). This call
-                                # only exists to serialize "Mamba send" after
-                                # sampling completes.
-                                self._wait_prefill_metadata(
+                                # The first decode/target-verify step consumes prefill's
+                                # sampled bootstrap token and spec candidates; publish
+                                # Success only after that metadata is ready.
+                                prefill_metadata = self._wait_prefill_metadata(
                                     kv_chunk.room,
                                     kv_chunk.bootstrap_token,
                                     kv_chunk.spec_candidate_ids,
                                 )
-                            ret = self.send_mamba_cache(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_mamba_indices,
-                                self.decode_kv_args_table[
-                                    req.mooncake_session_id
-                                ].dst_state_data_ptrs,
-                                req.dst_mamba_indices,
-                                transfer_fragments=req.transfer_fragments,
-                            )
+                            if kv_chunk.begin_cache_step is None:
+                                ret = self.send_mamba_cache(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_mamba_indices,
+                                    dst_state_data_ptrs,
+                                    req.dst_mamba_indices,
+                                    transfer_fragments=req.transfer_fragments,
+                                )
                         logger.debug(
                             "[TRANSFER_WORKER] send_kvcache returned %s for room %s",
                             ret,
@@ -806,18 +800,21 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 self.update_status(req.room, status)
                                 # bootstrap_token is carried directly in the chunk (set by
                                 # DisaggPrefillExecutor._decode after prefill forward).
-                                bootstrap_token, spec_candidate_ids = (
-                                    self._wait_prefill_metadata(
-                                        kv_chunk.room,
+                                if kv_chunk.wait_for_bootstrap_token:
+                                    if prefill_metadata is None:
+                                        prefill_metadata = self._wait_prefill_metadata(
+                                            kv_chunk.room,
+                                            kv_chunk.bootstrap_token,
+                                            kv_chunk.spec_candidate_ids,
+                                        )
+                                    bootstrap_token, spec_candidate_ids = (
+                                        prefill_metadata
+                                    )
+                                else:
+                                    bootstrap_token, spec_candidate_ids = (
                                         kv_chunk.bootstrap_token,
                                         kv_chunk.spec_candidate_ids,
                                     )
-                                    if kv_chunk.wait_for_bootstrap_token
-                                    else (
-                                        kv_chunk.bootstrap_token,
-                                        kv_chunk.spec_candidate_ids,
-                                    )
-                                )
                                 if self.check_status(req.room) == KVPoll.Failed:
                                     status = KVPoll.Failed
                                 for endpoint, dst_port, room in dst_ranks_infos:

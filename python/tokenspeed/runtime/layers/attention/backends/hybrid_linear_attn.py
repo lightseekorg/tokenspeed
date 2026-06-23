@@ -1157,11 +1157,13 @@ class MambaAttnBackend(AttentionBackend):
                     conv_states,
                     self.forward_metadata.track_ssm_final_src,
                     self.forward_metadata.track_ssm_final_dst,
+                    single_layer=True,
                 )
                 fused_mamba_state_copy(
                     ssm_states,
                     self.forward_metadata.track_ssm_final_src,
                     self.forward_metadata.track_ssm_final_dst,
+                    single_layer=True,
                 )
 
         return core_attn_out
