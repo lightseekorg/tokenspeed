@@ -824,9 +824,7 @@ class CudaGraphWrapper:
         if active_bs > 0:
             state_indices[:active_bs].copy_(active_req_pool_indices)
         if active_bs < padded_bs:
-            state_indices[active_bs:padded_bs].fill_(
-                int(self.config.max_req_pool_size)
-            )
+            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
 
     def __call__(
         self,

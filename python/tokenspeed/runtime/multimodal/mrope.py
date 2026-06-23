@@ -69,6 +69,19 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     image_grid_thw = torch.cat(image_grids, dim=0) if image_grids else None
     video_grid_thw = torch.cat(video_grids, dim=0) if video_grids else None
 
+    # Qwen3.5 models compute M-RoPE with one video segment per temporal grid.
+    # The vision encoder still consumes the original grid [T, H, W], but the
+    # text prompt contains T separate <|video_pad|> runs. Split only the RoPE
+    # grid to match HuggingFace's Qwen3.5 get_rope_index behavior.
+    if video_grid_thw is not None and getattr(hf_config, "model_type", None) in (
+        "qwen3_5",
+        "qwen3_5_moe",
+    ):
+        video_grid_thw = torch.repeat_interleave(
+            video_grid_thw, video_grid_thw[:, 0].to(torch.long), dim=0
+        ).clone()
+        video_grid_thw[:, 0] = 1
+
     input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
     mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
         spatial_merge_size=hf_config.vision_config.spatial_merge_size,

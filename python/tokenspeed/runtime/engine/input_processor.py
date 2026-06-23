@@ -149,6 +149,7 @@ class InputProcessor:
                     "precomputed_multimodal_inputs is provided for a text-only model."
                 )
             multimodal_inputs = obj.precomputed_multimodal_inputs
+            multimodal_inputs.ensure_pad_values()
             # MRoPE-aware models (Qwen2/3-VL, …) require 3-axis position_ids
             # derived from image_grid_thw + the image_token_id placeholders in
             # input_ids. SMG ships precomputed mm inputs with mrope_* unset; if
@@ -168,6 +169,10 @@ class InputProcessor:
                 )
                 multimodal_inputs.mrope_positions = mrope_positions
                 multimodal_inputs.mrope_position_delta = mrope_position_delta
+                if mrope_position_delta is not None:
+                    multimodal_inputs.mrope_position_delta_scalar = int(
+                        mrope_position_delta.flatten()[0].item()
+                    )
             if input_ids is not None:
                 input_ids_unpadded = list(input_ids)
                 input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
