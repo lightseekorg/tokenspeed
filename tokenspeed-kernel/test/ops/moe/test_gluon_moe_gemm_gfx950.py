@@ -508,6 +508,45 @@ def _make_precomputed_topk(
     return topk_weights.contiguous(), topk_ids.to(torch.int32).contiguous()
 
 
+def _deepseek_v4_backend_routing_config() -> dict[str, object]:
+    return {
+        "kernel_feature": "backend_routing:deepseek_v4",
+        "routing_method_type": 1,
+        "top_k": TOPK,
+        "renormalize": True,
+        "score_function": "sqrtsoftplus",
+        "choice_score_function": "sqrtsoftplus",
+        "group_score_function": "none",
+        "num_expert_group": 1,
+        "topk_group": 1,
+        "routed_scaling_factor": 1.0,
+        "applies_routed_scaling": False,
+        "correction_bias": None,
+        "correction_bias_for_choice_only": False,
+        "supports_hash_indices": False,
+        "logical_to_physical_mapping": False,
+        "topk_indices_dtype": torch.int32,
+    }
+
+
+def _dynamic_mxfp4_moe_plan(
+    solution: str,
+    *,
+    routing_config: dict[str, object] | None = None,
+) -> dict:
+    return tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=1,
+        ispp=INTERMEDIATE_SIZE,
+        internal_activation_dtype="input",
+        with_bias=False,
+        solution=solution,
+        routing_config=routing_config,
+    )
+
+
 def _swiglu_activation() -> FusedActivation:
     return FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
@@ -732,26 +771,8 @@ def test_gluon_dynamic_mxfp4_moe_apply_matches_triton_gfx950(
     raw = _make_raw_mxfp4_weights()
     triton_weights = _make_dynamic_weight_module(raw)
     gluon_weights = _make_dynamic_weight_module(raw)
-    triton_plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="swiglu",
-        ep_size=1,
-        ispp=INTERMEDIATE_SIZE,
-        internal_activation_dtype="input",
-        with_bias=False,
-        solution="triton",
-    )
-    gluon_plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="swiglu",
-        ep_size=1,
-        ispp=INTERMEDIATE_SIZE,
-        internal_activation_dtype="input",
-        with_bias=False,
-        solution="gluon",
-    )
+    triton_plan = _dynamic_mxfp4_moe_plan("triton")
+    gluon_plan = _dynamic_mxfp4_moe_plan("gluon")
     tokenspeed_kernel.moe_process_weights(triton_plan, triton_weights)
     tokenspeed_kernel.moe_process_weights(gluon_plan, gluon_weights)
 
@@ -775,6 +796,48 @@ def test_gluon_dynamic_mxfp4_moe_apply_matches_triton_gfx950(
             router_logits,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            num_tokens_global=num_tokens,
+            max_num_tokens_per_gpu=num_tokens,
+        )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
+        atol=APPLY_ATOL,
+        rtol=RTOL,
+    )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("num_tokens", [4, 64])
+def test_gluon_dynamic_mxfp4_backend_routing_matches_triton_gfx950(
+    num_tokens: int,
+) -> None:
+    raw = _make_raw_mxfp4_weights()
+    triton_weights = _make_dynamic_weight_module(raw)
+    gluon_weights = _make_dynamic_weight_module(raw)
+    routing_config = _deepseek_v4_backend_routing_config()
+    triton_plan = _dynamic_mxfp4_moe_plan("triton", routing_config=routing_config)
+    gluon_plan = _dynamic_mxfp4_moe_plan("gluon", routing_config=routing_config)
+    tokenspeed_kernel.moe_process_weights(triton_plan, triton_weights)
+    tokenspeed_kernel.moe_process_weights(gluon_plan, gluon_weights)
+
+    hidden_states, router_logits = _make_hidden_and_router(num_tokens)
+    with torch.no_grad():
+        expected = tokenspeed_kernel.moe_apply(
+            triton_plan,
+            hidden_states,
+            triton_weights,
+            router_logits,
+            num_tokens_global=num_tokens,
+            max_num_tokens_per_gpu=num_tokens,
+        )
+        actual = tokenspeed_kernel.moe_apply(
+            gluon_plan,
+            hidden_states,
+            gluon_weights,
+            router_logits,
             num_tokens_global=num_tokens,
             max_num_tokens_per_gpu=num_tokens,
         )
