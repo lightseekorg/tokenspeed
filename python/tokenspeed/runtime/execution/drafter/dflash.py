@@ -484,8 +484,6 @@ class DFlash(BaseDrafter):
         )
 
         extend_prefix_lens_cpu = self.draft_extend_prefix_lens_cpu[:bs]
-        extend_prefix_lens_cpu.copy_(prefix_lens.to(dtype=torch.int32))
-
         if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             self.attn_backend.init_forward_metadata(
                 bs=bs,
