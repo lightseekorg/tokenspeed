@@ -443,14 +443,24 @@ class ModelExecutor:
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
         if config.model_is_mrope:
             mrope_decode_capacity = self.input_buffers.max_num_tokens
-            self._mrope_decode_deltas_cpu = self._make_mrope_decode_deltas_cpu(
-                mrope_decode_capacity
-            )
+            # Double-buffered pinned host staging for the decode delta copy.
+            # Under overlap scheduling the next decode forward is dispatched
+            # before the previous result is synchronized, so a single reused
+            # pinned buffer could be refilled by the next step while the prior
+            # step's ``non_blocking=True`` H2D copy is still reading it (a race
+            # that corrupts M-RoPE deltas). Ping-pong two buffers so a buffer is
+            # never overwritten while its copy is in flight (overlap depth 1).
+            self._mrope_decode_deltas_cpu = [
+                self._make_mrope_decode_deltas_cpu(mrope_decode_capacity),
+                self._make_mrope_decode_deltas_cpu(mrope_decode_capacity),
+            ]
+            self._mrope_decode_deltas_cpu_idx = 0
             self._mrope_decode_deltas_buf = torch.zeros(
                 mrope_decode_capacity, device=self.device, dtype=torch.int64
             )
         else:
             self._mrope_decode_deltas_cpu = None
+            self._mrope_decode_deltas_cpu_idx = 0
             self._mrope_decode_deltas_buf = None
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
@@ -1763,7 +1773,11 @@ class ModelExecutor:
             )
 
         base_positions = self.input_buffers.positions_buf[:total_tokens]
-        token_deltas_cpu = self._mrope_decode_deltas_cpu[:total_tokens]
+        # Ping-pong the pinned host staging buffer (see __init__): the previous
+        # step's non_blocking H2D copy may still be reading the other buffer.
+        cpu_staging = self._mrope_decode_deltas_cpu[self._mrope_decode_deltas_cpu_idx]
+        self._mrope_decode_deltas_cpu_idx ^= 1
+        token_deltas_cpu = cpu_staging[:total_tokens]
 
         offset = 0
         has_nonzero_delta = False
@@ -1774,7 +1788,12 @@ class ModelExecutor:
 
             delta = 0
             mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
-            if mm_input is not None and mm_input.mrope_position_delta is not None:
+            # Honor scalar-only deltas: an upstream payload may set
+            # mrope_position_delta_scalar while leaving the tensor field
+            # mrope_position_delta as None (positions precomputed upstream).
+            # _mrope_delta_scalar handles scalar, tensor, and the absent case
+            # (returns 0), so call it whenever an mm_input is present.
+            if mm_input is not None:
                 delta = self._mrope_delta_scalar(mm_input)
                 has_nonzero_delta = has_nonzero_delta or delta != 0
 
