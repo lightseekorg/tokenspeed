@@ -1457,3 +1457,37 @@ class TestGemmDispatchProfiling:
                 },
             )
         ]
+
+    @pytest.mark.parametrize(
+        ("m", "n", "expected_shape"),
+        [
+            (0, 6, (0, 6)),
+            (4, 0, (4, 0)),
+        ],
+    )
+    def test_mm_returns_empty_output_without_kernel_for_zero_extent(
+        self,
+        monkeypatch,
+        m: int,
+        n: int,
+        expected_shape: tuple[int, int],
+    ):
+        def fail_select_kernel(*args, **kwargs):
+            _ = args, kwargs
+            raise AssertionError("empty GEMM should not select a backend kernel")
+
+        monkeypatch.setattr(gemm, "select_kernel", fail_select_kernel)
+
+        scope = self._ScopeRecorder()
+        monkeypatch.setattr(gemm, "kernel_scope", scope)
+
+        A = torch.empty((m, 8), dtype=torch.float16)
+        B = torch.empty((n, 8), dtype=torch.float16)
+
+        out = gemm.mm(A, B, out_dtype=torch.float32)
+
+        assert out.shape == expected_shape
+        assert out.dtype is torch.float32
+        assert out.device == A.device
+        assert scope.calls == []
+        assert scope.trace == []

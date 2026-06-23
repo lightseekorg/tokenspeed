@@ -250,6 +250,8 @@ def mm(
     scales, or can be set explicitly via ``quant``.  When ``A_scales``
     is ``None`` for a quantized mode (e.g. ``quant="mxfp8"``), online
     activation quantization is performed here before calling the kernel.
+    Empty outputs (zero ``M`` or ``N``) return an empty tensor directly
+    without launching a backend kernel.
 
     Args:
         A: Activation matrix ``[M, K]``.
@@ -288,6 +290,9 @@ def mm(
         "n_align_128": N % 128 == 0,
         "k_align_128": K % 128 == 0,
     }
+
+    if M == 0 or N == 0:
+        return A.new_empty((M, N), dtype=out_dtype)
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
