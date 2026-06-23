@@ -44,7 +44,7 @@ semantics used by SGLang. For DSA MTP, the first draft step computes NextN's own
 indexer top-k and only reuses the gathered draft-produced top-k rows across
 later MTP iterations; the draft MoE path is also excluded from
 expert-distribution recording. The GLM DSA decode top-k schedule cache is
-refreshed when MTP verify and draft paths use different per-request query widths.
+refreshed against the current MTP query width and visible lengths.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \

@@ -497,7 +497,7 @@ def test_glm_dsa_decode_seq_lens_distinguish_full_window_and_catchup():
     ]
 
 
-def test_glm_dsa_decode_topk_schedule_rebuilds_when_q_len_changes(monkeypatch):
+def test_glm_dsa_decode_topk_schedule_refreshes_for_current_layout(monkeypatch):
     schedule_calls = []
 
     class FakeDeepGemm:
@@ -646,8 +646,26 @@ def test_glm_dsa_decode_topk_schedule_rebuilds_when_q_len_changes(monkeypatch):
         num_decode_tokens=2,
         topk=512,
     )
+    cached_schedule = metadata._dsa_paged_mqa_schedule_metadata
 
-    assert [call["shape"] for call in schedule_calls] == [(2, 2), (2, 1)]
+    metadata.seq_lens_k.copy_(torch.tensor([70, 72], dtype=torch.int32))
+    attn._compute_decode_topk_indices_deepgemm(
+        indexer_output=second_output,
+        ctx=ctx,
+        seq_lens_per_token=torch.tensor([70, 72], dtype=torch.int32),
+        block_tables=metadata.block_kv_indices,
+        block_tables_per_token=metadata.block_kv_indices,
+        q_len_per_req=1,
+        decode_start=0,
+        num_tokens=2,
+        num_decode_tokens=2,
+        topk=512,
+    )
+
+    assert [call["shape"] for call in schedule_calls] == [(2, 2), (2, 1), (2, 1)]
+    assert schedule_calls[-1]["seq_lens"].tolist() == [[70], [72]]
+    assert metadata._dsa_paged_mqa_schedule_metadata is cached_schedule
+    assert metadata._dsa_paged_mqa_schedule_metadata.tolist() == [3]
     assert metadata._dsa_paged_mqa_schedule_q_len == 1
     assert metadata._dsa_paged_mqa_schedule_shape == (2, 1)
 

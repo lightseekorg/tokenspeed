@@ -1108,32 +1108,41 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             if decode_metadata is None
             else getattr(decode_metadata, "_dsa_paged_mqa_schedule_shape", None)
         )
-        if (
+        need_new_schedule = (
             schedule_metadata is None
             or schedule_q_len != q_len_per_req
             or schedule_cached_shape != schedule_shape
+        )
+        refreshed_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            seq_lens_2d,
+            page_size,
+            deep_gemm.get_num_sms(),
+        )
+        if not need_new_schedule and (
+            schedule_metadata.shape == refreshed_schedule.shape
+            and schedule_metadata.device == refreshed_schedule.device
+            and schedule_metadata.dtype == refreshed_schedule.dtype
         ):
-            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                seq_lens_2d,
-                page_size,
-                deep_gemm.get_num_sms(),
+            with torch.inference_mode():
+                schedule_metadata.copy_(refreshed_schedule)
+        else:
+            schedule_metadata = refreshed_schedule
+        if decode_metadata is not None:
+            setattr(
+                decode_metadata,
+                "_dsa_paged_mqa_schedule_metadata",
+                schedule_metadata,
             )
-            if decode_metadata is not None:
-                setattr(
-                    decode_metadata,
-                    "_dsa_paged_mqa_schedule_metadata",
-                    schedule_metadata,
-                )
-                setattr(
-                    decode_metadata,
-                    "_dsa_paged_mqa_schedule_q_len",
-                    q_len_per_req,
-                )
-                setattr(
-                    decode_metadata,
-                    "_dsa_paged_mqa_schedule_shape",
-                    schedule_shape,
-                )
+            setattr(
+                decode_metadata,
+                "_dsa_paged_mqa_schedule_q_len",
+                q_len_per_req,
+            )
+            setattr(
+                decode_metadata,
+                "_dsa_paged_mqa_schedule_shape",
+                schedule_shape,
+            )
         index_k_with_scale_cache = ctx.token_to_kv_pool.get_index_k_with_scale_buffer(
             self.attn_mqa.layer_id
         )
