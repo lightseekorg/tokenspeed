@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 
 import torch
 from torch import nn
@@ -69,6 +70,35 @@ _STACKED_PARAMS_MAPPING = (
 )
 
 
+class GlmMoeDsaDraftDecoderLayer(GlmMoeDsaDecoderLayer):
+    def _apply_correction(self, ctx: ForwardContext) -> None:
+        seq_lens_buf = ctx.draft_seq_lens_buf
+        if seq_lens_buf is None or ctx.accept_lengths is None:
+            return
+        num_extends = ctx.num_extends
+        if num_extends >= ctx.bs:
+            return
+        correction = (
+            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
+        ).to(seq_lens_buf.dtype)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+
+        advance = getattr(ctx.attn_backend, "advance_draft_forward_metadata", None)
+        if advance is not None:
+            advance(seq_lens_buf[: ctx.bs])
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        self._apply_correction(ctx)
+        return super().forward(positions, hidden_states, ctx, out_cache_loc, residual)
+
+
 class GlmMoeDsaModelNextN(nn.Module):
     def __init__(
         self,
@@ -94,7 +124,7 @@ class GlmMoeDsaModelNextN(nn.Module):
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         self.alt_stream = torch.cuda.Stream()
-        self.decoder = GlmMoeDsaDecoderLayer(
+        self.decoder = GlmMoeDsaDraftDecoderLayer(
             config,
             0,
             mapping=self.mapping,
@@ -215,6 +245,45 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             tp_group=self.mapping.attn.tp_group,
         )
 
+    def _narrow_decode_first_step(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        captured_hidden_states: torch.Tensor | None,
+    ) -> tuple[
+        ForwardContext,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        if (
+            ctx.accept_lengths is None
+            or not ctx.draft_first_step_reduce
+            or ctx.gather_ids is None
+            or ctx.num_extends != 0
+        ):
+            return ctx, input_ids, positions, out_cache_loc, captured_hidden_states
+
+        self.model.decoder._apply_correction(ctx)
+        gather_ids = ctx.gather_ids
+        narrowed_ctx = replace(
+            ctx,
+            input_num_tokens=ctx.bs,
+            global_num_tokens=ctx.global_bs,
+            draft_first_step_reduce=False,
+            gather_ids=None,
+            accept_lengths=None,
+        )
+        input_ids = input_ids.index_select(0, gather_ids)
+        positions = positions.index_select(0, gather_ids)
+        out_cache_loc = out_cache_loc.index_select(0, gather_ids)
+        if captured_hidden_states is not None:
+            captured_hidden_states = captured_hidden_states.index_select(0, gather_ids)
+        return narrowed_ctx, input_ids, positions, out_cache_loc, captured_hidden_states
+
     @torch.no_grad()
     def forward(
         self,
@@ -224,14 +293,22 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        model_ctx, input_ids, positions, out_cache_loc, captured_hidden_states = (
+            self._narrow_decode_first_step(
+                ctx, input_ids, positions, out_cache_loc, captured_hidden_states
+            )
+        )
         hidden_states, _ = self.model(
             input_ids,
             positions,
-            ctx,
+            model_ctx,
             out_cache_loc,
             captured_hidden_states=captured_hidden_states,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        if model_ctx is not ctx:
+            ctx.dsa_prefill_topk = model_ctx.dsa_prefill_topk
+            ctx.dsa_decode_topk = model_ctx.dsa_decode_topk
+        logits_metadata = LogitsMetadata.from_forward_context(model_ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

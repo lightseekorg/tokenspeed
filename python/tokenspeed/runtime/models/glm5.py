@@ -1481,25 +1481,34 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             decode_start,
             decode_end,
         )
-        should_compute_indexer = not self.skip_indexer_topk or (
+        nextn_needs_topk = self.is_nextn and (
+            (num_prefill_tokens > 0 and carried_prefill_topk is None)
+            or (num_decode_tokens > 0 and not carried_decode_topk_covers_window)
+        )
+        should_compute_indexer = not self.skip_indexer_topk or nextn_needs_topk
+        should_write_reused_index_k = (
             self.is_nextn
+            and self.skip_indexer_topk
+            and not should_compute_indexer
             and (
-                (num_prefill_tokens > 0 and carried_prefill_topk is None)
-                or (num_decode_tokens > 0 and not carried_decode_topk_covers_window)
+                (num_prefill_tokens > 0 and carried_prefill_topk is not None)
+                or (num_decode_tokens > 0 and carried_decode_topk_covers_window)
             )
         )
 
         indexer_output = None
         full_context_decode_topk = None
-        if should_compute_indexer:
+        if should_compute_indexer or should_write_reused_index_k:
             full_context_decode_topk = (
                 self._try_compute_decode_full_context_topk_indices(
                     ctx,
                     num_tokens=hidden_states.shape[0],
                     device=hidden_states.device,
                 )
+                if should_compute_indexer
+                else None
             )
-            key_only_indexer = (
+            key_only_indexer = should_write_reused_index_k or (
                 full_context_decode_topk is not None
                 and _glm_dsa_is_pure_decode_token_mode(ctx.forward_mode)
                 and ctx.num_extends == 0

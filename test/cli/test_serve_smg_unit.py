@@ -39,6 +39,9 @@ from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
+    DEFAULT_REASONING_PARSER,
+    GLM_REASONING_PARSER,
+    GLM_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
@@ -328,6 +331,31 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert gateway_args.count("--reasoning-parser") == 1
     idx = gateway_args.index("--reasoning-parser")
     assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
+
+
+def test_glm_dsa_parser_defaults_do_not_disable_kvstore():
+    model = "zai-org/GLM-5.2-FP8"
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        GLM_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        GLM_REASONING_PARSER,
+        "--tool-call-parser",
+        GLM_TOOL_CALL_PARSER,
+    ]
+    assert "--disable-kvstore" not in engine_args
 
 
 def test_local_deepseek_v4_config_is_detected(tmp_path):

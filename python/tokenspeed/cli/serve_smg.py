@@ -296,8 +296,6 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
-        if "--disable-kvstore" not in engine_result:
-            engine_result.append("--disable-kvstore")
         return engine_result, gateway_result
 
     engine_result = list(engine_args)

@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
@@ -45,6 +46,11 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 logger = get_colorful_logger(__name__)
 
 DsaTopKState = tuple[Any | None, Any | None]
+_DRAFT_FIRST_STEP_REDUCE_MODELS = (
+    GlmMoeDsaForCausalLMNextN,
+    LlamaForCausalLMEagle3,
+    Qwen3_5ForConditionalGenerationNextN,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -61,6 +67,13 @@ def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None
         advance(seq_lens)
 
 
+def should_reduce_draft_first_step(model: Any, forward_mode: ForwardMode) -> bool:
+    return forward_mode.is_decode() or (
+        isinstance(model, _DRAFT_FIRST_STEP_REDUCE_MODELS)
+        and not forward_mode.is_idle()
+    )
+
+
 @dataclass
 class EagleDraftInput:
     input_num_tokens: int
@@ -72,6 +85,7 @@ class EagleDraftInput:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    dsa_topk: DsaTopKState = (None, None)
 
 
 class Eagle(BaseDrafter):
@@ -171,6 +185,27 @@ class Eagle(BaseDrafter):
             return dsa_topk
         return ctx.dsa_prefill_topk, ctx.dsa_decode_topk
 
+    def _select_dsa_decode_topk(
+        self,
+        dsa_topk: DsaTopKState,
+        gather_ids: torch.Tensor,
+    ) -> DsaTopKState:
+        prefill_topk, decode_topk = dsa_topk
+        if not self._dsa_reuse_mtp_topk or decode_topk is None:
+            return dsa_topk
+        topk_indices = getattr(decode_topk, "topk_indices", None)
+        topk_lens = getattr(decode_topk, "topk_lens", None)
+        if topk_indices is None or topk_lens is None:
+            return dsa_topk
+        if topk_indices.shape[0] <= gather_ids.numel():
+            return dsa_topk
+        selected_decode_topk = replace(
+            decode_topk,
+            topk_indices=topk_indices.index_select(0, gather_ids),
+            topk_lens=topk_lens.index_select(0, gather_ids),
+        )
+        return prefill_topk, selected_decode_topk
+
     def _map_hot(self, ids: torch.Tensor) -> torch.Tensor:
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
         return self.hot_token_ids[ids] if self.hot_token_ids is not None else ids
@@ -243,15 +278,14 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        # Llama Eagle3 and Qwen3.5 NextN narrow for any non-idle catch-up
-        # (EXTEND/MIXED/TARGET_VERIFY/DECODE); DeepSeek keeps is_decode() only.
-        draft_first_step_reduce = forward_mode.is_decode() or (
-            isinstance(
-                self.draft_model_runner.model,
-                (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
-            )
-            and not forward_mode.is_idle()
+        draft_first_step_reduce = should_reduce_draft_first_step(
+            self.draft_model_runner.model,
+            forward_mode,
         )
+        input_num_tokens = draft_input.input_num_tokens
+        positions = buffers.positions_buf[:input_num_tokens]
+        out_cache_loc = buffers.out_cache_loc_buf[:input_num_tokens]
+        captured_hidden_states = draft_input.base_out_hidden_states
 
         draft_first_mode = (
             ForwardMode.DRAFT_EXTEND
@@ -265,7 +299,7 @@ class Eagle(BaseDrafter):
             req_to_page=self.req_to_page,
             bs=bs,
             num_extends=draft_input.num_extends,
-            input_num_tokens=draft_input.input_num_tokens,
+            input_num_tokens=input_num_tokens,
             forward_mode=draft_first_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=gather_ids,
@@ -276,16 +310,22 @@ class Eagle(BaseDrafter):
             draft_seq_lens_buf=self.draft_seq_lens_buf,
             accept_lengths=draft_input.accept_lengths,
         )
+        dsa_topk = draft_input.dsa_topk
+        if draft_input.num_extends == 0:
+            dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
+        else:
+            dsa_topk = (None, None)
+        self._attach_dsa_topk(ctx, dsa_topk)
 
         logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
-            positions=buffers.positions_buf[: draft_input.input_num_tokens],
-            out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
-            captured_hidden_states=draft_input.base_out_hidden_states,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+            captured_hidden_states=captured_hidden_states,
             spec_step_idx=0,
         )
-        dsa_topk = self._extract_dsa_topk(ctx, (None, None))
+        dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
         return logits_output, dsa_topk
 
     @nvtx_range("draft_multi_step", color="purple")
@@ -356,9 +396,9 @@ class Eagle(BaseDrafter):
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
             )
-            self._attach_dsa_topk(ctx, dsa_topk)
 
             out_cache_loc = cache_locs[:, i - 1].contiguous()
+            self._attach_dsa_topk(ctx, dsa_topk)
             # Keep attention metadata on the accepted prefix; rejected verify
             # tail slots may still contain stale draft KV.
             _advance_draft_forward_metadata_if_supported(
@@ -502,6 +542,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=base_ctx.global_num_tokens,
             global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
+            dsa_topk=(base_ctx.dsa_prefill_topk, base_ctx.dsa_decode_topk),
         )
 
         # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.

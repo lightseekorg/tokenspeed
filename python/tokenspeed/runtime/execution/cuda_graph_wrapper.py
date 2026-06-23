@@ -667,10 +667,12 @@ class CudaGraphWrapper:
             )
             if draft_uses_paged_groups and draft_forward_mode.is_speculative():
                 draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
+            draft_seq_lens.copy_(seq_lens[:padded_bs])
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
                 req_pool_indices,
-                seq_lens,
+                draft_seq_lens,
                 req_to_page=self.drafter.req_to_page,
                 forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,
@@ -805,15 +807,18 @@ class CudaGraphWrapper:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
-    @staticmethod
     def _pad_graph_req_pool_indices(
-        active_req_pool_indices: torch.Tensor, padded_bs: int
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
     ) -> torch.Tensor:
         pad = padded_bs - active_req_pool_indices.shape[0]
         if pad <= 0:
             return active_req_pool_indices
+        dummy_req_pool_index = int(self.config.max_req_pool_size)
         return torch.cat(
-            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+            [
+                active_req_pool_indices,
+                active_req_pool_indices.new_full((pad,), dummy_req_pool_index),
+            ]
         )
 
     def _set_graph_state_write_indices(

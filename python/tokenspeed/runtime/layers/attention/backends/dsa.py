@@ -343,6 +343,16 @@ class DSABackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self._dense_backend.get_cuda_graph_seq_len_fill_value()
 
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
+        metadata = self.forward_decode_metadata
+        if metadata is None or metadata.seq_lens_k is None:
+            raise RuntimeError("DSA draft decode metadata was not initialized")
+        if seq_lens is None:
+            metadata.seq_lens_k.add_(1)
+        else:
+            metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
+        self._refresh_decode_topk_schedule_metadata(metadata.seq_lens_k.numel())
+
     def init_forward_metadata(
         self,
         bs: int,
@@ -355,7 +365,7 @@ class DSABackend(AttentionBackend):
         **kwargs,
     ):
         dense_forward_mode = (
-            ForwardMode.DECODE if forward_mode.is_target_verify() else forward_mode
+            ForwardMode.DECODE if forward_mode.is_speculative() else forward_mode
         )
         out = self._dense_backend.init_forward_metadata(
             bs=bs,
