@@ -20,6 +20,7 @@ from tokenspeed.runtime.models import glm5 as glm5_module
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.models.glm5 import (
     GlmDsaDecodeTopK,
+    GlmDsaPrefillTopK,
     GlmMoeDsaAttention,
     GlmMoeDsaDecoderLayer,
 )
@@ -826,10 +827,33 @@ def test_eagle_glm_mixed_first_step_selects_draft_dsa_decode_topk_rows():
     eagle.draft_seq_lens_buf = torch.zeros((3,), dtype=torch.int32)
     draft_model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
     seen = {}
-    draft_decode_topk = GlmDsaDecodeTopK(
-        topk_indices=(1000 + torch.arange(16 * 3, dtype=torch.int32)).view(16, 3),
-        topk_lens=100 + torch.arange(16, dtype=torch.int32),
+    draft_prefill_topk = GlmDsaPrefillTopK(
+        workspace_indices=torch.tensor(
+            [
+                [0, 1, 2],
+                [3, 4, 5],
+                [6, 7, 8],
+                [9, 10, -1],
+            ],
+            dtype=torch.int32,
+        ),
+        topk_lens=torch.tensor([200, 201, 202, 203], dtype=torch.int32),
+        block_tables=torch.empty((1, 1), dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        max_seq_len=4,
+        kv_workspace_slots=torch.tensor(
+            [500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510],
+            dtype=torch.int32,
+        ),
     )
+    draft_decode_topk = GlmDsaDecodeTopK(
+        topk_indices=torch.full((16, 3), -12345, dtype=torch.int32),
+        topk_lens=torch.full((16,), -1, dtype=torch.int32),
+    )
+    draft_decode_topk.topk_indices[4:] = (
+        1000 + torch.arange(12 * 3, dtype=torch.int32)
+    ).view(12, 3)
+    draft_decode_topk.topk_lens[4:] = 100 + torch.arange(12, dtype=torch.int32)
 
     class Runner:
         model = draft_model
@@ -837,6 +861,7 @@ def test_eagle_glm_mixed_first_step_selects_draft_dsa_decode_topk_rows():
         def forward(self, **kwargs):
             seen.update(kwargs)
             seen["initial_ctx_dsa_decode_topk"] = kwargs["ctx"].dsa_decode_topk
+            kwargs["ctx"].dsa_prefill_topk = draft_prefill_topk
             kwargs["ctx"].dsa_decode_topk = draft_decode_topk
             return SimpleNamespace(
                 hidden_states=torch.empty((3, 4)),
@@ -868,9 +893,9 @@ def test_eagle_glm_mixed_first_step_selects_draft_dsa_decode_topk_rows():
     selected = dsa_topk[1]
     assert selected is not draft_decode_topk
     assert selected is not full_decode_topk
-    assert selected.topk_lens.tolist() == [103, 104, 113]
+    assert selected.topk_lens.tolist() == [203, 100, 109]
     assert selected.topk_indices.tolist() == [
-        draft_decode_topk.topk_indices[3].tolist(),
+        [509, 510, -1],
         draft_decode_topk.topk_indices[4].tolist(),
         draft_decode_topk.topk_indices[13].tolist(),
     ]

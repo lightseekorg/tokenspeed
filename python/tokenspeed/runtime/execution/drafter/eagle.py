@@ -36,6 +36,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.layers.attention.backends.dsa import (
+    _workspace_indices_to_kv_slots,
+)
 from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
@@ -194,6 +197,8 @@ class Eagle(BaseDrafter):
         self,
         dsa_topk: DsaTopKState,
         gather_ids: torch.Tensor,
+        *,
+        decode_start: int = 0,
     ) -> DsaTopKState:
         prefill_topk, decode_topk = dsa_topk
         if not self._dsa_reuse_mtp_topk or decode_topk is None:
@@ -202,12 +207,51 @@ class Eagle(BaseDrafter):
         topk_lens = getattr(decode_topk, "topk_lens", None)
         if topk_indices is None or topk_lens is None:
             return dsa_topk
-        if topk_indices.shape[0] <= gather_ids.numel():
+        if topk_indices.shape[0] == 0:
             return dsa_topk
+        if decode_start <= 0 and topk_indices.shape[0] <= gather_ids.numel():
+            return dsa_topk
+        if decode_start <= 0:
+            selected_indices = topk_indices.index_select(0, gather_ids)
+            selected_lens = topk_lens.index_select(0, gather_ids)
+        else:
+            if prefill_topk is None:
+                return dsa_topk
+            prefill_indices = getattr(prefill_topk, "workspace_indices", None)
+            prefill_lens = getattr(prefill_topk, "topk_lens", None)
+            kv_workspace_slots = getattr(prefill_topk, "kv_workspace_slots", None)
+            if prefill_indices is None or prefill_lens is None:
+                return dsa_topk
+            prefill_row_ids = gather_ids.clamp_max(decode_start - 1)
+            decode_row_ids = gather_ids.clamp(
+                min=decode_start,
+                max=topk_indices.shape[0] - 1,
+            )
+            selected_prefill_indices = _workspace_indices_to_kv_slots(
+                prefill_indices.index_select(0, prefill_row_ids),
+                kv_workspace_slots,
+            ).to(device=topk_indices.device, dtype=topk_indices.dtype)
+            selected_prefill_lens = prefill_lens.index_select(0, prefill_row_ids).to(
+                device=topk_lens.device,
+                dtype=topk_lens.dtype,
+            )
+            selected_decode_indices = topk_indices.index_select(0, decode_row_ids)
+            selected_decode_lens = topk_lens.index_select(0, decode_row_ids)
+            is_prefill_row = gather_ids < decode_start
+            selected_indices = torch.where(
+                is_prefill_row.view(-1, 1),
+                selected_prefill_indices,
+                selected_decode_indices,
+            )
+            selected_lens = torch.where(
+                is_prefill_row,
+                selected_prefill_lens,
+                selected_decode_lens,
+            )
         selected_decode_topk = replace(
             decode_topk,
-            topk_indices=topk_indices.index_select(0, gather_ids),
-            topk_lens=topk_lens.index_select(0, gather_ids),
+            topk_indices=selected_indices,
+            topk_lens=selected_lens,
         )
         return prefill_topk, selected_decode_topk
 
@@ -316,6 +360,11 @@ class Eagle(BaseDrafter):
             accept_lengths=draft_input.accept_lengths,
         )
         dsa_topk = draft_input.dsa_topk
+        first_step_decode_start = 0
+        if draft_input.num_extends > 0:
+            first_step_decode_start = input_num_tokens - (
+                (bs - draft_input.num_extends) * self.spec_num_tokens
+            )
         select_dsa_topk_for_next_step = False
         compute_dsa_topk_first_step = should_compute_dsa_topk_for_draft_first_step(
             self.draft_model_runner.model
@@ -342,7 +391,11 @@ class Eagle(BaseDrafter):
         )
         dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
         if select_dsa_topk_for_next_step:
-            dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
+            dsa_topk = self._select_dsa_decode_topk(
+                dsa_topk,
+                gather_ids,
+                decode_start=first_step_decode_start,
+            )
         return logits_output, dsa_topk
 
     @nvtx_range("draft_multi_step", color="purple")
