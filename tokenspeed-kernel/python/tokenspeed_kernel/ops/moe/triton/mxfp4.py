@@ -45,7 +45,9 @@ with redirect_triton_to_tokenspeed_triton():
 
 import triton_kernels.matmul_details.opt_flags as opt_flags
 from triton_kernels.matmul import (
+    Epilogue,
     FlexCtx,
+    FnName,
     FnSpecs,
     FusedActivation,
     PrecisionConfig,
@@ -66,6 +68,7 @@ from triton_kernels.topk import topk
 
 # isort: off
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.thirdparty.triton import (
     deepseek_v4_softplus_topk,
     moe_routing_from_topk_medium_m,
@@ -76,6 +79,82 @@ platform = current_platform()
 
 MXFP4_BLOCK = 32
 MXFP4_ACTIVATION_SCALE_LAYOUT = "linear"
+
+
+@triton.jit(repr=lambda _: "_quantize_mxfp4_tokenspeed")
+def _quantize_mxfp4_tokenspeed_fn(input, mask, pid=None):
+    max_normal: tl.constexpr = 6
+    min_normal: tl.constexpr = 1
+    block_m: tl.constexpr = input.shape[0]
+    block_n: tl.constexpr = input.shape[1]
+    num_quant_blocks: tl.constexpr = block_n // 32
+
+    x = input.to(tl.bfloat16).to(tl.float32)
+    x = tl.where(mask, x, 0.0)
+    x = x.reshape(block_m, num_quant_blocks, 32)
+    amax = tl.max(tl.abs(x), axis=2)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+    scale_byte = scale_e8m0_unbiased.to(tl.uint8) + 127
+
+    qx = x * tl.exp2(-scale_e8m0_unbiased[:, :, None])
+    qx = qx.to(tl.uint32, bitcast=True)
+
+    sign = qx & 0x80000000
+    qx = qx ^ sign
+    qx_fp32 = qx.to(tl.float32, bitcast=True)
+    saturate_mask = qx_fp32 >= max_normal
+    denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
+    normal_mask = not (saturate_mask | denormal_mask)
+
+    denorm_exp: tl.constexpr = (127 - 1) + (23 - 1) + 1
+    denorm_mask_int: tl.constexpr = denorm_exp << 23
+    denorm_mask_float: tl.constexpr = tl.cast(
+        denorm_mask_int,
+        tl.float32,
+        bitcast=True,
+    )
+    denormal_x = qx_fp32 + denorm_mask_float
+    denormal_x = denormal_x.to(tl.uint32, bitcast=True)
+    denormal_x -= denorm_mask_int
+    denormal_x = denormal_x.to(tl.uint8)
+
+    normal_x = qx
+    mant_odd = (normal_x >> (23 - 1)) & 1
+    normal_x += 0xC11FFFFF
+    normal_x += mant_odd
+    normal_x = normal_x >> (23 - 1)
+    normal_x = normal_x.to(tl.uint8)
+
+    e2m1 = tl.full(x.shape, 0x7, dtype=tl.uint8)
+    e2m1 = tl.where(normal_mask, normal_x, e2m1)
+    e2m1 = tl.where(denormal_mask, denormal_x, e2m1)
+    sign_lp = sign >> (23 + 8 - 1 - 2)
+    sign_lp = sign_lp.to(tl.uint8)
+    e2m1 = e2m1 | sign_lp
+    e2m1 = e2m1.reshape(block_m, num_quant_blocks, 16, 2)
+    evens, odds = tl.split(e2m1)
+    packed = evens | (odds << 4)
+    return (
+        packed.reshape(block_m, block_n // 2),
+        scale_byte.reshape(block_m, num_quant_blocks),
+    )
+
+
+_MXFP4_QUANT_EPILOGUE = Epilogue(
+    FnSpecs(
+        FnName.QUANTIZE_MXFP4.name,
+        _quantize_mxfp4_tokenspeed_fn,
+        (),
+        (),
+    ),
+    tuple(),
+    tuple(),
+    effective_itemsize=6.0,
+)
 
 
 def _uses_dynamic_mxfp4_activations(w: torch.nn.Module) -> bool:
@@ -106,6 +185,18 @@ def _with_activation_mx_scale(
     precision_config = copy.copy(precision_config)
     precision_config.a_mx_scale = activation_scale
     precision_config.a_microblock_size = MXFP4_BLOCK
+    return precision_config
+
+
+def _with_output_mx_scale(
+    precision_config: PrecisionConfig,
+    output_scale: torch.Tensor,
+) -> PrecisionConfig:
+    precision_config = copy.copy(precision_config)
+    precision_config.c_mx_scale = output_scale
+    precision_config.c_microblock_size = MXFP4_BLOCK
+    precision_config.c_value_pack_factor = 2
+    precision_config.out_dtype = torch.uint8
     return precision_config
 
 
@@ -560,6 +651,8 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         w2_lhs = InFlexData()
         out_dtype = torch.bfloat16 if _uses_dynamic_mxfp4_activations(w) else None
 
+    w._mxfp4_intermediate_size = int(w.w2_weight.shape[-1]) * 2
+
     w.w13_precision_config = PrecisionConfig(
         flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
         b_mx_scale=w13_scale,
@@ -799,6 +892,22 @@ def triton_mxfp4_moe_apply(
     else:
         gemm1_input = x
 
+    fuse_gemm1_quant = (
+        use_dynamic_mxfp4
+        and act is not None
+        and getattr(w, "_mxfp4_intermediate_size", None) is not None
+    )
+    if fuse_gemm1_quant:
+        gemm2_scale = torch.empty(
+            (
+                gather_indx.shape[0],
+                (int(w._mxfp4_intermediate_size) + MXFP4_BLOCK - 1) // MXFP4_BLOCK,
+            ),
+            device=x.device,
+            dtype=torch.uint8,
+        )
+        w13_pc = _with_output_mx_scale(w13_pc, gemm2_scale)
+
     with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc), _maybe_dynamic_mxfp4_guard(
         use_dynamic_mxfp4_tile_policy,
         n_tokens,
@@ -811,6 +920,7 @@ def triton_mxfp4_moe_apply(
             gather_indx=gather_indx,
             precision_config=w13_pc,
             fused_activation=act,
+            epilogue=_MXFP4_QUANT_EPILOGUE if fuse_gemm1_quant else None,
         )
     if act is None:
         intermediate_cache = _silu_gate_up(
@@ -820,6 +930,12 @@ def triton_mxfp4_moe_apply(
 
     if hasattr(w, "w2_act_scale"):
         gemm2_input = fp8_quantize(intermediate_cache, scale=w.w2_act_scale)
+    elif fuse_gemm1_quant:
+        gemm2_input = intermediate_cache
+        w2_pc = _with_activation_mx_scale(
+            w2_pc,
+            gemm2_scale,
+        )
     elif use_dynamic_mxfp4:
         gemm2_input, gemm2_scale = _quantize_mxfp4_activation(intermediate_cache)
         w2_pc = _with_activation_mx_scale(
