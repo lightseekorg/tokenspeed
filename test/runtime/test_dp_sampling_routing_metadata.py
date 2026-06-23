@@ -21,6 +21,7 @@ from tokenspeed.runtime.models import glm5 as glm5_module
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.models.glm5 import (
     GlmDsaDecodeTopK,
+    GlmDsaIndexerOutput,
     GlmDsaPrefillTopK,
     GlmMoeDsaAttention,
     GlmMoeDsaDecoderLayer,
@@ -683,6 +684,74 @@ def test_glm_dsa_decode_topk_schedule_refreshes_for_current_layout(monkeypatch):
     assert metadata._dsa_paged_mqa_schedule_metadata.tolist() == [3]
     assert metadata._dsa_paged_mqa_schedule_q_len == 1
     assert metadata._dsa_paged_mqa_schedule_shape == (2, 1)
+
+
+def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
+    captured = {}
+
+    def fake_build_prefill_kv_workspace_slots(**kwargs):
+        captured["workspace_max_seq_len"] = kwargs["max_seq_len"]
+        captured["workspace_block_tables_shape"] = tuple(kwargs["block_tables"].shape)
+        return (
+            torch.arange(12, dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+        )
+
+    def fake_compute_prefill_topk_indices_deepgemm(self, **kwargs):
+        captured["deepgemm_max_seq_len"] = kwargs["max_seq_len"]
+        captured["deepgemm_num_prefill_tokens"] = kwargs["num_prefill_tokens"]
+        return "prefill-topk"
+
+    monkeypatch.setattr(
+        glm5_module,
+        "_build_prefill_kv_workspace_slots",
+        fake_build_prefill_kv_workspace_slots,
+    )
+    monkeypatch.setattr(
+        GlmMoeDsaAttention,
+        "_compute_prefill_topk_indices_deepgemm",
+        fake_compute_prefill_topk_indices_deepgemm,
+    )
+
+    # The live tensors deliberately disagree with the CPU mirror. The scalar
+    # token-count and max-len decisions should use the CPU mirror to avoid GPU
+    # syncs in the GLM DSA prefill top-k path.
+    chunk_meta = SimpleNamespace(
+        extend_prefix_lens=torch.tensor([100], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([100], dtype=torch.int32),
+        extend_prefix_lens_cpu=torch.tensor([7], dtype=torch.int32),
+        extend_seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+    )
+
+    attn = GlmMoeDsaAttention.__new__(GlmMoeDsaAttention)
+    attn.index_topk = 3
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(chunked_prefill_metadata=chunk_meta),
+        token_to_kv_pool=SimpleNamespace(page_size=64),
+        req_to_page=torch.arange(4, dtype=torch.int32).view(1, 4),
+        bs=1,
+        num_extends=1,
+        input_num_tokens=5,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    indexer_output = GlmDsaIndexerOutput(
+        query=torch.empty((5, 1, 1), dtype=torch.float32),
+        key=torch.empty((5, 1, 1), dtype=torch.float32),
+        weights=torch.empty((5, 1), dtype=torch.float32),
+    )
+
+    result = attn._compute_prefill_topk_indices(
+        indexer_output,
+        ctx,
+        num_prefill_tokens=5,
+    )
+
+    assert result == "prefill-topk"
+    assert captured["workspace_max_seq_len"] == 12
+    assert captured["workspace_block_tables_shape"] == (1, 1)
+    assert captured["deepgemm_max_seq_len"] == 12
+    assert captured["deepgemm_num_prefill_tokens"] == 5
 
 
 def test_glm_nextn_decode_first_step_keeps_full_verify_window():

@@ -1227,13 +1227,24 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             return None
         prefix_lens = chunk_meta.extend_prefix_lens[: ctx.num_extends].to(torch.int32)
         extend_lens = chunk_meta.extend_seq_lens[: ctx.num_extends].to(torch.int32)
+        prefix_lens_cpu = getattr(chunk_meta, "extend_prefix_lens_cpu", None)
+        extend_lens_cpu = getattr(chunk_meta, "extend_seq_lens_cpu", None)
+        if prefix_lens_cpu is not None:
+            prefix_lens_cpu = prefix_lens_cpu[: ctx.num_extends]
+        if extend_lens_cpu is not None:
+            extend_lens_cpu = extend_lens_cpu[: ctx.num_extends]
         seq_lens = prefix_lens + extend_lens
         if seq_lens.numel() == 0:
             return None
-        if int(extend_lens.sum().item()) != num_prefill_tokens:
+        extend_token_count = (
+            int(extend_lens_cpu.sum().item())
+            if extend_lens_cpu is not None
+            else int(extend_lens.sum().item())
+        )
+        if extend_token_count != num_prefill_tokens:
             raise RuntimeError(
                 "GLM DSA prefill token count mismatch: "
-                f"metadata={int(extend_lens.sum().item())}, "
+                f"metadata={extend_token_count}, "
                 f"tokens={num_prefill_tokens}"
             )
         if ctx.req_to_page is None:
@@ -1241,7 +1252,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
         topk = self.index_topk
         page_size = ctx.token_to_kv_pool.page_size
-        max_seq_len = int(seq_lens.max().item())
+        if prefix_lens_cpu is not None and extend_lens_cpu is not None:
+            max_seq_len = int((prefix_lens_cpu + extend_lens_cpu).max().item())
+        else:
+            max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
         block_tables_snapshot = getattr(ctx.attn_backend, "_prefill_block_tables", None)
         if block_tables_snapshot is None:
