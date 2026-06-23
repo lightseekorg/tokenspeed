@@ -112,7 +112,7 @@ class DFlashAttention(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
         )
 
-        sliding_window = _get_dflash_layer_attention_params(config, layer_id)
+        sliding_window, causal = _get_dflash_layer_attention_params(config, layer_id)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
@@ -120,7 +120,7 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window,
-            causal=False,
+            causal=causal,
         )
 
     def _apply_qk_norm(
@@ -486,10 +486,10 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
 
 def _get_dflash_layer_attention_params(
     config, layer_id: int
-) -> int:
+) -> tuple[int, bool]:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None:
-        return -1
+        return -1, False
     if layer_id >= len(layer_types):
         raise ValueError(
             "DFLASH config.layer_types must contain one entry per draft layer. "
@@ -498,11 +498,11 @@ def _get_dflash_layer_attention_params(
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":
-        return -1
+        return -1, False
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size
+        return sliding_window_size, True
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."
