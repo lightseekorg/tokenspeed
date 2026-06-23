@@ -160,6 +160,19 @@ def _quantize_mxfp4_tokenspeed_fn(input, mask, pid=None):
     )
 
 
+@triton.jit(repr=lambda _: "_mxfp4_scale_byte")
+def _mxfp4_scale_byte_fn(input, mask):
+    x = input.to(tl.bfloat16).to(tl.float32)
+    x = tl.where(mask, x, 0.0)
+    amax = tl.max(tl.abs(x), axis=1)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+    return scale_e8m0_unbiased.to(tl.uint8) + 127
+
+
 _MXFP4_QUANT_EPILOGUE = Epilogue(
     FnSpecs(
         FnName.QUANTIZE_MXFP4.name,
@@ -292,6 +305,252 @@ def _quantize_mxfp4_activation(
         solution="triton",
         enable_pdl=False,
     )
+
+
+@triton.jit
+def _sort_mxfp4_scales_for_sorted_moe_kernel(
+    scales_ptr,
+    source_token_ids_ptr,
+    num_valid_ids_ptr,
+    out_ptr,
+    n_groups: tl.constexpr,
+    scales_row_stride,
+    out_row_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    groups = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    num_valid_ids = tl.load(num_valid_ids_ptr)
+
+    row_mask = rows < num_valid_ids
+    source_rows = tl.load(
+        source_token_ids_ptr + rows,
+        mask=row_mask,
+        other=0,
+    )
+    scale_offsets = source_rows[:, None] * scales_row_stride + groups[None, :]
+    mask = row_mask[:, None] & (groups[None, :] < n_groups)
+    values = tl.load(scales_ptr + scale_offsets, mask=mask, other=0)
+
+    out_offsets = rows[:, None] * out_row_stride + groups[None, :]
+    tl.store(out_ptr + out_offsets, values, mask=mask)
+
+
+@triton.jit
+def _quantize_mxfp4_sorted_moe_input_kernel(
+    x_ptr,
+    source_token_ids_ptr,
+    num_valid_ids_ptr,
+    quantized_ptr,
+    sorted_scales_ptr,
+    n_tokens,
+    x_row_stride,
+    quantized_row_stride,
+    sorted_scales_row_stride,
+    N: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M_QUANT: tl.constexpr,
+    BLOCK_M_SORT: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    n_quant_pids = tl.cdiv(n_tokens, BLOCK_M_QUANT) * N_GROUPS
+
+    if pid < n_quant_pids:
+        pid_m = pid // N_GROUPS
+        pid_g = pid % N_GROUPS
+        rows = pid_m * BLOCK_M_QUANT + tl.arange(0, BLOCK_M_QUANT)
+        cols = pid_g * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask = (rows[:, None] < n_tokens) & (cols[None, :] < N)
+        x = tl.load(
+            x_ptr + rows[:, None] * x_row_stride + cols[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        packed, _ = _quantize_mxfp4_tokenspeed_fn(x, mask)
+
+        pack_cols = pid_g * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)
+        tl.store(
+            quantized_ptr
+            + rows[:, None] * quantized_row_stride
+            + pack_cols[None, :],
+            packed,
+            mask=rows[:, None] < n_tokens,
+        )
+        return
+
+    pid -= n_quant_pids
+    pid_m = pid // N_GROUPS
+    pid_g = pid % N_GROUPS
+    rows = pid_m * BLOCK_M_SORT + tl.arange(0, BLOCK_M_SORT)
+    cols = pid_g * BLOCK_K + tl.arange(0, BLOCK_K)
+    num_valid_ids = tl.load(num_valid_ids_ptr)
+
+    row_mask = rows < num_valid_ids
+    source_rows = tl.load(
+        source_token_ids_ptr + rows,
+        mask=row_mask,
+        other=0,
+    )
+    mask = row_mask[:, None] & (cols[None, :] < N)
+    x = tl.load(
+        x_ptr + source_rows[:, None] * x_row_stride + cols[None, :],
+        mask=mask,
+        other=0.0,
+    )
+    scale_byte = _mxfp4_scale_byte_fn(x, mask)
+    tl.store(
+        sorted_scales_ptr + rows * sorted_scales_row_stride + pid_g,
+        scale_byte,
+        mask=row_mask,
+    )
+
+
+def _validate_sorted_moe_mxfp4_inputs(
+    activations: torch.Tensor,
+    sorted_metadata: _SortedMoEMetadata,
+) -> tuple[int, int, int]:
+    if activations.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "sorted MoE MXFP4 quantization requires bf16/fp16 activations, "
+            f"got {activations.dtype}"
+        )
+    if activations.ndim != 2:
+        raise ValueError(
+            "sorted MoE MXFP4 quantization expects a rank-2 activation tensor, "
+            f"got shape {tuple(activations.shape)}"
+        )
+    if activations.stride(-1) != 1:
+        raise ValueError(
+            "sorted MoE MXFP4 quantization requires stride-1 hidden dimension"
+        )
+    if activations.shape[-1] % MXFP4_BLOCK != 0:
+        raise ValueError(
+            "sorted MoE MXFP4 quantization requires hidden dimension divisible "
+            f"by {MXFP4_BLOCK}, got {activations.shape[-1]}"
+        )
+    if sorted_metadata.source_token_ids.dtype != torch.int32:
+        raise ValueError("sorted MoE source_token_ids must be int32")
+    if sorted_metadata.num_valid_ids.dtype != torch.int32:
+        raise ValueError("sorted MoE num_valid_ids must be int32")
+    if sorted_metadata.source_token_ids.device != activations.device:
+        raise ValueError("sorted MoE source_token_ids must be on activation device")
+    if sorted_metadata.num_valid_ids.device != activations.device:
+        raise ValueError("sorted MoE num_valid_ids must be on activation device")
+
+    n_tokens = int(activations.shape[0])
+    n_hidden = int(activations.shape[1])
+    n_sorted = int(sorted_metadata.source_token_ids.shape[0])
+    return n_tokens, n_hidden, n_sorted
+
+
+def _sort_mxfp4_scales_for_sorted_moe(
+    scales: torch.Tensor,
+    sorted_metadata: _SortedMoEMetadata,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if scales.dtype != torch.uint8:
+        raise ValueError(f"MXFP4 scales must be uint8, got {scales.dtype}")
+    if scales.ndim != 2:
+        raise ValueError(f"MXFP4 scales must be rank-2, got {tuple(scales.shape)}")
+    if sorted_metadata.source_token_ids.dtype != torch.int32:
+        raise ValueError("sorted MoE source_token_ids must be int32")
+    if sorted_metadata.num_valid_ids.dtype != torch.int32:
+        raise ValueError("sorted MoE num_valid_ids must be int32")
+    if sorted_metadata.source_token_ids.device != scales.device:
+        raise ValueError("sorted MoE source_token_ids must be on scale device")
+    if sorted_metadata.num_valid_ids.device != scales.device:
+        raise ValueError("sorted MoE num_valid_ids must be on scale device")
+
+    n_sorted = int(sorted_metadata.source_token_ids.shape[0])
+    n_groups = int(scales.shape[1])
+    out_shape = (n_sorted, n_groups)
+    if out is None:
+        out = torch.empty(out_shape, dtype=torch.uint8, device=scales.device)
+    elif out.shape != out_shape or out.dtype != torch.uint8:
+        raise ValueError(
+            "sorted MXFP4 scale output must have shape "
+            f"{out_shape} and dtype uint8, got {tuple(out.shape)} {out.dtype}"
+        )
+    if n_sorted == 0 or n_groups == 0:
+        return out
+
+    block_m = 16
+    block_n = 8
+    grid = (triton.cdiv(n_sorted, block_m), triton.cdiv(n_groups, block_n))
+    _sort_mxfp4_scales_for_sorted_moe_kernel[grid](
+        scales,
+        sorted_metadata.source_token_ids,
+        sorted_metadata.num_valid_ids,
+        out,
+        n_groups,
+        scales.stride(0),
+        out.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        num_warps=1,
+    )
+    return out
+
+
+def _quantize_mxfp4_sorted_moe_input(
+    activations: torch.Tensor,
+    sorted_metadata: _SortedMoEMetadata,
+    *,
+    fused: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n_tokens, n_hidden, n_sorted = _validate_sorted_moe_mxfp4_inputs(
+        activations,
+        sorted_metadata,
+    )
+    quantized = torch.empty(
+        (n_tokens, n_hidden // 2),
+        dtype=torch.uint8,
+        device=activations.device,
+    )
+    sorted_scales = torch.empty(
+        (n_sorted, n_hidden // MXFP4_BLOCK),
+        dtype=torch.uint8,
+        device=activations.device,
+    )
+    if n_tokens == 0:
+        return quantized, sorted_scales
+
+    if fused:
+        n_groups = n_hidden // MXFP4_BLOCK
+        block_m_quant = 4
+        block_m_sort = 16
+        n_programs = triton.cdiv(n_tokens, block_m_quant) * n_groups
+        n_programs += triton.cdiv(n_sorted, block_m_sort) * n_groups
+        _quantize_mxfp4_sorted_moe_input_kernel[(n_programs,)](
+            activations,
+            sorted_metadata.source_token_ids,
+            sorted_metadata.num_valid_ids,
+            quantized,
+            sorted_scales,
+            n_tokens,
+            activations.stride(0),
+            quantized.stride(0),
+            sorted_scales.stride(0),
+            N=n_hidden,
+            N_GROUPS=n_groups,
+            BLOCK_K=MXFP4_BLOCK,
+            BLOCK_M_QUANT=block_m_quant,
+            BLOCK_M_SORT=block_m_sort,
+            num_warps=1,
+        )
+        return quantized, sorted_scales
+
+    quantized, scales = _quantize_mxfp4_activation(activations)
+    sorted_scales = _sort_mxfp4_scales_for_sorted_moe(
+        scales,
+        sorted_metadata,
+        out=sorted_scales,
+    )
+    return quantized, sorted_scales
 
 
 def _with_activation_mx_scale(

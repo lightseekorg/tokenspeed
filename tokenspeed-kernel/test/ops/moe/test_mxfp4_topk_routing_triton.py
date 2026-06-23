@@ -24,6 +24,8 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
+    _quantize_mxfp4_activation,
+    _quantize_mxfp4_sorted_moe_input,
     _routing_from_topk,
     _routing_from_topk_medium_m,
     _routing_from_topk_small_m,
@@ -406,6 +408,66 @@ def test_sorted_moe_metadata_rejects_unsupported_block_size(device: str) -> None
             gate,
             block_size=24,
         )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size"),
+    [
+        (4, 256),
+        (33, 2880),
+        (128, 7168),
+    ],
+)
+def test_quantize_mxfp4_sorted_moe_input_matches_reference(
+    device: str,
+    fused: bool,
+    num_tokens: int,
+    hidden_size: int,
+) -> None:
+    generator = torch.Generator(device=device).manual_seed(
+        9200 + num_tokens * 13 + hidden_size
+    )
+    activations = torch.randn(
+        (num_tokens, hidden_size),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    topk_weights, topk_ids = _make_topk(
+        num_tokens=num_tokens,
+        num_experts=384,
+        topk=8,
+        device=device,
+    )
+    metadata, gather, scatter, gate = _routing_from_topk_fast_path(
+        topk_weights,
+        topk_ids,
+        num_experts=384,
+        gate_dtype=torch.float32,
+    )
+    sorted_metadata = _sorted_moe_metadata_from_routing(
+        metadata,
+        gather,
+        scatter,
+        gate,
+        block_size=16,
+    )
+
+    quantized, sorted_scales = _quantize_mxfp4_sorted_moe_input(
+        activations,
+        sorted_metadata,
+        fused=fused,
+    )
+    expected_quantized, expected_scales = _quantize_mxfp4_activation(activations)
+    expected_sorted_scales = expected_scales.index_select(
+        0,
+        sorted_metadata.source_token_ids.to(torch.long),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(quantized, expected_quantized)
+    assert torch.equal(sorted_scales, expected_sorted_scales)
 
 
 def test_small_m_routing_from_topk_rejects_large_work(device: str) -> None:
